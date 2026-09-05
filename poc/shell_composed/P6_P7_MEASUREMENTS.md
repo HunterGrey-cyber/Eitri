@@ -213,6 +213,13 @@ when checked; no systemd timer with anywhere near a 10s period was found. Root c
 identified — flagging for the next phase / a follow-up investigation rather than attributing it to
 either WebKitGTK coexistence or pane resize, since it demonstrably occurs without either.
 
+> **Resolved by a follow-up investigation — see `STALL_ROOT_CAUSE.md`.** Verdict: environmental,
+> not a neovibe/neovide bug. A ~90-line GTK4+libepoxy C program with zero neovide/tokio/mundy/nvim/
+> WebKit code reproduces the identical pattern; direct `/proc/<gnome-shell-pid>/stat` CPU sampling
+> correlates it to a genuine periodic CPU burst inside the host's own GNOME Shell/Mutter process
+> (traced to system-monitoring GNOME Shell extensions active in this dev session), which delays
+> Wayland frame-callback delivery to any continuously-animating client. No code change follows.
+
 ---
 
 ## Summary of what was and wasn't fully tested
@@ -224,9 +231,10 @@ either WebKitGTK coexistence or pane resize, since it demonstrably occurs withou
 - **Partially tested / flagged as open**: the one non-reproduced sustained editor-dt-plateau
   anomaly (run A′) — genuinely uncertain whether it's a real WebView→editor interaction or
   workstation contention; needs a repeat attempt, ideally on a quieter machine or with the
-  workstation's other processes controlled for. The ~10.00s periodic stall's root cause is
-  completely open (confirmed unrelated to this phase's own variables, not investigated further
-  since it's out of scope for P6/P7 specifically).
+  workstation's other processes controlled for.
+- **Resolved since this doc was written**: the ~10.00s periodic stall's root cause, which was
+  completely open here, has since been chased down and closed as environmental (host GNOME Shell/
+  Mutter extensions, not neovibe) — see `STALL_ROOT_CAUSE.md`.
 - **Not attempted**: real keyboard input into the editor during the P6 WebView-busy window (task
   called idle-editor an acceptable baseline; sending synthetic input was deprioritized given the
   known xdotool unreliability in this sandbox and the time budget).
