@@ -698,8 +698,37 @@ fn build_content_area(editor: &gtk4::Widget, agent: &gtk4::Widget) -> (gtk4::Wid
     paned.set_shrink_end_child(false);
     paned.set_position(760);
 
+    install_webview_resize_throttle(&paned, agent);
+
     let widget = paned.clone().upcast();
     (widget, paned)
+}
+
+/// Frequent pane-position changes repeatedly reflow the WebView and consume CPU.
+/// Hide the agent widget during a burst of changes and reveal it about 70ms after the last
+/// change, deferring reflow until motion pauses.
+fn install_webview_resize_throttle(paned: &Paned, agent: &gtk4::Widget) {
+    const DEBOUNCE_MS: u32 = 70;
+
+    let agent = agent.clone();
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    paned.connect_notify_local(Some("position"), move |_paned, _pspec| {
+        if agent.is_visible() {
+            agent.set_visible(false);
+        }
+        if let Some(id) = pending.borrow_mut().take() {
+            id.remove();
+        }
+        let agent2 = agent.clone();
+        let pending2 = pending.clone();
+        let id = glib::source::timeout_add_local(Duration::from_millis(DEBOUNCE_MS as u64), move || {
+            agent2.set_visible(true);
+            *pending2.borrow_mut() = None;
+            glib::ControlFlow::Break
+        });
+        *pending.borrow_mut() = Some(id);
+    });
 }
 
 /// Bottom status bar strip, carried over from `shell_chrome::build_status_bar` unchanged.
