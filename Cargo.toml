@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "poc/gl_skia_test",
+    "poc/neovide_embed",
+    "poc/neovide_embed_live",
+    "poc/pump_events_spike",
+    "poc/shell_chrome",
+    "poc/shell_composed",
+    "poc/tools/wlr_vptr_drag",
+    "poc/webkit_pane",
+    "neovide-editor",
+]
+
+[workspace.package]
+edition = "2021"
+publish = false
