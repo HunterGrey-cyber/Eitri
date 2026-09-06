@@ -59,7 +59,7 @@ use skia_safe::gpu::{backend_render_targets, direct_contexts, surfaces, DirectCo
 use skia_safe::{Canvas, Color4f, Paint, PaintStyle, Rect, Surface};
 
 use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
-use neovide::units::PixelRect;
+use neovide::units::{GridSize, PixelRect, PixelSize};
 
 const APP_ID: &str = "cn.huntergrey.neovibe.neovide_embed_live";
 
@@ -209,6 +209,22 @@ fn compute_content_region(fb_width: i32, fb_height: i32) -> PixelRect<f32> {
     }
 }
 
+/// The (cols, rows) grid size that fits inside `content_region`, using `harness`'s own current
+/// font-derived `grid_scale` (`LiveHarness::grid_scale`) -- floored, not rounded, so nvim's grid
+/// never claims more space than the host actually has, the same convention neovide's own
+/// `WinitWindowWrapper::get_grid_size_from_window` uses when deriving a grid size from a real OS
+/// window's pixel content area. `LiveHarness::resize_grid` clamps again internally
+/// (`settings::clamped_grid_size`), but flooring here first keeps this value an honest reflection
+/// of what was actually computed from `content_region`, for the caller's own dedup/log purposes.
+fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRect<f32>) -> GridSize<u32> {
+    let pixel_size = PixelSize::new(
+        content_region.max.x - content_region.min.x,
+        content_region.max.y - content_region.min.y,
+    );
+    let grid_size = pixel_size / harness.grid_scale();
+    GridSize::new(grid_size.width.floor().max(1.0) as u32, grid_size.height.floor().max(1.0) as u32)
+}
+
 fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f32>, color: Color4f) {
     let mut paint = Paint::default();
     paint.set_color4f(color, None);
@@ -262,10 +278,17 @@ struct LiveSession {
     /// on nvim's async redraw round-trip to eventually move `last_seen_batches`). Read-and-cleared
     /// by the tick callback every tick.
     wants_frame: Cell<bool>,
+    /// The grid (cols, rows) size nvim was last asked to resize to via
+    /// `LiveHarness::resize_grid` -- the P2 frozen-scroll-bug fix. Set once at construction (to
+    /// whatever the initial `content_region` computed to) and re-checked on every `connect_resize`
+    /// callback so a real RPC is only sent when the *grid-cell* size actually changes, not on
+    /// every pixel-level resize event mid-drag (see `LiveHarness::resize_grid`'s own doc on why
+    /// that dedup matters).
+    last_grid_size: Cell<GridSize<u32>>,
 }
 
 impl LiveSession {
-    fn new(harness: LiveHarness) -> Self {
+    fn new(harness: LiveHarness, grid_size: GridSize<u32>) -> Self {
         let now = Instant::now();
         Self {
             harness,
@@ -276,6 +299,7 @@ impl LiveSession {
             last_animating: Cell::new(true),
             last_seen_batches: Cell::new(0),
             wants_frame: Cell::new(false),
+            last_grid_size: Cell::new(grid_size),
         }
     }
 
@@ -391,23 +415,42 @@ fn build_ui(app: &Application, want_clean: bool) {
         gl_area.connect_resize(move |widget, width, height| {
             // A resize is a real event that deserves a guaranteed next frame at the new size --
             // flag it for the tick callback regardless of whether nvim itself has anything new to
-            // say (see `LiveSession::wants_frame`'s own doc).
-            let live = live_state.borrow();
-            let forced_next_frame = if let LiveState::Ready(session) = &*live {
+            // say (see `LiveSession::wants_frame`'s own doc). Also the P2 frozen-scroll-bug fix:
+            // recompute the grid size that actually fits the new content_region and, if it
+            // differs (in grid *cells*, not raw pixels) from what nvim was last told, call
+            // `LiveHarness::resize_grid` so nvim's own viewport tracks the real host size instead
+            // of staying stuck at whatever grid size was in effect at launch -- see
+            // `LiveHarness::resize_grid`'s own doc for why that staleness is exactly what froze
+            // scrolling. `borrow_mut()` (not the plain `borrow()` this handler used before) is
+            // required now: `resize_grid` takes `&mut LiveHarness`, unlike the `Cell`-based
+            // `wants_frame` flag alone.
+            let mut live = live_state.borrow_mut();
+            let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                 session.wants_frame.set(true);
-                true
+                let content_region = compute_content_region(width, height);
+                let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
+                let resized_grid = if new_grid_size != session.last_grid_size.get() {
+                    session.harness.resize_grid(new_grid_size);
+                    session.last_grid_size.set(new_grid_size);
+                    Some(new_grid_size)
+                } else {
+                    None
+                };
+                (true, resized_grid)
             } else {
-                false
+                (false, None)
             };
             drop(live);
             println!(
-                "[resize] fb={}x{}px scale_factor={} logical={}x{} forced_next_frame={}",
+                "[resize] fb={}x{}px scale_factor={} logical={}x{} forced_next_frame={} \
+                 resized_grid={:?}",
                 width,
                 height,
                 widget.scale_factor(),
                 widget.width(),
                 widget.height(),
                 forced_next_frame,
+                resized_grid.map(|g| (g.width, g.height)),
             );
             let mut state = skia_state.borrow_mut();
             match state.as_mut() {
@@ -591,13 +634,33 @@ fn build_ui(app: &Application, want_clean: bool) {
                     );
                     let t0 = Instant::now();
                     match LiveHarness::with_options(options) {
-                        Ok(harness) => {
+                        Ok(mut harness) => {
                             let elapsed = t0.elapsed();
                             println!(
                                 "[live] LiveHarness::with_options returned after {elapsed:?} \
                                  (blocked the GTK main loop for that long)"
                             );
-                            *live = LiveState::Ready(Box::new(LiveSession::new(harness)));
+                            // The P2 frozen-scroll-bug fix: `LiveHarnessOptions::grid_size`
+                            // (left `None` above, so `DEFAULT_GRID_SIZE` 100x50) only ever sets
+                            // nvim's grid size at `nvim_ui_attach` time and has no relationship to
+                            // this window's actual `content_region` -- resize it immediately to
+                            // what the real content_region fits, so nvim's own viewport tracks the
+                            // host's real size from the very first frame instead of only being
+                            // caught up by the next `connect_resize` event (which may never come,
+                            // e.g. if the user never resizes the window at all).
+                            let grid_size = grid_size_for_content_region(&harness, &content_region);
+                            println!(
+                                "[live] resizing nvim grid to {}x{} to match initial \
+                                 content_region ({}x{}px) -- fixes the P2 frozen-scroll bug \
+                                 (nvim's grid no longer stays stuck at LiveHarnessOptions' \
+                                 launch-time default)",
+                                grid_size.width,
+                                grid_size.height,
+                                (content_region.max.x - content_region.min.x) as i32,
+                                (content_region.max.y - content_region.min.y) as i32,
+                            );
+                            harness.resize_grid(grid_size);
+                            *live = LiveState::Ready(Box::new(LiveSession::new(harness, grid_size)));
                         }
                         Err(err) => {
                             let elapsed = t0.elapsed();
