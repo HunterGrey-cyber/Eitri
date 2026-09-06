@@ -97,6 +97,32 @@ but a full saturated core for the duration of any drag-resize gesture is a real 
 into the Go/No-Go discussion, particularly for less powerful target hardware than this dev
 workstation (18 logical CPUs).
 
+**Fixed, 2026-09-06 — `install_webview_resize_throttle` in `main.rs`.** There's no public
+GtkPaned/WebKitGTK API to throttle reflow rate directly, so this hides the agent-panel widget for
+the duration of an active drag (a hidden widget isn't allocated/painted, so WebKit never reflows
+it) via `notify::position`, and reveals it again ~70ms after the *last* position change in a burst
+— i.e. once the drag has genuinely paused, not on a fixed timer during continuous motion. The
+editor pane's own resize handling is completely untouched (still real-time on every tick).
+
+Re-ran the same resize-sweep methodology (`SHELL_COMPOSED_AUTO_RESIZE_SWEEP=1`, 1Hz `/proc`
+sampling of the real `WebKitWebProcess` PID) with the fix in place: **`WebKitWebProcess` CPU was
+0% for the entire 20s sampled window** (vs. the 107.7% mean above) — a full elimination, not just a
+reduction, for this specific test pattern. Editor frame dt stayed healthy throughout (median
+13.98ms, p95 17.06ms, no regression vs. baseline). Clean shutdown, no orphaned processes.
+
+**Important caveat on the 0% number — be honest about what it does and doesn't prove**: the
+automated sweep changes `paned` position continuously every ~16ms with *no pauses* for its entire
+duration, so the 70ms debounce literally never fires until the sweep stops — the WebView stays
+hidden for the whole run. That's a genuine, correct result for this specific synthetic worst-case
+(continuous, never-pausing resize), but it does **not** by itself demonstrate the "reveal after
+pause" half of the mechanism. Separately verified that half: launched without the sweep (position
+never changes after startup) and confirmed via `poc/tools/screenshot.py` that the agent panel
+renders normally at rest, correctly visible, no stuck-hidden state. A real human drag (with natural
+pauses/reversals) would show intermittent reveal cycles between those, landing somewhere between
+this 0% best case and the original 107.7% baseline — not measured here (still blocked on
+`poc/docs/synthetic-input-findings.md`'s mouse-calibration gap for driving a *realistic*,
+pause-containing synthetic drag rather than a continuous sweep or a static launch).
+
 **Verdict inputs, not verdict**: no correctness failures (no bad dimensions, no stuck frames, no
 crashes), dt stays smooth outside the one already-explained-away periodic hitch, but WebKitGTK CPU
 cost during continuous resize is non-trivial and should be weighed.

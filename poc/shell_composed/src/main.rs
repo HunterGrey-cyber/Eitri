@@ -727,8 +727,42 @@ fn build_content_area(editor: &gtk4::Widget, agent: &gtk4::Widget) -> (gtk4::Wid
     paned.set_shrink_end_child(false);
     paned.set_position(760);
 
+    install_webview_resize_throttle(&paned, agent);
+
     let widget = paned.clone().upcast();
     (widget, paned)
+}
+
+/// P7 quick-win: `WebKitWebProcess` was measured pegging ~108% CPU (over one full core) during a
+/// resize sweep, because every single `notify::position` change on the paned reallocates -- and
+/// so reflows -- the WebView in real time. There's no public GtkPaned/WebKitGTK API to throttle
+/// that reflow rate directly, so this hides the agent widget for the duration of an active drag
+/// (a hidden widget isn't allocated/painted, so WebKit doesn't reflow it) and reveals it again,
+/// letting it reflow exactly once at the final size, ~70ms after the *last* position change in a
+/// burst (i.e. once the drag has actually paused, not on a fixed timer during continuous motion).
+/// The editor pane is unaffected -- it keeps resizing in real time throughout, exactly as before.
+fn install_webview_resize_throttle(paned: &Paned, agent: &gtk4::Widget) {
+    const DEBOUNCE_MS: u32 = 70;
+
+    let agent = agent.clone();
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    paned.connect_notify_local(Some("position"), move |_paned, _pspec| {
+        if agent.is_visible() {
+            agent.set_visible(false);
+        }
+        if let Some(id) = pending.borrow_mut().take() {
+            id.remove();
+        }
+        let agent2 = agent.clone();
+        let pending2 = pending.clone();
+        let id = glib::source::timeout_add_local(Duration::from_millis(DEBOUNCE_MS as u64), move || {
+            agent2.set_visible(true);
+            *pending2.borrow_mut() = None;
+            glib::ControlFlow::Break
+        });
+        *pending.borrow_mut() = Some(id);
+    });
 }
 
 /// Bottom status bar strip, carried over from `shell_chrome::build_status_bar` unchanged.
