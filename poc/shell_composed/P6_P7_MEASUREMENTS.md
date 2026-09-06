@@ -232,6 +232,30 @@ either WebKitGTK coexistence or pane resize, since it demonstrably occurs withou
   anomaly (run A′) — genuinely uncertain whether it's a real WebView→editor interaction or
   workstation contention; needs a repeat attempt, ideally on a quieter machine or with the
   workstation's other processes controlled for.
+
+  **Re-attempted 2026-09-06, inconclusive for a new, important reason**: the P11 idle-render fix
+  (merged after this doc was originally written) means the editor now correctly stops rendering
+  entirely when idle (`[tick] issued=0 skipped=300` — `animating=false`, no `[frame]` lines at
+  all). A plain re-run of the original A/A′ methodology (launch, wait, sample) produces almost no
+  frame data to analyze at all (24 frame-log lines across a 58s run, nearly all clustered in the
+  first 0.5s of startup) — there is no "editor dt" to measure during genuine idle, by design, now.
+  Reproducing the anomaly requires the editor to be genuinely *active* (typing/scrolling)
+  throughout the measurement window, not idle. Tried driving that via synthetic scroll-wheel input
+  (`ydotool mousemove -w -- 0 1`, see `poc/docs/synthetic-input-findings.md` for the mechanism,
+  proven to work elsewhere in this session) at ~4.5 events/sec for ~45s — this did **not**
+  meaningfully increase frame activity either (still only ~24 frames total), most likely because
+  the synthetic scroll events need the pointer positioned precisely over the editor's `GtkGLArea`
+  widget to route to nvim's mouse handling, and this session did not yet calibrate absolute pointer
+  coordinates against `shell_composed`'s actual layout (the same open item noted in
+  `synthetic-input-findings.md`). No orphaned processes from any of these attempts.
+
+  **Net status: still unresolved, but now for a more specific, actionable reason** — the next
+  attempt should first calibrate `ydotool mousemove -a -x/-y` against `shell_composed`'s real
+  window geometry (logged in its own `[resize #N]` lines), confirm scroll/keystrokes are actually
+  reaching the editor grid (e.g. watch `batches` climb in the `[frame]` log), *then* re-run the
+  busy-WebView comparison with that confirmed-working sustained activity driving the editor for the
+  full window, rather than relying on incidental idle/dashboard animation the way the original A/A′
+  runs implicitly did before the idle-render fix existed.
 - **Resolved since this doc was written**: the ~10.00s periodic stall's root cause, which was
   completely open here, has since been chased down and closed as environmental (host GNOME Shell/
   Mutter extensions, not neovibe) — see `STALL_ROOT_CAUSE.md`.
