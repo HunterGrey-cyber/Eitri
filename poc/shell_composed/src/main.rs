@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, EventControllerKey, GLArea, Paned};
+use gtk4::{Application, ApplicationWindow, EventControllerKey, GLArea, IMMulticontext, Paned};
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, direct_contexts, surfaces, DirectContext, SurfaceOrigin};
@@ -598,7 +598,7 @@ fn build_ui(app: &Application, want_clean: bool) {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
 
-    let (editor_widget, live_state, gl_area) = build_editor_pane(want_clean);
+    let (editor_widget, live_state, gl_area, im_context) = build_editor_pane(want_clean);
     let agent_widget = build_agent_pane();
     let (content_widget, paned) = build_content_area(&editor_widget, &agent_widget);
 
@@ -636,6 +636,7 @@ fn build_ui(app: &Application, want_clean: bool) {
 
     window.present();
     gl_area.grab_focus();
+    im_context.focus_in();
     println!(
         "shell_composed running: chrome+editor+agent-panel single window. \
          initial window scale_factor={} clean={} auto_resize_sweep={}",
@@ -788,7 +789,7 @@ fn build_status_bar() -> gtk4::Widget {
 /// `content_region` + time-since-last-frame (see this file's own module doc on why that's new).
 fn build_editor_pane(
     want_clean: bool,
-) -> (gtk4::Widget, Rc<RefCell<LiveState>>, GLArea) {
+) -> (gtk4::Widget, Rc<RefCell<LiveState>>, GLArea, IMMulticontext) {
     let gl_area = GLArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -865,10 +866,36 @@ fn build_editor_pane(
         });
     }
 
+    // --- IME: identical to neovide_embed_live's GtkIMMulticontext wiring -- see that crate's
+    // comment for the full rationale (GTK filters IME-consumed keys out of ::key-pressed itself
+    // via `set_im_context`, so composed text arrives only through `connect_commit`, forwarded to
+    // nvim through the same `send_text_input` path plain keystrokes use).
+    let im_context = IMMulticontext::new();
+    im_context.set_client_widget(Some(&gl_area));
+    {
+        let live_state = live_state.clone();
+        im_context.connect_commit(move |_ctx, text| {
+            let mut live = live_state.borrow_mut();
+            if let LiveState::Ready(session) = &mut *live {
+                if !session.harness.has_neovim_exited() {
+                    session.harness.send_text_input(text);
+                    session.wants_frame.set(true);
+                }
+            }
+        });
+    }
+    im_context.connect_preedit_start(|_ctx| println!("[ime] preedit-start"));
+    im_context.connect_preedit_end(|_ctx| println!("[ime] preedit-end"));
+    im_context.connect_preedit_changed(|ctx| {
+        let (text, _attrs, _cursor_pos) = ctx.preedit_string();
+        println!("[ime] preedit-changed: {text:?}");
+    });
+
     // --- keyboard input: identical to neovide_embed_live's EventControllerKey wiring.
     {
         let live_state = live_state.clone();
         let key_controller = EventControllerKey::new();
+        key_controller.set_im_context(Some(&im_context));
         key_controller.connect_key_pressed(move |_controller, key, _keycode, state| {
             if state.intersects(
                 ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
@@ -1129,7 +1156,7 @@ fn build_editor_pane(
     }
 
     let widget: gtk4::Widget = gl_area.clone().upcast();
-    (widget, live_state, gl_area)
+    (widget, live_state, gl_area, im_context)
 }
 
 /// Right pane: the real agent panel, carried over from `webkit_pane::main`'s `WebView`
