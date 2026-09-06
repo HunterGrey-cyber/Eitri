@@ -380,6 +380,7 @@ fn run_workload_script(
     nvim_exited: Arc<AtomicBool>,
     workload_path: String,
     sanity_path: String,
+    t_process_start: Instant,
 ) {
     macro_rules! bail_if_dead {
         () => {
@@ -401,6 +402,15 @@ fn run_workload_script(
         return;
     }
     phase_marker("FILE_OPENED");
+    // Closes the P11 startup-time methodology gap: NEOVIBE_READY only covers "blank buffer ready"
+    // (LiveHarness can't open a file at launch, see module doc point 1), so it under-counts vs.
+    // stock Neovide's single combined startup+file-open number. This gives the real end-to-end
+    // "time to first real content visible" figure, directly comparable to stock's.
+    println!(
+        "NEOVIBE_TIMING:file_opened_end_to_end t={:.4}",
+        t_process_start.elapsed().as_secs_f64()
+    );
+    let _ = std::io::stdout().flush();
     bail_if_dead!();
 
     // ---- warm-up: identical shape to the stock driver's own warm-up (idle, then a substantial
@@ -650,7 +660,13 @@ fn build_ui(
                             let workload_path2 = workload_path.clone();
                             let sanity_path2 = sanity_path.clone();
                             thread::spawn(move || {
-                                run_workload_script(tx2, nvim_exited2, workload_path2, sanity_path2);
+                                run_workload_script(
+                                    tx2,
+                                    nvim_exited2,
+                                    workload_path2,
+                                    sanity_path2,
+                                    t_process_start,
+                                );
                             });
                         }
                     }
