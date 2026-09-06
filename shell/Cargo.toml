@@ -1,0 +1,10 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+neovide-editor = { path = "../neovide-editor" }
+gtk4 = { version = "0.11.4", features = ["v4_18"] }
+webkit6 = "0.6"
