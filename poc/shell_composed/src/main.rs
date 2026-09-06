@@ -26,7 +26,10 @@ use std::time::{Duration, Instant};
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, EventControllerKey, GLArea, IMMulticontext, Paned};
+use gtk4::{
+    Application, ApplicationWindow, DrawingArea, EventControllerKey, GLArea, IMMulticontext,
+    Overlay, Paned,
+};
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, direct_contexts, surfaces, DirectContext, SurfaceOrigin};
@@ -698,8 +701,10 @@ fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget {
 }
 
 /// Horizontal split, carried over from `shell_chrome::build_content_area`'s `GtkPaned` setup, with
-/// the two placeholder panes replaced by the real editor/agent widgets. Returns the wrapping
-/// widget plus the `Paned` itself (needed by `install_auto_resize_sweep`).
+/// the two placeholder panes replaced by the real editor/agent widgets. `agent` is deliberately
+/// *not* attached to `paned` directly -- see `install_webview_resize_throttle`'s doc for why -- so
+/// the wrapper widget that helper returns becomes the actual end child instead. Returns the
+/// wrapping widget plus the `Paned` itself (needed by `install_auto_resize_sweep`).
 fn build_content_area(editor: &gtk4::Widget, agent: &gtk4::Widget) -> (gtk4::Widget, Paned) {
     let paned = Paned::new(gtk4::Orientation::Horizontal);
     paned.add_css_class("content-area");
@@ -707,45 +712,73 @@ fn build_content_area(editor: &gtk4::Widget, agent: &gtk4::Widget) -> (gtk4::Wid
     paned.set_hexpand(true);
     paned.set_wide_handle(true);
 
+    let agent_host = install_webview_resize_throttle(agent);
+
     paned.set_start_child(Some(editor));
-    paned.set_end_child(Some(agent));
+    paned.set_end_child(Some(&agent_host));
     paned.set_resize_start_child(true);
     paned.set_resize_end_child(true);
     paned.set_shrink_start_child(false);
     paned.set_shrink_end_child(false);
     paned.set_position(760);
 
-    install_webview_resize_throttle(&paned, agent);
-
     let widget = paned.clone().upcast();
     (widget, paned)
 }
 
-/// Frequent pane-position changes repeatedly reflow the WebView and consume CPU.
-/// Hide the agent widget during a burst of changes and reveal it about 70ms after the last
-/// change, deferring reflow until motion pauses.
-fn install_webview_resize_throttle(paned: &Paned, agent: &gtk4::Widget) {
+/// Debounces WebView resizing to avoid repeated reflows during divider motion.
+/// Hiding a `Paned` child would give the editor the full width and remove the divider, so keep
+/// both pane children visible and place `agent` as an overlay child of a `gtk4::Overlay`.
+/// A `DrawingArea` sensor is the overlay's main child and receives its full current allocation.
+/// Its resize signal drives `agent.set_size_request` about 70ms after the last resize in a burst.
+/// Between updates, the agent stays visible at its previous size without reflowing on every change.
+/// The first size is applied immediately so startup does not leave the WebView at zero or stale size.
+/// `Start` alignment prevents the overlay from stretching the agent automatically. Clipping keeps
+/// an agent still at its old size from spilling into the editor while its pane is shrinking.
+/// Return the overlay for use as `Paned`'s end child; using `agent` directly would bypass debouncing.
+fn install_webview_resize_throttle(agent: &gtk4::Widget) -> gtk4::Widget {
     const DEBOUNCE_MS: u32 = 70;
+
+    agent.set_halign(gtk4::Align::Start);
+    agent.set_valign(gtk4::Align::Start);
+
+    let sensor = DrawingArea::new();
+    sensor.set_hexpand(true);
+    sensor.set_vexpand(true);
+
+    let overlay = Overlay::new();
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
+    overlay.set_child(Some(&sensor));
+    overlay.add_overlay(agent);
+    overlay.set_clip_overlay(agent, true);
 
     let agent = agent.clone();
     let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let primed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-    paned.connect_notify_local(Some("position"), move |_paned, _pspec| {
-        if agent.is_visible() {
-            agent.set_visible(false);
-        }
+    sensor.connect_resize(move |_sensor, width, height| {
         if let Some(id) = pending.borrow_mut().take() {
             id.remove();
+        }
+        if !primed.get() {
+            // First-ever layout: size it now, not debounced, so the WebView doesn't sit at a
+            // stale/zero size before the user has dragged (or resized) anything.
+            primed.set(true);
+            agent.set_size_request(width, height);
+            return;
         }
         let agent2 = agent.clone();
         let pending2 = pending.clone();
         let id = glib::source::timeout_add_local(Duration::from_millis(DEBOUNCE_MS as u64), move || {
-            agent2.set_visible(true);
+            agent2.set_size_request(width, height);
             *pending2.borrow_mut() = None;
             glib::ControlFlow::Break
         });
         *pending.borrow_mut() = Some(id);
     });
+
+    overlay.upcast()
 }
 
 /// Bottom status bar strip, carried over from `shell_chrome::build_status_bar` unchanged.
