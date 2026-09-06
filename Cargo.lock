@@ -3316,6 +3316,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "neovide-editor",
+ "webkit6",
+]
+
+[[package]]
 name = "shell_chrome"
 version = "0.1.0"
 dependencies = [

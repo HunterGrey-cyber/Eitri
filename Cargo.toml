@@ -10,6 +10,7 @@ members = [
     "poc/tools/wlr_vptr_drag",
     "poc/webkit_pane",
     "neovide-editor",
+    "shell",
 ]
 
 [workspace.package]
