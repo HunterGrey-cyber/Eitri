@@ -1,0 +1,35 @@
+# Synthetic input findings (2026-09-06)
+
+## TL;DR: the "no reliable synthetic input" wall was a tooling-choice problem, not a real wall — same shape as the earlier screenshot fix.
+
+`xdotool` fails here by *design*, not by accident: it relies on the X11 XTest extension, which Wayland's security model deliberately does not expose. Every prior attempt in this project used xdotool and concluded "synthetic input doesn't work on this machine" — that conclusion is too broad. **`ydotool` (kernel `uinput`-based, compositor-agnostic) works correctly against real GTK4 apps on this session, for both keyboard and mouse, verified visually, not just by exit code.**
+
+## Setup (no root/group changes needed)
+
+- `ydotool` and `ydotoold` are both already installed.
+- `/dev/uinput` already has an ACL granting `user:<you>:rw-` (`getfacl /dev/uinput`) — no sudo, no group membership change needed. This machine was already set up for this; nobody had tried it.
+- There is no systemd unit for `ydotoold` — it must be started manually per session: `ydotoold --socket-path=/tmp/.ydotool_socket &`. (The plain default invocation with no `--socket-path` did NOT create a socket in testing — always pass it explicitly.)
+- Then: `YDOTOOL_SOCKET=/tmp/.ydotool_socket ydotool <command>`.
+
+## What was verified, with real evidence (not just exit codes)
+
+Target: `poc/neovide_embed_live` (real `nvim --embed` in a `GtkGLArea`), screenshotted via `poc/tools/screenshot.py` before/after each step and actually Read/inspected.
+
+1. **Keyboard, minimal**: `ydotool key 23:1 23:0` (KEY_I down/up) against nvim's LazyVim-style dashboard, which was sitting at "Press ENTER or type command to continue". The message changed to **"E21: Cannot make changes, 'modifiable' is off"** — nvim's real response to an edit attempt on a read-only buffer. This is a distinct, causally-connected state change that can only happen if the keystroke genuinely reached nvim and was interpreted as a real edit command.
+2. **Keyboard, full text entry**: `ydotool type "hello from ydotool synthetic input"` after `:enew<CR>` + `i` into a fresh editable buffer. Screenshot shows the buffer's line 1 reading exactly `hello from ydotool synthetic input`, cursor at the end. Character-perfect, no drops, no reordering.
+3. **Mouse**: `ydotool mousemove -a -x 900 -y 300` then `ydotool click 0x00` (left click) while that text line was on screen, then typed a marker (`MOUSECLICK`) via keyboard. Result: `hello from ydotool synthetic inpuMOUSECLICKt` — the marker landed mid-word, proving the click was delivered to the window AND mapped to a specific, sensible character position (not a no-op, not landing somewhere random/off-window).
+
+No orphaned `nvim --embed` processes after killing the test binary (`pgrep -af "nvim --embed"` afterward showed only the two pre-existing, unrelated long-running user nvim sessions).
+
+## What this does NOT yet establish (be honest about the gap)
+
+- **Absolute-position calibration was not rigorously characterized.** The click landed in a sensible place, but the exact mapping from `ydotool mousemove -a -x/-y` values to real screen/window pixel coordinates (accounting for `scale_factor=2` HiDPI, the actual output resolution vs. whatever range `ydotool`'s virtual device advertises) needs a proper calibration pass before P3 can do precise click-target testing (e.g. "click exactly on character N of line M"). This is a small follow-up spike, not a new wall.
+- **IME composition was not tested at all this session** — ydotool's `type`/`key` deal in raw keysyms/Unicode codepoints, not IME candidate-window interaction. Whether pinyin composition (P4's actual concern) can be driven this way, or whether it needs a different mechanism (e.g. driving fcitx5/ibus directly via their own D-Bus interfaces, analogous to how gnome-shell's Screenshot vs. portal Screenshot are two different paths to a similar-looking capability) is unknown and should be the next thing checked before assuming P4 is unblocked too.
+- **`org.freedesktop.portal.RemoteDesktop` was introspected but not exercised** — its `CreateSession`/`SelectDevices`/`Start`/`Notify*` methods are real and present, but `ydotool` already worked and is architecturally simpler (no session/handshake state, no portal-consent-dialog risk to figure out), so it wasn't necessary to pursue further this session. Worth knowing it's there as a fallback if `ydotool` ever turns out to have a gap RemoteDesktop's higher-level (IME-aware?) API doesn't.
+- `wtype` is not installed and Mutter's `virtual-keyboard-unstable-v1` support wasn't checked — moot since `ydotool` already works and additionally covers mouse (wtype is keyboard-only).
+
+## Implication for P3/P4
+
+This reopens P3 (input depth: keyboard chords, mouse click/drag/wheel/selection, focus routing) to **agent-driven automation** using `ydotool` + `poc/tools/screenshot.py` for verification, the same way the screenshot fix reopened the visual half of P0/P1/P8/P9. P4 (IME) is NOT yet confirmed reopened — the composition-specific question above needs its own follow-up spike before assuming it's unblocked.
+
+Recommended immediate next step for whoever picks up P3: calibrate absolute mouse coordinates properly, then build a small `poc/`-style harness that drives `poc/shell_composed`'s real editor pane through the actual P3 checklist items in `poc/neovide_embed_live/MANUAL_VERIFICATION.md` / `poc/shell_composed/MANUAL_VERIFICATION.md`, screenshotting before/after each, exactly like this session's proof-of-concept did.
