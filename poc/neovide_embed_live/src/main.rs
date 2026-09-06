@@ -1,13 +1,21 @@
-//! GTK4 probe embedding `LiveHarness` in a focusable `GtkGLArea` backed by a Skia surface.
-//! `LiveHarness` connects to a real `nvim --embed` child. `GtkEventControllerKey` forwards
-//! printable characters and Escape, Return, BackSpace, and Tab through `send_text_input`.
-//! Ctrl, Alt, and Super combinations are ignored to avoid sending bare characters for shortcuts.
-//! `LiveHarness::with_options` blocks while launching nvim and establishing the RPC session.
-//! A starting placeholder is painted and presented before construction on the next callback,
-//! so the user sees an explanation while the GTK main loop is blocked. The per-frame pump
-//! inside `render_frame` uses `Duration::ZERO` and does not need that mitigation.
-//! The close-request handler calls `LiveHarness::shutdown()` and logs the result to clean up
-//! the embedded child when the window closes.
+//! Embeds a live `nvim --embed` connection in a GTK4 window using `GtkGLArea` and Skia.
+//! `LiveHarness` renders into the wrapped framebuffer, with a resizable content viewport
+//! and frame-pacing logs.
+//!
+//! `GtkEventControllerKey` forwards printable characters and Escape/Return/BackSpace/Tab
+//! to `LiveHarness::send_text_input`. The GLArea is focusable and grabs focus on startup.
+//! Ctrl/Alt/Super combinations are ignored instead of sending a bare character such as c for Ctrl+C;
+//! this input path does not provide full key and modifier translation.
+//!
+//! `LiveHarness::with_options` calls `NeovimRuntime::launch` synchronously, spawning nvim and
+//! waiting for its msgpack-rpc connection. Present a "starting nvim..." frame first and construct
+//! the harness on the next callback so the user sees that message before the blocking startup.
+//! The per-frame pump uses `NON_BLOCKING = Duration::ZERO`.
+//!
+//! Window close calls `LiveHarness::shutdown()` and logs the result to clean up the child process.
+//! The tick callback also calls window.close() when `LiveHarness::has_neovim_exited()` is true,
+//! including when nvim exits itself through :qa!. Otherwise the last frame would remain visible
+//! with no process to receive input.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -239,6 +247,11 @@ struct LiveSession {
     /// Initialized at construction and checked on every `connect_resize` callback so a resize RPC
     /// is sent only when the cell dimensions change, avoiding redundant calls during pixel-level drags.
     last_grid_size: Cell<GridSize<u32>>,
+    /// Set when the tick callback requests `window.close()` after nvim exits on its own.
+    /// `has_neovim_exited()` stays true, so this guard prevents repeated close requests, logs,
+    /// and shutdown calls while the window is tearing down. `Cell::replace` checks and sets
+    /// the flag in one operation on the GTK main loop.
+    close_requested: Cell<bool>,
 }
 
 impl LiveSession {
@@ -254,6 +267,7 @@ impl LiveSession {
             last_seen_batches: Cell::new(0),
             wants_frame: Cell::new(false),
             last_grid_size: Cell::new(grid_size),
+            close_requested: Cell::new(false),
         }
     }
 
@@ -686,9 +700,19 @@ fn build_ui(app: &Application, want_clean: bool) {
     {
         let live_state = live_state.clone();
         let gl_area_for_tick = gl_area.clone();
+        // Needed for the nvim-exited-on-its-own fix just below: `window.close()` re-enters
+        // `connect_close_request` (see that handler further down), which itself needs
+        // `live_state.borrow_mut()` -- so this closure must never call it while still holding
+        // `live` borrowed, or GTK's synchronous close-request dispatch would hit a `RefCell`
+        // `BorrowMutError` panic against our own still-live borrow. See `should_close_window`
+        // below for how that's kept safe.
+        let window_for_tick = window.clone();
         let tick_stats = Rc::new(TickStats::new());
         gl_area.add_tick_callback(move |_widget, _clock| {
             let mut live = live_state.borrow_mut();
+            // Set from inside the `Ready` arm below, then acted on only *after* `live` is
+            // dropped -- see the comment on `window_for_tick` above for why the ordering matters.
+            let mut should_close_window = false;
             let issued = match &mut *live {
                 LiveState::Ready(session) => {
                     // Cheap, non-blocking drain of any nvim redraw traffic that arrived since the
@@ -710,6 +734,15 @@ fn build_ui(app: &Application, want_clean: bool) {
                     // signals above.
                     let wants_frame = session.wants_frame.replace(false);
 
+                    // `pump()` observes asynchronous `UserEvent::NeovimExited` messages. Check for exit every
+                    // tick so quitting nvim directly closes the window instead of leaving its last frame visible.
+                    // `close_requested.replace(true)` permits only the first close request, avoiding repeated
+                    // shutdown calls while the window is closing.
+                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true)
+                    {
+                        should_close_window = true;
+                    }
+
                     session.last_animating.get() || new_content || wants_frame
                 }
                 // NotStarted/Starting: the placeholder-frame dance and the one blocking
@@ -723,6 +756,16 @@ fn build_ui(app: &Application, want_clean: bool) {
                 LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
             };
             drop(live);
+
+            if should_close_window {
+                println!(
+                    "[live] nvim exited on its own (not via a user-initiated window close) -- \
+                     calling window.close() so the normal connect_close_request -> \
+                     LiveHarness::shutdown() path still runs, instead of leaving a dead frame on \
+                     screen forever"
+                );
+                window_for_tick.close();
+            }
 
             if issued {
                 gl_area_for_tick.queue_render();
