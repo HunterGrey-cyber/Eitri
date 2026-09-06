@@ -78,6 +78,13 @@ fn log_every_n_frames() -> u64 {
         .unwrap_or(LOG_EVERY_N_FRAMES)
 }
 
+/// How many `add_tick_callback` invocations between `[tick]` summary log lines (see `TickStats`).
+/// The tick callback fires once per display frame (~144-165Hz on the dev machine this was
+/// measured on per `poc/p11_measurements/PHASE_REPORT.md`), so 300 ticks is roughly a 2s window --
+/// frequent enough to see idle-vs-active behavior change within a couple of seconds in the log,
+/// without spamming stdout at display refresh rate.
+const TICK_LOG_EVERY_N_TICKS: u64 = 300;
+
 /// Inset (device pixels) between the GtkGLArea's own framebuffer edge and the rect handed to
 /// `LiveHarness::render_frame` as `content_region`. Same value/rationale as
 /// `neovide_embed_live::CONTENT_MARGIN`.
@@ -459,12 +466,41 @@ struct LiveSession {
     last_frame: Instant,
     frame_count: u64,
     logged_ready: bool,
+    /// `render_frame`'s own returned `animating` value, set after every render callback
+    /// invocation below. This is the P11-report-identified signal the tick callback was
+    /// previously ignoring -- see `poc/p11_measurements/PHASE_REPORT.md`'s "headline finding".
+    /// Starts `true` so the tick callback keeps rendering continuously through the first few
+    /// Ready-state frames, until a real `render_frame` call has actually reported a real value --
+    /// erring toward "render" rather than "skip" whenever this value hasn't been established yet.
+    last_animating: Cell<bool>,
+    /// `harness.redraw_batches_seen()` as of the last time either the render callback or the tick
+    /// callback looked at it. The tick callback calls `LiveHarness::pump` every tick specifically
+    /// so a change here is visible at full display-refresh-rate latency even on ticks that don't
+    /// render -- this is the "did nvim actually send anything new" half of the fix, independent of
+    /// `last_animating`.
+    last_seen_batches: Cell<u64>,
+    /// Set by the resize handler and the keyboard input handler: both are real external events
+    /// that deserve a guaranteed next frame regardless of what `last_animating`/
+    /// `last_seen_batches` currently say (a resize needs its own frame at the new size even if
+    /// nvim sent nothing new; a keypress deserves a same-tick-latency render rather than waiting
+    /// on nvim's async redraw round-trip to eventually move `last_seen_batches`). Read-and-cleared
+    /// by the tick callback every tick.
+    wants_frame: Cell<bool>,
 }
 
 impl LiveSession {
     fn new(harness: LiveHarness) -> Self {
         let now = Instant::now();
-        Self { harness, start: now, last_frame: now, frame_count: 0, logged_ready: false }
+        Self {
+            harness,
+            start: now,
+            last_frame: now,
+            frame_count: 0,
+            logged_ready: false,
+            last_animating: Cell::new(true),
+            last_seen_batches: Cell::new(0),
+            wants_frame: Cell::new(false),
+        }
     }
 
     /// Advance real elapsed time and return (dt, instantaneous_fps), matching
@@ -476,6 +512,61 @@ impl LiveSession {
         self.frame_count += 1;
         let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
         (dt, fps)
+    }
+}
+
+/// Counts, over rolling windows of `TICK_LOG_EVERY_N_TICKS` tick-callback invocations, how many
+/// ticks actually issued a `queue_render()` vs. how many skipped it because nothing needed another
+/// frame -- this is the fix's own before/after evidence: an idle window should show `skipped`
+/// dominating, while a typing/scrolling/animating/resize-sweep window should show `issued`
+/// dominating. See `poc/p11_measurements/PHASE_REPORT.md` for the bug this directly addresses.
+struct TickStats {
+    ticks: Cell<u64>,
+    issued: Cell<u64>,
+    skipped: Cell<u64>,
+    issued_total: Cell<u64>,
+    skipped_total: Cell<u64>,
+}
+
+impl TickStats {
+    fn new() -> Self {
+        Self {
+            ticks: Cell::new(0),
+            issued: Cell::new(0),
+            skipped: Cell::new(0),
+            issued_total: Cell::new(0),
+            skipped_total: Cell::new(0),
+        }
+    }
+
+    /// Record one tick's outcome; every `TICK_LOG_EVERY_N_TICKS` ticks, print a `[tick]` summary
+    /// of the just-finished window and reset the windowed counters (the `_total` counters keep
+    /// accumulating for the life of the process).
+    fn record(&self, issued_this_tick: bool) {
+        self.ticks.set(self.ticks.get() + 1);
+        if issued_this_tick {
+            self.issued.set(self.issued.get() + 1);
+            self.issued_total.set(self.issued_total.get() + 1);
+        } else {
+            self.skipped.set(self.skipped.get() + 1);
+            self.skipped_total.set(self.skipped_total.get() + 1);
+        }
+
+        if self.ticks.get() >= TICK_LOG_EVERY_N_TICKS {
+            let ticks = self.ticks.get();
+            let issued = self.issued.get();
+            let skipped = self.skipped.get();
+            println!(
+                "[tick] last {ticks} ticks: issued={issued} skipped={skipped} \
+                 skip_ratio={:.1}% (cumulative issued={} skipped={})",
+                (skipped as f64 / ticks as f64) * 100.0,
+                self.issued_total.get(),
+                self.skipped_total.get(),
+            );
+            self.ticks.set(0);
+            self.issued.set(0);
+            self.skipped.set(0);
+        }
     }
 }
 
@@ -693,15 +784,20 @@ fn build_editor_pane(
 
             let content_region = compute_content_region(width, height);
             let live = live_state.borrow();
-            let (since_last_frame, frame_count) = match &*live {
+            // A resize is a real event that deserves a guaranteed next frame at the new size --
+            // flag it for the tick callback regardless of whether nvim itself has anything new to
+            // say (see `LiveSession::wants_frame`'s own doc).
+            let (since_last_frame, frame_count, forced_next_frame) = match &*live {
                 LiveState::Ready(session) => {
-                    (Some(session.last_frame.elapsed()), Some(session.frame_count))
+                    session.wants_frame.set(true);
+                    (Some(session.last_frame.elapsed()), Some(session.frame_count), true)
                 }
-                _ => (None, None),
+                _ => (None, None, false),
             };
             println!(
                 "[resize #{event_no}] fb={}x{}px scale_factor={} logical={}x{} \
-                 content_region={}x{}@({},{}) live_state={} since_last_frame={} frame_count={}",
+                 content_region={}x{}@({},{}) live_state={} since_last_frame={} frame_count={} \
+                 forced_next_frame={forced_next_frame}",
                 width,
                 height,
                 widget.scale_factor(),
@@ -776,6 +872,9 @@ fn build_editor_pane(
             if let LiveState::Ready(session) = &mut *live {
                 if !session.harness.has_neovim_exited() {
                     session.harness.send_text_input(text);
+                    // A keypress deserves a same-tick-latency render rather than waiting on
+                    // nvim's async redraw round-trip to eventually move `last_seen_batches`.
+                    session.wants_frame.set(true);
                 }
             }
             glib::Propagation::Stop
@@ -870,6 +969,10 @@ fn build_editor_pane(
                     let (dt, fps) = session.tick();
                     let animating =
                         session.harness.render_frame(canvas, Some(&content_region), dt);
+                    // Share this frame's "do we still need more frames" signals with the tick
+                    // callback -- the fix this crate exists to validate (see PHASE_REPORT.md).
+                    session.last_animating.set(animating);
+                    session.last_seen_batches.set(session.harness.redraw_batches_seen());
 
                     if !session.logged_ready && session.harness.is_ready() {
                         session.logged_ready = true;
@@ -934,12 +1037,59 @@ fn build_editor_pane(
         });
     }
 
-    // --- drive a continuous redraw off the display's frame clock, identical to
-    // neovide_embed_live/neovide_embed/gl_skia_test's own pattern.
+    // --- drive redraws off the display's frame clock, same tick-callback plumbing as
+    // neovide_embed_live/neovide_embed/gl_skia_test -- but, per the P11 fix, only actually calls
+    // `queue_render()` when something genuinely needs another frame. Previously this
+    // unconditionally requested a render on every single tick (~144-165Hz on the P11 dev machine)
+    // forever, which is the entire root cause of that phase's idle CPU/GPU finding (see
+    // `poc/p11_measurements/PHASE_REPORT.md`) -- `nvim` itself was already idling at 0.0% CPU;
+    // only this host-shell tick loop was hot.
     {
+        let live_state = live_state.clone();
         let gl_area_for_tick = gl_area.clone();
+        let tick_stats = Rc::new(TickStats::new());
         gl_area.add_tick_callback(move |_widget, _clock| {
-            gl_area_for_tick.queue_render();
+            let mut live = live_state.borrow_mut();
+            let issued = match &mut *live {
+                LiveState::Ready(session) => {
+                    // Cheap, non-blocking drain of any nvim redraw traffic that arrived since the
+                    // last tick. This does not touch the GL context or the Skia surface (that's
+                    // `render_frame`'s job, called only from the render callback) -- it's safe,
+                    // and per `LiveHarness::pump`'s own doc harmless, to call every display-frame
+                    // tick regardless of whether this tick ends up rendering. Without this, a
+                    // redraw batch nvim sent while we were otherwise idle would sit unapplied
+                    // until something else happened to trigger a render.
+                    session.harness.pump(Duration::ZERO);
+                    let batches_now = session.harness.redraw_batches_seen();
+                    let new_content = batches_now != session.last_seen_batches.get();
+                    if new_content {
+                        session.last_seen_batches.set(batches_now);
+                    }
+
+                    // Read-and-clear: a resize or a keypress since the last tick each force
+                    // exactly one more frame, on top of the ongoing-animation and new-content
+                    // signals above.
+                    let wants_frame = session.wants_frame.replace(false);
+
+                    session.last_animating.get() || new_content || wants_frame
+                }
+                // NotStarted/Starting: the placeholder-frame dance and the one blocking
+                // `LiveHarness::with_options` call both happen *inside* the render callback and
+                // only run when a render is actually requested -- keep rendering continuously
+                // here so that state machine can advance (see `LiveState`'s own doc). Failed: a
+                // rare terminal state; keep rendering rather than risk the one remaining
+                // Starting->Failed state-transition frame never actually getting painted (that
+                // transition sets the enum variant but doesn't itself paint FAILED_COLOR -- the
+                // *next* render call does, in the `Failed` match arm).
+                LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
+            };
+            drop(live);
+
+            if issued {
+                gl_area_for_tick.queue_render();
+            }
+            tick_stats.record(issued);
+
             glib::ControlFlow::Continue
         });
     }
