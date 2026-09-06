@@ -57,17 +57,20 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gtk4::gdk::{Key, ModifierType};
+use gtk4::gdk::{Key, ModifierType, ScrollUnit};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, EventControllerKey, GLArea, IMMulticontext};
+use gtk4::{
+    Application, ApplicationWindow, EventControllerKey, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext,
+};
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, direct_contexts, surfaces, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Paint, PaintStyle, Rect, Surface};
 
 use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
-use neovide::units::{GridSize, PixelRect, PixelSize};
+use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
 
 const APP_ID: &str = "cn.huntergrey.neovibe.neovide_embed_live";
 
@@ -233,6 +236,98 @@ fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRec
     GridSize::new(grid_size.width.floor().max(1.0) as u32, grid_size.height.floor().max(1.0) as u32)
 }
 
+/// nvim's own button-text notation for a GDK button number, mirroring the reference
+/// `neovide::window::mouse_manager::mouse_button_to_button_text`'s winit-`MouseButton`-keyed
+/// equivalent. GDK numbers buttons in the X11 convention: 1=left/primary, 2=middle, 3=right/
+/// secondary, 8=back, 9=forward. Anything else (e.g. an extra side button some mice report
+/// differently) is not forwarded -- same "silently drop, don't guess" stance the reference takes
+/// for a `MouseButton` variant its own match doesn't cover.
+fn gdk_button_to_button_text(button: u32) -> Option<&'static str> {
+    match button {
+        1 => Some("left"),
+        2 => Some("middle"),
+        3 => Some("right"),
+        8 => Some("x1"),
+        9 => Some("x2"),
+        _ => None,
+    }
+}
+
+/// nvim's own modifier-prefix notation (`"S-"`/`"C-"`/`"M-"`/`"D-"`, concatenated in that order)
+/// for a GDK modifier snapshot -- mirrors
+/// `neovide::window::keyboard_manager::KeyboardManager::format_modifier_string` called with
+/// `is_special = true` the way every mouse RPC in the reference `MouseManager` calls it (mouse
+/// events, like special keys, always include Shift when held rather than only when combined with
+/// Ctrl+ASCII -- see that method's own doc for why). Unlike the reference, which reads a
+/// `winit::keyboard::ModifiersState` this crate never accumulates (see the keyboard controller's
+/// own module-doc caveat on modifier fidelity), this reads GTK's own live `ModifierType` for
+/// whichever event is currently being handled
+/// (`EventControllerExt::current_event_state`) -- sufficient for a mouse command, which is always
+/// built and sent synchronously from inside the one GTK signal callback that observed it.
+fn format_modifier_string(state: ModifierType) -> String {
+    let mut modifiers = String::new();
+    if state.contains(ModifierType::SHIFT_MASK) {
+        modifiers.push_str("S-");
+    }
+    if state.contains(ModifierType::CONTROL_MASK) {
+        modifiers.push_str("C-");
+    }
+    if state.contains(ModifierType::ALT_MASK) {
+        modifiers.push_str("M-");
+    }
+    if state.contains(ModifierType::SUPER_MASK) {
+        modifiers.push_str("D-");
+    }
+    modifiers
+}
+
+/// Converts a widget-local *logical*-pixel position -- exactly what GTK4's `GestureClick`/
+/// `EventControllerMotion`/`EventControllerScroll` all report their `x`/`y` in -- into the (col,
+/// row) grid cell it lands on, reusing the exact content_region/grid-scale relationship
+/// `grid_size_for_content_region` already uses for the P2 resize fix rather than reimplementing
+/// it: `logical * scale_factor` first converts into the same device-pixel space `content_region`
+/// itself is expressed in (mirroring every other device-pixel user in this file, e.g. the initial
+/// `SkiaState` construction's own `widget.width() * widget.scale_factor()`), then
+/// `(pixel - content_region.min) / grid_scale`, floored and clamped to `[0, grid_size - 1]` --
+/// precisely `MouseManager::get_relative_position_at`'s own formula (see this crate's own task
+/// background for that reference). Callers pass `harness.grid_scale()`/`harness.get_grid_size()`
+/// straight through (rather than this function taking `&LiveHarness` itself) so the coordinate
+/// math stays a pure function of plain values -- independently unit-testable below, and clearly
+/// separated from *which* harness state a caller chooses to clamp against. Every call site in
+/// this crate clamps against `get_grid_size()` (the grid size nvim's own redraw traffic last
+/// actually confirmed), not merely the size last *requested* via `resize_grid`, matching how the
+/// reference clamps against a window's own reported `grid_size` rather than a pending resize
+/// target.
+fn pixel_to_grid_pos(
+    logical_x: f64,
+    logical_y: f64,
+    scale_factor: i32,
+    content_region: &PixelRect<f32>,
+    grid_scale: GridScale,
+    grid_size: GridSize<u32>,
+) -> (u32, u32) {
+    let scale_factor = scale_factor as f32;
+    let pixel_x = logical_x as f32 * scale_factor - content_region.min.x;
+    let pixel_y = logical_y as f32 * scale_factor - content_region.min.y;
+
+    let grid_x = (pixel_x / grid_scale.width()).floor().max(0.0) as u32;
+    let grid_y = (pixel_y / grid_scale.height()).floor().max(0.0) as u32;
+
+    (grid_x.min(grid_size.width.max(1) - 1), grid_y.min(grid_size.height.max(1) - 1))
+}
+
+/// `content_region` computed from `gl_area`'s own *current* framebuffer size -- the same
+/// `widget.width() * widget.scale_factor()` / `widget.height() * widget.scale_factor()`
+/// device-pixel conversion the render callback's initial `SkiaState` construction and the resize
+/// handler both already use, so a mouse handler reading it between two paints still sees the same
+/// rect the next frame will actually draw into (as opposed to reaching into `SkiaState`'s own
+/// cached `fb_width`/`fb_height`, which is only ever updated from inside `connect_resize`/
+/// `connect_render` and would otherwise need its own borrow here for no benefit).
+fn current_content_region(gl_area: &GLArea) -> PixelRect<f32> {
+    let scale_factor = gl_area.scale_factor();
+    compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor)
+}
+
 fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f32>, color: Color4f) {
     let mut paint = Paint::default();
     paint.set_color4f(color, None);
@@ -258,6 +353,19 @@ enum LiveState {
     Starting,
     Ready(Box<LiveSession>),
     Failed(String),
+}
+
+/// Mouse button + last grid cell an ongoing drag was last sent at -- tracked by `LiveSession::
+/// active_drag` while a button is held, mirroring `MouseManager::drag_details`. Its presence is
+/// what tells the `EventControllerMotion` handler below whether a `Drag` RPC should be sent at
+/// all (only while some button is down); its `last_grid_pos` is what lets that handler dedupe on
+/// the grid cell actually changing, the same `has_moved` check
+/// `MouseManager::handle_pointer_motion` does internally -- see `LiveHarness::send_mouse_drag`'s
+/// own doc for why that dedup has to live in the caller here rather than the harness.
+#[derive(Clone, Copy)]
+struct DragState {
+    button: &'static str,
+    last_grid_pos: (u32, u32),
 }
 
 struct LiveSession {
@@ -305,6 +413,22 @@ struct LiveSession {
     /// via `Cell::replace` so the check-and-flag is a single atomic step from this single-threaded
     /// GTK main-loop caller's point of view.
     close_requested: Cell<bool>,
+    /// Set on a `GestureClick` press, cleared on its matching release -- see `DragState`'s own
+    /// doc for what this tracks and why.
+    active_drag: Cell<Option<DragState>>,
+    /// Running fractional (x, y) grid-line scroll accumulator, mirroring `MouseManager::
+    /// scroll_position` exactly: only the *change* in `floor()` between one scroll event and the
+    /// next determines how many whole-grid-line `Scroll` RPCs to send (see the
+    /// `EventControllerScroll` handler below), so this is never reset back to zero -- only ever
+    /// added to, for the life of the session.
+    scroll_position: Cell<(f32, f32)>,
+    /// Widget-local logical-pixel pointer position last reported by `EventControllerMotion`'s
+    /// `motion`/`enter` signals, mirroring `MouseManager::window_position`. `GtkEventControllerScroll`'s
+    /// own `scroll` signal (like winit's `WindowEvent::MouseWheel`) carries no position at all, so
+    /// a scroll event's target grid cell has to come from here -- the last place the pointer was
+    /// actually seen -- exactly like the reference's own `get_window_details_under_mouse` reads
+    /// `self.window_position` rather than anything carried by the wheel event itself.
+    last_pointer_pos: Cell<(f64, f64)>,
 }
 
 impl LiveSession {
@@ -321,6 +445,9 @@ impl LiveSession {
             wants_frame: Cell::new(false),
             last_grid_size: Cell::new(grid_size),
             close_requested: Cell::new(false),
+            active_drag: Cell::new(None),
+            scroll_position: Cell::new((0.0, 0.0)),
+            last_pointer_pos: Cell::new((0.0, 0.0)),
         }
     }
 
@@ -389,6 +516,236 @@ impl TickStats {
             self.skipped.set(0);
         }
     }
+}
+
+/// Shared body for `GestureClick`'s `pressed`/`released` handlers -- see the controller wiring in
+/// `build_ui` for how each is attached. `pressed` selects which one this call is for.
+///
+/// On press: forwards a `MouseButton{action: "press"}` via `LiveHarness::send_mouse_button`, then
+/// arms `session.active_drag` so the motion handler below starts sending `Drag` RPCs while this
+/// button stays held (mirroring `MouseManager::send_nvim_mouse_button`'s own `self.drag_details =
+/// Some(..)` on press). On release: forwards `MouseButton{action: "release"}` at whichever grid
+/// cell the drag was last actually at (`active_drag`'s own `last_grid_pos`, if a drag happened) --
+/// matching the reference's own `if !down && self.has_moved { self.grid_position } else {
+/// self.get_relative_position(..) }` choice of position for a release after a drag -- then
+/// disarms `active_drag` regardless.
+///
+/// `gesture.current_button()` (not a `button` signal argument -- neither `pressed` nor `released`
+/// carries one) is nvim's own button-text notation source; a button this crate doesn't recognize
+/// (`gdk_button_to_button_text` returning `None`) is silently ignored, same as the reference.
+/// `x`/`y` are whatever the firing signal itself handed the caller (both `pressed` and `released`
+/// report the pointer position at that instant).
+fn handle_mouse_button(
+    live_state: &Rc<RefCell<LiveState>>,
+    gl_area: &GLArea,
+    gesture: &GestureClick,
+    x: f64,
+    y: f64,
+    pressed: bool,
+) {
+    let Some(button) = gdk_button_to_button_text(gesture.current_button()) else {
+        return;
+    };
+    let modifier_string = format_modifier_string(gesture.current_event_state());
+
+    let mut live = live_state.borrow_mut();
+    let LiveState::Ready(session) = &mut *live else {
+        return;
+    };
+    if session.harness.has_neovim_exited() {
+        return;
+    }
+
+    let content_region = current_content_region(gl_area);
+    let position_from_event = pixel_to_grid_pos(
+        x,
+        y,
+        gl_area.scale_factor(),
+        &content_region,
+        session.harness.grid_scale(),
+        session.harness.get_grid_size(),
+    );
+    let grid_pos = if !pressed {
+        // A release after a drag: send it at the drag's own last-known cell, not wherever the
+        // pointer happens to sit right now relative to a freshly recomputed content_region --
+        // mirrors the reference's `self.has_moved -> self.grid_position` branch exactly.
+        match session.active_drag.get() {
+            Some(drag) if drag.button == button => drag.last_grid_pos,
+            _ => position_from_event,
+        }
+    } else {
+        position_from_event
+    };
+
+    session.harness.send_mouse_button(button, pressed, grid_pos, &modifier_string);
+    session.active_drag.set(if pressed { Some(DragState { button, last_grid_pos: grid_pos }) } else { None });
+    session.wants_frame.set(true);
+}
+
+/// `EventControllerMotion`'s `motion` handler -- sends a `Drag` RPC via
+/// `LiveHarness::send_mouse_drag` only while `session.active_drag` is armed (some button held,
+/// set by `handle_mouse_button` above) and only when the computed grid cell actually differs from
+/// `active_drag`'s own `last_grid_pos`, mirroring `MouseManager::handle_pointer_motion`'s combined
+/// `drag_details.is_some()` + `has_moved` gate. A plain hover-move with no button held is not
+/// forwarded at all -- the reference only does that when `WindowSettings::mouse_move_event` is
+/// explicitly enabled (default off), which this crate has no equivalent setting for.
+fn handle_mouse_motion(
+    live_state: &Rc<RefCell<LiveState>>,
+    gl_area: &GLArea,
+    controller: &EventControllerMotion,
+    x: f64,
+    y: f64,
+) {
+    let mut live = live_state.borrow_mut();
+    let LiveState::Ready(session) = &mut *live else {
+        return;
+    };
+    // Recorded on every motion/enter regardless of drag state -- this is the only source of
+    // pointer position a subsequent scroll event (which carries none of its own) has. See
+    // `LiveSession::last_pointer_pos`'s own doc.
+    session.last_pointer_pos.set((x, y));
+
+    let Some(drag) = session.active_drag.get() else {
+        return;
+    };
+    if session.harness.has_neovim_exited() {
+        return;
+    }
+
+    let content_region = current_content_region(gl_area);
+    let grid_pos = pixel_to_grid_pos(
+        x,
+        y,
+        gl_area.scale_factor(),
+        &content_region,
+        session.harness.grid_scale(),
+        session.harness.get_grid_size(),
+    );
+    if grid_pos == drag.last_grid_pos {
+        return;
+    }
+
+    let modifier_string = format_modifier_string(controller.current_event_state());
+    session.harness.send_mouse_drag(drag.button, grid_pos, &modifier_string);
+    session.active_drag.set(Some(DragState { button: drag.button, last_grid_pos: grid_pos }));
+    session.wants_frame.set(true);
+}
+
+/// `EventControllerScroll`'s `scroll` handler -- mirrors `MouseManager::handle_line_scroll`/
+/// `handle_pixel_scroll` combined: `controller.unit()` (`gdk::ScrollUnit`, always available here
+/// since this crate is built with gtk4's `"v4_18"` feature, which pulls in the `"v4_8"` this
+/// getter needs) tells us whether `dx`/`dy` are already in wheel-notch units (`Wheel` -- the same
+/// semantic as winit's `MouseScrollDelta::LineDelta`, no conversion needed) or raw device pixels
+/// (`Surface` -- winit's `PixelDelta` equivalent, divided by `grid_scale` first, exactly like
+/// `handle_pixel_scroll` does). Either way the result is accumulated into
+/// `session.scroll_position` and only the *change* in `floor()` since the last event decides how
+/// many whole-line `Scroll` RPCs to send, in a loop, exactly like the reference.
+///
+/// GDK's own sign convention for `dy`/`dx` (matching `GtkScrolledWindow`'s adjustment-value
+/// convention: a positive delta increases the adjustment, scrolling the view down/right) is
+/// mapped to nvim's `"down"`/`"right"` here. **Verified end-to-end in the sandbox (2026-09-06)**:
+/// a real `zwlr_virtual_pointer_v1.axis(..., VerticalScroll, +value)` + `axis_source(Wheel)` +
+/// `frame()` sequence (see `poc/tools/wlr_vptr_drag/src/scroll.rs`, added this pass) reliably
+/// scrolled the real viewport further into the buffer (revealing later lines) and a matching
+/// negative value scrolled back to the original position -- both directions round-tripped
+/// correctly, confirming this mapping is at least internally consistent and produces the intended
+/// effect. **Still open**: whether a real physical wheel notch rotated in a specific physical
+/// direction reports positive or negative to GDK on the *real* desktop (as opposed to a value this
+/// phase's own test tool chose) is unverified -- if a human's first real scroll comes out
+/// inverted, the fix is a one-line swap of the `Greater`/`Less` arms below, not a coordinate-math
+/// bug. See this crate's own `MANUAL_VERIFICATION.md` for the full verification writeup, including
+/// a real, distinct finding: `wlrctl pointer scroll` (unlike this pass's own `wlr-vptr-scroll`)
+/// sends a bare `axis`+`frame` with no `axis_source` at all, which this sandbox's GDK/Wayland
+/// backend silently drops entirely (`handle_mouse_scroll` never even gets called) -- a real,
+/// specific `wlrctl` tooling gap, not a bug in this handler.
+fn handle_mouse_scroll(
+    live_state: &Rc<RefCell<LiveState>>,
+    gl_area: &GLArea,
+    controller: &EventControllerScroll,
+    dx: f64,
+    dy: f64,
+) -> glib::Propagation {
+    let mut live = live_state.borrow_mut();
+    let LiveState::Ready(session) = &mut *live else {
+        return glib::Propagation::Proceed;
+    };
+    if session.harness.has_neovim_exited() {
+        return glib::Propagation::Proceed;
+    }
+
+    // NOTE (found during P3 verification, 2026-09-06): in the sandbox, a *synthetic* wheel-sourced
+    // scroll delivered via wlr-virtual-pointer (axis_source=Wheel) still arrives here classified as
+    // `ScrollUnit::Surface`, not `Wheel` -- confirmed via temporary instrumentation, not assumed.
+    // That makes a single simulated "notch" (raw value ~10, libinput's own one-click convention)
+    // divide down to under half a grid line, so it takes several notches to produce one real
+    // `Scroll` RPC -- end-to-end scrolling still works (verified: the real viewport moves, in the
+    // correct direction, round-trips cleanly), just requires more simulated notches than a real
+    // wheel might need. This divide-by-`grid_scale` branch is the textbook-correct handling for a
+    // genuine `Surface` (pixel-space, e.g. touchpad) delta per GTK4's own documented contract, and
+    // mirrors the reference `handle_pixel_scroll` exactly -- left as-is rather than "fixed" against
+    // a single sandbox observation, since it's unconfirmed whether a *real* hardware wheel on a
+    // *real* desktop reports `Wheel` correctly here (this may well be specific to how wlroots'
+    // virtual-pointer protocol forwards axis_source, not a real-hardware behavior) -- see
+    // MANUAL_VERIFICATION.md for the full writeup and why this is a "needs a human with a real
+    // wheel" open item, not a bug fixed or left broken by guesswork.
+    let (mut amount_x, mut amount_y) = (dx as f32, dy as f32);
+    if controller.unit() == ScrollUnit::Surface {
+        let grid_scale = session.harness.grid_scale();
+        amount_x /= grid_scale.width();
+        amount_y /= grid_scale.height();
+    }
+
+    let content_region = current_content_region(gl_area);
+    // `EventControllerScroll` (unlike `GestureClick`/`EventControllerMotion`) never reports the
+    // pointer's own x/y at all -- only deltas -- so the grid cell a scroll targets comes from
+    // `last_pointer_pos`, the most recent position `EventControllerMotion` observed. See
+    // `LiveSession::last_pointer_pos`'s own doc for why that mirrors the reference exactly rather
+    // than being a workaround.
+    let (px, py) = session.last_pointer_pos.get();
+    let grid_pos = pixel_to_grid_pos(
+        px,
+        py,
+        gl_area.scale_factor(),
+        &content_region,
+        session.harness.grid_scale(),
+        session.harness.get_grid_size(),
+    );
+
+    let (prev_x, prev_y) = session.scroll_position.get();
+    let (new_x, new_y) = (prev_x + amount_x, prev_y + amount_y);
+    session.scroll_position.set((new_x, new_y));
+
+    let modifier_string = format_modifier_string(controller.current_event_state());
+
+    let (prev_floor_y, new_floor_y) = (prev_y.floor() as i64, new_y.floor() as i64);
+    let vertical_direction = match new_floor_y.cmp(&prev_floor_y) {
+        std::cmp::Ordering::Greater => Some("down"),
+        std::cmp::Ordering::Less => Some("up"),
+        std::cmp::Ordering::Equal => None,
+    };
+    if let Some(direction) = vertical_direction {
+        for _ in 0..(new_floor_y - prev_floor_y).abs() {
+            session.harness.send_mouse_scroll(direction, grid_pos, &modifier_string);
+        }
+    }
+
+    let (prev_floor_x, new_floor_x) = (prev_x.floor() as i64, new_x.floor() as i64);
+    let horizontal_direction = match new_floor_x.cmp(&prev_floor_x) {
+        std::cmp::Ordering::Greater => Some("right"),
+        std::cmp::Ordering::Less => Some("left"),
+        std::cmp::Ordering::Equal => None,
+    };
+    if let Some(direction) = horizontal_direction {
+        for _ in 0..(new_floor_x - prev_floor_x).abs() {
+            session.harness.send_mouse_scroll(direction, grid_pos, &modifier_string);
+        }
+    }
+
+    if vertical_direction.is_some() || horizontal_direction.is_some() {
+        session.wants_frame.set(true);
+    }
+
+    glib::Propagation::Stop
 }
 
 fn main() -> glib::ExitCode {
@@ -579,6 +936,77 @@ fn build_ui(app: &Application, want_clean: bool) {
             glib::Propagation::Stop
         });
         gl_area.add_controller(key_controller);
+    }
+
+    // --- mouse input: three GTK4 controllers on the GLArea for click/drag-selection/scroll-wheel
+    // -- the P3 addition this crate previously had none of at all (see this file's module doc).
+    // All three share the exact content_region/grid-scale coordinate math this crate already uses
+    // for the P2 resize fix (`pixel_to_grid_pos`/`current_content_region` above) rather than
+    // reimplementing it, and all three unconditionally target `LiveHarness`'s single base grid --
+    // see `LiveHarness::send_mouse_button`'s own doc for why (no per-window/split hit-testing
+    // exists in this crate). Modifier handling reads GTK's own live `ModifierType` per event
+    // (`format_modifier_string`) rather than a persistent tracker, the same reduced-fidelity
+    // stance the keyboard controller above already takes and documents.
+    //
+    // GestureClick: click.set_button(0) means "any button" (GestureSingle's own convention) so
+    // one gesture handles left/right/middle/back/forward uniformly; `handle_mouse_button` reads
+    // which one via `gesture.current_button()` since neither `pressed` nor `released` carries a
+    // button argument. Double/triple-click is deliberately not hand-rolled here (or in the
+    // reference) -- see `handle_mouse_button`'s own doc.
+    {
+        let click = GestureClick::new();
+        click.set_button(0);
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            click.connect_pressed(move |gesture, _n_press, x, y| {
+                handle_mouse_button(&live_state, &gl_area, gesture, x, y, true);
+            });
+        }
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            click.connect_released(move |gesture, _n_press, x, y| {
+                handle_mouse_button(&live_state, &gl_area, gesture, x, y, false);
+            });
+        }
+        gl_area.add_controller(click);
+    }
+
+    // EventControllerMotion: tracks `last_pointer_pos` (for the scroll handler, which gets no
+    // position of its own) on every motion/enter, and emits `Drag` RPCs while a button is held
+    // (armed by the GestureClick handler above) -- see `handle_mouse_motion`'s own doc.
+    {
+        let motion = EventControllerMotion::new();
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            motion.connect_motion(move |controller, x, y| {
+                handle_mouse_motion(&live_state, &gl_area, controller, x, y);
+            });
+        }
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            motion.connect_enter(move |controller, x, y| {
+                handle_mouse_motion(&live_state, &gl_area, controller, x, y);
+            });
+        }
+        gl_area.add_controller(motion);
+    }
+
+    // EventControllerScroll: BOTH_AXES with neither DISCRETE nor KINETIC set gets GDK's own
+    // smooth-scroll deltas, tagged with a `gdk::ScrollUnit` (`unit()`, needs the "v4_8" feature
+    // this crate's "v4_18" already pulls in) telling us whether they're wheel-notch units or raw
+    // surface pixels -- see `handle_mouse_scroll`'s own doc for how each is handled.
+    {
+        let scroll = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
+        let live_state = live_state.clone();
+        let gl_area_for_scroll = gl_area.clone();
+        scroll.connect_scroll(move |controller, dx, dy| {
+            handle_mouse_scroll(&live_state, &gl_area_for_scroll, controller, dx, dy)
+        });
+        gl_area.add_controller(scroll);
     }
 
     // --- render: build (lazily) and drive one LiveHarness frame every tick. See the `LiveState`
@@ -899,4 +1327,76 @@ fn build_ui(app: &Application, want_clean: bool) {
         window.scale_factor(),
         want_clean
     );
+}
+
+/// Lightweight sanity checks for this crate's own pure mouse-input helper functions -- deliberately
+/// *not* a substitute for real end-to-end verification (real GTK signals firing from a real click/
+/// drag/scroll on a real Wayland session, ultimately needing either a human or a resolved
+/// synthetic-input story neither of which this phase attempts -- see this crate's own
+/// `MANUAL_VERIFICATION.md`). These just pin down the coordinate math and string-formatting logic
+/// against no GTK/GLib runtime at all, so a future edit can't silently invert a clamp or drop a
+/// modifier bit without a test noticing.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gdk_button_mapping_matches_x11_convention() {
+        assert_eq!(gdk_button_to_button_text(1), Some("left"));
+        assert_eq!(gdk_button_to_button_text(2), Some("middle"));
+        assert_eq!(gdk_button_to_button_text(3), Some("right"));
+        assert_eq!(gdk_button_to_button_text(8), Some("x1"));
+        assert_eq!(gdk_button_to_button_text(9), Some("x2"));
+        // A button code this crate doesn't recognize is silently dropped, not guessed at.
+        assert_eq!(gdk_button_to_button_text(4), None);
+        assert_eq!(gdk_button_to_button_text(0), None);
+    }
+
+    #[test]
+    fn modifier_string_orders_shift_control_alt_super() {
+        assert_eq!(format_modifier_string(ModifierType::empty()), "");
+        assert_eq!(format_modifier_string(ModifierType::CONTROL_MASK), "C-");
+        assert_eq!(
+            format_modifier_string(ModifierType::SHIFT_MASK | ModifierType::CONTROL_MASK),
+            "S-C-"
+        );
+        assert_eq!(
+            format_modifier_string(
+                ModifierType::SHIFT_MASK
+                    | ModifierType::CONTROL_MASK
+                    | ModifierType::ALT_MASK
+                    | ModifierType::SUPER_MASK
+            ),
+            "S-C-M-D-"
+        );
+    }
+
+    #[test]
+    fn pixel_to_grid_pos_accounts_for_content_region_offset_and_scale_factor() {
+        let content_region = PixelRect::from_min_max((40.0, 40.0), (940.0, 640.0));
+        let grid_scale = GridScale::new(PixelSize::new(9.0, 18.0));
+        let grid_size = GridSize::new(100, 33);
+
+        // Right at content_region's own top-left corner -> grid cell (0, 0), not wherever (0, 0)
+        // of the raw framebuffer would map to -- this is the whole point of subtracting
+        // content_region.min before dividing by grid_scale.
+        assert_eq!(pixel_to_grid_pos(40.0, 40.0, 1, &content_region, grid_scale, grid_size), (0, 0));
+
+        // One cell right/down of that (scale_factor=1, so logical == device pixels here).
+        assert_eq!(pixel_to_grid_pos(49.0, 58.0, 1, &content_region, grid_scale, grid_size), (1, 1));
+
+        // scale_factor=2 (HiDPI): logical (20, 20) is device pixel (40, 40) -- same as the first
+        // case above once converted, so still grid cell (0, 0).
+        assert_eq!(pixel_to_grid_pos(20.0, 20.0, 2, &content_region, grid_scale, grid_size), (0, 0));
+
+        // Anything left of/above content_region clamps to 0 rather than underflowing.
+        assert_eq!(pixel_to_grid_pos(0.0, 0.0, 1, &content_region, grid_scale, grid_size), (0, 0));
+
+        // Anything past the grid's own reported size clamps to grid_size - 1, matching
+        // `MouseManager::get_relative_position_at`'s own clamp.
+        assert_eq!(
+            pixel_to_grid_pos(9000.0, 9000.0, 1, &content_region, grid_scale, grid_size),
+            (99, 32)
+        );
+    }
 }

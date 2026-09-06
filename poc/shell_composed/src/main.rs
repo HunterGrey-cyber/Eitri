@@ -39,11 +39,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gtk4::gdk::{Key, ModifierType};
+use gtk4::gdk::{Key, ModifierType, ScrollUnit};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, DrawingArea, EventControllerKey, GLArea, IMMulticontext,
+    Application, ApplicationWindow, DrawingArea, EventControllerKey, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext,
     Overlay, Paned,
 };
 
@@ -52,7 +53,7 @@ use skia_safe::gpu::{backend_render_targets, direct_contexts, surfaces, DirectCo
 use skia_safe::{Canvas, Color4f, Paint, PaintStyle, Rect, Surface};
 
 use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
-use neovide::units::{GridSize, PixelRect, PixelSize};
+use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
 
 use webkit6::prelude::*;
 use webkit6::WebView;
@@ -440,6 +441,70 @@ fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRec
     GridSize::new(grid_size.width.floor().max(1.0) as u32, grid_size.height.floor().max(1.0) as u32)
 }
 
+/// Identical to `neovide_embed_live::gdk_button_to_button_text` -- see that crate's own copy for
+/// the full rationale (GDK's X11-convention button numbering mapped to nvim's button-text
+/// notation, silently dropping anything this crate doesn't recognize rather than guessing).
+fn gdk_button_to_button_text(button: u32) -> Option<&'static str> {
+    match button {
+        1 => Some("left"),
+        2 => Some("middle"),
+        3 => Some("right"),
+        8 => Some("x1"),
+        9 => Some("x2"),
+        _ => None,
+    }
+}
+
+/// Identical to `neovide_embed_live::format_modifier_string` -- see that crate's own copy for the
+/// full rationale (nvim's `"S-C-M-D-"` modifier-prefix notation from a live GDK `ModifierType`
+/// snapshot).
+fn format_modifier_string(state: ModifierType) -> String {
+    let mut modifiers = String::new();
+    if state.contains(ModifierType::SHIFT_MASK) {
+        modifiers.push_str("S-");
+    }
+    if state.contains(ModifierType::CONTROL_MASK) {
+        modifiers.push_str("C-");
+    }
+    if state.contains(ModifierType::ALT_MASK) {
+        modifiers.push_str("M-");
+    }
+    if state.contains(ModifierType::SUPER_MASK) {
+        modifiers.push_str("D-");
+    }
+    modifiers
+}
+
+/// Identical to `neovide_embed_live::pixel_to_grid_pos` -- see that crate's own copy for the full
+/// rationale (widget-local logical pixels -> (col, row) grid cell, via the same
+/// `content_region`/`grid_scale` relationship the P2 resize fix already established, floored and
+/// clamped to `[0, grid_size - 1]`).
+fn pixel_to_grid_pos(
+    logical_x: f64,
+    logical_y: f64,
+    scale_factor: i32,
+    content_region: &PixelRect<f32>,
+    grid_scale: GridScale,
+    grid_size: GridSize<u32>,
+) -> (u32, u32) {
+    let scale_factor = scale_factor as f32;
+    let pixel_x = logical_x as f32 * scale_factor - content_region.min.x;
+    let pixel_y = logical_y as f32 * scale_factor - content_region.min.y;
+
+    let grid_x = (pixel_x / grid_scale.width()).floor().max(0.0) as u32;
+    let grid_y = (pixel_y / grid_scale.height()).floor().max(0.0) as u32;
+
+    (grid_x.min(grid_size.width.max(1) - 1), grid_y.min(grid_size.height.max(1) - 1))
+}
+
+/// Identical to `neovide_embed_live::current_content_region` -- `content_region` computed from
+/// `gl_area`'s own *current* framebuffer size, so a mouse handler reading it between two paints
+/// still sees the same rect the next frame will actually draw into.
+fn current_content_region(gl_area: &GLArea) -> PixelRect<f32> {
+    let scale_factor = gl_area.scale_factor();
+    compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor)
+}
+
 fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f32>, color: Color4f) {
     let mut paint = Paint::default();
     paint.set_color4f(color, None);
@@ -474,6 +539,15 @@ impl LiveState {
             LiveState::Failed(_) => "failed",
         }
     }
+}
+
+/// Identical to `neovide_embed_live::DragState` -- mouse button + last grid cell an ongoing drag
+/// was last sent at, tracked by `LiveSession::active_drag` while a button is held. See that
+/// crate's own copy of this struct for the full rationale.
+#[derive(Clone, Copy)]
+struct DragState {
+    button: &'static str,
+    last_grid_pos: (u32, u32),
 }
 
 struct LiveSession {
@@ -515,6 +589,16 @@ struct LiveSession {
     /// the full rationale (the one-shot guard against re-closing an already-closing window every
     /// tick, since `has_neovim_exited()` is monotonic).
     close_requested: Cell<bool>,
+    /// Identical to `neovide_embed_live::LiveSession::active_drag` -- set on a `GestureClick`
+    /// press, cleared on its matching release. See `DragState`'s own doc for what this tracks.
+    active_drag: Cell<Option<DragState>>,
+    /// Identical to `neovide_embed_live::LiveSession::scroll_position` -- running fractional
+    /// (x, y) grid-line scroll accumulator, never reset, only ever added to.
+    scroll_position: Cell<(f32, f32)>,
+    /// Identical to `neovide_embed_live::LiveSession::last_pointer_pos` -- widget-local
+    /// logical-pixel pointer position last reported by `EventControllerMotion`, the only source
+    /// of position a scroll event (which carries none of its own) has.
+    last_pointer_pos: Cell<(f64, f64)>,
 }
 
 impl LiveSession {
@@ -531,6 +615,9 @@ impl LiveSession {
             wants_frame: Cell::new(false),
             last_grid_size: Cell::new(grid_size),
             close_requested: Cell::new(false),
+            active_drag: Cell::new(None),
+            scroll_position: Cell::new((0.0, 0.0)),
+            last_pointer_pos: Cell::new((0.0, 0.0)),
         }
     }
 
@@ -599,6 +686,175 @@ impl TickStats {
             self.skipped.set(0);
         }
     }
+}
+
+/// Identical to `neovide_embed_live::handle_mouse_button` -- see that crate's own doc for the
+/// full rationale (press arms `active_drag`; release uses the drag's own last grid cell if one
+/// happened, matching the reference `MouseManager`'s `has_moved` position choice). Ported here
+/// verbatim (only the `gl_area`/`live_state` types are shared, no shell_composed-specific
+/// behavior needed) because this crate's editor pane shares the exact same
+/// `LiveHarness`/`content_region`/`grid_scale` architecture as `neovide_embed_live` -- see this
+/// crate's own module doc for why P2/P7's bugs (and now P3's gap) were both shared, not
+/// coincidental duplication.
+fn handle_mouse_button(
+    live_state: &Rc<RefCell<LiveState>>,
+    gl_area: &GLArea,
+    gesture: &GestureClick,
+    x: f64,
+    y: f64,
+    pressed: bool,
+) {
+    let Some(button) = gdk_button_to_button_text(gesture.current_button()) else {
+        return;
+    };
+    let modifier_string = format_modifier_string(gesture.current_event_state());
+
+    let mut live = live_state.borrow_mut();
+    let LiveState::Ready(session) = &mut *live else {
+        return;
+    };
+    if session.harness.has_neovim_exited() {
+        return;
+    }
+
+    let content_region = current_content_region(gl_area);
+    let position_from_event = pixel_to_grid_pos(
+        x,
+        y,
+        gl_area.scale_factor(),
+        &content_region,
+        session.harness.grid_scale(),
+        session.harness.get_grid_size(),
+    );
+    let grid_pos = if !pressed {
+        match session.active_drag.get() {
+            Some(drag) if drag.button == button => drag.last_grid_pos,
+            _ => position_from_event,
+        }
+    } else {
+        position_from_event
+    };
+
+    session.harness.send_mouse_button(button, pressed, grid_pos, &modifier_string);
+    session.active_drag.set(if pressed { Some(DragState { button, last_grid_pos: grid_pos }) } else { None });
+    session.wants_frame.set(true);
+}
+
+/// Identical to `neovide_embed_live::handle_mouse_motion` -- see that crate's own doc. Also the
+/// only source of pointer position for the scroll handler below, which carries none of its own.
+fn handle_mouse_motion(
+    live_state: &Rc<RefCell<LiveState>>,
+    gl_area: &GLArea,
+    controller: &EventControllerMotion,
+    x: f64,
+    y: f64,
+) {
+    let mut live = live_state.borrow_mut();
+    let LiveState::Ready(session) = &mut *live else {
+        return;
+    };
+    session.last_pointer_pos.set((x, y));
+
+    let Some(drag) = session.active_drag.get() else {
+        return;
+    };
+    if session.harness.has_neovim_exited() {
+        return;
+    }
+
+    let content_region = current_content_region(gl_area);
+    let grid_pos = pixel_to_grid_pos(
+        x,
+        y,
+        gl_area.scale_factor(),
+        &content_region,
+        session.harness.grid_scale(),
+        session.harness.get_grid_size(),
+    );
+    if grid_pos == drag.last_grid_pos {
+        return;
+    }
+
+    let modifier_string = format_modifier_string(controller.current_event_state());
+    session.harness.send_mouse_drag(drag.button, grid_pos, &modifier_string);
+    session.active_drag.set(Some(DragState { button: drag.button, last_grid_pos: grid_pos }));
+    session.wants_frame.set(true);
+}
+
+/// Identical to `neovide_embed_live::handle_mouse_scroll` -- see that crate's own doc, including
+/// the P3-verification-pass finding that a `ScrollUnit::Surface`-classified wheel notch (observed
+/// in the sandbox via wlr-virtual-pointer) divides down to a fraction of a grid line -- left as-is
+/// since it's the textbook-correct handling for a genuine pixel-space delta and mirrors the
+/// reference `handle_pixel_scroll` exactly; unconfirmed whether this is a real-hardware behavior
+/// or specific to how wlroots' virtual-pointer protocol forwards `axis_source`.
+fn handle_mouse_scroll(
+    live_state: &Rc<RefCell<LiveState>>,
+    gl_area: &GLArea,
+    controller: &EventControllerScroll,
+    dx: f64,
+    dy: f64,
+) -> glib::Propagation {
+    let mut live = live_state.borrow_mut();
+    let LiveState::Ready(session) = &mut *live else {
+        return glib::Propagation::Proceed;
+    };
+    if session.harness.has_neovim_exited() {
+        return glib::Propagation::Proceed;
+    }
+
+    let (mut amount_x, mut amount_y) = (dx as f32, dy as f32);
+    if controller.unit() == ScrollUnit::Surface {
+        let grid_scale = session.harness.grid_scale();
+        amount_x /= grid_scale.width();
+        amount_y /= grid_scale.height();
+    }
+
+    let content_region = current_content_region(gl_area);
+    let (px, py) = session.last_pointer_pos.get();
+    let grid_pos = pixel_to_grid_pos(
+        px,
+        py,
+        gl_area.scale_factor(),
+        &content_region,
+        session.harness.grid_scale(),
+        session.harness.get_grid_size(),
+    );
+
+    let (prev_x, prev_y) = session.scroll_position.get();
+    let (new_x, new_y) = (prev_x + amount_x, prev_y + amount_y);
+    session.scroll_position.set((new_x, new_y));
+
+    let modifier_string = format_modifier_string(controller.current_event_state());
+
+    let (prev_floor_y, new_floor_y) = (prev_y.floor() as i64, new_y.floor() as i64);
+    let vertical_direction = match new_floor_y.cmp(&prev_floor_y) {
+        std::cmp::Ordering::Greater => Some("down"),
+        std::cmp::Ordering::Less => Some("up"),
+        std::cmp::Ordering::Equal => None,
+    };
+    if let Some(direction) = vertical_direction {
+        for _ in 0..(new_floor_y - prev_floor_y).abs() {
+            session.harness.send_mouse_scroll(direction, grid_pos, &modifier_string);
+        }
+    }
+
+    let (prev_floor_x, new_floor_x) = (prev_x.floor() as i64, new_x.floor() as i64);
+    let horizontal_direction = match new_floor_x.cmp(&prev_floor_x) {
+        std::cmp::Ordering::Greater => Some("right"),
+        std::cmp::Ordering::Less => Some("left"),
+        std::cmp::Ordering::Equal => None,
+    };
+    if let Some(direction) = horizontal_direction {
+        for _ in 0..(new_floor_x - prev_floor_x).abs() {
+            session.harness.send_mouse_scroll(direction, grid_pos, &modifier_string);
+        }
+    }
+
+    if vertical_direction.is_some() || horizontal_direction.is_some() {
+        session.wants_frame.set(true);
+    }
+
+    glib::Propagation::Stop
 }
 
 fn main() -> glib::ExitCode {
@@ -1051,6 +1307,61 @@ fn build_editor_pane(
             glib::Propagation::Stop
         });
         gl_area.add_controller(key_controller);
+    }
+
+    // --- mouse input: identical to neovide_embed_live's three GTK4 controllers on the GLArea for
+    // click/drag-selection/scroll-wheel -- see that crate's own module doc for the full rationale.
+    // These are attached to the editor's own `gl_area` specifically, not the `Paned`/`Overlay`
+    // wrapping it, so they only ever see pointer events that land on the editor pane itself --
+    // `Paned`'s own divider-drag handling (a separate, GTK-native `GtkPaned` behavior) lives
+    // entirely on the `Paned` widget's own input handling and is untouched by any of this.
+    {
+        let click = GestureClick::new();
+        click.set_button(0);
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            click.connect_pressed(move |gesture, _n_press, x, y| {
+                handle_mouse_button(&live_state, &gl_area, gesture, x, y, true);
+            });
+        }
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            click.connect_released(move |gesture, _n_press, x, y| {
+                handle_mouse_button(&live_state, &gl_area, gesture, x, y, false);
+            });
+        }
+        gl_area.add_controller(click);
+    }
+
+    {
+        let motion = EventControllerMotion::new();
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            motion.connect_motion(move |controller, x, y| {
+                handle_mouse_motion(&live_state, &gl_area, controller, x, y);
+            });
+        }
+        {
+            let live_state = live_state.clone();
+            let gl_area = gl_area.clone();
+            motion.connect_enter(move |controller, x, y| {
+                handle_mouse_motion(&live_state, &gl_area, controller, x, y);
+            });
+        }
+        gl_area.add_controller(motion);
+    }
+
+    {
+        let scroll = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
+        let live_state = live_state.clone();
+        let gl_area_for_scroll = gl_area.clone();
+        scroll.connect_scroll(move |controller, dx, dy| {
+            handle_mouse_scroll(&live_state, &gl_area_for_scroll, controller, dx, dy)
+        });
+        gl_area.add_controller(scroll);
     }
 
     // --- render: identical lifecycle/logging to neovide_embed_live's connect_render.
