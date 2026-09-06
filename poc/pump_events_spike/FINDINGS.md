@@ -206,17 +206,48 @@ through the pump loop rather than executed inline.
   only Wayland-specific extension traits it exports are `is_wayland()` checks,
   `xdg_toplevel()` (a raw pointer, not a connection), `with_name()`, and
   Wayland-only monitor id lookup. There is no public accessor for the
-  underlying `wayland-client::Connection`, its fd, or the internal `calloop`
-  loop winit uses. Confirmed via winit's own changelog
+  underlying `wayland-client::Connection` on that Wayland-specific extension
+  trait. Confirmed via winit's own changelog
   (docs.rs/winit/latest/winit/changelog) that 0.30.10 shipped "external event
   loops are now woken up when using `pump_events` and integrating via FD" —
   but this describes winit's *internal* wakeup plumbing for its own use of
-  `pump_events`, not a public fd handle callers can hand to
-  `glib::unix_fd_add_local`. Getting true FD-driven integration would require
-  either unsafe access to winit internals or a winit fork/patch that exposes
-  the connection — out of scope for this spike. The 16ms timer poll is not a
-  "we didn't try hard enough" compromise; it's what's available against
-  stock winit 0.30's public API today.
+  `pump_events`, not (it was concluded at the time) a public fd handle
+  callers can hand to `glib::unix_fd_add_local`.
+
+  **Correction (2026-09-06): that conclusion was wrong, checked the wrong
+  API surface.** `winit::event_loop::EventLoop<T>` has implemented the
+  standard `std::os::fd::AsFd` trait — a cross-platform accessor wrapping
+  calloop's own internal fd, which already multiplexes the Wayland
+  connection under the hood — since winit 0.29, and it is still present in
+  0.30.13, the version actually pinned in this workspace. The investigation
+  above checked the Wayland-*specific* extension traits and the raw
+  `wayland-client::Connection`, but never checked whether `EventLoop` itself
+  implements the ordinary cross-platform `AsFd`/`AsRawFd` traits — it does.
+  Registering `event_loop.as_fd()` with `glib::unix_fd_add_local` (or a
+  `glib::IOChannel`) is available today against stock winit 0.30's public
+  API; no unsafe internals access or winit fork/patch is needed.
+
+  This correction does not change the spike's practical bottom line, though,
+  for a narrower reason than "FD integration still isn't worth it": the
+  16ms timer poll's actual cost was burning idle CPU on a fixed cadence even
+  when nothing was happening on the Wayland socket — and that specific
+  failure mode has since been fixed a different way, in the real
+  `neovide_embed_live`/`shell_composed` crates (P11's idle-render fix,
+  `poc/idle-render-fix` commit `35b766d`: gate `queue_render()` on the
+  renderer's own `animating`/`redraw_batches_seen()` signal instead of
+  firing unconditionally on every tick — see
+  `docs/neovibe_feasibility_status.md`, P11 "修复后复测"). FD-driven wakeup
+  would only ever have bought the same thing that fix already bought: waking
+  the GLib loop only when the Wayland socket actually has data, instead of
+  polling it on a fixed interval regardless. It does **not** touch the
+  separate, still-open scroll-CPU gap (~37–38% higher than stock Neovide
+  during active scrolling — see `docs/neovibe_feasibility_status.md`, P11
+  "滚动 CPU 差距深挖"): that gap is not a "we're polling more often than we
+  need to" problem, it's that `GtkGLArea`'s `GdkFrameClock` is already
+  driven 1:1 with real compositor frame-done callbacks throughout active
+  scrolling — there is no coarser, cheaper cadence available to switch to
+  via FD-based wakeup, because the render loop during scrolling is already
+  firing once per genuine compositor frame, not once per idle poll tick.
 - **Long-run stability** (minutes/hours) was not tested; only 8-10s runs
   (repeated ~5 times) due to the sandboxed, non-interactive nature of this
   environment. No degradation was observed across runs, but this doesn't
@@ -240,12 +271,22 @@ ownership conflict — with caveats, not a plain "yes."**
    thread with a handoff back into the pump loop. This should become an
    explicit item in the P1 (Neovide-renderer-in-GtkGLArea) validation stage
    in the feasibility doc, since P1 is exactly where this would first bite.
-3. Don't plan on the FD-reactive GLib integration; budget for a timer-driven
-   poll (this spike used 16ms/~60Hz) unless/until winit exposes the
-   connection publicly. A well-tuned poll interval matching the target
-   refresh rate is a reasonable permanent design, not just a stopgap — it's
-   also what this spike's steady-state numbers (locking to ~60fps within 1-2
-   ticks) suggest is perfectly workable in practice.
+3. **Correction (2026-09-06):** the original wording here said "budget for a
+   timer-driven poll unless/until winit exposes the connection publicly" —
+   that's backwards. winit *already* exposes the connection publicly, via
+   the standard `AsFd` impl on `EventLoop<T>` (present since 0.29, still
+   there in the pinned 0.30.13; see the corrected "FD-based reactive
+   integration" finding above) — the earlier investigation just checked the
+   wrong API surface and missed it. That said, this doesn't change what to
+   actually plan for: a well-tuned timer poll (this spike used 16ms/~60Hz)
+   remains a perfectly workable permanent design, not a stopgap forced by a
+   missing winit API — its steady-state numbers (locking to ~60fps within
+   1-2 ticks) prove that out. FD-driven wakeup would only ever have saved
+   idle-CPU cost from polling with nothing to do, and that specific cost has
+   since been eliminated a different way (P11's idle-render fix). It does
+   not help the separate scroll-CPU gap, since the render loop during active
+   scrolling is already gated 1:1 to real compositor frames, not to the poll
+   timer.
 4. The "single GTK4 window, winit surface embedded as a widget" variant of
    this spike is a dead end as literally specified (embedding *unmodified*
    winit's own toplevel inside GTK on Wayland has no supporting protocol).

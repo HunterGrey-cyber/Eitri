@@ -92,6 +92,12 @@ trait SurfaceHost {
 1. **广度**：`Rc<Window>`/`&Window` 这个类型在 `window_wrapper.rs`（`RouteWindow.winit_window` 字段本身）、`mouse_manager.rs`（函数签名参数）、`SkiaRenderer::window()`（trait 方法签名）、`vsync/*.rs`（`request_redraw`/`get_refresh_rate` 都吃 `&Window`）四处都是硬编码类型，不是"某个模块内部细节"，要抽象成 trait 需要同时改这四处的签名。
 2. **深度**：GL surface 创建（`opengl.rs`）那部分不是"调用几个 Window 方法"，而是"用这个 Window 的 raw-window-handle 创建 GL context 本身"，这部分逻辑目前是和"创建一个真实 winit 窗口"强绑定的，要支持"GL 上下文由宿主已经建好、Neovide 只管往里面画"这种模式，需要新增一条不经过 `glutin_winit::DisplayBuilder` 的路径——这已经不是"抽象掉几个 setter 调用"能解决的，属于"必须改 renderer 内部（GL 后端选择/初始化那一层）"的情况，虽然它不碰 `grid_renderer.rs`/字体渲染/动画这些"画什么"的逻辑，但它确实位于架构文档 §7 划的 `renderer/` 目录里。
 
+### 更新（2026-09-06，P1+P2 完成后）：上面"侵入程度：最重"的判断是显著高估，已被实测推翻
+
+`poc/neovide_embed`（P1）和 `poc/neovide_embed_live`（P2）两阶段实测证明，把真实 nvim 内容渲染进 `GtkGLArea` 根本不需要走上面设想的 `SurfaceHost` 抽象路径：两阶段对 `opengl.rs`、`SkiaRenderer` trait、`mouse_manager.rs`、`vsync/mod.rs` 这四个文件的改动量都是**零行**。实际做法是绕开这四个文件，而不是抽象它们——不去动 Neovide fork 自己"创建 GL surface"的那部分代码，直接在已经与 winit 解耦的 `Renderer::draw_frame`/`bridge::send_ui` 这一层之上，搭一个薄薄的宿主专属适配层（P1 是 `DemoHarness`，P2 是 `LiveHarness` + 一个 `GtkEventControllerKey → send_text_input` 的按键转发），GL/Skia interop 机制原样照搬 `poc/gl_skia_test`——GtkGLArea 自己的 EGL context 由 GTK 提供，从一开始就没有创建过一个真实 `winit::window::Window`，也就没有触发过上面描述的那条耦合（`glutin_winit::DisplayBuilder` 从 winit `Window` 生成 GL surface）。上面对这条耦合"广度"与"深度"的分析，对**上游未改动的 Neovide 主程序**依然成立，但 P1/P2 实际选择的整合路径根本不经过这段代码——因为它们从不使用 upstream 的 `Application`/`WinitWindowWrapper`/`OpenGLSkiaRenderer::build_window` 那条初始化路径，而是直接构造一个裸 `Renderer` 并把 GTK 已经建好的 GL 上下文喂给 Skia。
+
+**唯一没有被这条更新推翻的缺口是 `MouseManager`**：它内部的拖选锚点跟踪、双击/三击时序判定、打字时隐藏光标这些真实业务逻辑，硬编码围绕 `window.set_cursor_visible(..)`/`window.has_focus()`/`window.inner_size()` 三个 winit `Window` 方法（见上文）。P2 的输入适配只接了键盘，没有触及鼠标，所以这部分代码路径完全没有被 P1/P2 的"零改动"证据检验过。如果 P3 决定复用 `MouseManager` 现成的时序/状态逻辑，而不是像 P2 对键盘那样另写一个薄的 GTK-事件 → `bridge::send_ui` 适配层，那么真正需要的最小 `SurfaceHost` 就只是这三个操作，不是本节原始设想的 `request_redraw`/`set_ime_enabled`/`set_ime_cursor_area`/`set_cursor`/`set_title` 五方法版本——尤其是两个 IME 相关的方法，在 P1/P2 已验证的范围内完全没有出现过对应需求。P3 到底走哪条路径的决定，记录在 `docs/neovibe_feasibility_status.md` 的"P3 结论"一节。
+
 ---
 
 ## 额外发现：事件循环所有权（比 §6 五条本身更底层的一条隐藏耦合）
