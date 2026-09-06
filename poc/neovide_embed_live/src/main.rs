@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, EventControllerKey, GLArea};
+use gtk4::{Application, ApplicationWindow, EventControllerKey, GLArea, IMMulticontext};
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, direct_contexts, surfaces, DirectContext, SurfaceOrigin};
@@ -377,16 +377,45 @@ fn build_ui(app: &Application, want_clean: bool) {
         });
     }
 
+    // Attach `GtkIMMulticontext` with `set_im_context` so GTK filters key events before
+    // emitting `key-pressed`. Keys consumed during composition never reach the plain-text
+    // handler, preventing double forwarding. Composed text arrives through `connect_commit`
+    // and uses the same `send_text_input` path as plain keystrokes, as UTF-8 text.
+    // `set_client_widget` and `focus_in()`, paired with `grab_focus()` below, give fcitx5 an
+    // anchor for its candidate window. This crate draws no preedit indicator of its own.
+    let im_context = IMMulticontext::new();
+    im_context.set_client_widget(Some(&gl_area));
+    {
+        let live_state = live_state.clone();
+        im_context.connect_commit(move |_ctx, text| {
+            let mut live = live_state.borrow_mut();
+            if let LiveState::Ready(session) = &mut *live {
+                if !session.harness.has_neovim_exited() {
+                    session.harness.send_text_input(text);
+                    session.wants_frame.set(true);
+                }
+            }
+        });
+    }
+    im_context.connect_preedit_start(|_ctx| println!("[ime] preedit-start"));
+    im_context.connect_preedit_end(|_ctx| println!("[ime] preedit-end"));
+    im_context.connect_preedit_changed(|ctx| {
+        let (text, _attrs, _cursor_pos) = ctx.preedit_string();
+        println!("[ime] preedit-changed: {text:?}");
+    });
+
     // --- keyboard input: GtkEventControllerKey attached directly to the GLArea (made focusable
     // above, grab_focus()'d below once the window is shown). Deliberately not full key-code/
     // modifier translation fidelity -- see this file's module doc -- just enough plain-text input
     // to drive a real nvim buffer: printable characters via `Key::to_unicode()`, plus a handful of
     // named keys common enough to actually use nvim with (Escape to leave insert mode, Return,
     // BackSpace, Tab). Any held Ctrl/Alt/Super is treated as "not plain text" and ignored, rather
-    // than silently forwarding e.g. bare `c` for what the user meant as Ctrl+C.
+    // than silently forwarding e.g. bare `c` for what the user meant as Ctrl+C. IME composition
+    // input never reaches this closure at all -- see the `im_context` wiring just above.
     {
         let live_state = live_state.clone();
         let key_controller = EventControllerKey::new();
+        key_controller.set_im_context(Some(&im_context));
         key_controller.connect_key_pressed(move |_controller, key, _keycode, state| {
             if state.intersects(
                 ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
@@ -685,6 +714,7 @@ fn build_ui(app: &Application, want_clean: bool) {
 
     window.present();
     gl_area.grab_focus();
+    im_context.focus_in();
     println!(
         "neovibe P2 probe running (LiveHarness/real nvim --embed in GtkGLArea). \
          initial window scale_factor={} clean={}",
