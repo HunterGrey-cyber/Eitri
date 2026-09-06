@@ -220,6 +220,7 @@ fn compute_content_region(fb_width: i32, fb_height: i32) -> PixelRect<f32> {
 }
 
 fn main() -> glib::ExitCode {
+    env_logger::init();
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
