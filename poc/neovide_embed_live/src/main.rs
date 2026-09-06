@@ -44,6 +44,14 @@
 //!   `nvim --embed` child is never left orphaned behind this probe (see the `connect_close_request`
 //!   handler below, and this crate's `MANUAL_VERIFICATION.md` for the `pgrep` diff used to confirm
 //!   it empirically).
+//! - **Fixed 2026-09-06**: the tick callback now also closes the window itself
+//!   (`window.close()`) when `LiveHarness::has_neovim_exited()` comes back true *without* that
+//!   having gone through `connect_close_request` first -- i.e. nvim quit on its own (`:qa!` typed
+//!   inside it), not via a user closing this window. Before this fix, that case left a dead-
+//!   looking-alive window on screen forever (last frame still rendering, all input silently
+//!   swallowed with nowhere to route it) instead of exiting like stock Neovide does when its own
+//!   nvim quits. See the tick callback's own comment for the mechanism and this crate's
+//!   `MANUAL_VERIFICATION.md` for the bug's original discovery and this fix's verification.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -285,6 +293,18 @@ struct LiveSession {
     /// every pixel-level resize event mid-drag (see `LiveHarness::resize_grid`'s own doc on why
     /// that dedup matters).
     last_grid_size: Cell<GridSize<u32>>,
+    /// Set once the tick callback has asked `window.close()` to run because
+    /// `LiveHarness::has_neovim_exited()` came back true on its own (i.e. nvim quit itself, e.g.
+    /// via `:qa!` typed inside it -- not via our own `connect_close_request` -> `shutdown()`
+    /// path). This is the P2 "dead-looking-alive window" bugfix: `has_neovim_exited()` is
+    /// monotonic (never goes back to `false`), so without this guard the tick callback would call
+    /// `window.close()` again on every subsequent tick until the window actually finishes tearing
+    /// down -- harmless in principle (`GtkWindow::close()` on an already-closing window is not
+    /// expected to misbehave) but noisy (a duplicate `[live] nvim exited...` log line and a
+    /// duplicate `connect_close_request` -> `shutdown()` call every tick in between). Read-and-set
+    /// via `Cell::replace` so the check-and-flag is a single atomic step from this single-threaded
+    /// GTK main-loop caller's point of view.
+    close_requested: Cell<bool>,
 }
 
 impl LiveSession {
@@ -300,6 +320,7 @@ impl LiveSession {
             last_seen_batches: Cell::new(0),
             wants_frame: Cell::new(false),
             last_grid_size: Cell::new(grid_size),
+            close_requested: Cell::new(false),
         }
     }
 
@@ -756,9 +777,19 @@ fn build_ui(app: &Application, want_clean: bool) {
     {
         let live_state = live_state.clone();
         let gl_area_for_tick = gl_area.clone();
+        // Needed for the nvim-exited-on-its-own fix just below: `window.close()` re-enters
+        // `connect_close_request` (see that handler further down), which itself needs
+        // `live_state.borrow_mut()` -- so this closure must never call it while still holding
+        // `live` borrowed, or GTK's synchronous close-request dispatch would hit a `RefCell`
+        // `BorrowMutError` panic against our own still-live borrow. See `should_close_window`
+        // below for how that's kept safe.
+        let window_for_tick = window.clone();
         let tick_stats = Rc::new(TickStats::new());
         gl_area.add_tick_callback(move |_widget, _clock| {
             let mut live = live_state.borrow_mut();
+            // Set from inside the `Ready` arm below, then acted on only *after* `live` is
+            // dropped -- see the comment on `window_for_tick` above for why the ordering matters.
+            let mut should_close_window = false;
             let issued = match &mut *live {
                 LiveState::Ready(session) => {
                     // Cheap, non-blocking drain of any nvim redraw traffic that arrived since the
@@ -780,6 +811,23 @@ fn build_ui(app: &Application, want_clean: bool) {
                     // signals above.
                     let wants_frame = session.wants_frame.replace(false);
 
+                    // The P2 "dead-looking-alive window" bugfix: `connect_close_request` below
+                    // already calls `LiveHarness::shutdown()` when a *user* closes this window,
+                    // but nothing previously reacted when nvim exits *on its own* (e.g. `:qa!`
+                    // typed inside it) -- `has_neovim_exited()` was read every render-loop frame
+                    // purely for the `[frame ...]` log line, never acted on. `pump()` just above
+                    // is what actually observes a real `UserEvent::NeovimExited` arriving
+                    // asynchronously (see `LiveHarness::user_event`'s handling of that variant),
+                    // so checking right here, every tick, catches it at the same latency the
+                    // frame log already did -- just now actually doing something about it.
+                    // `close_requested.replace(true)` is the one-shot guard documented on
+                    // `LiveSession::close_requested`; only the tick that flips it false->true
+                    // actually asks the window to close.
+                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true)
+                    {
+                        should_close_window = true;
+                    }
+
                     session.last_animating.get() || new_content || wants_frame
                 }
                 // NotStarted/Starting: the placeholder-frame dance and the one blocking
@@ -793,6 +841,16 @@ fn build_ui(app: &Application, want_clean: bool) {
                 LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
             };
             drop(live);
+
+            if should_close_window {
+                println!(
+                    "[live] nvim exited on its own (not via a user-initiated window close) -- \
+                     calling window.close() so the normal connect_close_request -> \
+                     LiveHarness::shutdown() path still runs, instead of leaving a dead frame on \
+                     screen forever"
+                );
+                window_for_tick.close();
+            }
 
             if issued {
                 gl_area_for_tick.queue_render();

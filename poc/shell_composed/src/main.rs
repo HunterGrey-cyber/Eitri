@@ -508,6 +508,13 @@ struct LiveSession {
     /// every `connect_resize` callback so a real RPC is only sent when the grid-*cell* size
     /// actually changes, not on every pixel-level resize event mid-drag.
     last_grid_size: Cell<GridSize<u32>>,
+    /// Set once the tick callback has asked `window.close()` to run because
+    /// `LiveHarness::has_neovim_exited()` came back true on its own (nvim quit itself, e.g. via
+    /// `:qa!` typed inside it -- not via `connect_close_request` -> `shutdown()`). Ported from
+    /// `neovide_embed_live`'s own fix for the same bug -- see that crate's copy of this field for
+    /// the full rationale (the one-shot guard against re-closing an already-closing window every
+    /// tick, since `has_neovim_exited()` is monotonic).
+    close_requested: Cell<bool>,
 }
 
 impl LiveSession {
@@ -523,6 +530,7 @@ impl LiveSession {
             last_seen_batches: Cell::new(0),
             wants_frame: Cell::new(false),
             last_grid_size: Cell::new(grid_size),
+            close_requested: Cell::new(false),
         }
     }
 
@@ -621,7 +629,7 @@ fn build_ui(app: &Application, want_clean: bool) {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
 
-    let (editor_widget, live_state, gl_area, im_context) = build_editor_pane(want_clean);
+    let (editor_widget, live_state, gl_area, im_context) = build_editor_pane(want_clean, &window);
     let agent_widget = build_agent_pane();
     let (content_widget, paned) = build_content_area(&editor_widget, &agent_widget);
 
@@ -874,6 +882,7 @@ fn build_status_bar() -> gtk4::Widget {
 /// `content_region` + time-since-last-frame (see this file's own module doc on why that's new).
 fn build_editor_pane(
     want_clean: bool,
+    window: &ApplicationWindow,
 ) -> (gtk4::Widget, Rc<RefCell<LiveState>>, GLArea, IMMulticontext) {
     let gl_area = GLArea::builder()
         .hexpand(true)
@@ -1227,9 +1236,16 @@ fn build_editor_pane(
     {
         let live_state = live_state.clone();
         let gl_area_for_tick = gl_area.clone();
+        // Needed for the nvim-exited-on-its-own fix just below -- ported from
+        // `neovide_embed_live`'s own copy of this tick callback (see that crate's comment on the
+        // equivalent `window_for_tick` binding for why `window.close()` must run only after `live`
+        // is dropped: it re-enters `connect_close_request`, which itself needs
+        // `live_state.borrow_mut()`).
+        let window_for_tick = window.clone();
         let tick_stats = Rc::new(TickStats::new());
         gl_area.add_tick_callback(move |_widget, _clock| {
             let mut live = live_state.borrow_mut();
+            let mut should_close_window = false;
             let issued = match &mut *live {
                 LiveState::Ready(session) => {
                     // Cheap, non-blocking drain of any nvim redraw traffic that arrived since the
@@ -1251,6 +1267,15 @@ fn build_editor_pane(
                     // signals above.
                     let wants_frame = session.wants_frame.replace(false);
 
+                    // The same P2 "dead-looking-alive window" bugfix as `neovide_embed_live` --
+                    // ported verbatim (this crate shares that crate's `LiveHarness`/tick-callback
+                    // plumbing exactly, so it shared the bug too). See that crate's own comment on
+                    // this same check for the full rationale.
+                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true)
+                    {
+                        should_close_window = true;
+                    }
+
                     session.last_animating.get() || new_content || wants_frame
                 }
                 // NotStarted/Starting: the placeholder-frame dance and the one blocking
@@ -1264,6 +1289,16 @@ fn build_editor_pane(
                 LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
             };
             drop(live);
+
+            if should_close_window {
+                println!(
+                    "[live] nvim exited on its own (not via a user-initiated window close) -- \
+                     calling window.close() so the normal connect_close_request -> \
+                     LiveHarness::shutdown() path still runs, instead of leaving a dead frame on \
+                     screen forever"
+                );
+                window_for_tick.close();
+            }
 
             if issued {
                 gl_area_for_tick.queue_render();
