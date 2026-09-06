@@ -322,6 +322,7 @@ fn run_workload_script(
     nvim_exited: Arc<AtomicBool>,
     workload_path: String,
     sanity_path: String,
+    t_process_start: Instant,
 ) {
     macro_rules! bail_if_dead {
         () => {
@@ -343,6 +344,13 @@ fn run_workload_script(
         return;
     }
     phase_marker("FILE_OPENED");
+    // Readiness covers a blank buffer because `LiveHarness` cannot open the workload at launch.
+    // Include the subsequent file-open time to measure startup through workload loading.
+    println!(
+        "NEOVIBE_TIMING:file_opened_end_to_end t={:.4}",
+        t_process_start.elapsed().as_secs_f64()
+    );
+    let _ = std::io::stdout().flush();
     bail_if_dead!();
 
     // ---- warm-up: identical shape to the stock driver's own warm-up (idle, then a substantial
@@ -591,7 +599,13 @@ fn build_ui(
                             let workload_path2 = workload_path.clone();
                             let sanity_path2 = sanity_path.clone();
                             thread::spawn(move || {
-                                run_workload_script(tx2, nvim_exited2, workload_path2, sanity_path2);
+                                run_workload_script(
+                                    tx2,
+                                    nvim_exited2,
+                                    workload_path2,
+                                    sanity_path2,
+                                    t_process_start,
+                                );
                             });
                         }
                     }
