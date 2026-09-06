@@ -8,6 +8,10 @@ publish.workspace = true
 name = "wlr-vptr-drag"
 path = "src/main.rs"
 
+[[bin]]
+name = "wlr-vptr-scroll"
+path = "src/scroll.rs"
+
 [dependencies]
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
