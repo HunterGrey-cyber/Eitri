@@ -13,7 +13,7 @@
 //! Rendering uses GTK's frame-clock tick callback. A warm-up idle, typing, and undo cycle
 //! runs before measurement to guard against embedded nvim startup instability.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +34,11 @@ use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::{GridSize, PixelRect};
 
 const APP_ID: &str = "cn.huntergrey.neovibe.neovide_embed_live.perf_baseline";
+
+/// Number of `add_tick_callback` invocations between `TickStats` summary log lines.
+/// Keep this cadence aligned with `main.rs`; this binary has its own render and tick callbacks,
+/// so changes to the interactive render loop must also be applied here for comparable measurements.
+const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 
 // ----------------------------------------------------------------------------
 // Workload constants -- verbatim copies of the stock phase's driver.py constants
@@ -208,6 +213,65 @@ struct LiveSession {
     last_frame: Instant,
     frame_count: u64,
     logged_ready: bool,
+    /// The `animating` value returned by `render_frame`, updated after every render callback.
+    /// The tick callback uses it to decide whether another frame is needed.
+    last_animating: Cell<bool>,
+    /// `harness.redraw_batches_seen()` when last checked by the render or tick callback.
+    last_seen_batches: Cell<u64>,
+    /// Set when a workload thread's `Ctrl::Input` message is applied to request a frame.
+    /// Read and cleared by the tick callback.
+    wants_frame: Cell<bool>,
+}
+
+/// Counts, over rolling windows of `TICK_LOG_EVERY_N_TICKS` tick-callback invocations, how many
+/// ticks actually issued a `queue_render()` vs. how many skipped it. Ported verbatim from
+/// `main.rs`'s own `TickStats` (see that file for full rationale) so this binary's stdout carries
+/// the same direct before/after evidence of the fix.
+struct TickStats {
+    ticks: Cell<u64>,
+    issued: Cell<u64>,
+    skipped: Cell<u64>,
+    issued_total: Cell<u64>,
+    skipped_total: Cell<u64>,
+}
+
+impl TickStats {
+    fn new() -> Self {
+        Self {
+            ticks: Cell::new(0),
+            issued: Cell::new(0),
+            skipped: Cell::new(0),
+            issued_total: Cell::new(0),
+            skipped_total: Cell::new(0),
+        }
+    }
+
+    fn record(&self, issued_this_tick: bool) {
+        self.ticks.set(self.ticks.get() + 1);
+        if issued_this_tick {
+            self.issued.set(self.issued.get() + 1);
+            self.issued_total.set(self.issued_total.get() + 1);
+        } else {
+            self.skipped.set(self.skipped.get() + 1);
+            self.skipped_total.set(self.skipped_total.get() + 1);
+        }
+
+        if self.ticks.get() >= TICK_LOG_EVERY_N_TICKS {
+            let ticks = self.ticks.get();
+            let issued = self.issued.get();
+            let skipped = self.skipped.get();
+            println!(
+                "[tick] last {ticks} ticks: issued={issued} skipped={skipped} \
+                 skip_ratio={:.1}% (cumulative issued={} skipped={})",
+                (skipped as f64 / ticks as f64) * 100.0,
+                self.issued_total.get(),
+                self.skipped_total.get(),
+            );
+            self.ticks.set(0);
+            self.issued.set(0);
+            self.skipped.set(0);
+        }
+    }
 }
 
 fn stats_json(dts: &[f32]) -> String {
@@ -482,6 +546,9 @@ fn build_ui(
                                 last_frame: now,
                                 frame_count: 0,
                                 logged_ready: false,
+                                last_animating: Cell::new(true),
+                                last_seen_batches: Cell::new(0),
+                                wants_frame: Cell::new(false),
                             }));
                         }
                         Err(err) => {
@@ -496,9 +563,12 @@ fn build_ui(
                     session.frame_count += 1;
 
                     let animating = session.harness.render_frame(canvas, Some(&content_region), dt);
-                    let _ = animating;
+                    // Share animation and redraw-batch state with the tick callback so it can request more frames.
+                    session.last_animating.set(animating);
+                    let batches_now = session.harness.redraw_batches_seen();
+                    session.last_seen_batches.set(batches_now);
 
-                    redraw_count.store(session.harness.redraw_batches_seen(), Ordering::Relaxed);
+                    redraw_count.store(batches_now, Ordering::Relaxed);
                     nvim_exited.store(session.harness.has_neovim_exited(), Ordering::Relaxed);
 
                     match *phase.borrow() {
@@ -554,10 +624,35 @@ fn build_ui(
         });
     }
 
+    // Call `queue_render()` only when another frame is needed, avoiding continuous idle rendering.
+    // This binary has its own render loop, so keep its scheduling aligned with the interactive loop
+    // for comparable measurements.
     {
+        let live_state = live_state.clone();
         let gl_area_for_tick = gl_area.clone();
+        let tick_stats = Rc::new(TickStats::new());
         gl_area.add_tick_callback(move |_widget, _clock| {
-            gl_area_for_tick.queue_render();
+            let mut live = live_state.borrow_mut();
+            let issued = match &mut *live {
+                LiveState::Ready(session) => {
+                    session.harness.pump(Duration::ZERO);
+                    let batches_now = session.harness.redraw_batches_seen();
+                    let new_content = batches_now != session.last_seen_batches.get();
+                    if new_content {
+                        session.last_seen_batches.set(batches_now);
+                    }
+                    let wants_frame = session.wants_frame.replace(false);
+                    session.last_animating.get() || new_content || wants_frame
+                }
+                LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
+            };
+            drop(live);
+
+            if issued {
+                gl_area_for_tick.queue_render();
+            }
+            tick_stats.record(issued);
+
             glib::ControlFlow::Continue
         });
     }
@@ -580,11 +675,28 @@ fn build_ui(
                         if let LiveState::Ready(session) = &mut *live {
                             if !session.harness.has_neovim_exited() {
                                 session.harness.send_text_input(&text);
+                                // Request a frame for workload input on the next tick, just as for a keypress.
+                                session.wants_frame.set(true);
                             }
                         }
                     }
                     Ctrl::SetPhase(p) => {
                         *phase.borrow_mut() = p;
+                        // Post-idle-render-fix measurement artifact, found and fixed during the
+                        // idle-render-fix follow-up phase (kept as a comment, not silently
+                        // squashed -- same policy PHASE_REPORT.md's own deviation #5 used): once
+                        // the tick callback can legitimately skip *every* frame for an entire
+                        // phase (e.g. all 13s of Idle now that the fix works), `last_frame` goes
+                        // stale for the whole gap, and the next phase's first real render computes
+                        // a `dt` covering that whole gap instead of one true frame interval --
+                        // polluting that phase's frame-timing bucket with one multi-second outlier
+                        // (observed: a >14s "frame" landing in `typing_frame_stats` immediately
+                        // after a 13s idle window). Resetting the clock at the phase boundary
+                        // itself (before any render has to decide what dt to report) keeps each
+                        // bucket's samples to genuine inter-frame intervals within that phase.
+                        if let LiveState::Ready(session) = &mut *live_state.borrow_mut() {
+                            session.last_frame = Instant::now();
+                        }
                     }
                     Ctrl::Finish => {
                         let mut live = live_state.borrow_mut();
