@@ -664,6 +664,7 @@ fn build_ui(app: &Application, want_clean: bool) {
     }
 
     install_auto_resize_sweep(&paned);
+    install_synthetic_activity(live_state.clone());
 
     window.present();
     gl_area.grab_focus();
@@ -1448,6 +1449,97 @@ fn install_auto_resize_sweep(paned: &Paned) {
                 "[resize-sweep] tick {n}: paned.position()={pos} bounds=[{min_pos},{max_pos}] width={width}"
             );
         }
+
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Drives the embedded nvim with a continuous, looping "type then jump-scroll" workload via
+/// `LiveHarness::send_text_input` -- the same sanctioned in-process automation seam
+/// `neovide_embed_live`'s P11 `perf_baseline` binary uses (see that binary's module doc: this goes
+/// through the *exact* same `send_ui(SerialCommand::Keyboard(..))` path a real keypress takes, not
+/// a synthetic input-device event -- `LiveHarness` exposes no external `--listen` socket to attach
+/// an outside driver to, so an in-process call is the correct seam, not a workaround).
+///
+/// Added 2026-09-06 for the P6 run-A' anomaly reproduction task. The literal original
+/// methodology (`P6_P7_MEASUREMENTS.md`'s run A/A': `--clean`, no keystrokes, editor genuinely
+/// idle) predates the P11 idle-render fix -- under *that* code, an idle editor still queued a
+/// redraw every frame regardless, so idle dt data existed to compare against WebView fps. Under
+/// the current, fixed code an idle editor correctly renders almost nothing after startup
+/// (confirmed empirically before adding this: `[tick] issued=0 skipped=300` repeating, `animating`
+/// false, only ~20 frames total across a 30s idle run) -- so a literal idle re-run has no
+/// editor-side dt series left to test the hypothesis against, exactly the gap
+/// `P6_P7_MEASUREMENTS.md`'s "Re-attempted 2026-09-06" section already flagged and recommended
+/// closing with real sustained activity. That section's own suggested fix (calibrate `ydotool`
+/// against real window geometry) is unavailable in this task's sandbox (synthetic input devices are
+/// explicitly out of bounds here), so this reaches the same goal -- genuine, continuous nvim
+/// activity for the whole measurement window -- through the harness's own existing input seam
+/// instead of a device-level one.
+///
+/// Off by default; enabled by `SHELL_COMPOSED_SYNTHETIC_ACTIVITY=1`, paced by
+/// `SHELL_COMPOSED_SYNTHETIC_ACTIVITY_INTERVAL_MS` (default 70ms/keystroke, ~14 chars/s). Each tick
+/// either sends the next character of a short repeating Rust-like snippet (newlines become `<CR>`,
+/// matching the real keyboard controller's own key-to-text mapping above) or, every 240 characters,
+/// escapes to normal mode and jumps `gg`/`G` (top/bottom of buffer) before re-entering insert mode
+/// with `A` -- a cheap stand-in for "type for a while, then jump around and keep going" that also
+/// exercises `win_viewport`/full-redraw traffic, not just per-character `grid_line` updates.
+fn install_synthetic_activity(live_state: Rc<RefCell<LiveState>>) {
+    let enabled = std::env::var("SHELL_COMPOSED_SYNTHETIC_ACTIVITY").as_deref() == Ok("1");
+    if !enabled {
+        println!(
+            "[synthetic-activity] disabled (set SHELL_COMPOSED_SYNTHETIC_ACTIVITY=1 to enable; \
+             tunable via SHELL_COMPOSED_SYNTHETIC_ACTIVITY_INTERVAL_MS)"
+        );
+        return;
+    }
+
+    let interval_ms: u64 = std::env::var("SHELL_COMPOSED_SYNTHETIC_ACTIVITY_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(70);
+
+    println!("[synthetic-activity] enabled: interval={interval_ms}ms/keystroke");
+
+    const SNIPPET: &str = "fn synthetic_probe(seed: u64) -> u64 {\n    let mut acc: u64 = seed;\n    for i in 0..2000u64 {\n        acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);\n        if acc % 101 == 0 {\n            acc ^= i;\n        }\n    }\n    acc\n}\n\n";
+    let snippet_chars: Rc<Vec<char>> = Rc::new(SNIPPET.chars().collect());
+
+    let started = Rc::new(Cell::new(false));
+    let cycle_pos = Rc::new(Cell::new(0usize));
+    let chars_since_jump = Rc::new(Cell::new(0u32));
+
+    glib::timeout_add_local(Duration::from_millis(interval_ms), move || {
+        let mut live = live_state.borrow_mut();
+        let Some(session) = (match &mut *live {
+            LiveState::Ready(session) => Some(session),
+            _ => None,
+        }) else {
+            return glib::ControlFlow::Continue;
+        };
+        if session.harness.has_neovim_exited() {
+            return glib::ControlFlow::Continue;
+        }
+
+        if !started.replace(true) {
+            session.harness.send_text_input("i");
+        } else if chars_since_jump.get() >= 240 {
+            chars_since_jump.set(0);
+            session.harness.send_text_input("<Esc>");
+            session.harness.send_text_input("gg");
+            session.harness.send_text_input("G");
+            session.harness.send_text_input("A");
+        } else {
+            let pos = cycle_pos.get();
+            let ch = snippet_chars[pos % snippet_chars.len()];
+            cycle_pos.set(pos + 1);
+            chars_since_jump.set(chars_since_jump.get() + 1);
+            if ch == '\n' {
+                session.harness.send_text_input("<CR>");
+            } else {
+                let mut buf = [0u8; 4];
+                session.harness.send_text_input(ch.encode_utf8(&mut buf));
+            }
+        }
+        session.wants_frame.set(true);
 
         glib::ControlFlow::Continue
     });
