@@ -1,6 +1,8 @@
-//! Provider-neutral events adapted from the Claude CLI wire protocol. UI code consumes these
-//! events so raw wire JSON stays behind the provider adapter:
-//! `wire protocol -> provider adapter -> agent::Event -> session state -> UI`.
+//! Provider-neutral events this crate produces from the real Claude CLI wire protocol. UI code
+//! (a future `agent-ui`) should only ever see these -- never the raw wire JSON, per this
+//! project's own architecture decision and the
+//! early design assessment's core recommended pattern:
+//! `wire protocol -> provider adapter -> agent::Event -> session state -> (future) UI`.
 
 use serde_json::Value;
 

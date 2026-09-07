@@ -1,7 +1,7 @@
-//! The shell's embedded Lua extension kernel runs independently of the editor's internal Lua
-//! runtime. Its global extension table exposes panel registration (`panel.register`), command
-//! registration (`command.register`), events (`on`) and configuration
-//! (`config.get`/`config.set`).
+//! The shell's embedded Lua extension kernel -- a separate, independent runtime from Neovim's
+//! own internal Lua. Exposes exactly four v1
+//! extension points under a `neovibe` global table: `panel.register`, `command.register`, `on`,
+//! `config.get`/`config.set`.
 
 mod command;
 mod config;
