@@ -24,7 +24,7 @@ use gtk4::{
 };
 
 use skia_safe::gpu::direct_contexts;
-use skia_safe::{Color4f, Paint, PaintStyle, Rect};
+use skia_safe::Color4f;
 
 use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::GridSize;
@@ -41,11 +41,10 @@ const LOG_EVERY_N_FRAMES: u64 = 60;
 /// How many `add_tick_callback` invocations between `[tick]` summary log lines (see `TickStats`).
 const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 
-/// Painted by us into the full framebuffer before each `LiveHarness::render_frame` call. A color
-/// the renderer would never itself produce, so a viewport-clear regression bleeding past
-/// `gl_interop::CONTENT_MARGIN` is visible at a glance.
-const OUTSIDE_COLOR: Color4f = Color4f::new(0.55, 0.15, 0.55, 1.0);
-const BORDER_COLOR: Color4f = Color4f::new(0.95, 0.85, 0.25, 1.0);
+/// Clears the full framebuffer before each `LiveHarness::render_frame` call, including the
+/// inset border around the content from `gl_interop::CONTENT_MARGIN`.
+/// The near-black color blends with dark UI chrome without depending on the host's exact theme.
+const OUTSIDE_COLOR: Color4f = Color4f::new(0.102, 0.106, 0.122, 1.0);
 /// Painted across the whole `content_region` while `LiveHarness` is being constructed (the one
 /// real, observed blocking call in this crate) -- distinct from both `OUTSIDE_COLOR` and anything
 /// the real renderer would draw, so it's obvious on screen which phase is showing.
@@ -392,9 +391,9 @@ impl NeovideEditorPane {
                 let content_region = compute_content_region(fb_w, fb_h);
                 let canvas = surface.canvas();
 
-                // Paint the *entire* framebuffer a color the renderer would never itself produce,
-                // then hand only the inset `content_region` to whatever's actually drawing this
-                // frame -- viewport-containment check.
+                // Paint the entire framebuffer the neutral margin color first, then hand only the
+                // inset `content_region` to whatever's actually drawing this frame -- see
+                // `OUTSIDE_COLOR`'s own doc for why this is neutral now rather than a debug work.
                 canvas.clear(OUTSIDE_COLOR);
 
                 let mut live = live_state.borrow_mut();
@@ -515,23 +514,6 @@ impl NeovideEditorPane {
                 }
                 drop(live);
 
-                // Border traces exactly where `content_region` is, so a bleed (or a misplaced
-                // region) is visible at a glance, in every LiveState.
-                let mut border_paint = Paint::default();
-                border_paint.set_anti_alias(true);
-                border_paint.set_style(PaintStyle::Stroke);
-                border_paint.set_stroke_width(2.0);
-                border_paint.set_color4f(BORDER_COLOR, None);
-                canvas.draw_rect(
-                    Rect::from_ltrb(
-                        content_region.min.x,
-                        content_region.min.y,
-                        content_region.max.x,
-                        content_region.max.y,
-                    ),
-                    &border_paint,
-                );
-
                 state.gr_context.flush_and_submit();
 
                 glib::Propagation::Stop
@@ -552,7 +534,7 @@ impl NeovideEditorPane {
             // `should_fire_exited_callback` below for how that's kept safe.
             let exited_callback_for_tick = exited_callback.clone();
             let tick_stats = Rc::new(TickStats::new());
-            gl_area.add_tick_callback(move |_widget, _clock| {
+            gl_area.add_tick_callback(move |widget, _clock| {
                 let mut live = live_state.borrow_mut();
                 // Set from inside the `Ready` arm below, then acted on only *after* `live` is
                 // dropped -- see the comment on `exited_callback_for_tick` above for why the
@@ -569,10 +551,44 @@ impl NeovideEditorPane {
                             session.last_seen_batches.set(batches_now);
                         }
 
+                        // Resize-resync safety net (found 2026-09-07 on real GNOME/Mutter
+                        // hardware, via `shell`, not the headless-sway sandbox every earlier
+                        // resize check ran in): `connect_resize` above is the only other place
+                        // that calls `resize_grid`, and it only fires on a `GtkGLArea` `resize`
+                        // signal. On this real desktop, a window shown already-maximized (or
+                        // resized by the compositor while `LiveHarness::with_options`'s
+                        // synchronous, main-loop-blocking nvim launch was in flight) can settle at
+                        // its final size without ever emitting a *further* `resize` signal after
+                        // the Ready-time snapshot the constructor already takes -- leaving nvim's
+                        // grid permanently sized for a stale, smaller content_region than the
+                        // widget's real one, visible as leftover `OUTSIDE_COLOR` past the grid's
+                        // real edge. Re-deriving the grid size from the widget's *current* actual
+                        // size on every tick (cheap: a handful of integer ops, no allocation) and
+                        // only calling `resize_grid` -- which is what actually costs anything --
+                        // when it disagrees with `last_grid_size` makes this self-correcting
+                        // regardless of which exact GTK/Wayland/compositor timing produced the
+                        // staleness, instead of chasing that one root cause.
+                        let width = widget.width() * widget.scale_factor();
+                        let height = widget.height() * widget.scale_factor();
+                        let content_region = compute_content_region(width, height);
+                        let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
+                        let grid_resynced = if new_grid_size != session.last_grid_size.get() {
+                            session.harness.resize_grid(new_grid_size);
+                            session.last_grid_size.set(new_grid_size);
+                            println!(
+                                "[tick] resize-resync: grid was stale for the widget's current \
+                                 size (fb={width}x{height}px) -- corrected to {}x{}",
+                                new_grid_size.width, new_grid_size.height,
+                            );
+                            true
+                        } else {
+                            false
+                        };
+
                         // Read-and-clear: a resize or a keypress since the last tick each force
                         // exactly one more frame, on top of the ongoing-animation and new-content
                         // signals above.
-                        let wants_frame = session.wants_frame.replace(false);
+                        let wants_frame = session.wants_frame.replace(false) || grid_resynced;
 
                         // `shutdown()` handles host-initiated closure. Check here after `pump()` for nvim exiting on
                         // its own, such as through `:qa!`, so the host can react on the same tick.
