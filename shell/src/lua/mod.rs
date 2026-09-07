@@ -49,6 +49,15 @@ impl LuaEngine {
     pub(crate) fn emit(&self, event_name: &str) {
         event::emit(&self.lua, &self.events.borrow(), event_name, Value::Nil);
     }
+
+    pub(crate) fn invoke_command(&self, id: &str) {
+        let commands = self.commands.borrow();
+        let Some(entry) = commands.get(id) else { return };
+        let Ok(f) = self.lua.registry_value::<mlua::Function>(&entry.action) else { return };
+        if let Err(err) = f.call::<()>(()) {
+            eprintln!("[lua] command '{id}' handler error: {err}");
+        }
+    }
 }
 
 #[cfg(test)]
