@@ -6,6 +6,16 @@
 
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionSource {
+    /// Arrived over the per-conversation `agent-hook` Unix socket — the primary, reliable path.
+    HookRelay,
+    /// Arrived as an unsolicited `control_request`/`can_use_tool` — confirmed unreliable (does
+    /// not fire for every tool call, e.g. `Bash`); kept only as a secondary signal, never the
+    /// sole gate. See docs/superpowers/specs/2026-09-07-agent-v2-streaming-protocol-design.md.
+    CanUseTool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// The CLI's own `system`/`init` line -- fired once, first, at the start of every
@@ -37,6 +47,13 @@ pub enum AgentEvent {
     /// exposing that it happened; this may later gain typed fields once something actually
     /// consumes it (e.g. an agent-ui usage indicator).
     RateLimit { raw: Value },
+    /// A tool-use approval request, regardless of which underlying channel produced it -- see
+    /// `PermissionSource`. Callers answer via `AgentSession::respond_permission`, which routes
+    /// the answer back on whichever channel this request arrived on.
+    PermissionRequest { request_id: String, tool_name: String, input: Value, source: PermissionSource },
+    /// Any `control_response` line -- acknowledges `initialize`, `interrupt`, or a caller's own
+    /// `can_use_tool` answer. `agent` does not correlate these internally; see `process.rs`.
+    ControlResponse { request_id: String, subtype: String, raw: Value },
     /// Deliberately permissive catch-all -- see this plan's Global Constraint on never letting
     /// an unrecognized event stop the stream. `kind` is the wire `type` field, `subtype` its
     /// `subtype` field if present (many `system` events use this to distinguish e.g.

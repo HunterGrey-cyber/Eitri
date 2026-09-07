@@ -1,12 +1,20 @@
-//! Folds the stream of `AgentEvent`s from one `AgentProcess` into a queryable
-//! `AgentSessionState`, and keeps an in-memory, append-only log of every event seen (v1: no
-//! disk persistence, see this plan's Global Constraints). This is the "session state" stage of
-//! the wire -> event -> session-state -> (future) UI pipeline this plan follows from the
-//! early design assessment's recommended shape.
+//! The reducer stage of the wire -> event -> session-state -> (future) UI pipeline this plan
+//! follows from the early design assessment's recommended shape: folds a stream of `AgentEvent`s into
+//! a queryable `AgentSessionState`. The reducer (`AgentSessionState::apply`) is pure and
+//! side-effect-free (no I/O, no dependency on `AgentProcess`) so it stays trivially testable
+//! without spawning anything.
+//!
+//! This file also owns `AgentSession` (v2, reintroduced by Task 6): a thin, process-owning
+//! wrapper around `agent::process::AgentProcess` that pumps its events through the reducer and
+//! exposes the crate's real public API for a whole conversation -- `send_turn`/`interrupt`/
+//! `respond_permission`/`pump`. Task 5 removed the v1 `AgentSession` (built around the
+//! now-deleted `SpawnMode`/per-turn `AgentProcess::spawn`) rather than adapt it, since Task 5's
+//! own scope was `agent::process` only; this is that real replacement, built around
+//! `AgentProcess`'s new long-lived, full-duplex shape.
 
-use crate::event::AgentEvent;
-use crate::process::{AgentProcess, SpawnMode};
-use uuid::Uuid;
+use crate::event::{AgentEvent, PermissionSource};
+use crate::process::{AgentProcess, PermissionMode};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
@@ -30,10 +38,22 @@ pub struct ToolCallRecord {
     pub result: Option<(serde_json::Value, bool)>,
 }
 
+/// One unanswered permission request, recording which channel (`PermissionSource`) it arrived on
+/// so `AgentSession::respond_permission` can route the answer back correctly without the caller
+/// having to separately track that.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRequestRecord {
+    pub request_id: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+    pub source: PermissionSource,
+}
+
 /// Mirrors the architecture doc's original `AgentSessionState` shape (session id, messages,
-/// tool calls, cwd, status) -- "task" and "permissions" fields from that original sketch are
-/// deliberately not yet present: there's no multi-task queue and no real permission
-/// request/response round-trip in v1 (see this plan's Global Constraints on both).
+/// tool calls, cwd, status) -- "task" from that original sketch is deliberately not yet present:
+/// there's no multi-task queue in v2 either. `turn_in_progress` and `pending_permissions` are new
+/// in v2, tracking the conversation-lifecycle state a long-lived, multi-turn process needs that a
+/// v1 one-shot-per-turn process never had to.
 #[derive(Debug, Clone, Default)]
 pub struct AgentSessionState {
     pub session_id: Option<String>,
@@ -45,13 +65,25 @@ pub struct AgentSessionState {
     pub transcript: Vec<String>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub status: SessionStatus,
+    /// True from `AgentSession::send_turn` until the matching `TurnFinished` arrives. A separate,
+    /// orthogonal flag from `status` -- the conversation can be `Running` with no turn in flight.
+    pub turn_in_progress: bool,
+    /// Every unanswered permission request, in arrival order. A collection, not a single slot:
+    /// one assistant message can genuinely contain several `tool_use` blocks, and the generated
+    /// hook matcher is `"*"` (every tool), so several `agent-hook` connections can legitimately be
+    /// live at once, each blocking its own tool call. A single-slot `Option` silently stranded
+    /// every request but the newest -- its connection stayed open with nothing in the public API
+    /// able to answer it, so its `agent-hook` blocked for the CLI's full 600s hook timeout.
+    /// Entries are removed one at a time by `AgentSession::respond_permission` -- see its own doc
+    /// for why nothing else ever removes one (in particular, not an incoming `ControlResponse`).
+    pub pending_permissions: Vec<PermissionRequestRecord>,
 }
 
 impl AgentSessionState {
     /// The reducer: applies one event's effect to this state. Pure and side-effect-free (no I/O)
     /// so it's trivially testable without spawning anything -- see this task's own tests, which
-    /// feed a hand-assembled sequence of `AgentEvent`s (built from the same real fixture data
-    /// Task 1 introduced) and assert on the resulting state, not on any live process.
+    /// feed a hand-assembled sequence of `AgentEvent`s and assert on the resulting state, not on
+    /// any live process.
     pub fn apply(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::SessionStarted { session_id, model, cwd } => {
@@ -76,16 +108,38 @@ impl AgentSessionState {
                     call.result = Some((content.clone(), *is_error));
                 }
             }
-            AgentEvent::TurnFinished { is_error, .. } => {
-                self.status = SessionStatus::Finished { is_error: *is_error };
+            AgentEvent::TurnFinished { .. } => {
+                // v2 semantic change from v1: a finished turn does NOT end the conversation --
+                // the process stays alive for more turns. Only ProcessExited ends the session
+                // now. This also correctly handles an interrupted turn's error_during_execution
+                // result: it clears turn_in_progress without flipping the whole session to
+                // Finished, since the conversation is still alive.
+                self.turn_in_progress = false;
+            }
+            AgentEvent::PermissionRequest { request_id, tool_name, input, source } => {
+                // Push, never overwrite: concurrent requests (several `tool_use` blocks in one
+                // assistant message) must all stay answerable -- see `pending_permissions`' doc.
+                self.pending_permissions.push(PermissionRequestRecord {
+                    request_id: request_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                    source: *source,
+                });
+            }
+            AgentEvent::ControlResponse { .. } => {
+                // Purely observational in v2: a control_response only ever acknowledges a
+                // control_request THIS crate itself initiated (e.g. `interrupt`) -- the CLI
+                // never sends one back for OUR OWN answer to ITS can_use_tool request (that
+                // answer IS a control_response we send, not something acknowledged in turn).
+                // So there is no case where an incoming ControlResponse should remove an entry
+                // from pending_permissions -- that removal happens immediately inside
+                // AgentSession::respond_permission instead, for both PermissionSource variants
+                // alike. No state effect here, same as Thinking/RateLimit/Unknown.
             }
             AgentEvent::ProcessExited { success } => {
                 // Only meaningful if the process died WITHOUT ever having emitted a
-                // `TurnFinished` (abnormal/failed exit -- crash, bad `--resume` id, auth
-                // failure, spawn-then-die). If `TurnFinished` already arrived and set
-                // `Finished`, this is redundant -- leave the existing (possibly
-                // `is_error: false`) status alone rather than let a late `ProcessExited`
-                // overwrite a normal finish.
+                // `TurnFinished` that ended things (which no `TurnFinished` does anymore in v2)
+                // -- this is genuinely the only path that ends a session now.
                 if matches!(self.status, SessionStatus::Starting | SessionStatus::Running) {
                     self.status = SessionStatus::Finished { is_error: !*success };
                 }
@@ -94,69 +148,102 @@ impl AgentSessionState {
             | AgentEvent::RateLimit { .. }
             | AgentEvent::Unknown { .. }
             | AgentEvent::ProcessStderr { .. } => {
-                // No state effect in v1 -- these are observable via the raw event log
-                // (`AgentSession::event_log`) if a future caller needs them.
+                // No state effect -- these are observable via `AgentSession::event_log` if
+                // needed.
             }
         }
     }
+
+    /// The unanswered permission request with this `request_id`, if it is still pending. What
+    /// `AgentSession::respond_permission` uses to find the channel a given request arrived on;
+    /// also the natural way for a UI to redraw one specific approve/deny card.
+    pub fn find_pending_permission(&self, request_id: &str) -> Option<&PermissionRequestRecord> {
+        self.pending_permissions.iter().find(|p| p.request_id == request_id)
+    }
+
+    /// Removes and returns the unanswered permission request with this `request_id`, leaving every
+    /// other pending request untouched. Returns `None` if it was already answered or never
+    /// existed. This is the removal half of `AgentSession::respond_permission` -- which only calls
+    /// it once the decision has genuinely been written, so a failed write leaves the request
+    /// pending and still answerable rather than silently dropping it.
+    pub fn take_pending_permission(&mut self, request_id: &str) -> Option<PermissionRequestRecord> {
+        let index = self.pending_permissions.iter().position(|p| p.request_id == request_id)?;
+        Some(self.pending_permissions.remove(index))
+    }
 }
 
+/// A whole live conversation: owns the long-lived `AgentProcess`, pumps its events through the
+/// pure `AgentSessionState` reducer, and keeps a full raw `event_log` alongside the reduced
+/// state (a future `agent-ui` may want the raw stream, e.g. to render every assistant text chunk
+/// as it arrived, not just the reducer's flattened projection).
 pub struct AgentSession {
     process: AgentProcess,
     pub state: AgentSessionState,
     event_log: Vec<AgentEvent>,
-    /// The session id `agent` itself asked the CLI to use (via `--session-id`/`--resume`),
-    /// recorded from the `SpawnMode` passed to `start` -- in both `New` and `Resume` cases we
-    /// already know what UUID we asked for. Used only for the defensive cross-check in `pump()`;
-    /// never treated as anything other than a diagnostic (see this plan's Global Constraint:
-    /// session identity is caller-assigned, never scraped from the CLI's own output).
-    expected_session_id: Uuid,
 }
 
 impl AgentSession {
-    pub fn start(prompt: &str, mode: SpawnMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
-        let expected_session_id = mode.session_id();
-        let process = AgentProcess::spawn(prompt, mode, disallowed_tools)?;
-        Ok(Self {
-            process,
-            state: AgentSessionState::default(),
-            event_log: Vec::new(),
-            expected_session_id,
-        })
+    /// Spawns the underlying `AgentProcess` for a whole conversation. See
+    /// `AgentProcess::spawn`'s own doc for what `project_dir`/`mode`/`disallowed_tools` mean.
+    pub fn start(project_dir: &Path, mode: PermissionMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
+        let process = AgentProcess::spawn(project_dir, mode, disallowed_tools)?;
+        Ok(Self { process, state: AgentSessionState::default(), event_log: Vec::new() })
     }
 
-    /// Convenience constructor for starting a brand-new session: generates a fresh
-    /// `Uuid::new_v4()` internally and returns it alongside the session, since the caller needs
-    /// that UUID later to `--resume`. The lower-level `start` remains available for tests wanting
-    /// a specific, deterministic UUID, and is still required for `SpawnMode::Resume` (which
-    /// always needs an explicit prior UUID).
-    pub fn start_new(prompt: &str, disallowed_tools: &[&str]) -> std::io::Result<(Self, Uuid)> {
-        let session_id = Uuid::new_v4();
-        let session = Self::start(prompt, SpawnMode::New { session_id }, disallowed_tools)?;
-        Ok((session, session_id))
-    }
-
-    /// Drains whatever's newly arrived from the underlying process, folds each event into
-    /// `state`, appends it to the in-memory log, and returns an owned copy of just the events
-    /// that were new this call (empty if nothing arrived).
+    /// Writes one user turn to the underlying process and marks `state.turn_in_progress`. See
+    /// `AgentProcess::send_turn`'s own doc for the caller's responsibility around turn ordering.
     ///
-    /// Returns an owned `Vec` rather than a slice borrowing `self`: the natural consumer pattern
-    /// (`for ev in sess.pump() { render(ev, &sess.state) }`, reading `sess.state` -- already
-    /// updated by `apply()` -- while iterating the events that produced it) fails to borrow-check
-    /// against `&[AgentEvent]`, since that slice keeps `self` borrowed for as long as it's alive,
-    /// conflicting with the second access to `self.state` in the same scope. Every event is still
-    /// appended to `self.event_log` as before for the durable history.
+    /// `turn_in_progress` is only set once the write has actually succeeded: setting it first
+    /// meant a failed write (a dead process, a closed stdin) left the flag stuck `true` forever,
+    /// since nothing but a `TurnFinished` for a turn that never started could ever clear it again.
+    pub fn send_turn(&mut self, text: &str) -> std::io::Result<()> {
+        self.process.send_turn(text)?;
+        self.state.turn_in_progress = true;
+        Ok(())
+    }
+
+    /// Sends a real interrupt control_request. See `AgentProcess::interrupt`'s own doc.
+    pub fn interrupt(&mut self) -> std::io::Result<uuid::Uuid> {
+        self.process.interrupt()
+    }
+
+    /// Answers one specific pending permission request, looked up by `request_id` in
+    /// `self.state.pending_permissions` and routed via that request's own recorded `source` --
+    /// callers don't need to separately track which channel a request arrived on, unlike
+    /// `AgentProcess::respond_permission`. Removes *only* that entry once the answer is
+    /// successfully sent, leaving any other concurrently-pending request (a second `tool_use`
+    /// block in the same assistant message, say) exactly as answerable as it was before. Returns
+    /// `ErrorKind::NotFound` if no pending request carries that id.
+    ///
+    /// Removal happens immediately on a successful send, for BOTH sources alike: unlike
+    /// `interrupt`, there is no later incoming event that ever acknowledges this crate's own
+    /// answer to a permission request (a `HookRelay` answer goes out over that request's socket
+    /// connection and the CLI just proceeds; a `CanUseTool` answer IS itself the control_response
+    /// -- nothing comes back to confirm it landed). An earlier draft of this reducer wrongly tried
+    /// to clear the pending request from an incoming `ControlResponse` event instead -- that event
+    /// never arrives for a `CanUseTool` answer, which would have left it pending forever; see
+    /// `AgentSessionState::apply`'s `ControlResponse` arm for the corrected reasoning.
+    pub fn respond_permission(&mut self, request_id: &str, allow: bool, reason: Option<&str>) -> std::io::Result<()> {
+        let Some(source) = self.state.find_pending_permission(request_id).map(|p| p.source) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no pending permission request with id {request_id}"),
+            ));
+        };
+        self.process.respond_permission(request_id, source, allow, reason)?;
+        // Only after the decision genuinely went out -- a failed write leaves it pending and
+        // answerable again, rather than dropping a request nothing ever answered.
+        self.state.take_pending_permission(request_id);
+        Ok(())
+    }
+
+    /// Non-blocking drain: pulls whatever events have arrived from the underlying process since
+    /// the last call, folds each into `state` via the reducer, appends each to `event_log`, and
+    /// returns the same batch to the caller (mirroring `AgentProcess::poll_events`'s shape, so a
+    /// future GTK tick callback can call this every frame with no redesign needed).
     pub fn pump(&mut self) -> Vec<AgentEvent> {
         let mut new_events = Vec::new();
         for event in self.process.poll_events() {
-            if let AgentEvent::SessionStarted { session_id, .. } = &event {
-                if session_id != &self.expected_session_id.to_string() {
-                    eprintln!(
-                        "[agent] session id mismatch: requested {}, CLI reported {session_id}",
-                        self.expected_session_id
-                    );
-                }
-            }
             self.state.apply(&event);
             self.event_log.push(event.clone());
             new_events.push(event);
@@ -168,21 +255,21 @@ impl AgentSession {
         &self.event_log
     }
 
-    /// The underlying `claude` child process's OS pid -- delegates to
-    /// [`AgentProcess::pid`](crate::process::AgentProcess::pid). Exists so a caller holding only
-    /// an `AgentSession` handle (e.g. a future `agent-ui`) can check process liveness/identity
-    /// without reaching into a private field.
-    pub fn pid(&mut self) -> u32 {
+    pub fn pid(&self) -> u32 {
         self.process.pid()
     }
 
-    /// True once the underlying `claude` child process has exited -- delegates to
-    /// [`AgentProcess::has_exited`](crate::process::AgentProcess::has_exited).
     pub fn has_exited(&mut self) -> bool {
         self.process.has_exited()
     }
 
     pub fn shutdown(&mut self) {
         self.process.shutdown();
+        // `AgentProcess::shutdown` already released every live hook connection (denying and
+        // dropping each); clear the state-level records to match, so a caller (e.g. a future
+        // agent-ui) doesn't keep rendering approve/deny cards for requests that can no longer
+        // ever be genuinely answered -- answering one now would silently no-op (the transport
+        // side is already gone) rather than deliver anything.
+        self.state.pending_permissions.clear();
     }
 }
