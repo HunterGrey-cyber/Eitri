@@ -5,6 +5,8 @@ mod agent_placeholder;
 mod chrome;
 mod layout;
 mod theme;
+#[allow(dead_code)]
+mod lua;
 
 use gtk4::glib;
 use gtk4::prelude::*;
