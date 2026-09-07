@@ -8,3 +8,4 @@ publish.workspace = true
 neovide-editor = { path = "../neovide-editor" }
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
 webkit6 = "0.6"
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
