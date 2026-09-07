@@ -1,0 +1,1 @@
+{"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_01BNd1uugPz7giUUePqgCeyD", "type": "tool_result", "content": "hi", "is_error": false}]}, "session_id": "d458598d-0c10-4f26-ab8a-6302bc9e0b35"}

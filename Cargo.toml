@@ -11,6 +11,7 @@ members = [
     "poc/webkit_pane",
     "neovide-editor",
     "shell",
+    "agent",
 ]
 
 [workspace.package]
