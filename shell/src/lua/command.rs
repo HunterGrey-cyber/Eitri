@@ -14,7 +14,12 @@ pub(crate) struct CommandEntry {
     #[allow(dead_code)] // read by a future command-palette UI; not consumed by this plan
     pub(crate) title: String,
     pub(crate) keybinding: Option<String>,
-    pub(crate) action: RegistryKey,
+    // `Rc<RegistryKey>`, not a bare `RegistryKey`: `RegistryKey` doesn't implement `Clone`
+    // (verified against the installed mlua 0.12.1's `src/types/registry_key.rs`), and
+    // `LuaEngine::invoke_command` needs to clone the handle *out* of a borrowed
+    // `CommandRegistry` before dropping that borrow, to avoid a reentrant `BorrowMutError` if
+    // the action itself calls `neovibe.command.register(...)`.
+    pub(crate) action: Rc<RegistryKey>,
 }
 
 #[derive(Default)]
@@ -52,7 +57,7 @@ pub(crate) fn install(
         let action_key = lua.create_registry_value(action)?;
         registry
             .borrow_mut()
-            .register(id, CommandEntry { title, keybinding, action: action_key });
+            .register(id, CommandEntry { title, keybinding, action: Rc::new(action_key) });
         Ok(())
     })?;
     command_table.set("register", register_fn)?;
@@ -113,5 +118,52 @@ mod tests {
         .unwrap();
 
         assert!(registry.borrow().get("no-key").unwrap().keybinding.is_none());
+    }
+
+    /// Regression test for the reentrancy panic the final review reproduced: a command action
+    /// that itself calls `neovibe.command.register(...)` -- registering another command from
+    /// inside a command's own action -- must not panic with `BorrowMutError`. This mirrors
+    /// `LuaEngine::invoke_command`'s own borrow/call sequence rather than going through
+    /// `LuaEngine` directly, since this module (unlike `LuaEngine`) needs no display and is
+    /// fully unit-testable on its own.
+    #[test]
+    fn action_that_registers_another_command_does_not_panic() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        lua.load(
+            r#"
+            neovibe.command.register({
+                id = "first",
+                title = "First",
+                action = function()
+                    neovibe.command.register({
+                        id = "second",
+                        title = "Second",
+                        action = function() end,
+                    })
+                end,
+            })
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Mirror `LuaEngine::invoke_command`'s clone-out-then-call pattern: resolve the action
+        // under a scoped borrow, drop the borrow, then call it. Before the fix (a bare
+        // `RegistryKey` resolved and called while still holding `registry.borrow()`), the
+        // action's own `neovibe.command.register` call would panic with `BorrowMutError`.
+        let action = {
+            let commands = registry.borrow();
+            let entry = commands.get("first").expect("command should be registered");
+            entry.action.clone()
+        };
+        let f: mlua::Function = lua.registry_value(&action).unwrap();
+        f.call::<()>(()).unwrap();
+
+        assert!(registry.borrow().get("second").is_some());
     }
 }

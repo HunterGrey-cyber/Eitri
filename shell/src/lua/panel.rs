@@ -93,12 +93,29 @@ pub(crate) fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
     Ok(ParsedPanelSpec { id, title, slot, url })
 }
 
+/// True if `raw` already begins with a URI scheme (`data:`, `file:`, `http:`, `https:`, ...) --
+/// i.e. an alphanumeric (plus `+`/`-`/`.`) prefix followed by `:`, per RFC 3986's scheme
+/// grammar. Deliberately not limited to schemes that also have a `//` authority component
+/// (`file://`, `http://`): `data:` URIs have no authority at all (`data:text/html,<h1>...`),
+/// so a `raw.contains("://")` check alone misses them and wrongly treats them as a relative
+/// filename -- found via sandbox verification (a `data:text/html,...` panel URL from
+/// `neovibe.panel.register` resolved to a bogus `file://<config_dir>/panels/data:text/html,...`
+/// path instead of being used as-is).
+fn has_uri_scheme(raw: &str) -> bool {
+    match raw.find(':') {
+        Some(colon_idx) if colon_idx > 0 => raw[..colon_idx]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')),
+        _ => false,
+    }
+}
+
 /// Resolves a Lua-registered webview panel's `url` field against `<config_dir>/panels/`, per
 /// the plugin-loading convention (`~/.config/neovibe/panels/*.html`). A bare relative filename
-/// resolves there; anything containing a URI scheme (`file://`, `http://`, `https://`) or
-/// starting with `/` is used exactly as given.
+/// resolves there; anything already carrying a URI scheme (`data:`, `file://`, `http://`,
+/// `https://`, ...) or starting with `/` is used exactly as given.
 pub(crate) fn resolve_panel_url(config_dir: &std::path::Path, raw: &str) -> String {
-    if raw.contains("://") || raw.starts_with('/') {
+    if has_uri_scheme(raw) || raw.starts_with('/') {
         raw.to_string()
     } else {
         let path = config_dir.join("panels").join(raw);
@@ -210,5 +227,14 @@ mod tests {
         let dir = std::path::Path::new("/home/example/.config/neovibe");
         assert_eq!(resolve_panel_url(dir, "https://example.com"), "https://example.com");
         assert_eq!(resolve_panel_url(dir, "/tmp/x.html"), "/tmp/x.html");
+    }
+
+    #[test]
+    fn resolve_panel_url_passes_through_data_uris() {
+        // `data:` URIs have no `//` authority component (unlike `file://`/`http://`), so they
+        // need their own scheme-aware check -- found broken via sandbox verification (task 8).
+        let dir = std::path::Path::new("/home/example/.config/neovibe");
+        let raw = "data:text/html,<h1>plugin panel</h1>";
+        assert_eq!(resolve_panel_url(dir, raw), raw);
     }
 }
