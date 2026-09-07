@@ -52,7 +52,7 @@ pub(crate) fn build_content_area(editor: &gtk4::Widget, agent: &gtk4::Widget) ->
 /// WebView gone -- for the entire held-and-moving duration of a drag, snapping back only once
 /// motion paused or the button was released. (`Paned::position()` itself tracked the real cursor
 /// throughout the hidden period, which is exactly why it always self-corrected instead of getting
-/// stuck.) See `MANUAL_VERIFICATION.md` and `docs/neovibe_feasibility_status.md`'s P7 section for
+/// stuck.) See `MANUAL_VERIFICATION.md` and `docs/canonical/neovibe_feasibility_status.md`'s P7 section for
 /// the full repro/root-cause writeup.
 ///
 /// This version never touches `agent`'s visibility, and never lets `agent` itself be a real,

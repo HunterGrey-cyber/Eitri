@@ -1,5 +1,5 @@
 //! Minimal placeholder implementation of the `Theme` struct described in
-//! `docs/neovibe_architecture_summary.md` §4 ("统一视觉系统").
+//! `docs/canonical/neovibe_architecture_summary.md` §4 ("统一视觉系统").
 //!
 //! This is a throwaway feasibility-probe palette, not a real design system.
 //! The same `Theme` shape is meant to eventually also drive the Neovim theme

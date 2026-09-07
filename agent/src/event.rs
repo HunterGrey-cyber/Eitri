@@ -1,6 +1,6 @@
 //! Provider-neutral events this crate produces from the real Claude CLI wire protocol. UI code
 //! (a future `agent-ui`) should only ever see these -- never the raw wire JSON, per this
-//! project's own architecture decision (docs/neovibe_architecture_decisions.md §5) and the
+//! project's own architecture decision (docs/canonical/neovibe_architecture_decisions.md §5) and the
 //! early design assessment's core recommended pattern:
 //! `wire protocol -> provider adapter -> agent::Event -> session state -> (future) UI`.
 

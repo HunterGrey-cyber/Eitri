@@ -1,5 +1,5 @@
 //! The shell's embedded Lua extension kernel -- a separate, independent runtime from Neovim's
-//! own internal Lua (see docs/neovibe_architecture_decisions.md §3). Exposes exactly four v1
+//! own internal Lua (see docs/canonical/neovibe_architecture_decisions.md §3). Exposes exactly four v1
 //! extension points under a `neovibe` global table: `panel.register`, `command.register`, `on`,
 //! `config.get`/`config.set`.
 
