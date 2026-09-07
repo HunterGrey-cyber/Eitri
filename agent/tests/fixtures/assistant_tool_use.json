@@ -1,0 +1,1 @@
+{"type": "assistant", "message": {"model": "claude-sonnet-5", "id": "msg_011Cep1ZiGBQC6zU1bTsA7cQ", "type": "message", "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_01BNd1uugPz7giUUePqgCeyD", "name": "Bash", "input": {"command": "echo hi", "description": "Echo \"hi\" to stdout"}, "caller": {"type": "direct"}}], "stop_reason": null}}
