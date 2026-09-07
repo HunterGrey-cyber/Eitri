@@ -13,7 +13,7 @@ pub(crate) use command::{CommandEntry, CommandRegistry};
 #[allow(unused_imports)]
 pub(crate) use panel::{PanelEntry, PanelRegistry, PanelSlot};
 
-use mlua::Lua;
+use mlua::{Lua, Value};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -44,6 +44,10 @@ impl LuaEngine {
         lua.globals().set("neovibe", neovibe)?;
 
         Ok(Self { lua, panels, commands, events, config })
+    }
+
+    pub(crate) fn emit(&self, event_name: &str) {
+        event::emit(&self.lua, &self.events.borrow(), event_name, Value::Nil);
     }
 }
 
