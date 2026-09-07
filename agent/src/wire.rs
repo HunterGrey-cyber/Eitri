@@ -6,7 +6,7 @@
 //! `agent/tests/fixtures/*.json` for the exact (trimmed but real) captured lines this module's
 //! own tests parse.
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, PermissionSource};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -67,11 +67,38 @@ struct UserLine {
 
 #[derive(Deserialize)]
 struct ResultLine {
+    #[serde(default)]
     result: String,
     is_error: bool,
     stop_reason: Option<String>,
     total_cost_usd: f64,
     num_turns: u32,
+}
+
+#[derive(Deserialize)]
+struct ControlRequestLine {
+    request_id: String,
+    request: ControlRequestBody,
+}
+
+#[derive(Deserialize)]
+struct ControlRequestBody {
+    subtype: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ControlResponseLine {
+    response: ControlResponseBody,
+}
+
+#[derive(Deserialize)]
+struct ControlResponseBody {
+    request_id: String,
+    subtype: String,
 }
 
 /// Parses one line of the CLI's newline-delimited `stream-json` stdout into zero or more
@@ -165,6 +192,33 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
             Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
         },
         "rate_limit_event" => vec![AgentEvent::RateLimit { raw }],
+        "control_request" => match serde_json::from_value::<ControlRequestLine>(raw.clone()) {
+            Ok(cr) if cr.request.subtype == "can_use_tool" => {
+                vec![AgentEvent::PermissionRequest {
+                    request_id: cr.request_id,
+                    tool_name: cr.request.tool_name.unwrap_or_default(),
+                    input: cr.request.input.unwrap_or(Value::Null),
+                    source: PermissionSource::CanUseTool,
+                }]
+            }
+            // Every other control_request subtype (interrupt acks are control_RESPONSEs, not
+            // requests the CLI sends us; this arm is for CLI-initiated control_requests other
+            // than can_use_tool, e.g. hook_callback) is preserved raw, never acted on.
+            Ok(cr) => vec![AgentEvent::Unknown {
+                kind: "control_request".into(),
+                subtype: Some(cr.request.subtype),
+                raw,
+            }],
+            Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+        },
+        "control_response" => match serde_json::from_value::<ControlResponseLine>(raw.clone()) {
+            Ok(cr) => vec![AgentEvent::ControlResponse {
+                request_id: cr.response.request_id,
+                subtype: cr.response.subtype,
+                raw,
+            }],
+            Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+        },
         other => vec![AgentEvent::Unknown { kind: other.to_string(), subtype: envelope.subtype, raw }],
     }
 }

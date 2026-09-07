@@ -1,4 +1,4 @@
-use agent::{translate_line, AgentEvent};
+use agent::{translate_line, AgentEvent, PermissionSource};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR")))
@@ -128,5 +128,42 @@ fn a_line_with_a_hook_subtype_this_crate_does_not_model_becomes_unknown() {
             assert_eq!(subtype.as_deref(), Some("hook_started"));
         }
         other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+#[test]
+fn control_response_becomes_control_response_event() {
+    let events = translate_line(fixture("v2_control_response_interrupt.json").trim());
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        AgentEvent::ControlResponse { request_id, subtype, .. } => {
+            assert_eq!(request_id, "int-1");
+            assert_eq!(subtype, "success");
+        }
+        other => panic!("expected ControlResponse, got {other:?}"),
+    }
+}
+
+#[test]
+fn interrupted_result_still_becomes_turn_finished_with_error() {
+    let events = translate_line(fixture("v2_result_interrupted.json").trim());
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        AgentEvent::TurnFinished { is_error, .. } => assert!(*is_error),
+        other => panic!("expected TurnFinished, got {other:?}"),
+    }
+}
+
+#[test]
+fn can_use_tool_control_request_becomes_permission_request_with_can_use_tool_source() {
+    let events = translate_line(fixture("v2_control_request_can_use_tool.json").trim());
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        AgentEvent::PermissionRequest { request_id, tool_name, source, .. } => {
+            assert_eq!(request_id, "ctu-1");
+            assert_eq!(tool_name, "Bash");
+            assert_eq!(*source, PermissionSource::CanUseTool);
+        }
+        other => panic!("expected PermissionRequest, got {other:?}"),
     }
 }
