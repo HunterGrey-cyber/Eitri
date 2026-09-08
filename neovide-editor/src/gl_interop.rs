@@ -24,6 +24,24 @@ pub(crate) struct SkiaState {
 }
 
 impl SkiaState {
+    /// Invalidates Skia's cached GL state. Call at the start of every render callback, before
+    /// drawing.
+    ///
+    /// GTK shares this GL context and can change its state between callbacks. On resize,
+    /// `gtk_gl_area_allocate_buffers()` leaves the new framebuffer texture bound to texture
+    /// unit 0. Skia may still cache its glyph atlas as bound there and skip `glBindTexture`,
+    /// causing glyph quads to sample the opaque framebuffer texture and render as solid blocks.
+    /// Idle render gating can leave that bad frame visible until input arrives.
+    ///
+    /// Reset on every frame because nvim's resize response and grid repaint arrive
+    /// asynchronously, after the frame that rebuilt the surface. Resetting only that frame
+    /// misses later repaint frames. A full reset also covers framebuffer, program, and blend
+    /// state that GTK can change. The measured reset cost is about 1-4 us in a roughly 3 ms
+    /// render callback.
+    pub(crate) fn invalidate_cached_gl_state(&mut self) {
+        self.gr_context.reset(None);
+    }
+
     pub(crate) fn ensure_surface(&mut self) {
         if self.surface.is_some() {
             return;
