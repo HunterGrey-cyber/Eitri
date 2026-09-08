@@ -13,9 +13,9 @@ gtk4 = { version = "0.11.4", features = ["v4_18"] }
 libloading = "0.9.0"
 skia-safe = { version = "0.153.3", features = ["gl"] }
 
-# The patched Neovide fork (sibling repo, branch `neovibe-integration`), depended on via its
-# `neovide` library target (see /home/user/src/neovide/Cargo.toml `[lib] name =
-# "neovide"` — same name as the `[package]`, no rename). Pulls in `neovide::live_harness::LiveHarness`
+# The patched Neovide fork (branch `neovibe-integration`), depended on via its `neovide` library
+# target (same name as the `[package]`, no rename). Pulls in `neovide::live_harness::LiveHarness`
 # (P2's real-`nvim --embed` counterpart to P1's `neovide::demo_harness::DemoHarness`) and
-# `neovide::units::PixelRect`.
+# `neovide::units::PixelRect`. Pinned via `rev` rather than a local path or a live branch track --
+# see neovide-editor/Cargo.toml's identical dependency for why.
 neovide = { path = "../../neovide" }

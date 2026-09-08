@@ -11,4 +11,10 @@ name = "neovide_editor"
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
 libloading = "0.9.0"
 skia-safe = { version = "0.153.3", features = ["gl"] }
+# The patched Neovide fork (branch `neovibe-integration`), pinned to a real commit rather than
+# tracking the branch live -- this project's own `neovibe_architecture_decisions.md` §13
+# constraint keeps this fork's divergence scoped to surface/geometry/input-adapter/
+# renderer-viewport concerns, so pinning matters: an unreviewed later commit on the branch
+# should never silently change what a `cargo build` here actually compiles against. Bump the
+# `rev` deliberately (and re-verify) when the fork gains something this crate needs.
 neovide = { path = "../neovide" }
