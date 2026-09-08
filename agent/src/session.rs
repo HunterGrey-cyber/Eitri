@@ -204,7 +204,14 @@ impl AgentSession {
 
     /// Sends a real interrupt control_request. See `AgentProcess::interrupt`'s own doc.
     pub fn interrupt(&mut self) -> std::io::Result<uuid::Uuid> {
-        self.process.interrupt()
+        let result = self.process.interrupt();
+        // AgentProcess::interrupt now releases every pending hook connection (denying each) as
+        // part of stopping the turn -- clear the state-level records to match, mirroring
+        // shutdown()'s identical reasoning: a request that can no longer ever be genuinely
+        // answered must not keep rendering an approve/deny card that would silently no-op if
+        // clicked.
+        self.state.pending_permissions.clear();
+        result
     }
 
     /// Answers one specific pending permission request, looked up by `request_id` in

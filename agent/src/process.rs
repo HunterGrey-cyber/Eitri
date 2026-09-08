@@ -489,6 +489,17 @@ impl AgentProcess {
     /// Sends a real interrupt control_request. Returns the generated request_id so the caller
     /// can recognize the matching `AgentEvent::ControlResponse` when it arrives -- `agent` does
     /// not correlate this internally (see the spec's "No internal request/response correlation").
+    ///
+    /// Also releases every pending hook connection (see `release_pending_hook_connections`),
+    /// regardless of whether the stdin write itself succeeds -- this is the real fix for a real
+    /// stall found via `agent-ui`'s own Task 8 sandbox verification (see
+    /// `shell/MANUAL_VERIFICATION.md`'s "agent-ui verification" section): if a `PreToolUse`
+    /// permission request was still pending at the moment `interrupt()` was called, the CLI is
+    /// parked inside the synchronous hook subprocess call and cannot service a buffered interrupt
+    /// control_request on its own stdin, so the turn (and any subsequent interrupt) would
+    /// otherwise stall for the CLI's full 600s hook timeout. A request from the turn being
+    /// interrupted can never be genuinely answered either way once the caller has asked to stop,
+    /// so releasing it here mirrors `shutdown()`'s identical reasoning exactly.
     pub fn interrupt(&mut self) -> std::io::Result<Uuid> {
         let request_id = Uuid::new_v4();
         let payload = serde_json::json!({
@@ -496,13 +507,24 @@ impl AgentProcess {
             "request_id": request_id.to_string(),
             "request": { "subtype": "interrupt", "cancel_queued": true },
         });
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)"))?;
-        writeln!(stdin, "{payload}")?;
-        stdin.flush()?;
-        Ok(request_id)
+        let write_result = (|| -> std::io::Result<()> {
+            let stdin = self.stdin.as_mut().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)")
+            })?;
+            writeln!(stdin, "{payload}")?;
+            stdin.flush()
+        })();
+
+        // Release every pending hook connection regardless of whether the interrupt write itself
+        // succeeded: a permission request from the turn being interrupted can never be genuinely
+        // answered either way once the caller has asked to stop, and leaving `agent-hook` blocked
+        // in `read_line` for the CLI's full 600s hook timeout is exactly the stall this closes --
+        // found via agent-ui's real Task 8 sandbox verification (see
+        // shell/MANUAL_VERIFICATION.md's "agent-ui verification" section). Mirrors shutdown()'s
+        // identical reasoning exactly.
+        release_pending_hook_connections(&self.pending_hook_connections);
+
+        write_result.map(|()| request_id)
     }
 
     /// Answers a pending `PermissionRequest`, routing based on `source`. For `HookRelay`, writes

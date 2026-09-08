@@ -6,7 +6,8 @@
 
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionSource {
     /// Arrived over the per-conversation `agent-hook` Unix socket — the primary, reliable path.
     HookRelay,
@@ -16,7 +17,8 @@ pub enum PermissionSource {
     CanUseTool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// The CLI's own `system`/`init` line -- fired once, first, at the start of every
     /// invocation (fresh session or `--resume`).
