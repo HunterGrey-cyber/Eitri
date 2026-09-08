@@ -48,6 +48,15 @@ struct Args {
     steps: u32,
     screen_w: u32,
     screen_h: u32,
+    /// Total press/release cycles to emit at (x1, y1). `1` (the default) is the original
+    /// behavior. `2`/`3` produce a real double/triple click -- all cycles delivered over one
+    /// already-open Wayland connection, which is the point: two separate invocations of this
+    /// binary pay process startup + connection setup between them, which can push the gap past
+    /// Neovim's own `'mousetime'` (500 ms) multi-click window and make a genuine negative result
+    /// indistinguishable from a tooling artifact.
+    clicks: u32,
+    /// Gap between the release of one click and the press of the next, in ms.
+    click_gap_ms: u64,
 }
 
 const BTN_LEFT: u32 = 0x110;
@@ -58,7 +67,13 @@ fn usage() -> ! {
     eprintln!(
         "usage: wlr-vptr-drag <x1> <y1> <x2> <y2> \
          [--button left|right|middle] [--hold-ms N] [--steps N] \
-         [--screen-w W] [--screen-h H]\n\n\
+         [--clicks N] [--click-gap-ms N] [--screen-w W] [--screen-h H]\n\n\
+         --clicks N emits N press/release cycles at (x1, y1) over one open \
+         connection before the final one drags to (x2, y2) -- pass \
+         --clicks 2/3 with x1==x2, y1==y2 and --steps 1 for a real \
+         double/triple click. Doing it in-process matters: two separate \
+         invocations pay process + connection startup between them, which \
+         can exceed Neovim's own 'mousetime' multi-click window.\n\n\
          Requires $WAYLAND_DISPLAY to be set explicitly -- this tool refuses \
          to fall back to a default socket, since it exists specifically to \
          avoid ever accidentally targeting the real desktop session. Point \
@@ -86,6 +101,8 @@ fn parse_args() -> Args {
     let mut steps = 10u32;
     let mut screen_w = 1280u32;
     let mut screen_h = 720u32;
+    let mut clicks = 1u32;
+    let mut click_gap_ms = 40u64;
 
     let mut it = env::args().skip(1);
     while let Some(a) = it.next() {
@@ -101,6 +118,10 @@ fn parse_args() -> Args {
             }
             "--hold-ms" => hold_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--steps" => steps = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            "--clicks" => clicks = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            "--click-gap-ms" => {
+                click_gap_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())
+            }
             "--screen-w" => screen_w = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--screen-h" => screen_h = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
@@ -122,6 +143,8 @@ fn parse_args() -> Args {
         steps: steps.max(1),
         screen_w,
         screen_h,
+        clicks: clicks.max(1),
+        click_gap_ms,
     }
 }
 
@@ -193,8 +216,8 @@ fn main() -> ExitCode {
     };
 
     eprintln!(
-        "drag: ({}, {}) -> ({}, {}) button=0x{:x} steps={} hold_ms={} screen={}x{}",
-        args.x1, args.y1, args.x2, args.y2, args.button, args.steps, args.hold_ms, args.screen_w, args.screen_h
+        "drag: ({}, {}) -> ({}, {}) button=0x{:x} steps={} hold_ms={} clicks={} screen={}x{}",
+        args.x1, args.y1, args.x2, args.y2, args.button, args.steps, args.hold_ms, args.clicks, args.screen_w, args.screen_h
     );
 
     // 1. Move to the start position and settle there before pressing --
@@ -203,6 +226,18 @@ fn main() -> ExitCode {
     pointer.motion_absolute(now_ms(start), args.x1, args.y1, args.screen_w, args.screen_h);
     pointer.frame();
     flush_and_wait(&mut queue, &mut state, 30);
+
+    // 1b. Any leading clicks of a multi-click gesture -- all but the last, which is the
+    //     press/drag/release below. Emitted over this same open connection so the gap between
+    //     them is only `--click-gap-ms`, not that plus process startup.
+    for _ in 1..args.clicks {
+        pointer.button(now_ms(start), args.button, wl_pointer::ButtonState::Pressed);
+        pointer.frame();
+        flush_and_wait(&mut queue, &mut state, args.click_gap_ms.min(20).max(5));
+        pointer.button(now_ms(start), args.button, wl_pointer::ButtonState::Released);
+        pointer.frame();
+        flush_and_wait(&mut queue, &mut state, args.click_gap_ms);
+    }
 
     // 2. Press.
     pointer.button(now_ms(start), args.button, wl_pointer::ButtonState::Pressed);

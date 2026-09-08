@@ -102,6 +102,23 @@ pub(crate) fn handle_mouse_button(
     y: f64,
     pressed: bool,
 ) {
+    // Clicking the editor must also *focus* it. GTK4 does not focus a plain widget on click the
+    // way it does a button (there is no focus-on-click behavior for a bare `GtkGLArea`), and
+    // pointer events are delivered by position regardless of who holds the keyboard focus -- so
+    // without this, a click here moves the Neovim cursor while the keyboard keeps going somewhere
+    // else entirely.
+    //
+    // **This closes a real, reproduced bug, not a hypothetical one.** It was invisible for as long
+    // as the editor was the only focusable widget in its window, which was true of every crate
+    // this code had been verified in before now. With `shell`'s agent panel now a real, focusable
+    // `WebView`, the 2026-09-08 sandbox pass caught it directly: click the composer, type, click
+    // back on the editor, type -- and the second batch of text went into the composer too, with
+    // the editor's own key controller seeing zero events. Done before the button lookup so that a
+    // click with a button this crate doesn't forward still restores focus.
+    if pressed && !gl_area.has_focus() {
+        gl_area.grab_focus();
+    }
+
     let Some(button) = gdk_button_to_button_text(gesture.current_button()) else {
         return;
     };
