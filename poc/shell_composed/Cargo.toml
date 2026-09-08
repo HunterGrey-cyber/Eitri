@@ -21,7 +21,8 @@ libloading = "0.9.0"
 skia-safe = { version = "0.153.3", features = ["gl"] }
 webkit6 = "0.6"
 
-# The patched Neovide fork (sibling repo, branch `neovibe-integration`), same path dependency
-# `neovide_embed_live` uses — consumed read-only via its existing `live_harness` module, the fork
-# itself is not modified.
+# The patched Neovide fork (branch `neovibe-integration`), same git dependency `neovide_embed_live`
+# uses — consumed read-only via its existing `live_harness` module, the fork itself is not
+# modified here. Pinned via `rev` rather than a local path or a live branch track -- see
+# neovide-editor/Cargo.toml's identical dependency for why.
 neovide = { path = "../../neovide" }
