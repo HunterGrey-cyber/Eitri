@@ -412,6 +412,13 @@ impl NeovideEditorPane {
                 }
 
                 let state = state_slot.as_mut().unwrap();
+                // Must come before anything draws this frame: GTK shares this GL context with us
+                // and rebinds textures behind Skia's back (on a resize in particular), which makes
+                // every glyph paint as a solid block until Skia is told to distrust its state
+                // cache. See `SkiaState::invalidate_cached_gl_state` for the full root-cause
+                // record and the measurements behind doing this every frame rather than only on
+                // resize frames.
+                state.invalidate_cached_gl_state();
                 state.ensure_surface();
 
                 let Some(surface) = state.surface.as_mut() else {

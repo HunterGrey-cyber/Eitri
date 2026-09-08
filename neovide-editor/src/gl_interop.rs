@@ -27,6 +27,41 @@ pub(crate) struct SkiaState {
 }
 
 impl SkiaState {
+    /// Tell Skia that the GL context's state was changed by someone else since the last frame, so
+    /// it must re-emit its own state instead of trusting its cache. **Call this at the top of
+    /// every render callback, before any drawing.**
+    ///
+    /// This is not a precaution -- it is the fix for a real, reproducible, long-standing rendering
+    /// bug (found 2026-09-07 via `shell`, root-caused 2026-09-08). `GrDirectContext` assumes it is
+    /// the only thing touching the underlying GL context and caches the GL state it has already
+    /// set, most importantly which texture is bound to which texture unit. That assumption does
+    /// not hold inside a `GtkGLArea`: GTK drives the very same GL context around our render
+    /// callback, and on any resize `gtk_gl_area_allocate_buffers()` creates the new colour texture
+    /// backing the area's framebuffer and leaves *it* bound to texture unit 0.
+    ///
+    /// Measured directly (`glGetIntegerv(GL_TEXTURE_BINDING_2D)` at the top of the render
+    /// callback): on an ordinary frame the unit-0 binding on entry is the same texture Skia left
+    /// bound on exit from the previous frame, but on a frame following a GTK buffer reallocation
+    /// it is GTK's *new* texture instead -- while Skia's cache still believes its own glyph atlas
+    /// is bound there. Skia therefore skips the `glBindTexture` it would otherwise emit, and every
+    /// glyph-mask draw samples GTK's opaque RGBA framebuffer texture instead of the A8 glyph
+    /// atlas. Full coverage everywhere inside each glyph's quad, so every character paints as a
+    /// solid block the exact shape of its bounding box, with no letterform detail -- and it
+    /// persists, because the idle-render gating added in P11 correctly stops issuing frames once
+    /// nothing is animating, leaving that one bad frame on screen until real input arrives.
+    ///
+    /// Evidence for why this is unconditional rather than resize-only: resetting only on the frame
+    /// that rebuilds the surface (i.e. only on the resize frame itself) was tested and did **not**
+    /// fix it (0/4 trials clean), because nvim answers the resize asynchronously and the frames
+    /// that repaint the newly-sized grid arrive later. Resetting on every frame does
+    /// (5/5 clean with the full reset here, 4/4 with the narrower `reset_gl_texture_bindings()`).
+    /// The cost measured over a scripted scroll workload is ~1-4us against a ~3ms render callback
+    /// -- roughly 0.1% -- so the wider, safer reset is used: GTK also owns the framebuffer binding
+    /// and can touch program/blend state, and those caches are equally stale for the same reason.
+    pub(crate) fn invalidate_cached_gl_state(&mut self) {
+        self.gr_context.reset(None);
+    }
+
     pub(crate) fn ensure_surface(&mut self) {
         if self.surface.is_some() {
             return;
