@@ -3386,9 +3386,12 @@ dependencies = [
 name = "shell"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "gtk4",
  "mlua",
  "neovide-editor",
+ "serde",
+ "serde_json",
  "webkit6",
 ]
 

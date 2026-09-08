@@ -486,9 +486,14 @@ impl AgentProcess {
         stdin.flush()
     }
 
-    /// Sends a real interrupt control_request. Returns the generated request_id so the caller
-    /// can recognize the matching `AgentEvent::ControlResponse` when it arrives -- `agent` does
-    /// not correlate this internally.
+    /// Sends an interrupt `control_request` and returns its generated `request_id`.
+    /// The caller matches the corresponding `AgentEvent::ControlResponse`; this layer does not
+    /// correlate requests and responses internally. Also releases every pending hook connection
+    /// through `release_pending_hook_connections`, even if writing to stdin fails.
+    /// A CLI waiting in a synchronous `PreToolUse` hook cannot read a buffered interrupt from stdin.
+    /// Releasing the pending request prevents a stall lasting the full 600 s hook timeout.
+    /// Once the caller asks to stop, the interrupted turn's permission requests no longer need
+    /// an answer, so this releases them just as `shutdown()` does.
     pub fn interrupt(&mut self) -> std::io::Result<Uuid> {
         let request_id = Uuid::new_v4();
         let payload = serde_json::json!({
@@ -496,13 +501,21 @@ impl AgentProcess {
             "request_id": request_id.to_string(),
             "request": { "subtype": "interrupt", "cancel_queued": true },
         });
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)"))?;
-        writeln!(stdin, "{payload}")?;
-        stdin.flush()?;
-        Ok(request_id)
+        let write_result = (|| -> std::io::Result<()> {
+            let stdin = self.stdin.as_mut().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)")
+            })?;
+            writeln!(stdin, "{payload}")?;
+            stdin.flush()
+        })();
+
+        // Release pending hook connections even if writing the interrupt failed.
+        // The interrupted turn's permission requests no longer need an answer after a stop request.
+        // Leaving `agent-hook` blocked in `read_line` can stall the CLI for its full 600 s hook timeout.
+        // Release them here for the same reason as in `shutdown()`.
+        release_pending_hook_connections(&self.pending_hook_connections);
+
+        write_result.map(|()| request_id)
     }
 
     /// Answers a pending `PermissionRequest`, routing based on `source`. For `HookRelay`, writes

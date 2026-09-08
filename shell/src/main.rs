@@ -1,7 +1,9 @@
 //! The shell window combines custom chrome, a two-pane layout, an embedded editor
-//! pane, and a placeholder panel for the agent UI.
+//! pane, and an agent panel. The agent panel hosts a frontend in a WebView and
+//! bridges it to a lazily started `agent::AgentSession`.
 
-mod agent_placeholder;
+mod agent_bridge;
+mod agent_panel;
 mod chrome;
 mod layout;
 mod theme;
@@ -60,7 +62,8 @@ fn build_ui(app: &Application, want_clean: bool) {
         PanelSlot::Main,
         PanelEntry { id: "editor".into(), title: "Editor".into(), widget: editor_widget },
     );
-    let agent_widget = agent_placeholder::build_placeholder_panel();
+    let (agent_widget, agent_panel_handle) =
+        agent_panel::build_agent_panel(std::env::current_dir().expect("cwd"));
     lua_engine.register_builtin_panel(
         PanelSlot::Side,
         PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget },
@@ -156,6 +159,13 @@ fn build_ui(app: &Application, want_clean: bool) {
     // `NeovimExited` was actually observed.
     window.connect_close_request(move |_window| {
         pane.shutdown();
+        // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never
+        // left the mode-selector screen) -- without this, a normal window close never runs
+        // `AgentSession::shutdown()` at all: the `Rc<RefCell<AgentPanelState>>` that owns the
+        // session is otherwise only reachable from closures internal to agent_panel.rs, none of
+        // which run on window close on their own. See `AgentPanelHandle`'s own doc for the full
+        // consequences (settings backup restore, hook socket cleanup, child SIGTERM) this closes.
+        agent_panel_handle.shutdown();
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
         // here is what keeps its `Rc` alive for the life of the window rather than dropping as
         // soon as `build_ui` returns -- nothing else in this function holds a reference past
@@ -167,7 +177,7 @@ fn build_ui(app: &Application, want_clean: bool) {
     });
 
     println!(
-        "shell running: chrome+editor+placeholder-agent-panel. scale_factor={} clean={}",
+        "shell running: chrome+editor+agent-panel. scale_factor={} clean={}",
         window.scale_factor(),
         want_clean,
     );

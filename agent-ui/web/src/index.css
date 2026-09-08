@@ -1,0 +1,117 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #1e1e2e;
+  color: #cdd6f4;
+  font-family: -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+
+.agent-ui-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.agent-ui-conversation {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.mode-selector {
+  margin: auto;
+  padding: 24px;
+  text-align: center;
+}
+.mode-selector button {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  padding: 10px;
+}
+
+.session-header {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #181825;
+  border-bottom: 1px solid #313244;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.message-list {
+  overflow-y: auto;
+  padding: 12px;
+}
+.message {
+  margin-bottom: 12px;
+}
+.assistant-message pre {
+  background: #11111b;
+  padding: 8px;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.tool-card {
+  background: #181825;
+  border-left: 3px solid #89b4fa;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+}
+.tool-card-skill {
+  border-left-color: #a6e3a1;
+  font-style: italic;
+}
+.tool-error {
+  color: #f38ba8;
+  font-size: 12px;
+}
+
+.permission-card {
+  background: #313244;
+  border: 1px solid #f9e2af;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 12px;
+}
+.permission-card-input {
+  background: #11111b;
+  padding: 6px;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+.permission-card-buttons button {
+  margin-right: 8px;
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid #313244;
+}
+.composer textarea {
+  flex: 1;
+  resize: none;
+  min-height: 44px;
+  background: #11111b;
+  color: #cdd6f4;
+  border: 1px solid #313244;
+  border-radius: 4px;
+  padding: 8px;
+}
