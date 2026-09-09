@@ -3392,6 +3392,8 @@ dependencies = [
  "neovide-editor",
  "serde",
  "serde_json",
+ "supervisor",
+ "uuid",
  "webkit6",
 ]
 
@@ -3661,6 +3663,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "supervisor"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

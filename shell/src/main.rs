@@ -8,6 +8,7 @@ mod agent_panel;
 mod chrome;
 mod layout;
 mod pane_switch;
+mod supervisor_client;
 mod theme;
 mod lua;
 
@@ -214,6 +215,23 @@ fn build_ui(app: &Application, want_clean: bool) {
     // The one real v1 event: fires once the window is actually up, so any Lua handler reacting
     // to it sees a fully-built shell (panels registered, commands bound, window shown).
     lua_engine.emit("shell:ready");
+
+    // Polls for a cross-window "come to the front" request from `neovibe-supervisor` -- e.g. the
+    // dashboard's own UI, or another shell instance, asking this window to raise itself. Cloning
+    // `agent_panel_handle` here (rather than after) is load-bearing: the `connect_close_request`
+    // closure below takes ownership of the original `agent_panel_handle` by move, so anything
+    // that still needs it afterward -- this timer included -- must clone it first, the same
+    // pattern `lua_engine`'s own comment two blocks up documents for itself.
+    {
+        let window = window.clone();
+        let agent_panel_handle_for_poll = agent_panel_handle.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            if agent_panel_handle_for_poll.poll_activate() {
+                window.present();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
     // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in
     // outright rather than cloned again. (`pane` is an `Rc<NeovideEditorPane>` because the side

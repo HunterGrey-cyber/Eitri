@@ -12,6 +12,7 @@ members = [
     "neovide-editor",
     "shell",
     "agent",
+    "supervisor",
 ]
 
 [workspace.package]

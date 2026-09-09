@@ -33,6 +33,7 @@ const PUMP_POLL_INTERVAL_MS: u64 = 33;
 struct AgentPanelState {
     session: Option<AgentSession>,
     project_dir: PathBuf,
+    supervisor: Option<crate::supervisor_client::SupervisorClient>,
 }
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
@@ -41,6 +42,7 @@ struct AgentPanelState {
 /// internal to this module (the script-message handler and the pump timer), neither of which
 /// ever runs `AgentSession::shutdown()` on its own, so a normal window close would otherwise
 /// leak the child process, its hook socket, and any in-memory-only settings backup.
+#[derive(Clone)]
 pub(crate) struct AgentPanelHandle {
     state: Rc<RefCell<AgentPanelState>>,
 }
@@ -51,6 +53,18 @@ impl AgentPanelHandle {
     pub(crate) fn shutdown(&self) {
         if let Some(session) = self.state.borrow_mut().session.as_mut() {
             session.shutdown();
+        }
+    }
+
+    /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
+    /// front since the last call. `main.rs` polls this on its own timer and calls
+    /// `window.present()` in response -- this handle has no `Window` reference of its own (see
+    /// `AgentPanelHandle`'s own top-level doc: window lifecycle stays owned by `main.rs`).
+    pub(crate) fn poll_activate(&self) -> bool {
+        if let Some(supervisor) = self.state.borrow_mut().supervisor.as_mut() {
+            supervisor.poll_activate()
+        } else {
+            false
         }
     }
 }
@@ -103,7 +117,13 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         false
     });
 
-    let state = Rc::new(RefCell::new(AgentPanelState { session: None, project_dir }));
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let project_name = project_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
+    let supervisor = crate::supervisor_client::SupervisorClient::connect_or_spawn(instance_id, project_name, &project_dir);
+    let state = Rc::new(RefCell::new(AgentPanelState { session: None, project_dir, supervisor }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
     {
@@ -138,6 +158,10 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 let payload = serialize_events_for_js(from_revision, through_revision, &events);
                 evaluate_js_dispatch(&webview, &payload);
             }
+        }
+        let status = crate::supervisor_client::derive_status(state_ref.session.as_ref().map(|s| &s.projection));
+        if let Some(supervisor) = state_ref.supervisor.as_mut() {
+            supervisor.send_status(status);
         }
         gtk4::glib::ControlFlow::Continue
     });
