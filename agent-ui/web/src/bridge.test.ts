@@ -1,21 +1,48 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
-import { installDispatch } from "./bridge";
+import { installDispatch, nextRequestId } from "./bridge";
+
+describe("nextRequestId", () => {
+  it("returns distinct values on successive calls", () => {
+    const a = nextRequestId();
+    const b = nextRequestId();
+    const c = nextRequestId();
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+});
 
 describe("installDispatch", () => {
-  it("demuxes an event envelope", () => {
+  it("demuxes a command_result envelope with ok:true", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "event", event: { type: "assistant_text", text: "hi" } }));
-    expect(handler).toHaveBeenCalledWith({ kind: "event", event: { type: "assistant_text", text: "hi" } });
+    window.__neovibeDispatch!(JSON.stringify({ kind: "command_result", requestId: "req-1", ok: true }));
+    expect(handler).toHaveBeenCalledWith({ kind: "command_result", requestId: "req-1", ok: true });
+  });
+
+  it("demuxes a command_result envelope with ok:false and an error message", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "command_result", requestId: "req-2", ok: false, error: "boom" }));
+    expect(handler).toHaveBeenCalledWith({ kind: "command_result", requestId: "req-2", ok: false, error: "boom" });
+  });
+
+  it("demuxes an events envelope, keeping fromRevision/throughRevision/events intact", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const events = [{ type: "turn_started", turn_id: "t1" }];
+    window.__neovibeDispatch!(JSON.stringify({ kind: "events", fromRevision: 3, throughRevision: 4, events }));
+    expect(handler).toHaveBeenCalledWith({ kind: "events", fromRevision: 3, throughRevision: 4, events });
   });
 
   it("demuxes a snapshot envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    const snapshot = { sessionId: "abc", model: "m", cwd: "/tmp", transcript: [], toolCalls: [], status: { kind: "running" }, turnInProgress: false, pendingPermissions: [] };
-    window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", snapshot }));
-    expect(handler).toHaveBeenCalledWith({ kind: "snapshot", snapshot });
+    const state = {
+      sessionId: "abc", model: "m", cwd: "/tmp", transcript: [], toolCalls: [],
+      status: { kind: "running" }, activeTurnId: null, pendingPermissions: [],
+    };
+    window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", throughRevision: 7, state }));
+    expect(handler).toHaveBeenCalledWith({ kind: "snapshot", throughRevision: 7, state });
   });
 
   it("demuxes an error envelope", () => {

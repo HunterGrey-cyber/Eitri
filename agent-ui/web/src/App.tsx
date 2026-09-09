@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { applyEvent, applySnapshot, initialState, markPermissionAnswered, markTurnInterrupted, markTurnStarted } from "./reducer";
-import { installDispatch, postToRust } from "./bridge";
+import { applyEvent, applySnapshot, initialState } from "./reducer";
+import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import { ModeSelector } from "./components/ModeSelector";
 import { Composer } from "./components/Composer";
 import { MessageList } from "./components/MessageList";
@@ -9,65 +9,65 @@ import { SessionHeader } from "./components/SessionHeader";
 export default function App() {
   const [state, setState] = useState(initialState());
   const [sessionStarted, setSessionStarted] = useState(false);
+  // Spinner-only, per-requestId in-flight tracking -- never read to answer "is a turn in
+  // progress" or "is this permission still pending" (those come only from canonical
+  // state.activeTurnId / state.pendingPermissions). Cleared on the matching command_result
+  // regardless of ok/error. No spinner UI consumes this yet (out of this task's scope), so the
+  // getter is deliberately left unbound here -- this project's tsconfig has `noUnusedLocals`, and
+  // binding a name nothing reads would fail the build; the setter alone still exercises the real
+  // per-requestId tracking this comment documents.
+  const [, setPendingCommands] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     installDispatch((payload) => {
       if (payload.kind === "snapshot") {
-        setState((s) => applySnapshot(s, payload.snapshot));
-        // A snapshot only ever arrives after a real session exists (rehydration after reload) --
-        // treat its arrival as proof a session is already running, so a WebView reload doesn't
-        // re-show the mode selector for a conversation that's already past that point.
+        setState((s) => applySnapshot(s, payload.state));
         setSessionStarted(true);
+      } else if (payload.kind === "events") {
+        setState((s) => payload.events.reduce((acc, event) => applyEvent(acc, event), s));
+      } else if (payload.kind === "command_result") {
+        setPendingCommands((prev) => {
+          const next = new Set(prev);
+          next.delete(payload.requestId);
+          return next;
+        });
+        if (!payload.ok) {
+          console.warn("agent-ui: command failed", payload.requestId, payload.error);
+        }
       } else if (payload.kind === "error") {
-        // Reset first, alert second: window.alert() blocks the page's JS until its modal is
-        // dismissed, and this sandbox's synthetic-input support for dismissing a real WebKitGTK
-        // script dialog is unverified -- resetting first means the recovery (back to the mode
-        // selector) happens unconditionally, never gated on a dialog actually getting dismissed.
-        // Reset the whole AgentUiState, not just sessionStarted: this envelope now also covers a
-        // fatal send_turn/interrupt/respond_permission failure mid-conversation (not just a
-        // failed start), and Rust drops the dead AgentSession in the fatal cases too -- a
-        // subsequent successful "start_session" must not carry over the previous session's stale
-        // state.
         setSessionStarted(false);
         setState(initialState());
         window.alert(`agent error: ${payload.message}`);
-      } else {
-        setState((s) => applyEvent(s, payload.event));
       }
     });
-    postToRust({ type: "ready" });
+    const requestId = nextRequestId();
+    setPendingCommands((prev) => new Set(prev).add(requestId));
+    postToRust({ type: "ready", request_id: requestId });
   }, []);
 
   function startSession(mode: "auto" | "bypass") {
-    postToRust({ type: "start_session", mode });
+    const requestId = nextRequestId();
+    setPendingCommands((prev) => new Set(prev).add(requestId));
+    postToRust({ type: "start_session", request_id: requestId, mode });
     setSessionStarted(true);
   }
 
   function sendMessage(text: string) {
-    postToRust({ type: "send_message", text });
-    // Optimistic: no AgentEvent ever announces "a turn just started" (that's local Rust-side
-    // bookkeeping, set synchronously inside AgentSession::send_turn before any wire event comes
-    // back) -- without this, turnInProgress would never become true and the Stop button/composer
-    // disabling would be permanently dead. A real turn_finished event (or a rehydration
-    // snapshot) is what eventually clears it back to false.
-    setState((s) => markTurnStarted(s));
+    const requestId = nextRequestId();
+    setPendingCommands((prev) => new Set(prev).add(requestId));
+    postToRust({ type: "send_message", request_id: requestId, text });
   }
 
   function interrupt() {
-    postToRust({ type: "interrupt" });
-    // Optimistic: AgentSession::interrupt() now clears pending_permissions on the Rust side too
-    // (any request from the turn being stopped can never be genuinely answered) -- without this,
-    // any permission card visible at the moment of interrupt would linger forever in the frontend.
-    setState((s) => markTurnInterrupted(s));
+    const requestId = nextRequestId();
+    setPendingCommands((prev) => new Set(prev).add(requestId));
+    postToRust({ type: "interrupt", request_id: requestId });
   }
 
-  function answerPermission(requestId: string, allow: boolean, reason?: string) {
-    postToRust({ type: "permission_response", request_id: requestId, allow, reason });
-    // Optimistic: no AgentEvent ever announces "this permission request was resolved" -- without
-    // this, the card stays rendered forever (a real bug found during Task 8's real sandbox
-    // verification, confirmed 3/3 times). A duplicate answer on an already-cleared card is a no-op
-    // here and a logged, harmless error on the Rust side.
-    setState((s) => markPermissionAnswered(s, requestId));
+  function answerPermission(permissionId: string, allow: boolean, reason?: string) {
+    const requestId = nextRequestId();
+    setPendingCommands((prev) => new Set(prev).add(requestId));
+    postToRust({ type: "permission_response", request_id: requestId, permission_id: permissionId, allow, reason });
   }
 
   if (!sessionStarted) {
@@ -78,11 +78,12 @@ export default function App() {
     );
   }
 
+  const turnInProgress = state.activeTurnId !== null;
   return (
     <div className="agent-ui-root agent-ui-conversation">
       <SessionHeader state={state} />
       <MessageList state={state} onAnswerPermission={answerPermission} />
-      <Composer disabled={state.turnInProgress} turnInProgress={state.turnInProgress} onSend={sendMessage} onInterrupt={interrupt} />
+      <Composer disabled={turnInProgress} turnInProgress={turnInProgress} onSend={sendMessage} onInterrupt={interrupt} />
     </div>
   );
 }

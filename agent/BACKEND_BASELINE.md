@@ -53,7 +53,10 @@ against fixed behavior.
 
 - **Concurrent permission requests** (multiple simultaneously-pending `PermissionRequest`s, each
   independently answerable in any order): pinned at the pure-reducer level, with no real CLI cost,
-  by `agent/tests/session_state.rs::two_concurrent_permission_requests_are_both_retained_and_independently_answerable`.
+  by `agent/tests/projection.rs::two_concurrent_permission_requests_are_both_retained_and_independently_resolvable_in_either_order`
+  (moved here from the now-deleted `agent/tests/session_state.rs` when Phase 1 of the Claude
+  runtime/provider refactor replaced `AgentSessionState` with `AgentSessionProjection` --
+  `docs/superpowers/plans/2026-09-09-claude-runtime-refactor-phase1-domain-ui.md`).
 - **Window close / orphan cleanup** (a real compositor window close reliably runs
   `AgentSession::shutdown()` with zero orphaned `claude`/`nvim`/WebKit processes, confirmed via a
   real `/proc`-based before/after diff repeated 3 times): pinned by real, repeated sandbox

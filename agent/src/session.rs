@@ -1,185 +1,45 @@
-//! The reducer stage of the wire -> event -> session-state -> (future) UI pipeline this plan
-//! follows from the early design assessment's recommended shape: folds a stream of `AgentEvent`s into
-//! a queryable `AgentSessionState`. The reducer (`AgentSessionState::apply`) is pure and
-//! side-effect-free (no I/O, no dependency on `AgentProcess`) so it stays trivially testable
-//! without spawning anything.
+//! The reducer stage sitting above `agent::process::AgentProcess`: pumps the real Claude-CLI
+//! wire events (`agent::event::AgentEvent`) through a per-session translation step into the
+//! provider-neutral `agent::projection::AgentDomainEvent` vocabulary, then folds each into a
+//! queryable `AgentSessionProjection` -- this crate's real public API for a whole conversation
+//! (`start`/`send_turn`/`interrupt`/`respond_permission`/`pump`/`shutdown`).
 //!
-//! This file also owns `AgentSession` (v2, reintroduced by Task 6): a thin, process-owning
-//! wrapper around `agent::process::AgentProcess` that pumps its events through the reducer and
-//! exposes the crate's real public API for a whole conversation -- `send_turn`/`interrupt`/
-//! `respond_permission`/`pump`. Task 5 removed the v1 `AgentSession` (built around the
-//! now-deleted `SpawnMode`/per-turn `AgentProcess::spawn`) rather than adapt it, since Task 5's
-//! own scope was `agent::process` only; this is that real replacement, built around
-//! `AgentProcess`'s new long-lived, full-duplex shape.
+//! `AgentEvent`/`PermissionSource` (the Claude-wire-specific types) never cross this module's own
+//! public boundary as such: `translate_event` (private) is the one place they get turned into
+//! `AgentDomainEvent`s, matching design doc §10.2's "these types are not domain/UI events" list.
+//! The one piece of Claude-wire-specific state this module still has to keep -- which channel
+//! (`PermissionSource::HookRelay` vs `CanUseTool`) a given pending permission arrived on, needed
+//! to route `AgentProcess::respond_permission`'s answer back correctly -- lives in
+//! `pending_permission_sources`, a private map never exposed through `AgentSessionProjection`.
 
 use crate::event::{AgentEvent, PermissionSource};
 use crate::process::{AgentProcess, PermissionMode};
+use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
+use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionStatus {
-    Starting,
-    Running,
-    Finished { is_error: bool },
-}
-
-impl Default for SessionStatus {
-    fn default() -> Self {
-        SessionStatus::Starting
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCallRecord {
-    pub id: String,
-    pub name: String,
-    pub input: serde_json::Value,
-    /// `None` until the matching `ToolResult` event arrives.
-    pub result: Option<(serde_json::Value, bool)>,
-}
-
-/// One unanswered permission request, recording which channel (`PermissionSource`) it arrived on
-/// so `AgentSession::respond_permission` can route the answer back correctly without the caller
-/// having to separately track that.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PermissionRequestRecord {
-    pub request_id: String,
-    pub tool_name: String,
-    pub input: serde_json::Value,
-    pub source: PermissionSource,
-}
-
-/// Mirrors the architecture doc's original `AgentSessionState` shape (session id, messages,
-/// tool calls, cwd, status) -- "task" from that original sketch is deliberately not yet present:
-/// there's no multi-task queue in v2 either. `turn_in_progress` and `pending_permissions` are new
-/// in v2, tracking the conversation-lifecycle state a long-lived, multi-turn process needs that a
-/// v1 one-shot-per-turn process never had to.
-#[derive(Debug, Clone, Default)]
-pub struct AgentSessionState {
-    pub session_id: Option<String>,
-    pub model: Option<String>,
-    pub cwd: Option<String>,
-    /// Plain assistant text, in arrival order -- a minimal transcript projection. Does not
-    /// interleave tool calls/results into this list; consult `tool_calls` separately. A richer
-    /// unified transcript view is left for whenever `agent-ui` actually needs one.
-    pub transcript: Vec<String>,
-    pub tool_calls: Vec<ToolCallRecord>,
-    pub status: SessionStatus,
-    /// True from `AgentSession::send_turn` until the matching `TurnFinished` arrives. A separate,
-    /// orthogonal flag from `status` -- the conversation can be `Running` with no turn in flight.
-    pub turn_in_progress: bool,
-    /// Every unanswered permission request, in arrival order. A collection, not a single slot:
-    /// one assistant message can genuinely contain several `tool_use` blocks, and the generated
-    /// hook matcher is `"*"` (every tool), so several `agent-hook` connections can legitimately be
-    /// live at once, each blocking its own tool call. A single-slot `Option` silently stranded
-    /// every request but the newest -- its connection stayed open with nothing in the public API
-    /// able to answer it, so its `agent-hook` blocked for the CLI's full 600s hook timeout.
-    /// Entries are removed one at a time by `AgentSession::respond_permission` -- see its own doc
-    /// for why nothing else ever removes one (in particular, not an incoming `ControlResponse`).
-    pub pending_permissions: Vec<PermissionRequestRecord>,
-}
-
-impl AgentSessionState {
-    /// The reducer: applies one event's effect to this state. Pure and side-effect-free (no I/O)
-    /// so it's trivially testable without spawning anything -- see this task's own tests, which
-    /// feed a hand-assembled sequence of `AgentEvent`s and assert on the resulting state, not on
-    /// any live process.
-    pub fn apply(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::SessionStarted { session_id, model, cwd } => {
-                self.session_id = Some(session_id.clone());
-                self.model = Some(model.clone());
-                self.cwd = Some(cwd.clone());
-                self.status = SessionStatus::Running;
-            }
-            AgentEvent::AssistantText { text } => {
-                self.transcript.push(text.clone());
-            }
-            AgentEvent::ToolStarted { id, name, input } => {
-                self.tool_calls.push(ToolCallRecord {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    result: None,
-                });
-            }
-            AgentEvent::ToolResult { id, content, is_error } => {
-                if let Some(call) = self.tool_calls.iter_mut().find(|c| &c.id == id) {
-                    call.result = Some((content.clone(), *is_error));
-                }
-            }
-            AgentEvent::TurnFinished { .. } => {
-                // v2 semantic change from v1: a finished turn does NOT end the conversation --
-                // the process stays alive for more turns. Only ProcessExited ends the session
-                // now. This also correctly handles an interrupted turn's error_during_execution
-                // result: it clears turn_in_progress without flipping the whole session to
-                // Finished, since the conversation is still alive.
-                self.turn_in_progress = false;
-            }
-            AgentEvent::PermissionRequest { request_id, tool_name, input, source } => {
-                // Push, never overwrite: concurrent requests (several `tool_use` blocks in one
-                // assistant message) must all stay answerable -- see `pending_permissions`' doc.
-                self.pending_permissions.push(PermissionRequestRecord {
-                    request_id: request_id.clone(),
-                    tool_name: tool_name.clone(),
-                    input: input.clone(),
-                    source: *source,
-                });
-            }
-            AgentEvent::ControlResponse { .. } => {
-                // Purely observational in v2: a control_response only ever acknowledges a
-                // control_request THIS crate itself initiated (e.g. `interrupt`) -- the CLI
-                // never sends one back for OUR OWN answer to ITS can_use_tool request (that
-                // answer IS a control_response we send, not something acknowledged in turn).
-                // So there is no case where an incoming ControlResponse should remove an entry
-                // from pending_permissions -- that removal happens immediately inside
-                // AgentSession::respond_permission instead, for both PermissionSource variants
-                // alike. No state effect here, same as Thinking/RateLimit/Unknown.
-            }
-            AgentEvent::ProcessExited { success } => {
-                // Only meaningful if the process died WITHOUT ever having emitted a
-                // `TurnFinished` that ended things (which no `TurnFinished` does anymore in v2)
-                // -- this is genuinely the only path that ends a session now.
-                if matches!(self.status, SessionStatus::Starting | SessionStatus::Running) {
-                    self.status = SessionStatus::Finished { is_error: !*success };
-                }
-            }
-            AgentEvent::Thinking { .. }
-            | AgentEvent::RateLimit { .. }
-            | AgentEvent::Unknown { .. }
-            | AgentEvent::ProcessStderr { .. } => {
-                // No state effect -- these are observable via `AgentSession::event_log` if
-                // needed.
-            }
-        }
-    }
-
-    /// The unanswered permission request with this `request_id`, if it is still pending. What
-    /// `AgentSession::respond_permission` uses to find the channel a given request arrived on;
-    /// also the natural way for a UI to redraw one specific approve/deny card.
-    pub fn find_pending_permission(&self, request_id: &str) -> Option<&PermissionRequestRecord> {
-        self.pending_permissions.iter().find(|p| p.request_id == request_id)
-    }
-
-    /// Removes and returns the unanswered permission request with this `request_id`, leaving every
-    /// other pending request untouched. Returns `None` if it was already answered or never
-    /// existed. This is the removal half of `AgentSession::respond_permission` -- which only calls
-    /// it once the decision has genuinely been written, so a failed write leaves the request
-    /// pending and still answerable rather than silently dropping it.
-    pub fn take_pending_permission(&mut self, request_id: &str) -> Option<PermissionRequestRecord> {
-        let index = self.pending_permissions.iter().position(|p| p.request_id == request_id)?;
-        Some(self.pending_permissions.remove(index))
-    }
-}
-
-/// A whole live conversation: owns the long-lived `AgentProcess`, pumps its events through the
-/// pure `AgentSessionState` reducer, and keeps a full raw `event_log` alongside the reduced
-/// state (a future `agent-ui` may want the raw stream, e.g. to render every assistant text chunk
-/// as it arrived, not just the reducer's flattened projection).
+/// A whole live conversation: owns the long-lived `AgentProcess`, translates and folds its events
+/// through the pure `AgentSessionProjection` reducer, and keeps a full raw `event_log` of every
+/// domain event alongside the reduced projection (a future consumer may want the raw stream, e.g.
+/// to render every text delta as it arrived rather than just the reducer's flattened view).
 pub struct AgentSession {
     process: AgentProcess,
-    pub state: AgentSessionState,
-    event_log: Vec<AgentEvent>,
+    pub projection: AgentSessionProjection,
+    event_log: Vec<AgentDomainEvent>,
+    /// Which real channel each currently-pending permission arrived on -- needed by
+    /// `respond_permission` to route the answer, never exposed via `AgentSessionProjection` (see
+    /// this module's own header doc). Entries are inserted alongside the matching
+    /// `PermissionRequested` domain event and removed alongside the matching `PermissionResolved`
+    /// one, so this map's keys are always exactly `self.projection.pending_permissions`'s keys.
+    pending_permission_sources: HashMap<String, PermissionSource>,
+    /// Set by `interrupt()`, consumed and cleared by the next translated `TurnFinished` --
+    /// distinguishes a real, CLI-driven `TurnOutcome::Interrupted` from `Completed`/`Failed`. The
+    /// CLI still emits a genuine terminal `result` line for an interrupted turn (confirmed by
+    /// Phase 0's own real conformance test,
+    /// `agent::tests::backend_conformance::real_interrupt_mid_permission_denies_pending_requests_without_ending_the_session`)
+    /// -- `interrupt()` itself must NOT synthesize a premature `TurnCompleted` before that real
+    /// terminal event arrives, or the session would produce two terminal events for one turn.
+    interrupt_requested: bool,
 }
 
 impl AgentSession {
@@ -187,78 +47,95 @@ impl AgentSession {
     /// `AgentProcess::spawn`'s own doc for what `project_dir`/`mode`/`disallowed_tools` mean.
     pub fn start(project_dir: &Path, mode: PermissionMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
         let process = AgentProcess::spawn(project_dir, mode, disallowed_tools)?;
-        Ok(Self { process, state: AgentSessionState::default(), event_log: Vec::new() })
+        Ok(Self {
+            process,
+            projection: AgentSessionProjection::default(),
+            event_log: Vec::new(),
+            pending_permission_sources: HashMap::new(),
+            interrupt_requested: false,
+        })
     }
 
-    /// Writes one user turn to the underlying process and marks `state.turn_in_progress`. See
-    /// `AgentProcess::send_turn`'s own doc for the caller's responsibility around turn ordering.
+    /// Writes one user turn to the underlying process, synthesizes and folds `TurnStarted`
+    /// immediately on success, and returns it. Global Constraint: one active turn per session --
+    /// rejects (does not queue) a second call while `self.projection.active_turn_id` is `Some`.
     ///
-    /// `turn_in_progress` is only set once the write has actually succeeded: setting it first
-    /// meant a failed write (a dead process, a closed stdin) left the flag stuck `true` forever,
-    /// since nothing but a `TurnFinished` for a turn that never started could ever clear it again.
-    pub fn send_turn(&mut self, text: &str) -> std::io::Result<()> {
-        self.process.send_turn(text)?;
-        self.state.turn_in_progress = true;
-        Ok(())
-    }
-
-    /// Sends a real interrupt control_request. See `AgentProcess::interrupt`'s own doc.
-    pub fn interrupt(&mut self) -> std::io::Result<uuid::Uuid> {
-        let result = self.process.interrupt();
-        // AgentProcess::interrupt now releases every pending hook connection (denying each) as
-        // part of stopping the turn -- clear the state-level records to match, mirroring
-        // shutdown()'s identical reasoning: a request that can no longer ever be genuinely
-        // answered must not keep rendering an approve/deny card that would silently no-op if
-        // clicked.
-        self.state.pending_permissions.clear();
-        result
-    }
-
-    /// Answers one specific pending permission request, looked up by `request_id` in
-    /// `self.state.pending_permissions` and routed via that request's own recorded `source` --
-    /// callers don't need to separately track which channel a request arrived on, unlike
-    /// `AgentProcess::respond_permission`. Removes *only* that entry once the answer is
-    /// successfully sent, leaving any other concurrently-pending request (a second `tool_use`
-    /// block in the same assistant message, say) exactly as answerable as it was before. Returns
-    /// `ErrorKind::NotFound` if no pending request carries that id.
-    ///
-    /// Removal happens immediately on a successful send, for BOTH sources alike: unlike
-    /// `interrupt`, there is no later incoming event that ever acknowledges this crate's own
-    /// answer to a permission request (a `HookRelay` answer goes out over that request's socket
-    /// connection and the CLI just proceeds; a `CanUseTool` answer IS itself the control_response
-    /// -- nothing comes back to confirm it landed). An earlier draft of this reducer wrongly tried
-    /// to clear the pending request from an incoming `ControlResponse` event instead -- that event
-    /// never arrives for a `CanUseTool` answer, which would have left it pending forever; see
-    /// `AgentSessionState::apply`'s `ControlResponse` arm for the corrected reasoning.
-    pub fn respond_permission(&mut self, request_id: &str, allow: bool, reason: Option<&str>) -> std::io::Result<()> {
-        let Some(source) = self.state.find_pending_permission(request_id).map(|p| p.source) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no pending permission request with id {request_id}"),
-            ));
-        };
-        self.process.respond_permission(request_id, source, allow, reason)?;
-        // Only after the decision genuinely went out -- a failed write leaves it pending and
-        // answerable again, rather than dropping a request nothing ever answered.
-        self.state.take_pending_permission(request_id);
-        Ok(())
-    }
-
-    /// Non-blocking drain: pulls whatever events have arrived from the underlying process since
-    /// the last call, folds each into `state` via the reducer, appends each to `event_log`, and
-    /// returns the same batch to the caller (mirroring `AgentProcess::poll_events`'s shape, so a
-    /// future GTK tick callback can call this every frame with no redesign needed).
-    pub fn pump(&mut self) -> Vec<AgentEvent> {
-        let mut new_events = Vec::new();
-        for event in self.process.poll_events() {
-            self.state.apply(&event);
-            self.event_log.push(event.clone());
-            new_events.push(event);
+    /// `TurnStarted` is only folded once the write has actually succeeded: setting it first meant
+    /// a failed write (a dead process, a closed stdin) left `active_turn_id` stuck `Some` forever,
+    /// since nothing but a `TurnCompleted` for a turn that never started could ever clear it again
+    /// -- the same reasoning the pre-Phase-1 `AgentSession::send_turn` already used for
+    /// `turn_in_progress`.
+    pub fn send_turn(&mut self, text: &str) -> std::io::Result<Vec<AgentDomainEvent>> {
+        if self.projection.active_turn_id.is_some() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "a turn is already in progress on this session"));
         }
-        new_events
+        self.process.send_turn(text)?;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let event = AgentDomainEvent::TurnStarted { turn_id };
+        self.fold(event.clone());
+        Ok(vec![event])
     }
 
-    pub fn event_log(&self) -> &[AgentEvent] {
+    /// Sends a real interrupt control_request (`AgentProcess::interrupt` already releases every
+    /// pending hook connection at the transport level, denying each -- see its own doc). Folds and
+    /// returns a `PermissionResolved { outcome: CancelledByInterrupt }` for every permission that
+    /// was pending at the moment of the call, draining `pending_permission_sources` to match.
+    /// Does NOT fold a `TurnCompleted` here -- see `interrupt_requested`'s own doc for why that
+    /// must wait for the turn's real terminal event.
+    pub fn interrupt(&mut self) -> std::io::Result<Vec<AgentDomainEvent>> {
+        self.process.interrupt()?;
+        if self.projection.active_turn_id.is_some() {
+            self.interrupt_requested = true;
+        }
+
+        let pending_ids: Vec<String> = self.projection.pending_permissions.keys().cloned().collect();
+        let mut events = Vec::with_capacity(pending_ids.len());
+        for permission_id in pending_ids {
+            self.pending_permission_sources.remove(&permission_id);
+            let event = AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::CancelledByInterrupt };
+            self.fold(event.clone());
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    /// Answers one specific pending permission request, looked up by `permission_id` in
+    /// `pending_permission_sources` to find which real channel to route the answer over. Folds
+    /// and returns a `PermissionResolved` event only once the decision has genuinely been written
+    /// -- a failed write leaves the request pending and still answerable, matching the pre-Phase-1
+    /// `AgentSession::respond_permission`'s identical reasoning. Returns `ErrorKind::NotFound` if
+    /// no pending request carries that id (an already-answered or unknown id) -- callers must
+    /// treat that as a benign no-op, per this plan's Global Constraint on duplicate/unknown ids.
+    pub fn respond_permission(&mut self, permission_id: &str, allow: bool, reason: Option<&str>) -> std::io::Result<Vec<AgentDomainEvent>> {
+        let Some(source) = self.pending_permission_sources.get(permission_id).copied() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no pending permission request with id {permission_id}")));
+        };
+        self.process.respond_permission(permission_id, source, allow, reason)?;
+        self.pending_permission_sources.remove(permission_id);
+        let outcome = if allow { PermissionOutcome::Allowed } else { PermissionOutcome::Denied };
+        let event = AgentDomainEvent::PermissionResolved { permission_id: permission_id.to_string(), outcome };
+        self.fold(event.clone());
+        Ok(vec![event])
+    }
+
+    /// Non-blocking drain: pulls whatever real wire events have arrived from the underlying
+    /// process since the last call, translates each into zero or more `AgentDomainEvent`s (see
+    /// `translate_event`), folds each into `self.projection` immediately (so
+    /// `self.projection.active_turn_id` is always current for the NEXT event this same call
+    /// translates -- e.g. a `ToolStarted` arriving right after the `TurnStarted` this same batch
+    /// already folded), appends each to `event_log`, and returns the whole batch.
+    pub fn pump(&mut self) -> Vec<AgentDomainEvent> {
+        let mut produced = Vec::new();
+        for wire_event in self.process.poll_events() {
+            for domain_event in self.translate_event(wire_event) {
+                self.fold(domain_event.clone());
+                produced.push(domain_event);
+            }
+        }
+        produced
+    }
+
+    pub fn event_log(&self) -> &[AgentDomainEvent] {
         &self.event_log
     }
 
@@ -272,11 +149,87 @@ impl AgentSession {
 
     pub fn shutdown(&mut self) {
         self.process.shutdown();
-        // `AgentProcess::shutdown` already released every live hook connection (denying and
-        // dropping each); clear the state-level records to match, so a caller (e.g. a future
-        // agent-ui) doesn't keep rendering approve/deny cards for requests that can no longer
-        // ever be genuinely answered -- answering one now would silently no-op (the transport
-        // side is already gone) rather than deliver anything.
-        self.state.pending_permissions.clear();
+        // Fail-closed on shutdown, mirroring interrupt()'s identical reasoning: a permission request
+        // from a session that's ending can never be genuinely answered. Design doc §7.3 requires this
+        // specifically for a Rust shell/window close -- the pre-Phase-1 AgentSession::shutdown already
+        // did the equivalent (state.pending_permissions.clear()); this restores that behavior under
+        // the new domain-event vocabulary, giving PermissionOutcome::CancelledBySessionClose its first
+        // real producer.
+        let pending_ids: Vec<String> = self.projection.pending_permissions.keys().cloned().collect();
+        for permission_id in pending_ids {
+            self.pending_permission_sources.remove(&permission_id);
+            self.fold(AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::CancelledBySessionClose });
+        }
+        self.fold(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
+    }
+
+    /// Folds one domain event into `self.projection` and appends it to `self.event_log` -- the one
+    /// place either happens, so the two never drift apart.
+    fn fold(&mut self, event: AgentDomainEvent) {
+        self.projection.apply(&event);
+        self.event_log.push(event);
+    }
+
+    /// Translates one real Claude-wire `AgentEvent` into zero or more `AgentDomainEvent`s, using
+    /// `self.projection.active_turn_id` (already current -- see `pump`'s own doc) to stamp
+    /// `turn_id` onto events that need one, and `self.interrupt_requested` to decide a
+    /// `TurnFinished`'s outcome. Global Constraint: an `AgentEvent` with no domain-event mapping
+    /// (`ControlResponse`, `ProcessStderr`, `RateLimit`, `Unknown`) always returns an empty `Vec`
+    /// -- never a fabricated event, never a panic.
+    fn translate_event(&mut self, event: AgentEvent) -> Vec<AgentDomainEvent> {
+        match event {
+            AgentEvent::SessionStarted { session_id, model, cwd } => {
+                vec![AgentDomainEvent::SessionOpened { session_id, model, cwd }]
+            }
+            AgentEvent::AssistantText { text } => {
+                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
+                vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Text, text }]
+            }
+            AgentEvent::Thinking { text } => {
+                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
+                vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Thinking, text }]
+            }
+            AgentEvent::ToolStarted { id, name, input } => {
+                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
+                vec![AgentDomainEvent::ToolCallStarted { turn_id, tool_use_id: id, name, input }]
+            }
+            AgentEvent::ToolResult { id, content, is_error } => {
+                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
+                vec![AgentDomainEvent::ToolCallCompleted { turn_id, tool_use_id: id, content, is_error }]
+            }
+            AgentEvent::PermissionRequest { request_id, tool_name, input, source } => {
+                self.pending_permission_sources.insert(request_id.clone(), source);
+                vec![AgentDomainEvent::PermissionRequested { permission_id: request_id, tool_name, input }]
+            }
+            AgentEvent::TurnFinished { result_text, is_error, stop_reason, total_cost_usd, num_turns } => {
+                let turn_id = self.projection.active_turn_id.clone().unwrap_or_else(|| "unknown-turn".to_string());
+                let outcome = if self.interrupt_requested {
+                    self.interrupt_requested = false;
+                    TurnOutcome::Interrupted
+                } else if is_error {
+                    TurnOutcome::Failed
+                } else {
+                    TurnOutcome::Completed
+                };
+                vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, total_cost_usd, num_turns }]
+            }
+            AgentEvent::ProcessExited { success: true } => {
+                vec![AgentDomainEvent::SessionClosed { reason: "provider_exited".to_string() }]
+            }
+            AgentEvent::ProcessExited { success: false } => {
+                vec![AgentDomainEvent::SessionUnavailable { reason: "provider process exited unexpectedly".to_string() }]
+            }
+            AgentEvent::ProcessStderr { line } => {
+                eprintln!("[agent] claude stderr: {line}");
+                vec![]
+            }
+            AgentEvent::RateLimit { raw } => {
+                eprintln!("[agent] rate limit notice: {raw}");
+                vec![]
+            }
+            AgentEvent::ControlResponse { .. } | AgentEvent::Unknown { .. } => {
+                vec![]
+            }
+        }
     }
 }

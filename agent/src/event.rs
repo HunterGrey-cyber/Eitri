@@ -62,7 +62,7 @@ pub enum AgentEvent {
     /// `hook_started`/`hook_response`/`init`/`thinking_tokens`).
     Unknown { kind: String, subtype: Option<String>, raw: Value },
     /// One line of the child's stderr, verbatim. Diagnostic only -- v1 has no state effect for
-    /// this (see `AgentSessionState::apply`), it exists purely so stderr is observable (and
+    /// this (see `AgentSessionProjection::apply`), it exists purely so stderr is observable (and
     /// actually drained, so the child can never block on a full stderr pipe buffer) instead of
     /// being silently discarded.
     ProcessStderr { line: String },

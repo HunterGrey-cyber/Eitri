@@ -3,7 +3,7 @@ import type { PermissionRequestRecord } from "../types";
 
 type Props = {
   request: PermissionRequestRecord;
-  onAnswer: (requestId: string, allow: boolean, reason?: string) => void;
+  onAnswer: (permissionId: string, allow: boolean, reason?: string) => void;
 };
 
 export function PermissionCard({ request, onAnswer }: Props) {
@@ -12,7 +12,7 @@ export function PermissionCard({ request, onAnswer }: Props) {
 
   function handleAnswer(allow: boolean) {
     setAnswered(true);
-    onAnswer(request.requestId, allow, allow ? undefined : reason || undefined);
+    onAnswer(request.permissionId, allow, allow ? undefined : reason || undefined);
   }
 
   return (
