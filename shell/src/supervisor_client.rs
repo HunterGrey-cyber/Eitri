@@ -5,6 +5,7 @@
 use agent::{AgentSessionProjection, ProjectionStatus};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 
@@ -37,6 +38,10 @@ pub(crate) struct SupervisorClient {
     reader: BufReader<UnixStream>,
     instance_id: String,
     last_sent_status: Option<AgentStatus>,
+    /// Set once a write or read has failed, or the peer has cleanly closed. Short-circuits
+    /// `send_status`/`poll_activate` so a dead supervisor doesn't cost a failed write attempt on
+    /// every 33ms pump tick for the rest of this session.
+    dead: bool,
 }
 
 impl SupervisorClient {
@@ -54,9 +59,33 @@ impl SupervisorClient {
 
         match supervisor::locate_supervisor_binary() {
             Ok(binary) => {
-                if let Err(e) = std::process::Command::new(&binary).spawn() {
-                    eprintln!("shell: failed to spawn {binary:?}: {e}");
-                    return None;
+                let mut command = std::process::Command::new(&binary);
+                // Detach the persistent supervisor: `shell` must not wait on it directly or give it this
+                // process's stdio or process group. Null stdio keeps GTK/a11y output out of the launching terminal;
+                // a separate process group keeps Ctrl+C in that terminal from killing the supervisor.
+                command
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0);
+                match command.spawn() {
+                    Ok(mut child) => {
+                        // The supervisor is deliberately never waited on by this process (it's a
+                        // separate, persistent background service, not a child this session
+                        // owns). But `std::process::Child`'s own `Drop` does not call `wait()`,
+                        // so an unreaped child becomes a zombie the moment the supervisor exits,
+                        // held for the rest of this `shell` process's own lifetime. A detached
+                        // thread that does nothing but block on `wait()` reaps it whenever that
+                        // eventually happens, without this call site -- or the GTK main thread --
+                        // waiting on anything.
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("shell: failed to spawn {binary:?}: {e}");
+                        return None;
+                    }
                 }
             }
             Err(e) => {
@@ -80,7 +109,7 @@ impl SupervisorClient {
     /// `instance_id` is captured into the returned `Self` (not just used once and discarded) --
     /// `send_status` (below) needs it on every call to build a `ShellMessage::Status`, since the
     /// wire protocol has no per-connection implicit identity beyond what `Register` announced.
-    fn finish_connecting(stream: UnixStream, instance_id: String, project_name: String, project_dir: &Path) -> Option<Self> {
+    fn finish_connecting(mut stream: UnixStream, instance_id: String, project_name: String, project_dir: &Path) -> Option<Self> {
         // Non-blocking for reads (poll_activate must never stall the GTK main loop), but the
         // initial Register write below happens before this is set, while the connection is still
         // in its default blocking mode -- a single small write to a socket the peer just accepted
@@ -91,27 +120,27 @@ impl SupervisorClient {
             project_dir: project_dir.to_string_lossy().to_string(),
             pid: std::process::id(),
         };
-        let mut stream = stream;
         let payload = serde_json::to_string(&register).ok()?;
-        writeln!(stream, "{payload}").ok()?;
+        stream.write_all(format!("{payload}\n").as_bytes()).ok()?;
 
         stream.set_nonblocking(true).ok()?;
         let reader = BufReader::new(stream.try_clone().ok()?);
-        Some(Self { stream, reader, instance_id, last_sent_status: None })
+        Some(Self { stream, reader, instance_id, last_sent_status: None, dead: false })
     }
 
     /// Sends a `Status` message only if `status` differs from the last one actually sent --
     /// called from `agent_panel.rs`'s existing 33ms pump timer, so without this dedup every tick
     /// would write to the socket regardless of whether anything changed.
     pub(crate) fn send_status(&mut self, status: AgentStatus) {
-        if self.last_sent_status == Some(status) {
+        if self.dead || self.last_sent_status == Some(status) {
             return;
         }
         let msg = ShellMessage::Status { instance_id: self.instance_id.clone(), status };
-        if let Ok(payload) = serde_json::to_string(&msg) {
-            if writeln!(self.stream, "{payload}").is_ok() {
-                self.last_sent_status = Some(status);
-            }
+        let Ok(payload) = serde_json::to_string(&msg) else { return };
+        if self.stream.write_all(format!("{payload}\n").as_bytes()).is_ok() {
+            self.last_sent_status = Some(status);
+        } else {
+            self.dead = true;
         }
     }
 
@@ -119,19 +148,33 @@ impl SupervisorClient {
     /// call. Drains any buffered lines fully (a burst arriving between polls shouldn't be missed
     /// or double-counted), returning `true` if *any* of them was `Activate`.
     pub(crate) fn poll_activate(&mut self) -> bool {
+        if self.dead {
+            return false;
+        }
         let mut activated = false;
         loop {
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
-                Ok(0) => break, // peer closed -- nothing more to read, ever
+                Ok(0) => {
+                    self.dead = true;
+                    break;
+                }
                 Ok(_) => {
-                    if let Ok(SupervisorMessage::Activate) = serde_json::from_str(line.trim()) {
-                        activated = true;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<SupervisorMessage>(trimmed) {
+                        Ok(SupervisorMessage::Activate) => activated = true,
+                        Err(e) => eprintln!("shell: unparseable message from neovibe-supervisor: {e} -- raw: {trimmed}"),
                     }
                     continue;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
             }
         }
         activated
