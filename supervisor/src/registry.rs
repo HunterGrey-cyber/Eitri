@@ -40,14 +40,18 @@ impl Registry {
         self.entries.push(Entry { connection_id, instance_id, project_name, status: AgentStatus::NoSession });
     }
 
-    pub fn handle_status(&mut self, instance_id: &str, status: AgentStatus) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.instance_id == instance_id) {
+    /// `connection_id` must match the connection that originally registered `instance_id` --
+    /// without this check, any connected client could overwrite any other instance's row by
+    /// sending a `Status` message claiming someone else's `instance_id` on the wire (the wire
+    /// message itself carries no other identity). Not a real threat model on a single-user local
+    /// socket, but free to close.
+    pub fn handle_status(&mut self, connection_id: u64, instance_id: &str, status: AgentStatus) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.connection_id == connection_id && e.instance_id == instance_id) {
             entry.status = status;
         }
-        // A status for an instance_id that was never registered (shouldn't happen -- `shell`
-        // always registers before sending status -- but, again, never trust the wire) is a
-        // harmless no-op, matching this project's established "unknown id -> no-op, not a panic"
-        // convention (e.g. `agent::process::write_hook_decision`'s own unknown-id branch).
+        // A status for a (connection_id, instance_id) pair that doesn't match any registered
+        // entry (never registered, or a connection_id/instance_id mismatch) is a harmless no-op,
+        // matching this project's established "unknown id -> no-op, not a panic" convention.
     }
 
     pub fn handle_disconnect(&mut self, connection_id: u64) {
@@ -84,7 +88,7 @@ mod tests {
         let mut reg = Registry::new();
         reg.handle_register(1, "abc".into(), "proj-a".into(), "/tmp/a".into(), 100);
         reg.handle_register(2, "def".into(), "proj-b".into(), "/tmp/b".into(), 200);
-        reg.handle_status("def", AgentStatus::Blocked);
+        reg.handle_status(2, "def", AgentStatus::Blocked);
         let rows = reg.rows();
         assert_eq!(rows[0].status, AgentStatus::NoSession);
         assert_eq!(rows[1].status, AgentStatus::Blocked);
@@ -93,8 +97,18 @@ mod tests {
     #[test]
     fn status_for_an_unregistered_instance_id_is_a_harmless_no_op() {
         let mut reg = Registry::new();
-        reg.handle_status("never-registered", AgentStatus::Working);
+        reg.handle_status(1, "never-registered", AgentStatus::Working);
         assert_eq!(reg.rows(), vec![]);
+    }
+
+    #[test]
+    fn status_is_ignored_when_the_connection_id_does_not_match_the_registered_one() {
+        let mut reg = Registry::new();
+        reg.handle_register(1, "abc".into(), "proj-a".into(), "/tmp/a".into(), 100);
+        // A different connection claiming the same instance_id on the wire must not be able to
+        // overwrite the row the real owning connection registered.
+        reg.handle_status(999, "abc", AgentStatus::Blocked);
+        assert_eq!(reg.rows()[0].status, AgentStatus::NoSession);
     }
 
     #[test]
@@ -121,7 +135,7 @@ mod tests {
         let mut reg = Registry::new();
         reg.handle_register(1, "third".into(), "c".into(), "/tmp/c".into(), 300);
         reg.handle_register(2, "first".into(), "a".into(), "/tmp/a".into(), 100);
-        reg.handle_status("first", AgentStatus::Working);
+        reg.handle_status(2, "first", AgentStatus::Working);
         let rows = reg.rows();
         let ids: Vec<&str> = rows.iter().map(|r| r.instance_id.as_str()).collect();
         assert_eq!(ids, vec!["third", "first"]);

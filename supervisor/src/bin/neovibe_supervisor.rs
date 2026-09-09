@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::rc::Rc;
 
-use supervisor::registry::Registry;
+use supervisor::registry::{Registry, Row};
 use supervisor::{AgentStatus, ShellMessage};
 
 const APP_ID: &str = "cn.huntergrey.neovibe.supervisor";
@@ -37,6 +37,13 @@ struct AppState {
     registry: Registry,
     connections: HashMap<u64, Connection>,
     next_connection_id: u64,
+    /// The rows actually rendered as of the last `rebuild_list` call -- compared against
+    /// `registry.rows()` each poll tick so the widget tree is only torn down and rebuilt when
+    /// something genuinely changed, not unconditionally 5x/second forever (the unconditional
+    /// rebuild was the root cause of a real, documented click-drop bug: a mouse press/release
+    /// straddling a rebuild tick lost its GTK gesture because the widget it started on no longer
+    /// existed).
+    last_rendered_rows: Vec<Row>,
 }
 
 fn main() -> glib::ExitCode {
@@ -46,10 +53,28 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
+    // gio enforces single-instance-per-application_id: a second `neovibe-supervisor` process
+    // launched while one is already running does not run its own copy of this function --
+    // instead gio relays a remote activation request back to THIS (the primary) process, which
+    // fires `activate` again, running `build_ui` a second time in the same process. Without this
+    // guard, that second call would remove the socket file this process is itself listening on
+    // (orphaning the real listener at an unlinked inode) and build a second, independent
+    // AppState/Registry/window with a split client registry. Guard the standard gio way: a
+    // second activation just raises the existing window.
+    if let Some(window) = app.windows().first() {
+        window.present();
+        return;
+    }
+
     let socket_path = supervisor::socket_path();
-    // A stale socket file from a previous ungraceful exit would make `bind` fail with
-    // `AddrInUse` even though nothing is actually listening -- remove it first, matching
-    // `agent::process::spawn_with_binary`'s own pre-bind cleanup of its per-conversation socket.
+    // Only remove a stale socket file if nothing is actually listening on it -- a live listener
+    // there means a genuinely separate process (e.g. one launched directly from a terminal,
+    // bypassing gio's single-instance mechanism entirely) owns this path, and unlinking it out
+    // from under that listener would orphan it. Exit cleanly rather than stealing the path.
+    if UnixStream::connect(&socket_path).is_ok() {
+        eprintln!("neovibe-supervisor: another instance is already listening on {socket_path:?} -- exiting");
+        std::process::exit(0);
+    }
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
         panic!("neovibe-supervisor: failed to bind {socket_path:?}: {e}");
@@ -60,7 +85,12 @@ fn build_ui(app: &Application) {
     // development; get it right here from the start rather than rediscovering it.
     listener.set_nonblocking(true).expect("set listener non-blocking");
 
-    let state = Rc::new(RefCell::new(AppState { registry: Registry::new(), connections: HashMap::new(), next_connection_id: 0 }));
+    let state = Rc::new(RefCell::new(AppState {
+        registry: Registry::new(),
+        connections: HashMap::new(),
+        next_connection_id: 0,
+        last_rendered_rows: Vec::new(),
+    }));
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -77,7 +107,13 @@ fn build_ui(app: &Application) {
         let list_box = list_box.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(POLL_INTERVAL_MS), move || {
             poll_once(&listener, &state);
-            rebuild_list(&list_box, &state.borrow().registry);
+            let mut state_ref = state.borrow_mut();
+            let current_rows = state_ref.registry.rows();
+            if current_rows != state_ref.last_rendered_rows {
+                state_ref.last_rendered_rows = current_rows.clone();
+                drop(state_ref);
+                rebuild_list(&list_box, &current_rows);
+            }
             glib::ControlFlow::Continue
         });
     }
@@ -134,7 +170,7 @@ fn poll_once(listener: &UnixListener, state: &Rc<RefCell<AppState>>) {
                             state_ref.registry.handle_register(id, instance_id, project_name, project_dir, pid);
                         }
                         Ok(ShellMessage::Status { instance_id, status }) => {
-                            state_ref.registry.handle_status(&instance_id, status);
+                            state_ref.registry.handle_status(id, &instance_id, status);
                         }
                         Err(e) => {
                             eprintln!("neovibe-supervisor: unparseable message on connection {id}: {e} -- raw: {trimmed}");
@@ -158,11 +194,11 @@ fn poll_once(listener: &UnixListener, state: &Rc<RefCell<AppState>>) {
     }
 }
 
-fn rebuild_list(list_box: &ListBox, registry: &Registry) {
+fn rebuild_list(list_box: &ListBox, rows: &[Row]) {
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
     }
-    for row in registry.rows() {
+    for row in rows {
         let hbox = gtk4::Box::new(Orientation::Horizontal, 8);
         hbox.set_margin_top(4);
         hbox.set_margin_bottom(4);
@@ -206,7 +242,7 @@ fn activate_instance(state: &Rc<RefCell<AppState>>, instance_id: &str) {
     };
     let payload = serde_json::to_string(&supervisor::SupervisorMessage::Activate).unwrap();
     if let Some(connection) = state_ref.connections.get_mut(&connection_id) {
-        if let Err(e) = writeln!(connection.stream, "{payload}") {
+        if let Err(e) = connection.stream.write_all(format!("{payload}\n").as_bytes()) {
             eprintln!("neovibe-supervisor: failed to send activate to connection {connection_id}: {e}");
         }
     }
