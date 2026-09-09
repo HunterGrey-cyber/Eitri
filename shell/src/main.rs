@@ -7,15 +7,17 @@ mod agent_bridge;
 mod agent_panel;
 mod chrome;
 mod layout;
+mod pane_switch;
 mod theme;
 mod lua;
 
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow};
+use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelEntry, PanelSlot};
 use neovide_editor::NeovideEditorPane;
@@ -47,7 +49,17 @@ fn build_ui(app: &Application, want_clean: bool) {
     let theme = theme::Theme::dark();
     chrome::apply_css(&theme.to_css());
 
-    let pane = NeovideEditorPane::new(want_clean);
+    // Built before the editor pane, because its `child_env()` has to be handed to the pane's
+    // constructor -- those variables reach nvim through `Command::env` at spawn time and cannot
+    // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
+    // own doc); the editor is constructed with an empty child env and behaves exactly as before.
+    let mut pane_switch = pane_switch::PaneSwitch::new();
+    let nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
+
+    // `Rc` because two separate closures need it after this function returns: the agent panel's
+    // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
+    // `NeovideEditorPane` is deliberately not `Clone`.
+    let pane = Rc::new(NeovideEditorPane::with_child_env(want_clean, nvim_child_env));
 
     let config_dir = config_dir();
     let lua_engine = Rc::new(
@@ -112,6 +124,58 @@ fn build_ui(app: &Application, want_clean: bool) {
 
     window.set_child(Some(&root));
 
+    // --- Ctrl+l: editor -> agent panel, decided by Neovim itself.
+    //
+    // This half deliberately has no key handler at all. The embedded nvim received `TMUX`,
+    // `TMUX_PANE` and a fake-`tmux`-carrying `PATH` at spawn time (see `pane_switch`), so the
+    // user's real `vim-tmux-navigator` runs its own `wincmd l` first and only calls out to
+    // "tmux" once the cursor is at a genuine Neovim window boundary -- which is what reaches us
+    // here as an `'R'`. Real `:vsplit` navigation therefore keeps working untouched; `shell`
+    // never sees the keypresses that Neovim resolved internally.
+    if let Some(ps) = pane_switch.as_mut() {
+        let side_widget = side_widget.clone();
+        ps.listen(move |direction| match direction {
+            'R' => {
+                // A `WebView` is an ordinary focusable GTK widget -- unlike a bare `GtkGLArea`,
+                // which needs `focusable(true)` set explicitly before `grab_focus()` does
+                // anything. Verified in the sandbox rather than assumed; see
+                // `shell/MANUAL_VERIFICATION.md`.
+                let grabbed = side_widget.grab_focus();
+                println!("[pane_switch] direction R -> focusing the side panel (grab_focus={grabbed})");
+            }
+            // The editor is already the leftmost pane, and `shell` has no vertical layout, so
+            // these are the same no-ops real tmux performs at the edge of its own pane grid.
+            other => println!("[pane_switch] direction {other} -> no pane in that direction, ignoring"),
+        });
+    }
+
+    // --- Ctrl+h: agent panel -> editor.
+    //
+    // The reverse direction cannot go through the mechanism above: `vim-tmux-navigator` lives
+    // inside Neovim, which is not the focused widget here, so nothing would ever run. This is a
+    // direct GTK capture-phase handler on whatever widget currently occupies the side slot
+    // (which may be a Lua-registered panel rather than the built-in agent panel -- attaching to
+    // the slot's widget rather than to `agent_widget` specifically is what keeps this working in
+    // that case). Capture phase, not bubble: a `WebView` handles key events itself and would
+    // otherwise consume the chord before a bubble-phase controller on the same widget ran.
+    {
+        let pane = pane.clone();
+        let controller = EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            if key == Key::h && state.contains(ModifierType::CONTROL_MASK) {
+                // `NeovideEditorPane::grab_focus()`, not a bare `widget().grab_focus()`: the
+                // pane's own method also calls `im_context.focus_in()`, without which the input
+                // method keeps believing the panel still owns the keyboard.
+                pane.grab_focus();
+                println!("[pane_switch] Ctrl+h in the side panel -> focusing the editor");
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        side_widget.add_controller(controller);
+    }
+
     // nvim exiting on its own (e.g. `:qa!`) has no window to close by itself -- ask this
     // host's window to close, which in turn drives the connect_close_request handler below.
     // Mirrors neovide-editor's own `examples/standalone.rs` exactly.
@@ -151,15 +215,25 @@ fn build_ui(app: &Application, want_clean: bool) {
     // to it sees a fully-built shell (panels registered, commands bound, window shown).
     lua_engine.emit("shell:ready");
 
-    // Registered last: this is `pane`'s final use in this function, so it can be moved in
-    // outright rather than needing `Rc`-wrapping or an extra clone -- `NeovideEditorPane`
-    // doesn't derive `Clone`, but every earlier use above only ever borrowed it via `&self`
-    // methods (`.widget()`, `.on_exited_unrequested()`, `.grab_focus()`). Same
-    // connect_close_request -> shutdown() -> unconditional glib::Propagation::Proceed pattern
-    // as standalone.rs: the app is exiting either way, regardless of whether a clean
-    // `NeovimExited` was actually observed.
+    // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in
+    // outright rather than cloned again. (`pane` is an `Rc<NeovideEditorPane>` because the side
+    // panel's Ctrl+h handler above needs it too; `NeovideEditorPane` doesn't derive `Clone`, and
+    // every use here only ever needs `&self` methods.) Same connect_close_request -> shutdown()
+    // -> unconditional glib::Propagation::Proceed pattern as standalone.rs: the app is exiting
+    // either way, regardless of whether a clean `NeovimExited` was actually observed.
     window.connect_close_request(move |_window| {
         pane.shutdown();
+        // Capturing `pane_switch` here is load-bearing twice over. First, it keeps the
+        // `PaneSwitch` alive for the window's whole lifetime -- it is otherwise a local of
+        // `build_ui`, and its directory (holding the fake-`tmux` symlink and the live socket)
+        // would be removed the instant this function returned, so nvim's `tmux` lookup would
+        // fail from the very first keypress. Second, `cleanup()` is called explicitly rather
+        // than left to `Drop`: a sandbox run confirmed GTK does not deterministically free a
+        // signal-handler closure before the process exits, so relying on `Drop` reproducibly
+        // left `/tmp/neovibe-pane-switch-<pid>/` behind after every close.
+        if let Some(ps) = &pane_switch {
+            ps.cleanup();
+        }
         // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never
         // left the mode-selector screen) -- without this, a normal window close never runs
         // `AgentSession::shutdown()` at all: the `Rc<RefCell<AgentPanelState>>` that owns the

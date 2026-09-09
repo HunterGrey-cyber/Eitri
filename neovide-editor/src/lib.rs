@@ -262,6 +262,21 @@ impl NeovideEditorPane {
     /// `clean` is forwarded to `LiveHarnessOptions::extra_nvim_args` as `--clean`, for
     /// deterministic manual-verification runs.
     pub fn new(clean: bool) -> Self {
+        Self::with_child_env(clean, Vec::new())
+    }
+
+    /// Same as [`NeovideEditorPane::new`], plus extra `(name, value)` environment variables set on
+    /// the spawned `nvim --embed` child process **only** -- forwarded verbatim to
+    /// `LiveHarnessOptions::child_env`, which reaches the child through `Command::env` at spawn
+    /// time. This pane's own process environment is never touched, so nothing else the host
+    /// spawns can observe the injection.
+    ///
+    /// This crate takes no view on *what* a host injects or why; it only owns the plumbing. The
+    /// one real caller today is `shell`, which uses it to make the embedded nvim believe it is
+    /// running inside tmux so `vim-tmux-navigator` forwards boundary-crossing `Ctrl-h`/`Ctrl-l`
+    /// out to the host (see `shell/src/pane_switch.rs`). Values are applied on top of the
+    /// inherited environment, so a host prepending to `PATH` must compose the whole value itself.
+    pub fn with_child_env(clean: bool, child_env: Vec<(String, String)>) -> Self {
         let gl_area = GLArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -393,6 +408,9 @@ impl NeovideEditorPane {
         {
             let skia_state = skia_state.clone();
             let live_state = live_state.clone();
+            // `child_env` is moved into this closure by the `move` below -- it is not needed
+            // again in this function, and this closure is the only place `LiveHarness` is ever
+            // constructed.
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -459,6 +477,10 @@ impl NeovideEditorPane {
                             } else {
                                 Vec::new()
                             },
+                            // Cloned rather than moved because this closure is `Fn` and runs on
+                            // every frame -- but this arm is the one-shot construction pass, so
+                            // the clone happens exactly once per pane.
+                            child_env: child_env.clone(),
                             ..Default::default()
                         };
                         println!(
