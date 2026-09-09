@@ -12,6 +12,7 @@ members = [
     "neovide-editor",
     "shell",
     "agent",
+    "supervisor",
 ]
 # The Neovide fork is a submodule with its own workspace; it is a path dependency, not a member.
 exclude = ["neovide"]
