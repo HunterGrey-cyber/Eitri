@@ -10,6 +10,7 @@
 
 mod event;
 mod process;
+mod projection;
 mod session;
 mod wire;
 
@@ -18,5 +19,10 @@ pub mod settings;
 
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
-pub use session::{AgentSession, AgentSessionState, PermissionRequestRecord, SessionStatus, ToolCallRecord};
+pub use session::AgentSession;
 pub use wire::translate_line;
+
+pub use projection::{
+    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
+    ToolCallRecord, ToolCallResult, PermissionRequestRecord, UsageInfo, TurnOutcome,
+};

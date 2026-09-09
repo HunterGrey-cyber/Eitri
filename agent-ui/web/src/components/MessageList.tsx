@@ -7,7 +7,7 @@ import { PermissionCard } from "./PermissionCard";
 
 type Props = {
   state: AgentUiState;
-  onAnswerPermission: (requestId: string, allow: boolean, reason?: string) => void;
+  onAnswerPermission: (permissionId: string, allow: boolean, reason?: string) => void;
 };
 
 export function MessageList({ state, onAnswerPermission }: Props) {
@@ -24,12 +24,12 @@ export function MessageList({ state, onAnswerPermission }: Props) {
         <div key={i} className="message assistant-message" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(text) as string) }} />
       ))}
       {state.toolCalls.map((call) => (
-        <div key={call.id} className="message tool-message">
+        <div key={call.toolUseId} className="message tool-message">
           {renderToolCall(call)}
         </div>
       ))}
       {state.pendingPermissions.map((request) => (
-        <PermissionCard key={request.requestId} request={request} onAnswer={onAnswerPermission} />
+        <PermissionCard key={request.permissionId} request={request} onAnswer={onAnswerPermission} />
       ))}
       <div ref={bottomRef} />
     </div>

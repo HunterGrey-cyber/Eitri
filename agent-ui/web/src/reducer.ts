@@ -1,4 +1,4 @@
-import type { AgentEvent, AgentUiState, ToolCallRecord } from "./types";
+import type { AgentDomainEvent, AgentUiState, ToolCallRecord } from "./types";
 
 export function initialState(): AgentUiState {
   return {
@@ -8,59 +8,54 @@ export function initialState(): AgentUiState {
     transcript: [],
     toolCalls: [],
     status: { kind: "starting" },
-    turnInProgress: false,
+    activeTurnId: null,
     pendingPermissions: [],
   };
 }
 
-export function applyEvent(state: AgentUiState, event: AgentEvent): AgentUiState {
+export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentUiState {
   switch (event.type) {
-    case "session_started":
+    case "session_opened":
       return { ...state, sessionId: event.session_id, model: event.model, cwd: event.cwd, status: { kind: "running" } };
-    case "assistant_text":
-      return { ...state, transcript: [...state.transcript, event.text] };
-    case "thinking":
-      return state;
-    case "tool_started": {
-      const record: ToolCallRecord = { id: event.id, name: event.name, input: event.input, result: null };
+    case "turn_started":
+      return { ...state, activeTurnId: event.turn_id };
+    case "content_delta":
+      return event.kind === "text" ? { ...state, transcript: [...state.transcript, event.text] } : state;
+    case "tool_call_started": {
+      const record: ToolCallRecord = { toolUseId: event.tool_use_id, name: event.name, input: event.input, result: null };
       return { ...state, toolCalls: [...state.toolCalls, record] };
     }
-    case "tool_result":
+    case "tool_call_completed":
       return {
         ...state,
         toolCalls: state.toolCalls.map((call) =>
-          call.id === event.id ? { ...call, result: { content: event.content, isError: event.is_error } } : call,
+          call.toolUseId === event.tool_use_id ? { ...call, result: { content: event.content, isError: event.is_error } } : call,
         ),
       };
-    case "turn_finished":
-      // v2 semantics: a finished turn does NOT end the conversation, only ProcessExited does --
-      // matches agent::AgentSessionState::apply exactly. See the agent-v2 spec for why.
-      return { ...state, turnInProgress: false };
-    case "process_exited":
-      if (state.status.kind === "starting" || state.status.kind === "running") {
-        return { ...state, status: { kind: "finished", isError: !event.success } };
-      }
-      return state;
-    case "permission_request":
+    case "permission_requested":
       return {
         ...state,
         pendingPermissions: [
           ...state.pendingPermissions,
-          { requestId: event.request_id, toolName: event.tool_name, input: event.input, source: event.source },
+          { permissionId: event.permission_id, toolName: event.tool_name, input: event.input },
         ],
       };
-    case "rate_limit":
-    case "control_response":
-    case "process_stderr":
-      return state;
-    case "unknown":
-      console.warn("agent-ui: unrecognized AgentEvent from Rust", event);
-      return state;
+    case "permission_resolved":
+      // Rust sends `permission_resolved` when `AgentSession::respond_permission` or `interrupt()`
+      // resolves the request. Remove the card from this event so its lifetime follows Rust state.
+      return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
+    case "turn_completed":
+      // The one authoritative source for "no turn is in flight" -- replaces the deleted
+      // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
+      // NOT end the conversation, only session_closed/session_unavailable do.
+      return { ...state, activeTurnId: null };
+    case "session_unavailable":
+      return { ...state, status: { kind: "unavailable", reason: event.reason } };
+    case "session_closed":
+      return { ...state, status: { kind: "closed", reason: event.reason } };
     default: {
-      // Exhaustiveness guard: a new AgentEvent variant added on the Rust side without a matching
-      // TS case lands here at runtime (TypeScript's own exhaustiveness check on `event` would
-      // already fail to compile in that case, catching most drift at build time) -- observable,
-      // never silently dropped, matching agent::wire's own "never discard" posture.
+      // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
+      // matching TS case lands here at runtime -- observable, never silently dropped.
       console.warn("agent-ui: completely unhandled event shape from Rust", event);
       return state;
     }
@@ -69,30 +64,4 @@ export function applyEvent(state: AgentUiState, event: AgentEvent): AgentUiState
 
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiState): AgentUiState {
   return snapshot;
-}
-
-// Optimistic, local-only state update for the moment a turn is sent -- there is no AgentEvent
-// for "a turn just started" (agent::AgentSession::send_turn sets turn_in_progress on the Rust
-// side directly, before any wire event comes back from the CLI at all), so the frontend must
-// set this itself right when it calls postToRust({type: "send_message", ...}) rather than
-// waiting for something that will never arrive over the event stream. A subsequent
-// turn_finished event (or a rehydration snapshot) is what eventually clears it back to false.
-export function markTurnStarted(state: AgentUiState): AgentUiState {
-  return { ...state, turnInProgress: true };
-}
-
-// Clear a permission locally as soon as its answer is sent. `AgentSession::respond_permission`
-// removes it from Rust's `pending_permissions`, but no event announces that removal.
-// Waiting for an event after `postToRust({type: "permission_response", ...})` would leave the
-// answered card visible forever.
-export function markPermissionAnswered(state: AgentUiState, requestId: string): AgentUiState {
-  return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.requestId !== requestId) };
-}
-
-// Clear permissions locally when interrupt is sent. `AgentProcess::interrupt` denies pending
-// hook connections and `AgentSession::interrupt` clears `pending_permissions`, because requests
-// from the interrupted turn can no longer be answered. No event announces the clear, so waiting
-// would leave stale cards looking actionable.
-export function markTurnInterrupted(state: AgentUiState): AgentUiState {
-  return { ...state, pendingPermissions: [] };
 }

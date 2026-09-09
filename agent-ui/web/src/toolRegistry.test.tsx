@@ -5,7 +5,7 @@ import { renderToolCall } from "./toolRegistry";
 import type { ToolCallRecord } from "./types";
 
 function call(overrides: Partial<ToolCallRecord>): ToolCallRecord {
-  return { id: "toolu_1", name: "Bash", input: { command: "echo hi" }, result: null, ...overrides };
+  return { toolUseId: "toolu_1", name: "Bash", input: { command: "echo hi" }, result: null, ...overrides };
 }
 
 describe("renderToolCall", () => {

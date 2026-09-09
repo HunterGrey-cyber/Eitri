@@ -256,7 +256,7 @@ fn release_pending_hook_connections(
 /// `pending` map and a real `UnixStream::pair()`, without needing a live `AgentProcess`/child
 /// process. A request id with no matching pending connection (already answered, or never a real
 /// `HookRelay` request) is a harmless no-op, not an error -- mirrors the same reasoning as
-/// `AgentSessionState::apply`'s `ToolResult`-for-unknown-id case elsewhere in this crate.
+/// `AgentSessionProjection::apply`'s `ToolResult`-for-unknown-id case elsewhere in this crate.
 fn write_hook_decision(
     pending: &Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
     request_id: &str,

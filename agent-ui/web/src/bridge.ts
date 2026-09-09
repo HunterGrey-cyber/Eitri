@@ -1,11 +1,11 @@
-import type { AgentEvent, AgentUiState } from "./types";
+import type { AgentDomainEvent, AgentUiState } from "./types";
 
 export type OutboundMessage =
-  | { type: "ready" }
-  | { type: "start_session"; mode: "auto" | "bypass" }
-  | { type: "send_message"; text: string }
-  | { type: "interrupt" }
-  | { type: "permission_response"; request_id: string; allow: boolean; reason?: string };
+  | { type: "ready"; request_id: string }
+  | { type: "start_session"; request_id: string; mode: "auto" | "bypass" }
+  | { type: "send_message"; request_id: string; text: string }
+  | { type: "interrupt"; request_id: string }
+  | { type: "permission_response"; request_id: string; permission_id: string; allow: boolean; reason?: string };
 
 declare global {
   interface Window {
@@ -14,12 +14,18 @@ declare global {
   }
 }
 
+let requestCounter = 0;
+/** A per-page-load monotonic counter is enough uniqueness here -- this bridge only ever talks to
+ * the one Rust host process behind this exact WebView instance, never a shared or multi-client
+ * server, so there is no cross-client collision risk a random UUID would guard against. */
+export function nextRequestId(): string {
+  requestCounter += 1;
+  return `req-${requestCounter}`;
+}
+
 export function postToRust(message: OutboundMessage): void {
   const handler = window.webkit?.messageHandlers?.neovibeAgent;
   if (!handler) {
-    // No real WebKitGTK bridge present -- expected when this page is opened directly in a
-    // regular browser during frontend development (`npm run dev`). Never throw: the app must
-    // still render and be visually inspectable without a real shell process behind it.
     console.warn("agent-ui: no WebKitGTK message handler present, message dropped", message);
     return;
   }
@@ -28,8 +34,10 @@ export function postToRust(message: OutboundMessage): void {
 
 type InboundHandler = (
   payload:
-    | { kind: "event"; event: AgentEvent }
-    | { kind: "snapshot"; snapshot: AgentUiState }
+    | { kind: "command_result"; requestId: string; ok: true }
+    | { kind: "command_result"; requestId: string; ok: false; error: string }
+    | { kind: "events"; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
+    | { kind: "snapshot"; throughRevision: number; state: AgentUiState }
     | { kind: "error"; message: string },
 ) => void;
 
@@ -44,16 +52,8 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
-      if (obj.kind === "event") {
-        handler({ kind: "event", event: (parsed as { kind: "event"; event: AgentEvent }).event });
-        return;
-      }
-      if (obj.kind === "snapshot") {
-        handler({ kind: "snapshot", snapshot: (parsed as { kind: "snapshot"; snapshot: AgentUiState }).snapshot });
-        return;
-      }
-      if (obj.kind === "error") {
-        handler({ kind: "error", message: (parsed as { kind: "error"; message: string }).message });
+      if (obj.kind === "command_result" || obj.kind === "events" || obj.kind === "snapshot" || obj.kind === "error") {
+        handler(parsed as Parameters<InboundHandler>[0]);
         return;
       }
     }
