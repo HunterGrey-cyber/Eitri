@@ -43,6 +43,13 @@ pub enum PermissionOutcome {
     Denied,
     CancelledByInterrupt,
     CancelledBySessionClose,
+    /// The provider process itself failed/crashed while this permission was pending -- the sidecar
+    /// proto's `PERMISSION_OUTCOME_PROVIDER_FAILED`. No legacy-backend producer; only
+    /// `ClaudeSidecarProvider`'s translation (Task 5) can produce this.
+    ProviderFailed,
+    /// A permission request timed out waiting for a decision -- the sidecar proto's
+    /// `PERMISSION_OUTCOME_EXPIRED`. No legacy-backend producer either.
+    Expired,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -65,7 +72,7 @@ pub enum AgentDomainEvent {
     ContentDelta { turn_id: String, kind: ContentKind, text: String },
     ToolCallStarted { turn_id: String, tool_use_id: String, name: String, input: serde_json::Value },
     ToolCallCompleted { turn_id: String, tool_use_id: String, content: serde_json::Value, is_error: bool },
-    PermissionRequested { permission_id: String, tool_name: String, input: serde_json::Value },
+    PermissionRequested { permission_id: String, tool_use_id: Option<String>, tool_name: String, input: serde_json::Value },
     PermissionResolved { permission_id: String, outcome: PermissionOutcome },
     TurnCompleted {
         turn_id: String,
@@ -101,16 +108,16 @@ pub struct ToolCallRecord {
 
 /// One unanswered permission request. Deliberately carries no `PermissionSource`
 /// (`HookRelay`/`CanUseTool`) -- that Claude-wire-internal routing detail stays in
-/// `agent::session`'s own bookkeeping (see Task 2), never in this provider-neutral type. Also
-/// deliberately carries no `tool_use_id`: the current Claude-CLI wire protocol's own
-/// `AgentEvent::PermissionRequest` (`agent/src/event.rs`) has no field independent of
-/// `request_id` to populate one from -- inventing one here would be a fabricated value, not a
-/// real one. (The future SDK-backed runtime's `PreToolUseHookInput` genuinely does carry a
-/// distinct `tool_use_id` — add this field back when that backend lands and can actually supply
-/// it, not before.)
+/// `agent::session`'s own bookkeeping, never in this provider-neutral type.
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionRequestRecord {
     pub permission_id: String,
+    /// `None` for a backend whose own wire protocol has no field independent of a request id to
+    /// populate this from (the legacy Claude-CLI backend's `AgentEvent::PermissionRequest` --
+    /// `agent/src/session.rs`'s translation site passes `None` explicitly). `Some(..)` starting
+    /// with `ClaudeSidecarProvider`, whose proto `PermissionRequested` message genuinely carries
+    /// one (2026-09-10, Phase 3 of the runtime/provider refactor).
+    pub tool_use_id: Option<String>,
     pub tool_name: String,
     pub input: serde_json::Value,
 }
@@ -191,11 +198,12 @@ impl AgentSessionProjection {
                     call.result = Some(ToolCallResult { content: content.clone(), is_error: *is_error });
                 }
             }
-            AgentDomainEvent::PermissionRequested { permission_id, tool_name, input } => {
+            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, input } => {
                 self.pending_permissions.insert(
                     permission_id.clone(),
                     PermissionRequestRecord {
                         permission_id: permission_id.clone(),
+                        tool_use_id: tool_use_id.clone(),
                         tool_name: tool_name.clone(),
                         input: input.clone(),
                     },

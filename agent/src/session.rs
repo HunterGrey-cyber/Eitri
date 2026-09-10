@@ -199,7 +199,7 @@ impl AgentSession {
             }
             AgentEvent::PermissionRequest { request_id, tool_name, input, source } => {
                 self.pending_permission_sources.insert(request_id.clone(), source);
-                vec![AgentDomainEvent::PermissionRequested { permission_id: request_id, tool_name, input }]
+                vec![AgentDomainEvent::PermissionRequested { permission_id: request_id, tool_use_id: None, tool_name, input }]
             }
             AgentEvent::TurnFinished { result_text, is_error, stop_reason, total_cost_usd, num_turns } => {
                 let turn_id = self.projection.active_turn_id.clone().unwrap_or_else(|| "unknown-turn".to_string());

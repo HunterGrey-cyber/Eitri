@@ -1,0 +1,286 @@
+//! Pure, I/O-free translation from the sidecar's wire-level `SessionEvent` (proto) to this crate's
+//! own provider-neutral `AgentDomainEvent` (design doc §10.2's event-flow layering: "Claude gRPC
+//! event -> AgentDomainEvent"). No I/O, no async -- every case is covered by a plain unit test with
+//! no sidecar process involved, matching this crate's own established preference for testing a
+//! pure reducer/translator in isolation before any real-process integration test exercises it.
+
+use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, TurnOutcome};
+use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
+use claude_runtime_protocol::v1::{
+    PermissionOutcome as ProtoPermissionOutcome, SessionCloseReason,
+    SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome,
+};
+
+/// Translates one proto `SessionEvent`'s wire fields into this crate's own domain event. Returns
+/// `None` for a genuinely malformed message (unset `oneof`, or unparseable `input_json`/
+/// `content_json`) -- logged via `eprintln!`, never panics (Global Constraints), and the caller
+/// (Task 8's watch-loop) simply skips that one occurrence rather than tearing down the whole
+/// stream over one bad event.
+pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
+    match event.event? {
+        ProtoEvent::SessionReady(ready) => Some(AgentDomainEvent::SessionOpened {
+            session_id: ready.session_id,
+            model: ready.model,
+            cwd: ready.cwd,
+        }),
+        ProtoEvent::TurnStarted(started) => Some(AgentDomainEvent::TurnStarted { turn_id: started.turn_id }),
+        ProtoEvent::TextDelta(delta) => Some(AgentDomainEvent::ContentDelta {
+            turn_id: delta.turn_id,
+            kind: ContentKind::Text,
+            text: delta.text,
+        }),
+        ProtoEvent::ThinkingDelta(delta) => Some(AgentDomainEvent::ContentDelta {
+            turn_id: delta.turn_id,
+            kind: ContentKind::Thinking,
+            text: delta.text,
+        }),
+        ProtoEvent::ToolCallStarted(started) => match serde_json::from_str(&started.input_json) {
+            Ok(input) => Some(AgentDomainEvent::ToolCallStarted {
+                turn_id: started.turn_id,
+                tool_use_id: started.tool_use_id,
+                name: started.name,
+                input,
+            }),
+            Err(e) => {
+                eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallStarted.input_json, dropping this event: {e}");
+                None
+            }
+        },
+        ProtoEvent::ToolCallCompleted(completed) => match serde_json::from_str(&completed.content_json) {
+            Ok(content) => Some(AgentDomainEvent::ToolCallCompleted {
+                turn_id: completed.turn_id,
+                tool_use_id: completed.tool_use_id,
+                content,
+                is_error: completed.is_error,
+            }),
+            Err(e) => {
+                eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallCompleted.content_json, dropping this event: {e}");
+                None
+            }
+        },
+        ProtoEvent::PermissionRequested(requested) => match serde_json::from_str(&requested.input_json) {
+            Ok(input) => Some(AgentDomainEvent::PermissionRequested {
+                permission_id: requested.permission_id,
+                tool_use_id: Some(requested.tool_use_id),
+                tool_name: requested.tool_name,
+                input,
+            }),
+            Err(e) => {
+                eprintln!("agent: ClaudeSidecarProvider: unparseable PermissionRequested.input_json, dropping this event: {e}");
+                None
+            }
+        },
+        ProtoEvent::PermissionResolved(resolved) => {
+            let outcome = translate_permission_outcome(resolved.outcome());
+            Some(AgentDomainEvent::PermissionResolved {
+                permission_id: resolved.permission_id,
+                outcome,
+            })
+        },
+        ProtoEvent::TurnCompleted(completed) => {
+            let outcome = translate_turn_outcome(completed.outcome());
+            Some(AgentDomainEvent::TurnCompleted {
+                turn_id: completed.turn_id,
+                outcome,
+                result_text: completed.result_text,
+                stop_reason: completed.stop_reason,
+                // No source data: the v1 sidecar proto's TurnCompleted carries no cost/usage fields at
+                // all (confirmed by reading proto/verdandi/claude/runtime/v1/runtime.proto directly --
+                // the design doc's own §9.6 "suggested" UsageUpdated event was never implemented this
+                // round). Zero, not fabricated, until a later sidecar proto revision adds one.
+                total_cost_usd: 0.0,
+                num_turns: 0,
+            })
+        },
+        ProtoEvent::SessionClosed(closed) => Some(AgentDomainEvent::SessionClosed {
+            reason: translate_close_reason(closed.reason()),
+        }),
+        ProtoEvent::ProviderNotice(notice) => {
+            // Diagnostics only, per design doc §3.2/§5.2 -- never surfaced as a domain event.
+            eprintln!(
+                "agent: ClaudeSidecarProvider: ProviderNotice kind={} subtype={:?} (turn {})",
+                notice.kind, notice.subtype, event.turn_id.unwrap_or_default()
+            );
+            None
+        }
+    }
+}
+
+fn translate_permission_outcome(outcome: ProtoPermissionOutcome) -> PermissionOutcome {
+    match outcome {
+        ProtoPermissionOutcome::Allowed => PermissionOutcome::Allowed,
+        ProtoPermissionOutcome::Denied => PermissionOutcome::Denied,
+        ProtoPermissionOutcome::CancelledByInterrupt => PermissionOutcome::CancelledByInterrupt,
+        ProtoPermissionOutcome::CancelledBySessionClose => PermissionOutcome::CancelledBySessionClose,
+        ProtoPermissionOutcome::ProviderFailed => PermissionOutcome::ProviderFailed,
+        ProtoPermissionOutcome::Expired => PermissionOutcome::Expired,
+        ProtoPermissionOutcome::Unspecified => {
+            eprintln!("agent: ClaudeSidecarProvider: PermissionOutcome::Unspecified from the wire, treating as Expired");
+            PermissionOutcome::Expired
+        }
+    }
+}
+
+fn translate_turn_outcome(outcome: ProtoTurnOutcome) -> TurnOutcome {
+    match outcome {
+        ProtoTurnOutcome::Completed => TurnOutcome::Completed,
+        ProtoTurnOutcome::Interrupted => TurnOutcome::Interrupted,
+        ProtoTurnOutcome::Failed => TurnOutcome::Failed,
+        ProtoTurnOutcome::LimitReached => TurnOutcome::LimitReached,
+        ProtoTurnOutcome::Unspecified => {
+            eprintln!("agent: ClaudeSidecarProvider: TurnOutcome::Unspecified from the wire, treating as Failed");
+            TurnOutcome::Failed
+        }
+    }
+}
+
+/// `AgentDomainEvent::SessionClosed` carries a plain `String` reason (unchanged by this plan --
+/// Task 2 did not touch it), so the proto's typed `SessionCloseReason` enum collapses to a short,
+/// stable diagnostic string here rather than propagating a second parallel typed reason.
+fn translate_close_reason(reason: SessionCloseReason) -> String {
+    match reason {
+        SessionCloseReason::ClosedByHost => "closed_by_host".to_string(),
+        SessionCloseReason::ProviderExited => "provider_exited".to_string(),
+        SessionCloseReason::ProviderFailed => "provider_failed".to_string(),
+        SessionCloseReason::Unspecified => "unspecified".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_runtime_protocol::v1::{
+        PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved, ProviderNotice,
+        SessionClosed, SessionCloseReason, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted,
+        ToolCallStarted, TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
+    };
+
+    fn wrap(event: ProtoEvent) -> ProtoSessionEvent {
+        ProtoSessionEvent { session_id: "sess-1".into(), sequence: 1, occurred_at: 0, turn_id: None, event: Some(event) }
+    }
+
+    #[test]
+    fn session_ready_translates_to_session_opened() {
+        let event = wrap(ProtoEvent::SessionReady(SessionReady {
+            session_id: "sess-1".into(), provider_session_id: "prov-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into(),
+        }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::SessionOpened { session_id: "sess-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() }));
+    }
+
+    #[test]
+    fn turn_started_translates() {
+        let event = wrap(ProtoEvent::TurnStarted(TurnStarted { turn_id: "turn-1".into() }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() }));
+    }
+
+    #[test]
+    fn text_delta_translates_with_text_kind() {
+        let event = wrap(ProtoEvent::TextDelta(TextDelta { turn_id: "turn-1".into(), text: "hi".into() }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "hi".into() }));
+    }
+
+    #[test]
+    fn thinking_delta_translates_with_thinking_kind() {
+        let event = wrap(ProtoEvent::ThinkingDelta(ThinkingDelta { turn_id: "turn-1".into(), text: "hmm".into() }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Thinking, text: "hmm".into() }));
+    }
+
+    #[test]
+    fn tool_call_started_parses_input_json() {
+        let event = wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
+            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), name: "Bash".into(), input_json: r#"{"command":"echo hi"}"#.into(),
+        }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::ToolCallStarted {
+            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), name: "Bash".into(), input: serde_json::json!({"command": "echo hi"}),
+        }));
+    }
+
+    #[test]
+    fn tool_call_started_drops_the_event_on_unparseable_input_json() {
+        let event = wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
+            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), name: "Bash".into(), input_json: "not json".into(),
+        }));
+        assert_eq!(translate(event), None);
+    }
+
+    #[test]
+    fn tool_call_completed_drops_the_event_on_unparseable_content_json() {
+        let event = wrap(ProtoEvent::ToolCallCompleted(ToolCallCompleted {
+            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), content_json: "not json".into(), is_error: false,
+        }));
+        assert_eq!(translate(event), None);
+    }
+
+    #[test]
+    fn tool_call_completed_parses_content_json() {
+        let event = wrap(ProtoEvent::ToolCallCompleted(ToolCallCompleted {
+            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), content_json: r#""hi""#.into(), is_error: false,
+        }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), content: serde_json::json!("hi"), is_error: false,
+        }));
+    }
+
+    #[test]
+    fn permission_requested_carries_tool_use_id_and_parses_input_json() {
+        let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
+            permission_id: "perm-1".into(), tool_use_id: "tu-1".into(), tool_name: "Write".into(), input_json: "{}".into(),
+        }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(), tool_use_id: Some("tu-1".into()), tool_name: "Write".into(), input: serde_json::json!({}),
+        }));
+    }
+
+    #[test]
+    fn permission_resolved_translates_every_outcome_value() {
+        let cases = [
+            (ProtoPermOutcome::Allowed, PermissionOutcome::Allowed),
+            (ProtoPermOutcome::Denied, PermissionOutcome::Denied),
+            (ProtoPermOutcome::CancelledByInterrupt, PermissionOutcome::CancelledByInterrupt),
+            (ProtoPermOutcome::CancelledBySessionClose, PermissionOutcome::CancelledBySessionClose),
+            (ProtoPermOutcome::ProviderFailed, PermissionOutcome::ProviderFailed),
+            (ProtoPermOutcome::Expired, PermissionOutcome::Expired),
+        ];
+        for (proto_outcome, expected) in cases {
+            let event = wrap(ProtoEvent::PermissionResolved(PermissionResolved { permission_id: "perm-1".into(), outcome: proto_outcome as i32 }));
+            assert_eq!(translate(event), Some(AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: expected }));
+        }
+    }
+
+    #[test]
+    fn turn_completed_translates_every_outcome_value_and_zeroes_usage() {
+        let cases = [
+            (ProtoTOutcome::Completed, TurnOutcome::Completed),
+            (ProtoTOutcome::Interrupted, TurnOutcome::Interrupted),
+            (ProtoTOutcome::Failed, TurnOutcome::Failed),
+            (ProtoTOutcome::LimitReached, TurnOutcome::LimitReached),
+        ];
+        for (proto_outcome, expected) in cases {
+            let event = wrap(ProtoEvent::TurnCompleted(TurnCompleted {
+                turn_id: "turn-1".into(), outcome: proto_outcome as i32, result_text: "done".into(), is_error: false, stop_reason: Some("end_turn".into()),
+            }));
+            assert_eq!(translate(event), Some(AgentDomainEvent::TurnCompleted {
+                turn_id: "turn-1".into(), outcome: expected, result_text: "done".into(), stop_reason: Some("end_turn".into()), total_cost_usd: 0.0, num_turns: 0,
+            }));
+        }
+    }
+
+    #[test]
+    fn session_closed_translates_every_reason_value_to_a_stable_string() {
+        let cases = [
+            (SessionCloseReason::ClosedByHost, "closed_by_host"),
+            (SessionCloseReason::ProviderExited, "provider_exited"),
+            (SessionCloseReason::ProviderFailed, "provider_failed"),
+        ];
+        for (proto_reason, expected) in cases {
+            let event = wrap(ProtoEvent::SessionClosed(SessionClosed { reason: proto_reason as i32 }));
+            assert_eq!(translate(event), Some(AgentDomainEvent::SessionClosed { reason: expected.to_string() }));
+        }
+    }
+
+    #[test]
+    fn provider_notice_never_becomes_a_domain_event() {
+        let event = wrap(ProtoEvent::ProviderNotice(ProviderNotice { kind: "diagnostic".into(), subtype: None }));
+        assert_eq!(translate(event), None);
+    }
+}

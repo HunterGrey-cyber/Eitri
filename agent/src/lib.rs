@@ -19,10 +19,13 @@
 mod event;
 mod process;
 mod projection;
+mod provider;
+mod runtime_thread;
 mod session;
 mod wire;
 
 pub mod hook_protocol;
+pub mod providers;
 pub mod settings;
 
 pub use event::{AgentEvent, PermissionSource};
@@ -34,3 +37,9 @@ pub use projection::{
     AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
     ToolCallRecord, ToolCallResult, PermissionRequestRecord, UsageInfo, TurnOutcome,
 };
+pub use provider::{
+    AgentProvider, CreateSessionRequest, ResumeSessionRequest, SendTurnRequest,
+    InterruptTurnRequest, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
+    ProviderError,
+};
+pub use providers::claude_sidecar::ClaudeSidecarProvider;

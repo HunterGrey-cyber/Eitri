@@ -72,10 +72,11 @@ fn tool_call_completed_for_unknown_tool_use_id_is_a_harmless_no_op() {
 fn permission_requested_populates_pending_permissions_map() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_name: "Bash".into(), input: json!({}),
+        permission_id: "perm-1".into(), tool_use_id: Some("tu-1".into()), tool_name: "Bash".into(), input: json!({}),
     });
     assert!(projection.pending_permissions.contains_key("perm-1"));
     assert_eq!(projection.pending_permissions["perm-1"].tool_name, "Bash");
+    assert_eq!(projection.pending_permissions["perm-1"].tool_use_id, Some("tu-1".into()));
 }
 
 /// The scenario `agent/BACKEND_BASELINE.md` cites by name as pinning concurrent-permission
@@ -85,10 +86,10 @@ fn permission_requested_populates_pending_permissions_map() {
 fn two_concurrent_permission_requests_are_both_retained_and_independently_resolvable_in_either_order() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_name: "Bash".into(), input: json!({}),
+        permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
     });
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-2".into(), tool_name: "Write".into(), input: json!({}),
+        permission_id: "perm-2".into(), tool_use_id: None, tool_name: "Write".into(), input: json!({}),
     });
     assert_eq!(projection.pending_permissions.len(), 2);
 
@@ -146,4 +147,20 @@ fn every_apply_call_bumps_last_revision_by_exactly_one() {
         projection.apply(event);
         assert_eq!(projection.last_revision, (i + 1) as u64);
     }
+}
+
+#[test]
+fn permission_resolved_accepts_provider_failed_and_expired_outcomes() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+    });
+    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: PermissionOutcome::ProviderFailed });
+    assert!(!projection.pending_permissions.contains_key("perm-1"));
+
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-2".into(), tool_use_id: None, tool_name: "Write".into(), input: json!({}),
+    });
+    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-2".into(), outcome: PermissionOutcome::Expired });
+    assert!(!projection.pending_permissions.contains_key("perm-2"));
 }
