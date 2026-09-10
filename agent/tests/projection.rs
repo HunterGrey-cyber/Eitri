@@ -9,10 +9,12 @@ fn session_opened_populates_identity_and_sets_running() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::SessionOpened {
         session_id: "sess-1".into(),
+        provider_session_id: "prov-1".into(),
         model: "claude-sonnet-5".into(),
         cwd: "/tmp/project".into(),
     });
     assert_eq!(projection.session_id, Some("sess-1".into()));
+    assert_eq!(projection.provider_session_id, Some("prov-1".into()));
     assert_eq!(projection.model, Some("claude-sonnet-5".into()));
     assert_eq!(projection.cwd, Some("/tmp/project".into()));
     assert_eq!(projection.status, ProjectionStatus::Running);
@@ -139,7 +141,7 @@ fn session_unavailable_and_session_closed_set_distinct_statuses() {
 fn every_apply_call_bumps_last_revision_by_exactly_one() {
     let mut projection = AgentSessionProjection::default();
     let events = vec![
-        AgentDomainEvent::SessionOpened { session_id: "s".into(), model: "m".into(), cwd: "/".into() },
+        AgentDomainEvent::SessionOpened { session_id: "s".into(), provider_session_id: "p".into(), model: "m".into(), cwd: "/".into() },
         AgentDomainEvent::TurnStarted { turn_id: "t".into() },
         AgentDomainEvent::ContentDelta { turn_id: "t".into(), kind: ContentKind::Thinking, text: "".into() },
     ];

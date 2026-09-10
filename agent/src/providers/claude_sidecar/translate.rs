@@ -17,6 +17,7 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
     match event.event? {
         ProtoEvent::SessionReady(ready) => Some(AgentDomainEvent::SessionOpened {
             session_id: ready.session_id,
+            provider_session_id: ready.provider_session_id,
             model: ready.model,
             cwd: ready.cwd,
         }),
@@ -158,7 +159,7 @@ mod tests {
         let event = wrap(ProtoEvent::SessionReady(SessionReady {
             session_id: "sess-1".into(), provider_session_id: "prov-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into(),
         }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::SessionOpened { session_id: "sess-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::SessionOpened { session_id: "sess-1".into(), provider_session_id: "prov-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() }));
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub enum ProjectionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentDomainEvent {
-    SessionOpened { session_id: String, model: String, cwd: String },
+    SessionOpened { session_id: String, provider_session_id: String, model: String, cwd: String },
     TurnStarted { turn_id: String },
     ContentDelta { turn_id: String, kind: ContentKind, text: String },
     ToolCallStarted { turn_id: String, tool_use_id: String, name: String, input: serde_json::Value },
@@ -134,6 +134,13 @@ pub struct UsageInfo {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentSessionProjection {
     pub session_id: Option<String>,
+    /// The real Claude CLI session UUID -- for the legacy backend this is identical to
+    /// `session_id` above (the CLI never distinguishes them); for `ClaudeSidecarProvider` this is
+    /// the wire's own `SessionReady.provider_session_id`, genuinely distinct from the sidecar's
+    /// internal `session_id`. Needed for `claude --resume <id>` -- not
+    /// modeled before this phase per this struct's own established "no field with zero current
+    /// consumer" discipline.
+    pub provider_session_id: Option<String>,
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub status: ProjectionStatus,
@@ -164,8 +171,9 @@ impl AgentSessionProjection {
     /// spawning anything.
     pub fn apply(&mut self, event: &AgentDomainEvent) {
         match event {
-            AgentDomainEvent::SessionOpened { session_id, model, cwd } => {
+            AgentDomainEvent::SessionOpened { session_id, provider_session_id, model, cwd } => {
                 self.session_id = Some(session_id.clone());
+                self.provider_session_id = Some(provider_session_id.clone());
                 self.model = Some(model.clone());
                 self.cwd = Some(cwd.clone());
                 self.status = ProjectionStatus::Running;
