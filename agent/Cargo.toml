@@ -15,3 +15,5 @@ prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+sha2 = "0.10"
+libc = "0.2"

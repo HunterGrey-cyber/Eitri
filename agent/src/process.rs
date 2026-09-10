@@ -1101,10 +1101,17 @@ mod tests {
         assert!(new_sockets.is_empty(), "a failed spawn must not leave its socket file behind: {new_sockets:?}");
 
         // A leaked listener thread never exits, so five leaks would be five permanently-extra
-        // threads. Allow a small margin for genuinely unrelated threads other tests in this same
-        // binary may hold momentarily -- five is far outside that margin.
-        std::thread::sleep(Duration::from_millis(200));
-        let threads_after = live_thread_count();
+        // threads. Threads that other tests in this same binary hold are, by contrast, transient
+        // -- so poll until the count settles rather than trusting one sample. A single sample
+        // failed deterministically at --test-threads=4 (and so on any 4-core machine, with no
+        // flags at all) once this crate gained env-var-serialized tests whose sleeps overlap
+        // this one's sampling window.
+        let settle_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut threads_after = live_thread_count();
+        while threads_after > threads_before + 2 && std::time::Instant::now() < settle_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            threads_after = live_thread_count();
+        }
         assert!(
             threads_after <= threads_before + 2,
             "five failed spawns leaked threads: {threads_before} before, {threads_after} after"

@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn serialize_snapshot_for_js_produces_camel_case_matching_the_ts_shape() {
         let mut projection = AgentSessionProjection::default();
-        projection.apply(&AgentDomainEvent::SessionOpened { session_id: "abc".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() });
+        projection.apply(&AgentDomainEvent::SessionOpened { session_id: "abc".into(), provider_session_id: "abc".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() });
         projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
         projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({"command": "echo hi"}) });
         projection.apply(&AgentDomainEvent::ToolCallCompleted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), content: json!("boom"), is_error: true });

@@ -66,8 +66,8 @@ fn send_and_wait(session: &mut AgentSession, prompt: &str) {
 
 fn print_event(event: &AgentDomainEvent) {
     match event {
-        AgentDomainEvent::SessionOpened { session_id, model, cwd } => {
-            println!("[session opened] id={session_id} model={model} cwd={cwd}");
+        AgentDomainEvent::SessionOpened { session_id, provider_session_id, model, cwd } => {
+            println!("[session opened] id={session_id} provider_session_id={provider_session_id} model={model} cwd={cwd}");
         }
         AgentDomainEvent::TurnStarted { turn_id } => println!("[turn started] {turn_id}"),
         AgentDomainEvent::ContentDelta { kind: agent::ContentKind::Text, text, .. } => println!("[assistant] {text}"),

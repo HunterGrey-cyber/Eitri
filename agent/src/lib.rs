@@ -24,9 +24,14 @@ mod runtime_thread;
 mod session;
 mod wire;
 
+pub mod external_writer;
+pub mod handoff;
 pub mod hook_protocol;
+pub mod lease;
+pub mod persistence;
 pub mod providers;
 pub mod settings;
+pub mod transcript;
 
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};

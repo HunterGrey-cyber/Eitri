@@ -179,7 +179,11 @@ impl AgentSession {
     fn translate_event(&mut self, event: AgentEvent) -> Vec<AgentDomainEvent> {
         match event {
             AgentEvent::SessionStarted { session_id, model, cwd } => {
-                vec![AgentDomainEvent::SessionOpened { session_id, model, cwd }]
+                // The legacy CLI backend never distinguishes a sidecar-internal id from the real
+                // provider session id -- `session_id` here already *is* the real Claude CLI UUID
+                // (it comes straight from the CLI's own `init` line), so both fields get the same
+                // value.
+                vec![AgentDomainEvent::SessionOpened { session_id: session_id.clone(), provider_session_id: session_id, model, cwd }]
             }
             AgentEvent::AssistantText { text } => {
                 let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
