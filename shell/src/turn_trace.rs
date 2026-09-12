@@ -110,10 +110,10 @@ impl TurnTrace {
                 }
                 // A turn that ends because the session did still gets a line: a trace that only
                 // prints for turns that finished cleanly hides exactly the slow, broken ones.
-                AgentDomainEvent::SessionUnavailable { .. } | AgentDomainEvent::SessionClosed { .. } => {
-                    if self.completed.is_none() {
-                        self.completed = Some(self.since_submit());
-                    }
+                AgentDomainEvent::SessionUnavailable { .. } | AgentDomainEvent::SessionClosed { .. }
+                    if self.completed.is_none() =>
+                {
+                    self.completed = Some(self.since_submit());
                 }
                 _ => {}
             }
