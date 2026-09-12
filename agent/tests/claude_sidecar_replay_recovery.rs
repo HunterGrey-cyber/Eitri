@@ -242,6 +242,78 @@ fn a_gap_too_large_to_replay_ends_the_session_visibly() {
     assert_eq!(projection.active_turn_id, None, "a session that lost events is not still working");
 }
 
+/// **The same stall, but through a real `AgentConversation`.**
+///
+/// The test below measures the PROVIDER in isolation, where a stalled caller still lets its queue
+/// grow -- that is the provider's own contract and it is unchanged. This one measures what the
+/// product actually assembles: a conversation, whose ingestion thread drains that provider
+/// continuously regardless of what the UI is doing. Both are true, and keeping them side by side is
+/// the point: the raw queue did not disappear, it stopped being the UI's to hold.
+#[test]
+#[ignore]
+fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
+    let provider = std::sync::Arc::new(
+        ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
+            .expect("connecting to a real sidecar should succeed"),
+    );
+    let mut conversation = agent::AgentConversation::create(
+        provider.clone(),
+        &std::env::temp_dir(),
+        PermissionMode::Bypass,
+    )
+    .expect("creating a conversation should succeed");
+
+    conversation.send_turn(STREAMING_PROMPT).expect("send_turn should succeed");
+
+    // The UI never looks. Not once, for the whole turn.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut worst_provider_queue = 0usize;
+    while Instant::now() < deadline {
+        worst_provider_queue = worst_provider_queue.max(provider.backpressure_stats().pending_events);
+        let done = {
+            let projection = conversation.projection();
+            projection.active_turn_id.is_none() && projection.last_revision > 2
+        };
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let ingest = conversation.ingest_stats();
+    let wire = provider.backpressure_stats();
+    eprintln!("---- a real turn with the UI stalled throughout ----");
+    eprintln!("  provider events received : {}", wire.events_received);
+    eprintln!("  events folded            : {}", ingest.events_ingested);
+    eprintln!("  worst provider-side queue: {worst_provider_queue}");
+    eprintln!("  deepest UI backlog       : {} (cap {})", ingest.max_ui_backlog, agent::UI_EVENT_QUEUE_CAPACITY);
+    eprintln!("  resyncs owed to the UI   : {}", ingest.resyncs);
+    eprintln!("  transcript messages      : {}", conversation.projection().transcript.len());
+
+    // The premise: a real streamed turn actually happened.
+    assert!(ingest.events_ingested > 50, "only {} events -- no real stream to stall against", ingest.events_ingested);
+
+    // Ingestion kept up even though nothing rendered: the provider's own queue never became the
+    // place the backlog lives.
+    assert!(
+        worst_provider_queue < 200,
+        "the provider's queue reached {worst_provider_queue} -- ingestion is not draining it, which \
+         would mean the unbounded pile simply moved one layer down"
+    );
+    assert!(
+        ingest.max_ui_backlog <= agent::UI_EVENT_QUEUE_CAPACITY + 1,
+        "the UI queue reached {}, past its cap",
+        ingest.max_ui_backlog
+    );
+
+    // And the conversation is complete despite never having been rendered: partial updates coalesced
+    // into real messages rather than being held as raw events waiting for a repaint.
+    let projection = conversation.projection();
+    assert!(!projection.transcript.is_empty(), "the turn produced no assistant message");
+    assert_eq!(projection.active_turn_id, None, "the turn should have completed");
+    assert!(!matches!(projection.status, ProjectionStatus::Unavailable { .. }));
+}
+
 /// **Is it lossless because recovery is bounded, or because something buffers without limit?**
 ///
 /// The existing stall test answers only the first half of that question. This one measures the

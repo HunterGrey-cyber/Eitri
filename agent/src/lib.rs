@@ -28,6 +28,7 @@ mod wire;
 pub mod external_writer;
 pub mod handoff;
 pub mod hook_protocol;
+pub mod ingestion;
 pub mod lease;
 pub mod persistence;
 pub mod providers;
@@ -35,6 +36,7 @@ pub mod settings;
 pub mod transcript;
 
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
+pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
 pub use persistence::{resumable_session, ResumableSession};
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};

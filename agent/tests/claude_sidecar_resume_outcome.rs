@@ -14,8 +14,8 @@
 
 use agent::{AgentConversation, ClaudeSidecarProvider, ConversationError, PermissionMode};
 
-fn provider() -> Box<ClaudeSidecarProvider> {
-    Box::new(
+fn provider() -> std::sync::Arc<ClaudeSidecarProvider> {
+    std::sync::Arc::new(
         ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
             .expect("connecting to a real sidecar should succeed"),
     )
@@ -41,7 +41,7 @@ fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
             "a resume of a nonexistent session produced a conversation (session_id={:?}, status={:?}). \
              That is the silent substitution this protocol exists to prevent.",
             conversation.session_id(),
-            conversation.projection.status,
+            conversation.projection().status,
         ),
         Err(error) => error,
     };

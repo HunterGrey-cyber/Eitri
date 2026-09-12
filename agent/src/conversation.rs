@@ -37,7 +37,9 @@ use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
 };
-use crate::projection::{AgentDomainEvent, AgentSessionProjection, PermissionOutcome};
+use crate::ingestion::ConversationIngest;
+use crate::projection::{AgentDomainEvent, PermissionOutcome};
+use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -161,7 +163,7 @@ pub fn conversation_id_for_cwd(canonical_cwd: &Path) -> String {
 
 /// The `provider` component of both the lease key and the persisted record. One constant so the two
 /// cannot disagree -- a mismatch would silently produce a lease nobody else looks for.
-const PROVIDER_NAME: &str = "claude";
+pub(crate) const PROVIDER_NAME: &str = "claude";
 
 /// How long `resume` waits for the provider's verdict before showing the conversation anyway.
 ///
@@ -222,7 +224,7 @@ fn ensure_transcript_is_not_being_written(
 
 /// Best-effort. A conversation that runs but was not recorded is a lost resume offer next time, not
 /// a broken session -- so this logs rather than failing the caller.
-fn persist_record(
+pub(crate) fn persist_record(
     conversation_id: &str,
     canonical_cwd: &str,
     provider_session_id: &str,
@@ -270,20 +272,27 @@ pub struct AgentConversation {
     /// afterwards. That is not a nicety: creating one spawns a real sidecar process and performs a
     /// real handshake, and on a cold Verdandi checkout it also runs `npm ci` and `npm run build` --
     /// minutes of work that must never happen on a GTK main loop.
-    provider: Box<dyn AgentProvider + Send>,
+    /// Shared with the ingestion thread rather than owned. Every `AgentProvider` method takes
+    /// `&self`, so the UI thread can issue commands while ingestion drains the same provider with no
+    /// lock between them -- a mutex here would let a blocking `send_turn` stall ingestion for a whole
+    /// gRPC round trip, recreating the UI/provider coupling `ingestion.rs` exists to break.
+    ///
+    /// `+ Send + Sync` so it can cross to that thread. (`+ Send` alone already mattered: a
+    /// conversation is CONSTRUCTED on a worker thread, because creating one spawns a real sidecar
+    /// process and, on a cold checkout, runs `npm ci` -- minutes that must never land on a GTK loop.)
+    provider: Arc<dyn AgentProvider + Send + Sync>,
     capabilities: ProviderCapabilities,
     info: ProviderInfo,
     /// Verdandi's id for this session. `None` only between construction failure modes -- a
     /// successfully created conversation always has one.
     session_id: Option<String>,
-    /// Claude's own session UUID. `None` until the provider's first `SessionOpened` event, which is
-    /// why a "continue in a real terminal" action cannot be offered on a conversation that has
-    /// never taken a turn.
-    provider_session_id: Option<String>,
-    /// Reserved for the phase that adds resume; see this module's header. Always `None` today.
-    lease: Option<SessionLease>,
-    pub projection: AgentSessionProjection,
-    event_log: Vec<AgentDomainEvent>,
+    /// Canonical state, and the thread that keeps it current independently of the UI.
+    ///
+    /// Owns the projection, the Claude session id, and the session lease -- all three used to live
+    /// here and be advanced only by a GTK timer calling `pump()`. `event_log` used to live here too,
+    /// an unbounded `Vec` holding every raw event forever with no reader anywhere in the product;
+    /// it is gone, because memory must follow the conversation rather than the event count.
+    ingest: ConversationIngest,
 }
 
 impl AgentConversation {
@@ -293,7 +302,7 @@ impl AgentConversation {
     /// provider see -- otherwise `/home/x/proj` and `/home/x/../x/proj` would be two conversations
     /// for one directory, and would later map to two different persisted records.
     pub fn create(
-        provider: Box<dyn AgentProvider + Send>,
+        provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
         permission_mode: crate::PermissionMode,
     ) -> Result<Self, ConversationError> {
@@ -306,18 +315,31 @@ impl AgentConversation {
             // A UI client always wants incremental presentation.
             streaming: crate::provider::StreamingPreference::Partial,
         })?;
-        Ok(Self {
-            conversation_id: conversation_id_for_cwd(&canonical_cwd),
-            canonical_cwd,
-            provider,
-            capabilities,
-            info,
-            session_id: Some(session_id),
-            provider_session_id: None,
-            lease: None,
-            projection: AgentSessionProjection::default(),
-            event_log: Vec::new(),
-        })
+        Ok(Self::assembled(provider, canonical_cwd, capabilities, info, session_id))
+    }
+
+    /// Wires a freshly-created conversation to its ingestion thread.
+    ///
+    /// Ingestion starts here, which is BEFORE this returns to the caller -- so events begin folding
+    /// into canonical state the moment the provider has one to give, rather than waiting for
+    /// whichever thread eventually decides to look.
+    fn assembled(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        canonical_cwd: PathBuf,
+        capabilities: ProviderCapabilities,
+        info: ProviderInfo,
+        session_id: String,
+    ) -> Self {
+        let conversation_id = conversation_id_for_cwd(&canonical_cwd);
+        let ingest = ConversationIngest::start(
+            Arc::clone(&provider),
+            conversation_id.clone(),
+            canonical_cwd.to_string_lossy().to_string(),
+            capabilities.resume,
+            None,
+            None,
+        );
+        Self { conversation_id, canonical_cwd, provider, capabilities, info, session_id: Some(session_id), ingest }
     }
 
     /// Continues an existing Claude session.
@@ -338,7 +360,7 @@ impl AgentConversation {
     /// this protocol. A raw `claude --resume` run outside Neovibe is not blocked by it, and nothing
     /// here pretends otherwise (design doc §8.5).
     pub fn resume(
-        provider: Box<dyn AgentProvider + Send>,
+        provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
         provider_session_id: &str,
         permission_mode: crate::PermissionMode,
@@ -372,6 +394,16 @@ impl AgentConversation {
 
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
 
+        let ingest = ConversationIngest::start(
+            Arc::clone(&provider),
+            conversation_id.clone(),
+            cwd_string.clone(),
+            capabilities.resume,
+            // Known up front on this path, unlike `create` -- it is what we asked to resume -- and
+            // the lease was taken before the provider was called at all.
+            Some(provider_session_id.to_string()),
+            Some(lease),
+        );
         let mut conversation = Self {
             conversation_id,
             canonical_cwd,
@@ -379,11 +411,7 @@ impl AgentConversation {
             capabilities,
             info,
             session_id: Some(session_id),
-            // Known up front on this path, unlike `create` -- it is what we asked to resume.
-            provider_session_id: Some(provider_session_id.to_string()),
-            lease: Some(lease),
-            projection: AgentSessionProjection::default(),
-            event_log: Vec::new(),
+            ingest,
         };
 
         // A resume the provider ACCEPTS can still fail moments later. The sidecar's CreateSession
@@ -447,16 +475,19 @@ impl AgentConversation {
     ) -> ResumeVerdict {
         let deadline = std::time::Instant::now() + window;
         while std::time::Instant::now() < deadline {
-            for event in self.pump() {
-                match event {
-                    // The provider's own verdict, and the only thing here that settles the question.
-                    AgentDomainEvent::ResumeOutcome {
-                        requested_provider_session_id: requested,
-                        status,
-                        attached_provider_session_id,
-                        forked,
-                        detail,
-                    } => {
+            // Read from the ingestion thread's record rather than by draining events. Draining here
+            // would consume the very events the UI has not been shown yet -- and ingestion is
+            // already folding continuously, so there is nothing to drive by hand.
+            if let Some(outcome) = self.ingest.resume_outcome() {
+                let crate::ingestion::ResumeOutcomeRecord {
+                    requested,
+                    status,
+                    attached,
+                    forked,
+                    detail,
+                } = outcome;
+                {
+                    {
                         // The provider echoes back the id it was asked for. If that disagrees with
                         // what this client sent, the verdict is about some other session and cannot
                         // be trusted as an answer to this request -- treated as a failure rather
@@ -472,7 +503,7 @@ impl AgentConversation {
                         }
                         return if status.attached_to_the_requested_session(
                             &requested,
-                            attached_provider_session_id.as_deref(),
+                            attached.as_deref(),
                             forked,
                         ) {
                             ResumeVerdict::Attached
@@ -481,25 +512,26 @@ impl AgentConversation {
                                 reason: crate::describe_failed_resume(
                                     &requested,
                                     status,
-                                    attached_provider_session_id.as_deref(),
+                                    attached.as_deref(),
                                     detail.as_deref(),
                                 ),
                             }
                         };
                     }
-                    // A session that dies before saying anything about the resume. Still a failure,
-                    // but reported in the provider's own terms rather than as a resume verdict it
-                    // never gave.
-                    AgentDomainEvent::SessionClosed { reason } | AgentDomainEvent::SessionUnavailable { reason } => {
-                        return ResumeVerdict::Failed { reason };
-                    }
-                    // Deliberately NOT a success signal, though it carries a provider session id.
-                    // Either the verdict preceded it in this same batch and was returned above, or
-                    // this is not the event that answers the question.
-                    _ => {}
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // A session that dies before saying anything about the resume. Still a failure, but
+            // reported in the provider's own terms rather than as a resume verdict it never gave.
+            let terminal_reason = match &self.projection().status {
+                crate::ProjectionStatus::Unavailable { reason } | crate::ProjectionStatus::Closed { reason } => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            };
+            if let Some(reason) = terminal_reason {
+                return ResumeVerdict::Failed { reason };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         ResumeVerdict::NotYetKnown
     }
@@ -519,8 +551,19 @@ impl AgentConversation {
     /// The real Claude session UUID, once the provider has reported it. `None` means this
     /// conversation has never opened a provider session -- notably, it means a handoff to
     /// `claude --resume <id>` is not yet possible.
-    pub fn provider_session_id(&self) -> Option<&str> {
-        self.provider_session_id.as_deref()
+    pub fn provider_session_id(&self) -> Option<String> {
+        self.ingest.provider_session_id()
+    }
+
+    /// Canonical conversation state. A borrow through the ingestion lock rather than a clone: the
+    /// UI reads this on every 33ms tick.
+    pub fn projection(&self) -> crate::ingestion::ProjectionGuard<'_> {
+        self.ingest.projection()
+    }
+
+    /// What ingestion is costing right now -- see `IngestStats`.
+    pub fn ingest_stats(&self) -> crate::ingestion::IngestStats {
+        self.ingest.stats()
     }
 
     pub fn capabilities(&self) -> ProviderCapabilities {
@@ -529,10 +572,6 @@ impl AgentConversation {
 
     pub fn provider_info(&self) -> &ProviderInfo {
         &self.info
-    }
-
-    pub fn event_log(&self) -> &[AgentDomainEvent] {
-        &self.event_log
     }
 
     /// Submits one user turn.
@@ -548,7 +587,7 @@ impl AgentConversation {
     /// only defense against a double send, and it is not: the provider rejects a concurrent turn
     /// too, with a typed `TurnAlreadyActive`. Both are real; neither is optimistic shadow state.
     pub fn send_turn(&mut self, text: &str) -> Result<String, ConversationError> {
-        if self.projection.active_turn_id.is_some() {
+        if self.projection().active_turn_id.is_some() {
             return Err(ConversationError::TurnAlreadyActive);
         }
         let session_id = self.require_session()?;
@@ -592,7 +631,7 @@ impl AgentConversation {
         permission_id: &str,
         decision: PermissionDecision,
     ) -> Result<(), ConversationError> {
-        if !self.projection.pending_permissions.contains_key(permission_id) {
+        if !self.projection().pending_permissions.contains_key(permission_id) {
             return Err(ConversationError::Provider(ProviderError::Provider {
                 code: crate::ProviderErrorCode::PermissionNotFound,
                 message: format!("no pending permission request with id {permission_id}"),
@@ -612,24 +651,15 @@ impl AgentConversation {
     ///
     /// This is also where `provider_session_id` is learned: it arrives on `SessionOpened` and
     /// nowhere else.
-    pub fn pump(&mut self) -> Vec<AgentDomainEvent> {
-        let events = self.provider.pump();
-        for event in &events {
-            if let AgentDomainEvent::SessionOpened { provider_session_id, .. } = event {
-                let first_time = self.provider_session_id.is_none();
-                self.provider_session_id = Some(provider_session_id.clone());
-                // Only on the FIRST one. `SessionOpened` repeats -- the Agent SDK emits a
-                // system/init at the start of every turn, not once per session -- so acquiring the
-                // lease here unconditionally would try to re-take a lease this conversation already
-                // holds on every single turn.
-                if first_time {
-                    self.adopt_provider_session(provider_session_id);
-                }
-            }
-            self.projection.apply(event);
-            self.event_log.push(event.clone());
-        }
-        events
+    /// What the UI should apply next.
+    ///
+    /// This no longer drains the provider, and that is the entire point of the change. It used to do
+    /// both -- drain AND fold -- with a 33ms GTK timer as the only caller, which made the reducer's
+    /// progress a function of repaint progress. Folding now happens on the ingestion thread, so a UI
+    /// that stops calling this stops RENDERING; it no longer stops the conversation from advancing,
+    /// and raw events no longer queue up waiting for it.
+    pub fn take_ui_delivery(&self) -> crate::ingestion::UiDelivery {
+        self.ingest.take_delivery()
     }
 
     /// Closes the provider session and folds the terminal state.
@@ -644,45 +674,32 @@ impl AgentConversation {
                 eprintln!("agent: AgentConversation::shutdown: close_session failed: {e}");
             }
         }
-        let pending: Vec<String> = self.projection.pending_permissions.keys().cloned().collect();
+        // Ingestion stops FIRST, so the terminal events folded below are the last word rather than
+        // racing a thread that is still folding whatever the dying provider emits.
+        self.ingest.stop();
+
+        let pending: Vec<String> = self.projection().pending_permissions.keys().cloned().collect();
         for permission_id in pending {
             self.fold(AgentDomainEvent::PermissionResolved {
                 permission_id,
                 outcome: PermissionOutcome::CancelledBySessionClose,
             });
         }
-        if !matches!(self.projection.status, crate::ProjectionStatus::Closed { .. }) {
+        let already_closed = matches!(self.projection().status, crate::ProjectionStatus::Closed { .. });
+        if !already_closed {
             self.fold(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
         }
         // Released last: the lease must outlive the provider's own session teardown, so no other
         // client can acquire it while this one is still closing. (Always `None` today -- see this
         // module's header.)
-        self.lease = None;
+        self.ingest.release_lease();
     }
 
-    /// Takes the lease and persists the mapping the first time this conversation learns its Claude
-    /// session id. Only reachable from the `create` path -- `resume` already did both before it
-    /// called the provider at all.
-    ///
-    /// Neither failure is fatal here, deliberately. The session is already open and streaming; a
-    /// contended lease at this point means another window opened the SAME provider session
-    /// concurrently, which resume's own up-front check prevents for every path a user can take.
-    /// Tearing down a live conversation over a bookkeeping failure would cost more than it protects.
-    fn adopt_provider_session(&mut self, provider_session_id: &str) {
-        let cwd = self.canonical_cwd.to_string_lossy().to_string();
-        match SessionLease::try_acquire(PROVIDER_NAME, &cwd, provider_session_id) {
-            Ok(lease) => self.lease = Some(lease),
-            Err(e) => eprintln!(
-                "agent: could not take the session lease for {provider_session_id}: {e} -- \
-                 continuing without it; another Neovibe window may be driving the same session"
-            ),
-        }
-        persist_record(&self.conversation_id, &cwd, provider_session_id, self.capabilities.resume);
-    }
-
+    /// Folds an event this side produced because the provider no longer can -- shutdown's
+    /// fail-closed terminal events, and nothing else. Provider lifecycle events stay the provider's
+    /// to state.
     fn fold(&mut self, event: AgentDomainEvent) {
-        self.projection.apply(&event);
-        self.event_log.push(event);
+        self.ingest.fold_locally(event);
     }
 
     fn require_session(&self) -> Result<String, ConversationError> {
@@ -708,6 +725,9 @@ mod tests {
         calls: Mutex<Vec<String>>,
         queued_events: Mutex<Vec<AgentDomainEvent>>,
         send_turn_error: Mutex<Option<ProviderError>>,
+        /// Every event ever queued. A test waits for ingestion to reach exactly this, which is a
+        /// real condition rather than a sleep long enough to probably be fine.
+        queued_total: std::sync::atomic::AtomicU64,
     }
 
     impl FakeProvider {
@@ -725,6 +745,10 @@ mod tests {
         }
         fn queue(&self, event: AgentDomainEvent) {
             self.queued_events.lock().unwrap().push(event);
+            self.queued_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn queued_total(&self) -> u64 {
+            self.queued_total.load(std::sync::atomic::Ordering::Relaxed)
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
@@ -785,8 +809,38 @@ mod tests {
             fn pump(&self) -> Vec<AgentDomainEvent> { self.0.pump() }
         }
         // std::env::temp_dir() is guaranteed to exist and canonicalize.
-        AgentConversation::create(Box::new(Shared(fake)), &std::env::temp_dir(), PermissionMode::Bypass)
+        AgentConversation::create(Arc::new(Shared(fake)), &std::env::temp_dir(), PermissionMode::Bypass)
             .expect("create should succeed against the fake provider")
+    }
+
+    /// Waits for the ingestion thread to reach a state, or fails.
+    ///
+    /// These tests used to drive folding by calling `pump()` themselves, which no longer exists:
+    /// folding happens continuously on its own thread now, so a test observes it rather than
+    /// pumping it. Bounded and asserted rather than a bare sleep -- a sleep long enough to be safe
+    /// on a loaded machine is long enough to make the suite unpleasant, and one that is too short
+    /// fails as a mystery.
+    fn wait_for(conversation: &AgentConversation, what: &str, mut done: impl FnMut(&AgentConversation) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if done(conversation) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("ingestion never reached: {what}");
+    }
+
+    /// Waits until every queued event has been folded.
+    fn wait_for_ingest(conversation: &AgentConversation, count: u64) {
+        wait_for(conversation, &format!("{count} event(s) ingested"), |c| {
+            c.ingest_stats().events_ingested >= count
+        });
+    }
+
+    /// Waits until every event queued on the fake so far has been folded.
+    fn settle(fake: &FakeProvider, conversation: &AgentConversation) {
+        wait_for_ingest(conversation, fake.queued_total());
     }
 
     fn session_opened() -> AgentDomainEvent {
@@ -984,7 +1038,7 @@ mod tests {
             fn pump(&self) -> Vec<AgentDomainEvent> { vec![] }
         }
         let result = AgentConversation::create(
-            Box::new(Never),
+            Arc::new(Never),
             Path::new("/definitely/does/not/exist/neovibe-test"),
             PermissionMode::Bypass,
         );
@@ -1000,37 +1054,46 @@ mod tests {
     #[test]
     fn the_three_identities_stay_distinct() {
         let fake = Arc::new(FakeProvider::new());
-        let mut conversation = conversation_with(fake.clone());
+        let conversation = conversation_with(fake.clone());
 
         // Before any event: Verdandi's id is known, Claude's is not.
         assert_eq!(conversation.session_id(), Some("verdandi-session-1"));
         assert_eq!(conversation.provider_session_id(), None, "a created-but-never-opened session has no Claude identity");
 
         fake.queue(session_opened());
-        conversation.pump();
+        settle(&fake, &conversation);
 
         assert_eq!(conversation.session_id(), Some("verdandi-session-1"));
-        assert_eq!(conversation.provider_session_id(), Some("claude-uuid-abc"));
+        assert_eq!(conversation.provider_session_id().as_deref(), Some("claude-uuid-abc"));
         assert_ne!(conversation.conversation_id(), "verdandi-session-1");
         assert_ne!(conversation.conversation_id(), "claude-uuid-abc");
     }
 
     #[test]
-    fn pump_folds_into_the_projection_and_the_event_log_together() {
+    fn ingestion_folds_the_projection_without_the_ui_asking()  {
         let fake = Arc::new(FakeProvider::new());
-        let mut conversation = conversation_with(fake.clone());
+        let conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
         fake.queue(AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "hi".into() });
 
-        let drained = conversation.pump();
+        // Nothing calls a pump. The projection advances anyway, which is the property: the reducer's
+        // progress is no longer a function of the UI's.
+        settle(&fake, &conversation);
 
-        assert_eq!(drained.len(), 3);
-        assert_eq!(conversation.event_log().len(), 3);
-        assert_eq!(conversation.projection.last_revision, 3);
-        assert_eq!(conversation.projection.transcript, vec!["hi".to_string()]);
-        assert_eq!(conversation.projection.active_turn_id.as_deref(), Some("t1"));
-        assert!(conversation.pump().is_empty(), "a second drain with nothing new returns nothing");
+        assert_eq!(conversation.projection().last_revision, 3);
+        assert_eq!(conversation.projection().transcript, vec!["hi".to_string()]);
+        assert_eq!(conversation.projection().active_turn_id.as_deref(), Some("t1"));
+
+        // And the UI, whenever it gets round to it, is handed exactly those three.
+        match conversation.take_ui_delivery() {
+            crate::ingestion::UiDelivery::Events(events) => assert_eq!(events.len(), 3),
+            other => panic!("expected three events, got {other:?}"),
+        }
+        assert!(
+            matches!(conversation.take_ui_delivery(), crate::ingestion::UiDelivery::Nothing),
+            "a second look with nothing new returns nothing"
+        );
     }
 
     #[test]
@@ -1041,15 +1104,15 @@ mod tests {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
-        conversation.pump();
-        let revision_before = conversation.projection.last_revision;
+        settle(&fake, &conversation);
+        let revision_before = conversation.projection().last_revision;
 
         let turn_id = conversation.send_turn("hello").unwrap();
 
         assert_eq!(turn_id, "turn-1");
-        assert_eq!(conversation.projection.last_revision, revision_before, "send_turn must fold nothing");
-        assert_eq!(conversation.projection.active_turn_id, None, "state comes from the provider's own event");
-        assert_eq!(conversation.event_log().len(), 1, "only the SessionOpened folded earlier");
+        assert_eq!(conversation.projection().last_revision, revision_before, "send_turn must fold nothing");
+        assert_eq!(conversation.projection().active_turn_id, None, "state comes from the provider's own event");
+        assert_eq!(conversation.ingest_stats().events_ingested, 1, "only the SessionOpened folded earlier");
     }
 
     #[test]
@@ -1058,7 +1121,7 @@ mod tests {
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-        conversation.pump();
+        settle(&fake, &conversation);
 
         let result = conversation.send_turn("second");
         assert!(matches!(result, Err(ConversationError::TurnAlreadyActive)), "got: {result:?}");
@@ -1078,7 +1141,7 @@ mod tests {
         });
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
-        conversation.pump();
+        settle(&fake, &conversation);
 
         let result = conversation.send_turn("racing");
         assert!(matches!(result, Err(ConversationError::TurnAlreadyActive)), "got: {result:?}");
@@ -1093,7 +1156,7 @@ mod tests {
         });
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
-        conversation.pump();
+        settle(&fake, &conversation);
 
         let error = conversation.send_turn("hello").unwrap_err();
         assert!(!error.is_benign(), "got: {error:?}");
@@ -1123,12 +1186,12 @@ mod tests {
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-        conversation.pump();
-        let revision_before = conversation.projection.last_revision;
+        settle(&fake, &conversation);
+        let revision_before = conversation.projection().last_revision;
 
         conversation.interrupt().unwrap();
 
-        assert_eq!(conversation.projection.last_revision, revision_before);
+        assert_eq!(conversation.projection().last_revision, revision_before);
         assert!(fake.calls().iter().any(|c| c == "interrupt_turn"));
 
         // The provider's own terminal event is what moves state.
@@ -1140,8 +1203,8 @@ mod tests {
             total_cost_usd: 0.0,
             num_turns: 0,
         });
-        conversation.pump();
-        assert_eq!(conversation.projection.active_turn_id, None);
+        settle(&fake, &conversation);
+        assert_eq!(conversation.projection().active_turn_id, None);
     }
 
     #[test]
@@ -1149,7 +1212,7 @@ mod tests {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
-        conversation.pump();
+        settle(&fake, &conversation);
 
         let result = conversation.respond_permission("never-existed", PermissionDecision::Allow);
         assert!(result.is_err());
@@ -1168,7 +1231,7 @@ mod tests {
             tool_name: "Bash".into(),
             input: serde_json::json!({}),
         });
-        conversation.pump();
+        settle(&fake, &conversation);
 
         conversation.respond_permission("p1", PermissionDecision::Allow).unwrap();
         assert!(fake.calls().iter().any(|c| c == "resolve_permission(p1, allow=true)"), "got: {:?}", fake.calls());
@@ -1185,18 +1248,18 @@ mod tests {
             tool_name: "Write".into(),
             input: serde_json::json!({}),
         });
-        conversation.pump();
-        assert_eq!(conversation.projection.pending_permissions.len(), 1);
+        settle(&fake, &conversation);
+        assert_eq!(conversation.projection().pending_permissions.len(), 1);
 
         conversation.shutdown();
 
-        assert!(conversation.projection.pending_permissions.is_empty(), "a closing session can never answer them");
-        assert!(matches!(conversation.projection.status, crate::ProjectionStatus::Closed { .. }));
+        assert!(conversation.projection().pending_permissions.is_empty(), "a closing session can never answer them");
+        assert!(matches!(conversation.projection().status, crate::ProjectionStatus::Closed { .. }));
         assert_eq!(fake.calls().iter().filter(|c| *c == "close_session").count(), 1);
 
-        let revision_after_first = conversation.projection.last_revision;
+        let revision_after_first = conversation.projection().last_revision;
         conversation.shutdown();
         assert_eq!(fake.calls().iter().filter(|c| *c == "close_session").count(), 1, "close_session must not repeat");
-        assert_eq!(conversation.projection.last_revision, revision_after_first, "a repeat shutdown folds nothing");
+        assert_eq!(conversation.projection().last_revision, revision_after_first, "a repeat shutdown folds nothing");
     }
 }

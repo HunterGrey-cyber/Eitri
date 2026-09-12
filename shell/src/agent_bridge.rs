@@ -5,7 +5,9 @@
 //! command, and pushes a revisioned `events`/`snapshot` envelope independently of any specific
 //! command. See agent-ui/web/src/types.ts for the exact TS-side shapes these must match.
 
-use agent::{AgentDomainEvent, AgentSessionProjection, PermissionMode};
+use agent::{AgentDomainEvent, PermissionMode};
+#[cfg(test)]
+use agent::AgentSessionProjection;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -184,10 +186,13 @@ pub(crate) struct SnapshotView<'a> {
     /// learn it until the first `SessionOpened`, which on the sidecar path is not until the first
     /// turn.
     pub(crate) session_id: Option<&'a str>,
-    pub(crate) provider_session_id: Option<&'a str>,
+    pub(crate) provider_session_id: Option<String>,
     pub(crate) capabilities: agent::ProviderCapabilities,
     pub(crate) provider: Option<&'a agent::ProviderInfo>,
-    pub(crate) projection: &'a AgentSessionProjection,
+    /// Borrowed, not cloned. On the sidecar path this is a live borrow through the ingestion
+    /// thread's lock, so a snapshot is serialized directly out of canonical state rather than from a
+    /// copy of a whole conversation.
+    pub(crate) projection: crate::agent_backend::ProjectionRef<'a>,
 }
 
 impl<'a> SnapshotView<'a> {
@@ -216,7 +221,7 @@ impl<'a> SnapshotView<'a> {
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
 /// answers with SESSION_NOT_FOUND.
 pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
-    let projection = view.projection;
+    let projection = &*view.projection;
     let tool_calls: Vec<Value> = projection
         .tool_calls
         .iter()
@@ -463,10 +468,10 @@ mod tests {
             backend: "sidecar",
             conversation_id: Some("conv-hash"),
             session_id: Some("verdandi-1"),
-            provider_session_id: Some("claude-1"),
+            provider_session_id: Some("claude-1".to_string()),
             capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
             provider: Some(&provider),
-            projection: &projection,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
 
         let json_str = serialize_snapshot_for_js(&view);
@@ -506,7 +511,7 @@ mod tests {
             provider_session_id: None,
             capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
             provider: None,
-            projection: &projection,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
         assert_eq!(parsed["state"]["backend"], "legacy");

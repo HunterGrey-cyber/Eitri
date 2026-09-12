@@ -14,8 +14,8 @@ use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 /// `Option<&AgentSessionProjection>` rather than the state directly because `shell`'s own
 /// `AgentPanelState.session` is itself an `Option<AgentSession>` before the user leaves the mode
 /// selector; `None` here means exactly that (spec's `no_session` row).
-pub(crate) fn derive_status(session: Option<&AgentSessionProjection>) -> AgentStatus {
-    let Some(projection) = session else {
+pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
+    let Some(projection) = projection else {
         return AgentStatus::NoSession;
     };
     // A terminal status is checked FIRST, ahead of the two "busy" signals. A session that has ended

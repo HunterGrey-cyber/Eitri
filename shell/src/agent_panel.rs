@@ -16,6 +16,7 @@
 //! runtime design forbids.
 
 use crate::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
+use agent::UiDelivery;
 use crate::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
     serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
@@ -241,17 +242,34 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
             let mut first_text_in_this_batch = false;
             let payload = session.as_mut().and_then(|session| {
                 let from_revision = session.projection().last_revision;
-                let events = session.pump();
-                if events.is_empty() {
-                    return None;
+                match session.take_ui_delivery() {
+                    UiDelivery::Nothing => None,
+                    UiDelivery::Events(events) => {
+                        if let Some(trace) = turn_trace.as_mut() {
+                            first_text_in_this_batch = trace.observe(&events);
+                        }
+                        let through_revision = session.projection().last_revision;
+                        Some(serialize_events_for_js(from_revision, through_revision, &events))
+                    }
+                    // More happened than was worth queueing as individual events -- the UI was away
+                    // long enough that the bounded queue overflowed. It reloads from canonical state
+                    // instead, which is complete by construction rather than a degraded fallback:
+                    // the projection saw every event, in order, while nobody was watching.
+                    //
+                    // The turn trace deliberately observes nothing here. Its "first presentation
+                    // delta" mark is about how fast text reaches a LIVE reader; a window that was not
+                    // being repainted has no such measurement to contribute, and recording one would
+                    // report the stall as latency.
+                    UiDelivery::Resync => {
+                        let view = SnapshotView::of(session);
+                        Some(serialize_snapshot_for_js(&view))
+                    }
                 }
-                if let Some(trace) = turn_trace.as_mut() {
-                    first_text_in_this_batch = trace.observe(&events);
-                }
-                let through_revision = session.projection().last_revision;
-                Some(serialize_events_for_js(from_revision, through_revision, &events))
             });
-            let status = crate::supervisor_client::derive_status(session.as_ref().map(|s| s.projection()));
+            // Bound first: `projection()` returns a guard on the sidecar path, and passing it
+            // inline would drop the ingestion lock before `derive_status` had read through it.
+            let projection = session.as_ref().map(|s| s.projection());
+            let status = crate::supervisor_client::derive_status(projection.as_deref());
             if let Some(supervisor) = supervisor.as_mut() {
                 supervisor.send_status(status);
             }
@@ -347,7 +365,8 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
                 state_ref.session = Some(backend);
                 // The frontend has been showing a connecting state since it sent start_session; give
                 // it the real projection immediately rather than making it wait for the first event.
-                serialize_snapshot_for_js(&SnapshotView::of(state_ref.session.as_ref().unwrap()))
+                let view = SnapshotView::of(state_ref.session.as_ref().unwrap());
+                serialize_snapshot_for_js(&view)
             };
             evaluate_js_dispatch(webview, &snapshot);
             evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
