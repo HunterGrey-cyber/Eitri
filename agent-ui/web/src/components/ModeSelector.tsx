@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { Hello, PermissionModeChoice } from "../types";
 
 type Props = {
@@ -7,10 +8,10 @@ type Props = {
 };
 
 /** One button per permission mode the backend GENUINELY offers, driven by `hello.permissionModes`
- * rather than hardcoded. The two backends differ for a real reason: the legacy backend has a
- * tested interactive permission gate, while the sidecar path ships BYPASS only in this milestone.
- * Rendering a fixed pair here would offer the sidecar user a choice between two modes that behave
- * identically. */
+ * and never hardcoded. That list is the client's own implemented set intersected, at session
+ * creation, with what the provider advertises -- a backend whose provider does not offer a policy
+ * fails loudly there rather than being quietly given a different one. It is deliberately not keyed
+ * on which backend this is: both have a real, separately verified interactive gate. */
 const MODE_LABELS: Record<PermissionModeChoice, { title: string; detail: string }> = {
   auto: { title: "Auto", detail: "Tool calls that could change things ask first." },
   bypass: { title: "Bypass", detail: "No permission prompts. Every tool call proceeds immediately." },
@@ -21,6 +22,17 @@ function shortId(id: string): string {
 }
 
 export function ModeSelector({ hello, connecting, onStart }: Props) {
+  /* Whether the next start continues the stored session or begins a fresh one. Two axes, not one:
+     WHICH conversation and under WHAT permission policy are independent choices, and a resume mints
+     a new run whose policy is genuinely open.
+
+     This used to be one button that carried a permission mode chosen for the user
+     (`permissionModes.includes("auto") ? "auto" : "bypass"`). That was invisible but harmless while
+     the sidecar offered a single mode -- there was nothing to choose. Once it offered two, the same
+     line started silently picking one, on a screen whose own text promises "choose a permission mode
+     (it cannot be changed afterwards)". A screen cannot say that and then decide for you. */
+  const [continuePrevious, setContinuePrevious] = useState(false);
+
   if (connecting) {
     return (
       <div className="mode-selector">
@@ -38,12 +50,9 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
   }
 
   const onlyBypass = hello.permissionModes.length === 1 && hello.permissionModes[0] === "bypass";
-  // The default mode for a continued session: the single offered mode when there is only one,
-  // otherwise the safer of the two. Resuming deliberately does not ask again -- the permission
-  // policy is a property of the new run, not of the conversation being continued, and making the
-  // user re-answer it turns a one-click "carry on" into a form.
-  const resumeMode: PermissionModeChoice = hello.permissionModes.includes("auto") ? "auto" : "bypass";
   const resumable = hello.resumableSession;
+  // Guards against a stale `true` if a hello ever arrives without the record that armed it.
+  const resuming = continuePrevious && resumable !== null;
 
   return (
     <div className="mode-selector">
@@ -53,31 +62,56 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
           ? " — choose a permission mode (it cannot be changed afterwards):"
           : ":"}
       </p>
-      {hello.permissionModes.map((mode) => (
-        <button key={mode} onClick={() => onStart(mode)}>
-          <strong>{MODE_LABELS[mode].title}</strong>
-          <span className="detail">{MODE_LABELS[mode].detail}</span>
-        </button>
-      ))}
+
       {resumable !== null && (
-        // Rendered on `resumableSession` alone. That field is already the full condition -- server
-        // advertised resume, this client implements it, and this workspace has a stored provider
-        // session -- so there is no second check to forget here.
-        <button className="resume" onClick={() => onStart(resumeMode, resumable.providerSessionId)}>
-          <strong>Continue previous session</strong>
+        /* Rendered on `resumableSession` alone. That field is already the full condition -- server
+           advertised resume, this client implements it, and this workspace has a stored provider
+           session -- so there is no second check to forget here.
+
+           A selector, not a start button: picking it changes what the mode buttons below will do
+           rather than starting anything, which is what keeps the permission choice the user's. */
+        <div className="session-choice" role="radiogroup" aria-label="Which conversation">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={!resuming}
+            className={resuming ? "" : "selected"}
+            onClick={() => setContinuePrevious(false)}
+          >
+            <strong>New session</strong>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={resuming}
+            className={`resume ${resuming ? "selected" : ""}`}
+            onClick={() => setContinuePrevious(true)}
+          >
+            <strong>Continue previous session</strong>
+            <span className="detail">
+              Claude {shortId(resumable.providerSessionId)}
+              {resumable.updatedAt !== "" ? ` · last used ${formatWhen(resumable.updatedAt)}` : ""}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {hello.permissionModes.map((mode) => (
+        <button key={mode} onClick={() => onStart(mode, resuming ? resumable.providerSessionId : undefined)}>
+          <strong>{MODE_LABELS[mode].title}</strong>
           <span className="detail">
-            Claude {shortId(resumable.providerSessionId)}
-            {resumable.updatedAt !== "" ? ` · last used ${formatWhen(resumable.updatedAt)}` : ""}
+            {MODE_LABELS[mode].detail}
+            {resuming ? " Continues the session above." : ""}
           </span>
         </button>
-      )}
+      ))}
+
       {onlyBypass && (
-        // Said plainly rather than buried: this backend runs every tool without asking, and that is
-        // the only policy it currently implements. Calling it a "choice" would imply an alternative
-        // exists.
+        // Said plainly rather than buried: this backend offers exactly one policy, and it runs every
+        // tool without asking. Calling that a "choice" would imply an alternative exists.
         <p className="warning">
-          This backend ({hello.backend}) currently supports <strong>Bypass only</strong>. Tool calls
-          run without asking. Interactive permission approval is not implemented on this path yet.
+          This backend ({hello.backend}) offers <strong>Bypass only</strong>. Tool calls run without
+          asking.
         </p>
       )}
     </div>
