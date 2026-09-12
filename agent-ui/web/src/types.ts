@@ -25,8 +25,12 @@ export type ProviderInfo = {
   claudeAgentSdkVersion: string;
   claudeCodeVersion: string;
   protocol: string;
-  /** Non-fatal things the provider said on its way up: which Verdandi checkout/revision it was
-   * built from, and any CLI version-skew warning. The first thing to check when behavior is odd. */
+  /** Which build of the provider this is (Verdandi checkout and revision). Descriptive and
+   * essentially always present -- deliberately NOT a diagnostic. */
+  buildDescription: string | null;
+  /** Only things worth warning about: an untested CLI version, a Verdandi checkout that has drifted
+   * from the verified baseline. **Empty is the normal case**, which is what makes non-empty a real
+   * signal worth putting a glyph on. */
   startupDiagnostics: string[];
 };
 

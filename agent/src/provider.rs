@@ -92,8 +92,13 @@ pub struct ProviderInfo {
     /// capability is visible in diagnostics rather than silently dropped by the mapping above.
     pub advertised_capabilities: Vec<String>,
     pub advertised_permission_modes: Vec<String>,
-    /// Non-fatal diagnostics the provider process emitted while starting (e.g. "this CLI version is
-    /// inside the supported range but untested"). Empty for a provider that had nothing to say.
+    /// Which build of the provider this is (for the sidecar: the Verdandi checkout and revision).
+    /// Descriptive and essentially always present -- deliberately NOT in `startup_diagnostics`,
+    /// because a list that is never empty cannot drive a "something is wrong" indicator.
+    pub build_description: Option<String>,
+    /// Only things genuinely worth warning about: a CLI version inside the supported range but
+    /// untested, a Verdandi checkout that has drifted from the verified baseline. **Empty is the
+    /// normal case**, which is what lets a UI treat non-empty as a real signal.
     pub startup_diagnostics: Vec<String>,
 }
 

@@ -70,11 +70,37 @@ pub(crate) struct AgentPanelHandle {
 }
 
 impl AgentPanelHandle {
-    /// No-op if no session was ever started -- a user who never leaves the mode-selector screen
-    /// before closing the window has nothing to shut down.
+    /// Shuts down whatever backend exists, INCLUDING one still being constructed on a worker thread.
+    ///
+    /// The in-flight case is not hypothetical: since construction moved off the GTK main loop, a
+    /// window closed during the connect leaves a fully-built backend -- a live sidecar process and a
+    /// Tokio runtime thread -- owned by nothing but a channel nobody will ever read. Before that
+    /// move, GTK's single thread made the window impossible to close while a backend existed outside
+    /// `state.session`.
+    ///
+    /// Taking `pending_start` is load-bearing twice over: it lets a backend that already finished be
+    /// shut down properly, and it makes any later `collect_pending_start` tick early-return instead
+    /// of installing a session into a panel that has already torn down.
     pub(crate) fn shutdown(&self) {
-        if let Some(session) = self.state.borrow_mut().session.as_mut() {
+        let pending = self.state.borrow_mut().pending_start.take();
+        if let Some(mut session) = self.state.borrow_mut().session.take() {
             session.shutdown();
+        }
+        if let Some(pending) = pending {
+            // Bounded, and blocking on purpose: this runs on the window-close path, where waiting
+            // for a clean teardown is the whole point. The worker is either about to finish or has
+            // already failed; three seconds is well past a warm connect and well short of a hang.
+            match pending.result_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                Ok(Ok(mut backend)) => {
+                    eprintln!("[agent_panel] window closed mid-connect; shutting down the backend that finished anyway");
+                    backend.shutdown();
+                }
+                Ok(Err(e)) => eprintln!("[agent_panel] window closed mid-connect; the backend had already failed: {}", e.message),
+                Err(_) => eprintln!(
+                    "[agent_panel] window closed mid-connect and the worker did not report within 3s; \
+                     any backend it produces will be dropped with its channel"
+                ),
+            }
         }
     }
 
@@ -192,19 +218,30 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(PUMP_POLL_INTERVAL_MS), move || {
         collect_pending_start(&state, &webview);
 
-        let mut state_ref = state.borrow_mut();
-        if let Some(session) = state_ref.session.as_mut() {
-            let from_revision = session.projection().last_revision;
-            let events = session.pump();
-            if !events.is_empty() {
+        // The payload is built under the borrow and dispatched OUTSIDE it. Calling into WebKit while
+        // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
+        // message handler takes the same `RefCell`, and anything that let it run during the
+        // dispatch would panic on an already-borrowed cell rather than fail gracefully. Nothing
+        // today re-enters, which is exactly why it would stay latent until it didn't.
+        let payload = {
+            let mut state_ref = state.borrow_mut();
+            let payload = state_ref.session.as_mut().and_then(|session| {
+                let from_revision = session.projection().last_revision;
+                let events = session.pump();
+                if events.is_empty() {
+                    return None;
+                }
                 let through_revision = session.projection().last_revision;
-                let payload = serialize_events_for_js(from_revision, through_revision, &events);
-                evaluate_js_dispatch(&webview, &payload);
+                Some(serialize_events_for_js(from_revision, through_revision, &events))
+            });
+            let status = crate::supervisor_client::derive_status(state_ref.session.as_ref().map(|s| s.projection()));
+            if let Some(supervisor) = state_ref.supervisor.as_mut() {
+                supervisor.send_status(status);
             }
-        }
-        let status = crate::supervisor_client::derive_status(state_ref.session.as_ref().map(|s| s.projection()));
-        if let Some(supervisor) = state_ref.supervisor.as_mut() {
-            supervisor.send_status(status);
+            payload
+        };
+        if let Some(payload) = payload {
+            evaluate_js_dispatch(&webview, &payload);
         }
         gtk4::glib::ControlFlow::Continue
     });
@@ -293,7 +330,23 @@ fn apply_command_outcome(
         }
         Err(error) => {
             eprintln!("[agent_panel] command failed fatally: {}", error.message);
-            state.borrow_mut().session = None;
+            // Retired on a worker thread, for the same reason construction runs on one. Two separate
+            // problems with doing it here: `AgentConversation` has no `Drop`, so a bare
+            // `session = None` never sends `close_session` at all and the sidecar is left holding a
+            // session it thinks is live; and the drop chain that DOES run (SpawnedSidecar polls for
+            // up to 3s before escalating to SIGKILL, then RuntimeThread joins its Tokio thread)
+            // would block the whole shell -- editor pane included -- on the GTK main loop.
+            //
+            // Calling `shutdown()` inline instead would be worse, not better: it issues
+            // `close_session` through a unary RPC bounded at 10s, which is precisely the timeout
+            // case that gets here in the first place.
+            //
+            // Two statements, not `if let Some(..) = state.borrow_mut().session.take()`: the latter
+            // keeps the `RefMut` alive across the whole body.
+            let dead = state.borrow_mut().session.take();
+            if let Some(mut backend) = dead {
+                std::thread::spawn(move || backend.shutdown());
+            }
             evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Err(&error.message)));
             evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
         }

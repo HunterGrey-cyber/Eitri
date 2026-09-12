@@ -79,7 +79,11 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
     }
 }
 
-fn info_from_handshake(response: &HandshakeResponse, startup_diagnostics: Vec<String>) -> ProviderInfo {
+fn info_from_handshake(
+    response: &HandshakeResponse,
+    build_description: Option<String>,
+    startup_diagnostics: Vec<String>,
+) -> ProviderInfo {
     ProviderInfo {
         sidecar_version: response.sidecar_version.clone(),
         claude_agent_sdk_version: response.claude_agent_sdk_version.clone(),
@@ -88,6 +92,7 @@ fn info_from_handshake(response: &HandshakeResponse, startup_diagnostics: Vec<St
         protocol_minor: response.protocol_minor,
         advertised_capabilities: response.capabilities.clone(),
         advertised_permission_modes: response.permission_modes.clone(),
+        build_description,
         startup_diagnostics,
     }
 }
@@ -200,12 +205,12 @@ impl ClaudeSidecarProvider {
         }
 
         let capabilities = capabilities_from_handshake(&handshake);
-        // Which Verdandi build this is, then whatever the sidecar itself warned about. Both belong
-        // in the same list: "why is it behaving oddly?" is answered by the checkout revision at
-        // least as often as by the CLI version.
-        let mut diagnostics = sidecar.checkout_diagnostics.clone();
+        // Warnings only. The checkout DESCRIPTION is always present and travels separately as
+        // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
+        // a permanent warning indicator in the UI for every healthy session.
+        let mut diagnostics = sidecar.checkout_warnings.clone();
         diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
-        let info = info_from_handshake(&handshake, diagnostics);
+        let info = info_from_handshake(&handshake, Some(sidecar.checkout_description.clone()), diagnostics);
         for diagnostic in &info.startup_diagnostics {
             eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
         }
@@ -451,7 +456,7 @@ mod tests {
 
     #[test]
     fn info_carries_the_advertised_lists_verbatim_for_diagnostics() {
-        let info = info_from_handshake(&real_handshake_today(), vec!["diag".into()]);
+        let info = info_from_handshake(&real_handshake_today(), Some("checkout @ abc1234".into()), vec!["diag".into()]);
         assert_eq!(info.actual_claude_code_version, "2.1.269");
         assert_eq!(info.protocol_major, 1);
         assert_eq!(info.sidecar_version, "0.1.0");
@@ -460,6 +465,7 @@ mod tests {
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
         assert_eq!(info.advertised_capabilities.len(), 7);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
+        assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
 
     #[test]

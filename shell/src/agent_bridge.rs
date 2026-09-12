@@ -120,6 +120,10 @@ pub(crate) fn serialize_events_for_js(from_revision: u64, through_revision: u64,
 pub(crate) struct SnapshotView<'a> {
     pub(crate) backend: &'static str,
     pub(crate) conversation_id: Option<&'a str>,
+    /// Verdandi's session id, from the backend rather than the projection -- the projection does not
+    /// learn it until the first `SessionOpened`, which on the sidecar path is not until the first
+    /// turn.
+    pub(crate) session_id: Option<&'a str>,
     pub(crate) provider_session_id: Option<&'a str>,
     pub(crate) capabilities: agent::ProviderCapabilities,
     pub(crate) provider: Option<&'a agent::ProviderInfo>,
@@ -131,6 +135,7 @@ impl<'a> SnapshotView<'a> {
         Self {
             backend: backend.kind().as_str(),
             conversation_id: backend.conversation_id(),
+            session_id: backend.session_id(),
             provider_session_id: backend.provider_session_id(),
             capabilities: backend.capabilities(),
             provider: backend.provider_info(),
@@ -185,6 +190,7 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
             "claudeAgentSdkVersion": info.claude_agent_sdk_version,
             "claudeCodeVersion": info.actual_claude_code_version,
             "protocol": format!("{}.{}", info.protocol_major, info.protocol_minor),
+            "buildDescription": info.build_description,
             "startupDiagnostics": info.startup_diagnostics,
         })
     });
@@ -193,7 +199,7 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         "backend": view.backend,
         // Three identities, three fields. Never one.
         "conversationId": view.conversation_id,
-        "sessionId": projection.session_id,
+        "sessionId": view.session_id,
         "providerSessionId": view.provider_session_id,
         "model": projection.model,
         "cwd": projection.cwd,
@@ -340,11 +346,13 @@ mod tests {
             protocol_minor: 0,
             advertised_capabilities: vec!["handshake".into()],
             advertised_permission_modes: vec!["bypass".into()],
-            startup_diagnostics: vec!["Verdandi checkout: /x @ eb70aa3 (via NEOVIBE_VERDANDI_CHECKOUT)".into()],
+            build_description: Some("Verdandi checkout: /x @ eb70aa3 (via NEOVIBE_VERDANDI_CHECKOUT)".into()),
+            startup_diagnostics: vec!["claude CLI 2.1.269 is untested".into()],
         };
         let view = SnapshotView {
             backend: "sidecar",
             conversation_id: Some("conv-hash"),
+            session_id: Some("verdandi-1"),
             provider_session_id: Some("claude-1"),
             capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true },
             provider: Some(&provider),
@@ -373,7 +381,9 @@ mod tests {
         assert_eq!(parsed["state"]["capabilities"]["resume"], false, "resume must not be advertised in this milestone");
         assert_eq!(parsed["state"]["provider"]["claudeCodeVersion"], "2.1.269");
         assert_eq!(parsed["state"]["provider"]["protocol"], "1.0");
-        assert!(parsed["state"]["provider"]["startupDiagnostics"][0].as_str().unwrap().contains("eb70aa3"));
+        assert!(parsed["state"]["provider"]["buildDescription"].as_str().unwrap().contains("eb70aa3"));
+        // Warnings only -- a list that is never empty cannot drive a "something is wrong" glyph.
+        assert!(parsed["state"]["provider"]["startupDiagnostics"][0].as_str().unwrap().contains("untested"));
     }
 
     #[test]
@@ -382,6 +392,7 @@ mod tests {
         let view = SnapshotView {
             backend: "legacy",
             conversation_id: None,
+            session_id: None,
             provider_session_id: None,
             capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true },
             provider: None,

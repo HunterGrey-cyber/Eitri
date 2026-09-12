@@ -53,9 +53,11 @@ impl StderrTail {
 
 pub(crate) struct SpawnedSidecar {
     pub(crate) socket_path: PathBuf,
-    /// Which Verdandi checkout and revision this sidecar was built and launched from -- see
-    /// `describe_checkout`. Surfaced to the UI through `ProviderInfo::startup_diagnostics`.
-    pub(crate) checkout_diagnostics: Vec<String>,
+    /// Which Verdandi checkout and revision this sidecar was built and launched from. Descriptive,
+    /// always present -- reaches the UI as `ProviderInfo::verdandi_checkout`, NOT as a diagnostic.
+    pub(crate) checkout_description: String,
+    /// Only things genuinely worth warning about (today: baseline drift). Usually empty.
+    pub(crate) checkout_warnings: Vec<String>,
     stdin_keepalive: Option<ChildStdin>,
     child: Child,
     stderr_tail: Arc<Mutex<StderrTail>>,
@@ -168,21 +170,25 @@ fn git_short_revision(checkout: &Path) -> Option<String> {
     }
 }
 
-/// The one-line description of which backend build this session is running, plus a baseline-drift
-/// note when the checkout is not at `EXPECTED_VERDANDI_REVISION`. Surfaced through
-/// `ProviderInfo::startup_diagnostics`, so it reaches the UI rather than only this process's stderr.
-fn describe_checkout(checkout: &VerdandiCheckout) -> Vec<String> {
+/// One line saying which backend build this session is running, plus a separate list of things
+/// genuinely worth warning about.
+///
+/// The split is load-bearing. The description is unconditional -- there is always a checkout, and a
+/// missing git revision degrades to "unknown revision" rather than suppressing the line -- so
+/// folding it into the warning list made that list never empty, and any UI that treats "has
+/// diagnostics" as "something is wrong" lit up permanently for every healthy session. A warning
+/// that is always on is not a warning.
+fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
     let source = if checkout.from_override { "NEOVIBE_VERDANDI_CHECKOUT" } else { "default path" };
     let revision = checkout.revision.as_deref().unwrap_or("unknown revision");
-    let mut lines = vec![format!(
-        "Verdandi checkout: {} @ {revision} (via {source})",
-        checkout.path.display()
-    )];
+    let description = format!("Verdandi checkout: {} @ {revision} (via {source})", checkout.path.display());
+
+    let mut warnings = Vec::new();
     // `starts_with` rather than equality: `git rev-parse --short` picks its own abbreviation length,
     // which grows as a repository does, so a strict comparison would start reporting false drift.
     if let Some(actual) = &checkout.revision {
         if !actual.starts_with(EXPECTED_VERDANDI_REVISION) && !EXPECTED_VERDANDI_REVISION.starts_with(actual.as_str()) {
-            lines.push(format!(
+            warnings.push(format!(
                 "Verdandi baseline drift: running {actual}, this client was verified against \
                  {EXPECTED_VERDANDI_REVISION}. Not an error -- testing a Verdandi branch is exactly \
                  what NEOVIBE_VERDANDI_CHECKOUT is for -- but if behavior looks wrong, this is the \
@@ -190,7 +196,7 @@ fn describe_checkout(checkout: &VerdandiCheckout) -> Vec<String> {
             ));
         }
     }
-    lines
+    (description, warnings)
 }
 
 /// True if the checkout's root `package.json` declares a `build` script.
@@ -270,8 +276,9 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
 /// concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let checkout = locate_verdandi_checkout()?;
-    let checkout_diagnostics = describe_checkout(&checkout);
-    for line in &checkout_diagnostics {
+    let (checkout_description, checkout_warnings) = describe_checkout(&checkout);
+    eprintln!("agent: {checkout_description}");
+    for line in &checkout_warnings {
         eprintln!("agent: {line}");
     }
     let checkout = checkout.path;
@@ -308,7 +315,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     const RETRY_DELAY: Duration = Duration::from_millis(50);
     for _ in 0..RETRY_ATTEMPTS {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            return Ok(SpawnedSidecar { socket_path, checkout_diagnostics, stdin_keepalive, child, stderr_tail });
+            return Ok(SpawnedSidecar { socket_path, checkout_description, checkout_warnings, stdin_keepalive, child, stderr_tail });
         }
         // Check for a dead child BEFORE sleeping again. The sidecar fails closed on a policy
         // violation (an incompatible Claude CLI, a socket already in use) by throwing before it
