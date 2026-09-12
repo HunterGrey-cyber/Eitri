@@ -19,6 +19,19 @@
 //! | first paint frame | reported back by the WebView | the first characters are on screen |
 //! | completed | the pump drains `TurnCompleted` | the turn is over |
 //!
+//! **What these numbers do NOT bound.** They measure a request/response route: a turn goes out, a
+//! reply streams back, and the span from "text exists in Rust" to "frame drawn" is ~20-26ms against
+//! a 3-6s wait. That is a statement about LATENCY on this shape of traffic, and nothing else. It is
+//! not evidence that transport is cheap in general, and specifically not for a continuous stream
+//! that pushes whether or not anyone asked for anything -- there the question is whether the pipe
+//! keeps up, which is throughput, which nothing here measures. (Raised by the terminal-runtime track,
+//! which is measuring exactly that for its own route; the tempting bad inference is "the SDK route
+//! proved transport is not the bottleneck, so it is not one anywhere".)
+//!
+//! The one transport property this route did establish is a correctness one, not a speed one: a
+//! consumer that stalls for 20 seconds loses nothing, because grpc-js queues server-side rather than
+//! dropping -- see `agent/MANUAL_VERIFICATION.md`'s 2026-09-12 backpressure section.
+//!
 //! **On "first paint frame", and what it is not.** The WebView reports how long it took from
 //! *receiving* the payload to the animation frame that drew it, and that span is added to the
 //! moment Rust dispatched it. Measured as a span rather than a wall-clock instant on purpose: JS
