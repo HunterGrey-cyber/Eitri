@@ -52,6 +52,40 @@ fn text_of(events: &[AgentDomainEvent]) -> String {
         .collect()
 }
 
+/// Prints a compact event trace under `--nocapture`. Kept permanently rather than added and
+/// removed: when one of these tests fails, the sequence the provider actually produced is the first
+/// thing anyone needs, and reconstructing it costs another billed run.
+fn trace(label: &str, events: &[AgentDomainEvent]) {
+    eprintln!("---- {label}: {} events ----", events.len());
+    for event in events {
+        match event {
+            AgentDomainEvent::SessionOpened { session_id, provider_session_id, .. } => {
+                eprintln!("  SessionOpened   session_id={session_id} provider_session_id={provider_session_id}")
+            }
+            AgentDomainEvent::TurnStarted { turn_id } => eprintln!("  TurnStarted     turn_id={turn_id}"),
+            AgentDomainEvent::ContentDelta { kind, text, .. } => {
+                eprintln!("  ContentDelta    {kind:?} {:?}", text.chars().take(40).collect::<String>())
+            }
+            AgentDomainEvent::ToolCallStarted { name, tool_use_id, .. } => {
+                eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}")
+            }
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, is_error, .. } => {
+                eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}")
+            }
+            AgentDomainEvent::PermissionRequested { permission_id, tool_name, .. } => {
+                eprintln!("  PermissionReq   {tool_name} permission_id={permission_id}")
+            }
+            AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
+                eprintln!("  PermissionDone  permission_id={permission_id} {outcome:?}")
+            }
+            AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
+                eprintln!("  TurnCompleted   turn_id={turn_id} {outcome:?}")
+            }
+            other => eprintln!("  {other:?}"),
+        }
+    }
+}
+
 fn turn_outcomes(events: &[AgentDomainEvent]) -> Vec<TurnOutcome> {
     events
         .iter()
@@ -125,17 +159,51 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         "the second turn did not recall the first turn's content -- the session did not carry over. got: {recalled:?}"
     );
 
-    // Both turns belong to the same session, and each got its own distinct turn id.
-    let session_ids: Vec<&String> = first
+    trace("turn 1", &first);
+    trace("turn 2", &second);
+
+    // Every SessionOpened must carry the sidecar's own session id -- the one CreateSession returned
+    // and the one every later RPC is addressed with. This is not automatic: the message's own inner
+    // `session_id` field carries the CLAUDE session UUID instead (a real Verdandi wire-naming
+    // defect), so this assertion is what pins that `translate` reads the envelope.
+    //
+    // Note there is one SessionOpened PER TURN, not one per session: the Agent SDK emits a
+    // `system`/`init` message at the start of each turn even within a single streaming session, and
+    // Verdandi translates each into `session_ready`. Harmless -- the projection's fold is idempotent
+    // for it -- but it means a consumer must not treat SessionOpened as "a new session began".
+    let opened: Vec<(&String, &String)> = first
         .iter()
         .chain(second.iter())
         .filter_map(|e| match e {
-            AgentDomainEvent::SessionOpened { session_id, .. } => Some(session_id),
+            AgentDomainEvent::SessionOpened { session_id, provider_session_id, .. } => {
+                Some((session_id, provider_session_id))
+            }
             _ => None,
         })
         .collect();
-    assert!(session_ids.iter().all(|id| **id == session_id), "got: {session_ids:?}");
+    assert!(!opened.is_empty(), "expected at least one SessionOpened; got: {first:?} {second:?}");
+    for (event_session_id, _) in &opened {
+        assert_eq!(
+            **event_session_id, session_id,
+            "SessionOpened.session_id must be the sidecar's own id, not Claude's"
+        );
+    }
+    // The Claude identity is stable across turns and genuinely distinct from the sidecar's.
+    let provider_ids: std::collections::BTreeSet<&&String> = opened.iter().map(|(_, p)| p).collect();
+    assert_eq!(provider_ids.len(), 1, "the provider session id must not change between turns: {provider_ids:?}");
+    assert_ne!(
+        ***provider_ids.iter().next().unwrap(), session_id,
+        "the Claude session id and the sidecar session id are different identities and must not be collapsed"
+    );
 
+    // Two turns, two distinct turn ids, each announced by a real TurnStarted event.
+    //
+    // This is the assertion that caught Verdandi's `turn_started` never reaching the wire: the
+    // kernel pushed it into its history log instead of the buffer `pump()` drains, so a
+    // WatchSessionEvents subscriber -- which is not the caller of sendTurn and has no other way to
+    // learn a turn began -- saw zero of them across two real turns. Without TurnStarted,
+    // `active_turn_id` never sets, so no consumer can light a turn-in-progress indicator, gate a
+    // Stop button, or reject a concurrent turn from authoritative state.
     let turn_ids: Vec<&String> = first
         .iter()
         .chain(second.iter())
@@ -146,6 +214,17 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         .collect();
     assert_eq!(turn_ids.len(), 2, "expected exactly two TurnStarted events, got: {turn_ids:?}");
     assert_ne!(turn_ids[0], turn_ids[1], "two turns must not share a turn id");
+
+    // And each TurnStarted must pair with the TurnCompleted for the same turn.
+    let completed_ids: Vec<&String> = first
+        .iter()
+        .chain(second.iter())
+        .filter_map(|e| match e {
+            AgentDomainEvent::TurnCompleted { turn_id, .. } => Some(turn_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(turn_ids, completed_ids, "every started turn must complete under the same id");
 
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
 }
