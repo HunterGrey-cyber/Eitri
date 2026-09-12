@@ -85,9 +85,23 @@ impl SequenceTracker {
         Self { last_delivered: 0 }
     }
 
-    /// What a reconnect must ask for. The server replays everything strictly greater than this, so
-    /// resuming from the last *delivered* sequence (not the last *seen*) is what makes a hole
-    /// impossible to paper over.
+    /// The cursor to ask for, on a first open and on every reconnect alike.
+    ///
+    /// The server replays everything strictly greater than this, so resuming from the last
+    /// *delivered* sequence -- not the last *seen* -- is what makes a hole impossible to paper over.
+    ///
+    /// On a first open this is 0, which the protocol now treats as an ordinary cursor meaning "I
+    /// have seen nothing", checked for eviction like any other. That is the whole reason this client
+    /// uses `AFTER_SEQUENCE` for every watch it ever opens, including the first, rather than
+    /// `AVAILABLE_HISTORY`: the other mode cannot report a gap, because a caller choosing it has
+    /// declared that a missing prefix is acceptable. It is not acceptable here. `FROM_NOW` is
+    /// likewise never used -- a conversation that silently begins mid-history is the same defect
+    /// wearing a different name.
+    ///
+    /// PROVENANCE. This value only ever comes from a sequence this stream delivered. It is never
+    /// persisted, never carried across sessions, and never reconstructed -- see the proto's note on
+    /// `after_sequence`. The server now refuses a cursor beyond anything it has assigned, so a
+    /// future violation of that rule fails loudly instead of landing in `Duplicate` below.
     pub(crate) fn after_sequence(&self) -> u64 {
         self.last_delivered
     }
@@ -126,6 +140,13 @@ pub(crate) fn classify_open_failure(error: &ProviderError) -> OpenFailure {
         ),
         ProviderError::Provider { code: ProviderErrorCode::SessionNotFound, .. } => {
             OpenFailure::Fatal("the provider no longer has this session".to_string())
+        }
+        // The server refusing our cursor as impossible means this client sent one it could not have
+        // received -- a bug on this side, not a transport problem, and retrying sends it again.
+        // Surfaced with the provider's own words because they name the cursor and the latest
+        // sequence, which is what a reader needs to see that the two are unrelated.
+        ProviderError::Provider { code: ProviderErrorCode::InvalidConfiguration, message } => {
+            OpenFailure::Fatal(format!("the provider refused this client's replay cursor: {message}"))
         }
         // Any other typed refusal is also unanswerable by a retry, but says something this client
         // did not anticipate -- carry its own words rather than paraphrasing them.

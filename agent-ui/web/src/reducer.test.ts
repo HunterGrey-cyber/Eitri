@@ -246,3 +246,60 @@ describe("partial assistant streaming", () => {
     expect(next.transcript).toEqual(["an earlier reply", "new message"]);
   });
 });
+
+describe("resume outcome", () => {
+  function outcome(over: Partial<Extract<AgentDomainEvent, { type: "resume_outcome" }>> = {}) {
+    return {
+      type: "resume_outcome" as const,
+      requested_provider_session_id: "claude-abc",
+      status: "attached" as const,
+      attached_provider_session_id: "claude-abc",
+      forked: false,
+      detail: null,
+      ...over,
+    };
+  }
+
+  it("a confirmed resume changes nothing", () => {
+    const before = applyEvent(initialState(), { type: "session_opened", session_id: "s", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
+    const after = applyEvent(before, outcome());
+    expect(after.status).toEqual({ kind: "running" });
+  });
+
+  /* The substitution the resume protocol exists to prevent. A conversation that looks continued
+     while carrying none of its history must not be presented as a working one. */
+  it("attaching to a different session ends the conversation and says which is which", () => {
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "s", provider_session_id: "other", model: "m", cwd: "/tmp" });
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, outcome({ attached_provider_session_id: "some-other-session" }));
+
+    expect(state.status.kind).toBe("unavailable");
+    const reason = state.status.kind === "unavailable" ? state.status.reason : "";
+    expect(reason).toContain("claude-abc");
+    expect(reason).toContain("some-other-session");
+    expect(state.activeTurnId).toBeNull();
+  });
+
+  /* Forking legitimately returns a different id. Without reading `forked`, every successful fork
+     would report as a substitution the day fork is enabled. */
+  it("a fork attaching under a new id is not a substitution", () => {
+    const state = applyEvent(initialState(), outcome({ attached_provider_session_id: "forked-copy", forked: true }));
+    expect(state.status.kind).not.toBe("unavailable");
+  });
+
+  it("a refused resume names the session that is gone and what to do instead", () => {
+    const state = applyEvent(initialState(), outcome({ status: "rejected", attached_provider_session_id: null }));
+    expect(state.status.kind).toBe("unavailable");
+    const reason = state.status.kind === "unavailable" ? state.status.reason : "";
+    expect(reason).toContain("claude-abc");
+    expect(reason).toContain("Start a new session");
+  });
+
+  it("a provider that failed to start is not reported as a missing conversation", () => {
+    const state = applyEvent(initialState(), outcome({ status: "initialization_failed", attached_provider_session_id: null, detail: "spawn ENOENT" }));
+    const reason = state.status.kind === "unavailable" ? state.status.reason : "";
+    expect(reason).toContain("provider problem");
+    expect(reason).toContain("spawn ENOENT");
+    expect(reason).not.toContain("does not have session");
+  });
+});
