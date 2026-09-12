@@ -4,7 +4,7 @@ import type { AgentDomainEvent, TurnOutcome } from "./types";
 
 describe("applyEvent", () => {
   it("session_opened populates identity and sets status to running", () => {
-    const event: AgentDomainEvent = { type: "session_opened", session_id: "abc-123", model: "claude-sonnet-5", cwd: "/tmp" };
+    const event: AgentDomainEvent = { type: "session_opened", session_id: "abc-123", provider_session_id: "claude-abc-123", model: "claude-sonnet-5", cwd: "/tmp" };
     const state = applyEvent(initialState(), event);
     expect(state.sessionId).toBe("abc-123");
     expect(state.model).toBe("claude-sonnet-5");
@@ -47,7 +47,7 @@ describe("applyEvent", () => {
   });
 
   it("turn_completed does not change status (v2 semantics: only session_unavailable/session_closed do)", () => {
-    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", model: "m", cwd: "/tmp" });
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, {
       type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done",
@@ -57,13 +57,13 @@ describe("applyEvent", () => {
   });
 
   it("session_unavailable sets status to unavailable with a reason", () => {
-    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", model: "m", cwd: "/tmp" });
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
     state = applyEvent(state, { type: "session_unavailable", reason: "provider process exited unexpectedly" });
     expect(state.status).toEqual({ kind: "unavailable", reason: "provider process exited unexpectedly" });
   });
 
   it("session_closed sets status to closed with a reason", () => {
-    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", model: "m", cwd: "/tmp" });
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
     state = applyEvent(state, { type: "session_closed", reason: "window closed" });
     expect(state.status).toEqual({ kind: "closed", reason: "window closed" });
   });
@@ -116,5 +116,49 @@ describe("applyEvent", () => {
     const snapshot = { ...initialState(), sessionId: "replaced", transcript: ["from snapshot"] };
     const state = applySnapshot(initialState(), snapshot);
     expect(state).toEqual(snapshot);
+  });
+});
+
+describe("identity handling", () => {
+  it("keeps the Verdandi session id and the Claude provider session id in separate fields", () => {
+    // The two are genuinely different values on the sidecar backend. Measured against a real
+    // sidecar: CreateSessionResponse returned one UUID while SessionReady carried another. Storing
+    // both in one field would eventually send Claude's id where Verdandi's belongs.
+    const state = applyEvent(initialState(), {
+      type: "session_opened",
+      session_id: "8b3be45a-330b-429f-b1a9-573e73448e23",
+      provider_session_id: "f6fabf0a-8be9-4916-879c-ceadc863620e",
+      model: "claude-sonnet-5",
+      cwd: "/tmp",
+    });
+    expect(state.sessionId).toBe("8b3be45a-330b-429f-b1a9-573e73448e23");
+    expect(state.providerSessionId).toBe("f6fabf0a-8be9-4916-879c-ceadc863620e");
+    expect(state.sessionId).not.toBe(state.providerSessionId);
+  });
+
+  it("a second session_opened on the same session is idempotent, not a new session", () => {
+    // The Agent SDK emits system/init at the start of EVERY turn inside one streaming session, so
+    // this event legitimately repeats. It must not reset accumulated state.
+    const opened: AgentDomainEvent = {
+      type: "session_opened",
+      session_id: "sess-1",
+      provider_session_id: "claude-1",
+      model: "claude-sonnet-5",
+      cwd: "/tmp",
+    };
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "hello" });
+    state = applyEvent(state, opened);
+    expect(state.transcript).toEqual(["hello"]);
+    expect(state.sessionId).toBe("sess-1");
+    expect(state.providerSessionId).toBe("claude-1");
+  });
+
+  it("starts with every capability false, so a gated control cannot appear before the server says so", () => {
+    const state = initialState();
+    expect(state.capabilities).toEqual({ resume: false, fork: false, interrupt: false, bypassPermissionMode: false });
+    expect(state.provider).toBeNull();
+    expect(state.conversationId).toBeNull();
+    expect(state.providerSessionId).toBeNull();
   });
 });

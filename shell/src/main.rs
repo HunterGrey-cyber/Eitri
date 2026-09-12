@@ -3,6 +3,7 @@
 //! WebView-hosted frontend bridged to a lazily-started `agent::AgentSession`). See
 //! docs/superpowers/specs/2026-09-06-shell-scaffolding-design.md.
 
+mod agent_backend;
 mod agent_bridge;
 mod agent_panel;
 mod chrome;

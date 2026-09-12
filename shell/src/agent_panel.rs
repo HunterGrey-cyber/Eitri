@@ -1,22 +1,30 @@
 //! The real agent-ui panel: a `WebView` hosting the embedded `agent-ui/web` frontend, a
-//! `UserContentManager` script-message bridge (JS -> Rust), and a fast poll of
-//! `AgentSession::pump()` pushed to the page via `evaluate_javascript` (Rust -> JS). See
+//! `UserContentManager` script-message bridge (JS -> Rust), and a fast poll of the backend's
+//! `pump()` pushed to the page via `evaluate_javascript` (Rust -> JS). See
 //! docs/superpowers/specs/2026-09-07-agent-ui-design.md.
 //!
-//! `AgentSession` construction is lazy: this module starts with `None` and only calls
-//! `AgentSession::start(...)` once the frontend sends `"start_session"` -- `PermissionMode` is a
-//! construction-time-only choice on the real `agent` API (no live mode-switch exists), so the
-//! frontend must choose before any real subprocess is spawned.
+//! Backend construction is lazy: this module starts with `None` and only builds one once the
+//! frontend sends `"start_session"` -- `PermissionMode` is a construction-time-only choice on the
+//! real `agent` API (no live mode-switch exists), so the frontend must choose before any real
+//! subprocess is spawned. Which backend gets built is `crate::agent_backend`'s decision.
+//!
+//! **State is server-originated.** For the sidecar backend this module folds nothing of its own:
+//! `active_turn_id`, tool calls and permissions all arrive as real events through `pump()`. A
+//! command that succeeds returns no events at all; the UI updates on the next poll. Nothing here
+//! synthesizes an optimistic `TurnStarted` to make the UI feel faster -- doing so would put the
+//! panel's idea of "a turn is running" ahead of the server's, which is the exact shadow state the
+//! runtime design forbids.
 
+use crate::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
 use crate::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
-    serialize_snapshot_for_js, InboundMessage,
+    serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
 };
-use agent::{AgentSession, CONSERVATIVE_DISALLOWED_TOOLS};
 use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use webkit6::prelude::*;
 use webkit6::{UserContentManager, WebView};
 
@@ -31,9 +39,23 @@ const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.
 const PUMP_POLL_INTERVAL_MS: u64 = 33;
 
 struct AgentPanelState {
-    session: Option<AgentSession>,
+    session: Option<AgentBackend>,
+    backend_kind: BackendKind,
     project_dir: PathBuf,
     supervisor: Option<crate::supervisor_client::SupervisorClient>,
+    /// Set while a backend is being constructed on a worker thread. Holds the requestId whose
+    /// `command_result` is owed once that finishes -- the reply is deferred, not dropped, which is
+    /// exactly what a requestId-addressed protocol is for.
+    pending_start: Option<PendingStart>,
+}
+
+/// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
+/// real gRPC handshake, and on a cold Verdandi checkout runs `npm ci` + `npm run build` -- minutes
+/// of blocking work. Doing that on the GTK main loop would freeze the whole editor, so it happens
+/// on a worker thread and the result is collected by a poll on the main loop.
+struct PendingStart {
+    request_id: String,
+    result_rx: mpsc::Receiver<Result<AgentBackend, crate::agent_backend::BackendError>>,
 }
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
@@ -123,7 +145,15 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
     let supervisor = crate::supervisor_client::SupervisorClient::connect_or_spawn(instance_id, project_name, &project_dir);
-    let state = Rc::new(RefCell::new(AgentPanelState { session: None, project_dir, supervisor }));
+    let backend_kind = BackendKind::from_env();
+    println!("[agent_panel] backend: {}", backend_kind.as_str());
+    let state = Rc::new(RefCell::new(AgentPanelState {
+        session: None,
+        backend_kind,
+        project_dir,
+        supervisor,
+        pending_start: None,
+    }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
     {
@@ -137,34 +167,137 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
 
     webview.load_html(AGENT_UI_HTML, None);
 
+    // Started once, at construction, rather than when a session starts: it is also what collects a
+    // finished background connect. Previously it was started inside the start_session handler,
+    // which meant a second start attempt after a failure installed a SECOND timer on the same
+    // state -- every later event would then be dispatched twice.
+    start_pump_timer(state.clone(), webview.clone());
+
     let handle = AgentPanelHandle { state: state.clone() };
     (webview.upcast(), handle)
 }
 
-/// Starts the fast poll of `AgentSession::pump()`, batching every event drained in one tick into
-/// a single `events{fromRevision,throughRevision,events[]}` dispatch (not one dispatch per event,
-/// unlike the pre-v2 pump loop) -- fromRevision/throughRevision are read directly off the
-/// projection immediately before/after the batch, since `pump()` already folds each event into
-/// the projection before returning. An empty batch (nothing new since the last tick) sends
-/// nothing, matching the pre-v2 loop's own behavior.
+/// The panel's single main-loop tick. Three jobs, in order:
+///
+/// 1. collect a backend that finished constructing on a worker thread, and answer the
+///    `start_session` command that has been waiting on it;
+/// 2. drain the backend's events and dispatch them as one batched
+///    `events{fromRevision,throughRevision,events[]}` envelope (not one per event);
+/// 3. report derived status to `neovibe-supervisor`.
+///
+/// `fromRevision`/`throughRevision` are read off the projection immediately before and after the
+/// batch, since `pump()` folds each event into the projection before returning. An empty batch
+/// sends nothing.
 fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(PUMP_POLL_INTERVAL_MS), move || {
+        collect_pending_start(&state, &webview);
+
         let mut state_ref = state.borrow_mut();
         if let Some(session) = state_ref.session.as_mut() {
-            let from_revision = session.projection.last_revision;
+            let from_revision = session.projection().last_revision;
             let events = session.pump();
             if !events.is_empty() {
-                let through_revision = session.projection.last_revision;
+                let through_revision = session.projection().last_revision;
                 let payload = serialize_events_for_js(from_revision, through_revision, &events);
                 evaluate_js_dispatch(&webview, &payload);
             }
         }
-        let status = crate::supervisor_client::derive_status(state_ref.session.as_ref().map(|s| &s.projection));
+        let status = crate::supervisor_client::derive_status(state_ref.session.as_ref().map(|s| s.projection()));
         if let Some(supervisor) = state_ref.supervisor.as_mut() {
             supervisor.send_status(status);
         }
         gtk4::glib::ControlFlow::Continue
     });
+}
+
+/// Non-blocking check on an in-flight backend construction. `try_recv`, never `recv`: this runs on
+/// the GTK main loop 30 times a second and must never block it -- which is the entire reason the
+/// construction was moved off this thread in the first place.
+fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let finished = {
+        let mut state_ref = state.borrow_mut();
+        let Some(pending) = state_ref.pending_start.as_ref() else { return };
+        match pending.result_rx.try_recv() {
+            Ok(result) => {
+                let request_id = pending.request_id.clone();
+                state_ref.pending_start = None;
+                Some((request_id, result))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The worker died without sending anything -- a panic in backend construction. The
+                // command would otherwise wait forever for a reply that is never coming.
+                let request_id = pending.request_id.clone();
+                state_ref.pending_start = None;
+                Some((
+                    request_id,
+                    Err(crate::agent_backend::BackendError {
+                        message: "the backend connect worker stopped without reporting a result".to_string(),
+                        benign: false,
+                    }),
+                ))
+            }
+        }
+    };
+
+    let Some((request_id, result)) = finished else { return };
+    match result {
+        Ok(backend) => {
+            let snapshot = {
+                let mut state_ref = state.borrow_mut();
+                state_ref.session = Some(backend);
+                // The frontend has been showing a connecting state since it sent start_session; give
+                // it the real projection immediately rather than making it wait for the first event.
+                serialize_snapshot_for_js(&SnapshotView::of(state_ref.session.as_ref().unwrap()))
+            };
+            evaluate_js_dispatch(webview, &snapshot);
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
+        }
+        Err(error) => {
+            eprintln!("[agent_panel] backend failed to start: {}", error.message);
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&error.message)));
+            evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
+        }
+    }
+}
+
+/// Applies one command's outcome to the panel and the frontend, uniformly.
+///
+/// The benign/fatal split is the whole point: a benign failure (a turn sent while one was running,
+/// a permission answered twice) reports itself and leaves the session alone, while a fatal one
+/// tears the session down and tells the frontend the whole session is gone. Before this existed the
+/// same three-branch shape was copy-pasted at every call site, which is how the two classes drifted.
+fn apply_command_outcome(
+    state: &Rc<RefCell<AgentPanelState>>,
+    webview: &WebView,
+    request_id: &str,
+    outcome: Result<Vec<agent::AgentDomainEvent>, crate::agent_backend::BackendError>,
+) {
+    match outcome {
+        Ok(events) => {
+            if !events.is_empty() {
+                // Only the legacy backend ever gets here with a non-empty batch: it synthesizes
+                // events its own wire protocol cannot provide. The sidecar backend returns an empty
+                // vec and its state arrives through the pump, from the server.
+                let state_ref = state.borrow();
+                let through_revision = state_ref.session.as_ref().map(|s| s.projection().last_revision).unwrap_or(0);
+                let from_revision = through_revision.saturating_sub(events.len() as u64);
+                drop(state_ref);
+                evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, &events));
+            }
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Ok(())));
+        }
+        Err(error) if error.benign => {
+            eprintln!("[agent_panel] command rejected (session stays alive): {}", error.message);
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Err(&error.message)));
+        }
+        Err(error) => {
+            eprintln!("[agent_panel] command failed fatally: {}", error.message);
+            state.borrow_mut().session = None;
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Err(&error.message)));
+            evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
+        }
+    }
 }
 
 fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
@@ -178,11 +311,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
 
     match message {
         InboundMessage::Ready { .. } => {
-            let state_ref = state.borrow();
-            // No session yet is not an error -- the frontend's own App.tsx shows the mode
-            // selector in that case and doesn't expect a snapshot until one exists.
-            let snapshot_payload = state_ref.session.as_ref().map(|session| serialize_snapshot_for_js(&session.projection));
-            drop(state_ref);
+            let (greeting_payload, snapshot_payload) = {
+                let state_ref = state.borrow();
+                let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
+                // No session yet is not an error -- the frontend shows its start screen in that
+                // case and does not expect a snapshot until one exists.
+                let snapshot = state_ref.session.as_ref().map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
+                (serialize_hello_for_js(&greeting), snapshot)
+            };
+            // `hello` FIRST: it tells the frontend which backend it is talking to and which
+            // permission policies are genuinely on offer, which is what its start screen renders.
+            evaluate_js_dispatch(webview, &greeting_payload);
             if let Some(payload) = snapshot_payload {
                 evaluate_js_dispatch(webview, &payload);
             }
@@ -191,124 +330,74 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         InboundMessage::StartSession { mode, .. } => {
             let mut state_ref = state.borrow_mut();
             if state_ref.session.is_some() {
-                eprintln!("[agent_panel] start_session received but a session already exists -- ignoring");
                 drop(state_ref);
                 evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("a session already exists")));
                 return;
             }
-            let project_dir = state_ref.project_dir.clone();
-            match AgentSession::start(&project_dir, mode.into(), CONSERVATIVE_DISALLOWED_TOOLS) {
-                Ok(session) => {
-                    state_ref.session = Some(session);
-                    drop(state_ref);
-                    start_pump_timer(state.clone(), webview.clone());
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
-                }
-                Err(e) => {
-                    eprintln!("[agent_panel] failed to start AgentSession: {e}");
-                    drop(state_ref);
-                    let message = format!("failed to start session: {e}");
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&message)));
-                    evaluate_js_dispatch(webview, &serialize_error_for_js(&message));
-                }
+            if state_ref.pending_start.is_some() {
+                // A second start while one is already connecting. Rejecting is right: accepting
+                // would spawn a second sidecar process whose result would overwrite the first,
+                // leaking it.
+                drop(state_ref);
+                evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("a session is already starting")));
+                return;
             }
+
+            let backend_kind = state_ref.backend_kind;
+            let project_dir = state_ref.project_dir.clone();
+            let permission_mode: agent::PermissionMode = mode.into();
+
+            // Off the GTK main loop. Constructing the sidecar backend spawns a real process, does a
+            // real gRPC handshake, and on a cold Verdandi checkout runs `npm ci` + `npm run build`.
+            // Doing that here would freeze the editor -- for minutes, in the cold case.
+            let (result_tx, result_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = AgentBackend::start(backend_kind, &project_dir, permission_mode);
+                // The receiver is gone only if the panel was torn down mid-connect; dropping the
+                // backend here is then the correct cleanup (its Drop shuts the sidecar down).
+                let _ = result_tx.send(result);
+            });
+            state_ref.pending_start = Some(PendingStart { request_id, result_rx });
+            // No command_result yet -- it is owed once the worker reports, and `collect_pending_start`
+            // on the next tick is what pays it.
         }
         InboundMessage::SendMessage { text, .. } => {
-            let mut state_ref = state.borrow_mut();
-            match state_ref.session.as_mut().map(|session| session.send_turn(&text)) {
-                Some(Ok(events)) => {
-                    let through_revision = state_ref.session.as_ref().unwrap().projection.last_revision;
-                    let from_revision = through_revision - events.len() as u64;
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, &events));
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
+            let outcome = {
+                let mut state_ref = state.borrow_mut();
+                match state_ref.session.as_mut() {
+                    Some(session) => session.send_turn(&text),
+                    None => Err(no_session_error()),
                 }
-                Some(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                    // Benign: a turn was already in progress. The frontend's own Composer disables sending
-                    // while a turn is active, but there's a real round-trip window (postMessage -> GTK main
-                    // loop -> evaluate_javascript) where a fast double-send can still reach here. This is an
-                    // ordering complaint, not a process failure -- the session must stay alive.
-                    eprintln!("[agent_panel] send_turn rejected: {e}");
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("a turn is already in progress")));
-                }
-                Some(Err(e)) => {
-                    eprintln!("[agent_panel] send_turn failed: {e}");
-                    state_ref.session = None;
-                    drop(state_ref);
-                    let message = format!("failed to send message: {e}");
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&message)));
-                    evaluate_js_dispatch(webview, &serialize_error_for_js(&message));
-                }
-                None => {
-                    eprintln!("[agent_panel] send_message received with no active session -- ignoring");
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("no active session")));
-                }
-            }
+            };
+            apply_command_outcome(state, webview, &request_id, outcome);
         }
         InboundMessage::Interrupt { .. } => {
-            let mut state_ref = state.borrow_mut();
-            match state_ref.session.as_mut().map(|session| session.interrupt()) {
-                Some(Ok(events)) => {
-                    if !events.is_empty() {
-                        let through_revision = state_ref.session.as_ref().unwrap().projection.last_revision;
-                        let from_revision = through_revision - events.len() as u64;
-                        drop(state_ref);
-                        evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, &events));
-                    } else {
-                        drop(state_ref);
-                    }
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
+            let outcome = {
+                let mut state_ref = state.borrow_mut();
+                match state_ref.session.as_mut() {
+                    Some(session) => session.interrupt(),
+                    None => Err(no_session_error()),
                 }
-                Some(Err(e)) => {
-                    eprintln!("[agent_panel] interrupt failed: {e}");
-                    state_ref.session = None;
-                    drop(state_ref);
-                    let message = format!("failed to send interrupt: {e}");
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&message)));
-                    evaluate_js_dispatch(webview, &serialize_error_for_js(&message));
-                }
-                None => {
-                    eprintln!("[agent_panel] interrupt received with no active session -- ignoring");
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("no active session")));
-                }
-            }
+            };
+            apply_command_outcome(state, webview, &request_id, outcome);
         }
         InboundMessage::PermissionResponse { permission_id, allow, reason, .. } => {
-            let mut state_ref = state.borrow_mut();
-            match state_ref.session.as_mut().map(|session| session.respond_permission(&permission_id, allow, reason.as_deref())) {
-                Some(Ok(events)) => {
-                    let through_revision = state_ref.session.as_ref().unwrap().projection.last_revision;
-                    let from_revision = through_revision - events.len() as u64;
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, &events));
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
+            let outcome = {
+                let mut state_ref = state.borrow_mut();
+                match state_ref.session.as_mut() {
+                    Some(session) => session.respond_permission(&permission_id, allow, reason.as_deref()),
+                    None => Err(no_session_error()),
                 }
-                Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Benign: an already-answered or unknown permission id -- not fatal to the
-                    // session. Global Constraint: a duplicate/unknown id is a logged no-op.
-                    eprintln!("[agent_panel] respond_permission failed: {e}");
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("permission already resolved or unknown")));
-                }
-                Some(Err(e)) => {
-                    eprintln!("[agent_panel] respond_permission failed: {e}");
-                    state_ref.session = None;
-                    drop(state_ref);
-                    let message = format!("failed to send permission response: {e}");
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&message)));
-                    evaluate_js_dispatch(webview, &serialize_error_for_js(&message));
-                }
-                None => {
-                    eprintln!("[agent_panel] permission_response received with no active session -- ignoring");
-                    drop(state_ref);
-                    evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("no active session")));
-                }
-            }
+            };
+            apply_command_outcome(state, webview, &request_id, outcome);
         }
     }
+}
+
+/// A command arriving with no session. Benign: the frontend's start screen is showing, or the
+/// session just ended -- either way the panel is healthy and there is nothing to tear down.
+fn no_session_error() -> crate::agent_backend::BackendError {
+    crate::agent_backend::BackendError { message: "no active session".to_string(), benign: true }
 }
 
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {

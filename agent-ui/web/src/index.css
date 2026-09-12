@@ -115,3 +115,73 @@ body,
   border-radius: 4px;
   padding: 8px;
 }
+
+/* --- Phase 3: backend-aware start screen, identities, and in-panel errors ------------------- */
+
+.mode-selector button {
+  text-align: left;
+}
+.mode-selector button strong {
+  display: block;
+}
+.mode-selector .detail {
+  display: block;
+  opacity: 0.75;
+  font-size: 12px;
+  margin-top: 2px;
+}
+.mode-selector .connecting {
+  opacity: 0.85;
+}
+.mode-selector .warning {
+  margin-top: 16px;
+  padding: 10px 12px;
+  border: 1px solid #f9e2af;
+  border-radius: 4px;
+  background: rgba(249, 226, 175, 0.08);
+  color: #f9e2af;
+  font-size: 12px;
+  text-align: left;
+}
+.mode-selector code {
+  font-family: ui-monospace, monospace;
+  opacity: 0.85;
+}
+
+/* The header now carries four independent readouts rather than two, so it needs real spacing
+   instead of `justify-content: space-between` pushing the outermost pair to the edges. */
+.session-header {
+  justify-content: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.session-header .identities,
+.session-header .provider,
+.session-header .backend {
+  opacity: 0.7;
+  cursor: help; /* every one of these has the full value in its title attribute */
+}
+.session-header .status-unavailable,
+.session-header .status-closed {
+  color: #f38ba8;
+}
+
+/* Replaces window.alert: copyable, non-blocking, and able to show the sidecar's own multi-line
+   startup diagnostics, which is usually where the real cause is. */
+.fatal-error {
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid #f38ba8;
+  border-radius: 4px;
+  background: rgba(243, 139, 168, 0.08);
+  color: #f38ba8;
+  font-size: 12px;
+}
+.fatal-error pre {
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, monospace;
+  color: #cdd6f4;
+  user-select: text;
+}

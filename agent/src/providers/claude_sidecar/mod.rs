@@ -9,6 +9,8 @@
 mod spawn;
 mod translate;
 
+pub use spawn::EXPECTED_VERDANDI_REVISION;
+
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest,
@@ -198,7 +200,12 @@ impl ClaudeSidecarProvider {
         }
 
         let capabilities = capabilities_from_handshake(&handshake);
-        let info = info_from_handshake(&handshake, startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
+        // Which Verdandi build this is, then whatever the sidecar itself warned about. Both belong
+        // in the same list: "why is it behaving oddly?" is answered by the checkout revision at
+        // least as often as by the CLI version.
+        let mut diagnostics = sidecar.checkout_diagnostics.clone();
+        diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
+        let info = info_from_handshake(&handshake, diagnostics);
         for diagnostic in &info.startup_diagnostics {
             eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
         }
@@ -457,8 +464,10 @@ mod tests {
 
     #[test]
     fn the_cli_compatibility_warning_is_picked_out_of_real_sidecar_stderr() {
-        // Verbatim from a real run of the fixed sidecar against CLI 2.1.269, as it arrives through
-        // SpawnedSidecar's stderr tail.
+        // The real diagnostic line, as it arrives through SpawnedSidecar's stderr tail, truncated
+        // after "Starting anyway." -- the real message continues with guidance text. Truncated on
+        // purpose: this asserts that the FILTER matches, and a filter that only worked on the full
+        // sentence would be matching prose rather than the stable marker.
         let lines = vec![
             "Debug: something unrelated".to_string(),
             "claude-sidecar: CLI version diagnostic: claude CLI version 2.1.269 is inside this sidecar's supported range (>=2.1.267 <3.0.0) but has not been tested against it (tested: 2.1.267). Starting anyway.".to_string(),

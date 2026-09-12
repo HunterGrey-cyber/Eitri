@@ -49,4 +49,4 @@ pub use provider::{
     InterruptTurnRequest, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo,
 };
-pub use providers::claude_sidecar::ClaudeSidecarProvider;
+pub use providers::claude_sidecar::{ClaudeSidecarProvider, EXPECTED_VERDANDI_REVISION};

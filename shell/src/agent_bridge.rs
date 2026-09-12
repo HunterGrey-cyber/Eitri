@@ -72,6 +72,31 @@ pub(crate) fn serialize_command_result_for_js(request_id: &str, result: Result<(
     }
 }
 
+/// `{"kind":"hello","backend":...,"permissionModes":[...],"resumeAvailable":false,...}` -- sent once,
+/// in reply to the frontend's `ready`, BEFORE any snapshot.
+///
+/// It exists because the frontend's start screen cannot be honest without it. The two backends
+/// genuinely differ in what they can offer: the legacy backend has a real, tested interactive
+/// permission gate, while the sidecar path ships BYPASS only in this milestone (its `interactive`
+/// and `verdandi_rules` modes are confirmed to behave identically in the current sidecar, so
+/// presenting them as distinct choices would be a lie). Hardcoding either shape into the frontend
+/// would make it wrong for the other.
+///
+/// `resumeAvailable` is always false here and is sent anyway, deliberately: it gives the frontend a
+/// single field to gate a Resume control on, so the control appears only when the whole path behind
+/// it exists rather than when someone remembers to add the UI.
+pub(crate) fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
+    json!({
+        "kind": "hello",
+        "backend": greeting.kind.as_str(),
+        "projectDir": greeting.project_dir.to_string_lossy(),
+        "permissionModes": greeting.permission_modes,
+        "resumeAvailable": false,
+        "expectedVerdandiRevision": greeting.expected_verdandi_revision,
+    })
+    .to_string()
+}
+
 /// `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
 /// `AgentDomainEvent`'s own `#[derive(Serialize)]` produces the tagged shape directly for each
 /// element. `from_revision` is the projection's `last_revision` BEFORE this batch was folded;
@@ -86,12 +111,47 @@ pub(crate) fn serialize_events_for_js(from_revision: u64, through_revision: u64,
     json!({ "kind": "events", "fromRevision": from_revision, "throughRevision": through_revision, "events": events }).to_string()
 }
 
+/// Everything one snapshot needs, gathered from wherever it actually lives.
+///
+/// Exists so the serializer stays a pure function of plain data: it can be unit-tested against a
+/// hand-built view without constructing a real `AgentBackend`, which would mean spawning a real
+/// sidecar process. `SnapshotView::of` is the one place the gathering happens, so the two can never
+/// disagree about where a field comes from.
+pub(crate) struct SnapshotView<'a> {
+    pub(crate) backend: &'static str,
+    pub(crate) conversation_id: Option<&'a str>,
+    pub(crate) provider_session_id: Option<&'a str>,
+    pub(crate) capabilities: agent::ProviderCapabilities,
+    pub(crate) provider: Option<&'a agent::ProviderInfo>,
+    pub(crate) projection: &'a AgentSessionProjection,
+}
+
+impl<'a> SnapshotView<'a> {
+    pub(crate) fn of(backend: &'a crate::agent_backend::AgentBackend) -> Self {
+        Self {
+            backend: backend.kind().as_str(),
+            conversation_id: backend.conversation_id(),
+            provider_session_id: backend.provider_session_id(),
+            capabilities: backend.capabilities(),
+            provider: backend.provider_info(),
+            projection: backend.projection(),
+        }
+    }
+}
+
 /// `{"kind":"snapshot","throughRevision":...,"state":<AgentUiState-shaped JSON>}` -- a
 /// hand-written re-shaping of `AgentSessionProjection`'s snake_case Rust fields into the camelCase
 /// shape `agent-ui/web/src/types.ts`'s `AgentUiState` expects (deliberately not a direct
 /// `#[derive(Serialize)]` passthrough -- the TS and Rust naming conventions differ, and this
 /// function is the one place that difference is bridged).
-pub(crate) fn serialize_snapshot_for_js(projection: &AgentSessionProjection) -> String {
+///
+/// Takes a `SnapshotView` rather than the projection alone, because two of the three identities
+/// live outside it: `conversationId` is Neovibe's own and `providerSessionId` is Claude's, while the
+/// projection's `sessionId` is Verdandi's. Collapsing them would defeat the entire point of keeping
+/// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
+/// answers with SESSION_NOT_FOUND.
+pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
+    let projection = view.projection;
     let tool_calls: Vec<Value> = projection
         .tool_calls
         .iter()
@@ -118,8 +178,23 @@ pub(crate) fn serialize_snapshot_for_js(projection: &AgentSessionProjection) -> 
         agent::ProjectionStatus::Closed { reason } => json!({ "kind": "closed", "reason": reason }),
     };
 
+    let capabilities = view.capabilities;
+    let provider = view.provider.map(|info| {
+        json!({
+            "sidecarVersion": info.sidecar_version,
+            "claudeAgentSdkVersion": info.claude_agent_sdk_version,
+            "claudeCodeVersion": info.actual_claude_code_version,
+            "protocol": format!("{}.{}", info.protocol_major, info.protocol_minor),
+            "startupDiagnostics": info.startup_diagnostics,
+        })
+    });
+
     let state = json!({
+        "backend": view.backend,
+        // Three identities, three fields. Never one.
+        "conversationId": view.conversation_id,
         "sessionId": projection.session_id,
+        "providerSessionId": view.provider_session_id,
         "model": projection.model,
         "cwd": projection.cwd,
         "transcript": projection.transcript,
@@ -127,6 +202,13 @@ pub(crate) fn serialize_snapshot_for_js(projection: &AgentSessionProjection) -> 
         "status": status,
         "activeTurnId": projection.active_turn_id,
         "pendingPermissions": pending_permissions,
+        "capabilities": {
+            "resume": capabilities.resume,
+            "fork": capabilities.fork,
+            "interrupt": capabilities.interrupt,
+            "bypassPermissionMode": capabilities.bypass_permission_mode,
+        },
+        "provider": provider,
     });
 
     json!({ "kind": "snapshot", "throughRevision": projection.last_revision, "state": state }).to_string()
@@ -244,21 +326,98 @@ mod tests {
     #[test]
     fn serialize_snapshot_for_js_produces_camel_case_matching_the_ts_shape() {
         let mut projection = AgentSessionProjection::default();
-        projection.apply(&AgentDomainEvent::SessionOpened { session_id: "abc".into(), provider_session_id: "abc".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() });
+        projection.apply(&AgentDomainEvent::SessionOpened { session_id: "verdandi-1".into(), provider_session_id: "claude-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() });
         projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
         projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({"command": "echo hi"}) });
         projection.apply(&AgentDomainEvent::ToolCallCompleted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), content: json!("boom"), is_error: true });
         projection.apply(&AgentDomainEvent::SessionUnavailable { reason: "provider process exited unexpectedly".into() });
 
-        let json_str = serialize_snapshot_for_js(&projection);
+        let provider = agent::ProviderInfo {
+            sidecar_version: "0.1.0".into(),
+            claude_agent_sdk_version: "0.3.0".into(),
+            actual_claude_code_version: "2.1.269".into(),
+            protocol_major: 1,
+            protocol_minor: 0,
+            advertised_capabilities: vec!["handshake".into()],
+            advertised_permission_modes: vec!["bypass".into()],
+            startup_diagnostics: vec!["Verdandi checkout: /x @ eb70aa3 (via NEOVIBE_VERDANDI_CHECKOUT)".into()],
+        };
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: Some("conv-hash"),
+            provider_session_id: Some("claude-1"),
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true },
+            provider: Some(&provider),
+            projection: &projection,
+        };
+
+        let json_str = serialize_snapshot_for_js(&view);
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["kind"], "snapshot");
         assert_eq!(parsed["throughRevision"], 5);
-        assert_eq!(parsed["state"]["sessionId"], "abc");
+        assert_eq!(parsed["state"]["backend"], "sidecar");
         assert_eq!(parsed["state"]["pendingPermissions"], json!([]));
         assert_eq!(parsed["state"]["status"]["kind"], "unavailable");
         assert_eq!(parsed["state"]["status"]["reason"], "provider process exited unexpectedly");
         assert_eq!(parsed["state"]["toolCalls"][0]["toolUseId"], "toolu_1");
         assert_eq!(parsed["state"]["toolCalls"][0]["result"]["isError"], true);
+
+        // The three identities reach the frontend as three separate fields. If any two of these
+        // ever collapse to the same source, a consumer will eventually send Claude's id where
+        // Verdandi's belongs and get SESSION_NOT_FOUND.
+        assert_eq!(parsed["state"]["conversationId"], "conv-hash");
+        assert_eq!(parsed["state"]["sessionId"], "verdandi-1");
+        assert_eq!(parsed["state"]["providerSessionId"], "claude-1");
+
+        assert_eq!(parsed["state"]["capabilities"]["interrupt"], true);
+        assert_eq!(parsed["state"]["capabilities"]["resume"], false, "resume must not be advertised in this milestone");
+        assert_eq!(parsed["state"]["provider"]["claudeCodeVersion"], "2.1.269");
+        assert_eq!(parsed["state"]["provider"]["protocol"], "1.0");
+        assert!(parsed["state"]["provider"]["startupDiagnostics"][0].as_str().unwrap().contains("eb70aa3"));
+    }
+
+    #[test]
+    fn a_legacy_snapshot_carries_no_conversation_id_and_no_provider_block() {
+        let projection = AgentSessionProjection::default();
+        let view = SnapshotView {
+            backend: "legacy",
+            conversation_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true },
+            provider: None,
+            projection: &projection,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        assert_eq!(parsed["state"]["backend"], "legacy");
+        assert!(parsed["state"]["conversationId"].is_null(), "the legacy backend has no conversation identity");
+        assert!(parsed["state"]["provider"].is_null());
+    }
+
+    #[test]
+    fn the_sidecar_hello_offers_bypass_only_and_never_advertises_resume() {
+        let greeting = crate::agent_backend::BackendGreeting::for_kind(
+            crate::agent_backend::BackendKind::Sidecar,
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(parsed["kind"], "hello");
+        assert_eq!(parsed["backend"], "sidecar");
+        assert_eq!(parsed["permissionModes"], json!(["bypass"]));
+        assert_eq!(parsed["resumeAvailable"], false);
+        assert_eq!(parsed["projectDir"], "/tmp/project");
+        assert!(parsed["expectedVerdandiRevision"].is_string());
+    }
+
+    #[test]
+    fn the_legacy_hello_keeps_its_real_two_mode_choice() {
+        let greeting = crate::agent_backend::BackendGreeting::for_kind(
+            crate::agent_backend::BackendKind::Legacy,
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(parsed["backend"], "legacy");
+        assert_eq!(parsed["permissionModes"], json!(["auto", "bypass"]));
+        assert_eq!(parsed["resumeAvailable"], false);
+        assert!(parsed["expectedVerdandiRevision"].is_null());
     }
 }

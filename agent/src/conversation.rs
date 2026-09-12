@@ -102,7 +102,11 @@ fn hex_prefix(bytes: &[u8], take: usize) -> String {
 pub struct AgentConversation {
     conversation_id: String,
     canonical_cwd: PathBuf,
-    provider: Box<dyn AgentProvider>,
+    /// `+ Send` so a conversation can be CONSTRUCTED on a worker thread and moved to the UI thread
+    /// afterwards. That is not a nicety: creating one spawns a real sidecar process and performs a
+    /// real handshake, and on a cold Verdandi checkout it also runs `npm ci` and `npm run build` --
+    /// minutes of work that must never happen on a GTK main loop.
+    provider: Box<dyn AgentProvider + Send>,
     capabilities: ProviderCapabilities,
     info: ProviderInfo,
     /// Verdandi's id for this session. `None` only between construction failure modes -- a
@@ -125,7 +129,7 @@ impl AgentConversation {
     /// provider see -- otherwise `/home/x/proj` and `/home/x/../x/proj` would be two conversations
     /// for one directory, and would later map to two different persisted records.
     pub fn create(
-        provider: Box<dyn AgentProvider>,
+        provider: Box<dyn AgentProvider + Send>,
         cwd: &Path,
         permission_mode: crate::PermissionMode,
     ) -> Result<Self, ConversationError> {
@@ -309,16 +313,19 @@ mod tests {
     use super::*;
     use crate::provider::ResumeSessionRequest;
     use crate::{ContentKind, PermissionMode, ProviderErrorCode, TurnOutcome};
-    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
 
     /// A provider that records what it was asked to do and replays scripted events. No process, no
     /// network, no cost -- everything `AgentConversation` itself decides is testable here.
+    /// `Mutex`, not `RefCell`: `AgentConversation` now requires `Box<dyn AgentProvider + Send>` so
+    /// a real provider can be constructed off the UI thread, and the fake has to satisfy the same
+    /// bound. Every method still takes `&self`, so the lock is never held across a call.
     #[derive(Default)]
     struct FakeProvider {
         capabilities: ProviderCapabilities,
-        calls: RefCell<Vec<String>>,
-        queued_events: RefCell<Vec<AgentDomainEvent>>,
-        send_turn_error: RefCell<Option<ProviderError>>,
+        calls: Mutex<Vec<String>>,
+        queued_events: Mutex<Vec<AgentDomainEvent>>,
+        send_turn_error: Mutex<Option<ProviderError>>,
     }
 
     impl FakeProvider {
@@ -334,10 +341,10 @@ mod tests {
             }
         }
         fn queue(&self, event: AgentDomainEvent) {
-            self.queued_events.borrow_mut().push(event);
+            self.queued_events.lock().unwrap().push(event);
         }
         fn calls(&self) -> Vec<String> {
-            self.calls.borrow().clone()
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -349,40 +356,40 @@ mod tests {
             ProviderInfo { sidecar_version: "fake".into(), protocol_major: 1, ..Default::default() }
         }
         fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
-            self.calls.borrow_mut().push(format!("create_session(cwd={})", request.cwd));
+            self.calls.lock().unwrap().push(format!("create_session(cwd={})", request.cwd));
             Ok("verdandi-session-1".into())
         }
         fn resume_session(&self, _r: ResumeSessionRequest) -> Result<String, ProviderError> {
             Err(ProviderError::UnsupportedCapability("resume"))
         }
         fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError> {
-            self.calls.borrow_mut().push(format!("send_turn({})", request.text));
-            if let Some(e) = self.send_turn_error.borrow_mut().take() {
+            self.calls.lock().unwrap().push(format!("send_turn({})", request.text));
+            if let Some(e) = self.send_turn_error.lock().unwrap().take() {
                 return Err(e);
             }
             Ok("turn-1".into())
         }
         fn interrupt_turn(&self, _r: InterruptTurnRequest) -> Result<(), ProviderError> {
-            self.calls.borrow_mut().push("interrupt_turn".into());
+            self.calls.lock().unwrap().push("interrupt_turn".into());
             Ok(())
         }
         fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
-            self.calls.borrow_mut().push(format!("resolve_permission({}, allow={})", request.permission_id, request.allow));
+            self.calls.lock().unwrap().push(format!("resolve_permission({}, allow={})", request.permission_id, request.allow));
             Ok(())
         }
         fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
-            self.calls.borrow_mut().push("close_session".into());
+            self.calls.lock().unwrap().push("close_session".into());
             Ok(())
         }
         fn pump(&self) -> Vec<AgentDomainEvent> {
-            std::mem::take(&mut *self.queued_events.borrow_mut())
+            std::mem::take(&mut *self.queued_events.lock().unwrap())
         }
     }
 
     /// `Box<dyn AgentProvider>` consumes the fake, so tests that need to inspect it afterward keep
     /// a second handle. `AgentProvider`'s methods all take `&self`, so an `Rc` is enough.
-    fn conversation_with(fake: std::rc::Rc<FakeProvider>) -> AgentConversation {
-        struct Shared(std::rc::Rc<FakeProvider>);
+    fn conversation_with(fake: Arc<FakeProvider>) -> AgentConversation {
+        struct Shared(Arc<FakeProvider>);
         impl AgentProvider for Shared {
             fn capabilities(&self) -> ProviderCapabilities { self.0.capabilities() }
             fn info(&self) -> ProviderInfo { self.0.info() }
@@ -426,7 +433,7 @@ mod tests {
 
     #[test]
     fn create_canonicalizes_cwd_before_deriving_the_id_or_calling_the_provider() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let conversation = conversation_with(fake.clone());
         let canonical = std::env::temp_dir().canonicalize().unwrap();
         assert_eq!(conversation.canonical_cwd(), canonical.as_path());
@@ -466,7 +473,7 @@ mod tests {
 
     #[test]
     fn the_three_identities_stay_distinct() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
 
         // Before any event: Verdandi's id is known, Claude's is not.
@@ -484,7 +491,7 @@ mod tests {
 
     #[test]
     fn pump_folds_into_the_projection_and_the_event_log_together() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
@@ -505,7 +512,7 @@ mod tests {
         // The regression this pins: copying AgentSession's behavior here would fold a second,
         // locally-invented TurnStarted for a turn the provider also reports, giving one turn two
         // ids and two revisions.
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         conversation.pump();
@@ -521,7 +528,7 @@ mod tests {
 
     #[test]
     fn a_second_turn_while_one_is_active_is_rejected_locally_and_never_reaches_the_provider() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
@@ -538,8 +545,8 @@ mod tests {
         // The local guard cannot catch a double send that races the provider's TurnStarted event,
         // so the provider's own typed rejection must land as the same benign error, not as a
         // generic provider failure a caller would treat as fatal.
-        let fake = std::rc::Rc::new(FakeProvider::new());
-        *fake.send_turn_error.borrow_mut() = Some(ProviderError::Provider {
+        let fake = Arc::new(FakeProvider::new());
+        *fake.send_turn_error.lock().unwrap() = Some(ProviderError::Provider {
             code: ProviderErrorCode::TurnAlreadyActive,
             message: "a turn is already in progress on this session".into(),
         });
@@ -553,8 +560,8 @@ mod tests {
 
     #[test]
     fn a_fatal_provider_error_stays_fatal() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
-        *fake.send_turn_error.borrow_mut() = Some(ProviderError::Provider {
+        let fake = Arc::new(FakeProvider::new());
+        *fake.send_turn_error.lock().unwrap() = Some(ProviderError::Provider {
             code: ProviderErrorCode::SessionNotFound,
             message: "gone".into(),
         });
@@ -568,7 +575,7 @@ mod tests {
 
     #[test]
     fn interrupt_is_refused_when_the_provider_does_not_advertise_it() {
-        let fake = std::rc::Rc::new(FakeProvider {
+        let fake = Arc::new(FakeProvider {
             capabilities: ProviderCapabilities { interrupt: false, ..ProviderCapabilities::default() },
             ..Default::default()
         });
@@ -586,7 +593,7 @@ mod tests {
         // Same reasoning as send_turn: the provider emits the real TurnCompleted{Interrupted} and
         // the real PermissionResolved outcomes. Synthesizing them here would produce two terminal
         // events for one turn.
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
@@ -613,7 +620,7 @@ mod tests {
 
     #[test]
     fn responding_to_an_unknown_permission_is_rejected_without_reaching_the_provider() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         conversation.pump();
@@ -626,7 +633,7 @@ mod tests {
 
     #[test]
     fn responding_to_a_real_pending_permission_reaches_the_provider() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::PermissionRequested {
@@ -643,7 +650,7 @@ mod tests {
 
     #[test]
     fn shutdown_closes_the_session_fail_closes_pending_permissions_and_is_idempotent() {
-        let fake = std::rc::Rc::new(FakeProvider::new());
+        let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::PermissionRequested {
