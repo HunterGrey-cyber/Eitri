@@ -59,6 +59,19 @@ pub enum ConversationError {
     /// session: handing back a dead conversation is the silent-substitution failure this whole
     /// phase exists to prevent.
     ResumeRejected { provider_session_id: String, reason: String },
+    /// The provider opened a session with a DIFFERENT provider session id than the one asked for.
+    ///
+    /// This is the silent substitution itself, caught in the act. A resume that comes back as some
+    /// other session is the exact failure the whole resume protocol exists to prevent: the
+    /// conversation would look continued, carry none of the history, and -- worse -- get the
+    /// requested id persisted against it, so every later resume of this workspace would chase a
+    /// session that was never there.
+    ///
+    /// Kept distinct from `ResumeRejected` because the two say different things about the provider.
+    /// A rejection is a provider being honest about a session it cannot continue; this is a
+    /// provider substituting one. Collapsing them would lose exactly the distinction worth alerting
+    /// on.
+    ResumeIdentityMismatch { requested: String, actual: String },
     /// Another Neovibe-participating client already holds this provider session.
     ///
     /// Advisory, and honestly so: the lease binds clients that take part in this protocol. A raw
@@ -86,7 +99,8 @@ impl ConversationError {
             ConversationError::LeaseHeld { .. }
             | ConversationError::Lease(_)
             | ConversationError::TranscriptUnstable { .. }
-            | ConversationError::ResumeRejected { .. } => false,
+            | ConversationError::ResumeRejected { .. }
+            | ConversationError::ResumeIdentityMismatch { .. } => false,
         }
     }
 }
@@ -108,6 +122,12 @@ impl std::fmt::Display for ConversationError {
                 f,
                 "the provider ended session {provider_session_id} immediately after accepting it \
                  ({reason}) -- it most likely no longer exists. Start a new session instead."
+            ),
+            ConversationError::ResumeIdentityMismatch { requested, actual } => write!(
+                f,
+                "asked to continue session {requested}, but the provider opened {actual} instead. \
+                 That session has been closed rather than handed back: continuing it would look like \
+                 your previous conversation while carrying none of it. Start a new session instead."
             ),
             ConversationError::TranscriptUnstable { provider_session_id } => write!(
                 f,
@@ -146,6 +166,17 @@ const PROVIDER_NAME: &str = "claude";
 /// for the SDK to attempt the attach and fail, short enough that a user does not sit on a start
 /// screen wondering. A session still alive after this is treated as started.
 const RESUME_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a just-issued resume turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeVerdict {
+    /// The requested session opened, or nothing contradicted it inside the window.
+    HeldUp,
+    /// The provider ended the session instead of continuing it.
+    Terminated { reason: String },
+    /// The provider opened a session -- just not the one that was asked for.
+    DifferentSession { actual: String },
+}
 
 /// Refuses a resume whose Claude transcript is still being written.
 ///
@@ -345,38 +376,84 @@ impl AgentConversation {
         // So wait, briefly, for a terminal event -- and report it as a failed RESUME rather than
         // handing back a dead conversation. Nothing is synthesized here: this waits for the
         // provider's own event and folds it normally.
-        if let Some(reason) = conversation.wait_for_early_termination(RESUME_FAILURE_WINDOW) {
-            return Err(ConversationError::ResumeRejected {
-                provider_session_id: provider_session_id.to_string(),
-                reason,
-            });
+        match conversation.watch_resume_take_hold(provider_session_id, RESUME_FAILURE_WINDOW) {
+            ResumeVerdict::HeldUp => {}
+            ResumeVerdict::Terminated { reason } => {
+                return Err(ConversationError::ResumeRejected {
+                    provider_session_id: provider_session_id.to_string(),
+                    reason,
+                });
+            }
+            ResumeVerdict::DifferentSession { actual } => {
+                // A live session belonging to someone else's id. Close it rather than dropping it on
+                // the floor: this one really did open, unlike the terminated case.
+                conversation.shutdown();
+                return Err(ConversationError::ResumeIdentityMismatch {
+                    requested: provider_session_id.to_string(),
+                    actual,
+                });
+            }
         }
 
         persist_record(conversation.conversation_id(), &cwd_string, provider_session_id, capabilities.resume);
         Ok(conversation)
     }
 
-    /// Drains for up to `window`, returning the reason if the session terminates in that time.
+    /// Watches a just-issued resume long enough to decide whether it actually took hold.
+    ///
+    /// TWO things can go wrong, and only one of them announces itself:
+    ///
+    /// 1. The provider accepts the request and then terminates the session (the usual cause is an id
+    ///    that no longer exists). That arrives as a real terminal event.
+    /// 2. The provider opens a session that is not the one that was asked for. Nothing announces
+    ///    that at all -- it looks exactly like success, which is what makes it the dangerous one.
+    ///
+    /// So `SessionOpened` is not treated as proof of a successful resume; only `SessionOpened`
+    /// **carrying the requested provider session id** is. That check is the one the acceptance
+    /// criteria always named, and it lived only in the tests until now: the runtime accepted any
+    /// `SessionOpened` and moved on.
     ///
     /// Bounded and short: this runs on the connect worker, not the UI thread, but a user waiting on
     /// "Continue previous session" is waiting on it. A session that survives the window is treated
     /// as started -- a later termination is a normal session-death, reported through the usual
     /// status path rather than as a construction failure.
-    fn wait_for_early_termination(&mut self, window: std::time::Duration) -> Option<String> {
+    ///
+    /// **Protocol debt.** Waiting at all is a workaround: `CreateSession` returns success for a
+    /// resume the provider has not yet tried to attach, so there is nothing to read and the only
+    /// option is to watch. A `CreateSessionResponse` that reported resume acceptance directly would
+    /// retire both the window and its guesswork; until then the window is an upper bound on
+    /// confidence, not a proof, and a rejection slower than it still surfaces as a session death.
+    fn watch_resume_take_hold(
+        &mut self,
+        requested_provider_session_id: &str,
+        window: std::time::Duration,
+    ) -> ResumeVerdict {
         let deadline = std::time::Instant::now() + window;
         while std::time::Instant::now() < deadline {
             for event in self.pump() {
                 match event {
-                    AgentDomainEvent::SessionClosed { reason } => return Some(reason),
-                    AgentDomainEvent::SessionUnavailable { reason } => return Some(reason),
-                    // Real content means the session is genuinely alive; stop waiting early.
-                    AgentDomainEvent::SessionOpened { .. } | AgentDomainEvent::TurnStarted { .. } => return None,
+                    AgentDomainEvent::SessionClosed { reason } => return ResumeVerdict::Terminated { reason },
+                    AgentDomainEvent::SessionUnavailable { reason } => return ResumeVerdict::Terminated { reason },
+                    AgentDomainEvent::SessionOpened { provider_session_id, .. } => {
+                        return if provider_session_id == requested_provider_session_id {
+                            ResumeVerdict::HeldUp
+                        } else {
+                            ResumeVerdict::DifferentSession { actual: provider_session_id }
+                        };
+                    }
+                    // A turn starting proves the session is alive but says nothing about WHICH
+                    // session it is, and on a resume that is the whole question. Keep waiting for
+                    // the event that carries the id.
                     _ => {}
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        None
+        // Neither dead nor identified inside the window. Treated as held up, matching the pre-existing
+        // behavior: refusing here would break every resume whose SessionReady is merely slow, and a
+        // wrong id that arrives late is still caught -- `fold` records whatever id actually turns up,
+        // so the session header shows the truth even if this check ran out of time.
+        ResumeVerdict::HeldUp
     }
 
     pub fn conversation_id(&self) -> &str {
@@ -671,6 +748,74 @@ mod tests {
             model: "claude-sonnet-5".into(),
             cwd: "/tmp".into(),
         }
+    }
+
+    /// The substitution the whole resume protocol exists to prevent, at the layer that can see it.
+    ///
+    /// A provider that ignores the resume id and opens a fresh session emits a perfectly normal
+    /// `SessionOpened` -- nothing about it says "this is not what you asked for" except the id it
+    /// carries. Until this check existed, the runtime accepted any `SessionOpened` and moved on,
+    /// and the acceptance criterion ("SessionOpened.provider_session_id == the requested id") lived
+    /// only in the integration tests. That is exactly backwards: a test proves it happened once,
+    /// the runtime check is what makes it true every time.
+    #[test]
+    fn a_session_opened_under_a_different_id_is_a_substitution_not_a_resume() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        fake.queue(AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-session-1".into(),
+            provider_session_id: "some-other-session".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/tmp".into(),
+        });
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        assert_eq!(verdict, ResumeVerdict::DifferentSession { actual: "some-other-session".into() });
+    }
+
+    #[test]
+    fn a_session_opened_under_the_requested_id_is_a_real_resume() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        fake.queue(session_opened());
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        assert_eq!(verdict, ResumeVerdict::HeldUp);
+    }
+
+    #[test]
+    fn a_session_that_closes_immediately_is_a_rejected_resume() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        fake.queue(AgentDomainEvent::SessionClosed { reason: "provider_exited".into() });
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        assert_eq!(verdict, ResumeVerdict::Terminated { reason: "provider_exited".into() });
+    }
+
+    /// A stream that dies during the window counts as a rejection too -- the resume cannot be
+    /// confirmed, and reporting "started" for a session nobody can observe is the same silent
+    /// substitution wearing a different hat.
+    #[test]
+    fn a_stream_lost_during_the_window_is_a_rejected_resume() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        fake.queue(AgentDomainEvent::SessionUnavailable { reason: "stream ended early".into() });
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        assert_eq!(verdict, ResumeVerdict::Terminated { reason: "stream ended early".into() });
+    }
+
+    /// Silence is NOT failure. A `SessionReady` slower than the window must not fail the resume --
+    /// that would break every resume on a loaded machine. The window is an upper bound on
+    /// confidence, not a proof, and this is the honest consequence of that.
+    #[test]
+    fn a_window_that_expires_with_no_events_lets_the_resume_stand() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(150));
+        assert_eq!(verdict, ResumeVerdict::HeldUp);
     }
 
     #[test]
