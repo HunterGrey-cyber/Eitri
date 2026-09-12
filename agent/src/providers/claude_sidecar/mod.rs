@@ -26,11 +26,12 @@ use claude_runtime_protocol::v1::{
     ErrorDetail, StreamingMode,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode,
-    ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest,
-    WatchSessionEventsRequest,
+    ReplayStart, ResolvePermissionRequest as ProtoResolvePermissionRequest,
+    SendTurnRequest as ProtoSendTurnRequest, WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -41,7 +42,7 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The protocol major this client speaks. A sidecar reporting anything else is refused outright --
 /// design doc §9.3: "major 不兼容：拒绝连接".
-const CLIENT_PROTOCOL_MAJOR: u32 = 1;
+const CLIENT_PROTOCOL_MAJOR: u32 = 2;
 
 /// Capability strings this client understands, as the sidecar advertises them in
 /// `HandshakeResponse.capabilities`. Named constants rather than inline literals because a typo
@@ -148,6 +149,7 @@ pub struct ClaudeSidecarProvider {
     runtime: RuntimeThread,
     client: RuntimeServiceClient<Channel>,
     events: Arc<Mutex<Vec<AgentDomainEvent>>>,
+    backpressure: Arc<BackpressureCounters>,
     /// Captured once at `connect()` from the real `HandshakeResponse`, which this provider used to
     /// discard entirely -- it checked only that the RPC succeeded. Without it there was no truthful
     /// source for any capability at all, so `capabilities()` returned a hardcoded literal.
@@ -226,9 +228,21 @@ impl ClaudeSidecarProvider {
             runtime,
             client,
             events: Arc::new(Mutex::new(Vec::new())),
+            backpressure: Arc::new(BackpressureCounters::default()),
             capabilities,
             info,
         })
+    }
+
+    /// What the event stream is costing right now: queue depth, and how far behind production
+    /// delivery has fallen. See `BackpressureStats` for why losslessness alone is not the question.
+    pub fn backpressure_stats(&self) -> BackpressureStats {
+        BackpressureStats {
+            pending_events: self.events.lock().unwrap().len(),
+            events_received: self.backpressure.events_received.load(Ordering::Relaxed),
+            max_delivery_lag_ms: self.backpressure.max_delivery_lag_ms.load(Ordering::Relaxed),
+            last_delivery_lag_ms: self.backpressure.last_delivery_lag_ms.load(Ordering::Relaxed),
+        }
     }
 
     /// The sidecar process's recent stderr, for diagnosing a provider that connected but is
@@ -312,6 +326,7 @@ impl ClaudeSidecarProvider {
     fn start_watching(&self, session_id: String) {
         let client = self.client.clone();
         let events = Arc::clone(&self.events);
+        let backpressure = Arc::clone(&self.backpressure);
         self.runtime.handle().spawn(async move {
             let mut tracker = watch::SequenceTracker::new();
             // Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new
@@ -328,7 +343,12 @@ impl ClaudeSidecarProvider {
             loop {
                 let request = WatchSessionEventsRequest {
                     session_id: session_id.clone(),
-                    after_sequence: tracker.after_sequence(),
+                    // Always AFTER_SEQUENCE, on the first open as well as every reconnect. See
+                    // `SequenceTracker::after_sequence` for why neither other mode is usable here:
+                    // both are defined as unable to report a gap, which is the one thing this client
+                    // must never accept silently.
+                    start: ReplayStart::AfterSequence as i32,
+                    after_sequence: Some(tracker.after_sequence()),
                 };
                 let opened = {
                     let mut client = client.clone();
@@ -364,6 +384,7 @@ impl ClaudeSidecarProvider {
                     match stream.message().await {
                         Ok(Some(event)) => {
                             let sequence = event.sequence;
+                            record_delivery_lag(&backpressure, event.occurred_at);
                             match tracker.observe(sequence) {
                                 watch::SequenceVerdict::Deliver => {
                                     delivered_since_open = true;
@@ -418,6 +439,42 @@ impl ClaudeSidecarProvider {
             }
         });
     }
+}
+
+/// What a stalled consumer is actually costing, as opposed to whether it is losing anything.
+///
+/// The existing backpressure tests establish that a stalled consumer loses NOTHING. That is a real
+/// property and a necessary one, but it is not the same as boundedness, and gRPC supplies the first
+/// while concealing the absence of the second: a congested reader is never told it is congested, the
+/// queue simply grows. These counters exist to answer the question the loss tests cannot -- is the
+/// system lossless because recovery is bounded, or because some layer is buffering without limit?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackpressureStats {
+    /// Events received from the wire and not yet taken by `pump()`. This client's own queue, and the
+    /// only one of the three (grpc-js server-side, tonic client-side, this `Vec`) that is
+    /// observable from here at all.
+    pub pending_events: usize,
+    /// Every event this provider has received since it connected.
+    pub events_received: u64,
+    /// The worst delay seen between the provider stamping an event and this client receiving it,
+    /// in milliseconds, from the wire's own `occurred_at`.
+    ///
+    /// The honest measure of a backlog: a queue that is growing shows up here as delivery falling
+    /// further and further behind production, whereas `pending_events` only shows what has not yet
+    /// been collected by the consumer.
+    pub max_delivery_lag_ms: i64,
+    /// The most recent such delay, so a caller can see catch-up happening rather than only the peak.
+    pub last_delivery_lag_ms: i64,
+}
+
+/// Shared counters the watch task updates and `backpressure_stats()` reads. Atomics rather than a
+/// mutex: the watch loop touches these on every single event, and a partial-streamed turn is
+/// hundreds of them.
+#[derive(Default)]
+struct BackpressureCounters {
+    events_received: AtomicU64,
+    max_delivery_lag_ms: AtomicI64,
+    last_delivery_lag_ms: AtomicI64,
 }
 
 /// Classifies one `tonic::Status` into this crate's own typed error.
@@ -580,6 +637,29 @@ impl AgentProvider for ClaudeSidecarProvider {
     fn pump(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
     }
+}
+
+/// Records how far behind production one delivered event was.
+///
+/// `occurred_at` is stamped by the sidecar the moment the event is drained from the kernel's pump,
+/// so the difference from local wall-clock time is the whole transport-plus-queue delay. Both ends
+/// are on this machine, so clock skew is not a factor; a negative value would mean the two clocks
+/// disagree anyway, and is discarded rather than recorded as a negative lag.
+fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64) {
+    counters.events_received.fetch_add(1, Ordering::Relaxed);
+    if occurred_at_millis <= 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let lag = now - occurred_at_millis;
+    if lag < 0 {
+        return;
+    }
+    counters.last_delivery_lag_ms.store(lag, Ordering::Relaxed);
+    counters.max_delivery_lag_ms.fetch_max(lag, Ordering::Relaxed);
 }
 
 #[cfg(test)]

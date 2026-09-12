@@ -4,10 +4,10 @@
 //! no sidecar process involved, matching this crate's own established preference for testing a
 //! pure reducer/translator in isolation before any real-process integration test exercises it.
 
-use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, TurnOutcome};
+use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TurnOutcome};
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
-    PermissionOutcome as ProtoPermissionOutcome, SessionCloseReason,
+    PermissionOutcome as ProtoPermissionOutcome, ResumeStatus as ProtoResumeStatus, SessionCloseReason,
     SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome,
 };
 
@@ -112,6 +112,20 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
         ProtoEvent::SessionClosed(closed) => Some(AgentDomainEvent::SessionClosed {
             reason: translate_close_reason(closed.reason()),
         }),
+        ProtoEvent::ResumeOutcome(outcome) => {
+            let status = translate_resume_status(outcome.status());
+            Some(AgentDomainEvent::ResumeOutcome {
+                requested_provider_session_id: outcome.requested_provider_session_id,
+                status,
+                // The wire uses an empty string for "not set" on a plain string field. An empty id
+                // is not an id, so it becomes None rather than travelling inward as `Some("")` and
+                // failing an equality check for the wrong reason.
+                attached_provider_session_id: Some(outcome.attached_provider_session_id)
+                    .filter(|id| !id.is_empty()),
+                forked: outcome.forked,
+                detail: Some(outcome.detail).filter(|d| !d.trim().is_empty()),
+            })
+        }
         ProtoEvent::ProviderNotice(notice) => {
             // Diagnostics only, per design doc §3.2/§5.2 -- never surfaced as a domain event.
             eprintln!(
@@ -119,6 +133,23 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 notice.kind, notice.subtype, envelope_turn_id.unwrap_or_default()
             );
             None
+        }
+    }
+}
+
+/// An unrecognized or unset status becomes `InitializationFailed`, never `Attached`.
+///
+/// The asymmetry is deliberate: the only dangerous default here is the one that says a resume
+/// succeeded. "Something went wrong and I do not know what" is a true, if vague, statement; "your
+/// conversation continued" would not be.
+fn translate_resume_status(status: ProtoResumeStatus) -> ResumeStatus {
+    match status {
+        ProtoResumeStatus::Attached => ResumeStatus::Attached,
+        ProtoResumeStatus::Rejected => ResumeStatus::Rejected,
+        ProtoResumeStatus::InitializationFailed => ResumeStatus::InitializationFailed,
+        ProtoResumeStatus::Unspecified => {
+            eprintln!("agent: ClaudeSidecarProvider: ResumeStatus::Unspecified from the wire, treating as a failure");
+            ResumeStatus::InitializationFailed
         }
     }
 }

@@ -18,6 +18,10 @@ export type ResumableSession = {
 };
 export type PermissionModeChoice = "auto" | "bypass";
 
+/** What the provider said about a resume. `attached` is the late verdict -- the provider only
+ *  reports its session id at the start of a turn -- while the two failures arrive promptly. */
+export type ResumeStatus = "attached" | "rejected" | "initialization_failed";
+
 /** What the provider can actually do, as the server advertised it, intersected with what this
  * client implements. Never inferred from a name or from an enum member existing. */
 export type Capabilities = {
@@ -93,5 +97,16 @@ export type AgentDomainEvent =
   | { type: "permission_requested"; permission_id: string; tool_name: string; input: unknown }
   | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" }
   | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; total_cost_usd: number; num_turns: number }
+  /** The provider's verdict on a resume, stated once for a session that asked for one. Mirrors the
+   *  Rust `AgentDomainEvent::ResumeOutcome`; the reducer must fold it the same way
+   *  `AgentSessionProjection` does, or the two states diverge on a failed resume. */
+  | {
+      type: "resume_outcome";
+      requested_provider_session_id: string;
+      status: ResumeStatus;
+      attached_provider_session_id: string | null;
+      forked: boolean;
+      detail: string | null;
+    }
   | { type: "session_unavailable"; reason: string }
   | { type: "session_closed"; reason: string };

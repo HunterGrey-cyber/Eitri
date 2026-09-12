@@ -52,6 +52,37 @@ pub enum PermissionOutcome {
     Expired,
 }
 
+/// What the provider said about a resume. Mirrors the wire's `ResumeStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeStatus {
+    /// The provider opened a session; `attached_provider_session_id` says which one. Necessarily the
+    /// late verdict -- the provider only reports its session id at the start of a turn.
+    Attached,
+    /// The provider refused the requested id. Prompt, and needs no turn.
+    Rejected,
+    /// The provider died before it could attach, for some reason other than refusing the id.
+    InitializationFailed,
+}
+
+impl ResumeStatus {
+    /// Whether the requested session genuinely continued.
+    ///
+    /// `forked` is consulted rather than ignored because forking legitimately returns a different
+    /// id. Without it, the day fork is enabled every successful fork reads as a substitution.
+    pub fn attached_to_the_requested_session(
+        self,
+        requested: &str,
+        attached: Option<&str>,
+        forked: bool,
+    ) -> bool {
+        match self {
+            ResumeStatus::Attached => forked || attached == Some(requested),
+            ResumeStatus::Rejected | ResumeStatus::InitializationFailed => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectionStatus {
@@ -87,6 +118,21 @@ pub enum AgentDomainEvent {
     /// exists yet in this phase; the only current producer is `agent::session`'s translation of a
     /// crashed/non-zero-exit `AgentEvent::ProcessExited`.
     SessionUnavailable { reason: String },
+    /// The provider's verdict on a resume, reported exactly once for a session that asked for one.
+    ///
+    /// Replaces an inference the client could not make safely: `CreateSession` returns before the
+    /// provider has tried to attach, so this side used to watch for a few seconds and treat silence
+    /// as success. Measured, that had no margin -- a real rejection surfaces at ~1.7-2.3s against a
+    /// 3.0s window.
+    ResumeOutcome {
+        requested_provider_session_id: String,
+        status: ResumeStatus,
+        /// Set only when `status` is `Attached`.
+        attached_provider_session_id: Option<String>,
+        /// True when this session asked to fork, in which case a DIFFERENT attached id is correct.
+        forked: bool,
+        detail: Option<String>,
+    },
     SessionClosed { reason: String },
 }
 
@@ -258,6 +304,34 @@ impl AgentSessionProjection {
             // not a synthesized `TurnCompleted`: no completion is recorded, no outcome is invented,
             // and no result text appears. The turn simply stops being in progress, because it is
             // not.
+            // A resume verdict is a provider-reported fact, and the two bad ones end the session's
+            // usefulness whatever else follows. Turning them into a status here is not synthesizing
+            // anything: the provider said it, and a conversation that did not continue what the user
+            // asked for must not look like one that did.
+            AgentDomainEvent::ResumeOutcome {
+                requested_provider_session_id,
+                status,
+                attached_provider_session_id,
+                forked,
+                detail,
+            } => {
+                if !status.attached_to_the_requested_session(
+                    requested_provider_session_id,
+                    attached_provider_session_id.as_deref(),
+                    *forked,
+                ) {
+                    self.active_turn_id = None;
+                    self.assistant_message_open = false;
+                    self.status = ProjectionStatus::Unavailable {
+                        reason: describe_failed_resume(
+                            requested_provider_session_id,
+                            *status,
+                            attached_provider_session_id.as_deref(),
+                            detail.as_deref(),
+                        ),
+                    };
+                }
+            }
             AgentDomainEvent::SessionUnavailable { reason } => {
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
@@ -270,5 +344,43 @@ impl AgentSessionProjection {
             }
         }
         self.last_revision += 1;
+    }
+}
+
+/// The user-facing reason a resume did not continue the session that was asked for.
+///
+/// Says which conversation was wanted, because a user who has several workspaces has no other way
+/// to tell which one just failed, and always ends with what to do instead -- an error that only
+/// reports a fault leaves the reader stuck.
+pub fn describe_failed_resume(
+    requested: &str,
+    status: ResumeStatus,
+    attached: Option<&str>,
+    detail: Option<&str>,
+) -> String {
+    let suffix = match detail {
+        Some(detail) if !detail.trim().is_empty() => format!(" ({detail})"),
+        _ => String::new(),
+    };
+    match status {
+        ResumeStatus::Rejected => format!(
+            "the provider does not have session {requested} any more, so that conversation cannot be \
+             continued{suffix}. Start a new session instead."
+        ),
+        ResumeStatus::InitializationFailed => format!(
+            "the provider failed to start while continuing session {requested}{suffix}. This is a \
+             provider problem rather than a missing conversation -- the session may still exist. \
+             Try again, or start a new session."
+        ),
+        // Reached only when the ids disagree and this was not a fork: the provider opened a real
+        // session, just not the one that was asked for. Treated as a failure rather than accepted,
+        // because a conversation that looks continued while carrying none of its history is the
+        // single outcome the whole resume protocol exists to prevent.
+        ResumeStatus::Attached => format!(
+            "asked to continue session {requested}, but the provider attached to {} instead, so this \
+             conversation carries none of the history that was asked for{suffix}. Start a new session \
+             instead.",
+            attached.unwrap_or("an unnamed session"),
+        ),
     }
 }

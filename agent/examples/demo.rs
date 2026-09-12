@@ -85,6 +85,13 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::TurnCompleted { result_text, outcome, total_cost_usd, num_turns, .. } => {
             println!("\n[turn completed] outcome={outcome:?} cost=${total_cost_usd:.4} turns={num_turns}\nresult: {result_text}\n");
         }
+        AgentDomainEvent::ResumeOutcome { requested_provider_session_id, status, attached_provider_session_id, forked, detail } => {
+            println!(
+                "[resume {status:?}] requested={requested_provider_session_id} attached={} forked={forked} detail={}",
+                attached_provider_session_id.as_deref().unwrap_or("-"),
+                detail.as_deref().unwrap_or("-"),
+            );
+        }
         AgentDomainEvent::SessionUnavailable { reason } => println!("[session unavailable] {reason}"),
         AgentDomainEvent::SessionClosed { reason } => println!("[session closed] {reason}"),
     }

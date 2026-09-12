@@ -43,11 +43,12 @@ pub use wire::translate_line;
 
 pub use projection::{
     AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
-    ToolCallRecord, ToolCallResult, PermissionRequestRecord, UsageInfo, TurnOutcome,
+    ToolCallRecord, ToolCallResult, PermissionRequestRecord, UsageInfo, TurnOutcome, ResumeStatus,
+    describe_failed_resume,
 };
 pub use provider::{
     AgentProvider, CreateSessionRequest, ResumeSessionRequest, SendTurnRequest,
     InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, StreamingPreference,
 };
-pub use providers::claude_sidecar::{ClaudeSidecarProvider, EXPECTED_VERDANDI_REVISION};
+pub use providers::claude_sidecar::{BackpressureStats, ClaudeSidecarProvider, EXPECTED_VERDANDI_REVISION};

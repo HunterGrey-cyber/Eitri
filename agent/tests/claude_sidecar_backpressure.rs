@@ -68,6 +68,7 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::PermissionRequested { .. } => "PermissionRequested",
             AgentDomainEvent::PermissionResolved { .. } => "PermissionResolved",
             AgentDomainEvent::TurnCompleted { .. } => "TurnCompleted",
+            AgentDomainEvent::ResumeOutcome { .. } => "ResumeOutcome",
             AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
             AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
         };

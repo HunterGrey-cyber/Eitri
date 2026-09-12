@@ -97,6 +97,23 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
     // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
     // a completion: no message is closed out, no outcome invented; the turn just stops being in
     // flight, which is the truth.
+    case "resume_outcome": {
+      // Mirrors AgentSessionProjection exactly. A verdict that does not confirm the requested
+      // session ends the conversation's usefulness, whatever arrives afterwards: a session that
+      // looks continued while carrying none of its history is the one outcome the resume protocol
+      // exists to prevent. `forked` is consulted rather than ignored because forking legitimately
+      // returns a different id.
+      const attached =
+        event.status === "attached" &&
+        (event.forked || event.attached_provider_session_id === event.requested_provider_session_id);
+      if (attached) return state;
+      return {
+        ...state,
+        activeTurnId: null,
+        status: { kind: "unavailable", reason: describeFailedResume(event) },
+        assistantMessageOpen: false,
+      };
+    }
     case "session_unavailable":
       return {
         ...state,
@@ -126,4 +143,22 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiState): Age
   // direction: the next content event starts a new transcript entry rather than appending to a
   // message that may have been closed before the snapshot was taken.
   return { ...snapshot, assistantMessageOpen: false };
+}
+
+/** The user-facing reason a resume did not continue the session that was asked for.
+ *
+ * Deliberately a near-transcription of Rust's `describe_failed_resume`: the two run on the same
+ * events and must not disagree about what happened. Kept as text rather than a code so the panel
+ * has something to show without a second mapping table on this side. */
+function describeFailedResume(event: Extract<AgentDomainEvent, { type: "resume_outcome" }>): string {
+  const detail = event.detail !== null && event.detail.trim() !== "" ? ` (${event.detail})` : "";
+  const requested = event.requested_provider_session_id;
+  switch (event.status) {
+    case "rejected":
+      return `the provider does not have session ${requested} any more, so that conversation cannot be continued${detail}. Start a new session instead.`;
+    case "initialization_failed":
+      return `the provider failed to start while continuing session ${requested}${detail}. This is a provider problem rather than a missing conversation — the session may still exist. Try again, or start a new session.`;
+    case "attached":
+      return `asked to continue session ${requested}, but the provider attached to ${event.attached_provider_session_id ?? "an unnamed session"} instead, so this conversation carries none of the history that was asked for${detail}. Start a new session instead.`;
+  }
 }

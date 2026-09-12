@@ -162,20 +162,38 @@ pub fn conversation_id_for_cwd(canonical_cwd: &Path) -> String {
 /// cannot disagree -- a mismatch would silently produce a lease nobody else looks for.
 const PROVIDER_NAME: &str = "claude";
 
-/// How long `resume` waits for the provider to reject a session it already accepted. Long enough
-/// for the SDK to attempt the attach and fail, short enough that a user does not sit on a start
-/// screen wondering. A session still alive after this is treated as started.
-const RESUME_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long `resume` waits for the provider's verdict before showing the conversation anyway.
+///
+/// **Not the old inference, despite the similar shape.** The previous constant decided
+/// CORRECTNESS: silence for three seconds was read as a successful resume, and a rejection measured
+/// at 1.7-2.3s on an idle machine had only ~0.7s of margin before a loaded machine turned a real
+/// failure into an accepted, empty, dead conversation. This one decides only WHERE the failure is
+/// reported -- on the start screen, or as a lost session a moment later -- because the provider now
+/// states a typed verdict and `AgentSessionProjection` acts on it whenever it arrives.
+///
+/// It cannot be shortened to nothing without making the common case worse (a rejection would always
+/// flash a conversation before removing it), and it cannot be lengthened into safety either, which
+/// is the point: no value here is load-bearing any more.
+const RESUME_VERDICT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// What a just-issued resume turned out to be.
 #[derive(Debug, PartialEq, Eq)]
 enum ResumeVerdict {
-    /// The requested session opened, or nothing contradicted it inside the window.
-    HeldUp,
-    /// The provider ended the session instead of continuing it.
-    Terminated { reason: String },
-    /// The provider opened a session -- just not the one that was asked for.
-    DifferentSession { actual: String },
+    /// The provider stated that it attached to the session that was asked for.
+    Attached,
+    /// No verdict yet, and that is not the same as success.
+    ///
+    /// The provider is contractually going to send one: a refusal arrives within a couple of
+    /// seconds with no turn sent, while a confirmation cannot arrive until the first turn, because
+    /// the provider only reports its session id at the start of one. So an expired wait means "the
+    /// answer is still coming", and the projection is the authority from that point on -- a late
+    /// failure surfaces as a lost session rather than as a failed construction.
+    ///
+    /// This is what replaced treating silence as success. The old code had no way to distinguish
+    /// the two and chose the dangerous reading.
+    NotYetKnown,
+    /// The provider stated that it did not attach to the session that was asked for.
+    Failed { reason: String },
 }
 
 /// Refuses a resume whose Claude transcript is still being written.
@@ -376,21 +394,19 @@ impl AgentConversation {
         // So wait, briefly, for a terminal event -- and report it as a failed RESUME rather than
         // handing back a dead conversation. Nothing is synthesized here: this waits for the
         // provider's own event and folds it normally.
-        match conversation.watch_resume_take_hold(provider_session_id, RESUME_FAILURE_WINDOW) {
-            ResumeVerdict::HeldUp => {}
-            ResumeVerdict::Terminated { reason } => {
+        match conversation.watch_resume_take_hold(provider_session_id, RESUME_VERDICT_WAIT) {
+            // Confirmed, or not yet answered. Both continue: the provider is still going to state a
+            // verdict, and `AgentSessionProjection` turns a late failure into a visibly lost session
+            // rather than letting it pass as a working conversation.
+            ResumeVerdict::Attached | ResumeVerdict::NotYetKnown => {}
+            ResumeVerdict::Failed { reason } => {
+                // Torn down rather than handed back. A session may genuinely have opened here (the
+                // provider can attach to the wrong id), and leaving it running would keep a
+                // conversation alive that nobody asked for.
+                conversation.shutdown();
                 return Err(ConversationError::ResumeRejected {
                     provider_session_id: provider_session_id.to_string(),
                     reason,
-                });
-            }
-            ResumeVerdict::DifferentSession { actual } => {
-                // A live session belonging to someone else's id. Close it rather than dropping it on
-                // the floor: this one really did open, unlike the terminated case.
-                conversation.shutdown();
-                return Err(ConversationError::ResumeIdentityMismatch {
-                    requested: provider_session_id.to_string(),
-                    actual,
                 });
             }
         }
@@ -432,28 +448,59 @@ impl AgentConversation {
         while std::time::Instant::now() < deadline {
             for event in self.pump() {
                 match event {
-                    AgentDomainEvent::SessionClosed { reason } => return ResumeVerdict::Terminated { reason },
-                    AgentDomainEvent::SessionUnavailable { reason } => return ResumeVerdict::Terminated { reason },
-                    AgentDomainEvent::SessionOpened { provider_session_id, .. } => {
-                        return if provider_session_id == requested_provider_session_id {
-                            ResumeVerdict::HeldUp
+                    // The provider's own verdict, and the only thing here that settles the question.
+                    AgentDomainEvent::ResumeOutcome {
+                        requested_provider_session_id: requested,
+                        status,
+                        attached_provider_session_id,
+                        forked,
+                        detail,
+                    } => {
+                        // The provider echoes back the id it was asked for. If that disagrees with
+                        // what this client sent, the verdict is about some other session and cannot
+                        // be trusted as an answer to this request -- treated as a failure rather
+                        // than ignored, because accepting a verdict meant for a different session is
+                        // exactly how a substitution would slip through.
+                        if requested != requested_provider_session_id {
+                            return ResumeVerdict::Failed {
+                                reason: format!(
+                                    "the provider answered about session {requested}, but this client asked to \
+                                     continue {requested_provider_session_id}. Start a new session instead."
+                                ),
+                            };
+                        }
+                        return if status.attached_to_the_requested_session(
+                            &requested,
+                            attached_provider_session_id.as_deref(),
+                            forked,
+                        ) {
+                            ResumeVerdict::Attached
                         } else {
-                            ResumeVerdict::DifferentSession { actual: provider_session_id }
+                            ResumeVerdict::Failed {
+                                reason: crate::describe_failed_resume(
+                                    &requested,
+                                    status,
+                                    attached_provider_session_id.as_deref(),
+                                    detail.as_deref(),
+                                ),
+                            }
                         };
                     }
-                    // A turn starting proves the session is alive but says nothing about WHICH
-                    // session it is, and on a resume that is the whole question. Keep waiting for
-                    // the event that carries the id.
+                    // A session that dies before saying anything about the resume. Still a failure,
+                    // but reported in the provider's own terms rather than as a resume verdict it
+                    // never gave.
+                    AgentDomainEvent::SessionClosed { reason } | AgentDomainEvent::SessionUnavailable { reason } => {
+                        return ResumeVerdict::Failed { reason };
+                    }
+                    // Deliberately NOT a success signal, though it carries a provider session id.
+                    // Either the verdict preceded it in this same batch and was returned above, or
+                    // this is not the event that answers the question.
                     _ => {}
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        // Neither dead nor identified inside the window. Treated as held up, matching the pre-existing
-        // behavior: refusing here would break every resume whose SessionReady is merely slow, and a
-        // wrong id that arrives late is still caught -- `fold` records whatever id actually turns up,
-        // so the session header shows the truth even if this check ran out of time.
-        ResumeVerdict::HeldUp
+        ResumeVerdict::NotYetKnown
     }
 
     pub fn conversation_id(&self) -> &str {
@@ -750,73 +797,148 @@ mod tests {
         }
     }
 
-    /// The substitution the whole resume protocol exists to prevent, at the layer that can see it.
+    fn resume_outcome(
+        requested: &str,
+        status: crate::ResumeStatus,
+        attached: Option<&str>,
+        forked: bool,
+    ) -> AgentDomainEvent {
+        AgentDomainEvent::ResumeOutcome {
+            requested_provider_session_id: requested.into(),
+            status,
+            attached_provider_session_id: attached.map(str::to_string),
+            forked,
+            detail: None,
+        }
+    }
+
+    /// The substitution the whole resume protocol exists to prevent.
     ///
-    /// A provider that ignores the resume id and opens a fresh session emits a perfectly normal
-    /// `SessionOpened` -- nothing about it says "this is not what you asked for" except the id it
-    /// carries. Until this check existed, the runtime accepted any `SessionOpened` and moved on,
-    /// and the acceptance criterion ("SessionOpened.provider_session_id == the requested id") lived
-    /// only in the integration tests. That is exactly backwards: a test proves it happened once,
-    /// the runtime check is what makes it true every time.
+    /// These tests used to drive the check with a `SessionOpened` queued synchronously by a fake
+    /// provider. They passed, and they were testing a path the real kernel cannot take: the provider
+    /// reports its session id in an init message that only arrives at the start of a TURN, and
+    /// `resume()` never sends one -- so `SessionOpened` never arrived inside the window and the
+    /// check never actually ran in production. The provider now states a typed verdict instead, and
+    /// that is what these drive.
     #[test]
-    fn a_session_opened_under_a_different_id_is_a_substitution_not_a_resume() {
+    fn a_provider_that_attached_to_a_different_session_is_a_failed_resume() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
-        fake.queue(AgentDomainEvent::SessionOpened {
-            session_id: "verdandi-session-1".into(),
-            provider_session_id: "some-other-session".into(),
-            model: "claude-sonnet-5".into(),
-            cwd: "/tmp".into(),
-        });
+        fake.queue(resume_outcome(
+            "claude-uuid-abc",
+            crate::ResumeStatus::Attached,
+            Some("some-other-session"),
+            false,
+        ));
         let verdict = conversation
             .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
-        assert_eq!(verdict, ResumeVerdict::DifferentSession { actual: "some-other-session".into() });
+        match verdict {
+            ResumeVerdict::Failed { reason } => {
+                assert!(reason.contains("some-other-session"), "{reason}");
+                assert!(reason.contains("claude-uuid-abc"), "{reason}");
+            }
+            other => panic!("expected a failed resume, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_session_opened_under_the_requested_id_is_a_real_resume() {
+    fn a_provider_that_attached_to_the_requested_session_is_a_real_resume() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
-        fake.queue(session_opened());
+        fake.queue(resume_outcome(
+            "claude-uuid-abc",
+            crate::ResumeStatus::Attached,
+            Some("claude-uuid-abc"),
+            false,
+        ));
         let verdict = conversation
             .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
-        assert_eq!(verdict, ResumeVerdict::HeldUp);
+        assert_eq!(verdict, ResumeVerdict::Attached);
+    }
+
+    /// A fork legitimately comes back under a different id, so the ids disagreeing is CORRECT here.
+    /// Without this, enabling fork would report every successful one as a substitution.
+    #[test]
+    fn a_fork_attaching_under_a_new_id_is_not_a_substitution() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        fake.queue(resume_outcome(
+            "claude-uuid-abc",
+            crate::ResumeStatus::Attached,
+            Some("a-brand-new-forked-id"),
+            true,
+        ));
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        assert_eq!(verdict, ResumeVerdict::Attached);
     }
 
     #[test]
-    fn a_session_that_closes_immediately_is_a_rejected_resume() {
+    fn a_refused_resume_is_reported_in_terms_of_the_session_that_is_gone() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
-        fake.queue(AgentDomainEvent::SessionClosed { reason: "provider_exited".into() });
+        fake.queue(resume_outcome("claude-uuid-abc", crate::ResumeStatus::Rejected, None, false));
         let verdict = conversation
             .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
-        assert_eq!(verdict, ResumeVerdict::Terminated { reason: "provider_exited".into() });
+        match verdict {
+            ResumeVerdict::Failed { reason } => {
+                assert!(reason.contains("claude-uuid-abc"), "{reason}");
+                // Ends with what to do instead. An error that only names a fault leaves the reader
+                // stuck on a start screen with no next step.
+                assert!(reason.contains("Start a new session"), "{reason}");
+            }
+            other => panic!("expected a failed resume, got {other:?}"),
+        }
     }
 
-    /// A stream that dies during the window counts as a rejection too -- the resume cannot be
-    /// confirmed, and reporting "started" for a session nobody can observe is the same silent
-    /// substitution wearing a different hat.
+    /// A provider that could not start is kept distinct from one that refused the id: the session
+    /// may well still exist, and telling someone their conversation was deleted when it was not is
+    /// a different and worse error than saying the provider broke.
     #[test]
-    fn a_stream_lost_during_the_window_is_a_rejected_resume() {
+    fn a_provider_that_failed_to_start_is_not_reported_as_a_missing_conversation() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(fake.clone());
+        fake.queue(resume_outcome(
+            "claude-uuid-abc",
+            crate::ResumeStatus::InitializationFailed,
+            None,
+            false,
+        ));
+        let verdict = conversation
+            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        match verdict {
+            ResumeVerdict::Failed { reason } => {
+                assert!(reason.contains("provider problem"), "{reason}");
+                assert!(!reason.contains("does not have session"), "{reason}");
+            }
+            other => panic!("expected a failed resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_that_dies_before_any_verdict_is_still_a_failed_resume() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         fake.queue(AgentDomainEvent::SessionUnavailable { reason: "stream ended early".into() });
         let verdict = conversation
             .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
-        assert_eq!(verdict, ResumeVerdict::Terminated { reason: "stream ended early".into() });
+        assert_eq!(verdict, ResumeVerdict::Failed { reason: "stream ended early".into() });
     }
 
-    /// Silence is NOT failure. A `SessionReady` slower than the window must not fail the resume --
-    /// that would break every resume on a loaded machine. The window is an upper bound on
-    /// confidence, not a proof, and this is the honest consequence of that.
+    /// **Silence is no longer success.** The old code returned "held up" here, which is what made a
+    /// rejection slower than the window -- measured at 1.7-2.3s against a 3.0s budget -- silently
+    /// become an accepted, empty, dead conversation. It is now a distinct verdict meaning the
+    /// answer has not arrived yet, and the caller proceeds knowing the provider still owes it one.
     #[test]
-    fn a_window_that_expires_with_no_events_lets_the_resume_stand() {
+    fn an_expired_wait_means_not_yet_known_rather_than_success() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
         let verdict = conversation
             .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(150));
-        assert_eq!(verdict, ResumeVerdict::HeldUp);
+        assert_eq!(verdict, ResumeVerdict::NotYetKnown);
+        assert_ne!(verdict, ResumeVerdict::Attached, "an unanswered resume must not read as a confirmed one");
     }
+
 
     #[test]
     fn conversation_id_is_stable_for_a_directory_and_differs_between_directories() {
