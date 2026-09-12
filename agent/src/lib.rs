@@ -35,6 +35,7 @@ pub mod settings;
 pub mod transcript;
 
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
+pub use persistence::{resumable_session, ResumableSession};
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 pub use session::AgentSession;

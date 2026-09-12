@@ -43,6 +43,9 @@ struct AgentPanelState {
     backend_kind: BackendKind,
     project_dir: PathBuf,
     supervisor: Option<crate::supervisor_client::SupervisorClient>,
+    /// Set once a start-failure has been reported, so the 33ms tick reports it exactly once rather
+    /// than every tick for as long as the dead session is installed.
+    reported_start_failure: bool,
     /// Set while a backend is being constructed on a worker thread. Holds the requestId whose
     /// `command_result` is owed once that finishes -- the reply is deferred, not dropped, which is
     /// exactly what a requestId-addressed protocol is for.
@@ -179,6 +182,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         project_dir,
         supervisor,
         pending_start: None,
+        reported_start_failure: false,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -223,6 +227,8 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully. Nothing
         // today re-enters, which is exactly why it would stay latent until it didn't.
+        report_a_session_that_never_opened(&state, &webview);
+
         let payload = {
             let mut state_ref = state.borrow_mut();
             let payload = state_ref.session.as_mut().and_then(|session| {
@@ -245,6 +251,40 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         }
         gtk4::glib::ControlFlow::Continue
     });
+}
+
+/// A session that reached a terminal state without ever opening never worked, and must not be
+/// left on screen as an empty conversation the user cannot act on.
+///
+/// `AgentConversation::resume` catches the common case synchronously, within its own short window.
+/// This is the backstop for everything slower than that window and for fresh sessions, which have
+/// no equivalent check: either way the user is returned to the start screen with the provider's own
+/// reason, where "start a new session" is available. It is never turned into a fresh session
+/// automatically.
+fn report_a_session_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let failure = {
+        let state_ref = state.borrow();
+        if state_ref.reported_start_failure {
+            return;
+        }
+        state_ref.session.as_ref().and_then(|s| s.terminated_before_opening())
+    };
+    let Some(reason) = failure else { return };
+
+    let message = format!(
+        "the session ended before it started ({reason}). If you were continuing a previous \
+         conversation, it most likely no longer exists -- start a new session instead."
+    );
+    eprintln!("[agent_panel] {message}");
+    let dead = {
+        let mut state_ref = state.borrow_mut();
+        state_ref.reported_start_failure = true;
+        state_ref.session.take()
+    };
+    if let Some(mut backend) = dead {
+        std::thread::spawn(move || backend.shutdown());
+    }
+    evaluate_js_dispatch(webview, &serialize_error_for_js(&message));
 }
 
 /// Non-blocking check on an in-flight backend construction. `try_recv`, never `recv`: this runs on
@@ -282,6 +322,7 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
         Ok(backend) => {
             let snapshot = {
                 let mut state_ref = state.borrow_mut();
+                state_ref.reported_start_failure = false;
                 state_ref.session = Some(backend);
                 // The frontend has been showing a connecting state since it sent start_session; give
                 // it the real projection immediately rather than making it wait for the first event.
@@ -380,7 +421,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
             evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
         }
-        InboundMessage::StartSession { mode, .. } => {
+        InboundMessage::StartSession { mode, resume, .. } => {
             let mut state_ref = state.borrow_mut();
             if state_ref.session.is_some() {
                 drop(state_ref);
@@ -405,7 +446,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             // Doing that here would freeze the editor -- for minutes, in the cold case.
             let (result_tx, result_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = AgentBackend::start(backend_kind, &project_dir, permission_mode);
+                let result = AgentBackend::start(backend_kind, &project_dir, permission_mode, resume.as_deref());
                 // The receiver is gone only if the panel was torn down mid-connect; dropping the
                 // backend here is then the correct cleanup (its Drop shuts the sidecar down).
                 let _ = result_tx.send(result);

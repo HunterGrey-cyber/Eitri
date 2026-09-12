@@ -54,6 +54,11 @@ pub enum ConversationError {
     NoSession,
     /// `cwd` could not be canonicalized -- it does not exist, or is not readable.
     Cwd(std::io::Error),
+    /// The provider accepted the resume request and then terminated the session -- the usual cause
+    /// is a provider session id that no longer exists. Reported as a failed resume, never as a
+    /// session: handing back a dead conversation is the silent-substitution failure this whole
+    /// phase exists to prevent.
+    ResumeRejected { provider_session_id: String, reason: String },
     /// Another Neovibe-participating client already holds this provider session.
     ///
     /// Advisory, and honestly so: the lease binds clients that take part in this protocol. A raw
@@ -80,7 +85,8 @@ impl ConversationError {
             // "carry on either" -- the caller asked for a conversation and does not have one.
             ConversationError::LeaseHeld { .. }
             | ConversationError::Lease(_)
-            | ConversationError::TranscriptUnstable { .. } => false,
+            | ConversationError::TranscriptUnstable { .. }
+            | ConversationError::ResumeRejected { .. } => false,
         }
     }
 }
@@ -98,6 +104,11 @@ impl std::fmt::Display for ConversationError {
                  there first, or start a new conversation"
             ),
             ConversationError::Lease(e) => write!(f, "could not take the session lease: {e}"),
+            ConversationError::ResumeRejected { provider_session_id, reason } => write!(
+                f,
+                "the provider ended session {provider_session_id} immediately after accepting it \
+                 ({reason}) -- it most likely no longer exists. Start a new session instead."
+            ),
             ConversationError::TranscriptUnstable { provider_session_id } => write!(
                 f,
                 "session {provider_session_id} is still being written to, so something else is \
@@ -131,6 +142,11 @@ pub fn conversation_id_for_cwd(canonical_cwd: &Path) -> String {
 /// cannot disagree -- a mismatch would silently produce a lease nobody else looks for.
 const PROVIDER_NAME: &str = "claude";
 
+/// How long `resume` waits for the provider to reject a session it already accepted. Long enough
+/// for the SDK to attempt the attach and fail, short enough that a user does not sit on a start
+/// screen wondering. A session still alive after this is treated as started.
+const RESUME_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Refuses a resume whose Claude transcript is still being written.
 ///
 /// A missing transcript is NOT a refusal: a session that ran under an ephemeral persistence policy
@@ -156,7 +172,12 @@ fn ensure_transcript_is_not_being_written(
 
 /// Best-effort. A conversation that runs but was not recorded is a lost resume offer next time, not
 /// a broken session -- so this logs rather than failing the caller.
-fn persist_record(conversation_id: &str, canonical_cwd: &str, provider_session_id: &str) {
+fn persist_record(
+    conversation_id: &str,
+    canonical_cwd: &str,
+    provider_session_id: &str,
+    provider_advertised_resume: bool,
+) {
     let now = epoch_millis();
     // Preserve the original `created_at` when a record already exists: this runs again on every
     // resume of the same workspace, and rewriting it would turn "when did this conversation start"
@@ -171,6 +192,7 @@ fn persist_record(conversation_id: &str, canonical_cwd: &str, provider_session_i
         canonical_cwd: canonical_cwd.to_string(),
         created_at,
         updated_at: now,
+        provider_advertised_resume,
     };
     if let Err(e) = save_conversation_record(&record) {
         eprintln!("agent: could not persist the conversation record for {conversation_id}: {e}");
@@ -296,9 +318,8 @@ impl AgentConversation {
         })?;
 
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
-        persist_record(&conversation_id, &cwd_string, provider_session_id);
 
-        Ok(Self {
+        let mut conversation = Self {
             conversation_id,
             canonical_cwd,
             provider,
@@ -310,7 +331,49 @@ impl AgentConversation {
             lease: Some(lease),
             projection: AgentSessionProjection::default(),
             event_log: Vec::new(),
-        })
+        };
+
+        // A resume the provider ACCEPTS can still fail moments later. The sidecar's CreateSession
+        // returns as soon as the session object exists; the SDK only discovers that the session id
+        // does not exist when it tries to attach, and the session then terminates. Measured: a
+        // resume of `00000000-dead-beef-...` returned Ok and produced a working-looking, empty
+        // conversation that was already closed.
+        //
+        // So wait, briefly, for a terminal event -- and report it as a failed RESUME rather than
+        // handing back a dead conversation. Nothing is synthesized here: this waits for the
+        // provider's own event and folds it normally.
+        if let Some(reason) = conversation.wait_for_early_termination(RESUME_FAILURE_WINDOW) {
+            return Err(ConversationError::ResumeRejected {
+                provider_session_id: provider_session_id.to_string(),
+                reason,
+            });
+        }
+
+        persist_record(conversation.conversation_id(), &cwd_string, provider_session_id, capabilities.resume);
+        Ok(conversation)
+    }
+
+    /// Drains for up to `window`, returning the reason if the session terminates in that time.
+    ///
+    /// Bounded and short: this runs on the connect worker, not the UI thread, but a user waiting on
+    /// "Continue previous session" is waiting on it. A session that survives the window is treated
+    /// as started -- a later termination is a normal session-death, reported through the usual
+    /// status path rather than as a construction failure.
+    fn wait_for_early_termination(&mut self, window: std::time::Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + window;
+        while std::time::Instant::now() < deadline {
+            for event in self.pump() {
+                match event {
+                    AgentDomainEvent::SessionClosed { reason } => return Some(reason),
+                    AgentDomainEvent::SessionUnavailable { reason } => return Some(reason),
+                    // Real content means the session is genuinely alive; stop waiting early.
+                    AgentDomainEvent::SessionOpened { .. } | AgentDomainEvent::TurnStarted { .. } => return None,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        None
     }
 
     pub fn conversation_id(&self) -> &str {
@@ -482,7 +545,7 @@ impl AgentConversation {
                  continuing without it; another Neovibe window may be driving the same session"
             ),
         }
-        persist_record(&self.conversation_id, &cwd, provider_session_id);
+        persist_record(&self.conversation_id, &cwd, provider_session_id, self.capabilities.resume);
     }
 
     fn fold(&mut self, event: AgentDomainEvent) {

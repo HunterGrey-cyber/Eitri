@@ -29,7 +29,16 @@ impl From<SessionModeChoice> for PermissionMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum InboundMessage {
     Ready { request_id: String },
-    StartSession { request_id: String, mode: SessionModeChoice },
+    /// `resume` carries the Claude provider session id to continue. Absent for a fresh session.
+    /// One message rather than two so there is exactly one path into backend construction -- a
+    /// second entry point is how a "resume" would eventually acquire its own subtly different
+    /// failure handling.
+    StartSession {
+        request_id: String,
+        mode: SessionModeChoice,
+        #[serde(default)]
+        resume: Option<String>,
+    },
     SendMessage { request_id: String, text: String },
     Interrupt { request_id: String },
     PermissionResponse { request_id: String, permission_id: String, allow: bool, reason: Option<String> },
@@ -82,16 +91,24 @@ pub(crate) fn serialize_command_result_for_js(request_id: &str, result: Result<(
 /// presenting them as distinct choices would be a lie). Hardcoding either shape into the frontend
 /// would make it wrong for the other.
 ///
-/// `resumeAvailable` is always false here and is sent anyway, deliberately: it gives the frontend a
-/// single field to gate a Resume control on, so the control appears only when the whole path behind
-/// it exists rather than when someone remembers to add the UI.
+/// `resumableSession` is the whole resume gate: non-null only when the server advertised resume,
+/// this client implements it, AND this workspace has a persisted provider session id. The frontend
+/// renders "continue previous session" on exactly that field and nothing else, so the control
+/// cannot appear for a workspace with nothing to continue.
 pub(crate) fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
     json!({
         "kind": "hello",
         "backend": greeting.kind.as_str(),
         "projectDir": greeting.project_dir.to_string_lossy(),
         "permissionModes": greeting.permission_modes,
-        "resumeAvailable": false,
+        // The three-term intersection, already evaluated: server-advertised (last known) ∩
+        // client-implemented ∩ this workspace has a persisted provider session. `null` when any
+        // term fails, and the frontend renders the continue option on exactly that.
+        "resumableSession": greeting.resumable.as_ref().map(|r| json!({
+            "provider": r.provider,
+            "providerSessionId": r.provider_session_id,
+            "updatedAt": r.updated_at,
+        })),
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
     })
     .to_string()
@@ -414,9 +431,59 @@ mod tests {
         assert_eq!(parsed["kind"], "hello");
         assert_eq!(parsed["backend"], "sidecar");
         assert_eq!(parsed["permissionModes"], json!(["bypass"]));
-        assert_eq!(parsed["resumeAvailable"], false);
         assert_eq!(parsed["projectDir"], "/tmp/project");
         assert!(parsed["expectedVerdandiRevision"].is_string());
+    }
+
+    #[test]
+    fn hello_offers_nothing_to_continue_when_the_workspace_has_no_record() {
+        let greeting = crate::agent_backend::BackendGreeting {
+            kind: crate::agent_backend::BackendKind::Sidecar,
+            project_dir: std::path::PathBuf::from("/tmp/project"),
+            permission_modes: &["bypass"],
+            expected_verdandi_revision: Some("abc1234"),
+            resumable: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert!(parsed["resumableSession"].is_null());
+    }
+
+    #[test]
+    fn hello_offers_the_claude_session_id_when_the_workspace_has_one() {
+        // The CLAUDE id, not Verdandi's: resuming mints a new Verdandi session, so a record keyed
+        // on that one would point at something that stops existing the moment it is used.
+        let greeting = crate::agent_backend::BackendGreeting {
+            kind: crate::agent_backend::BackendKind::Sidecar,
+            project_dir: std::path::PathBuf::from("/tmp/project"),
+            permission_modes: &["bypass"],
+            expected_verdandi_revision: Some("abc1234"),
+            resumable: Some(agent::ResumableSession {
+                provider: "claude".into(),
+                provider_session_id: "1857dcd5-973b-46a2".into(),
+                updated_at: "1757700000000".into(),
+            }),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(parsed["resumableSession"]["providerSessionId"], "1857dcd5-973b-46a2");
+        assert_eq!(parsed["resumableSession"]["provider"], "claude");
+        assert_eq!(parsed["resumableSession"]["updatedAt"], "1757700000000");
+    }
+
+    #[test]
+    fn start_session_parses_with_and_without_a_resume_id() {
+        let fresh = parse_inbound_message(r#"{"type":"start_session","request_id":"r1","mode":"bypass"}"#).unwrap();
+        match fresh {
+            InboundMessage::StartSession { resume, .. } => assert!(resume.is_none()),
+            other => panic!("expected StartSession, got {other:?}"),
+        }
+        let resumed = parse_inbound_message(
+            r#"{"type":"start_session","request_id":"r2","mode":"bypass","resume":"claude-abc"}"#,
+        )
+        .unwrap();
+        match resumed {
+            InboundMessage::StartSession { resume, .. } => assert_eq!(resume.as_deref(), Some("claude-abc")),
+            other => panic!("expected StartSession, got {other:?}"),
+        }
     }
 
     #[test]
@@ -428,7 +495,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
         assert_eq!(parsed["backend"], "legacy");
         assert_eq!(parsed["permissionModes"], json!(["auto", "bypass"]));
-        assert_eq!(parsed["resumeAvailable"], false);
+        assert!(parsed["resumableSession"].is_null(), "the legacy backend can never offer a resume");
         assert!(parsed["expectedVerdandiRevision"].is_null());
     }
 }

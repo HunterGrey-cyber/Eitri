@@ -19,7 +19,8 @@
 
 use agent::{
     AgentConversation, AgentSession, AgentDomainEvent, AgentSessionProjection, ClaudeSidecarProvider,
-    ConversationError, PermissionMode, ProviderCapabilities, ProviderInfo, CONSERVATIVE_DISALLOWED_TOOLS,
+    ConversationError, PermissionMode, ProviderCapabilities, ProviderInfo, ResumableSession,
+    CONSERVATIVE_DISALLOWED_TOOLS,
 };
 use std::path::{Path, PathBuf};
 
@@ -128,15 +129,31 @@ impl AgentBackend {
     /// Constructs the selected backend. **Blocking, and for the sidecar path potentially for
     /// minutes** (a cold Verdandi checkout runs `npm ci` and `npm run build`), so callers must run
     /// this off the GTK main thread -- see `agent_panel`'s connect worker.
+    /// `resume` carries the Claude provider session id to continue, or `None` for a fresh session.
+    ///
+    /// A resume that cannot be honored fails as a resume. It is never downgraded into a fresh
+    /// session anywhere on this path -- the whole Phase 4 validation exists to catch exactly that
+    /// silent substitution, and doing it in the host would reintroduce one layer above where the
+    /// protocol was fixed.
     pub(crate) fn start(
         kind: BackendKind,
         project_dir: &Path,
         mode: PermissionMode,
+        resume: Option<&str>,
     ) -> Result<Self, BackendError> {
         match kind {
-            BackendKind::Legacy => AgentSession::start(project_dir, mode, CONSERVATIVE_DISALLOWED_TOOLS)
-                .map(AgentBackend::Legacy)
-                .map_err(|e| BackendError::fatal(format!("failed to start the legacy Claude backend: {e}"))),
+            BackendKind::Legacy => {
+                if resume.is_some() {
+                    return Err(BackendError::fatal(
+                        "this backend cannot continue a previous session: the legacy Claude backend has \
+                         no resume. Start a new session instead."
+                            .to_string(),
+                    ));
+                }
+                AgentSession::start(project_dir, mode, CONSERVATIVE_DISALLOWED_TOOLS)
+                    .map(AgentBackend::Legacy)
+                    .map_err(|e| BackendError::fatal(format!("failed to start the legacy Claude backend: {e}")))
+            }
             BackendKind::Sidecar => {
                 let instance_id = uuid::Uuid::new_v4().to_string();
                 let provider = ClaudeSidecarProvider::connect(&instance_id).map_err(|e| {
@@ -145,9 +162,16 @@ impl AgentBackend {
                     // cause -- an incompatible Claude CLI, say -- exists.
                     BackendError::fatal(format!("failed to connect to the Verdandi sidecar: {e}"))
                 })?;
-                AgentConversation::create(Box::new(provider), project_dir, mode)
-                    .map(|conversation| AgentBackend::Sidecar(Box::new(conversation)))
-                    .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}")))
+                match resume {
+                    Some(provider_session_id) => {
+                        AgentConversation::resume(Box::new(provider), project_dir, provider_session_id, mode)
+                            .map(|c| AgentBackend::Sidecar(Box::new(c)))
+                            .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}")))
+                    }
+                    None => AgentConversation::create(Box::new(provider), project_dir, mode)
+                        .map(|c| AgentBackend::Sidecar(Box::new(c)))
+                        .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
+                }
             }
         }
     }
@@ -156,6 +180,26 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => BackendKind::Legacy,
             AgentBackend::Sidecar(_) => BackendKind::Sidecar,
+        }
+    }
+
+    /// The reason a session terminated WITHOUT ever having opened, if that is what happened.
+    ///
+    /// "Opened" means the provider reported a real `SessionOpened` -- which is also where `model`
+    /// comes from, so its absence is the signal. A session in a terminal state that never opened
+    /// never worked at all, and presenting it as a conversation (empty, marked closed, no
+    /// explanation) is indistinguishable to a user from "the agent has nothing to say". The
+    /// commonest cause is a resume of a provider session that no longer exists.
+    pub(crate) fn terminated_before_opening(&self) -> Option<String> {
+        let projection = self.projection();
+        if projection.model.is_some() {
+            return None;
+        }
+        match &projection.status {
+            agent::ProjectionStatus::Closed { reason } | agent::ProjectionStatus::Unavailable { reason } => {
+                Some(reason.clone())
+            }
+            _ => None,
         }
     }
 
@@ -286,16 +330,41 @@ pub(crate) struct BackendGreeting {
     pub(crate) project_dir: PathBuf,
     pub(crate) permission_modes: &'static [&'static str],
     pub(crate) expected_verdandi_revision: Option<&'static str>,
+    /// The previous conversation in THIS workspace, when there is one worth offering.
+    ///
+    /// `Some` only when all three terms hold: the provider advertised `resume` when the record was
+    /// written (server side), this backend kind implements resume (client side), and this workspace
+    /// has a persisted provider session id.
+    ///
+    /// The server term is the LAST-KNOWN advertisement rather than a live one, because the start
+    /// screen has to decide before any provider exists. It is re-checked for real when resume is
+    /// attempted -- `ClaudeSidecarProvider::resume_session` refuses outright if the live handshake
+    /// no longer advertises it -- so a stale `true` here produces an honest failure, never a silent
+    /// fresh session.
+    pub(crate) resumable: Option<ResumableSession>,
 }
 
 impl BackendGreeting {
     pub(crate) fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
+        // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
+        // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
+        let resumable = match kind {
+            // The legacy backend cannot resume at all, so the client term of the intersection is
+            // false and nothing is offered, however many records exist for this directory.
+            BackendKind::Legacy => None,
+            BackendKind::Sidecar => project_dir
+                .canonicalize()
+                .ok()
+                .map(|cwd| agent::conversation_id_for_cwd(&cwd))
+                .and_then(|id| agent::resumable_session(&id)),
+        };
         match kind {
             BackendKind::Legacy => Self {
                 kind,
                 project_dir,
                 permission_modes: &["auto", "bypass"],
                 expected_verdandi_revision: None,
+                resumable,
             },
             BackendKind::Sidecar => Self {
                 kind,
@@ -306,6 +375,7 @@ impl BackendGreeting {
                 // different.
                 permission_modes: &["bypass"],
                 expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
+                resumable,
             },
         }
     }
@@ -344,7 +414,13 @@ mod tests {
         let greeting = BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/tmp"));
         let hello: serde_json::Value =
             serde_json::from_str(&crate::agent_bridge::serialize_hello_for_js(&greeting)).unwrap();
-        assert_eq!(hello["resumeAvailable"], LEGACY_CAPABILITIES.resume);
+        // `resumableSession` replaced the old boolean `resumeAvailable`: the gate is now "is there a
+        // specific session to continue", not "could this backend resume in principle". For legacy
+        // both answers are no, and they must agree.
+        assert!(hello["resumableSession"].is_null());
+        // resume/fork being false is enforced at compile time beside the constant; asserting it
+        // again here would be a constant assertion, which is what the previous version of this
+        // test was.
         // Cross-checked against the greeting rather than asserted directly: the greeting offers
         // "bypass" as a real choice, and a backend that advertises the mode must support it.
         let modes: Vec<&str> = greeting.permission_modes.to_vec();
