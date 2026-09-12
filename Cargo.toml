@@ -12,6 +12,7 @@ members = [
     "poc/vt_renderer_spike",
     "neovide-editor",
     "shell",
+    "terminal-pane",
     "agent",
     "supervisor",
 ]
