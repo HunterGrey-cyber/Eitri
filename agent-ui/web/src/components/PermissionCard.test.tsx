@@ -9,7 +9,6 @@ import type { PermissionRequestRecord } from "../types";
 
 const REQUEST: PermissionRequestRecord = {
   permissionId: "perm-1",
-  toolUseId: "tool-1",
   toolName: "Bash",
   input: { command: "rm -rf /" },
 };
