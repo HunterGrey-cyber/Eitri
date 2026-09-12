@@ -34,7 +34,14 @@ fn conversation() -> (AgentConversation, u32) {
 }
 
 /// Pumps until `done`, folding as it goes. Returns every event seen.
-fn drain_until<F: Fn(&AgentConversation) -> bool>(
+///
+/// `done` sees the accumulated events as well as the projection, because projection state alone is
+/// not a safe "this turn is over" signal for a turn that has only just been sent: `active_turn_id`
+/// is still `None` in the window between `send_turn` returning and its `TurnStarted` arriving, so a
+/// predicate written on that field alone returns true immediately and the caller gets an empty
+/// batch. That mistake made this file's double-decision test pass on timing and then fail, which is
+/// worse than failing outright.
+fn drain_until<F: Fn(&AgentConversation, &[AgentDomainEvent]) -> bool>(
     conversation: &mut AgentConversation,
     window: Duration,
     done: F,
@@ -43,7 +50,7 @@ fn drain_until<F: Fn(&AgentConversation) -> bool>(
     let mut seen = Vec::new();
     while Instant::now() < deadline {
         seen.extend(conversation.pump());
-        if done(conversation) {
+        if done(conversation, &seen) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -51,8 +58,21 @@ fn drain_until<F: Fn(&AgentConversation) -> bool>(
     seen
 }
 
+/// True once this drain has seen a turn end. The only safe stop condition for a turn that was just
+/// sent.
+fn saw_a_turn_end(events: &[AgentDomainEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            AgentDomainEvent::TurnCompleted { .. }
+                | AgentDomainEvent::SessionUnavailable { .. }
+                | AgentDomainEvent::SessionClosed { .. }
+        )
+    })
+}
+
 fn wait_for_a_pending_permission(conversation: &mut AgentConversation) -> String {
-    drain_until(conversation, Duration::from_secs(60), |c| !c.projection.pending_permissions.is_empty());
+    drain_until(conversation, Duration::from_secs(60), |c, _| !c.projection.pending_permissions.is_empty());
     conversation
         .projection
         .pending_permissions
@@ -93,8 +113,8 @@ fn a_decision_that_takes_a_minute_is_still_honored() {
 
     conversation.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
 
-    let events = drain_until(&mut conversation, Duration::from_secs(60), |c| {
-        c.projection.active_turn_id.is_none() && c.projection.pending_permissions.is_empty()
+    let events = drain_until(&mut conversation, Duration::from_secs(60), |c, seen| {
+        saw_a_turn_end(seen) && c.projection.pending_permissions.is_empty()
     });
     let outcome = events.iter().find_map(|e| match e {
         AgentDomainEvent::PermissionResolved { permission_id: id, outcome } if *id == permission_id => Some(*outcome),
@@ -142,7 +162,7 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
         }
     }
 
-    let events = drain_until(&mut conversation, Duration::from_secs(60), |c| c.projection.active_turn_id.is_none());
+    let events = drain_until(&mut conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     let outcomes: Vec<PermissionOutcome> = events
         .iter()
         .filter_map(|e| match e {
@@ -158,7 +178,9 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
 
     // And the conversation still works afterwards.
     conversation.send_turn("reply with exactly: still-here").unwrap();
-    let events = drain_until(&mut conversation, Duration::from_secs(60), |c| c.projection.active_turn_id.is_none());
+    // Waits for THIS turn to end, not for the projection to look idle -- it already does, because
+    // the turn just sent has not reported starting yet.
+    let events = drain_until(&mut conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     let text: String = events
         .iter()
         .filter_map(|e| match e { AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()), _ => None })
@@ -182,7 +204,7 @@ fn an_unknown_permission_id_never_reaches_the_provider() {
 
     // The real one still works afterwards -- the refusal did not disturb the pending request.
     conversation.respond_permission(&real_id, PermissionDecision::Allow).unwrap();
-    drain_until(&mut conversation, Duration::from_secs(60), |c| c.projection.active_turn_id.is_none());
+    drain_until(&mut conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     conversation.shutdown();
 }
 
@@ -206,7 +228,7 @@ fn a_session_that_dies_with_a_decision_outstanding_reports_it_and_keeps_the_reco
     let killed = unsafe { libc::kill(sidecar_pid as i32, libc::SIGKILL) };
     assert_eq!(killed, 0, "could not signal the sidecar this test spawned");
 
-    drain_until(&mut conversation, Duration::from_secs(30), |c| {
+    drain_until(&mut conversation, Duration::from_secs(30), |c, _| {
         matches!(c.projection.status, ProjectionStatus::Unavailable { .. })
     });
 
