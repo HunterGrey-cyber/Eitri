@@ -4,13 +4,16 @@ import { useEffect, useRef } from "react";
 import type { AgentUiState } from "../types";
 import { renderToolCall } from "../toolRegistry";
 import { PermissionCard } from "./PermissionCard";
+import type { PermissionDecision } from "../bridge";
 
 type Props = {
   state: AgentUiState;
-  onAnswerPermission: (permissionId: string, allow: boolean, reason?: string) => void;
+  /** The session is gone. Pending cards stay visible but can no longer submit into it. */
+  sessionEnded: boolean;
+  onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string) => void;
 };
 
-export function MessageList({ state, onAnswerPermission }: Props) {
+export function MessageList({ state, sessionEnded, onAnswerPermission }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -29,7 +32,12 @@ export function MessageList({ state, onAnswerPermission }: Props) {
         </div>
       ))}
       {state.pendingPermissions.map((request) => (
-        <PermissionCard key={request.permissionId} request={request} onAnswer={onAnswerPermission} />
+        <PermissionCard
+          key={request.permissionId}
+          request={request}
+          sessionEnded={sessionEnded}
+          onAnswer={onAnswerPermission}
+        />
       ))}
       <div ref={bottomRef} />
     </div>

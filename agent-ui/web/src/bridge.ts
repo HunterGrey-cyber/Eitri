@@ -5,7 +5,17 @@ export type OutboundMessage =
   | { type: "start_session"; request_id: string; mode: "auto" | "bypass"; resume?: string }
   | { type: "send_message"; request_id: string; text: string }
   | { type: "interrupt"; request_id: string }
-  | { type: "permission_response"; request_id: string; permission_id: string; allow: boolean; reason?: string };
+  /** `decision` is a closed set, not a boolean: Rust rejects an unrecognized value at parse time
+   *  rather than defaulting it, and the tempting default would be the one that runs the tool.
+   *  `reason` is only ever sent with a denial -- there is no field downstream that would show the
+   *  model an approval's reason. */
+  | { type: "permission_response"; request_id: string; permission_id: string; decision: PermissionDecision; reason?: string };
+
+/** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
+ *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send
+ *  one to -- adding a button for it here would produce a control that silently degrades to a plain
+ *  allow. Widening this is a Verdandi protocol change first. */
+export type PermissionDecision = "allow" | "deny";
 
 declare global {
   interface Window {

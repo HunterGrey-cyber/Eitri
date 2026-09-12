@@ -1,0 +1,89 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { render, cleanup, fireEvent } from "@testing-library/react";
+
+// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+afterEach(cleanup);
+import { PermissionCard } from "./PermissionCard";
+import type { PermissionRequestRecord } from "../types";
+
+const REQUEST: PermissionRequestRecord = {
+  permissionId: "perm-1",
+  toolUseId: "tool-1",
+  toolName: "Bash",
+  input: { command: "rm -rf /" },
+};
+
+function buttons(container: HTMLElement) {
+  const all = Array.from(container.querySelectorAll("button"));
+  return {
+    approve: all.find((b) => b.textContent === "Approve")!,
+    deny: all.find((b) => b.textContent === "Deny")!,
+  };
+}
+
+describe("PermissionCard decisions", () => {
+  it("sends a typed allow, with no reason attached", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(
+      <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
+    );
+    fireEvent.change(container.querySelector("input")!, { target: { value: "typed but irrelevant" } });
+    fireEvent.click(buttons(container).approve);
+    // An approval never carries a reason: nothing downstream has a field to show it in, so sending
+    // one would be inventing a channel that does not exist.
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined);
+  });
+
+  it("sends a typed deny carrying the reason the model will be shown", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(
+      <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
+    );
+    fireEvent.change(container.querySelector("input")!, { target: { value: "not in this repo" } });
+    fireEvent.click(buttons(container).deny);
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "not in this repo");
+  });
+
+  it("does not send the same decision twice while the real resolution is still in flight", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(
+      <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
+    );
+    fireEvent.click(buttons(container).approve);
+    fireEvent.click(buttons(container).approve);
+    fireEvent.click(buttons(container).deny);
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+    // The card is still on screen. Only a real PermissionResolved event removes it -- this component
+    // never decides that its own request is finished.
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+  });
+});
+
+describe("PermissionCard on a session that has ended", () => {
+  /* The specific thing being prevented: a card left over from a session that died stays clickable,
+     the user clicks Approve, and the decision is posted into a session that no longer exists. */
+  it("cannot submit into a dead session", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(
+      <PermissionCard request={REQUEST} sessionEnded onAnswer={onAnswer} />,
+    );
+    const { approve, deny } = buttons(container);
+    expect(approve.disabled).toBe(true);
+    expect(deny.disabled).toBe(true);
+    fireEvent.click(approve);
+    fireEvent.click(deny);
+    expect(onAnswer).not.toHaveBeenCalled();
+  });
+
+  it("stays visible and says why it is inert, rather than vanishing", () => {
+    const { container } = render(
+      <PermissionCard request={REQUEST} sessionEnded onAnswer={vi.fn()} />,
+    );
+    // Removing it would read as a resolution nobody made; the request really was left unanswered.
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+    expect(container.querySelector(".permission-card-stale")?.textContent).toContain(
+      "ended before the request was answered",
+    );
+  });
+});

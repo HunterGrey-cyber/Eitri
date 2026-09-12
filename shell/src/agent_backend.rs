@@ -19,7 +19,8 @@
 
 use agent::{
     AgentConversation, AgentSession, AgentDomainEvent, AgentSessionProjection, ClaudeSidecarProvider,
-    ConversationError, PermissionMode, ProviderCapabilities, ProviderInfo, ResumableSession,
+    ConversationError, PermissionDecision, PermissionMode, ProviderCapabilities, ProviderInfo,
+    ResumableSession,
     CONSERVATIVE_DISALLOWED_TOOLS,
 };
 use std::path::{Path, PathBuf};
@@ -35,6 +36,9 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     fork: false,
     interrupt: true,
     bypass_permission_mode: true,
+    // Its interactive gate is the `PreToolUse` hook relay, which is this backend's primary,
+    // end-to-end-verified permission mechanism -- not the leaky `can_use_tool` it also listens to.
+    interactive_permission_mode: true,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -289,16 +293,21 @@ impl AgentBackend {
         }
     }
 
+    /// Answers one pending permission request.
+    ///
+    /// The two arms return different things for a real reason, not an oversight: the legacy backend
+    /// has no provider event for a resolution and hands back the one it folded itself, while the
+    /// sidecar returns nothing because its `PermissionResolved` arrives through `pump()` like every
+    /// other provider event. Nothing here invents one on the sidecar's behalf.
     pub(crate) fn respond_permission(
         &mut self,
         permission_id: &str,
-        allow: bool,
-        reason: Option<&str>,
+        decision: PermissionDecision,
     ) -> Result<Vec<AgentDomainEvent>, BackendError> {
         match self {
-            AgentBackend::Legacy(session) => Ok(session.respond_permission(permission_id, allow, reason)?),
+            AgentBackend::Legacy(session) => Ok(session.respond_permission(permission_id, decision)?),
             AgentBackend::Sidecar(conversation) => {
-                conversation.respond_permission(permission_id, allow, reason)?;
+                conversation.respond_permission(permission_id, decision)?;
                 Ok(Vec::new())
             }
         }
@@ -319,12 +328,29 @@ impl AgentBackend {
     }
 }
 
-/// What the frontend is told at handshake time, before any session exists.
+/// Every permission policy this CLIENT can drive end to end, in the order a start screen should
+/// offer them.
 ///
-/// The permission policy is part of it because the two backends genuinely differ: the legacy
-/// backend has a real, tested interactive permission gate, while the sidecar path in this milestone
-/// ships BYPASS only -- its `interactive` and `verdandi_rules` modes are confirmed to behave
-/// identically in the current sidecar, so offering them as distinct choices would be a lie.
+/// The **client half** of the same two-term rule capabilities everywhere else in this codebase obey:
+/// effective capability = what the provider advertises, intersected with what this side implements.
+/// The start screen has to decide what to offer before any provider exists, so it can only state
+/// this half; the provider half is checked for real at session creation, where an unsupported mode
+/// is refused outright (`ClaudeSidecarProvider::require_permission_mode`) rather than quietly mapped
+/// onto whatever the provider does support.
+///
+/// It is deliberately NOT keyed on `BackendKind`. Both backends have a real, separately verified
+/// interactive gate -- the legacy one through its `PreToolUse` hook relay, the sidecar through a
+/// real `PermissionRequested`/`ResolvePermission` round trip (`agent/tests/claude_sidecar_conformance
+/// ::real_pretooluse_permission_allow_end_to_end`, which runs in `PermissionMode::Auto`). An earlier
+/// revision of this file hardcoded `Sidecar => ["bypass"]`, which hid a working, tested capability
+/// behind a backend's name: exactly the failure mode capability advertisement exists to prevent,
+/// just pointed inward.
+///
+/// `verdandi_rules` is absent because it is confirmed to behave identically to `interactive` in the
+/// current sidecar. A third button that does nothing different is a worse lie than a missing one.
+pub(crate) const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
+
+/// What the frontend is told at handshake time, before any session exists.
 pub(crate) struct BackendGreeting {
     pub(crate) kind: BackendKind,
     pub(crate) project_dir: PathBuf,
@@ -362,18 +388,14 @@ impl BackendGreeting {
             BackendKind::Legacy => Self {
                 kind,
                 project_dir,
-                permission_modes: &["auto", "bypass"],
+                permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
                 expected_verdandi_revision: None,
                 resumable,
             },
             BackendKind::Sidecar => Self {
                 kind,
                 project_dir,
-                // BYPASS only, deliberately. Not a capability gap to paper over later: until a
-                // permission policy with genuinely distinct runtime behavior exists on this path,
-                // presenting a choice would invite the user to pick a mode that does nothing
-                // different.
-                permission_modes: &["bypass"],
+                permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
                 expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
                 resumable,
             },
@@ -392,17 +414,53 @@ mod tests {
     }
 
     #[test]
-    fn the_sidecar_greeting_offers_bypass_only_and_names_its_verdandi_baseline() {
+    fn the_sidecar_greeting_names_its_verdandi_baseline() {
         let greeting = BackendGreeting::for_kind(BackendKind::Sidecar, PathBuf::from("/tmp"));
-        assert_eq!(greeting.permission_modes, &["bypass"]);
         assert_eq!(greeting.expected_verdandi_revision, Some(agent::EXPECTED_VERDANDI_REVISION));
     }
 
     #[test]
-    fn the_legacy_greeting_keeps_its_real_two_mode_choice() {
+    fn the_legacy_greeting_has_no_verdandi_baseline_to_name() {
         let greeting = BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/tmp"));
-        assert_eq!(greeting.permission_modes, &["auto", "bypass"]);
         assert_eq!(greeting.expected_verdandi_revision, None, "the legacy backend has no Verdandi dependency");
+    }
+
+    /// The permission offer is a statement about what this CLIENT implements, so it does not vary by
+    /// backend name. An earlier revision returned `["bypass"]` for the sidecar, which hid a real,
+    /// conformance-tested interactive gate behind a string comparison on the backend's name -- and a
+    /// hidden capability is indistinguishable from a missing one to everyone downstream.
+    ///
+    /// What makes this safe rather than optimistic is the other half of the check: an unsupported
+    /// mode is refused at session creation (`ClaudeSidecarProvider::require_permission_mode`) instead
+    /// of being mapped onto whatever the provider does support.
+    #[test]
+    fn both_backends_offer_the_same_permission_policies_because_both_implement_them() {
+        for kind in [BackendKind::Legacy, BackendKind::Sidecar] {
+            let greeting = BackendGreeting::for_kind(kind, PathBuf::from("/tmp"));
+            assert_eq!(
+                greeting.permission_modes,
+                CLIENT_IMPLEMENTED_PERMISSION_MODES,
+                "{} must not narrow the offer by its own name",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// Ties the offered list to the capability struct it claims to describe, so adding a mode to one
+    /// without the other fails here rather than producing a button whose mode is never honored.
+    #[test]
+    fn every_offered_mode_is_one_the_legacy_capabilities_actually_claim() {
+        for mode in CLIENT_IMPLEMENTED_PERMISSION_MODES {
+            let parsed = match *mode {
+                "auto" => PermissionMode::Auto,
+                "bypass" => PermissionMode::Bypass,
+                other => panic!("offered permission mode {other:?} has no PermissionMode to map to"),
+            };
+            assert!(
+                LEGACY_CAPABILITIES.supports_permission_mode(parsed),
+                "{mode} is offered but LEGACY_CAPABILITIES does not claim it"
+            );
+        }
     }
 
     #[test]
