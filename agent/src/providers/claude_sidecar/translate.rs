@@ -17,9 +17,25 @@ use claude_runtime_protocol::v1::{
 /// (Task 8's watch-loop) simply skips that one occurrence rather than tearing down the whole
 /// stream over one bad event.
 pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
+    // The ENVELOPE's session_id, captured before the oneof is destructured. This is the sidecar's
+    // own session id -- the value `CreateSession` returned and the one every subsequent RPC must be
+    // addressed with.
+    //
+    // Do not use `SessionReady.session_id` (the inner field) for this, however much its name
+    // suggests otherwise: Verdandi's kernel populates BOTH inner fields from the SDK's own
+    // `system`/`init` message, so `SessionReady.session_id == SessionReady.provider_session_id ==
+    // the Claude session UUID`, and the sidecar's id appears nowhere inside the message. Measured
+    // against a real sidecar, 2026-09-11: CreateSessionResponse returned
+    // 0124c913-eeb7-4eef-9436-9714eb1f596c while SessionReady carried
+    // a9fd9d1a-92e2-4d0f-8b1f-56bb8c92436c in both inner fields. Trusting the inner field collapses
+    // two identities into one and would send Claude's id back as a session_id, which the sidecar
+    // answers with SESSION_NOT_FOUND. Reported to Verdandi as a wire-level naming defect; this
+    // client does not depend on it being fixed.
+    let envelope_session_id = event.session_id;
+    let envelope_turn_id = event.turn_id;
     match event.event? {
         ProtoEvent::SessionReady(ready) => Some(AgentDomainEvent::SessionOpened {
-            session_id: ready.session_id,
+            session_id: envelope_session_id,
             provider_session_id: ready.provider_session_id,
             model: ready.model,
             cwd: ready.cwd,
@@ -100,7 +116,7 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             // Diagnostics only, per design doc §3.2/§5.2 -- never surfaced as a domain event.
             eprintln!(
                 "agent: ClaudeSidecarProvider: ProviderNotice kind={} subtype={:?} (turn {})",
-                notice.kind, notice.subtype, event.turn_id.unwrap_or_default()
+                notice.kind, notice.subtype, envelope_turn_id.unwrap_or_default()
             );
             None
         }
@@ -161,11 +177,26 @@ mod tests {
     }
 
     #[test]
-    fn session_ready_translates_to_session_opened() {
+    fn session_opened_takes_its_session_id_from_the_envelope_not_the_inner_message() {
+        // The inner field is deliberately given a DIFFERENT (and, per the real sidecar, wrong)
+        // value here: Verdandi's kernel fills both inner fields with the Claude session UUID, so
+        // trusting `SessionReady.session_id` collapses the sidecar's identity into Claude's. The
+        // envelope is the authority for which session an event belongs to.
         let event = wrap(ProtoEvent::SessionReady(SessionReady {
-            session_id: "sess-1".into(), provider_session_id: "prov-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into(),
+            session_id: "claude-uuid-not-the-sidecars".into(),
+            provider_session_id: "claude-uuid-not-the-sidecars".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/tmp".into(),
         }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::SessionOpened { session_id: "sess-1".into(), provider_session_id: "prov-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::SessionOpened {
+                session_id: "sess-1".into(), // the envelope's, set by `wrap`
+                provider_session_id: "claude-uuid-not-the-sidecars".into(),
+                model: "claude-sonnet-5".into(),
+                cwd: "/tmp".into(),
+            })
+        );
     }
 
     #[test]
