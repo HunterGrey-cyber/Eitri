@@ -11,7 +11,7 @@ use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessio
 fn a_real_turn_s_reply_arrives_via_pump() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let session_id = provider
-        .create_session(CreateSessionRequest { cwd: std::env::temp_dir().to_string_lossy().to_string(), permission_mode: PermissionMode::Auto })
+        .create_session(CreateSessionRequest { cwd: std::env::temp_dir().to_string_lossy().to_string(), permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial })
         .unwrap();
 
     provider.send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "reply with exactly the word: pong".into() }).unwrap();

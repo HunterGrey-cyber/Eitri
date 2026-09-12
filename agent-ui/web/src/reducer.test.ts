@@ -16,11 +16,14 @@ describe("applyEvent", () => {
     expect(state.activeTurnId).toBe("t1");
   });
 
-  it("content_delta appends text deltas to transcript in order, ignoring thinking deltas", () => {
+  it("content_delta accumulates consecutive text into one message, ignoring thinking deltas", () => {
+    // This asserted ["first", "second"] until partial streaming landed. `transcript` holds assistant
+    // MESSAGES, and two consecutive text deltas with nothing between them are one message -- under
+    // partial streaming they are two fragments of one sentence.
     let state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "text", text: "first" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "pondering" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "second" });
-    expect(state.transcript).toEqual(["first", "second"]);
+    expect(state.transcript).toEqual(["firstsecond"]);
   });
 
   it("tool_call_started then tool_call_completed links by tool_use_id", () => {
@@ -160,5 +163,60 @@ describe("identity handling", () => {
     expect(state.provider).toBeNull();
     expect(state.conversationId).toBeNull();
     expect(state.providerSessionId).toBeNull();
+  });
+});
+
+describe("partial assistant streaming", () => {
+  const opened: AgentDomainEvent = {
+    type: "session_opened", session_id: "s", provider_session_id: "p", model: "m", cwd: "/tmp",
+  };
+  const delta = (text: string): AgentDomainEvent => ({ type: "content_delta", turn_id: "t1", kind: "text", text });
+
+  it("accumulates a streamed reply into ONE transcript entry, not one per delta", () => {
+    // The defect this pins: under partial streaming a 600-word reply arrives as 400+ deltas. One
+    // transcript entry each renders 400 separate bubbles, every fragment markdown-parsed alone --
+    // so "`neovibe_" or "**bold" is not valid standalone markdown and the formatting breaks.
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    for (const chunk of ["The ", "quick ", "**brown** ", "fox"]) state = applyEvent(state, delta(chunk));
+    expect(state.transcript).toEqual(["The quick **brown** fox"]);
+  });
+
+  it("starts a new entry after a tool call, because that ends the assistant message", () => {
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, delta("I'll check."));
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
+    state = applyEvent(state, delta("It printed hi."));
+    expect(state.transcript).toEqual(["I'll check.", "It printed hi."]);
+  });
+
+  it("starts a new entry on the next turn", () => {
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, delta("first"));
+    state = applyEvent(state, { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "first", stop_reason: null, total_cost_usd: 0, num_turns: 0 });
+    state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
+    state = applyEvent(state, delta("second"));
+    expect(state.transcript).toEqual(["first", "second"]);
+  });
+
+  it("a thinking delta does not split the text around it", () => {
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, delta("before "));
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    state = applyEvent(state, delta("after"));
+    expect(state.transcript).toEqual(["before after"]);
+  });
+
+  it("a snapshot resets the open-message flag rather than appending into a closed message", () => {
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, delta("streaming"));
+    expect(state.assistantMessageOpen).toBe(true);
+    const restored = applySnapshot(state, { ...state, transcript: ["an earlier reply"], assistantMessageOpen: true });
+    expect(restored.assistantMessageOpen).toBe(false);
+    const next = applyEvent(restored, delta("new message"));
+    expect(next.transcript).toEqual(["an earlier reply", "new message"]);
   });
 });

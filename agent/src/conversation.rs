@@ -253,6 +253,8 @@ impl AgentConversation {
         let session_id = provider.create_session(CreateSessionRequest {
             cwd: canonical_cwd.to_string_lossy().to_string(),
             permission_mode,
+            // A UI client always wants incremental presentation.
+            streaming: crate::provider::StreamingPreference::Partial,
         })?;
         Ok(Self {
             conversation_id: conversation_id_for_cwd(&canonical_cwd),
@@ -315,6 +317,7 @@ impl AgentConversation {
             provider_session_id: provider_session_id.to_string(),
             cwd: cwd_string.clone(),
             permission_mode,
+            streaming: crate::provider::StreamingPreference::Partial,
         })?;
 
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);

@@ -23,7 +23,7 @@ fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(provider: &ClaudeSidecarProvi
 fn real_pretooluse_permission_allow_end_to_end() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
-    let session_id = provider.create_session(CreateSessionRequest { cwd, permission_mode: PermissionMode::Auto }).unwrap();
+    let session_id = provider.create_session(CreateSessionRequest { cwd, permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial }).unwrap();
 
     provider.send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "run: echo hello, and tell me the output".into() }).unwrap();
 
@@ -58,7 +58,7 @@ fn real_pretooluse_permission_allow_end_to_end() {
 fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
-    let session_id = provider.create_session(CreateSessionRequest { cwd, permission_mode: PermissionMode::Auto }).unwrap();
+    let session_id = provider.create_session(CreateSessionRequest { cwd, permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial }).unwrap();
 
     provider.send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "run: sleep 30, and tell me when it finishes".into() }).unwrap();
 
@@ -99,7 +99,7 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
 fn real_close_session_fail_closes_a_pending_permission() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
-    let session_id = provider.create_session(CreateSessionRequest { cwd, permission_mode: PermissionMode::Auto }).unwrap();
+    let session_id = provider.create_session(CreateSessionRequest { cwd, permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial }).unwrap();
 
     provider.send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "run: sleep 30, and tell me when it finishes".into() }).unwrap();
 

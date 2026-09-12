@@ -20,6 +20,7 @@ export function initialState(): AgentUiState {
     pendingPermissions: [],
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
+    assistantMessageOpen: false,
   };
 }
 
@@ -38,14 +39,31 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
         model: event.model,
         cwd: event.cwd,
         status: { kind: "running" },
+        assistantMessageOpen: false,
       };
     case "turn_started":
-      return { ...state, activeTurnId: event.turn_id };
-    case "content_delta":
-      return event.kind === "text" ? { ...state, transcript: [...state.transcript, event.text] } : state;
+      return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false };
+    case "content_delta": {
+      if (event.kind !== "text") return state;
+      // `transcript` holds assistant MESSAGES, not content events. Under partial streaming a single
+      // 600-word reply arrives as 400+ deltas; pushing each as its own entry renders 400 separate
+      // bubbles, each markdown-parsed in isolation -- and a fragment like "`neovibe_" or "**bold"
+      // is not valid standalone markdown, so every streamed reply's formatting breaks.
+      //
+      // MUST stay identical to `AgentSessionProjection::apply` in agent/src/projection.rs: the two
+      // fold the same events and a snapshot from Rust has to be indistinguishable from this
+      // reducer's own accumulation.
+      if (state.assistantMessageOpen && state.transcript.length > 0) {
+        const transcript = state.transcript.slice();
+        transcript[transcript.length - 1] += event.text;
+        return { ...state, transcript };
+      }
+      return { ...state, transcript: [...state.transcript, event.text], assistantMessageOpen: true };
+    }
     case "tool_call_started": {
       const record: ToolCallRecord = { toolUseId: event.tool_use_id, name: event.name, input: event.input, result: null };
-      return { ...state, toolCalls: [...state.toolCalls, record] };
+      // A tool call only happens between assistant messages, so the streaming text ended here.
+      return { ...state, toolCalls: [...state.toolCalls, record], assistantMessageOpen: false };
     }
     case "tool_call_completed":
       return {
@@ -57,6 +75,7 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
     case "permission_requested":
       return {
         ...state,
+        assistantMessageOpen: false,
         pendingPermissions: [
           ...state.pendingPermissions,
           { permissionId: event.permission_id, toolName: event.tool_name, input: event.input },
@@ -72,11 +91,11 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
       // The one authoritative source for "no turn is in flight" -- replaces the deleted
       // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
       // NOT end the conversation, only session_closed/session_unavailable do.
-      return { ...state, activeTurnId: null };
+      return { ...state, activeTurnId: null, assistantMessageOpen: false };
     case "session_unavailable":
-      return { ...state, status: { kind: "unavailable", reason: event.reason } };
+      return { ...state, status: { kind: "unavailable", reason: event.reason }, assistantMessageOpen: false };
     case "session_closed":
-      return { ...state, status: { kind: "closed", reason: event.reason } };
+      return { ...state, status: { kind: "closed", reason: event.reason }, assistantMessageOpen: false };
     default: {
       // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
       // matching TS case lands here at runtime -- observable, never silently dropped.
@@ -87,5 +106,9 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
 }
 
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiState): AgentUiState {
-  return snapshot;
+  // A snapshot is a complete replacement, but it carries no `assistantMessageOpen` -- that flag is
+  // reducer-internal on both sides and deliberately not on the wire. Resetting it is the safe
+  // direction: the next content event starts a new transcript entry rather than appending to a
+  // message that may have been closed before the snapshot was taken.
+  return { ...snapshot, assistantMessageOpen: false };
 }

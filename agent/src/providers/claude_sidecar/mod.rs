@@ -14,7 +14,7 @@ pub use spawn::EXPECTED_VERDANDI_REVISION;
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest,
-    SendTurnRequest,
+    SendTurnRequest, StreamingPreference,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::{AgentDomainEvent, PermissionMode};
@@ -22,7 +22,7 @@ use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
     ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
     CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ExecutableSource,
-    ErrorDetail,
+    ErrorDetail, StreamingMode,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode,
     ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest,
@@ -323,10 +323,12 @@ impl ClaudeSidecarProvider {
 /// whose runtime behavior has been confirmed distinct. `verdandi_rules` is identical to
 /// `interactive` in the current sidecar, `external_store` is identical to `ephemeral`, and
 /// `executable` is not read at all -- sending any of them would be choosing a value that means
-/// nothing.
+/// nothing. `streaming` is the exception that proves the rule: PARTIAL has a measured, distinct
+/// effect, so it is sent.
 fn build_create_request(
     cwd: String,
     permission_mode: PermissionMode,
+    streaming: StreamingPreference,
     resume_provider_session_id: Option<String>,
     fork: bool,
 ) -> ProtoCreateSessionRequest {
@@ -337,6 +339,14 @@ fn build_create_request(
             permissions: to_proto_permission_mode(permission_mode),
             persistence: PersistenceMode::HostCli as i32,
             executable: ExecutableSource::HostCli as i32,
+            // Without PARTIAL a long reply is a blank panel for ten-plus seconds and then a wall of
+            // text: the provider only emits the completed message. A UI wants the incremental form;
+            // the cost the sidecar's own default guards against (many more events per turn, filling
+            // the replay buffer faster) is why it is opt-in rather than the sidecar's default.
+            streaming: match streaming {
+                StreamingPreference::Complete => StreamingMode::Complete as i32,
+                StreamingPreference::Partial => StreamingMode::Partial as i32,
+            },
         }),
         resume_provider_session_id,
         fork,
@@ -360,7 +370,7 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
-        self.open_session(build_create_request(request.cwd, request.permission_mode, None, false))
+        self.open_session(build_create_request(request.cwd, request.permission_mode, request.streaming, None, false))
     }
 
     /// Continues an existing Claude session. Goes through the same `CreateSession` RPC as a fresh
@@ -386,6 +396,7 @@ impl AgentProvider for ClaudeSidecarProvider {
         self.open_session(build_create_request(
             request.cwd,
             request.permission_mode,
+            request.streaming,
             Some(request.provider_session_id),
             false,
         ))

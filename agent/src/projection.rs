@@ -159,6 +159,20 @@ pub struct AgentSessionProjection {
     pub tool_calls: Vec<ToolCallRecord>,
     pub pending_permissions: HashMap<String, PermissionRequestRecord>,
     pub usage: UsageInfo,
+    /// True while the last thing folded was assistant text, so the next chunk CONTINUES the same
+    /// message instead of starting a new one.
+    ///
+    /// Load-bearing since partial streaming landed. `transcript` means "assistant messages", not
+    /// "content events": with `StreamingPreference::Partial` a single 600-word reply arrives as 400+
+    /// `ContentDelta`s, and pushing each as its own entry would render 400 separate message bubbles,
+    /// each markdown-parsed IN ISOLATION -- so a fragment like "`neovibe_" or "**bold" is not valid
+    /// standalone markdown and the formatting of every streamed reply breaks.
+    ///
+    /// Anything that can only occur BETWEEN assistant messages closes the run: a tool call, a
+    /// permission request, a turn boundary, a session event. `Thinking` deliberately does not --
+    /// it has no transcript effect and must not split the text around it.
+    #[serde(skip)]
+    pub assistant_message_open: bool,
     /// Strictly increasing by exactly one per `apply` call. What a WebView bridge snapshot's
     /// `throughRevision` reports, and what a later `events{fromRevision, throughRevision, ...}`
     /// batch continues from (Task 4).
@@ -184,15 +198,25 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::TurnStarted { turn_id } => {
                 self.active_turn_id = Some(turn_id.clone());
+                self.assistant_message_open = false;
             }
             AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => {
-                self.transcript.push(text.clone());
+                match self.transcript.last_mut() {
+                    Some(open) if self.assistant_message_open => open.push_str(text),
+                    _ => {
+                        self.transcript.push(text.clone());
+                        self.assistant_message_open = true;
+                    }
+                }
             }
             AgentDomainEvent::ContentDelta { kind: ContentKind::Thinking, .. } => {
                 // No projection effect -- mirrors the pre-Phase-1 AgentSessionState::apply's
                 // identical treatment of `Thinking`. Still bumps last_revision (see fn doc).
             }
             AgentDomainEvent::ToolCallStarted { turn_id, tool_use_id, name, input } => {
+                // A tool call can only happen between assistant messages, so whatever text was
+                // streaming has ended; the text after it is a new message.
+                self.assistant_message_open = false;
                 self.tool_calls.push(ToolCallRecord {
                     turn_id: turn_id.clone(),
                     tool_use_id: tool_use_id.clone(),
@@ -207,6 +231,7 @@ impl AgentSessionProjection {
                 }
             }
             AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, input } => {
+                self.assistant_message_open = false;
                 self.pending_permissions.insert(
                     permission_id.clone(),
                     PermissionRequestRecord {
@@ -222,12 +247,15 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::TurnCompleted { total_cost_usd, num_turns, .. } => {
                 self.active_turn_id = None;
+                self.assistant_message_open = false;
                 self.usage = UsageInfo { total_cost_usd: *total_cost_usd, num_turns: *num_turns };
             }
             AgentDomainEvent::SessionUnavailable { reason } => {
+                self.assistant_message_open = false;
                 self.status = ProjectionStatus::Unavailable { reason: reason.clone() };
             }
             AgentDomainEvent::SessionClosed { reason } => {
+                self.assistant_message_open = false;
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }
         }

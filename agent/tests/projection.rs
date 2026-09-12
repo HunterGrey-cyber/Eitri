@@ -29,11 +29,15 @@ fn turn_started_sets_active_turn_id() {
 }
 
 #[test]
-fn content_delta_text_appends_to_transcript_in_order() {
+fn content_delta_text_accumulates_into_one_message_in_order() {
+    // This asserted ["hello", "world"] until partial streaming landed. `transcript` holds assistant
+    // MESSAGES, and two consecutive text deltas with nothing between them are one message -- under
+    // StreamingPreference::Partial they are two fragments of one sentence, and one entry each would
+    // render 400 separate bubbles for a single reply.
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "hello".into() });
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "world".into() });
-    assert_eq!(projection.transcript, vec!["hello".to_string(), "world".to_string()]);
+    assert_eq!(projection.transcript, vec!["helloworld".to_string()]);
 }
 
 #[test]
@@ -165,4 +169,54 @@ fn permission_resolved_accepts_provider_failed_and_expired_outcomes() {
     });
     projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-2".into(), outcome: PermissionOutcome::Expired });
     assert!(!projection.pending_permissions.contains_key("perm-2"));
+}
+
+/// The Rust half of the partial-streaming accumulation. Must stay behaviorally identical to
+/// `agent-ui/web/src/reducer.ts`'s own `content_delta` case -- a snapshot from here has to be
+/// indistinguishable from what that reducer accumulates from the same events.
+#[test]
+fn streamed_text_accumulates_into_one_transcript_entry() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    for chunk in ["The ", "quick ", "**brown** ", "fox"] {
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: chunk.into(),
+        });
+    }
+    assert_eq!(projection.transcript, vec!["The quick **brown** fox".to_string()]);
+    // Every delta is still its own revision: a consumer replaying from a revision must be able to
+    // land between two chunks of one message.
+    assert_eq!(projection.last_revision, 5);
+}
+
+#[test]
+fn a_tool_call_or_a_turn_boundary_starts_a_new_transcript_entry() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() });
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(), tool_use_id: "tu1".into(), name: "Bash".into(), input: serde_json::json!({}),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "It printed hi.".into() });
+    assert_eq!(projection.transcript, vec!["I'll check.".to_string(), "It printed hi.".to_string()]);
+
+    projection.apply(&AgentDomainEvent::TurnCompleted {
+        turn_id: "t1".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
+        stop_reason: None, total_cost_usd: 0.0, num_turns: 0,
+    });
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t2".into(), kind: ContentKind::Text, text: "next turn".into() });
+    assert_eq!(projection.transcript.len(), 3);
+}
+
+#[test]
+fn a_thinking_delta_does_not_split_the_text_around_it() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "before ".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "after".into() });
+    assert_eq!(projection.transcript, vec!["before after".to_string()]);
 }

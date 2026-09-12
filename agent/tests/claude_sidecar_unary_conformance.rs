@@ -10,7 +10,7 @@ use agent::{AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, Permissi
 fn create_session_returns_a_real_session_id() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let session_id = provider
-        .create_session(CreateSessionRequest { cwd: std::env::temp_dir().to_string_lossy().to_string(), permission_mode: PermissionMode::Auto })
+        .create_session(CreateSessionRequest { cwd: std::env::temp_dir().to_string_lossy().to_string(), permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial })
         .unwrap();
     assert!(!session_id.is_empty());
     provider.close_session(agent::CloseSessionRequest { session_id }).unwrap();
@@ -31,6 +31,7 @@ fn resume_is_now_advertised_and_an_empty_id_is_rejected_before_the_wire() {
         provider_session_id: "   ".into(),
         cwd: "/tmp".into(),
         permission_mode: PermissionMode::Bypass,
+        streaming: agent::StreamingPreference::Partial,
     });
     match result {
         Err(agent::ProviderError::Provider { code, .. }) => {

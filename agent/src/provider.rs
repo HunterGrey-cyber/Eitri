@@ -12,10 +12,26 @@
 
 use crate::{AgentDomainEvent, PermissionMode};
 
+/// How much of an assistant reply the caller wants while it is still being produced.
+///
+/// A real behavioral choice with a measured cost, not a style preference: `Partial` turns one turn's
+/// handful of content events into hundreds, which fills the provider's replay buffer far faster. A
+/// UI wants it; a batch consumer that only reads a turn's final text does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamingPreference {
+    /// Assistant text arrives when a message completes.
+    Complete,
+    /// Assistant text arrives as it is produced. These are PRESENTATION deltas -- the provider's
+    /// own streaming events -- and are explicitly not a documented token boundary.
+    #[default]
+    Partial,
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateSessionRequest {
     pub cwd: String,
     pub permission_mode: PermissionMode,
+    pub streaming: StreamingPreference,
 }
 
 /// Continue an existing provider (Claude) session rather than starting a fresh one.
@@ -30,6 +46,7 @@ pub struct ResumeSessionRequest {
     pub provider_session_id: String,
     pub cwd: String,
     pub permission_mode: PermissionMode,
+    pub streaming: StreamingPreference,
 }
 
 #[derive(Debug, Clone)]

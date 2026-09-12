@@ -18,6 +18,8 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             configuration: ConfigurationProfile::Native as i32,
             permissions: PermissionMode::Interactive as i32,
             persistence: claude_runtime_protocol::v1::PersistenceMode::HostCli as i32,
+            // streaming added 2026-09-12; PARTIAL is what a UI client asks for.
+            streaming: claude_runtime_protocol::v1::StreamingMode::Partial as i32,
             executable: claude_runtime_protocol::v1::ExecutableSource::HostCli as i32,
         }),
     };

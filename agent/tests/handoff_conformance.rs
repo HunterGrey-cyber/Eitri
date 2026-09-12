@@ -39,7 +39,7 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     // the kind of real bug this plan's own "Verified facts" point 1 exists to prevent; do not
     // "simplify" this test by using one value for both.
     let session_id = provider
-        .create_session(CreateSessionRequest { cwd: cwd.clone(), permission_mode: PermissionMode::Auto })
+        .create_session(CreateSessionRequest { cwd: cwd.clone(), permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial })
         .unwrap();
 
     // `SessionOpened` carries the real Claude session UUID, and it is NOT emitted at
