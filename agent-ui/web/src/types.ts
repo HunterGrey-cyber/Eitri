@@ -58,6 +58,9 @@ export type AgentUiState = {
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
   capabilities: Capabilities;
   provider: ProviderInfo | null;
+  /** Reducer-internal, never on the wire: true while the last folded event was assistant text, so
+   * the next chunk continues the same message. See `reducer.ts`'s `content_delta` case. */
+  assistantMessageOpen: boolean;
 };
 
 /** The handshake reply, before any session exists: which backend is behind the bridge and what it

@@ -102,10 +102,17 @@ fn connect() -> ClaudeSidecarProvider {
 }
 
 fn create_bypass_session(provider: &ClaudeSidecarProvider) -> String {
+    create_bypass_session_with(provider, agent::StreamingPreference::Partial)
+}
+
+/// The streaming preference is a parameter so the same helper can drive both sides of a real
+/// before/after measurement rather than two divergent copies of the setup.
+fn create_bypass_session_with(provider: &ClaudeSidecarProvider, streaming: agent::StreamingPreference) -> String {
     provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             permission_mode: PermissionMode::Bypass,
+            streaming,
         })
         .expect("create_session should succeed")
 }
@@ -446,6 +453,7 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
             provider_session_id: provider_session_id.clone(),
             cwd,
             permission_mode: PermissionMode::Bypass,
+            streaming: agent::StreamingPreference::Partial,
         })
         .expect("resume_session should succeed against a real, closed session");
     assert_ne!(

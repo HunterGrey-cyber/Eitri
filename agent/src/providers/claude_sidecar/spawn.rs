@@ -87,6 +87,7 @@ impl SpawnedSidecar {
 /// the candidate revision. It checks multiple turns with content checks, BYPASS
 /// tool execution, reuse after interruption, teardown without orphan processes,
 /// and resume verified by both content and provider session ID.
+/// It also measures partial assistant streaming.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
