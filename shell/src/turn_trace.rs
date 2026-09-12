@@ -1,31 +1,23 @@
 // shell/src/turn_trace.rs
-//! Where a turn's latency actually goes, from the click to the pixels.
+//! Traces a turn's latency from submission to the frame containing its first text.
+//! Enabled by `NEOVIBE_AGENT_TRACE=1`; writes one line per turn to stderr.
 //!
-//! Off unless `NEOVIBE_AGENT_TRACE=1`. One line per turn, to stderr.
+//! Provider-boundary timings omit the pump, bridge hop, and WebView rendering.
+//! These marks expose that part of the pipeline: submission when `send_message` is
+//! handled, the first provider event drained by the pump, the first assistant text
+//! drained by the pump, the first paint frame reported by the WebView, and completion
+//! when the pump drains `TurnCompleted`.
 //!
-//! The point is to tell "the model is slow" apart from "our pipeline is slow", which the numbers in
-//! `agent/tests/claude_sidecar_partial_streaming.rs` cannot do: those are measured at the provider
-//! boundary, so everything after it -- the 33ms pump, the bridge hop, the WebView's own render --
-//! is invisible to them. Partial streaming cut time-to-first-text from ~29s to ~11s, and the next
-//! honest question is how much of the remainder this side is responsible for.
+//! These timings describe request/response latency. They do not measure whether a
+//! continuous output stream can keep up, which requires throughput measurements.
+//! Server-side grpc-js queuing preserved events during a 20-second consumer stall;
+//! this is a correctness observation rather than a speed measurement.
 //!
-//! The five marks:
-//!
-//! | mark | stamped where | means |
-//! | --- | --- | --- |
-//! | submitted | the `send_message` inbound message is handled | the user pressed Send |
-//! | first provider event | the pump drains any event of this turn | the provider said anything at all |
-//! | first presentation delta | the pump drains the first assistant text | the first characters exist here |
-//! | first paint frame | reported back by the WebView | the first characters are on screen |
-//! | completed | the pump drains `TurnCompleted` | the turn is over |
-//!
-//! **On "first paint frame", and what it is not.** The WebView reports how long it took from
-//! *receiving* the payload to the animation frame that drew it, and that span is added to the
-//! moment Rust dispatched it. Measured as a span rather than a wall-clock instant on purpose: JS
-//! `performance.now()` and Rust `Instant` have unrelated epochs, so subtracting one from the other
-//! would produce a confident, meaningless number. It is also a frame, not a photon -- the callback
-//! runs before the compositor presents -- so read it as the frame the text was drawn into, and as a
-//! floor on what the user perceives, never as a measured perceptual latency.
+//! The WebView reports the duration from receiving a payload to its animation frame.
+//! Rust adds that duration to its dispatch instant because JS `performance.now()` and
+//! Rust `Instant` have unrelated epochs and cannot be subtracted from each other.
+//! The callback runs before compositor presentation, so this is the frame containing
+//! the text and a lower bound on perceived latency, not a measurement of presentation.
 
 use agent::{AgentDomainEvent, ContentKind};
 use std::time::{Duration, Instant};
