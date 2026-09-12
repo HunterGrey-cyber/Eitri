@@ -8,6 +8,7 @@
 //! Unix socket by the `agent-hook` companion binary. The CLI's `can_use_tool` control request
 //! alone does not reliably gate tool execution. This crate has no GTK or WebView dependency.
 
+mod conversation;
 mod event;
 mod process;
 mod projection;
@@ -25,6 +26,7 @@ pub mod providers;
 pub mod settings;
 pub mod transcript;
 
+pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 pub use session::AgentSession;
@@ -37,6 +39,6 @@ pub use projection::{
 pub use provider::{
     AgentProvider, CreateSessionRequest, ResumeSessionRequest, SendTurnRequest,
     InterruptTurnRequest, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
-    ProviderError, ProviderInfo,
+    ProviderError, ProviderErrorCode, ProviderInfo,
 };
 pub use providers::claude_sidecar::ClaudeSidecarProvider;
