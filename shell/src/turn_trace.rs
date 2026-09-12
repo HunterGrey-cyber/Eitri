@@ -1,0 +1,297 @@
+// shell/src/turn_trace.rs
+//! Where a turn's latency actually goes, from the click to the pixels.
+//!
+//! Off unless `NEOVIBE_AGENT_TRACE=1`. One line per turn, to stderr.
+//!
+//! The point is to tell "the model is slow" apart from "our pipeline is slow", which the numbers in
+//! `agent/tests/claude_sidecar_partial_streaming.rs` cannot do: those are measured at the provider
+//! boundary, so everything after it -- the 33ms pump, the bridge hop, the WebView's own render --
+//! is invisible to them. Partial streaming cut time-to-first-text from ~29s to ~11s, and the next
+//! honest question is how much of the remainder this side is responsible for.
+//!
+//! The five marks:
+//!
+//! | mark | stamped where | means |
+//! | --- | --- | --- |
+//! | submitted | the `send_message` inbound message is handled | the user pressed Send |
+//! | first provider event | the pump drains any event of this turn | the provider said anything at all |
+//! | first presentation delta | the pump drains the first assistant text | the first characters exist here |
+//! | first paint frame | reported back by the WebView | the first characters are on screen |
+//! | completed | the pump drains `TurnCompleted` | the turn is over |
+//!
+//! **On "first paint frame", and what it is not.** The WebView reports how long it took from
+//! *receiving* the payload to the animation frame that drew it, and that span is added to the
+//! moment Rust dispatched it. Measured as a span rather than a wall-clock instant on purpose: JS
+//! `performance.now()` and Rust `Instant` have unrelated epochs, so subtracting one from the other
+//! would produce a confident, meaningless number. It is also a frame, not a photon -- the callback
+//! runs before the compositor presents -- so read it as the frame the text was drawn into, and as a
+//! floor on what the user perceives, never as a measured perceptual latency.
+
+use agent::{AgentDomainEvent, ContentKind};
+use std::time::{Duration, Instant};
+
+/// True when `NEOVIBE_AGENT_TRACE=1`. Read once per turn rather than cached in a `static`, so it can
+/// be flipped between runs of a long-lived process without a restart; a turn is far too coarse for
+/// one `std::env::var` to matter.
+fn enabled() -> bool {
+    matches!(std::env::var("NEOVIBE_AGENT_TRACE").as_deref(), Ok("1"))
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// One turn's marks. Created when the turn is submitted, emitted when it ends.
+#[derive(Debug)]
+pub(crate) struct TurnTrace {
+    submitted_at: Instant,
+    /// The provider's own id for this turn, learned from `TurnStarted`. Not known at submit time:
+    /// `send_turn` returns one for the sidecar but not for the legacy backend, and this file must
+    /// not care which backend it is looking at.
+    turn_id: Option<String>,
+    first_provider_event: Option<Duration>,
+    first_presentation_delta: Option<Duration>,
+    /// Dispatch time of the payload carrying the first assistant text, plus the WebView's own
+    /// receive-to-frame span. `None` until the WebView reports, which it does exactly once per turn.
+    first_paint_frame: Option<Duration>,
+    /// When the payload carrying the first assistant text was handed to the WebView. Kept so the
+    /// reported span can be added to it later.
+    first_text_dispatched: Option<Duration>,
+    completed: Option<Duration>,
+    /// Set once the line has been printed, so a second terminal event cannot print a second line.
+    emitted: bool,
+}
+
+impl TurnTrace {
+    /// Starts a trace, or returns `None` when tracing is off -- so every call site is a cheap
+    /// `Option` check rather than a flag test scattered through the panel.
+    pub(crate) fn start() -> Option<Self> {
+        enabled().then(|| Self {
+            submitted_at: Instant::now(),
+            turn_id: None,
+            first_provider_event: None,
+            first_presentation_delta: None,
+            first_paint_frame: None,
+            first_text_dispatched: None,
+            completed: None,
+            emitted: false,
+        })
+    }
+
+    fn since_submit(&self) -> Duration {
+        self.submitted_at.elapsed()
+    }
+
+    /// Folds one drained batch. Called with the same slice the bridge is about to serialize, so the
+    /// marks describe the events the user is actually about to see.
+    ///
+    /// Returns true when this batch carried the first assistant text, which is the caller's cue to
+    /// stamp the dispatch time.
+    pub(crate) fn observe(&mut self, events: &[AgentDomainEvent]) -> bool {
+        let mut carried_first_text = false;
+        for event in events {
+            if self.first_provider_event.is_none() {
+                self.first_provider_event = Some(self.since_submit());
+            }
+            match event {
+                AgentDomainEvent::TurnStarted { turn_id } => {
+                    if self.turn_id.is_none() {
+                        self.turn_id = Some(turn_id.clone());
+                    }
+                }
+                AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. }
+                    if self.first_presentation_delta.is_none() && !text.is_empty() =>
+                {
+                    self.first_presentation_delta = Some(self.since_submit());
+                    carried_first_text = true;
+                }
+                AgentDomainEvent::TurnCompleted { .. } => {
+                    self.completed = Some(self.since_submit());
+                }
+                // A turn that ends because the session did still gets a line: a trace that only
+                // prints for turns that finished cleanly hides exactly the slow, broken ones.
+                AgentDomainEvent::SessionUnavailable { .. } | AgentDomainEvent::SessionClosed { .. } => {
+                    if self.completed.is_none() {
+                        self.completed = Some(self.since_submit());
+                    }
+                }
+                _ => {}
+            }
+        }
+        carried_first_text
+    }
+
+    /// Records when the payload carrying the first assistant text was handed to the WebView.
+    pub(crate) fn mark_first_text_dispatched(&mut self) {
+        if self.first_text_dispatched.is_none() {
+            self.first_text_dispatched = Some(self.since_submit());
+        }
+    }
+
+    /// The WebView's own receive-to-animation-frame span for that payload. Ignored if it arrives
+    /// twice, or before the dispatch it refers to.
+    pub(crate) fn mark_painted(&mut self, receive_to_frame_ms: f64) {
+        if self.first_paint_frame.is_some() || !receive_to_frame_ms.is_finite() || receive_to_frame_ms < 0.0 {
+            return;
+        }
+        if let Some(dispatched) = self.first_text_dispatched {
+            self.first_paint_frame = Some(dispatched + Duration::from_secs_f64(receive_to_frame_ms / 1000.0));
+        }
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.completed.is_some()
+    }
+
+    /// True once every mark that is still coming has arrived. A turn whose text was never painted
+    /// (an interrupt before any text, a session that died first) is finished without it, so this
+    /// also reports true when there is nothing left to wait for.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.is_finished()
+            && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none())
+    }
+
+    /// Prints the line. Idempotent: the caller emits on completion and again on a deadline, and only
+    /// the first one produces output.
+    pub(crate) fn emit(&mut self) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let mark = |d: Option<Duration>| match d {
+            Some(d) => format!("{:.0}ms", ms(d)),
+            None => "--".to_string(),
+        };
+        eprintln!(
+            "[turn-trace] turn={} submitted=0ms first_provider_event={} first_presentation_delta={} \
+             first_paint_frame={} completed={}",
+            self.turn_id.as_deref().unwrap_or("?"),
+            mark(self.first_provider_event),
+            mark(self.first_presentation_delta),
+            mark(self.first_paint_frame),
+            mark(self.completed),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::TurnOutcome;
+
+    /// Built directly rather than through `start()`, which is env-gated: these tests are about the
+    /// folding, not about whether the flag is set.
+    fn trace() -> TurnTrace {
+        TurnTrace {
+            submitted_at: Instant::now(),
+            turn_id: None,
+            first_provider_event: None,
+            first_presentation_delta: None,
+            first_paint_frame: None,
+            first_text_dispatched: None,
+            completed: None,
+            emitted: false,
+        }
+    }
+
+    fn text(s: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: s.into() }
+    }
+
+    #[test]
+    fn the_first_provider_event_can_precede_the_first_text() {
+        let mut trace = trace();
+        // Thinking arrives first on a real turn, and often by many seconds. Counting it as the first
+        // presentation delta would make the pipeline look faster than a reader could possibly see.
+        let carried = trace.observe(&[
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() },
+        ]);
+        assert!(!carried);
+        assert!(trace.first_provider_event.is_some());
+        assert!(trace.first_presentation_delta.is_none());
+        assert_eq!(trace.turn_id.as_deref(), Some("t1"));
+
+        assert!(trace.observe(&[text("hello")]), "the batch carrying the first text must say so");
+        assert!(trace.first_presentation_delta.is_some());
+    }
+
+    #[test]
+    fn an_empty_text_delta_is_not_the_first_visible_text() {
+        let mut trace = trace();
+        assert!(!trace.observe(&[text("")]));
+        assert!(trace.first_presentation_delta.is_none());
+    }
+
+    #[test]
+    fn only_the_first_text_batch_claims_the_mark() {
+        let mut trace = trace();
+        assert!(trace.observe(&[text("a")]));
+        let first = trace.first_presentation_delta;
+        assert!(!trace.observe(&[text("b")]));
+        assert_eq!(trace.first_presentation_delta, first);
+    }
+
+    #[test]
+    fn a_paint_report_is_added_to_the_dispatch_it_refers_to() {
+        let mut trace = trace();
+        trace.observe(&[text("a")]);
+        trace.mark_first_text_dispatched();
+        let dispatched = trace.first_text_dispatched.unwrap();
+        trace.mark_painted(40.0);
+        let painted = trace.first_paint_frame.unwrap();
+        assert!(painted >= dispatched + Duration::from_millis(39), "{painted:?} vs {dispatched:?}");
+        // A second report is ignored -- the mark is "first", and a later frame is not it.
+        trace.mark_painted(500.0);
+        assert_eq!(trace.first_paint_frame, Some(painted));
+    }
+
+    /// A report that arrives with no dispatch to attach it to is dropped rather than measured from
+    /// submit -- that would silently hand the WebView credit for the model's own thinking time.
+    #[test]
+    fn a_paint_report_without_a_dispatch_is_ignored() {
+        let mut trace = trace();
+        trace.mark_painted(40.0);
+        assert!(trace.first_paint_frame.is_none());
+    }
+
+    #[test]
+    fn a_nonsense_paint_report_is_ignored() {
+        let mut trace = trace();
+        trace.observe(&[text("a")]);
+        trace.mark_first_text_dispatched();
+        trace.mark_painted(-5.0);
+        trace.mark_painted(f64::NAN);
+        assert!(trace.first_paint_frame.is_none());
+    }
+
+    #[test]
+    fn a_turn_that_produced_no_text_is_complete_without_a_paint() {
+        let mut trace = trace();
+        trace.observe(&[AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(), outcome: TurnOutcome::Interrupted, result_text: String::new(),
+            stop_reason: None, total_cost_usd: 0.0, num_turns: 0,
+        }]);
+        assert!(trace.is_finished());
+        assert!(trace.is_complete(), "nothing is still coming, so waiting for a paint would hang the line");
+    }
+
+    /// The slow and broken turns are the ones worth tracing, so a session that dies mid-turn still
+    /// produces a line rather than being the one case that silently never reports.
+    #[test]
+    fn a_session_that_dies_mid_turn_still_finishes_its_trace() {
+        let mut trace = trace();
+        trace.observe(&[text("half an ans")]);
+        trace.mark_first_text_dispatched();
+        trace.observe(&[AgentDomainEvent::SessionUnavailable { reason: "gone".into() }]);
+        assert!(trace.is_finished());
+    }
+
+    #[test]
+    fn emit_prints_once() {
+        let mut trace = trace();
+        trace.emit();
+        assert!(trace.emitted);
+        trace.emit(); // no panic, no second line
+    }
+}

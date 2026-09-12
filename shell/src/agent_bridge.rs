@@ -41,6 +41,13 @@ pub(crate) enum InboundMessage {
     },
     SendMessage { request_id: String, text: String },
     Interrupt { request_id: String },
+    /// The WebView reporting how long it took to draw the first assistant text of a turn, measured
+    /// from its own receipt of the payload to the animation frame that rendered it.
+    ///
+    /// A SPAN, not an instant: JS `performance.now()` and Rust `Instant` have unrelated epochs, so a
+    /// timestamp crossing this boundary would be a confident, meaningless number. Diagnostic only --
+    /// nothing branches on it, and it gets no `command_result`.
+    TurnRendered { request_id: String, receive_to_frame_ms: f64 },
     PermissionResponse {
         request_id: String,
         permission_id: String,
@@ -86,6 +93,7 @@ impl InboundMessage {
             | InboundMessage::StartSession { request_id, .. }
             | InboundMessage::SendMessage { request_id, .. }
             | InboundMessage::Interrupt { request_id }
+            | InboundMessage::TurnRendered { request_id, .. }
             | InboundMessage::PermissionResponse { request_id, .. } => request_id,
         }
     }

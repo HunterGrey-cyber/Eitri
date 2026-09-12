@@ -9,7 +9,13 @@ export type OutboundMessage =
    *  rather than defaulting it, and the tempting default would be the one that runs the tool.
    *  `reason` is only ever sent with a denial -- there is no field downstream that would show the
    *  model an approval's reason. */
-  | { type: "permission_response"; request_id: string; permission_id: string; decision: PermissionDecision; reason?: string };
+  | { type: "permission_response"; request_id: string; permission_id: string; decision: PermissionDecision; reason?: string }
+  /** How long this WebView took to draw a turn's first assistant text, from its own receipt of the
+   *  payload to the animation frame that rendered it. A SPAN, not an instant: `performance.now()`
+   *  and Rust's `Instant` have unrelated epochs, so a timestamp crossing this boundary would be a
+   *  confident, meaningless number. Diagnostic only -- Rust expects no reply and nothing branches
+   *  on it. */
+  | { type: "turn_rendered"; request_id: string; receive_to_frame_ms: number };
 
 /** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
  *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send

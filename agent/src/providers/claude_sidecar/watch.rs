@@ -56,6 +56,14 @@ pub(crate) enum SequenceVerdict {
     Deliver,
     /// Already delivered. A reconnect replays from `after_sequence`, and the boundary is inclusive
     /// enough that the same event can legitimately arrive twice; dropping it is correct and silent.
+    ///
+    /// The ONLY silent path here, and safe for one specific reason: `last_delivered` can only ever
+    /// have come from this same server's own sequence counter, so it cannot run ahead of what the
+    /// server has assigned and mistake fresh events for replays. (Verdandi's claude ring accepts an
+    /// impossible `after_sequence` -- one beyond anything ever assigned -- without complaint, per
+    /// verdandi-37's own reading of the terminal sidecar's mirror of this code, so the client cannot
+    /// lean on the server to catch it. Nothing here ever invents a cursor, which is what keeps that
+    /// laxness out of reach.)
     Duplicate,
     /// Events between the last delivered one and this one were skipped, and replay will never bring
     /// them back. The assistant text this client holds is missing a piece in the middle.

@@ -10,6 +10,7 @@ mod layout;
 mod pane_switch;
 mod supervisor_client;
 mod theme;
+mod turn_trace;
 mod lua;
 
 use std::path::PathBuf;
