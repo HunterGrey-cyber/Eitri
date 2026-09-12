@@ -85,7 +85,8 @@ impl SpawnedSidecar {
 ///
 /// Update this value after `claude_sidecar_lifecycle_conformance` passes against
 /// the candidate revision. It checks multiple turns with content checks, BYPASS
-/// tool execution, reuse after interruption, and teardown without orphan processes.
+/// tool execution, reuse after interruption, teardown without orphan processes,
+/// and resume verified by both content and provider session ID.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
