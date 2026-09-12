@@ -23,6 +23,29 @@ use agent::{
 };
 use std::path::{Path, PathBuf};
 
+/// The legacy backend's capabilities, stated once so a test can assert on the value
+/// `capabilities()` actually returns rather than on a copy of it.
+///
+/// It advertises nothing over a wire, so these are read off what its code demonstrably does: it
+/// interrupts (`AgentSession::interrupt` sends a real control_request), it has no resume and no
+/// fork, and `PermissionMode::Bypass` is a real construction-time choice.
+const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
+    resume: false,
+    fork: false,
+    interrupt: true,
+    bypass_permission_mode: true,
+};
+
+// Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
+// controls on exactly these flags. A runtime assertion would be a constant assertion in a test
+// nobody has to run; this fails the build. Flipping either one here must happen in the same change
+// that implements the path behind it -- see `CLIENT_IMPLEMENTS_RESUME` in the agent crate for the
+// sidecar side of the same rule.
+const _: () = {
+    assert!(!LEGACY_CAPABILITIES.resume, "resume must not be advertised before it works end to end");
+    assert!(!LEGACY_CAPABILITIES.fork, "fork must not be advertised before it works end to end");
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendKind {
     Legacy,
@@ -152,6 +175,20 @@ impl AgentBackend {
         }
     }
 
+    /// Verdandi's own session id -- known from `CreateSession`'s reply, before any event arrives.
+    ///
+    /// The projection only learns it when the first `SessionOpened` is folded, and on the sidecar
+    /// backend that does not happen until the first TURN (the Agent SDK emits its system/init per
+    /// turn). Reading the projection alone therefore showed an empty session id for the entire
+    /// window between "session created" and "first turn sent" -- visible in the panel header as a
+    /// dash where the real id already existed.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        match self {
+            AgentBackend::Legacy(session) => session.projection.session_id.as_deref(),
+            AgentBackend::Sidecar(conversation) => conversation.session_id(),
+        }
+    }
+
     /// The Claude session UUID, once the provider has reported it. Distinct from the projection's
     /// `session_id` (Verdandi's) for the sidecar backend; identical for the legacy one, whose CLI
     /// never separated them.
@@ -178,12 +215,7 @@ impl AgentBackend {
     /// real bypass mode.
     pub(crate) fn capabilities(&self) -> ProviderCapabilities {
         match self {
-            AgentBackend::Legacy(_) => ProviderCapabilities {
-                resume: false,
-                fork: false,
-                interrupt: true,
-                bypass_permission_mode: true,
-            },
+            AgentBackend::Legacy(_) => LEGACY_CAPABILITIES,
             AgentBackend::Sidecar(conversation) => conversation.capabilities(),
         }
     }
@@ -304,12 +336,20 @@ mod tests {
     }
 
     #[test]
-    fn neither_backend_reports_resume_in_this_milestone() {
-        // Resume is not exposed in this phase. If this ever fails, the UI would grow a Resume
-        // control before the path behind it exists.
-        let legacy = ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true };
-        assert!(!legacy.resume);
-        assert!(!legacy.fork);
+    fn the_legacy_greeting_and_its_capabilities_agree_about_resume() {
+        // Not a constant assertion: this crosses two independently-written surfaces -- the
+        // capability constant `AgentBackend::capabilities()` returns, and the `hello` envelope's
+        // own `resumeAvailable`. They are produced by different code and must not drift apart.
+        // (resume/fork being false at all is enforced at compile time next to the constant.)
+        let greeting = BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/tmp"));
+        let hello: serde_json::Value =
+            serde_json::from_str(&crate::agent_bridge::serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(hello["resumeAvailable"], LEGACY_CAPABILITIES.resume);
+        // Cross-checked against the greeting rather than asserted directly: the greeting offers
+        // "bypass" as a real choice, and a backend that advertises the mode must support it.
+        let modes: Vec<&str> = greeting.permission_modes.to_vec();
+        assert_eq!(modes.contains(&"bypass"), LEGACY_CAPABILITIES.bypass_permission_mode);
+        assert_eq!(modes, vec!["auto", "bypass"]);
     }
 
     #[test]
