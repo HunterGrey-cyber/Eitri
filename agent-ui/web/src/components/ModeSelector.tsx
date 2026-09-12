@@ -3,7 +3,7 @@ import type { Hello, PermissionModeChoice } from "../types";
 type Props = {
   hello: Hello | null;
   connecting: boolean;
-  onStart: (mode: PermissionModeChoice) => void;
+  onStart: (mode: PermissionModeChoice, resume?: string) => void;
 };
 
 /** One button per permission mode the backend GENUINELY offers, driven by `hello.permissionModes`
@@ -12,15 +12,13 @@ type Props = {
  * Rendering a fixed pair here would offer the sidecar user a choice between two modes that behave
  * identically. */
 const MODE_LABELS: Record<PermissionModeChoice, { title: string; detail: string }> = {
-  auto: {
-    title: "Auto",
-    detail: "Tool calls that could change things ask first.",
-  },
-  bypass: {
-    title: "Bypass",
-    detail: "No permission prompts. Every tool call proceeds immediately.",
-  },
+  auto: { title: "Auto", detail: "Tool calls that could change things ask first." },
+  bypass: { title: "Bypass", detail: "No permission prompts. Every tool call proceeds immediately." },
 };
+
+function shortId(id: string): string {
+  return id.slice(0, 8);
+}
 
 export function ModeSelector({ hello, connecting, onStart }: Props) {
   if (connecting) {
@@ -40,6 +38,12 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
   }
 
   const onlyBypass = hello.permissionModes.length === 1 && hello.permissionModes[0] === "bypass";
+  // The default mode for a continued session: the single offered mode when there is only one,
+  // otherwise the safer of the two. Resuming deliberately does not ask again -- the permission
+  // policy is a property of the new run, not of the conversation being continued, and making the
+  // user re-answer it turns a one-click "carry on" into a form.
+  const resumeMode: PermissionModeChoice = hello.permissionModes.includes("auto") ? "auto" : "bypass";
+  const resumable = hello.resumableSession;
 
   return (
     <div className="mode-selector">
@@ -55,6 +59,18 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
           <span className="detail">{MODE_LABELS[mode].detail}</span>
         </button>
       ))}
+      {resumable !== null && (
+        // Rendered on `resumableSession` alone. That field is already the full condition -- server
+        // advertised resume, this client implements it, and this workspace has a stored provider
+        // session -- so there is no second check to forget here.
+        <button className="resume" onClick={() => onStart(resumeMode, resumable.providerSessionId)}>
+          <strong>Continue previous session</strong>
+          <span className="detail">
+            Claude {shortId(resumable.providerSessionId)}
+            {resumable.updatedAt !== "" ? ` · last used ${formatWhen(resumable.updatedAt)}` : ""}
+          </span>
+        </button>
+      )}
       {onlyBypass && (
         // Said plainly rather than buried: this backend runs every tool without asking, and that is
         // the only policy it currently implements. Calling it a "choice" would imply an alternative
@@ -66,4 +82,12 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
       )}
     </div>
   );
+}
+
+/** `updatedAt` is epoch milliseconds as a string (no date library is a dependency of the Rust side
+ * that writes it). Anything unparseable renders as-is rather than as "Invalid Date". */
+function formatWhen(updatedAt: string): string {
+  const millis = Number(updatedAt);
+  if (!Number.isFinite(millis) || millis <= 0) return updatedAt;
+  return new Date(millis).toLocaleString();
 }

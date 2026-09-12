@@ -2,7 +2,7 @@ import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
-  | { type: "start_session"; request_id: string; mode: "auto" | "bypass" }
+  | { type: "start_session"; request_id: string; mode: "auto" | "bypass"; resume?: string }
   | { type: "send_message"; request_id: string; text: string }
   | { type: "interrupt"; request_id: string }
   | { type: "permission_response"; request_id: string; permission_id: string; allow: boolean; reason?: string };

@@ -8,14 +8,59 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// What one workspace's last conversation was, and enough to offer continuing it.
+///
+/// The resume key is `provider_session_id` -- Claude's identity -- and deliberately NOT the
+/// Verdandi session id. The real end-to-end test settled this: resuming mints a NEW Verdandi
+/// session while the Claude session continues, so a record keyed on the Verdandi id would point at
+/// something that no longer exists the moment it was used.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationRecord {
     pub conversation_id: String,
     pub provider: String,
+    /// Claude's session UUID. The only identity that survives a resume.
     pub provider_session_id: String,
     pub canonical_cwd: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Whether the provider advertised `resume` the last time this record was written.
+    ///
+    /// The last-known value, not a guarantee -- it is what makes "does this workspace have a
+    /// RESUMABLE session?" answerable before a provider exists, which is when the start screen has
+    /// to decide whether to offer the option. It is re-checked against the live handshake at the
+    /// moment resume is actually attempted, and a provider that no longer advertises it refuses
+    /// there rather than here.
+    ///
+    /// `#[serde(default)]` because records written before this field existed must still load; they
+    /// read as `false`, which correctly means "we cannot claim this is resumable".
+    #[serde(default)]
+    pub provider_advertised_resume: bool,
+}
+
+/// A previous conversation in this workspace that can be offered for continuation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumableSession {
+    pub provider: String,
+    pub provider_session_id: String,
+    pub updated_at: String,
+}
+
+/// Answers "does this workspace have a session worth offering to continue?" without needing a live
+/// provider -- the start screen has to decide before one exists.
+///
+/// Returns `None` rather than an error for every negative case (no record, unreadable record, a
+/// record whose provider did not advertise resume): none of them are failures a user can act on,
+/// and all of them mean exactly one thing to the caller -- do not offer it.
+pub fn resumable_session(conversation_id: &str) -> Option<ResumableSession> {
+    let record = load_conversation_record(conversation_id).ok()?;
+    if !record.provider_advertised_resume || record.provider_session_id.trim().is_empty() {
+        return None;
+    }
+    Some(ResumableSession {
+        provider: record.provider,
+        provider_session_id: record.provider_session_id,
+        updated_at: record.updated_at,
+    })
 }
 
 /// `$XDG_STATE_HOME/neovibe/conversations/`, falling back to `~/.local/state/neovibe/conversations/`
@@ -93,6 +138,23 @@ mod tests {
     }
 
     #[test]
+    fn a_record_written_before_provider_advertised_resume_existed_still_loads() {
+        // Records on disk predate this field. Without serde's default they would fail to
+        // deserialize, which would silently look like "this workspace has no previous session".
+        let json = r#"{
+            "conversation_id": "old",
+            "provider": "claude",
+            "provider_session_id": "prov-old",
+            "canonical_cwd": "/tmp/project",
+            "created_at": "1",
+            "updated_at": "2"
+        }"#;
+        let record: ConversationRecord = serde_json::from_str(json).expect("an older record must still load");
+        assert_eq!(record.provider_session_id, "prov-old");
+        assert!(!record.provider_advertised_resume, "unknown resumability must read as not-resumable");
+    }
+
+    #[test]
     fn a_path_traversal_shaped_conversation_id_is_rejected() {
         let result = validate_conversation_id("../../../../tmp/pwned");
         assert!(result.is_err());
@@ -107,6 +169,7 @@ mod tests {
             canonical_cwd: "/tmp/project".into(),
             created_at: "2026-09-10T00:00:00Z".into(),
             updated_at: "2026-09-10T00:00:00Z".into(),
+            provider_advertised_resume: true,
         };
         assert!(save_conversation_record(&record).is_err());
         assert!(load_conversation_record("../../../../tmp/pwned").is_err());
@@ -131,6 +194,7 @@ mod tests {
                 canonical_cwd: "/tmp/project".into(),
                 created_at: "2026-09-10T00:00:00Z".into(),
                 updated_at: "2026-09-10T00:00:00Z".into(),
+                provider_advertised_resume: true,
             };
             save_conversation_record(&record).unwrap();
             let loaded = load_conversation_record("conv-1").unwrap();
@@ -147,6 +211,27 @@ mod tests {
             save_conversation_record(&record2).unwrap();
             let loaded2 = load_conversation_record("conv-1").unwrap();
             assert_eq!(loaded2.provider_session_id, "prov-2");
+
+            // Scenario 4: resumable_session is the question the start screen actually asks.
+            let resumable = resumable_session("conv-1").expect("a record that advertised resume is offerable");
+            assert_eq!(resumable.provider_session_id, "prov-2");
+            assert_eq!(resumable.provider, "claude");
+            assert!(resumable_session("does-not-exist").is_none());
+
+            // Scenario 5: a record whose provider did NOT advertise resume is not offerable. This
+            // is also how every record written before the field existed reads (serde default).
+            let mut record3 = record2.clone();
+            record3.conversation_id = "conv-no-resume".into();
+            record3.provider_advertised_resume = false;
+            save_conversation_record(&record3).unwrap();
+            assert!(resumable_session("conv-no-resume").is_none());
+
+            // Scenario 6: an empty provider session id is never offerable, whatever the flag says.
+            let mut record4 = record2.clone();
+            record4.conversation_id = "conv-empty".into();
+            record4.provider_session_id = "   ".into();
+            save_conversation_record(&record4).unwrap();
+            assert!(resumable_session("conv-empty").is_none());
         });
     }
 }

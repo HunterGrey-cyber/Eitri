@@ -185,3 +185,12 @@ body,
   color: #cdd6f4;
   user-select: text;
 }
+
+/* The continue-previous-session option: visually distinct from a fresh start, since the two have
+   very different consequences and the wrong click is not obviously wrong afterwards. */
+.mode-selector button.resume {
+  border-color: #89b4fa;
+}
+.mode-selector button.resume strong {
+  color: #89b4fa;
+}

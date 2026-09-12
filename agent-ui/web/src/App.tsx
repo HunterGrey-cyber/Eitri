@@ -61,12 +61,15 @@ export default function App() {
     postToRust({ type: "ready", request_id: requestId });
   }, []);
 
-  function startSession(mode: PermissionModeChoice) {
+  /** `resume` carries the Claude provider session id to continue, or nothing for a fresh session.
+   * A resume that fails comes back as a normal fatal error and returns here -- it is never turned
+   * into a fresh session, by this component or by anything below it. */
+  function startSession(mode: PermissionModeChoice, resume?: string) {
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
     setStartingRequestId(requestId);
     setFatalError(null);
-    postToRust({ type: "start_session", request_id: requestId, mode });
+    postToRust({ type: "start_session", request_id: requestId, mode, resume });
   }
 
   function sendMessage(text: string) {

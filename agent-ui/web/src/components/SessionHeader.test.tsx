@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
-import { render } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+import { render, cleanup } from "@testing-library/react";
+
+// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+afterEach(cleanup);
 import { SessionHeader } from "./SessionHeader";
 import { initialState } from "../reducer";
 import type { AgentUiState } from "../types";

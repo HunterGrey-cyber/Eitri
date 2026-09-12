@@ -7,6 +7,15 @@ export type SessionStatus =
   | { kind: "closed"; reason: string };
 
 export type BackendKind = "legacy" | "sidecar";
+
+/** A previous conversation offered for continuation. The key is the CLAUDE session id -- the only
+ * identity that survives a resume. Resuming mints a new Verdandi session id, so storing that one
+ * would point at something that stops existing the moment it is used. */
+export type ResumableSession = {
+  provider: string;
+  providerSessionId: string;
+  updatedAt: string;
+};
 export type PermissionModeChoice = "auto" | "bypass";
 
 /** What the provider can actually do, as the server advertised it, intersected with what this
@@ -61,9 +70,13 @@ export type Hello = {
    * alone in this milestone -- its `interactive` and `verdandi_rules` modes are confirmed to
    * behave identically, so offering them as choices would be a lie. */
   permissionModes: PermissionModeChoice[];
-  /** Always false in this milestone. The single field a Resume control may ever be gated on, so
-   * the control cannot appear before the path behind it exists. */
-  resumeAvailable: boolean;
+  /** The previous conversation in this workspace, when there is one worth offering.
+   *
+   * Non-null only when ALL THREE hold: the provider advertised resume, this client implements it,
+   * and this workspace has a persisted provider session id. The continue-previous control renders
+   * on exactly this field and nothing else, so it cannot appear for a workspace with nothing to
+   * continue. Null is the normal case for a fresh workspace. */
+  resumableSession: ResumableSession | null;
   expectedVerdandiRevision: string | null;
 };
 
