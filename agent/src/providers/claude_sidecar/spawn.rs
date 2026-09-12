@@ -53,6 +53,9 @@ impl StderrTail {
 
 pub(crate) struct SpawnedSidecar {
     pub(crate) socket_path: PathBuf,
+    /// Which Verdandi checkout and revision this sidecar was built and launched from -- see
+    /// `describe_checkout`. Surfaced to the UI through `ProviderInfo::startup_diagnostics`.
+    pub(crate) checkout_diagnostics: Vec<String>,
     stdin_keepalive: Option<ChildStdin>,
     child: Child,
     stderr_tail: Arc<Mutex<StderrTail>>,
@@ -73,24 +76,111 @@ impl SpawnedSidecar {
     }
 }
 
-/// Locates the sidecar source checkout using an environment override or a default path
-/// under the user's home directory. The fallback must contain the sidecar package manifest.
-/// This lookup supports development checkouts.
-fn locate_verdandi_checkout() -> std::io::Result<PathBuf> {
-    if let Ok(path) = std::env::var("NEOVIBE_VERDANDI_CHECKOUT") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME").map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is unset and NEOVIBE_VERDANDI_CHECKOUT was not provided")
-    })?;
-    let default_path = PathBuf::from(home).join("src/verdandi");
-    if !default_path.join("apps/claude-sidecar/package.json").exists() {
+/// Baseline sidecar revision for development and conformance testing.
+/// Revision mismatches produce a startup diagnostic so the running build can be
+/// identified. Checkout overrides allow testing unreleased sidecars and protocol
+/// migrations without rejecting a different revision at startup.
+///
+/// Update this value after `claude_sidecar_lifecycle_conformance` passes against
+/// the candidate revision. It checks multiple turns with content checks, BYPASS
+/// tool execution, reuse after interruption, and teardown without orphan processes.
+pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
+
+/// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
+/// so the UI can name the backend build it is talking to.
+pub(crate) struct VerdandiCheckout {
+    pub(crate) path: PathBuf,
+    /// `git rev-parse --short HEAD`, or `None` when the checkout is not a git repo or `git` is
+    /// unavailable. Best-effort diagnostics only -- never a reason to refuse to start.
+    pub(crate) revision: Option<String>,
+    /// True when `NEOVIBE_VERDANDI_CHECKOUT` chose this path rather than the default.
+    pub(crate) from_override: bool,
+}
+
+/// Locates a real sidecar checkout for development and integration testing.
+/// The environment override takes precedence over the default checkout and uses
+/// the same validation. It allows testing feature branches, protocol migrations,
+/// or isolated checkouts. An invalid path fails with a clear error instead of
+/// falling back to a different sidecar.
+fn locate_verdandi_checkout() -> std::io::Result<VerdandiCheckout> {
+    let (path, from_override) = match std::env::var("NEOVIBE_VERDANDI_CHECKOUT") {
+        Ok(path) if !path.trim().is_empty() => (PathBuf::from(path.trim()), true),
+        _ => {
+            let home = std::env::var("HOME").map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "HOME is unset and NEOVIBE_VERDANDI_CHECKOUT was not provided",
+                )
+            })?;
+            (PathBuf::from(home).join("src/verdandi"), false)
+        }
+    };
+
+    // Validated for BOTH paths now. Previously only the default was checked, so a mistyped override
+    // reached `ensure_sidecar_built` and failed somewhere much less informative.
+    if !path.join("apps/claude-sidecar/package.json").exists() {
+        let origin = if from_override {
+            "NEOVIBE_VERDANDI_CHECKOUT points at"
+        } else {
+            "no Verdandi checkout found at the default"
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("no Verdandi checkout found at {default_path:?} -- set NEOVIBE_VERDANDI_CHECKOUT to override"),
+            format!(
+                "{origin} {path:?}, which has no apps/claude-sidecar/package.json -- \
+                 set NEOVIBE_VERDANDI_CHECKOUT to a real Verdandi checkout"
+            ),
         ));
     }
-    Ok(default_path)
+
+    let revision = git_short_revision(&path);
+    Ok(VerdandiCheckout { path, revision, from_override })
+}
+
+/// Best-effort `git rev-parse --short HEAD`. Any failure (not a repo, no `git`, detached weirdness)
+/// yields `None` -- this is diagnostics, and a diagnostic that can refuse to start is worse than no
+/// diagnostic.
+fn git_short_revision(checkout: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(checkout)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if revision.is_empty() {
+        None
+    } else {
+        Some(revision)
+    }
+}
+
+/// The one-line description of which backend build this session is running, plus a baseline-drift
+/// note when the checkout is not at `EXPECTED_VERDANDI_REVISION`. Surfaced through
+/// `ProviderInfo::startup_diagnostics`, so it reaches the UI rather than only this process's stderr.
+fn describe_checkout(checkout: &VerdandiCheckout) -> Vec<String> {
+    let source = if checkout.from_override { "NEOVIBE_VERDANDI_CHECKOUT" } else { "default path" };
+    let revision = checkout.revision.as_deref().unwrap_or("unknown revision");
+    let mut lines = vec![format!(
+        "Verdandi checkout: {} @ {revision} (via {source})",
+        checkout.path.display()
+    )];
+    // `starts_with` rather than equality: `git rev-parse --short` picks its own abbreviation length,
+    // which grows as a repository does, so a strict comparison would start reporting false drift.
+    if let Some(actual) = &checkout.revision {
+        if !actual.starts_with(EXPECTED_VERDANDI_REVISION) && !EXPECTED_VERDANDI_REVISION.starts_with(actual.as_str()) {
+            lines.push(format!(
+                "Verdandi baseline drift: running {actual}, this client was verified against \
+                 {EXPECTED_VERDANDI_REVISION}. Not an error -- testing a Verdandi branch is exactly \
+                 what NEOVIBE_VERDANDI_CHECKOUT is for -- but if behavior looks wrong, this is the \
+                 first thing to check."
+            ));
+        }
+    }
+    lines
 }
 
 /// True if the checkout's root `package.json` declares a `build` script.
@@ -170,6 +260,11 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
 /// concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let checkout = locate_verdandi_checkout()?;
+    let checkout_diagnostics = describe_checkout(&checkout);
+    for line in &checkout_diagnostics {
+        eprintln!("agent: {line}");
+    }
+    let checkout = checkout.path;
     let dist_entry = ensure_sidecar_built(&checkout)?;
     let socket_path = std::env::temp_dir().join(format!("neovibe-claude-sidecar-{instance_id}.sock"));
     let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
@@ -203,7 +298,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     const RETRY_DELAY: Duration = Duration::from_millis(50);
     for _ in 0..RETRY_ATTEMPTS {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            return Ok(SpawnedSidecar { socket_path, stdin_keepalive, child, stderr_tail });
+            return Ok(SpawnedSidecar { socket_path, checkout_diagnostics, stdin_keepalive, child, stderr_tail });
         }
         // Check for a dead child BEFORE sleeping again. The sidecar fails closed on a policy
         // violation (an incompatible Claude CLI, a socket already in use) by throwing before it

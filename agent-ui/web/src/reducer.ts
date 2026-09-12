@@ -1,8 +1,16 @@
 import type { AgentDomainEvent, AgentUiState, ToolCallRecord } from "./types";
 
+/** The state before any snapshot arrives. `backend` defaults to "legacy" only because something
+ * must be written here -- the real value always arrives with `hello` (before any session can exist)
+ * and again with every snapshot, so nothing renders a backend-dependent decision from this default.
+ * Capabilities default to all-false, which is the safe direction: a control gated on a capability
+ * stays hidden until the server has actually said the capability exists. */
 export function initialState(): AgentUiState {
   return {
+    backend: "legacy",
+    conversationId: null,
     sessionId: null,
+    providerSessionId: null,
     model: null,
     cwd: null,
     transcript: [],
@@ -10,13 +18,27 @@ export function initialState(): AgentUiState {
     status: { kind: "starting" },
     activeTurnId: null,
     pendingPermissions: [],
+    capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
+    provider: null,
   };
 }
 
 export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentUiState {
   switch (event.type) {
     case "session_opened":
-      return { ...state, sessionId: event.session_id, model: event.model, cwd: event.cwd, status: { kind: "running" } };
+      // Arrives once PER TURN on the sidecar backend, not once per session: the Agent SDK emits a
+      // system/init at the start of each turn even inside one streaming session. Folding it is
+      // idempotent, so that is harmless -- but it must never be read as "a new session began".
+      // `session_id` is Verdandi's and `provider_session_id` is Claude's; they are different values
+      // and are kept in different fields.
+      return {
+        ...state,
+        sessionId: event.session_id,
+        providerSessionId: event.provider_session_id,
+        model: event.model,
+        cwd: event.cwd,
+        status: { kind: "running" },
+      };
     case "turn_started":
       return { ...state, activeTurnId: event.turn_id };
     case "content_delta":

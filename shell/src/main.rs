@@ -2,6 +2,7 @@
 //! pane, and an agent panel. The agent panel hosts a frontend in a WebView and
 //! bridges it to a lazily started `agent::AgentSession`.
 
+mod agent_backend;
 mod agent_bridge;
 mod agent_panel;
 mod chrome;

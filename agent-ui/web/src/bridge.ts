@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiState } from "./types";
+import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -34,6 +34,7 @@ export function postToRust(message: OutboundMessage): void {
 
 type InboundHandler = (
   payload:
+    | { kind: "hello" } & Hello
     | { kind: "command_result"; requestId: string; ok: true }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     | { kind: "events"; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
@@ -52,7 +53,7 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
-      if (obj.kind === "command_result" || obj.kind === "events" || obj.kind === "snapshot" || obj.kind === "error") {
+      if (obj.kind === "hello" || obj.kind === "command_result" || obj.kind === "events" || obj.kind === "snapshot" || obj.kind === "error") {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;
       }
