@@ -130,3 +130,38 @@ pub(crate) fn install_webview_resize_throttle(agent: &gtk4::Widget) -> gtk4::Wid
 
     overlay.upcast()
 }
+
+/// Puts `bottom` underneath `content`, full width, in a vertical `GtkPaned`.
+///
+/// Called only when something has claimed the bottom slot. When nothing has, the window keeps the
+/// exact shape it had before this slot existed -- no extra `Paned`, no extra allocation pass -- so
+/// an unused feature costs the default layout nothing.
+///
+/// `bottom` gets `shrink = false` and a `size_request` floor for a reason a terminal makes
+/// concrete: a `GtkPaned` child with shrink enabled can be dragged to zero height, and a terminal
+/// dragged to zero reports a 1-row grid to its child process. `resize_start_child(true)` with
+/// `resize_end_child(false)` keeps the divider where the user left it when the window is resized,
+/// which is what a bottom terminal should do -- growing the window should give the editor the new
+/// space, not the terminal.
+pub(crate) fn build_vertical_split(content: &gtk4::Widget, bottom: &gtk4::Widget) -> (gtk4::Widget, Paned) {
+    const MIN_TERMINAL_HEIGHT: i32 = 80;
+
+    let paned = Paned::new(gtk4::Orientation::Vertical);
+    paned.add_css_class("content-area");
+    paned.set_vexpand(true);
+    paned.set_hexpand(true);
+    paned.set_wide_handle(true);
+
+    bottom.set_size_request(-1, MIN_TERMINAL_HEIGHT);
+
+    paned.set_start_child(Some(content));
+    paned.set_end_child(Some(bottom));
+    paned.set_resize_start_child(true);
+    paned.set_resize_end_child(false);
+    paned.set_shrink_start_child(false);
+    paned.set_shrink_end_child(false);
+    paned.set_position(480);
+
+    let widget = paned.clone().upcast();
+    (widget, paned)
+}

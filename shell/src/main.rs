@@ -10,6 +10,7 @@ mod chrome;
 mod layout;
 mod pane_switch;
 mod supervisor_client;
+mod terminal_panel;
 mod theme;
 mod turn_trace;
 mod lua;
@@ -42,13 +43,18 @@ fn main() -> glib::ExitCode {
     // `--clean` on this binary's own command line to launch nvim with `--clean` instead of a
     // real embedding host's actual config.
     let want_clean = std::env::args().any(|arg| arg == "--clean");
+    // `--terminal` adds the native terminal pane along the bottom. Opt-in because it cannot do
+    // anything yet -- Verdandi owns the PTY and `Term` and has not shipped them -- so the default
+    // window keeps exactly the startup, memory and focus behaviour it had. See
+    // `terminal_panel`'s own doc; the flag goes away when a session type lands.
+    let want_terminal = std::env::args().any(|arg| arg == "--terminal");
 
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_ui(app, want_clean));
+    app.connect_activate(move |app| build_ui(app, want_clean, want_terminal));
     app.run_with_args::<&str>(&[])
 }
 
-fn build_ui(app: &Application, want_clean: bool) {
+fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
     let theme = theme::Theme::dark();
     chrome::apply_css(&theme.to_css());
 
@@ -85,6 +91,19 @@ fn build_ui(app: &Application, want_clean: bool) {
         PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget },
     );
 
+    // Through the same `register` path as the other two built-ins, and BEFORE init.lua, so a
+    // plugin can replace the terminal in the bottom slot exactly as it can replace the editor or
+    // the agent panel. The `Rc` is kept here rather than only in the registry: focus routing needs
+    // `TerminalPane::grab_focus`, and the registry stores an opaque `gtk4::Widget`.
+    let terminal = want_terminal.then(|| {
+        let (terminal, widget) = terminal_panel::build_terminal_panel();
+        lua_engine.register_builtin_panel(
+            PanelSlot::Bottom,
+            PanelEntry { id: "terminal".into(), title: "Terminal".into(), widget },
+        );
+        terminal
+    });
+
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
     // Build the real layout from whatever ended up in the registry -- this is what makes
@@ -92,7 +111,11 @@ fn build_ui(app: &Application, want_clean: bool) {
     // documentation. `.expect()` here is deliberate: both slots are guaranteed non-empty by this
     // point (the two `register_builtin_panel` calls above ran unconditionally, and even if
     // init.lua replaced one, replacement never leaves a slot empty).
-    let (main_widget, side_widget) = {
+    //
+    // The bottom slot is the one that can legitimately be empty -- no `--terminal` and no plugin
+    // claiming it -- so it is an `Option` rather than an `expect`, and an empty one means the
+    // window is built with no vertical split at all.
+    let (main_widget, side_widget, bottom_widget) = {
         let panels = lua_engine.panels.borrow();
         let main_widget = panels
             .get(PanelSlot::Main)
@@ -102,7 +125,8 @@ fn build_ui(app: &Application, want_clean: bool) {
             .get(PanelSlot::Side)
             .map(|e| e.widget.clone())
             .expect("side slot must be populated by this point");
-        (main_widget, side_widget)
+        let bottom_widget = panels.get(PanelSlot::Bottom).map(|e| e.widget.clone());
+        (main_widget, side_widget, bottom_widget)
     };
 
     let window = ApplicationWindow::builder()
@@ -120,6 +144,10 @@ fn build_ui(app: &Application, want_clean: bool) {
     root.add_css_class("shell-root");
 
     let (content_widget, _paned) = layout::build_content_area(&main_widget, &side_widget);
+    let content_widget = match &bottom_widget {
+        Some(bottom) => layout::build_vertical_split(&content_widget, bottom).0,
+        None => content_widget,
+    };
 
     root.append(&chrome::build_top_bar(&window));
     root.append(&content_widget);
@@ -137,7 +165,16 @@ fn build_ui(app: &Application, want_clean: bool) {
     // never sees the keypresses that Neovim resolved internally.
     if let Some(ps) = pane_switch.as_mut() {
         let side_widget = side_widget.clone();
+        let terminal_for_switch = terminal.clone();
         ps.listen(move |direction| match direction {
+            // Ctrl+j past Neovim's own bottom window boundary, when a terminal is down there.
+            // Falls through to the no-op arm when there is none, which is what real tmux does at
+            // the edge of its pane grid -- not an error, just nothing in that direction.
+            'D' if terminal_for_switch.is_some() => {
+                let terminal = terminal_for_switch.as_ref().expect("guarded by the match arm");
+                terminal.grab_focus();
+                println!("[pane_switch] direction D -> focusing the terminal pane");
+            }
             'R' => {
                 // A `WebView` is an ordinary focusable GTK widget -- unlike a bare `GtkGLArea`,
                 // which needs `focusable(true)` set explicitly before `grab_focus()` does
@@ -177,6 +214,33 @@ fn build_ui(app: &Application, want_clean: bool) {
             glib::Propagation::Proceed
         });
         side_widget.add_controller(controller);
+    }
+
+    // --- Ctrl+k: terminal -> editor.
+    //
+    // Same shape as the agent panel's Ctrl+h above and for the same reason: `vim-tmux-navigator`
+    // lives inside Neovim, which is not focused here, so nothing on that side would ever run. This
+    // is the third focusable surface in the window, which is the situation that produced a real
+    // bug once already -- the editor stopped receiving click-focus when the agent panel became the
+    // second one. Capture phase so the chord is claimed before the pane's own key controller
+    // forwards it, since `TerminalPane` claims every key it is focused on (a terminal is the
+    // consumer of its own keyboard) and a bubble-phase handler here would never see it.
+    if let Some(terminal) = terminal.as_ref() {
+        let pane = pane.clone();
+        let controller = EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            if key == Key::k && state.contains(ModifierType::CONTROL_MASK) {
+                // The pane's own method, not `widget().grab_focus()`: it also drives the editor's
+                // IM context, without which the input method keeps believing the terminal has the
+                // keyboard.
+                pane.grab_focus();
+                println!("[pane_switch] Ctrl+k in the terminal -> focusing the editor");
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        terminal.widget().add_controller(controller);
     }
 
     // nvim exiting on its own (e.g. `:qa!`) has no window to close by itself -- ask this
@@ -272,7 +336,8 @@ fn build_ui(app: &Application, want_clean: bool) {
     });
 
     println!(
-        "shell running: chrome+editor+agent-panel. scale_factor={} clean={}",
+        "shell running: chrome+editor+agent-panel{}. scale_factor={} clean={}",
+        if terminal.is_some() { "+terminal" } else { "" },
         window.scale_factor(),
         want_clean,
     );
