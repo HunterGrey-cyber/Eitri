@@ -118,11 +118,12 @@ impl std::fmt::Display for ConversationError {
                  there first, or start a new conversation"
             ),
             ConversationError::Lease(e) => write!(f, "could not take the session lease: {e}"),
-            ConversationError::ResumeRejected { provider_session_id, reason } => write!(
-                f,
-                "the provider ended session {provider_session_id} immediately after accepting it \
-                 ({reason}) -- it most likely no longer exists. Start a new session instead."
-            ),
+            // Just the reason. It used to be wrapped in "the provider ended session X immediately
+            // after accepting it ... it most likely no longer exists" -- the old inference, written
+            // when this side was guessing from a termination it happened to observe. The provider
+            // now states a typed verdict and `describe_failed_resume` renders it, so the wrapper
+            // added a second, vaguer, and sometimes wrong account of the same event.
+            ConversationError::ResumeRejected { reason, .. } => write!(f, "{reason}"),
             ConversationError::ResumeIdentityMismatch { requested, actual } => write!(
                 f,
                 "asked to continue session {requested}, but the provider opened {actual} instead. \

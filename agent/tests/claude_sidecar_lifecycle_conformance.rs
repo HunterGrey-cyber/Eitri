@@ -386,8 +386,17 @@ fn a_connected_provider_reports_wire_sourced_capabilities_and_versions() {
     let info = provider.info();
     let capabilities = provider.capabilities();
 
-    assert_eq!(info.protocol_major, 1);
+    // 2 since the replay-start change (2026-09-12). A real incompatibility in both directions, which
+    // is what the handshake field is for -- see CLIENT_PROTOCOL_MAJOR's own comment.
+    assert_eq!(info.protocol_major, 2);
     assert!(!info.sidecar_version.is_empty(), "got: {info:?}");
+    // The provider states how much history it retains, and this client now keeps it. A test that
+    // configures a small ring has no other way to confirm the configuration actually took effect.
+    assert!(
+        info.event_buffer_policy.starts_with("bounded-"),
+        "the provider must state its replay capacity, got: {:?}",
+        info.event_buffer_policy
+    );
     assert!(!info.actual_claude_code_version.is_empty(), "got: {info:?}");
     assert!(!info.advertised_capabilities.is_empty(), "got: {info:?}");
 
