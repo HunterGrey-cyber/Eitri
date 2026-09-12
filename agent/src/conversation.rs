@@ -34,8 +34,8 @@
 use crate::lease::{LeaseError, SessionLease};
 use crate::persistence::{save_conversation_record, ConversationRecord};
 use crate::provider::{
-    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
-    ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
+    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
+    ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
 };
 use crate::projection::{AgentDomainEvent, AgentSessionProjection, PermissionOutcome};
 use sha2::{Digest, Sha256};
@@ -456,11 +456,16 @@ impl AgentConversation {
 
     /// Answers one pending permission request. Rejects an id the projection does not currently list
     /// as pending, so an already-answered card cannot produce a second decision.
+    ///
+    /// The projection is NOT updated here. `PermissionResolved` arrives as a real provider event --
+    /// including when the provider resolves it some other way entirely (an interrupt, a session
+    /// close, a provider failure), which is why the outcome vocabulary has six variants and not
+    /// two. Clearing the card optimistically here would mean this side deciding an outcome the
+    /// provider is the only one that knows.
     pub fn respond_permission(
         &mut self,
         permission_id: &str,
-        allow: bool,
-        reason: Option<&str>,
+        decision: PermissionDecision,
     ) -> Result<(), ConversationError> {
         if !self.projection.pending_permissions.contains_key(permission_id) {
             return Err(ConversationError::Provider(ProviderError::Provider {
@@ -472,8 +477,7 @@ impl AgentConversation {
         self.provider.resolve_permission(ResolvePermissionRequest {
             session_id,
             permission_id: permission_id.to_string(),
-            allow,
-            reason: reason.map(|r| r.to_string()),
+            decision,
         })?;
         Ok(())
     }
@@ -585,6 +589,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 capabilities: ProviderCapabilities {
+                    interactive_permission_mode: true,
                     resume: false,
                     fork: false,
                     interrupt: true,
@@ -627,7 +632,7 @@ mod tests {
             Ok(())
         }
         fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
-            self.calls.lock().unwrap().push(format!("resolve_permission({}, allow={})", request.permission_id, request.allow));
+            self.calls.lock().unwrap().push(format!("resolve_permission({}, allow={})", request.permission_id, request.decision.allows()));
             Ok(())
         }
         fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
@@ -878,7 +883,7 @@ mod tests {
         fake.queue(session_opened());
         conversation.pump();
 
-        let result = conversation.respond_permission("never-existed", true, None);
+        let result = conversation.respond_permission("never-existed", PermissionDecision::Allow);
         assert!(result.is_err());
         assert!(result.unwrap_err().is_benign(), "an already-answered or unknown id is a logged no-op, not fatal");
         assert!(!fake.calls().iter().any(|c| c.starts_with("resolve_permission")), "got: {:?}", fake.calls());
@@ -897,7 +902,7 @@ mod tests {
         });
         conversation.pump();
 
-        conversation.respond_permission("p1", true, None).unwrap();
+        conversation.respond_permission("p1", PermissionDecision::Allow).unwrap();
         assert!(fake.calls().iter().any(|c| c == "resolve_permission(p1, allow=true)"), "got: {:?}", fake.calls());
     }
 

@@ -228,3 +228,11 @@ body,
 .mode-selector button.resume strong {
   color: #89b4fa;
 }
+
+/* A permission request that outlived its session. Muted rather than alarming: the loud banner above
+   already says the session was lost -- this only explains why these buttons no longer do anything. */
+.permission-card-stale {
+  margin-top: 8px;
+  font-size: 11px;
+  color: #a6adc8;
+}

@@ -3,7 +3,7 @@
 //! legacy backend, so the two are directly comparable (Phase 5's own future A/B job). Mirrors that
 //! file's own polling style (`pump()` inside a deadline loop) deliberately, not a different idiom.
 
-use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode, PermissionOutcome};
+use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionDecision, PermissionMode, PermissionOutcome};
 
 fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(provider: &ClaudeSidecarProvider, deadline_secs: u64, done: F) -> Vec<AgentDomainEvent> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
@@ -39,7 +39,7 @@ fn real_pretooluse_permission_allow_end_to_end() {
     });
     let permission_id = permission_id.expect("expected a real PreToolUse-sourced PermissionRequested");
 
-    provider.resolve_permission(agent::ResolvePermissionRequest { session_id: session_id.clone(), permission_id, allow: true, reason: None }).unwrap();
+    provider.resolve_permission(agent::ResolvePermissionRequest { session_id: session_id.clone(), permission_id, decision: PermissionDecision::Allow }).unwrap();
 
     let events = drain_until(&provider, 30, |events| {
         events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))

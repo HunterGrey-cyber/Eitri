@@ -51,6 +51,7 @@ const CAP_INTERRUPT_TURN: &str = "interrupt_turn";
 const CAP_RESUME_SESSION: &str = "resume_session";
 const CAP_FORK_SESSION: &str = "fork_session";
 const PERMISSION_MODE_BYPASS: &str = "bypass";
+const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
 /// Whether THIS client can actually drive resume/fork end to end. Both are `false` until the phase
 /// that implements them lands; flipping either one here is the single switch that turns the feature
@@ -80,6 +81,7 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
         fork: CLIENT_IMPLEMENTS_FORK && has(CAP_FORK_SESSION),
         interrupt: has(CAP_INTERRUPT_TURN),
         bypass_permission_mode: response.permission_modes.iter().any(|m| m == PERMISSION_MODE_BYPASS),
+        interactive_permission_mode: response.permission_modes.iter().any(|m| m == PERMISSION_MODE_INTERACTIVE),
     }
 }
 
@@ -269,6 +271,34 @@ impl ClaudeSidecarProvider {
         let response = self.run_unary(async move { client.create_session(request).await })?;
         self.start_watching(response.session_id.clone());
         Ok(response.session_id)
+    }
+
+    /// Refuses a permission policy the live handshake does not advertise.
+    ///
+    /// The mode reaches here from a choice made on the start screen, before any provider existed --
+    /// so the offer there is what this CLIENT implements, and this is the server half of the same
+    /// two-term check `resume` already uses. Failing loudly is the whole point: the alternative,
+    /// mapping an unsupported mode onto whatever the provider does support, would start an agent
+    /// under a permission policy the user did not pick and would not be told about.
+    fn require_permission_mode(&self, mode: PermissionMode) -> Result<(), ProviderError> {
+        if self.capabilities.supports_permission_mode(mode) {
+            return Ok(());
+        }
+        Err(ProviderError::Provider {
+            code: ProviderErrorCode::InvalidConfiguration,
+            message: format!(
+                "this provider does not offer the {} permission policy (it advertises: {})",
+                match mode {
+                    PermissionMode::Auto => PERMISSION_MODE_INTERACTIVE,
+                    PermissionMode::Bypass => PERMISSION_MODE_BYPASS,
+                },
+                if self.info.advertised_permission_modes.is_empty() {
+                    "none".to_string()
+                } else {
+                    self.info.advertised_permission_modes.join(", ")
+                }
+            ),
+        })
     }
 
     /// Watches one session's event stream for as long as the session lives, reconnecting across
@@ -469,6 +499,7 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
+        self.require_permission_mode(request.permission_mode)?;
         self.open_session(build_create_request(request.cwd, request.permission_mode, request.streaming, None, false))
     }
 
@@ -492,6 +523,10 @@ impl AgentProvider for ClaudeSidecarProvider {
                 message: "cannot resume: no provider session id was supplied".to_string(),
             });
         }
+        // Checked on this path too, not only on create: resuming does not inherit the policy the
+        // original session ran under, so a resume into an unsupported mode would be a conversation
+        // coming back with a permission posture nobody chose.
+        self.require_permission_mode(request.permission_mode)?;
         self.open_session(build_create_request(
             request.cwd,
             request.permission_mode,
@@ -521,12 +556,15 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
         let mut client = self.client.clone();
+        // `PermissionDecision` is destructured here, at the wire, and nowhere else: the wire's
+        // `allow`/`reason` pair is the reason the enum has exactly these two variants. An approval
+        // sends no reason because there is no field on the far side that would ever show it.
         let proto_request = ProtoResolvePermissionRequest {
             session_id: request.session_id,
             command_id: uuid::Uuid::new_v4().to_string(),
             permission_id: request.permission_id,
-            allow: request.allow,
-            reason: request.reason.unwrap_or_default(),
+            allow: request.decision.allows(),
+            reason: request.decision.reason().unwrap_or_default().to_string(),
         };
         self.run_unary(async move { client.resolve_permission(proto_request).await })?;
         Ok(())

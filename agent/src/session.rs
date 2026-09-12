@@ -14,6 +14,7 @@
 
 use crate::event::{AgentEvent, PermissionSource};
 use crate::process::{AgentProcess, PermissionMode};
+use crate::provider::PermissionDecision;
 use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
 use std::collections::HashMap;
 use std::path::Path;
@@ -106,13 +107,20 @@ impl AgentSession {
     /// `AgentSession::respond_permission`'s identical reasoning. Returns `ErrorKind::NotFound` if
     /// no pending request carries that id (an already-answered or unknown id) -- callers must
     /// treat that as a benign no-op, per this plan's Global Constraint on duplicate/unknown ids.
-    pub fn respond_permission(&mut self, permission_id: &str, allow: bool, reason: Option<&str>) -> std::io::Result<Vec<AgentDomainEvent>> {
+    /// Answers one pending permission request.
+    ///
+    /// Unlike the sidecar provider, this backend has no event source for the answer: the Claude CLI
+    /// emits nothing when a `PreToolUse` hook is replied to, so the `PermissionResolved` below is
+    /// folded locally because it is the ONLY place the fact exists. That is a property of this
+    /// backend's wire, not a pattern to copy -- on a path where the provider does report the
+    /// resolution, the provider's event is the authority and this side must not pre-empt it.
+    pub fn respond_permission(&mut self, permission_id: &str, decision: PermissionDecision) -> std::io::Result<Vec<AgentDomainEvent>> {
         let Some(source) = self.pending_permission_sources.get(permission_id).copied() else {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no pending permission request with id {permission_id}")));
         };
-        self.process.respond_permission(permission_id, source, allow, reason)?;
+        self.process.respond_permission(permission_id, source, decision.allows(), decision.reason())?;
         self.pending_permission_sources.remove(permission_id);
-        let outcome = if allow { PermissionOutcome::Allowed } else { PermissionOutcome::Denied };
+        let outcome = if decision.allows() { PermissionOutcome::Allowed } else { PermissionOutcome::Denied };
         let event = AgentDomainEvent::PermissionResolved { permission_id: permission_id.to_string(), outcome };
         self.fold(event.clone());
         Ok(vec![event])

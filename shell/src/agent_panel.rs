@@ -475,11 +475,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             };
             apply_command_outcome(state, webview, &request_id, outcome);
         }
-        InboundMessage::PermissionResponse { permission_id, allow, reason, .. } => {
+        InboundMessage::PermissionResponse { permission_id, decision, reason, .. } => {
+            let decision = decision.into_decision(reason);
             let outcome = {
                 let mut state_ref = state.borrow_mut();
                 match state_ref.session.as_mut() {
-                    Some(session) => session.respond_permission(&permission_id, allow, reason.as_deref()),
+                    Some(session) => session.respond_permission(&permission_id, decision),
                     None => Err(no_session_error()),
                 }
             };

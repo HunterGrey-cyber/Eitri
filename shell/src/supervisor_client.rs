@@ -18,14 +18,19 @@ pub(crate) fn derive_status(session: Option<&AgentSessionProjection>) -> AgentSt
     let Some(projection) = session else {
         return AgentStatus::NoSession;
     };
+    // A terminal status is checked FIRST, ahead of the two "busy" signals. A session that has ended
+    // is neither blocked nor working, whatever its last-known fields say -- and a permission request
+    // that was still pending when the session died stays in the projection on purpose (it is real
+    // history, and deleting it would read as a resolution nobody made), so without this ordering a
+    // dead session showed a permanent Blocked dot in the dashboard.
+    if matches!(projection.status, ProjectionStatus::Unavailable { .. } | ProjectionStatus::Closed { .. }) {
+        return AgentStatus::Done;
+    }
     if !projection.pending_permissions.is_empty() {
         return AgentStatus::Blocked;
     }
     if projection.active_turn_id.is_some() {
         return AgentStatus::Working;
-    }
-    if matches!(projection.status, ProjectionStatus::Unavailable { .. } | ProjectionStatus::Closed { .. }) {
-        return AgentStatus::Done;
     }
     AgentStatus::Idle
 }

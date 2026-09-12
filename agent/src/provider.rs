@@ -60,12 +60,47 @@ pub struct InterruptTurnRequest {
     pub session_id: String,
 }
 
+/// What a human decided about one pending permission request.
+///
+/// Enumerates exactly what a provider can actually carry and nothing more. Verdandi's
+/// `ResolvePermissionRequest` is `bool allow` + `string reason`, and the legacy backend's hook relay
+/// is the same shape: there is no `AllowForSession`, no scoped grant, no allow-with-edits anywhere
+/// on either path. Modelling one here would produce a control that silently degrades to a plain
+/// allow -- the permission-policy equivalent of a resume that quietly starts a fresh session.
+/// Widening this enum is a Verdandi protocol change first, a client change second.
+///
+/// Typed rather than `allow: bool` + `reason: Option<String>` because that pair could express
+/// combinations no backend honors: an approval carrying a reason (dropped on the floor), or a denial
+/// whose reason field is silently repurposed. The model only ever sees a reason when it is denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// Run the tool, this once. The only grant any current backend can express.
+    Allow,
+    /// Refuse the tool. `reason` is shown to the model, which is the entire point of denying rather
+    /// than interrupting -- it is optional because the wire's own field is, not because it is
+    /// unimportant.
+    Deny { reason: Option<String> },
+}
+
+impl PermissionDecision {
+    pub fn allows(&self) -> bool {
+        matches!(self, PermissionDecision::Allow)
+    }
+
+    /// The text the model is shown. Never `Some` for an approval: there is nowhere for it to go.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            PermissionDecision::Allow => None,
+            PermissionDecision::Deny { reason } => reason.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvePermissionRequest {
     pub session_id: String,
     pub permission_id: String,
-    pub allow: bool,
-    pub reason: Option<String>,
+    pub decision: PermissionDecision,
 }
 
 #[derive(Debug, Clone)]
@@ -89,11 +124,32 @@ pub struct ProviderCapabilities {
     pub fork: bool,
     /// The provider can cancel an in-flight turn.
     pub interrupt: bool,
-    /// The provider advertises a BYPASS permission mode -- the only permission policy this
-    /// milestone actually uses, and the only one whose runtime behavior is genuinely distinct
-    /// (`interactive` and `verdandi_rules` are confirmed equivalent in the current sidecar, so
-    /// neither is modeled here as a separate capability).
+    /// The provider advertises a BYPASS permission mode: tools run without asking.
     pub bypass_permission_mode: bool,
+    /// The provider advertises an INTERACTIVE permission mode: tool use raises a real
+    /// `PermissionRequested` that a human answers.
+    ///
+    /// A separate capability from `bypass_permission_mode` because the two are separately
+    /// advertised and separately absent, and because choosing between them is a decision about what
+    /// the agent is allowed to do unsupervised. `verdandi_rules` is deliberately NOT modeled: it is
+    /// confirmed to behave identically to `interactive` in the current sidecar, so offering it as a
+    /// third choice would be a distinction without a difference.
+    pub interactive_permission_mode: bool,
+}
+
+impl ProviderCapabilities {
+    /// Whether this provider can actually honor a given permission policy.
+    ///
+    /// The hard rule this exists to enforce: **a requested permission mode must never silently
+    /// become a different one.** A provider that cannot do what was asked must fail loudly, exactly
+    /// as a resume that cannot continue a session must never quietly start a fresh one -- the cost
+    /// of getting it wrong is the same in kind, an agent running under a policy nobody chose.
+    pub fn supports_permission_mode(&self, mode: PermissionMode) -> bool {
+        match mode {
+            PermissionMode::Auto => self.interactive_permission_mode,
+            PermissionMode::Bypass => self.bypass_permission_mode,
+        }
+    }
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the

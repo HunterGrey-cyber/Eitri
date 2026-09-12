@@ -41,7 +41,42 @@ pub(crate) enum InboundMessage {
     },
     SendMessage { request_id: String, text: String },
     Interrupt { request_id: String },
-    PermissionResponse { request_id: String, permission_id: String, allow: bool, reason: Option<String> },
+    PermissionResponse {
+        request_id: String,
+        permission_id: String,
+        decision: DecisionChoice,
+        /// Only meaningful on a denial -- there is no field anywhere downstream that would show an
+        /// approval's reason to the model. Carried flat rather than inside the variant because
+        /// `InboundMessage` is already internally tagged on `type`.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// The decision half of a `permission_response`, as a closed set rather than a bool.
+///
+/// Typed on the wire so an unrecognized value is a PARSE failure, not a value some later `match`
+/// has to give a default to. The dangerous default here is obvious and one-directional: anything
+/// that is not clearly a denial must never end up running the tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DecisionChoice {
+    Allow,
+    Deny,
+}
+
+impl DecisionChoice {
+    /// Pairs the choice with its reason into the typed decision the backends take. An empty or
+    /// whitespace-only reason becomes `None`: sending the model an empty string as its explanation
+    /// is worse than sending it nothing.
+    pub(crate) fn into_decision(self, reason: Option<String>) -> agent::PermissionDecision {
+        match self {
+            DecisionChoice::Allow => agent::PermissionDecision::Allow,
+            DecisionChoice::Deny => agent::PermissionDecision::Deny {
+                reason: reason.filter(|r| !r.trim().is_empty()),
+            },
+        }
+    }
 }
 
 impl InboundMessage {
@@ -282,16 +317,65 @@ mod tests {
     }
 
     #[test]
-    fn parses_permission_response_with_no_reason() {
-        let msg = parse_inbound_message(r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","allow":true}"#).unwrap();
+    fn parses_an_approval_which_carries_no_reason() {
+        let msg = parse_inbound_message(r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","decision":"allow"}"#).unwrap();
         match msg {
-            InboundMessage::PermissionResponse { permission_id, allow, reason, .. } => {
+            InboundMessage::PermissionResponse { permission_id, decision, reason, .. } => {
                 assert_eq!(permission_id, "p1");
-                assert!(allow);
-                assert!(reason.is_none());
+                assert_eq!(decision, DecisionChoice::Allow);
+                assert_eq!(decision.into_decision(reason), agent::PermissionDecision::Allow);
             }
             other => panic!("expected PermissionResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_a_denial_and_carries_its_reason_to_the_model() {
+        let msg = parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","decision":"deny","reason":"not in this repo"}"#,
+        )
+        .unwrap();
+        match msg {
+            InboundMessage::PermissionResponse { decision, reason, .. } => {
+                assert_eq!(
+                    decision.into_decision(reason),
+                    agent::PermissionDecision::Deny { reason: Some("not in this repo".into()) }
+                );
+            }
+            other => panic!("expected PermissionResponse, got {other:?}"),
+        }
+    }
+
+    /// An empty reason box is not a reason. Sending the model "" as its explanation is worse than
+    /// sending it nothing, because nothing at least reads as "no reason given".
+    #[test]
+    fn a_blank_deny_reason_becomes_no_reason_at_all() {
+        let msg = parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","decision":"deny","reason":"   "}"#,
+        )
+        .unwrap();
+        match msg {
+            InboundMessage::PermissionResponse { decision, reason, .. } => {
+                assert_eq!(decision.into_decision(reason), agent::PermissionDecision::Deny { reason: None });
+            }
+            other => panic!("expected PermissionResponse, got {other:?}"),
+        }
+    }
+
+    /// The failure direction that matters: a decision this build does not recognize must be
+    /// REJECTED, never defaulted. A `bool allow` field could not express this -- any unknown value
+    /// would have had to become one of the two, and the tempting default is the one that runs the
+    /// tool.
+    #[test]
+    fn an_unrecognized_decision_is_rejected_rather_than_defaulted() {
+        assert!(parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","decision":"allow_for_session"}"#
+        )
+        .is_none());
+        assert!(
+            parse_inbound_message(r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","allow":true}"#).is_none(),
+            "the old bool shape must not still be accepted"
+        );
     }
 
     #[test]
@@ -371,7 +455,7 @@ mod tests {
             conversation_id: Some("conv-hash"),
             session_id: Some("verdandi-1"),
             provider_session_id: Some("claude-1"),
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true },
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
             provider: Some(&provider),
             projection: &projection,
         };
@@ -411,7 +495,7 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true },
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
             provider: None,
             projection: &projection,
         };
@@ -422,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sidecar_hello_offers_bypass_only_and_never_advertises_resume() {
+    fn the_sidecar_hello_carries_its_baseline_and_never_advertises_resume_without_a_record() {
         let greeting = crate::agent_backend::BackendGreeting::for_kind(
             crate::agent_backend::BackendKind::Sidecar,
             std::path::PathBuf::from("/tmp/project"),
@@ -430,7 +514,11 @@ mod tests {
         let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
         assert_eq!(parsed["kind"], "hello");
         assert_eq!(parsed["backend"], "sidecar");
-        assert_eq!(parsed["permissionModes"], json!(["bypass"]));
+        assert_eq!(
+            parsed["permissionModes"],
+            json!(crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES),
+            "the hello envelope must carry the client's real offer, not a per-backend narrowing"
+        );
         assert_eq!(parsed["projectDir"], "/tmp/project");
         assert!(parsed["expectedVerdandiRevision"].is_string());
     }

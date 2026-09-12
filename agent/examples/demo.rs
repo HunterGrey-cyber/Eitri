@@ -53,7 +53,7 @@ fn send_and_wait(session: &mut AgentSession, prompt: &str) {
             println!(
                 "[auto-approving] {tool_name} -- this demo has no interactive UI, see real_pretooluse_hook_allow_end_to_end/real_pretooluse_hook_deny_end_to_end for full round-trip examples"
             );
-            for event in session.respond_permission(&permission_id, true, None).expect("respond_permission") {
+            for event in session.respond_permission(&permission_id, agent::PermissionDecision::Allow).expect("respond_permission") {
                 print_event(&event);
             }
         }

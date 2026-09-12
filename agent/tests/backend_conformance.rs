@@ -23,7 +23,7 @@
 //!   `snapshot` envelope genuinely rehydrates prior state, not that literal `reload()` does.
 //! See `agent/BACKEND_BASELINE.md` (added in this plan's Task 3) for the full baseline record.
 
-use agent::{AgentDomainEvent, AgentSession, PermissionMode, ProjectionStatus, TurnOutcome, CONSERVATIVE_DISALLOWED_TOOLS};
+use agent::{AgentDomainEvent, AgentSession, PermissionDecision, PermissionMode, ProjectionStatus, TurnOutcome, CONSERVATIVE_DISALLOWED_TOOLS};
 
 #[test]
 #[ignore]
@@ -66,7 +66,7 @@ fn real_pretooluse_hook_allow_end_to_end() {
     }
     assert!(saw_permission_request, "expected a real PreToolUse-hook-sourced PermissionRequested");
     let permission_id = session.projection.pending_permissions.keys().next().unwrap().clone();
-    session.respond_permission(&permission_id, true, None).unwrap();
+    session.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
     assert!(
         !session.projection.pending_permissions.contains_key(&permission_id),
         "respond_permission must remove the answered request immediately"
@@ -112,7 +112,7 @@ fn real_pretooluse_hook_deny_end_to_end() {
         }
         let pending_ids: Vec<String> = session.projection.pending_permissions.keys().cloned().collect();
         for permission_id in pending_ids {
-            session.respond_permission(&permission_id, false, Some(DENY_REASON)).unwrap();
+            session.respond_permission(&permission_id, PermissionDecision::Deny { reason: Some(DENY_REASON.to_string()) }).unwrap();
             denied_any = true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -209,7 +209,7 @@ fn real_two_sessions_in_the_same_project_dir_cross_wire_permission_hooks() {
 
     let pending_ids: Vec<String> = session_b.projection.pending_permissions.keys().cloned().collect();
     for permission_id in pending_ids {
-        let _ = session_b.respond_permission(&permission_id, false, Some("test cleanup"));
+        let _ = session_b.respond_permission(&permission_id, PermissionDecision::Deny { reason: Some("test cleanup".to_string()) });
     }
     session_a.shutdown();
     session_b.shutdown();

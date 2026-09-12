@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { applyEvent, applySnapshot, initialState } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
+import type { PermissionDecision } from "./bridge";
 import { ModeSelector } from "./components/ModeSelector";
 import { Composer } from "./components/Composer";
 import { MessageList } from "./components/MessageList";
@@ -84,10 +85,10 @@ export default function App() {
     postToRust({ type: "interrupt", request_id: requestId });
   }
 
-  function answerPermission(permissionId: string, allow: boolean, reason?: string) {
+  function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string) {
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
-    postToRust({ type: "permission_response", request_id: requestId, permission_id: permissionId, allow, reason });
+    postToRust({ type: "permission_response", request_id: requestId, permission_id: permissionId, decision, reason });
   }
 
   const errorBanner =
@@ -136,7 +137,10 @@ export default function App() {
     <div className="agent-ui-root agent-ui-conversation">
       <SessionHeader state={state} />
       {errorBanner}
-      <MessageList state={state} onAnswerPermission={answerPermission} />
+      {/* `sessionEnded` makes every pending card inert. The cards themselves are NOT removed: a
+          permission that was still open when the session died is real history, and deleting it
+          would read as a resolution nobody made. */}
+      <MessageList state={state} sessionEnded={sessionEnded} onAnswerPermission={answerPermission} />
       {sessionEndedBanner}
       <Composer
         // A dead session takes no more turns. Without this, clearing `activeTurnId` on a lost
