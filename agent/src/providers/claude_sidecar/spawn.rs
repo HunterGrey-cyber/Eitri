@@ -86,10 +86,12 @@ impl SpawnedSidecar {
 /// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
 /// this session actually running?" is answerable after the fact rather than guessed at.
 ///
-/// Currently `eb70aa3` on Verdandi's `sdk-mainline-unblock`: the revision whose real-sidecar
-/// conformance (multi-turn with a content oracle, BYPASS tool execution, post-interrupt reuse,
-/// orphan-free teardown) this crate's own `claude_sidecar_lifecycle_conformance` suite passed
-/// against. Move it when a newer revision passes the same suite, not before.
+/// Currently `2fd30fb` on Verdandi's `sdk-mainline-unblock`: the revision whose real-sidecar
+/// conformance this crate's own `claude_sidecar_lifecycle_conformance` suite passed against --
+/// multi-turn with a content oracle, BYPASS tool execution, post-interrupt reuse, orphan-free
+/// teardown, and (as of this revision) a real resume proven by both a content oracle and a
+/// provider-session-id match. Moved here from eb70aa3 only after that suite went green against it;
+/// move it again on the same terms, not before.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`

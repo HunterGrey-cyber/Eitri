@@ -21,14 +21,18 @@
 //! `claude --resume <id>` takes, and it does not exist until the session's first real event
 //! arrives -- a session that has been created but has never opened has no provider identity yet.
 //!
-//! **Not modeled yet, on purpose**: no session lease and no on-disk conversation record. Both exist
-//! in this crate (`agent::lease`, `agent::persistence`) and both are keyed on `provider_session_id`.
-//! They guard one specific hazard -- two clients driving the SAME provider session -- which cannot
-//! arise while every conversation creates a fresh session, because resume does not exist yet. They
-//! get wired in by the phase that adds resume, which is also the first phase where they can be
-//! tested against the hazard they exist for.
+//! **The lease and the persisted record are wired in here**, and their ORDERING differs between the
+//! two entry points in a way that is easy to get backwards:
+//!
+//! - `create` cannot take a lease up front. The lease key includes `provider_session_id`, and that
+//!   value does not exist until the provider's first `SessionOpened` arrives -- so the lease is
+//!   acquired, and the record written, inside `pump()` when that event is folded.
+//! - `resume` knows the id before it calls anything, so it probes, acquires, and only THEN asks the
+//!   provider. Acquiring after would leave a window where two clients have both started resuming
+//!   the same Claude session, which is the exact hazard the lease exists to prevent.
 
-use crate::lease::SessionLease;
+use crate::lease::{LeaseError, SessionLease};
+use crate::persistence::{save_conversation_record, ConversationRecord};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
     ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
@@ -50,6 +54,18 @@ pub enum ConversationError {
     NoSession,
     /// `cwd` could not be canonicalized -- it does not exist, or is not readable.
     Cwd(std::io::Error),
+    /// Another Neovibe-participating client already holds this provider session.
+    ///
+    /// Advisory, and honestly so: the lease binds clients that take part in this protocol. A raw
+    /// `claude --resume` started outside Neovibe is NOT blocked by it, and this crate never claims
+    /// otherwise (design doc §8.5).
+    LeaseHeld { provider_session_id: String },
+    /// The lease could not be taken for a reason other than contention.
+    Lease(LeaseError),
+    /// Claude's own transcript for this session is still being written, so something else is very
+    /// likely driving it right now. Design doc §8.4 step 4: probe before resuming, refuse if the
+    /// transcript is moving.
+    TranscriptUnstable { provider_session_id: String },
 }
 
 impl ConversationError {
@@ -60,6 +76,11 @@ impl ConversationError {
             ConversationError::TurnAlreadyActive => true,
             ConversationError::Provider(e) => e.is_benign(),
             ConversationError::NoSession | ConversationError::Cwd(_) => false,
+            // A refused resume leaves nothing running and nothing to tear down, but it is not
+            // "carry on either" -- the caller asked for a conversation and does not have one.
+            ConversationError::LeaseHeld { .. }
+            | ConversationError::Lease(_)
+            | ConversationError::TranscriptUnstable { .. } => false,
         }
     }
 }
@@ -71,6 +92,17 @@ impl std::fmt::Display for ConversationError {
             ConversationError::TurnAlreadyActive => write!(f, "a turn is already in progress on this conversation"),
             ConversationError::NoSession => write!(f, "no active session"),
             ConversationError::Cwd(e) => write!(f, "could not resolve the working directory: {e}"),
+            ConversationError::LeaseHeld { provider_session_id } => write!(
+                f,
+                "session {provider_session_id} is already open in another Neovibe window -- close it \
+                 there first, or start a new conversation"
+            ),
+            ConversationError::Lease(e) => write!(f, "could not take the session lease: {e}"),
+            ConversationError::TranscriptUnstable { provider_session_id } => write!(
+                f,
+                "session {provider_session_id} is still being written to, so something else is \
+                 driving it right now -- close that first, or start a new conversation"
+            ),
         }
     }
 }
@@ -93,6 +125,66 @@ impl From<ProviderError> for ConversationError {
 pub fn conversation_id_for_cwd(canonical_cwd: &Path) -> String {
     let digest = Sha256::digest(canonical_cwd.as_os_str().as_encoded_bytes());
     hex_prefix(&digest, 16)
+}
+
+/// The `provider` component of both the lease key and the persisted record. One constant so the two
+/// cannot disagree -- a mismatch would silently produce a lease nobody else looks for.
+const PROVIDER_NAME: &str = "claude";
+
+/// Refuses a resume whose Claude transcript is still being written.
+///
+/// A missing transcript is NOT a refusal: a session that ran under an ephemeral persistence policy
+/// legitimately has none, and treating "no file" as "unsafe" would make those sessions permanently
+/// unresumable. Only an observably-moving file blocks.
+fn ensure_transcript_is_not_being_written(
+    cwd: &str,
+    provider_session_id: &str,
+) -> Result<(), ConversationError> {
+    const PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+    let Ok(path) = crate::transcript::transcript_path(cwd, provider_session_id) else {
+        return Ok(());
+    };
+    match crate::transcript::is_transcript_stable(&path, PROBE) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ConversationError::TranscriptUnstable {
+            provider_session_id: provider_session_id.to_string(),
+        }),
+        // Missing file, unreadable directory: not evidence of a writer.
+        Err(_) => Ok(()),
+    }
+}
+
+/// Best-effort. A conversation that runs but was not recorded is a lost resume offer next time, not
+/// a broken session -- so this logs rather than failing the caller.
+fn persist_record(conversation_id: &str, canonical_cwd: &str, provider_session_id: &str) {
+    let now = epoch_millis();
+    // Preserve the original `created_at` when a record already exists: this runs again on every
+    // resume of the same workspace, and rewriting it would turn "when did this conversation start"
+    // into "when was it last touched", which `updated_at` already answers.
+    let created_at = crate::persistence::load_conversation_record(conversation_id)
+        .map(|existing| existing.created_at)
+        .unwrap_or_else(|_| now.clone());
+    let record = ConversationRecord {
+        conversation_id: conversation_id.to_string(),
+        provider: PROVIDER_NAME.to_string(),
+        provider_session_id: provider_session_id.to_string(),
+        canonical_cwd: canonical_cwd.to_string(),
+        created_at,
+        updated_at: now,
+    };
+    if let Err(e) = save_conversation_record(&record) {
+        eprintln!("agent: could not persist the conversation record for {conversation_id}: {e}");
+    }
+}
+
+/// Milliseconds since the Unix epoch, as a string. No date library is a dependency of this crate
+/// and adding one to stamp two fields would be a poor trade; a monotonic-enough integer is what
+/// these fields are actually used for (ordering and "how stale is this record").
+fn epoch_millis() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn hex_prefix(bytes: &[u8], take: usize) -> String {
@@ -149,6 +241,73 @@ impl AgentConversation {
             session_id: Some(session_id),
             provider_session_id: None,
             lease: None,
+            projection: AgentSessionProjection::default(),
+            event_log: Vec::new(),
+        })
+    }
+
+    /// Continues an existing Claude session.
+    ///
+    /// Step order matters and is not the same as `create`'s (see this module's header):
+    ///   1. canonicalize `cwd` -- the lease key and the persisted record both use the canonical form;
+    ///   2. refuse if the provider does not advertise resume, rather than sending a command on the
+    ///      theory the server will ignore it;
+    ///   3. probe Claude's own transcript for this session: if it is still being written, something
+    ///      else is driving the session right now and resuming would interleave two writers into one
+    ///      conversation. A MISSING transcript is not a refusal -- an ephemeral or
+    ///      never-persisted session legitimately has none;
+    ///   4. take the lease, BEFORE asking the provider for anything. Taking it afterwards leaves a
+    ///      window in which two clients have both begun resuming the same session;
+    ///   5. only then resume, and persist the mapping.
+    ///
+    /// The lease is advisory and this crate says so plainly: it binds clients that participate in
+    /// this protocol. A raw `claude --resume` run outside Neovibe is not blocked by it, and nothing
+    /// here pretends otherwise (design doc §8.5).
+    pub fn resume(
+        provider: Box<dyn AgentProvider + Send>,
+        cwd: &Path,
+        provider_session_id: &str,
+        permission_mode: crate::PermissionMode,
+    ) -> Result<Self, ConversationError> {
+        let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
+        let capabilities = provider.capabilities();
+        if !capabilities.resume {
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability("resume")));
+        }
+        let info = provider.info();
+        let cwd_string = canonical_cwd.to_string_lossy().to_string();
+
+        ensure_transcript_is_not_being_written(&cwd_string, provider_session_id)?;
+
+        let lease = match SessionLease::try_acquire(PROVIDER_NAME, &cwd_string, provider_session_id) {
+            Ok(lease) => lease,
+            Err(LeaseError::AlreadyHeld) => {
+                return Err(ConversationError::LeaseHeld {
+                    provider_session_id: provider_session_id.to_string(),
+                })
+            }
+            Err(other) => return Err(ConversationError::Lease(other)),
+        };
+
+        let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
+            provider_session_id: provider_session_id.to_string(),
+            cwd: cwd_string.clone(),
+            permission_mode,
+        })?;
+
+        let conversation_id = conversation_id_for_cwd(&canonical_cwd);
+        persist_record(&conversation_id, &cwd_string, provider_session_id);
+
+        Ok(Self {
+            conversation_id,
+            canonical_cwd,
+            provider,
+            capabilities,
+            info,
+            session_id: Some(session_id),
+            // Known up front on this path, unlike `create` -- it is what we asked to resume.
+            provider_session_id: Some(provider_session_id.to_string()),
+            lease: Some(lease),
             projection: AgentSessionProjection::default(),
             event_log: Vec::new(),
         })
@@ -262,7 +421,15 @@ impl AgentConversation {
         let events = self.provider.pump();
         for event in &events {
             if let AgentDomainEvent::SessionOpened { provider_session_id, .. } = event {
+                let first_time = self.provider_session_id.is_none();
                 self.provider_session_id = Some(provider_session_id.clone());
+                // Only on the FIRST one. `SessionOpened` repeats -- the Agent SDK emits a
+                // system/init at the start of every turn, not once per session -- so acquiring the
+                // lease here unconditionally would try to re-take a lease this conversation already
+                // holds on every single turn.
+                if first_time {
+                    self.adopt_provider_session(provider_session_id);
+                }
             }
             self.projection.apply(event);
             self.event_log.push(event.clone());
@@ -296,6 +463,26 @@ impl AgentConversation {
         // client can acquire it while this one is still closing. (Always `None` today -- see this
         // module's header.)
         self.lease = None;
+    }
+
+    /// Takes the lease and persists the mapping the first time this conversation learns its Claude
+    /// session id. Only reachable from the `create` path -- `resume` already did both before it
+    /// called the provider at all.
+    ///
+    /// Neither failure is fatal here, deliberately. The session is already open and streaming; a
+    /// contended lease at this point means another window opened the SAME provider session
+    /// concurrently, which resume's own up-front check prevents for every path a user can take.
+    /// Tearing down a live conversation over a bookkeeping failure would cost more than it protects.
+    fn adopt_provider_session(&mut self, provider_session_id: &str) {
+        let cwd = self.canonical_cwd.to_string_lossy().to_string();
+        match SessionLease::try_acquire(PROVIDER_NAME, &cwd, provider_session_id) {
+            Ok(lease) => self.lease = Some(lease),
+            Err(e) => eprintln!(
+                "agent: could not take the session lease for {provider_session_id}: {e} -- \
+                 continuing without it; another Neovibe window may be driving the same session"
+            ),
+        }
+        persist_record(&self.conversation_id, &cwd, provider_session_id);
     }
 
     fn fold(&mut self, event: AgentDomainEvent) {

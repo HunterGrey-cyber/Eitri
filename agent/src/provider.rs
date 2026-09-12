@@ -18,13 +18,18 @@ pub struct CreateSessionRequest {
     pub permission_mode: PermissionMode,
 }
 
-/// No RPC exists yet to fulfill this (design doc §19, confirmed with Verdandi) -- kept as a real,
-/// typed request so the trait's shape doesn't need to change again once Phase 4 adds it. Every
-/// current implementation of `resume_session` returns `ProviderError::UnsupportedCapability`.
+/// Continue an existing provider (Claude) session rather than starting a fresh one.
+///
+/// Carries a `permission_mode` because the host policy applies to the resumed session exactly as it
+/// does to a new one -- resuming does not inherit the policy the original session ran under, and
+/// silently defaulting it would mean a conversation could come back with a different permission
+/// posture than the caller asked for.
 #[derive(Debug, Clone)]
 pub struct ResumeSessionRequest {
+    /// Claude's own session UUID -- the one `SessionOpened.provider_session_id` reported.
     pub provider_session_id: String,
     pub cwd: String,
+    pub permission_mode: PermissionMode,
 }
 
 #[derive(Debug, Clone)]

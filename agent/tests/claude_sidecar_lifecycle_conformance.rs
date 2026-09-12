@@ -386,14 +386,104 @@ fn a_connected_provider_reports_wire_sourced_capabilities_and_versions() {
 
     assert!(capabilities.interrupt, "interrupt_turn is advertised and exercised by this very suite");
     assert!(capabilities.bypass_permission_mode);
-    // Honest today, and a real regression guard: this must stay false until `resume_session` does
-    // something other than return UnsupportedCapability.
-    assert!(!capabilities.resume, "resume must not be advertised before it works end to end");
-    assert!(matches!(
-        provider.resume_session(agent::ResumeSessionRequest {
-            provider_session_id: "irrelevant".into(),
-            cwd: "/tmp".into()
-        }),
-        Err(agent::ProviderError::UnsupportedCapability("resume"))
-    ));
+    // Resume is advertised by the sidecar AND implemented by this client, so it reports true.
+    // Fork is advertised on the wire but this client does not drive it, so the intersection is
+    // false -- that asymmetry is the point of the intersection rule.
+    assert!(capabilities.resume, "resume_session should be advertised and implemented by now");
+    assert!(!capabilities.fork, "fork must stay false until this client actually drives one");
+}
+
+/// T4.6 -- the resume acceptance criterion, and the single most important test in this file.
+///
+/// An `Ok` RPC result proves nothing here. proto3 ignores unknown fields, so a client built against
+/// a protocol revision without `resume_provider_session_id` sends a request the sidecar reads as a
+/// plain fresh session -- succeeding, returning a session id, and losing the conversation, with no
+/// error anywhere. That is the failure this test exists to catch, and it needs BOTH assertions:
+///
+///   1. the resumed conversation remembers a fact planted in the original. If only this were
+///      asserted and it failed, the failure would read as "the model forgot" rather than "resume
+///      silently did nothing".
+///   2. the resumed session reports the SAME `provider_session_id` that was requested. If only this
+///      were asserted, a resume that reconnected to the right session but carried no history would
+///      pass.
+///
+/// Deliberately uses a SECOND, freshly-connected provider for the resume: resuming inside the same
+/// provider instance would leave open whether the continuity came from the wire or from state the
+/// first provider still had in memory.
+#[test]
+#[ignore]
+fn real_resume_continues_the_same_provider_session_with_its_history() {
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+    let (provider_session_id, original_session_id) = {
+        let provider = connect();
+        assert!(provider.capabilities().resume, "the sidecar must advertise resume before this can pass");
+        let session_id = create_bypass_session(&provider);
+
+        let events = run_turn(
+            &provider,
+            &session_id,
+            "Remember this number for later: 5903. Reply with just: OK",
+            60,
+        );
+        trace("original session", &events);
+        let provider_session_id = events
+            .iter()
+            .find_map(|e| match e {
+                AgentDomainEvent::SessionOpened { provider_session_id, .. } => Some(provider_session_id.clone()),
+                _ => None,
+            })
+            .expect("the first turn must report a provider session id");
+        assert_ne!(provider_session_id, session_id, "the two identities must not be the same value");
+
+        provider.close_session(CloseSessionRequest { session_id: session_id.clone() }).unwrap();
+        (provider_session_id, session_id)
+    }; // the whole first provider -- process, runtime thread and all -- is gone here
+
+    let provider = connect();
+    let resumed_session_id = provider
+        .resume_session(agent::ResumeSessionRequest {
+            provider_session_id: provider_session_id.clone(),
+            cwd,
+            permission_mode: PermissionMode::Bypass,
+        })
+        .expect("resume_session should succeed against a real, closed session");
+    assert_ne!(
+        resumed_session_id, original_session_id,
+        "resuming mints a NEW Verdandi session id; only the Claude identity continues"
+    );
+
+    let events = run_turn(
+        &provider,
+        &resumed_session_id,
+        "What number did I ask you to remember? Reply with just the number.",
+        60,
+    );
+    trace("resumed session", &events);
+
+    // Assertion 2 first: it is the one that distinguishes "resume did nothing" from "the model
+    // forgot", so a failure here explains a failure of assertion 1.
+    let resumed_provider_ids: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::SessionOpened { provider_session_id, .. } => Some(provider_session_id),
+            _ => None,
+        })
+        .collect();
+    assert!(!resumed_provider_ids.is_empty(), "the resumed turn reported no SessionOpened at all");
+    for id in &resumed_provider_ids {
+        assert_eq!(
+            **id, provider_session_id,
+            "the resumed session reports a DIFFERENT Claude session id -- resume silently started a fresh one"
+        );
+    }
+
+    // Assertion 1: the history really came back.
+    let recalled = text_of(&events);
+    assert!(
+        recalled.contains("5903"),
+        "the resumed conversation did not remember the original's content. got: {recalled:?}"
+    );
+
+    provider.close_session(CloseSessionRequest { session_id: resumed_session_id }).unwrap();
 }

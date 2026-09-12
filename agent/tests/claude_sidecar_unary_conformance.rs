@@ -18,11 +18,26 @@ fn create_session_returns_a_real_session_id() {
 
 #[test]
 #[ignore]
-fn resume_session_is_honestly_unsupported() {
+fn resume_is_now_advertised_and_an_empty_id_is_rejected_before_the_wire() {
+    // This test used to assert resume was honestly UNSUPPORTED. It is supported as of the Verdandi
+    // protocol change that added resume_provider_session_id to CreateSession; what it pins now is
+    // the replacement honesty property -- the capability is real, and a request that cannot be
+    // honored fails as a typed error rather than silently starting a fresh session.
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
-    let result = provider.resume_session(agent::ResumeSessionRequest { provider_session_id: "does-not-matter".into(), cwd: "/tmp".into() });
-    assert!(matches!(result, Err(agent::ProviderError::UnsupportedCapability("resume"))));
-    assert!(!provider.capabilities().resume);
+    assert!(provider.capabilities().resume, "the sidecar must advertise resume_session");
+    assert!(!provider.capabilities().fork, "fork is on the wire but this client does not drive it yet");
+
+    let result = provider.resume_session(agent::ResumeSessionRequest {
+        provider_session_id: "   ".into(),
+        cwd: "/tmp".into(),
+        permission_mode: PermissionMode::Bypass,
+    });
+    match result {
+        Err(agent::ProviderError::Provider { code, .. }) => {
+            assert_eq!(code, agent::ProviderErrorCode::InvalidConfiguration);
+        }
+        other => panic!("an empty resume id must be a typed error, never a fresh session: {other:?}"),
+    }
 }
 
 #[test]

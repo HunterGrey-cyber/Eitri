@@ -60,7 +60,10 @@ const PERMISSION_MODE_BYPASS: &str = "bypass";
 /// sidecar learned the word, while this client still returned `UnsupportedCapability` -- a button
 /// that cannot work is worse than no button, and it is exactly the "capability advertisement is a
 /// contract" failure this design is trying to avoid, just with the lie on the client side.
-const CLIENT_IMPLEMENTS_RESUME: bool = false;
+const CLIENT_IMPLEMENTS_RESUME: bool = true;
+/// Still false: the wire carries `fork`, and `build_create_request` can set it, but nothing in this
+/// client asks for a fork and nothing has verified one end to end. Flip it in the change that does
+/// both, not before.
 const CLIENT_IMPLEMENTS_FORK: bool = false;
 
 /// Derives what the provider can actually do from what it actually said. Pure, so it is unit-tested
@@ -274,6 +277,16 @@ impl ClaudeSidecarProvider {
         }
     }
 
+    /// Issues one `CreateSession` (fresh or resuming) and starts watching the resulting session.
+    /// Both paths must open the watch stream, and forgetting it on one of them would produce a
+    /// session that accepts commands and reports nothing.
+    fn open_session(&self, request: ProtoCreateSessionRequest) -> Result<String, ProviderError> {
+        let mut client = self.client.clone();
+        let response = self.run_unary(async move { client.create_session(request).await })?;
+        self.start_watching(response.session_id.clone());
+        Ok(response.session_id)
+    }
+
     fn start_watching(&self, session_id: String) {
         let mut client = self.client.clone();
         let events = Arc::clone(&self.events);
@@ -304,6 +317,32 @@ impl ClaudeSidecarProvider {
     }
 }
 
+/// Builds the one `CreateSessionRequest` both a fresh session and a resume go through.
+///
+/// The policy is fixed rather than parameterised on purpose: this client only ever sends values
+/// whose runtime behavior has been confirmed distinct. `verdandi_rules` is identical to
+/// `interactive` in the current sidecar, `external_store` is identical to `ephemeral`, and
+/// `executable` is not read at all -- sending any of them would be choosing a value that means
+/// nothing.
+fn build_create_request(
+    cwd: String,
+    permission_mode: PermissionMode,
+    resume_provider_session_id: Option<String>,
+    fork: bool,
+) -> ProtoCreateSessionRequest {
+    ProtoCreateSessionRequest {
+        cwd,
+        policy: Some(ClaudeHostPolicy {
+            configuration: ConfigurationProfile::Native as i32,
+            permissions: to_proto_permission_mode(permission_mode),
+            persistence: PersistenceMode::HostCli as i32,
+            executable: ExecutableSource::HostCli as i32,
+        }),
+        resume_provider_session_id,
+        fork,
+    }
+}
+
 fn to_proto_permission_mode(mode: PermissionMode) -> i32 {
     match mode {
         PermissionMode::Auto => ProtoPermissionMode::Interactive as i32,
@@ -321,23 +360,35 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
-        let mut client = self.client.clone();
-        let proto_request = ProtoCreateSessionRequest {
-            cwd: request.cwd,
-            policy: Some(ClaudeHostPolicy {
-                configuration: ConfigurationProfile::Native as i32,
-                permissions: to_proto_permission_mode(request.permission_mode),
-                persistence: PersistenceMode::HostCli as i32,
-                executable: ExecutableSource::HostCli as i32,
-            }),
-        };
-        let response = self.run_unary(async move { client.create_session(proto_request).await })?;
-        self.start_watching(response.session_id.clone());
-        Ok(response.session_id)
+        self.open_session(build_create_request(request.cwd, request.permission_mode, None, false))
     }
 
-    fn resume_session(&self, _request: ResumeSessionRequest) -> Result<String, ProviderError> {
-        Err(ProviderError::UnsupportedCapability("resume"))
+    /// Continues an existing Claude session. Goes through the same `CreateSession` RPC as a fresh
+    /// session, carrying `resume_provider_session_id` -- resume is a parameter of session creation
+    /// on this wire, not a lifecycle of its own, because that is the shape the runtime kernel itself
+    /// has (its `ClaudeSessionConfig` carries `resume`/`fork` as config fields).
+    ///
+    /// Returns the sidecar's session id for the resumed session, which is NOT the provider session
+    /// id that was passed in: the former is Verdandi's, minted fresh per `CreateSession`; the latter
+    /// is Claude's, and is what continues.
+    fn resume_session(&self, request: ResumeSessionRequest) -> Result<String, ProviderError> {
+        if !self.capabilities.resume {
+            // The provider does not advertise it, so this client must not send it -- design doc
+            // §9.3: never send a command on the theory the server will ignore it.
+            return Err(ProviderError::UnsupportedCapability("resume"));
+        }
+        if request.provider_session_id.trim().is_empty() {
+            return Err(ProviderError::Provider {
+                code: ProviderErrorCode::InvalidConfiguration,
+                message: "cannot resume: no provider session id was supplied".to_string(),
+            });
+        }
+        self.open_session(build_create_request(
+            request.cwd,
+            request.permission_mode,
+            Some(request.provider_session_id),
+            false,
+        ))
     }
 
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError> {
