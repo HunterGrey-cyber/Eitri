@@ -222,6 +222,22 @@ body,
 
 /* The continue-previous-session option: visually distinct from a fresh start, since the two have
    very different consequences and the wrong click is not obviously wrong afterwards. */
+/* Every control on this screen is painted explicitly, none of them inheriting the UA's native button
+   appearance. That was a real defect, not tidiness: setting ANY border property on a button drops
+   WebKit's native styling, and the fallback is a light `ButtonFace` background. Only `.resume` set a
+   border, so the start screen's one blue-labelled control -- the one whose misclick costs the most,
+   since it continues a conversation instead of starting one -- rendered pale-on-pale while every
+   other button stayed correctly dark. */
+.mode-selector button {
+  border: 1px solid #313244;
+  border-radius: 4px;
+  background: #1e1e2e;
+  color: #cdd6f4;
+  cursor: pointer;
+}
+.mode-selector button:hover {
+  background: #262637;
+}
 .mode-selector button.resume {
   border-color: #89b4fa;
 }
@@ -235,4 +251,26 @@ body,
   margin-top: 8px;
   font-size: 11px;
   color: #a6adc8;
+}
+
+/* The which-conversation axis, above the permission-mode buttons. Visually grouped so it reads as a
+   choice between two conversations rather than as two more ways to start one. */
+.mode-selector .session-choice {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.mode-selector .session-choice button {
+  flex: 1;
+  margin: 0;
+}
+/* The selected conversation, distinguished by fill rather than by border alone -- `.resume` already
+   carries a blue border unselected, so a border-only cue would make "armed" and "merely available"
+   look the same on the option where it matters. */
+.mode-selector .session-choice button.selected {
+  border-color: #89b4fa;
+  background: rgba(137, 180, 250, 0.18);
+}
+.mode-selector .session-choice button[aria-checked="false"] {
+  opacity: 0.7;
 }
