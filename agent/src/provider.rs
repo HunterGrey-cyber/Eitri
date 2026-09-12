@@ -51,9 +51,47 @@ pub struct CloseSessionRequest {
     pub session_id: String,
 }
 
+/// Capabilities reported by the provider, never inferred from its name, enum members,
+/// or RPCs in a generated stub. Hide or disable unavailable features and send no commands for them.
+/// Each bool has a source in `HandshakeResponse` and represents a choice a caller makes.
+/// `Copy` lets callers pass capabilities freely. Owned lists, versions and diagnostics
+/// belong in `ProviderInfo`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
+    /// The provider can continue an existing provider session by id.
     pub resume: bool,
+    /// The provider can branch an existing provider session into a new one.
+    pub fork: bool,
+    /// The provider can cancel an in-flight turn.
+    pub interrupt: bool,
+    /// The provider advertises a BYPASS permission mode -- the only permission policy this
+    /// milestone actually uses, and the only one whose runtime behavior is genuinely distinct
+    /// (`interactive` and `verdandi_rules` are confirmed equivalent in the current sidecar, so
+    /// neither is modeled here as a separate capability).
+    pub bypass_permission_mode: bool,
+}
+
+/// Descriptive, non-branching facts about the connected provider: versions to show a human, the
+/// raw advertised lists for diagnostics, and whatever the provider process said on its way up.
+///
+/// Separate from `ProviderCapabilities` because these are for *display and debugging*, never for
+/// deciding whether to send a command. Anything a caller branches on belongs in the capabilities
+/// struct, with a real wire source behind it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderInfo {
+    pub sidecar_version: String,
+    pub claude_agent_sdk_version: String,
+    /// The Claude Code CLI version the provider is actually running against.
+    pub actual_claude_code_version: String,
+    pub protocol_major: u32,
+    pub protocol_minor: u32,
+    /// Verbatim `capabilities[]` from the handshake -- kept raw so an unrecognized future
+    /// capability is visible in diagnostics rather than silently dropped by the mapping above.
+    pub advertised_capabilities: Vec<String>,
+    pub advertised_permission_modes: Vec<String>,
+    /// Non-fatal diagnostics the provider process emitted while starting (e.g. "this CLI version is
+    /// inside the supported range but untested"). Empty for a provider that had nothing to say.
+    pub startup_diagnostics: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -88,6 +126,9 @@ impl std::error::Error for ProviderError {}
 
 pub trait AgentProvider {
     fn capabilities(&self) -> ProviderCapabilities;
+    /// Descriptive facts for display and diagnostics -- never a substitute for `capabilities()`
+    /// when deciding whether a command may be sent.
+    fn info(&self) -> ProviderInfo;
     /// Returns the new session's own id.
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError>;
     /// Returns the resumed session's own id.
