@@ -11,7 +11,7 @@ mod translate;
 
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
-    ProviderError, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
+    ProviderError, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::{AgentDomainEvent, PermissionMode};
@@ -19,9 +19,10 @@ use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
     ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
     CreateSessionRequest as ProtoCreateSessionRequest, ExecutableSource, ErrorDetail,
-    HandshakeRequest, InterruptTurnRequest as ProtoInterruptTurnRequest, PermissionMode as ProtoPermissionMode,
-    PersistenceMode, ResolvePermissionRequest as ProtoResolvePermissionRequest,
-    SendTurnRequest as ProtoSendTurnRequest, WatchSessionEventsRequest,
+    HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
+    PermissionMode as ProtoPermissionMode, PersistenceMode,
+    ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest,
+    WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
@@ -33,15 +34,88 @@ use tower::service_fn;
 
 const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The protocol major this client speaks. A sidecar reporting anything else is refused outright --
+/// design doc §9.3: "major 不兼容：拒绝连接".
+const CLIENT_PROTOCOL_MAJOR: u32 = 1;
+
+/// Capability strings this client understands, as the sidecar advertises them in
+/// `HandshakeResponse.capabilities`. Named constants rather than inline literals because a typo
+/// here fails silently in the worst possible direction: the capability reads as absent, the feature
+/// is hidden, and nothing anywhere reports a problem.
+const CAP_INTERRUPT_TURN: &str = "interrupt_turn";
+const CAP_RESUME_SESSION: &str = "resume_session";
+const CAP_FORK_SESSION: &str = "fork_session";
+const PERMISSION_MODE_BYPASS: &str = "bypass";
+
+/// Whether THIS client can actually drive resume/fork end to end. Both are `false` until the phase
+/// that implements them lands; flipping either one here is the single switch that turns the feature
+/// on, and it must not be flipped before `resume_session` does something real.
+///
+/// A capability is the INTERSECTION of what the provider advertises and what this side implements.
+/// Reporting the provider's advertisement alone would put a Resume control in the UI the moment the
+/// sidecar learned the word, while this client still returned `UnsupportedCapability` -- a button
+/// that cannot work is worse than no button, and it is exactly the "capability advertisement is a
+/// contract" failure this design is trying to avoid, just with the lie on the client side.
+const CLIENT_IMPLEMENTS_RESUME: bool = false;
+const CLIENT_IMPLEMENTS_FORK: bool = false;
+
+/// Derives what the provider can actually do from what it actually said. Pure, so it is unit-tested
+/// against real handshake shapes without a sidecar process.
+///
+/// Note what this deliberately does NOT do: it never returns `resume: true` because a
+/// `ResumeSessionRequest` type exists in this crate, or because `resume_session` is a method on the
+/// trait. Both of those have been true since Phase 3 while the wire protocol had no resume at all.
+fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabilities {
+    let has = |name: &str| response.capabilities.iter().any(|c| c == name);
+    ProviderCapabilities {
+        resume: CLIENT_IMPLEMENTS_RESUME && has(CAP_RESUME_SESSION),
+        fork: CLIENT_IMPLEMENTS_FORK && has(CAP_FORK_SESSION),
+        interrupt: has(CAP_INTERRUPT_TURN),
+        bypass_permission_mode: response.permission_modes.iter().any(|m| m == PERMISSION_MODE_BYPASS),
+    }
+}
+
+fn info_from_handshake(response: &HandshakeResponse, startup_diagnostics: Vec<String>) -> ProviderInfo {
+    ProviderInfo {
+        sidecar_version: response.sidecar_version.clone(),
+        claude_agent_sdk_version: response.claude_agent_sdk_version.clone(),
+        actual_claude_code_version: response.actual_claude_code_version.clone(),
+        protocol_major: response.protocol_major,
+        protocol_minor: response.protocol_minor,
+        advertised_capabilities: response.capabilities.clone(),
+        advertised_permission_modes: response.permission_modes.clone(),
+        startup_diagnostics,
+    }
+}
+
+/// Picks out the lines of a sidecar's startup stderr worth showing a human.
+///
+/// The sidecar logs plenty that is pure noise to a user. What matters here is its own compatibility
+/// diagnostic -- the "this CLI version is inside the supported range but has not been tested"
+/// warning, which is the single most likely explanation for otherwise-inexplicable behavior and
+/// which no other channel carries (it is deliberately not a protocol field).
+fn startup_diagnostics_from_stderr(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| line.contains("CLI version diagnostic"))
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
 // `RuntimeServiceClient<Channel>` is already cheaply `Clone` (tonic's generated clients wrap a
 // `Channel`, designed for exactly this "clone one per concurrent call" pattern -- cloning shares
 // the same underlying HTTP/2 connection). No `Mutex` is needed to clone it from `&self`; a `Mutex`
 // here would be protecting nothing (`.clone()` never needs exclusive access).
 pub struct ClaudeSidecarProvider {
-    _sidecar: SpawnedSidecar,
+    sidecar: SpawnedSidecar,
     runtime: RuntimeThread,
     client: RuntimeServiceClient<Channel>,
     events: Arc<Mutex<Vec<AgentDomainEvent>>>,
+    /// Captured once at `connect()` from the real `HandshakeResponse`, which this provider used to
+    /// discard entirely -- it checked only that the RPC succeeded. Without it there was no truthful
+    /// source for any capability at all, so `capabilities()` returned a hardcoded literal.
+    capabilities: ProviderCapabilities,
+    info: ProviderInfo,
 }
 
 impl ClaudeSidecarProvider {
@@ -72,20 +146,63 @@ impl ClaudeSidecarProvider {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-        let provider = Self { _sidecar: sidecar, runtime, client, events: Arc::new(Mutex::new(Vec::new())) };
-        provider
-            .runtime
+        let handshake = runtime
             .block_on(
                 {
-                    let mut client = provider.client.clone();
-                    async move { client.handshake(HandshakeRequest { client_protocol_major: 1 }).await }
+                    let mut client = client.clone();
+                    async move {
+                        client.handshake(HandshakeRequest { client_protocol_major: CLIENT_PROTOCOL_MAJOR }).await
+                    }
                 },
                 UNARY_RPC_TIMEOUT,
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?
-            .map_err(|status| std::io::Error::other(format!("handshake failed: {status}")))?;
+            .map_err(|status| std::io::Error::other(format!("handshake failed: {status}")))?
+            .into_inner();
 
-        Ok(provider)
+        // Design doc §9.3: an incompatible major is refused, minor differences are tolerated
+        // (protobuf unknown-field rules cover the new fields a higher minor may add). The sidecar
+        // performs the mirror-image check on the client's major, but that only catches a client
+        // that is too old -- this catches a sidecar that is too new, which is the direction a
+        // stale pinned `rev` in Cargo.toml actually produces.
+        if handshake.protocol_major != CLIENT_PROTOCOL_MAJOR {
+            return Err(std::io::Error::other(format!(
+                "claude-sidecar speaks protocol major {} but this client speaks {CLIENT_PROTOCOL_MAJOR}; \
+                 refusing to continue rather than issuing commands it may silently misread",
+                handshake.protocol_major
+            )));
+        }
+
+        let capabilities = capabilities_from_handshake(&handshake);
+        let info = info_from_handshake(&handshake, startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
+        for diagnostic in &info.startup_diagnostics {
+            eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
+        }
+
+        Ok(Self {
+            sidecar,
+            runtime,
+            client,
+            events: Arc::new(Mutex::new(Vec::new())),
+            capabilities,
+            info,
+        })
+    }
+
+    /// The sidecar process's recent stderr, for diagnosing a provider that connected but is
+    /// misbehaving. `info().startup_diagnostics` is the curated subset worth showing a user.
+    pub fn sidecar_stderr_tail(&self) -> Vec<String> {
+        self.sidecar.stderr_tail()
+    }
+
+    /// The OS pid of the sidecar process this provider spawned and owns.
+    ///
+    /// Exists so an orphan check can assert on the ONE process this provider is responsible for.
+    /// Never match sidecar or `claude` processes by name for that purpose: Claude Code sessions on a
+    /// developer machine are themselves processes named `claude`, so a name-matched search sweeps up
+    /// the session running the test. Capture this pid, check this pid.
+    pub fn sidecar_pid(&self) -> u32 {
+        self.sidecar.pid()
     }
 
     fn map_status(&self, status: tonic::Status) -> ProviderError {
@@ -157,7 +274,11 @@ fn to_proto_permission_mode(mode: PermissionMode) -> i32 {
 
 impl AgentProvider for ClaudeSidecarProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities { resume: false }
+        self.capabilities
+    }
+
+    fn info(&self) -> ProviderInfo {
+        self.info.clone()
     }
 
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
@@ -220,5 +341,110 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn pump(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape today's real sidecar returns -- copied from
+    /// `apps/claude-sidecar/src/runtimeServiceImpl.ts`'s handshake handler, not invented.
+    fn real_handshake_today() -> HandshakeResponse {
+        HandshakeResponse {
+            protocol_major: 1,
+            protocol_minor: 0,
+            sidecar_version: "0.1.0".into(),
+            claude_agent_sdk_version: "0.3.0".into(),
+            sdk_declared_claude_code_version: "2.1.269".into(),
+            actual_claude_code_version: "2.1.269".into(),
+            capabilities: [
+                "handshake",
+                "create_session",
+                "send_turn",
+                "watch_session_events",
+                "interrupt_turn",
+                "resolve_permission",
+                "close_session",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            configuration_profiles: vec!["native".into(), "isolated".into()],
+            permission_modes: vec!["interactive".into(), "verdandi_rules".into(), "bypass".into()],
+            max_message_bytes: 4 * 1024 * 1024,
+            event_buffer_policy: "bounded-1000".into(),
+        }
+    }
+
+    #[test]
+    fn todays_real_sidecar_advertises_interrupt_and_bypass_but_not_resume_or_fork() {
+        let capabilities = capabilities_from_handshake(&real_handshake_today());
+        assert!(capabilities.interrupt, "interrupt_turn is advertised and works (proven by the conformance suite)");
+        assert!(capabilities.bypass_permission_mode, "bypass is advertised, and is this milestone's only permission policy");
+        assert!(!capabilities.resume, "no resume_session capability exists on the wire yet");
+        assert!(!capabilities.fork, "no fork_session capability exists on the wire yet");
+    }
+
+    #[test]
+    fn a_capability_the_provider_does_not_advertise_is_never_reported() {
+        let mut response = real_handshake_today();
+        response.capabilities.retain(|c| c != "interrupt_turn");
+        assert!(!capabilities_from_handshake(&response).interrupt);
+    }
+
+    #[test]
+    fn a_provider_advertising_resume_still_reports_false_until_this_client_implements_it() {
+        // The regression this pins: the day Verdandi starts advertising `resume_session`, this
+        // client must not start reporting `resume: true` -- `resume_session()` here still returns
+        // UnsupportedCapability, so a UI acting on the capability would render a control that
+        // cannot work. Flipping CLIENT_IMPLEMENTS_RESUME is what changes this, and that flip must
+        // happen in the same change that implements the call.
+        let mut response = real_handshake_today();
+        response.capabilities.push("resume_session".into());
+        response.capabilities.push("fork_session".into());
+        let capabilities = capabilities_from_handshake(&response);
+        assert_eq!(capabilities.resume, CLIENT_IMPLEMENTS_RESUME);
+        assert_eq!(capabilities.fork, CLIENT_IMPLEMENTS_FORK);
+    }
+
+    #[test]
+    fn bypass_is_not_reported_when_the_provider_does_not_offer_it() {
+        let mut response = real_handshake_today();
+        response.permission_modes.retain(|m| m != "bypass");
+        assert!(!capabilities_from_handshake(&response).bypass_permission_mode);
+    }
+
+    #[test]
+    fn info_carries_the_advertised_lists_verbatim_for_diagnostics() {
+        let info = info_from_handshake(&real_handshake_today(), vec!["diag".into()]);
+        assert_eq!(info.actual_claude_code_version, "2.1.269");
+        assert_eq!(info.protocol_major, 1);
+        assert_eq!(info.sidecar_version, "0.1.0");
+        // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
+        // capability must stay visible in diagnostics rather than vanish.
+        assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
+        assert_eq!(info.advertised_capabilities.len(), 7);
+        assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
+    }
+
+    #[test]
+    fn the_cli_compatibility_warning_is_picked_out_of_real_sidecar_stderr() {
+        // Verbatim from a real run of the fixed sidecar against CLI 2.1.269, as it arrives through
+        // SpawnedSidecar's stderr tail.
+        let lines = vec![
+            "Debug: something unrelated".to_string(),
+            "claude-sidecar: CLI version diagnostic: claude CLI version 2.1.269 is inside this sidecar's supported range (>=2.1.267 <3.0.0) but has not been tested against it (tested: 2.1.267). Starting anyway.".to_string(),
+            "another unrelated line".to_string(),
+        ];
+        let diagnostics = startup_diagnostics_from_stderr(&lines);
+        assert_eq!(diagnostics.len(), 1, "got: {diagnostics:?}");
+        assert!(diagnostics[0].contains("2.1.269"));
+    }
+
+    #[test]
+    fn a_clean_startup_produces_no_diagnostics() {
+        assert!(startup_diagnostics_from_stderr(&["nothing notable".to_string()]).is_empty());
+        assert!(startup_diagnostics_from_stderr(&[]).is_empty());
     }
 }

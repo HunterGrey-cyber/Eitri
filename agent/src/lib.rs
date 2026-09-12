@@ -45,6 +45,6 @@ pub use projection::{
 pub use provider::{
     AgentProvider, CreateSessionRequest, ResumeSessionRequest, SendTurnRequest,
     InterruptTurnRequest, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
-    ProviderError,
+    ProviderError, ProviderInfo,
 };
 pub use providers::claude_sidecar::ClaudeSidecarProvider;
