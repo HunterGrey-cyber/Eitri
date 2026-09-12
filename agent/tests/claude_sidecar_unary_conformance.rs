@@ -30,5 +30,15 @@ fn resume_session_is_honestly_unsupported() {
 fn close_session_on_an_unknown_id_surfaces_a_typed_provider_error() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let result = provider.close_session(agent::CloseSessionRequest { session_id: "does-not-exist".into() });
-    assert!(matches!(result, Err(agent::ProviderError::Provider(_))), "got: {result:?}");
+    // The typed code, not just "some provider error": the sidecar encodes a real SESSION_NOT_FOUND
+    // in the grpc-status-details-bin trailer, and this crate now carries it across the boundary so a
+    // caller can distinguish a dead session from a recoverable ordering complaint without parsing
+    // English. Asserting only `Provider(_)` would have passed even while the code was discarded.
+    match result {
+        Err(agent::ProviderError::Provider { code, message }) => {
+            assert_eq!(code, agent::ProviderErrorCode::SessionNotFound, "message was: {message}");
+            assert!(!code.is_benign(), "an unknown session is not something to continue past");
+        }
+        other => panic!("expected a typed provider error, got: {other:?}"),
+    }
 }

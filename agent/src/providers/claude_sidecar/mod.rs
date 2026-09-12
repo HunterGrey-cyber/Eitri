@@ -11,14 +11,16 @@ mod translate;
 
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
-    ProviderError, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
+    ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest,
+    SendTurnRequest,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::{AgentDomainEvent, PermissionMode};
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
     ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
-    CreateSessionRequest as ProtoCreateSessionRequest, ExecutableSource, ErrorDetail,
+    CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ExecutableSource,
+    ErrorDetail,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode,
     ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest,
@@ -85,6 +87,28 @@ fn info_from_handshake(response: &HandshakeResponse, startup_diagnostics: Vec<St
         advertised_capabilities: response.capabilities.clone(),
         advertised_permission_modes: response.permission_modes.clone(),
         startup_diagnostics,
+    }
+}
+
+/// Maps the sidecar proto's own `ErrorCode` onto this crate's provider-neutral mirror. Exhaustive
+/// by construction: adding a variant to the proto makes this stop compiling rather than silently
+/// collapsing a new, possibly-serious code into `Unspecified`.
+fn provider_error_code(code: ProtoErrorCode) -> ProviderErrorCode {
+    match code {
+        ProtoErrorCode::Unspecified => ProviderErrorCode::Unspecified,
+        ProtoErrorCode::IncompatibleProtocol => ProviderErrorCode::IncompatibleProtocol,
+        ProtoErrorCode::UnsupportedCliVersion => ProviderErrorCode::UnsupportedCliVersion,
+        ProtoErrorCode::SessionNotFound => ProviderErrorCode::SessionNotFound,
+        ProtoErrorCode::TurnAlreadyActive => ProviderErrorCode::TurnAlreadyActive,
+        ProtoErrorCode::NoActiveTurn => ProviderErrorCode::NoActiveTurn,
+        ProtoErrorCode::PermissionNotFound => ProviderErrorCode::PermissionNotFound,
+        ProtoErrorCode::PermissionAlreadyResolved => ProviderErrorCode::PermissionAlreadyResolved,
+        ProtoErrorCode::IdempotencyConflict => ProviderErrorCode::IdempotencyConflict,
+        ProtoErrorCode::EventGap => ProviderErrorCode::EventGap,
+        ProtoErrorCode::InvalidConfiguration => ProviderErrorCode::InvalidConfiguration,
+        ProtoErrorCode::ProviderUnavailable => ProviderErrorCode::ProviderUnavailable,
+        ProtoErrorCode::ProviderProtocolError => ProviderErrorCode::ProviderProtocolError,
+        ProtoErrorCode::DeadlineExceeded => ProviderErrorCode::DeadlineExceeded,
     }
 }
 
@@ -217,7 +241,10 @@ impl ClaudeSidecarProvider {
         let bytes = status.details();
         if !bytes.is_empty() {
             if let Ok(detail) = <ErrorDetail as prost::Message>::decode(bytes) {
-                return ProviderError::Provider(detail.message);
+                return ProviderError::Provider {
+                    code: provider_error_code(detail.code()),
+                    message: detail.message,
+                };
             }
         }
         ProviderError::Transport(status.message().to_string())

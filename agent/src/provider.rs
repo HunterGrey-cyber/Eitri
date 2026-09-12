@@ -97,6 +97,51 @@ pub struct ProviderInfo {
     pub startup_diagnostics: Vec<String>,
 }
 
+/// A provider-neutral mirror of the sidecar proto's own `ErrorCode`. Exists because the code was
+/// being thrown away: `ProviderError::Provider` used to carry only `ErrorDetail.message`, so a
+/// caller had no way to tell "you sent a second turn while one was running" (a recoverable ordering
+/// complaint about one command) from "the session is gone" (the session must be torn down) except
+/// by matching on English prose.
+///
+/// Mirrored rather than re-exported so no proto type crosses this boundary -- the same discipline
+/// that keeps `AgentDomainEvent` free of wire types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorCode {
+    Unspecified,
+    IncompatibleProtocol,
+    UnsupportedCliVersion,
+    SessionNotFound,
+    TurnAlreadyActive,
+    NoActiveTurn,
+    PermissionNotFound,
+    PermissionAlreadyResolved,
+    IdempotencyConflict,
+    EventGap,
+    InvalidConfiguration,
+    ProviderUnavailable,
+    ProviderProtocolError,
+    DeadlineExceeded,
+}
+
+impl ProviderErrorCode {
+    /// True when the error is a complaint about ONE command's timing or arguments, leaving the
+    /// session itself healthy. A benign error must be surfaced to the caller and then forgotten;
+    /// tearing the session down over one would lose a working conversation.
+    ///
+    /// Everything not listed is treated as NOT benign on purpose -- an unrecognized future code
+    /// must fail toward "this might be serious", never toward "probably fine".
+    pub fn is_benign(self) -> bool {
+        matches!(
+            self,
+            ProviderErrorCode::TurnAlreadyActive
+                | ProviderErrorCode::NoActiveTurn
+                | ProviderErrorCode::PermissionNotFound
+                | ProviderErrorCode::PermissionAlreadyResolved
+                | ProviderErrorCode::IdempotencyConflict
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum ProviderError {
     /// The caller asked for something this provider's `capabilities()` already says it doesn't
@@ -111,8 +156,20 @@ pub enum ProviderError {
     Transport(String),
     /// The provider's own service returned a real business error (e.g. `SESSION_NOT_FOUND`) --
     /// carries the provider's own error text, already safe to show a human (never raw stderr or an
-    /// unfiltered stack trace, per design doc §9.7).
-    Provider(String),
+    /// unfiltered stack trace, per design doc §9.7), plus the typed code so a caller can tell a
+    /// recoverable ordering complaint from a dead session without parsing that text.
+    Provider { code: ProviderErrorCode, message: String },
+}
+
+impl ProviderError {
+    /// True only for a provider-reported error the session can continue past. Transport failures and
+    /// timeouts are never benign: they say nothing about whether the command took effect.
+    pub fn is_benign(&self) -> bool {
+        match self {
+            ProviderError::Provider { code, .. } => code.is_benign(),
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderError {
@@ -121,7 +178,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::UnsupportedCapability(what) => write!(f, "unsupported capability: {what}"),
             ProviderError::Timeout => write!(f, "provider request timed out"),
             ProviderError::Transport(msg) => write!(f, "provider transport error: {msg}"),
-            ProviderError::Provider(msg) => write!(f, "provider error: {msg}"),
+            ProviderError::Provider { code, message } => write!(f, "provider error ({code:?}): {message}"),
         }
     }
 }
