@@ -12,8 +12,8 @@ use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 /// Maps an optional session projection to dashboard status. `AgentPanelState.session` is absent
 /// before the user leaves the mode selector, so this takes `Option<&AgentSessionProjection>`.
 /// `None` maps to `NoSession`.
-pub(crate) fn derive_status(session: Option<&AgentSessionProjection>) -> AgentStatus {
-    let Some(projection) = session else {
+pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
+    let Some(projection) = projection else {
         return AgentStatus::NoSession;
     };
     // A terminal status is checked FIRST, ahead of the two "busy" signals. A session that has ended

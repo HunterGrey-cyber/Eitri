@@ -19,6 +19,7 @@
 
 use agent::{
     AgentConversation, AgentSession, AgentDomainEvent, AgentSessionProjection, ClaudeSidecarProvider,
+    ProjectionGuard, UiDelivery,
     ConversationError, PermissionDecision, PermissionMode, ProviderCapabilities, ProviderInfo,
     ResumableSession,
     CONSERVATIVE_DISALLOWED_TOOLS,
@@ -50,6 +51,25 @@ const _: () = {
     assert!(!LEGACY_CAPABILITIES.resume, "resume must not be advertised before it works end to end");
     assert!(!LEGACY_CAPABILITIES.fork, "fork must not be advertised before it works end to end");
 };
+
+/// A borrow of whichever projection this backend owns.
+///
+/// The sidecar's lives behind the ingestion thread's lock and the legacy backend's is a plain field.
+/// Both deref to the same type, so call sites read `backend.projection().status` either way.
+pub(crate) enum ProjectionRef<'a> {
+    Borrowed(&'a AgentSessionProjection),
+    Guarded(ProjectionGuard<'a>),
+}
+
+impl std::ops::Deref for ProjectionRef<'_> {
+    type Target = AgentSessionProjection;
+    fn deref(&self) -> &AgentSessionProjection {
+        match self {
+            ProjectionRef::Borrowed(projection) => projection,
+            ProjectionRef::Guarded(guard) => guard,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendKind {
@@ -168,11 +188,11 @@ impl AgentBackend {
                 })?;
                 match resume {
                     Some(provider_session_id) => {
-                        AgentConversation::resume(Box::new(provider), project_dir, provider_session_id, mode)
+                        AgentConversation::resume(std::sync::Arc::new(provider), project_dir, provider_session_id, mode)
                             .map(|c| AgentBackend::Sidecar(Box::new(c)))
                             .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}")))
                     }
-                    None => AgentConversation::create(Box::new(provider), project_dir, mode)
+                    None => AgentConversation::create(std::sync::Arc::new(provider), project_dir, mode)
                         .map(|c| AgentBackend::Sidecar(Box::new(c)))
                         .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
                 }
@@ -207,10 +227,16 @@ impl AgentBackend {
         }
     }
 
-    pub(crate) fn projection(&self) -> &AgentSessionProjection {
+    /// Canonical conversation state, for whichever backend this is.
+    ///
+    /// Returns a borrow rather than a clone: the panel reads this on every 33ms tick, and the
+    /// sidecar path's projection can hold a whole conversation. The sidecar's arrives through the
+    /// ingestion thread's lock, the legacy backend's is a plain field -- `ProjectionRef` is what lets
+    /// one call site cover both without either paying for the other's shape.
+    pub(crate) fn projection(&self) -> ProjectionRef<'_> {
         match self {
-            AgentBackend::Legacy(session) => &session.projection,
-            AgentBackend::Sidecar(conversation) => &conversation.projection,
+            AgentBackend::Legacy(session) => ProjectionRef::Borrowed(&session.projection),
+            AgentBackend::Sidecar(conversation) => ProjectionRef::Guarded(conversation.projection()),
         }
     }
 
@@ -240,9 +266,9 @@ impl AgentBackend {
     /// The Claude session UUID, once the provider has reported it. Distinct from the projection's
     /// `session_id` (Verdandi's) for the sidecar backend; identical for the legacy one, whose CLI
     /// never separated them.
-    pub(crate) fn provider_session_id(&self) -> Option<&str> {
+    pub(crate) fn provider_session_id(&self) -> Option<String> {
         match self {
-            AgentBackend::Legacy(session) => session.projection.provider_session_id.as_deref(),
+            AgentBackend::Legacy(session) => session.projection.provider_session_id.clone(),
             AgentBackend::Sidecar(conversation) => conversation.provider_session_id(),
         }
     }
@@ -313,10 +339,25 @@ impl AgentBackend {
         }
     }
 
-    pub(crate) fn pump(&mut self) -> Vec<AgentDomainEvent> {
+    /// What the UI should apply next.
+    ///
+    /// The two backends reach this differently and the difference is the point of the sidecar
+    /// refactor. The legacy backend still drains its provider here, on the caller's thread -- so a
+    /// stalled UI still stalls its reducer. The sidecar path folds continuously on its own thread and
+    /// this only collects what is already canonical, which is why a stalled UI there can no longer
+    /// make raw events pile up. Legacy is left as it was deliberately: it is the path being retired,
+    /// it has no partial streaming, and one message per turn is not a backlog.
+    pub(crate) fn take_ui_delivery(&mut self) -> UiDelivery {
         match self {
-            AgentBackend::Legacy(session) => session.pump(),
-            AgentBackend::Sidecar(conversation) => conversation.pump(),
+            AgentBackend::Legacy(session) => {
+                let events = session.pump();
+                if events.is_empty() {
+                    UiDelivery::Nothing
+                } else {
+                    UiDelivery::Events(events)
+                }
+            }
+            AgentBackend::Sidecar(conversation) => conversation.take_ui_delivery(),
         }
     }
 

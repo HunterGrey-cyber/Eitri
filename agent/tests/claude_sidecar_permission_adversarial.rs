@@ -28,7 +28,7 @@ fn conversation() -> (AgentConversation, u32) {
     let cwd = std::env::temp_dir();
     // PermissionMode::Auto -> the sidecar's `interactive` policy. This is the mode the start screen
     // now offers on this backend, so it is the mode these tests must exercise.
-    let conversation = AgentConversation::create(Box::new(provider), &cwd, PermissionMode::Auto)
+    let conversation = AgentConversation::create(std::sync::Arc::new(provider), &cwd, PermissionMode::Auto)
         .expect("creating a conversation in interactive mode should succeed");
     (conversation, pid)
 }
@@ -42,14 +42,19 @@ fn conversation() -> (AgentConversation, u32) {
 /// batch. That mistake made this file's double-decision test pass on timing and then fail, which is
 /// worse than failing outright.
 fn drain_until<F: Fn(&AgentConversation, &[AgentDomainEvent]) -> bool>(
-    conversation: &mut AgentConversation,
+    conversation: &AgentConversation,
     window: Duration,
     done: F,
 ) -> Vec<AgentDomainEvent> {
     let deadline = Instant::now() + window;
     let mut seen = Vec::new();
     while Instant::now() < deadline {
-        seen.extend(conversation.pump());
+        // Collects what the UI would be handed. Ingestion is already folding on its own thread, so
+        // this no longer DRIVES anything -- a `Resync` here means the queue overflowed while this
+        // test was between polls, and the projection (which `done` reads) is the authority either way.
+        if let agent::UiDelivery::Events(events) = conversation.take_ui_delivery() {
+            seen.extend(events);
+        }
         if done(conversation, &seen) {
             break;
         }
@@ -71,10 +76,10 @@ fn saw_a_turn_end(events: &[AgentDomainEvent]) -> bool {
     })
 }
 
-fn wait_for_a_pending_permission(conversation: &mut AgentConversation) -> String {
-    drain_until(conversation, Duration::from_secs(60), |c, _| !c.projection.pending_permissions.is_empty());
+fn wait_for_a_pending_permission(conversation: &AgentConversation) -> String {
+    drain_until(conversation, Duration::from_secs(60), |c, _| !c.projection().pending_permissions.is_empty());
     conversation
-        .projection
+        .projection()
         .pending_permissions
         .keys()
         .next()
@@ -93,28 +98,27 @@ fn wait_for_a_pending_permission(conversation: &mut AgentConversation) -> String
 fn a_decision_that_takes_a_minute_is_still_honored() {
     let (mut conversation, _) = conversation();
     conversation.send_turn(TOOL_PROMPT).unwrap();
-    let permission_id = wait_for_a_pending_permission(&mut conversation);
+    let permission_id = wait_for_a_pending_permission(&conversation);
 
     eprintln!("holding the decision for 60s, as a slow human would");
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(60) {
-        conversation.pump();
         std::thread::sleep(Duration::from_millis(200));
     }
     // Still pending after a full minute: nothing timed it out behind the user's back.
     assert!(
-        conversation.projection.pending_permissions.contains_key(&permission_id),
+        conversation.projection().pending_permissions.contains_key(&permission_id),
         "the request was resolved by something other than the user during the wait"
     );
     assert!(
-        !matches!(conversation.projection.status, ProjectionStatus::Unavailable { .. }),
+        !matches!(conversation.projection().status, ProjectionStatus::Unavailable { .. }),
         "the session did not survive an idle minute"
     );
 
     conversation.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
 
-    let events = drain_until(&mut conversation, Duration::from_secs(60), |c, seen| {
-        saw_a_turn_end(seen) && c.projection.pending_permissions.is_empty()
+    let events = drain_until(&conversation, Duration::from_secs(60), |c, seen| {
+        saw_a_turn_end(seen) && c.projection().pending_permissions.is_empty()
     });
     let outcome = events.iter().find_map(|e| match e {
         AgentDomainEvent::PermissionResolved { permission_id: id, outcome } if *id == permission_id => Some(*outcome),
@@ -143,7 +147,7 @@ fn a_decision_that_takes_a_minute_is_still_honored() {
 fn deciding_twice_is_refused_without_killing_the_conversation() {
     let (mut conversation, _) = conversation();
     conversation.send_turn(TOOL_PROMPT).unwrap();
-    let permission_id = wait_for_a_pending_permission(&mut conversation);
+    let permission_id = wait_for_a_pending_permission(&conversation);
 
     conversation.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
 
@@ -162,7 +166,7 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
         }
     }
 
-    let events = drain_until(&mut conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
+    let events = drain_until(&conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     let outcomes: Vec<PermissionOutcome> = events
         .iter()
         .filter_map(|e| match e {
@@ -172,7 +176,7 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
         .collect();
     assert_eq!(outcomes, vec![PermissionOutcome::Allowed], "exactly one resolution, and it is the first one");
     assert!(
-        !matches!(conversation.projection.status, ProjectionStatus::Unavailable { .. }),
+        !matches!(conversation.projection().status, ProjectionStatus::Unavailable { .. }),
         "a double decision must not end the session"
     );
 
@@ -180,7 +184,7 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
     conversation.send_turn("reply with exactly: still-here").unwrap();
     // Waits for THIS turn to end, not for the projection to look idle -- it already does, because
     // the turn just sent has not reported starting yet.
-    let events = drain_until(&mut conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
+    let events = drain_until(&conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     let text: String = events
         .iter()
         .filter_map(|e| match e { AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()), _ => None })
@@ -195,7 +199,7 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
 fn an_unknown_permission_id_never_reaches_the_provider() {
     let (mut conversation, _) = conversation();
     conversation.send_turn(TOOL_PROMPT).unwrap();
-    let real_id = wait_for_a_pending_permission(&mut conversation);
+    let real_id = wait_for_a_pending_permission(&conversation);
 
     let error = conversation
         .respond_permission("not-a-real-permission-id", PermissionDecision::Allow)
@@ -204,7 +208,7 @@ fn an_unknown_permission_id_never_reaches_the_provider() {
 
     // The real one still works afterwards -- the refusal did not disturb the pending request.
     conversation.respond_permission(&real_id, PermissionDecision::Allow).unwrap();
-    drain_until(&mut conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
+    drain_until(&conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     conversation.shutdown();
 }
 
@@ -220,7 +224,7 @@ fn an_unknown_permission_id_never_reaches_the_provider() {
 fn a_session_that_dies_with_a_decision_outstanding_reports_it_and_keeps_the_record() {
     let (mut conversation, sidecar_pid) = conversation();
     conversation.send_turn(TOOL_PROMPT).unwrap();
-    let permission_id = wait_for_a_pending_permission(&mut conversation);
+    let permission_id = wait_for_a_pending_permission(&conversation);
     eprintln!("killing sidecar pid {sidecar_pid} with {permission_id} still unanswered");
 
     // ONLY the pid this test's own provider reported. Never by name.
@@ -228,21 +232,22 @@ fn a_session_that_dies_with_a_decision_outstanding_reports_it_and_keeps_the_reco
     let killed = unsafe { libc::kill(sidecar_pid as i32, libc::SIGKILL) };
     assert_eq!(killed, 0, "could not signal the sidecar this test spawned");
 
-    drain_until(&mut conversation, Duration::from_secs(30), |c, _| {
-        matches!(c.projection.status, ProjectionStatus::Unavailable { .. })
+    drain_until(&conversation, Duration::from_secs(30), |c, _| {
+        matches!(c.projection().status, ProjectionStatus::Unavailable { .. })
     });
 
-    let ProjectionStatus::Unavailable { reason } = &conversation.projection.status else {
-        panic!("a session that died with a permission pending reported nothing: {:?}", conversation.projection.status);
+    let reason = match &conversation.projection().status {
+        ProjectionStatus::Unavailable { reason } => reason.clone(),
+        other => panic!("a session that died with a permission pending reported nothing: {other:?}"),
     };
     eprintln!("reported: {reason}");
     assert!(!reason.trim().is_empty());
 
     assert!(
-        conversation.projection.pending_permissions.contains_key(&permission_id),
+        conversation.projection().pending_permissions.contains_key(&permission_id),
         "the unanswered request was silently dropped -- that reads as a resolution nobody made"
     );
-    assert_eq!(conversation.projection.active_turn_id, None, "the turn cannot still be in progress");
+    assert_eq!(conversation.projection().active_turn_id, None, "the turn cannot still be in progress");
 
     // And answering it now fails instead of appearing to work.
     let error = conversation
