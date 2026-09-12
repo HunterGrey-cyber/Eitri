@@ -99,6 +99,7 @@ fn info_from_handshake(
         protocol_minor: response.protocol_minor,
         advertised_capabilities: response.capabilities.clone(),
         advertised_permission_modes: response.permission_modes.clone(),
+        event_buffer_policy: response.event_buffer_policy.clone(),
         build_description,
         startup_diagnostics,
     }
@@ -242,6 +243,7 @@ impl ClaudeSidecarProvider {
             events_received: self.backpressure.events_received.load(Ordering::Relaxed),
             max_delivery_lag_ms: self.backpressure.max_delivery_lag_ms.load(Ordering::Relaxed),
             last_delivery_lag_ms: self.backpressure.last_delivery_lag_ms.load(Ordering::Relaxed),
+            watch_reconnects: self.backpressure.watch_reconnects.load(Ordering::Relaxed),
         }
     }
 
@@ -367,6 +369,7 @@ impl ClaudeSidecarProvider {
                         match watch::WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
                             Some(delay) => {
                                 consecutive_failures += 1;
+                                backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
                                 tokio::time::sleep(*delay).await;
                                 continue;
                             }
@@ -429,6 +432,7 @@ impl ClaudeSidecarProvider {
                 match watch::WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
                     Some(delay) => {
                         consecutive_failures += 1;
+                        backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(*delay).await;
                     }
                     None => {
@@ -465,6 +469,12 @@ pub struct BackpressureStats {
     pub max_delivery_lag_ms: i64,
     /// The most recent such delay, so a caller can see catch-up happening rather than only the peak.
     pub last_delivery_lag_ms: i64,
+    /// How many times this session's watch stream has been re-opened after breaking.
+    ///
+    /// Zero on a healthy session, and that is what makes it useful: a successful recovery is
+    /// otherwise completely silent, so a test asserting "it recovered" has no way to tell a repaired
+    /// stream from one that was never broken. Without this, such a test passes vacuously.
+    pub watch_reconnects: u64,
 }
 
 /// Shared counters the watch task updates and `backpressure_stats()` reads. Atomics rather than a
@@ -473,6 +483,7 @@ pub struct BackpressureStats {
 #[derive(Default)]
 struct BackpressureCounters {
     events_received: AtomicU64,
+    watch_reconnects: AtomicU64,
     max_delivery_lag_ms: AtomicI64,
     last_delivery_lag_ms: AtomicI64,
 }

@@ -451,10 +451,11 @@ mod tests {
             sidecar_version: "0.1.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             actual_claude_code_version: "2.1.269".into(),
-            protocol_major: 1,
+            protocol_major: 2,
             protocol_minor: 0,
             advertised_capabilities: vec!["handshake".into()],
             advertised_permission_modes: vec!["bypass".into()],
+            event_buffer_policy: "bounded-1000".into(),
             build_description: Some("Verdandi checkout: /x @ eb70aa3 (via NEOVIBE_VERDANDI_CHECKOUT)".into()),
             startup_diagnostics: vec!["claude CLI 2.1.269 is untested".into()],
         };
@@ -489,7 +490,7 @@ mod tests {
         assert_eq!(parsed["state"]["capabilities"]["interrupt"], true);
         assert_eq!(parsed["state"]["capabilities"]["resume"], false, "resume must not be advertised in this milestone");
         assert_eq!(parsed["state"]["provider"]["claudeCodeVersion"], "2.1.269");
-        assert_eq!(parsed["state"]["provider"]["protocol"], "1.0");
+        assert_eq!(parsed["state"]["provider"]["protocol"], "2.0");
         assert!(parsed["state"]["provider"]["buildDescription"].as_str().unwrap().contains("eb70aa3"));
         // Warnings only -- a list that is never empty cannot drive a "something is wrong" glyph.
         assert!(parsed["state"]["provider"]["startupDiagnostics"][0].as_str().unwrap().contains("untested"));

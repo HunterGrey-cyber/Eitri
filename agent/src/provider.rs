@@ -170,6 +170,14 @@ pub struct ProviderInfo {
     /// capability is visible in diagnostics rather than silently dropped by the mapping above.
     pub advertised_capabilities: Vec<String>,
     pub advertised_permission_modes: Vec<String>,
+    /// The provider's own statement of how much event history it retains, verbatim from the
+    /// handshake (the sidecar reports `bounded-<n>`).
+    ///
+    /// Descriptive, never branched on. It exists so a test that configures a small replay buffer can
+    /// confirm the configuration actually took effect rather than asserting on downstream symptoms
+    /// -- a ring that silently stayed at its default never evicts, and never gapping is
+    /// indistinguishable from correct behaviour.
+    pub event_buffer_policy: String,
     /// Which build of the provider this is (for the sidecar: the Verdandi checkout and revision).
     /// Descriptive and essentially always present -- deliberately NOT in `startup_diagnostics`,
     /// because a list that is never empty cannot drive a "something is wrong" indicator.
