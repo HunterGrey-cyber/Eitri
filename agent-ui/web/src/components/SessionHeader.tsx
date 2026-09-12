@@ -9,11 +9,21 @@ export function SessionHeader({ state }: { state: AgentUiState }) {
   return (
     <div className="session-header">
       <span className="model">{state.model ?? "no model yet"}</span>
-      {/* A terminal status wins over activeTurnId. Nothing clears activeTurnId when a session dies
-          mid-turn -- correctly so, since no provider event says "that turn is over" -- so without
-          this guard a crashed session renders the word "working" forever, in red, styled by the
-          very `.status-unavailable` rule written for the text it was hiding. */}
-      <span className={`status status-${state.status.kind}`}>
+      {/* A terminal status wins over activeTurnId. The reducer now also clears activeTurnId on
+          `session_unavailable`/`session_closed` -- the earlier note here argued the opposite, that
+          nothing should clear it because no provider event says "that turn is over", and that was
+          wrong in its consequence: it left a dead session reading "working" forever, in red, styled
+          by the very `.status-unavailable` rule written for the text it was hiding, and it kept
+          `App.tsx`'s composer spinner and the supervisor dashboard's Working dot stuck too.
+          Clearing it invents no completion; the terminal status is still the thing being shown. */}
+      <span
+        className={`status status-${state.status.kind}`}
+        title={
+          state.status.kind === "unavailable" || state.status.kind === "closed"
+            ? state.status.reason
+            : undefined
+        }
+      >
         {state.status.kind === "running" && state.activeTurnId !== null ? "working" : state.status.kind}
       </span>
       <span className="backend" title={`backend: ${state.backend}`}>{state.backend}</span>

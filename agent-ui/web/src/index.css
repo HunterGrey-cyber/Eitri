@@ -186,6 +186,40 @@ body,
   user-select: text;
 }
 
+/* A session that was LOST, as opposed to one that ended normally. Shares the fatal-error palette
+   deliberately: both mean "stop trusting what you see", and the whole point of this banner is that
+   a truncated reply must not look like a finished one. It sits directly above the composer, in the
+   reading path between the last message and the box, and has no dismiss control -- a warning about
+   incomplete output that can be clicked away is a warning that will be. */
+.session-lost {
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid #f38ba8;
+  border-radius: 4px;
+  background: rgba(243, 139, 168, 0.08);
+  color: #f38ba8;
+  font-size: 12px;
+}
+.session-lost pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, monospace;
+  color: #cdd6f4;
+  user-select: text;
+}
+
+/* An ordinary ending (the host closed it, the provider exited cleanly). Informational, not alarming
+   -- styling this like a loss would train the eye to ignore the one that matters. */
+.session-over {
+  margin: 12px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(205, 214, 244, 0.06);
+  color: #a6adc8;
+  font-size: 12px;
+}
+
 /* The continue-previous-session option: visually distinct from a fresh start, since the two have
    very different consequences and the wrong click is not obviously wrong afterwards. */
 .mode-selector button.resume {

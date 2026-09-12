@@ -71,6 +71,32 @@ describe("applyEvent", () => {
     expect(state.status).toEqual({ kind: "closed", reason: "window closed" });
   });
 
+  /* The forbidden failure mode, at the reducer level: a session that dies mid-turn used to leave
+     activeTurnId set forever, so App.tsx kept turnInProgress true, the composer stayed disabled
+     with a spinner, and the truncated reply above it looked like a reply that had simply finished
+     being short. */
+  it("session_unavailable mid-turn clears activeTurnId, because no turn_completed is ever coming", () => {
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "half an ans" });
+    expect(state.activeTurnId).toBe("t1");
+
+    state = applyEvent(state, { type: "session_unavailable", reason: "3 event(s) were never delivered" });
+
+    expect(state.activeTurnId).toBeNull();
+    expect(state.status).toEqual({ kind: "unavailable", reason: "3 event(s) were never delivered" });
+    // And the half-written text is still there: clearing the turn must not also erase what did
+    // arrive. The banner says it may be incomplete; the reducer does not quietly delete it.
+    expect(state.transcript[state.transcript.length - 1]).toBe("half an ans");
+  });
+
+  it("session_closed mid-turn clears activeTurnId too", () => {
+    let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, { type: "session_closed", reason: "closed_by_host" });
+    expect(state.activeTurnId).toBeNull();
+  });
+
   it("permission_requested pushes onto pendingPermissions without clearing prior entries", () => {
     let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_name: "Bash", input: {} });
     state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_name: "Read", input: {} });
