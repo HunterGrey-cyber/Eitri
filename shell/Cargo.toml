@@ -9,6 +9,8 @@ neovide-editor = { path = "../neovide-editor" }
 agent = { path = "../agent" }
 supervisor = { path = "../supervisor" }
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
+terminal-pane = { path = "../terminal-pane" }
+terminal-render = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "a2f194a8f309814ec457aebdf07f16e5abf6074b" }
 webkit6 = "0.6"
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
 serde = { version = "1", features = ["derive"] }

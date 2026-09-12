@@ -14,15 +14,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-/// The two named layout slots a panel can claim in v1. There are no tabs or multiple
-/// panels per slot: registering in an occupied slot replaces its panel and logs a warning.
-/// `main` is the left, primary pane containing the editor; `side` is the right,
-/// secondary pane containing the agent placeholder. A plugin can replace either
-/// built-in panel by registering in its slot.
+/// The named layout slots a panel can claim -- deliberately not a general docking system (no
+/// tabs, no arbitrary panel count per slot; a later registration to an already-occupied slot
+/// replaces the earlier one, logging a warning). `main` is the left/primary pane (today: the
+/// editor); `side` is the right/secondary pane (today: the agent panel); `bottom` spans the full
+/// width beneath both (today: the native terminal, when `--terminal` asks for it). A plugin
+/// registering to any of them will replace whatever built-in is there -- accepted as this
+/// project's stated personal-tool risk tolerance, not guarded against with a "protected slots"
+/// concept nobody has asked for.
+///
+/// `bottom` differs from the other two in one way worth knowing: it is the only slot that can be
+/// **empty**. `main` and `side` always have a built-in, so the layout can assume them; the bottom
+/// pane only exists when something claims it, and the window is built without a vertical split at
+/// all when nothing has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PanelSlot {
     Main,
     Side,
+    Bottom,
 }
 
 impl PanelSlot {
@@ -30,6 +39,7 @@ impl PanelSlot {
         match s {
             "main" => Some(Self::Main),
             "side" => Some(Self::Side),
+            "bottom" => Some(Self::Bottom),
             _ => None,
         }
     }
@@ -87,7 +97,7 @@ pub(crate) fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
     let url: String = content.get("url")?;
     let slot = PanelSlot::parse(&position).ok_or_else(|| {
         mlua::Error::RuntimeError(format!(
-            "neovibe.panel.register: unknown position '{position}' -- must be 'main' or 'side'"
+            "neovibe.panel.register: unknown position '{position}' -- must be 'main', 'side' or 'bottom'"
         ))
     })?;
     Ok(ParsedPanelSpec { id, title, slot, url })
@@ -193,6 +203,26 @@ mod tests {
             .unwrap();
         let err = parse_panel_spec(&spec).unwrap_err();
         assert!(err.to_string().contains("unsupported content.type"));
+    }
+
+    /// `bottom` is a real slot, not only something `main.rs` reaches for internally. Without this
+    /// a plugin could not claim it, and the built-in terminal would be the one panel in the app
+    /// that does not actually share the plugin path.
+    #[test]
+    fn accepts_the_bottom_position() {
+        let lua = Lua::new();
+        let spec: Table = lua
+            .load(
+                r#"
+                return {
+                    id = "notes", title = "Notes", position = "bottom",
+                    content = { type = "webview", url = "notes.html" },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(parse_panel_spec(&spec).unwrap().slot, PanelSlot::Bottom);
     }
 
     #[test]
