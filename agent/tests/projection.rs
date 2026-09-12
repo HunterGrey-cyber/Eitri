@@ -220,3 +220,46 @@ fn a_thinking_delta_does_not_split_the_text_around_it() {
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "after".into() });
     assert_eq!(projection.transcript, vec!["before after".to_string()]);
 }
+
+/// The forbidden failure mode, at the projection level.
+///
+/// A session that dies mid-turn used to leave `active_turn_id` set forever. Three separate surfaces
+/// read that field to mean "busy": the panel's composer (spinner, disabled input), the session
+/// header's status word, and `supervisor_client::derive_status`, which returns `Working` from it
+/// BEFORE it ever looks at the status. So a killed provider showed up as a working agent in every
+/// one of them, above a truncated reply that looked merely short.
+#[test]
+fn a_lost_session_stops_looking_like_a_turn_in_progress() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::SessionOpened {
+        session_id: "sess-1".into(), provider_session_id: "prov-1".into(),
+        model: "claude-sonnet-5".into(), cwd: "/tmp/project".into(),
+    });
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(), kind: ContentKind::Text, text: "half an ans".into(),
+    });
+    assert_eq!(projection.active_turn_id, Some("t1".into()));
+
+    projection.apply(&AgentDomainEvent::SessionUnavailable {
+        reason: "57 event(s) from the provider (sequence 41-97) were never delivered".into(),
+    });
+
+    assert_eq!(projection.active_turn_id, None, "a session that cannot report a turn is not running one");
+    assert!(matches!(projection.status, ProjectionStatus::Unavailable { .. }));
+    // What DID arrive stays. Clearing the turn must not double as deleting the partial reply: the
+    // reason string is what tells the reader it may be incomplete, not its absence.
+    assert_eq!(projection.transcript, vec!["half an ans".to_string()]);
+    // And no completion was invented on the way out.
+    assert_eq!(projection.usage.num_turns, 0);
+    assert_eq!(projection.usage.total_cost_usd, 0.0);
+}
+
+#[test]
+fn a_session_closed_mid_turn_also_stops_looking_like_a_turn_in_progress() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&AgentDomainEvent::SessionClosed { reason: "closed_by_host".into() });
+    assert_eq!(projection.active_turn_id, None);
+    assert!(matches!(projection.status, ProjectionStatus::Closed { .. }));
+}

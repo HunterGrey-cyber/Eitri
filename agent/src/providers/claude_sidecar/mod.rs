@@ -8,6 +8,7 @@
 
 mod spawn;
 mod translate;
+mod watch;
 
 pub use spawn::EXPECTED_VERDANDI_REVISION;
 
@@ -245,24 +246,7 @@ impl ClaudeSidecarProvider {
     }
 
     fn map_status(&self, status: tonic::Status) -> ProviderError {
-        // Design doc §9.7 / this plan's "Verified facts" point 9: business errors travel as
-        // protobuf-encoded `ErrorDetail` bytes in the standard `grpc-status-details-bin` trailing
-        // metadata key -- but tonic's `Status` already parses that specific well-known trailer out
-        // for you: `status.details()` returns the raw bytes directly, `status.metadata()` does NOT
-        // contain it (confirmed against a real sidecar-returned `SESSION_NOT_FOUND` error during
-        // this plan's own preparation -- `status.metadata().get_bin("grpc-status-details-bin")`
-        // silently returned `None` every time; `status.details()` decoded correctly on the first
-        // try). Do not "fix" this back to a `.metadata()` lookup -- that was the actual bug.
-        let bytes = status.details();
-        if !bytes.is_empty() {
-            if let Ok(detail) = <ErrorDetail as prost::Message>::decode(bytes) {
-                return ProviderError::Provider {
-                    code: provider_error_code(detail.code()),
-                    message: detail.message,
-                };
-            }
-        }
-        ProviderError::Transport(status.message().to_string())
+        map_status(status)
     }
 
     fn run_unary<F, T>(&self, future: F) -> Result<T, ProviderError>
@@ -287,34 +271,149 @@ impl ClaudeSidecarProvider {
         Ok(response.session_id)
     }
 
+    /// Watches one session's event stream for as long as the session lives, reconnecting across
+    /// transient transport failures and reporting -- as a typed event the consumer actually sees --
+    /// any loss it cannot repair. See `watch.rs` for the policy, the wire guarantees it rests on,
+    /// and the measured failure that motivated it.
+    ///
+    /// The previous version of this function logged stream errors to stderr and returned. Against a
+    /// real sidecar killed mid-reply, that produced zero further events, a projection stuck on an
+    /// active turn, and a truncated assistant message no UI had any way to flag.
     fn start_watching(&self, session_id: String) {
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let events = Arc::clone(&self.events);
         self.runtime.handle().spawn(async move {
-            let request = WatchSessionEventsRequest { session_id, after_sequence: 0 };
-            let mut stream = match client.watch_session_events(request).await {
-                Ok(response) => response.into_inner(),
-                Err(status) => {
-                    eprintln!("agent: ClaudeSidecarProvider: WatchSessionEvents failed to open: {status}");
-                    return;
-                }
+            let mut tracker = watch::SequenceTracker::new();
+            // Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new
+            // event resets it, so the budget bounds "getting nowhere", not "reconnecting at all".
+            let mut consecutive_failures = 0usize;
+
+            // The single exit for every abnormal path. Nothing here may return quietly except the
+            // one genuinely normal ending: a session that closed on its own terms.
+            let report = |reason: String| {
+                eprintln!("agent: ClaudeSidecarProvider: event stream lost: {reason}");
+                events.lock().unwrap().push(AgentDomainEvent::SessionUnavailable { reason });
             };
+
             loop {
-                match stream.message().await {
-                    Ok(Some(event)) => {
-                        if let Some(domain_event) = translate::translate(event) {
-                            events.lock().unwrap().push(domain_event);
+                let request = WatchSessionEventsRequest {
+                    session_id: session_id.clone(),
+                    after_sequence: tracker.after_sequence(),
+                };
+                let opened = {
+                    let mut client = client.clone();
+                    client.watch_session_events(request).await
+                };
+                let mut stream = match opened {
+                    Ok(response) => response.into_inner(),
+                    Err(status) => {
+                        let detail = match watch::classify_open_failure(&map_status(status)) {
+                            watch::OpenFailure::Fatal(detail) => {
+                                report(watch::stream_ended_early_reason(&detail));
+                                return;
+                            }
+                            watch::OpenFailure::Retry(detail) => detail,
+                        };
+                        match watch::WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
+                            Some(delay) => {
+                                consecutive_failures += 1;
+                                tokio::time::sleep(*delay).await;
+                                continue;
+                            }
+                            None => {
+                                report(watch::stream_ended_early_reason(&detail));
+                                return;
+                            }
                         }
                     }
-                    Ok(None) => break, // server closed the stream -- session is gone
-                    Err(status) => {
-                        eprintln!("agent: ClaudeSidecarProvider: WatchSessionEvents stream error: {status}");
-                        break;
+                };
+
+                let mut delivered_since_open = false;
+                let mut closed_by_session = false;
+                let end_detail = loop {
+                    match stream.message().await {
+                        Ok(Some(event)) => {
+                            let sequence = event.sequence;
+                            match tracker.observe(sequence) {
+                                watch::SequenceVerdict::Deliver => {
+                                    delivered_since_open = true;
+                                    if let Some(domain_event) = translate::translate(event) {
+                                        // A session that closes on its own terms is the one ending
+                                        // that is not a loss -- recorded from the provider's own
+                                        // terminal event, never inferred from the stream stopping.
+                                        closed_by_session |=
+                                            matches!(domain_event, AgentDomainEvent::SessionClosed { .. });
+                                        events.lock().unwrap().push(domain_event);
+                                    }
+                                }
+                                // Replay after a reconnect legitimately re-sends what was already
+                                // delivered. Dropping those is the one silent path that is correct.
+                                watch::SequenceVerdict::Duplicate => {}
+                                watch::SequenceVerdict::Lost { first, last } => {
+                                    report(watch::events_lost_reason(first, last));
+                                    return;
+                                }
+                                watch::SequenceVerdict::Invalid => {
+                                    report(watch::stream_ended_early_reason(
+                                        "the provider sent an event with the reserved sequence 0",
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        // A clean end AFTER the session's own terminal event is normal. A clean end
+                        // without one is not: the sidecar's pump loop reaches exactly that state
+                        // when it tears a session down with no terminal event left to broadcast.
+                        Ok(None) => break "the provider closed the event stream".to_string(),
+                        Err(status) => break status.to_string(),
+                    }
+                };
+
+                if closed_by_session {
+                    return;
+                }
+                if delivered_since_open {
+                    consecutive_failures = 0;
+                }
+                match watch::WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
+                    Some(delay) => {
+                        consecutive_failures += 1;
+                        tokio::time::sleep(*delay).await;
+                    }
+                    None => {
+                        report(watch::stream_ended_early_reason(&end_detail));
+                        return;
                     }
                 }
             }
         });
     }
+}
+
+/// Classifies one `tonic::Status` into this crate's own typed error.
+///
+/// A free function, not just an inherent method, because the watch task owns no `&self` and must
+/// classify a failed reconnect exactly the way a failed unary RPC is classified -- two divergent
+/// copies of this logic is how a fatal `EVENT_GAP` ends up being retried forever on one path.
+fn map_status(status: tonic::Status) -> ProviderError {
+    // Design doc §9.7 / this plan's "Verified facts" point 9: business errors travel as
+    // protobuf-encoded `ErrorDetail` bytes in the standard `grpc-status-details-bin` trailing
+    // metadata key -- but tonic's `Status` already parses that specific well-known trailer out
+    // for you: `status.details()` returns the raw bytes directly, `status.metadata()` does NOT
+    // contain it (confirmed against a real sidecar-returned `SESSION_NOT_FOUND` error during
+    // this plan's own preparation -- `status.metadata().get_bin("grpc-status-details-bin")`
+    // silently returned `None` every time; `status.details()` decoded correctly on the first
+    // try). Do not "fix" this back to a `.metadata()` lookup -- that was the actual bug.
+    let bytes = status.details();
+    if !bytes.is_empty() {
+        if let Ok(detail) = <ErrorDetail as prost::Message>::decode(bytes) {
+            return ProviderError::Provider {
+                code: provider_error_code(detail.code()),
+                message: detail.message,
+            };
+        }
+    }
+    ProviderError::Transport(status.message().to_string())
 }
 
 /// Builds the one `CreateSessionRequest` both a fresh session and a resume go through.

@@ -250,11 +250,21 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
                 self.usage = UsageInfo { total_cost_usd: *total_cost_usd, num_turns: *num_turns };
             }
+            // Both endings clear `active_turn_id`, and for one reason: no `TurnCompleted` is ever
+            // coming. Leaving it set is what turned a dead session into a spinner that never stops
+            // -- `App.tsx` derives `turnInProgress` from exactly this field, and
+            // `supervisor_client::derive_status` reports `Working` from it ahead of any status
+            // check, so a killed provider showed up as a busy agent in the dashboard too. This is
+            // not a synthesized `TurnCompleted`: no completion is recorded, no outcome is invented,
+            // and no result text appears. The turn simply stops being in progress, because it is
+            // not.
             AgentDomainEvent::SessionUnavailable { reason } => {
+                self.active_turn_id = None;
                 self.assistant_message_open = false;
                 self.status = ProjectionStatus::Unavailable { reason: reason.clone() };
             }
             AgentDomainEvent::SessionClosed { reason } => {
+                self.active_turn_id = None;
                 self.assistant_message_open = false;
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }

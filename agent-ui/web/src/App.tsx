@@ -112,16 +112,38 @@ export default function App() {
 
   // Authoritative, server-originated. `activeTurnId` is set by a real TurnStarted event from the
   // provider and cleared by a real TurnCompleted -- never by this component optimistically marking
-  // a turn as started when the user pressed Send.
+  // a turn as started when the user pressed Send. The reducer also clears it on a session that ends
+  // without one, because no TurnCompleted is ever coming for a session that is gone.
   const turnInProgress = state.activeTurnId !== null;
+  const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
+
+  /* A session that died is announced here, not left to be inferred from a status word in the
+     header. `unavailable` specifically means this client stopped being able to observe the session
+     -- the transcript above it can be missing its tail, or a piece out of its middle -- so the
+     reason text (which says exactly what was lost) is rendered in full and cannot be dismissed.
+     A hidden warning about incomplete output is the same thing as no warning. */
+  const sessionEndedBanner =
+    state.status.kind === "unavailable" ? (
+      <div className="session-lost" role="alert">
+        <strong>This session was lost. What is shown above may be incomplete.</strong>
+        <pre>{state.status.reason}</pre>
+      </div>
+    ) : state.status.kind === "closed" ? (
+      <div className="session-over">This session has ended ({state.status.reason}).</div>
+    ) : null;
+
   return (
     <div className="agent-ui-root agent-ui-conversation">
       <SessionHeader state={state} />
       {errorBanner}
       <MessageList state={state} onAnswerPermission={answerPermission} />
+      {sessionEndedBanner}
       <Composer
-        disabled={turnInProgress}
+        // A dead session takes no more turns. Without this, clearing `activeTurnId` on a lost
+        // session would have handed the user an enabled composer pointed at nothing.
+        disabled={turnInProgress || sessionEnded}
         turnInProgress={turnInProgress}
+        sessionEnded={sessionEnded}
         // Stop is gated on the capability, not on the backend's name: if a provider ever reports
         // that it cannot interrupt, the control disappears rather than sending a command the
         // server would reject.

@@ -92,10 +92,25 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
       // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
       // NOT end the conversation, only session_closed/session_unavailable do.
       return { ...state, activeTurnId: null, assistantMessageOpen: false };
+    // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
+    // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
+    // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
+    // a completion: no message is closed out, no outcome invented; the turn just stops being in
+    // flight, which is the truth.
     case "session_unavailable":
-      return { ...state, status: { kind: "unavailable", reason: event.reason }, assistantMessageOpen: false };
+      return {
+        ...state,
+        activeTurnId: null,
+        status: { kind: "unavailable", reason: event.reason },
+        assistantMessageOpen: false,
+      };
     case "session_closed":
-      return { ...state, status: { kind: "closed", reason: event.reason }, assistantMessageOpen: false };
+      return {
+        ...state,
+        activeTurnId: null,
+        status: { kind: "closed", reason: event.reason },
+        assistantMessageOpen: false,
+      };
     default: {
       // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
       // matching TS case lands here at runtime -- observable, never silently dropped.
