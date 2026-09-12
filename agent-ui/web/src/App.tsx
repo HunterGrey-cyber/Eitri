@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { applyEvent, applySnapshot, initialState } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { PermissionDecision } from "./bridge";
@@ -24,6 +24,13 @@ export default function App() {
   // progress" or "is this permission still pending" (those come only from canonical
   // state.activeTurnId / state.pendingPermissions).
   const [, setPendingCommands] = useState<Set<string>>(new Set());
+  /** When the payload carrying a turn's first assistant text was RECEIVED, for the render trace.
+   *  A ref, not state: writing it must not itself cause a render, which would be the thing being
+   *  measured. Null except in the window between that payload arriving and its frame being drawn. */
+  const firstTextReceivedAt = useRef<number | null>(null);
+  /** Guards the render report to one per turn. Without it the effect below re-arms on every one of
+   *  a reply's ~400 deltas. */
+  const renderReportSent = useRef(false);
 
   useEffect(() => {
     installDispatch((payload) => {
@@ -33,6 +40,19 @@ export default function App() {
         setState((s) => applySnapshot(s, payload.state));
         setSessionStarted(true);
       } else if (payload.kind === "events") {
+        // A new turn resets the render trace: each turn reports its own first text, once.
+        if (payload.events.some((e) => e.type === "turn_started")) {
+          firstTextReceivedAt.current = null;
+          renderReportSent.current = false;
+        }
+        // Stamped before the state update that will cause the render, so the span covers the work
+        // being measured rather than starting after it.
+        if (
+          firstTextReceivedAt.current === null &&
+          payload.events.some((e) => e.type === "content_delta" && e.kind === "text" && e.text !== "")
+        ) {
+          firstTextReceivedAt.current = performance.now();
+        }
         setState((s) => payload.events.reduce((acc, event) => applyEvent(acc, event), s));
       } else if (payload.kind === "command_result") {
         setPendingCommands((prev) => {
@@ -61,6 +81,25 @@ export default function App() {
     setPendingCommands((prev) => new Set(prev).add(requestId));
     postToRust({ type: "ready", request_id: requestId });
   }, []);
+
+  /* Reports how long this WebView took to draw a turn's first assistant text. The effect runs after
+     React has committed the DOM; the animation frame runs just before the browser paints it. That is
+     a frame, not a photon -- read it as a floor on what the user perceives, never as a measured
+     perceptual latency. Deliberately NOT cancelled on cleanup: with a delta arriving every ~33ms, a
+     cleanup that cancelled the pending frame would re-arm faster than the frame could ever fire, and
+     the mark would simply never be reported. */
+  useEffect(() => {
+    const receivedAt = firstTextReceivedAt.current;
+    if (receivedAt === null || renderReportSent.current) return;
+    renderReportSent.current = true;
+    requestAnimationFrame(() => {
+      postToRust({
+        type: "turn_rendered",
+        request_id: nextRequestId(),
+        receive_to_frame_ms: performance.now() - receivedAt,
+      });
+    });
+  }, [state.transcript]);
 
   /** `resume` carries the Claude provider session id to continue, or nothing for a fresh session.
    * A resume that fails comes back as a normal fatal error and returns here -- it is never turned

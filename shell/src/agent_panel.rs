@@ -50,6 +50,9 @@ struct AgentPanelState {
     /// `command_result` is owed once that finishes -- the reply is deferred, not dropped, which is
     /// exactly what a requestId-addressed protocol is for.
     pending_start: Option<PendingStart>,
+    /// The in-flight turn's latency marks, when `NEOVIBE_AGENT_TRACE=1`. `None` the rest of the
+    /// time, which is every normal run -- this is a diagnostic, not a metrics pipeline.
+    turn_trace: Option<crate::turn_trace::TurnTrace>,
 }
 
 /// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
@@ -183,6 +186,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         supervisor,
         pending_start: None,
         reported_start_failure: false,
+        turn_trace: None,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -229,25 +233,42 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // today re-enters, which is exactly why it would stay latent until it didn't.
         report_a_session_that_never_opened(&state, &webview);
 
-        let payload = {
+        let (payload, first_text_in_this_batch) = {
             let mut state_ref = state.borrow_mut();
-            let payload = state_ref.session.as_mut().and_then(|session| {
+            let AgentPanelState { session, turn_trace, supervisor, .. } = &mut *state_ref;
+            // Folded from the SAME slice the bridge is about to serialize, so the trace describes
+            // the events the user is actually about to see rather than a parallel accounting.
+            let mut first_text_in_this_batch = false;
+            let payload = session.as_mut().and_then(|session| {
                 let from_revision = session.projection().last_revision;
                 let events = session.pump();
                 if events.is_empty() {
                     return None;
                 }
+                if let Some(trace) = turn_trace.as_mut() {
+                    first_text_in_this_batch = trace.observe(&events);
+                }
                 let through_revision = session.projection().last_revision;
                 Some(serialize_events_for_js(from_revision, through_revision, &events))
             });
-            let status = crate::supervisor_client::derive_status(state_ref.session.as_ref().map(|s| s.projection()));
-            if let Some(supervisor) = state_ref.supervisor.as_mut() {
+            let status = crate::supervisor_client::derive_status(session.as_ref().map(|s| s.projection()));
+            if let Some(supervisor) = supervisor.as_mut() {
                 supervisor.send_status(status);
             }
-            payload
+            (payload, first_text_in_this_batch)
         };
         if let Some(payload) = payload {
             evaluate_js_dispatch(&webview, &payload);
+            // Stamped after the dispatch call, which is where the WebView's own clock starts.
+            let mut state_ref = state.borrow_mut();
+            if let Some(trace) = state_ref.turn_trace.as_mut() {
+                if first_text_in_this_batch {
+                    trace.mark_first_text_dispatched();
+                }
+                if trace.is_complete() {
+                    trace.emit();
+                }
+            }
         }
         gtk4::glib::ControlFlow::Continue
     });
@@ -458,6 +479,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         InboundMessage::SendMessage { text, .. } => {
             let outcome = {
                 let mut state_ref = state.borrow_mut();
+                // Stamped before the call, so the trace's zero is the user's action rather than the
+                // moment the backend got around to accepting it.
+                state_ref.turn_trace = crate::turn_trace::TurnTrace::start();
                 match state_ref.session.as_mut() {
                     Some(session) => session.send_turn(&text),
                     None => Err(no_session_error()),
@@ -474,6 +498,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 }
             };
             apply_command_outcome(state, webview, &request_id, outcome);
+        }
+        InboundMessage::TurnRendered { receive_to_frame_ms, .. } => {
+            // Purely a diagnostic: no command_result, and nothing downstream reads it. A WebView
+            // that never sends one costs only a missing column in a trace line.
+            let mut state_ref = state.borrow_mut();
+            if let Some(trace) = state_ref.turn_trace.as_mut() {
+                trace.mark_painted(receive_to_frame_ms);
+                if trace.is_complete() {
+                    trace.emit();
+                }
+            }
         }
         InboundMessage::PermissionResponse { permission_id, decision, reason, .. } => {
             let decision = decision.into_decision(reason);
