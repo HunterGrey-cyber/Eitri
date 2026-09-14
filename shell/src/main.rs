@@ -9,7 +9,6 @@ mod chrome;
 mod layout;
 mod pane_switch;
 mod supervisor_client;
-mod terminal_panel;
 mod theme;
 mod turn_trace;
 mod lua;
@@ -24,6 +23,11 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelEntry, PanelSlot};
 use neovide_editor::NeovideEditorPane;
+// `terminal_panel` now lives in this package's own library target (`src/lib.rs`), not as a
+// `mod` declared here -- so a diagnostic/test harness in a separate `src/bin/*.rs` binary can
+// `use shell::terminal_panel;` too and drive the exact same real wiring, no duplication. See
+// `lib.rs`'s own doc comment.
+use shell::terminal_panel;
 
 const APP_ID: &str = "cn.huntergrey.neovibe";
 
@@ -95,7 +99,8 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
     // the agent panel. The `Rc` is kept here rather than only in the registry: focus routing needs
     // `TerminalPane::grab_focus`, and the registry stores an opaque `gtk4::Widget`.
     let terminal = want_terminal.then(|| {
-        let (terminal, widget) = terminal_panel::build_terminal_panel();
+        let cwd = std::env::current_dir().expect("cwd").to_string_lossy().into_owned();
+        let (terminal, widget) = terminal_panel::build_terminal_panel(cwd);
         lua_engine.register_builtin_panel(
             PanelSlot::Bottom,
             PanelEntry { id: "terminal".into(), title: "Terminal".into(), widget },
@@ -269,6 +274,23 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
         }
     }
 
+    // Ctrl+Shift+S toggles the terminal bottom slot between raw and semantic views.
+    // `TerminalBottomSlot::toggle_view` is the shared switch, reached through a named
+    // `gio::SimpleAction` just like the Lua-command actions above. A test or diagnostic
+    // can use `app.activate_action("toggle-terminal-view", None)` without synthesizing
+    // keyboard input or relying on `wtype` to deliver `Ctrl+Shift+<letter>`.
+    // The app accelerator runs in the window's capture phase before the focused
+    // widget's bubble-phase controller, so the chord works from any focused pane.
+    if let Some(terminal) = terminal.as_ref() {
+        let action = gtk4::gio::SimpleAction::new("toggle-terminal-view", None);
+        let terminal_for_action = terminal.clone();
+        action.connect_activate(move |_, _| {
+            terminal_for_action.toggle_view();
+        });
+        app.add_action(&action);
+        app.set_accels_for_action("app.toggle-terminal-view", &["<Control><Shift>s"]);
+    }
+
     window.present();
     // grab_focus() after present(), matching standalone.rs's own
     // `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
@@ -296,6 +318,11 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
         });
     }
 
+    // Same load-bearing-clone reasoning as `agent_panel_handle`/`lua_engine` above: the
+    // `connect_close_request` closure below takes `terminal` by move, and the final `println!`
+    // after it still needs `terminal.is_some()`.
+    let terminal_for_close = terminal.clone();
+
     // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in
     // outright rather than cloned again. (`pane` is an `Rc<NeovideEditorPane>` because the side
     // panel's Ctrl+h handler above needs it too; `NeovideEditorPane` doesn't derive `Clone`, and
@@ -304,6 +331,12 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
     // either way, regardless of whether a clean `NeovimExited` was actually observed.
     window.connect_close_request(move |_window| {
         pane.shutdown();
+        // Closes the live terminal session, if one was ever opened -- window close must not leave
+        // an orphaned sidecar-hosted terminal any more than it may leave an orphaned `claude`
+        // process (see `agent_panel_handle.shutdown()` below for that side).
+        if let Some(terminal) = &terminal_for_close {
+            terminal.close();
+        }
         // Capturing `pane_switch` here is load-bearing twice over. First, it keeps the
         // `PaneSwitch` alive for the window's whole lifetime -- it is otherwise a local of
         // `build_ui`, and its directory (holding the fake-`tmux` symlink and the live socket)
