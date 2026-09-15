@@ -1,5 +1,5 @@
-//! The JSON contract for the `PreToolUse` hook configured through `settings.local.json`
-//! by `crate::settings` and spoken on stdin/stdout by the `agent-hook` companion binary.
+//! The JSON contract for the `PreToolUse` hook installed via `claude --settings` by
+//! `crate::settings` and spoken on stdin/stdout by the `agent-hook` companion binary.
 //! CLI payload examples are in `agent/tests/fixtures/v2_hook_*.json`.
 
 use serde::Deserialize;
