@@ -235,10 +235,22 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         })
         .collect();
 
+    // `toolUseId` is the link back to the tool call a request gates, and it is genuinely nullable:
+    // the legacy backend sends `None` today, by a decision recorded at `agent/src/session.rs`'s own
+    // `tool_use_id: None` (which also sets out what each of its two permission sources could
+    // supply). Emitted as an explicit `null` rather than omitted, so the frontend can tell "this
+    // backend sent no such id" from "this build predates the field".
     let pending_permissions: Vec<Value> = projection
         .pending_permissions
         .values()
-        .map(|p| json!({ "permissionId": p.permission_id, "toolName": p.tool_name, "input": p.input }))
+        .map(|p| {
+            json!({
+                "permissionId": p.permission_id,
+                "toolUseId": p.tool_use_id,
+                "toolName": p.tool_name,
+                "input": p.input,
+            })
+        })
         .collect();
 
     let status = match &projection.status {
@@ -499,6 +511,105 @@ mod tests {
         assert!(parsed["state"]["provider"]["buildDescription"].as_str().unwrap().contains("eb70aa3"));
         // Warnings only -- a list that is never empty cannot drive a "something is wrong" glyph.
         assert!(parsed["state"]["provider"]["startupDiagnostics"][0].as_str().unwrap().contains("untested"));
+    }
+
+    /// The link from a permission card back to the tool call it gates.
+    ///
+    /// The EVENT path has always carried it (`AgentDomainEvent`'s own derived `Serialize` emits
+    /// every field of `PermissionRequested`); this serializer dropped it, so a panel that
+    /// rehydrated from a snapshot -- a reload, or a bounded-queue overflow -- lost a link the live
+    /// path had. With several calls of one tool in flight, "Bash wants to run" identifies nothing.
+    #[test]
+    fn a_pending_permission_snapshot_carries_the_tool_call_it_gates() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: Some("toolu_01ABC".into()),
+            tool_name: "Bash".into(),
+            input: json!({"command": "rm -rf /"}),
+        });
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let pending = &parsed["state"]["pendingPermissions"][0];
+        assert_eq!(pending["permissionId"], "perm-1");
+        assert_eq!(pending["toolUseId"], "toolu_01ABC");
+        assert_eq!(pending["toolName"], "Bash");
+    }
+
+    /// `null`, not an omitted key. The TS side declares the field as `string | null`, and an absent
+    /// key would arrive as `undefined` -- which reads as "this build is too old to send it" rather
+    /// than "no id was sent for this request". This pins the serializer's handling of `None`; which
+    /// backends send `None`, and why, is settled at `agent/src/session.rs`'s own `tool_use_id: None`.
+    #[test]
+    fn a_permission_with_no_tool_use_id_says_null_rather_than_omitting_the_key() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: json!({}),
+        });
+        let view = SnapshotView {
+            backend: "legacy",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let pending = &parsed["state"]["pendingPermissions"][0];
+        assert!(pending["toolUseId"].is_null());
+        assert!(
+            pending.as_object().unwrap().contains_key("toolUseId"),
+            "the key must be present and null, not absent"
+        );
+    }
+
+    /// The event path's own half of the same link, pinned here rather than assumed from the derive:
+    /// if `PermissionRequested` ever gained a `skip_serializing_if` on this field, the live path
+    /// would start disagreeing with the snapshot path and only one of them would be caught.
+    #[test]
+    fn the_event_path_carries_tool_use_id_too_so_the_two_paths_cannot_diverge() {
+        let events = vec![AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: Some("toolu_01ABC".into()),
+            tool_name: "Bash".into(),
+            input: json!({}),
+        }];
+        let parsed: Value = serde_json::from_str(&serialize_events_for_js(0, 1, &events)).unwrap();
+        assert_eq!(parsed["events"][0]["tool_use_id"], "toolu_01ABC");
+    }
+
+    /// The one inbound message with no `command_result` and nothing branching on it, which is
+    /// exactly why it had no test: a silent diagnostic that stops parsing costs a trace column and
+    /// nothing else, so nothing would ever report the break. `receive_to_frame_ms` is a SPAN in
+    /// milliseconds -- a float, never an instant, since JS `performance.now()` and Rust `Instant`
+    /// have unrelated epochs.
+    #[test]
+    fn parses_turn_rendered_as_a_float_span() {
+        let msg = parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r7","receive_to_frame_ms":18.5}"#).unwrap();
+        assert_eq!(msg.request_id(), "r7");
+        match msg {
+            InboundMessage::TurnRendered { receive_to_frame_ms, .. } => assert_eq!(receive_to_frame_ms, 18.5),
+            other => panic!("expected TurnRendered, got {other:?}"),
+        }
+        // An integer on the wire is still a valid span -- JSON has one number type and a whole
+        // number of milliseconds is an ordinary measurement, not a different shape.
+        let whole = parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r8","receive_to_frame_ms":20}"#).unwrap();
+        assert!(matches!(whole, InboundMessage::TurnRendered { receive_to_frame_ms, .. } if receive_to_frame_ms == 20.0));
+        // Missing the measurement is a parse failure, not a defaulted zero: a zero-millisecond
+        // render would be reported into a trace as a real, impossibly good number.
+        assert!(parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r9"}"#).is_none());
     }
 
     #[test]

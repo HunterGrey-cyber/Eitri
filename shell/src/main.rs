@@ -210,6 +210,12 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         None => content_widget,
     };
 
+    // `app.reload-agent-panel` + Ctrl+Shift+R; the top bar's own `⟳` button points at the same
+    // action. Everything about it -- why it is an app action, what it costs, what is still
+    // unverified -- is in `agent_panel::install_reload_action`'s doc comment. One call rather than
+    // an inline block on purpose: `build_ui` is being edited by two other tracks of the same plan.
+    agent_panel::install_reload_action(app, &agent_panel_handle);
+
     root.append(&chrome::build_top_bar(&window));
     root.append(&content_widget);
     root.append(&chrome::build_status_bar());

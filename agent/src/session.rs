@@ -218,6 +218,32 @@ impl AgentSession {
             }
             AgentEvent::PermissionRequest { request_id, tool_name, input, source } => {
                 self.pending_permission_sources.insert(request_id.clone(), source);
+                // `tool_use_id: None` on BOTH sources. On the primary one that is a choice, not a
+                // limit -- the answer, since the frontend comments used to imply otherwise:
+                //
+                //   HookRelay (the documented primary gate) -- `request_id` IS the real Claude
+                //     `toolu_*` id. `process.rs`'s hook listener sets it from the `PreToolUse`
+                //     payload's own `tool_use_id` (a required field on
+                //     `hook_protocol::PreToolUseHookInput`; real capture in
+                //     `tests/fixtures/v2_hook_pretooluse_stdin.json`), and that is the same id
+                //     `ToolCallStarted` carries out of `wire.rs`'s `tool_use` block. So a
+                //     source-aware `Some(request_id.clone())` here would genuinely link a
+                //     permission card to the call it gates.
+                //
+                //   CanUseTool (secondary, best-effort) -- `request_id` is NOT a tool id. It is the
+                //     control_request envelope's own id (`wire.rs`'s `ControlRequestLine.request_id`,
+                //     e.g. "ctu-1"). Whether the real CLI also puts a `tool_use_id` inside the
+                //     request body is UNVERIFIED: the checked-in fixture carries one, but its value
+                //     is a hand-written placeholder, the protocol spec describes this message as
+                //     carrying `tool_name` and `input` only, and `ControlRequestBody` does not
+                //     deserialize the field at all.
+                //
+                // Left unwired deliberately. Doing it honestly means a source-aware value (so the
+                // CanUseTool path keeps saying `None` rather than passing off an envelope id as a
+                // tool id), matching changes in the two layers that render it, and one real-turn
+                // check that the hook's id and the `tool_use` block's id do match in a live
+                // conversation -- a change with its own verification, not a one-liner. Until then
+                // the frontend renders `null` honestly rather than guessing at the most recent call.
                 vec![AgentDomainEvent::PermissionRequested { permission_id: request_id, tool_use_id: None, tool_name, input }]
             }
             AgentEvent::TurnFinished { result_text, is_error, stop_reason, total_cost_usd, num_turns } => {

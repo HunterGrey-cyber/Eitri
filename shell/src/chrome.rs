@@ -18,8 +18,25 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow) -> gtk4::Widget {
     project_name.set_hexpand(true);
     project_name.set_halign(gtk4::Align::Start);
 
+    // Reload the agent panel's frontend -- the same `app.reload-agent-panel` action Ctrl+Shift+R
+    // fires (see `agent_panel::install_reload_action`). It lives in the window chrome rather than in
+    // the panel's own page on purpose: the page is the thing that wedges, and a control the page
+    // draws would be gone exactly when it is wanted. The accelerator is what makes the recovery
+    // possible at all; this button is what makes it discoverable.
+    //
+    // Its appearance is NOT verified. It borrows `win-btn`, the class the minimize/maximize/close
+    // buttons use, and is appended immediately before `build_window_controls`, so on screen it may
+    // well read as part of the window-control cluster rather than as a panel control. Left as-is
+    // rather than restyled blind -- see `shell/MANUAL_VERIFICATION.md`'s 2026-09-15 section.
+    let reload_agent = gtk4::Button::with_label("\u{21BB}");
+    reload_agent.add_css_class("win-btn");
+    reload_agent.set_valign(gtk4::Align::Center);
+    reload_agent.set_tooltip_text(Some("Reload the agent panel (Ctrl+Shift+R) — the session keeps running"));
+    reload_agent.set_action_name(Some("app.reload-agent-panel"));
+
     bar.append(&app_name);
     bar.append(&project_name);
+    bar.append(&reload_agent);
     bar.append(&build_window_controls(window));
 
     let handle = gtk4::WindowHandle::new();

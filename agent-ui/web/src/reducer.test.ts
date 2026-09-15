@@ -98,17 +98,43 @@ describe("applyEvent", () => {
   });
 
   it("permission_requested pushes onto pendingPermissions without clearing prior entries", () => {
-    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_name: "Bash", input: {} });
-    state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_name: "Read", input: {} });
+    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: {} });
+    state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_use_id: null, tool_name: "Read", input: {} });
     expect(state.pendingPermissions.map((p) => p.permissionId)).toEqual(["r1", "r2"]);
+  });
+
+  /* The link back to the tool call a permission gates. Without it a card can only ever say "Bash
+     wants to run", never WHICH Bash call -- and with several tool calls in one turn those are not
+     the same question. `null` is the legacy backend's honest answer (its wire protocol has no field
+     independent of the request id to populate this from), never a fabricated id. */
+  it("permission_requested carries the tool_use_id of the call it gates", () => {
+    const state = applyEvent(initialState(), {
+      type: "permission_requested",
+      permission_id: "r1",
+      tool_use_id: "toolu_01ABC",
+      tool_name: "Bash",
+      input: {},
+    });
+    expect(state.pendingPermissions[0].toolUseId).toBe("toolu_01ABC");
+  });
+
+  it("permission_requested keeps a backend's honest null rather than inventing an id", () => {
+    const state = applyEvent(initialState(), {
+      type: "permission_requested",
+      permission_id: "r1",
+      tool_use_id: null,
+      tool_name: "Bash",
+      input: {},
+    });
+    expect(state.pendingPermissions[0].toolUseId).toBeNull();
   });
 
   it("permission_resolved removes only the matching permission, leaving others pending", () => {
     // The direct replacement for the deleted markPermissionAnswered test -- this is now a real
     // event pushed from Rust the instant AgentSession::respond_permission (or interrupt())
     // resolves the request, not a frontend-local optimistic guess.
-    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_name: "Bash", input: {} });
-    state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_name: "Read", input: {} });
+    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: {} });
+    state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_use_id: null, tool_name: "Read", input: {} });
     state = applyEvent(state, { type: "permission_resolved", permission_id: "r1", outcome: "allowed" });
     expect(state.pendingPermissions.map((p) => p.permissionId)).toEqual(["r2"]);
   });
@@ -118,14 +144,14 @@ describe("applyEvent", () => {
       "allowed", "denied", "cancelled_by_interrupt", "cancelled_by_session_close",
     ];
     for (const outcome of outcomes) {
-      let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_name: "Bash", input: {} });
+      let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: {} });
       state = applyEvent(state, { type: "permission_resolved", permission_id: "r1", outcome });
       expect(state.pendingPermissions).toEqual([]);
     }
   });
 
   it("permission_resolved on an unknown permission id is a harmless no-op", () => {
-    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_name: "Bash", input: {} });
+    let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: {} });
     state = applyEvent(state, { type: "permission_resolved", permission_id: "does-not-exist", outcome: "allowed" });
     expect(state.pendingPermissions.map((p) => p.permissionId)).toEqual(["r1"]);
   });

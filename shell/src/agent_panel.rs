@@ -22,6 +22,7 @@ use crate::agent_bridge::{
     serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
 };
 use gtk4::prelude::*;
+use gtk4::Application;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -74,6 +75,9 @@ struct PendingStart {
 #[derive(Clone)]
 pub(crate) struct AgentPanelHandle {
     state: Rc<RefCell<AgentPanelState>>,
+    /// Held so the panel's document can be re-injected without going back through the widget tree.
+    /// Cheap: a `WebView` is a GObject and cloning it is a refcount bump on the same object.
+    webview: WebView,
 }
 
 impl AgentPanelHandle {
@@ -109,6 +113,33 @@ impl AgentPanelHandle {
                 ),
             }
         }
+    }
+
+    /// Reloads the panel's frontend from scratch, deliberately WITHOUT touching the session.
+    ///
+    /// The frontend is a pure view layer over `AgentSessionProjection`, which lives here in Rust --
+    /// so a WebView that has wedged (a frontend panic leaving a blank pane, a bridge that stopped
+    /// dispatching) can be thrown away and rebuilt while the real conversation keeps running. The
+    /// fresh document sends `ready` on mount, and `Ready`'s handler answers with `hello` plus a
+    /// snapshot of the still-live session, which is the rehydration path already verified end to
+    /// end in `shell/MANUAL_VERIFICATION.md`'s 2026-09-11 check 4.
+    ///
+    /// `load_html`, NOT `WebViewExt::reload()`. That same check found reload() reproducibly leaves
+    /// this WebView permanently blank with zero further page activity, because the panel's document
+    /// is a substitute-data load rather than a fetchable URI -- so the recovery action would itself
+    /// be the wedge it exists to undo.
+    ///
+    /// **The invariant this rests on, stated because it is not obvious and a later change could
+    /// break it silently:** `take_ui_delivery()` CONSUMES events. Every envelope the 33ms pump
+    /// dispatches between this `load_html` and the new document's own `ready` is therefore gone --
+    /// the old document is being torn down and the new one has no listener yet. Nothing is lost
+    /// only because `Ready`'s handler answers from canonical state with a full snapshot rather than
+    /// a replay, and `serialize_snapshot_for_js` already carries tool-call results. A pump that
+    /// ever stopped being the sole consumer, or a snapshot that stopped being complete, would turn
+    /// this into a quiet data-loss path with no test failing.
+    pub(crate) fn reload_document(&self) {
+        eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
+        self.webview.load_html(AGENT_UI_HTML, None);
     }
 
     /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
@@ -208,7 +239,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
     // state -- every later event would then be dispatched twice.
     start_pump_timer(state.clone(), webview.clone());
 
-    let handle = AgentPanelHandle { state: state.clone() };
+    let handle = AgentPanelHandle { state: state.clone(), webview: webview.clone() };
     (webview.upcast(), handle)
 }
 
@@ -556,4 +587,77 @@ fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
             eprintln!("[agent_panel] evaluate_javascript failed: {e}");
         }
     });
+}
+
+/// Installs `app.reload-agent-panel` and binds Ctrl+Shift+R to it, for the panel `handle` owns.
+///
+/// The affordance deliberately lives OUTSIDE the WebView. A reload button drawn by the panel's own
+/// page would be drawn by the very thing that has stopped responding -- missing exactly when it is
+/// needed -- and until now a wedged panel could only be recovered by closing the window, which also
+/// takes the editor, the nvim child and the agent session with it.
+///
+/// A `gio::SimpleAction` for the same two reasons `toggle-terminal-view` is one: an app-level accel
+/// runs in the window's capture phase regardless of which pane holds focus, and a verification
+/// harness can drive the identical path with `app.activate_action("reload-agent-panel", None)` and
+/// no synthetic chord -- which matters given `wtype`'s documented trouble delivering
+/// `Ctrl+Shift+<letter>`. The cost, stated plainly: an app accel never reaches Neovim, so
+/// `<C-S-r>` stops being available to the user's own config -- the same trade already made for
+/// Ctrl+Shift+S, and not yet checked against the owner's real config.
+///
+/// **Not verified, and stated here so nobody reads a constraint into the call site:** `main.rs`
+/// calls this before building the top bar, whose `⟳` button is a `GtkActionable` pointed at this
+/// action. An earlier version of this comment claimed the order was load-bearing -- that a button
+/// pointed at an action that does not exist yet renders permanently insensitive. That claim was
+/// never tested here, and upstream GTK4's own `gtk/gtkactionhelper.c` appears to contradict it:
+/// `GtkActionHelper` implements `GtkActionObserver` (`action_added`, `action_removed`,
+/// `action_enabled_changed`) and calls `gtk_widget_set_sensitive` when an action appears. That is
+/// read from the GNOME repository's `main`, not from the GTK actually installed here, and it is not
+/// the same thing as having watched a late-registered action light the button up. So the ordering
+/// is most likely free, on documentary evidence rather than observation. It is kept as it is because it is the conservative one, not
+/// because anything in this repository has demonstrated that the other order breaks. Whether the
+/// button is in fact sensitive on screen is a GUI-pass item -- see
+/// `shell/MANUAL_VERIFICATION.md`'s 2026-09-15 section.
+///
+/// **Known limitation while `shell` can still run two windows in one process:** the action is
+/// process-global (`app.add_action`) and this handle is per-window, so a second `activate` running
+/// `build_ui` again silently REPLACES the first window's action -- after which window 1's `⟳` and
+/// Ctrl+Shift+R reload window 2's panel. `ApplicationFlags::NON_UNIQUE` (task A1 of the same plan)
+/// makes that unreachable by giving each launch its own process; until it lands this is real, and
+/// it is the same class of bug A1 exists to close rather than a new one introduced here.
+pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle) {
+    let action = gtk4::gio::SimpleAction::new("reload-agent-panel", None);
+    // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
+    // takes it by move.
+    let handle = handle.clone();
+    action.connect_activate(move |_, _| handle.reload_document());
+    app.add_action(&action);
+    app.set_accels_for_action("app.reload-agent-panel", &["<Control><Shift>r"]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The document this panel loads -- at startup, and again on every `reload_document()` -- has to
+    /// actually carry the frontend and the global Rust dispatches into. A stale or truncated
+    /// `agent-ui/web/dist/index.html` (build.rs's mtime freshness check going wrong, a half-written
+    /// build output) would produce a WebView that loads without error and can never receive a single
+    /// envelope -- which presents exactly as the wedged panel `reload_document` exists to recover
+    /// from, so the recovery would silently reproduce the fault.
+    ///
+    /// What this does NOT prove: that the reload itself works. Re-injection is a real `load_html`
+    /// call on a real `WebView`, and it is verified in a sandbox -- notably `WebViewExt::reload()`
+    /// does NOT work for a substitute-data load like this one, per
+    /// `shell/MANUAL_VERIFICATION.md`'s 2026-09-11 reload check.
+    #[test]
+    fn the_embedded_panel_document_carries_the_frontend_and_its_dispatch_entry_point() {
+        assert!(
+            AGENT_UI_HTML.contains("__neovibeDispatch"),
+            "the embedded document never installs the global Rust pushes into -- every envelope would be dropped"
+        );
+        assert!(
+            AGENT_UI_HTML.contains("neovibeAgent"),
+            "the embedded document never posts through the script-message handler -- no command could reach Rust"
+        );
+    }
 }

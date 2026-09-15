@@ -77,9 +77,44 @@ body,
   border-left-color: #a6e3a1;
   font-style: italic;
 }
-.tool-error {
-  color: #f38ba8;
+/* A tool call's outcome, drawn for every tool. The three states have to be distinguishable at a
+   glance and not by colour alone -- "has this already run?" was unanswerable from the panel while
+   only errors were ever printed. */
+.tool-result {
+  margin-top: 4px;
+  font-family: ui-monospace, monospace;
   font-size: 12px;
+}
+.tool-result-pending {
+  color: #a6adc8;
+  font-style: italic;
+}
+.tool-result-error {
+  color: #f38ba8;
+}
+.tool-result-body {
+  background: #11111b;
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin: 0;
+  /* Bounded here as well as in `truncateResult`: the truncation budget is a character count, and a
+     few thousand characters of one-column output is still taller than the panel. */
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-result-truncated {
+  color: #a6adc8;
+  font-size: 11px;
+  margin-top: 2px;
+}
+/* The tool call a pending permission is blocking, marked where the call itself is rather than only
+   on the card further down. */
+.tool-awaiting-permission {
+  color: #f9e2af;
+  font-size: 11px;
+  margin-top: 2px;
 }
 
 .permission-card {
@@ -88,6 +123,14 @@ body,
   border-radius: 6px;
   padding: 10px;
   margin-bottom: 12px;
+}
+/* Which call, under the tool's name: subdued, because it identifies the request rather than being
+   the thing the user is deciding about. */
+.permission-card-tool-use-id {
+  color: #a6adc8;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  margin-bottom: 4px;
 }
 .permission-card-input {
   background: #11111b;

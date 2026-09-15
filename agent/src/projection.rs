@@ -158,11 +158,15 @@ pub struct ToolCallRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionRequestRecord {
     pub permission_id: String,
-    /// `None` for a backend whose own wire protocol has no field independent of a request id to
-    /// populate this from (the legacy Claude-CLI backend's `AgentEvent::PermissionRequest` --
-    /// `agent/src/session.rs`'s translation site passes `None` explicitly). `Some(..)` starting
-    /// with `ClaudeSidecarProvider`, whose proto `PermissionRequested` message genuinely carries
-    /// one (2026-09-10, Phase 3 of the runtime/provider refactor).
+    /// `None` for a backend that does not send one. Today that is the legacy Claude-CLI backend,
+    /// by a decision rather than by an absence on its wire: `agent/src/session.rs`'s translation
+    /// site passes `None` even on the hook-relay path, where the request id it already holds IS the
+    /// real `toolu_*` id -- that site carries the full account, per source. `Some(..)` starting with
+    /// `ClaudeSidecarProvider`, whose proto `PermissionRequested` message carries one directly
+    /// (2026-09-10, Phase 3 of the runtime/provider refactor).
+    ///
+    /// Note the proto3 shape on the sidecar side: an unset string arrives as `""`, not as an absent
+    /// field, so `Some("")` is a real possibility and every consumer must treat it as "no link".
     pub tool_use_id: Option<String>,
     pub tool_name: String,
     pub input: serde_json::Value,

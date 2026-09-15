@@ -9,6 +9,7 @@ import type { PermissionRequestRecord } from "../types";
 
 const REQUEST: PermissionRequestRecord = {
   permissionId: "perm-1",
+  toolUseId: "toolu_01ABC",
   toolName: "Bash",
   input: { command: "rm -rf /" },
 };
@@ -56,6 +57,36 @@ describe("PermissionCard decisions", () => {
     // The card is still on screen. Only a real PermissionResolved event removes it -- this component
     // never decides that its own request is finished.
     expect(container.querySelector(".permission-card")).not.toBeNull();
+  });
+});
+
+/* A turn can have several tool calls in flight at once, so "Bash wants to run" does not identify
+   anything on its own. The id is what ties the card to the exact call above it in the transcript --
+   the same id `MessageList` keys that call's block on. */
+describe("PermissionCard and the tool call it gates", () => {
+  it("names the tool call the request belongs to", () => {
+    const { container } = render(
+      <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />,
+    );
+    expect(container.querySelector(".permission-card-tool-use-id")?.textContent).toContain("toolu_01ABC");
+  });
+
+  /* proto3 has no absent scalar: an unset `tool_use_id` reaches Rust as "" and is carried through
+     as `Some("")`, so "no link" arrives in two shapes and both have to read the same. */
+  it("treats a proto3 empty-string id as no link at all", () => {
+    const { container } = render(
+      <PermissionCard request={{ ...REQUEST, toolUseId: "" }} sessionEnded={false} onAnswer={vi.fn()} />,
+    );
+    expect(container.querySelector(".permission-card-tool-use-id")).toBeNull();
+  });
+
+  it("says nothing at all rather than inventing a link when the backend sent none", () => {
+    // The legacy backend's own PermissionRequest has no field to populate this from; a placeholder
+    // like "unknown call" would read as a real, failed lookup instead of as an absent field.
+    const { container } = render(
+      <PermissionCard request={{ ...REQUEST, toolUseId: null }} sessionEnded={false} onAnswer={vi.fn()} />,
+    );
+    expect(container.querySelector(".permission-card-tool-use-id")).toBeNull();
   });
 });
 

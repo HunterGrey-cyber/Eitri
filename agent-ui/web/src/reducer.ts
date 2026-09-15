@@ -78,7 +78,16 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
         assistantMessageOpen: false,
         pendingPermissions: [
           ...state.pendingPermissions,
-          { permissionId: event.permission_id, toolName: event.tool_name, input: event.input },
+          // `tool_use_id` is carried through as-is, null included: it is what ties this card to the
+          // exact tool call it gates, and a turn can have several of the same tool in flight. The
+          // reducer takes no view on which backends send one -- that is settled upstream, at
+          // `agent/src/session.rs`'s `tool_use_id: None` -- it only refuses to invent one.
+          {
+            permissionId: event.permission_id,
+            toolUseId: event.tool_use_id,
+            toolName: event.tool_name,
+            input: event.input,
+          },
         ],
       };
     case "permission_resolved":
