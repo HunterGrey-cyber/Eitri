@@ -21,6 +21,16 @@ fn provider() -> std::sync::Arc<ClaudeSidecarProvider> {
     )
 }
 
+/// A directory no other test in this file shares, inside this process's disposable state root.
+///
+/// Both matter: `AgentConversation::resume` takes a lease keyed on the canonical cwd AND the
+/// session id, so two tests resuming from one directory stay independent as long as their ids
+/// differ -- and `test_workspace_dir` is what keeps that lease, and any record a successful resume
+/// persists, out of the developer's own XDG directories (see `agent::state_dirs`).
+fn workspace() -> std::path::PathBuf {
+    agent::state_dirs::test_workspace_dir("resume-outcome")
+}
+
 /// **A resume that cannot be honored fails as a resume.**
 ///
 /// The forbidden outcome is not "an error message" -- it is an apparently healthy, empty
@@ -29,7 +39,7 @@ fn provider() -> std::sync::Arc<ClaudeSidecarProvider> {
 #[test]
 #[ignore]
 fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
-    let cwd = std::env::temp_dir();
+    let cwd = workspace();
     let missing = "00000000-dead-beef-0000-000000000000";
 
     let started = std::time::Instant::now();
@@ -77,7 +87,7 @@ fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
 #[test]
 #[ignore]
 fn the_refusal_carries_the_providers_own_account_rather_than_an_inference() {
-    let cwd = std::env::temp_dir();
+    let cwd = workspace();
     let started = std::time::Instant::now();
     let result = AgentConversation::resume(
         provider(),

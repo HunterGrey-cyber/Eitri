@@ -25,7 +25,11 @@ fn conversation() -> (AgentConversation, u32) {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
         .expect("connecting to a real sidecar should succeed");
     let pid = provider.sidecar_pid();
-    let cwd = std::env::temp_dir();
+    // A directory no other test in this file shares, inside this process's disposable state root:
+    // a real session here writes a real conversation record and takes a real session lease, and
+    // `test_workspace_dir` is what keeps both out of the developer's own XDG directories (see
+    // `agent::state_dirs`).
+    let cwd = agent::state_dirs::test_workspace_dir("permission-adversarial");
     // PermissionMode::Auto -> the sidecar's `interactive` policy. This is the mode the start screen
     // now offers on this backend, so it is the mode these tests must exercise.
     let conversation = AgentConversation::create(std::sync::Arc::new(provider), &cwd, PermissionMode::Auto)

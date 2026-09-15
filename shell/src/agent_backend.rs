@@ -412,6 +412,11 @@ pub(crate) struct BackendGreeting {
 }
 
 impl BackendGreeting {
+    /// **Does synchronous file I/O, and its caller is the GTK main loop** (`agent_panel`'s
+    /// `InboundMessage::Ready` handler). `agent::resumable_session` reads one directory and parses
+    /// the small JSON records in it; `agent::persistence`'s own retention cap is what keeps that
+    /// bounded rather than growing with every session the workspace has ever had. It has not been
+    /// moved off the main thread, and if the cap ever rises far it should be.
     pub(crate) fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
         // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
