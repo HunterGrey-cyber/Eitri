@@ -157,8 +157,7 @@ describe("App event folding", () => {
       outcome: "completed",
       result_text: "",
       stop_reason: null,
-      total_cost_usd: 0,
-      num_turns: 1,
+      usage: { total_cost_usd: 0, num_turns: 1 },
     });
     expect(container.querySelector("textarea")!.disabled).toBe(false);
   });

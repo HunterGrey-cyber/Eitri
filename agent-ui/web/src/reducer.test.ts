@@ -43,7 +43,7 @@ describe("applyEvent", () => {
       expect(state.activeTurnId).toBe("t1");
       state = applyEvent(state, {
         type: "turn_completed", turn_id: "t1", outcome, result_text: "done",
-        stop_reason: "end_turn", total_cost_usd: 0.01, num_turns: 1,
+        stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1 },
       });
       expect(state.activeTurnId).toBeNull();
     }
@@ -54,7 +54,7 @@ describe("applyEvent", () => {
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, {
       type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done",
-      stop_reason: "end_turn", total_cost_usd: 0.01, num_turns: 1,
+      stop_reason: "end_turn", usage: { total_cost_usd: 0.01, num_turns: 1 },
     });
     expect(state.status).toEqual({ kind: "running" });
   });
@@ -247,7 +247,7 @@ describe("partial assistant streaming", () => {
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, delta("first"));
-    state = applyEvent(state, { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "first", stop_reason: null, total_cost_usd: 0, num_turns: 0 });
+    state = applyEvent(state, { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "first", stop_reason: null, usage: null });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
     state = applyEvent(state, delta("second"));
     expect(state.transcript).toEqual(["first", "second"]);

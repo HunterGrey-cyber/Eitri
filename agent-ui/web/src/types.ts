@@ -97,6 +97,18 @@ export type Hello = {
 };
 
 export type TurnOutcome = "completed" | "interrupted" | "failed" | "limit_reached";
+
+/** What a provider reported about a turn's cost. Mirrors Rust's `agent::UsageInfo`, and the
+ *  snake_case field names are deliberate -- `AgentDomainEvent` reaches the frontend through
+ *  serde's own derive, not through `serialize_snapshot_for_js`'s camelCase re-shaping.
+ *
+ *  `turn_completed.usage` is `null` whenever the backend reported nothing, which on the `sidecar`
+ *  backend is EVERY turn: `verdandi.claude.runtime.v1`'s `TurnCompleted` message carries no usage
+ *  fields at all. Anything that renders this must show `null` as unknown. Showing it as $0.00 would
+ *  reinstate the bug that made the field nullable: this event used to arrive with
+ *  `total_cost_usd: 0, num_turns: 0` hardcoded on that backend, so a cost readout would have been
+ *  correct on `legacy` and confidently, permanently wrong on `sidecar`. Nothing renders it today. */
+export type UsageInfo = { total_cost_usd: number; num_turns: number };
 export type AgentDomainEvent =
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "turn_started"; turn_id: string }
@@ -105,7 +117,7 @@ export type AgentDomainEvent =
   | { type: "tool_call_completed"; turn_id: string; tool_use_id: string; content: unknown; is_error: boolean }
   | { type: "permission_requested"; permission_id: string; tool_use_id: string | null; tool_name: string; input: unknown }
   | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" }
-  | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; total_cost_usd: number; num_turns: number }
+  | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; usage: UsageInfo | null }
   /** The provider's verdict on a resume, stated once for a session that asked for one. Mirrors the
    *  Rust `AgentDomainEvent::ResumeOutcome`; the reducer must fold it the same way
    *  `AgentSessionProjection` does, or the two states diverge on a failed resume. */

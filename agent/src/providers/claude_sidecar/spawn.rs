@@ -83,11 +83,14 @@ impl SpawnedSidecar {
 /// identified. Checkout overrides allow testing unreleased sidecars and protocol
 /// migrations without rejecting a different revision at startup.
 ///
-/// Update this value after `claude_sidecar_lifecycle_conformance` passes against
-/// the candidate revision. It checks multiple turns with content checks, BYPASS
+/// Keep this value aligned with the protocol dependency revision in `agent/Cargo.toml`,
+/// since that revision supplies the generated wire types compiled into this client.
+///
+/// Update this value after the ignored real-sidecar conformance tests pass against
+/// the candidate revision. They cover multiple turns with content checks, BYPASS
 /// tool execution, reuse after interruption, teardown without orphan processes,
-/// and resume verified by both content and provider session ID.
-/// It also measures partial assistant streaming.
+/// resume verified by content and provider session ID, partial assistant streaming,
+/// replay, recovery, and backpressure.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`

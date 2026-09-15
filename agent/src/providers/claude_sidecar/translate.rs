@@ -99,9 +99,9 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 result_text: completed.result_text,
                 stop_reason: completed.stop_reason,
                 // The sidecar protocol's `TurnCompleted` carries no cost or usage fields.
-                // These zeros are placeholders for missing data, not measured cost or turn counts.
-                total_cost_usd: 0.0,
-                num_turns: 0,
+                // Use `None` for missing data: zero would be stored as a measured value and could not be
+                // distinguished from a free turn. Send `Some` only when actual usage data is available.
+                usage: None,
             })
         },
         ProtoEvent::SessionClosed(closed) => Some(AgentDomainEvent::SessionClosed {
@@ -304,8 +304,12 @@ mod tests {
         }
     }
 
+    /// The usage half of this used to be named "...and_zeroes_usage", and asserted a `0.0`/`0` that
+    /// the wire never sent. `None` is the honest translation of a message with no usage fields, and
+    /// asserting it here is what stops a placeholder creeping back in ahead of a real
+    /// Verdandi-side usage field.
     #[test]
-    fn turn_completed_translates_every_outcome_value_and_zeroes_usage() {
+    fn turn_completed_translates_every_outcome_value_and_reports_usage_as_unknown() {
         let cases = [
             (ProtoTOutcome::Completed, TurnOutcome::Completed),
             (ProtoTOutcome::Interrupted, TurnOutcome::Interrupted),
@@ -317,7 +321,7 @@ mod tests {
                 turn_id: "turn-1".into(), outcome: proto_outcome as i32, result_text: "done".into(), is_error: false, stop_reason: Some("end_turn".into()),
             }));
             assert_eq!(translate(event), Some(AgentDomainEvent::TurnCompleted {
-                turn_id: "turn-1".into(), outcome: expected, result_text: "done".into(), stop_reason: Some("end_turn".into()), total_cost_usd: 0.0, num_turns: 0,
+                turn_id: "turn-1".into(), outcome: expected, result_text: "done".into(), stop_reason: Some("end_turn".into()), usage: None,
             }));
         }
     }

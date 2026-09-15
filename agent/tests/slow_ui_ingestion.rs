@@ -251,8 +251,7 @@ fn an_interrupt_during_a_stall_terminates_the_turn_exactly_once() {
         outcome: TurnOutcome::Interrupted,
         result_text: String::new(),
         stop_reason: None,
-        total_cost_usd: 0.0,
-        num_turns: 0,
+        usage: None,
     });
     settle(&provider, &conversation);
 
