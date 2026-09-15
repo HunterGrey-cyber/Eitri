@@ -82,8 +82,14 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
             println!("[permission resolved] id={permission_id} outcome={outcome:?}");
         }
-        AgentDomainEvent::TurnCompleted { result_text, outcome, total_cost_usd, num_turns, .. } => {
-            println!("\n[turn completed] outcome={outcome:?} cost=${total_cost_usd:.4} turns={num_turns}\nresult: {result_text}\n");
+        AgentDomainEvent::TurnCompleted { result_text, outcome, usage, .. } => {
+            // "unknown", not "$0.0000": a backend that reports no usage (the sidecar provider, whose
+            // wire has no usage fields) must not print a figure it was never given.
+            let cost = match usage {
+                Some(usage) => format!("${:.4} turns={}", usage.total_cost_usd, usage.num_turns),
+                None => "unknown (this backend reports no usage)".to_string(),
+            };
+            println!("\n[turn completed] outcome={outcome:?} cost={cost}\nresult: {result_text}\n");
         }
         AgentDomainEvent::ResumeOutcome { requested_provider_session_id, status, attached_provider_session_id, forked, detail } => {
             println!(

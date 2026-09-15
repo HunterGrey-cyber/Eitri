@@ -1,6 +1,6 @@
 use agent::{
     AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
-    TurnOutcome,
+    TurnOutcome, UsageInfo,
 };
 use serde_json::json;
 
@@ -122,12 +122,45 @@ fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
         projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
         projection.apply(&AgentDomainEvent::TurnCompleted {
             turn_id: "turn-1".into(), outcome, result_text: "done".into(), stop_reason: None,
-            total_cost_usd: 0.01, num_turns: 1,
+            usage: Some(UsageInfo { total_cost_usd: 0.01, num_turns: 1 }),
         });
         assert_eq!(projection.active_turn_id, None, "outcome {outcome:?} must clear active_turn_id");
-        assert_eq!(projection.usage.total_cost_usd, 0.01);
-        assert_eq!(projection.usage.num_turns, 1);
+        assert_eq!(projection.usage, Some(UsageInfo { total_cost_usd: 0.01, num_turns: 1 }));
     }
+}
+
+/// A provider that reports no usage must leave the projection saying so, and must not be able to
+/// overwrite a figure another turn genuinely reported.
+///
+/// This is the whole point of `usage` being an `Option`. `ClaudeSidecarProvider` sends `None` on
+/// every turn because its wire carries no usage fields; before this, its translation layer sent
+/// `0.0`/`0` and this arm assigned unconditionally, so a UI reading `usage` would have shown a
+/// confident zero for a session that had really spent money, with no way to tell that apart from a
+/// turn that was genuinely free.
+#[test]
+fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
+    let mut projection = AgentSessionProjection::default();
+    assert_eq!(projection.usage, None, "nothing has been reported yet");
+
+    projection.apply(&AgentDomainEvent::TurnCompleted {
+        turn_id: "turn-1".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
+        stop_reason: None, usage: None,
+    });
+    assert_eq!(projection.usage, None, "absence must stay absence, never become a measured zero");
+
+    projection.apply(&AgentDomainEvent::TurnCompleted {
+        turn_id: "turn-2".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
+        stop_reason: None, usage: Some(UsageInfo { total_cost_usd: 0.25, num_turns: 2 }),
+    });
+    projection.apply(&AgentDomainEvent::TurnCompleted {
+        turn_id: "turn-3".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
+        stop_reason: None, usage: None,
+    });
+    assert_eq!(
+        projection.usage,
+        Some(UsageInfo { total_cost_usd: 0.25, num_turns: 2 }),
+        "a silent turn must not zero out what an earlier turn actually reported"
+    );
 }
 
 #[test]
@@ -204,7 +237,7 @@ fn a_tool_call_or_a_turn_boundary_starts_a_new_transcript_entry() {
 
     projection.apply(&AgentDomainEvent::TurnCompleted {
         turn_id: "t1".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
-        stop_reason: None, total_cost_usd: 0.0, num_turns: 0,
+        stop_reason: None, usage: None,
     });
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t2".into(), kind: ContentKind::Text, text: "next turn".into() });
@@ -250,9 +283,10 @@ fn a_lost_session_stops_looking_like_a_turn_in_progress() {
     // What DID arrive stays. Clearing the turn must not double as deleting the partial reply: the
     // reason string is what tells the reader it may be incomplete, not its absence.
     assert_eq!(projection.transcript, vec!["half an ans".to_string()]);
-    // And no completion was invented on the way out.
-    assert_eq!(projection.usage.num_turns, 0);
-    assert_eq!(projection.usage.total_cost_usd, 0.0);
+    // And no completion was invented on the way out. `None` is a stronger statement than the
+    // zeroed struct this used to assert: nothing reported usage, as opposed to something reporting
+    // nought.
+    assert_eq!(projection.usage, None);
 }
 
 #[test]

@@ -256,7 +256,15 @@ impl AgentSession {
                 } else {
                     TurnOutcome::Completed
                 };
-                vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, total_cost_usd, num_turns }]
+                // `Some` unconditionally, and correctly so: both figures came off the CLI's own
+                // terminal `result` line, where `wire.rs::ResultLine` declares them as REQUIRED
+                // (no `serde(default)`) -- a `result` line missing either one fails to deserialize
+                // and becomes `AgentEvent::Unknown`, never a `TurnFinished`. So every value
+                // reaching here was genuinely reported. This backend has real session-cumulative
+                // figures; the sidecar backend has none, and sends `None` rather than a zero
+                // standing in for them.
+                let usage = Some(crate::UsageInfo { total_cost_usd, num_turns });
+                vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, usage }]
             }
             AgentEvent::ProcessExited { success: true } => {
                 vec![AgentDomainEvent::SessionClosed { reason: "provider_exited".to_string() }]

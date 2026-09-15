@@ -283,7 +283,7 @@ mod tests {
         let mut trace = trace();
         trace.observe(&[AgentDomainEvent::TurnCompleted {
             turn_id: "t1".into(), outcome: TurnOutcome::Interrupted, result_text: String::new(),
-            stop_reason: None, total_cost_usd: 0.0, num_turns: 0,
+            stop_reason: None, usage: None,
         }]);
         assert!(trace.is_finished());
         assert!(trace.is_complete(), "nothing is still coming, so waiting for a paint would hang the line");

@@ -101,12 +101,16 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 outcome,
                 result_text: completed.result_text,
                 stop_reason: completed.stop_reason,
-                // No source data: the v1 sidecar proto's TurnCompleted carries no cost/usage fields at
-                // all (confirmed by reading proto/verdandi/claude/runtime/v1/runtime.proto directly --
-                // the design doc's own §9.6 "suggested" UsageUpdated event was never implemented this
-                // round). Zero, not fabricated, until a later sidecar proto revision adds one.
-                total_cost_usd: 0.0,
-                num_turns: 0,
+                // No source data: the v1 sidecar proto's TurnCompleted carries no cost/usage fields
+                // at all (confirmed by reading proto/verdandi/claude/runtime/v1/runtime.proto
+                // directly -- the design doc's own §9.6 "suggested" UsageUpdated event was never
+                // implemented this round). `None` says exactly that, and is the whole reason the
+                // field is an `Option`: this site previously sent `0.0`/`0`, which the projection
+                // stored as a measured value indistinguishable from a real free turn. A Verdandi
+                // `TurnUsage` field is planned but does not exist, so do not reintroduce a
+                // placeholder here in anticipation of it -- send `Some` when there is something to
+                // put in it.
+                usage: None,
             })
         },
         ProtoEvent::SessionClosed(closed) => Some(AgentDomainEvent::SessionClosed {
@@ -310,8 +314,12 @@ mod tests {
         }
     }
 
+    /// The usage half of this used to be named "...and_zeroes_usage", and asserted a `0.0`/`0` that
+    /// the wire never sent. `None` is the honest translation of a message with no usage fields, and
+    /// asserting it here is what stops a placeholder creeping back in ahead of a real
+    /// Verdandi-side usage field.
     #[test]
-    fn turn_completed_translates_every_outcome_value_and_zeroes_usage() {
+    fn turn_completed_translates_every_outcome_value_and_reports_usage_as_unknown() {
         let cases = [
             (ProtoTOutcome::Completed, TurnOutcome::Completed),
             (ProtoTOutcome::Interrupted, TurnOutcome::Interrupted),
@@ -323,7 +331,7 @@ mod tests {
                 turn_id: "turn-1".into(), outcome: proto_outcome as i32, result_text: "done".into(), is_error: false, stop_reason: Some("end_turn".into()),
             }));
             assert_eq!(translate(event), Some(AgentDomainEvent::TurnCompleted {
-                turn_id: "turn-1".into(), outcome: expected, result_text: "done".into(), stop_reason: Some("end_turn".into()), total_cost_usd: 0.0, num_turns: 0,
+                turn_id: "turn-1".into(), outcome: expected, result_text: "done".into(), stop_reason: Some("end_turn".into()), usage: None,
             }));
         }
     }

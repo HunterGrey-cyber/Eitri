@@ -86,13 +86,24 @@ impl SpawnedSidecar {
 /// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
 /// this session actually running?" is answerable after the fact rather than guessed at.
 ///
-/// Currently `c331615` on Verdandi's `sdk-mainline-unblock`: the revision whose real-sidecar
-/// conformance this crate's own `claude_sidecar_lifecycle_conformance` suite passed against --
-/// multi-turn with a content oracle, BYPASS tool execution, post-interrupt reuse, orphan-free
-/// teardown, and (as of this revision) a real resume proven by both a content oracle and a
-/// provider-session-id match, and partial assistant streaming measured before/after. Moved
-/// here (eb70aa3 -> 2fd30fb -> c331615) only after that suite went green against each; move it
-/// again on the same terms, not before.
+/// Currently `bb487d7` on Verdandi's `sdk-mainline-unblock`, which is also the `rev` that
+/// `agent/Cargo.toml` pins `claude-runtime-protocol` to -- and those two must stay equal, because
+/// the generated wire types this crate compiles against come from exactly that revision, so it is
+/// the revision "verified against" can honestly refer to. (The checkout actually RUNNING may differ;
+/// that is what the drift warning below reports, and what `NEOVIBE_VERDANDI_CHECKOUT` is for.)
+///
+/// The value earns its way here by the real suite, never by a version bump: the whole `#[ignore]`d
+/// real-sidecar set is re-run against the exact pushed revision first (multi-turn with a content
+/// oracle, BYPASS tool execution, post-interrupt reuse, orphan-free teardown, a real resume proven
+/// by both a content oracle and a provider-session-id match, partial assistant streaming measured
+/// before/after, and the replay/recovery and backpressure suites). Moved here
+/// `eb70aa3 -> 2fd30fb -> c331615 -> ff05677 -> bb487d7` on those terms each time; move it again on
+/// the same terms, not before. The most recent move is this repo's commit `6980f69`, whose message
+/// records the 28 green real tests behind it.
+///
+/// Keep this doc comment and the literal in step. They were not, between `6980f69` (which bumped
+/// only the literal) and the 2026-09-15 cross-repository review that caught it: the prose said
+/// `c331615` while the constant said `bb487d7`, two revisions apart, and nothing failed.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`

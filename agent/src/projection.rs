@@ -110,8 +110,15 @@ pub enum AgentDomainEvent {
         outcome: TurnOutcome,
         result_text: String,
         stop_reason: Option<String>,
-        total_cost_usd: f64,
-        num_turns: u32,
+        /// `None` means the provider reported no usage for this turn -- NOT a turn that cost
+        /// nothing. The distinction is load-bearing because the two backends genuinely differ:
+        /// the legacy Claude-CLI backend's own `result` line carries real cumulative figures, while
+        /// the sidecar's `verdandi.claude.runtime.v1` `TurnCompleted` message has no usage fields at
+        /// all. Before this was an `Option` the sidecar path filled in `0.0`/`0`, and the projection
+        /// then stored that zero as though it were measured -- so the same UI element would have
+        /// read as a real running cost on one backend and a confident, permanent "$0.00" on the
+        /// other, with nothing anywhere able to tell the two apart.
+        usage: Option<UsageInfo>,
     },
     /// The provider process is gone unexpectedly (a real, non-zero-exit `ProcessExited`) --
     /// distinct from `SessionClosed`, which is an orderly end. No hook-relay/gRPC-crash producer
@@ -172,7 +179,9 @@ pub struct PermissionRequestRecord {
     pub input: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+/// What a provider actually reported about a turn's cost. Only ever constructed from figures a
+/// provider sent; a provider that sends none produces `None`, never a zeroed `UsageInfo`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct UsageInfo {
     pub total_cost_usd: f64,
     pub num_turns: u32,
@@ -208,7 +217,13 @@ pub struct AgentSessionProjection {
     pub transcript: Vec<String>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub pending_permissions: HashMap<String, PermissionRequestRecord>,
-    pub usage: UsageInfo,
+    /// The last usage a provider actually reported, or `None` if none ever has -- which is the
+    /// steady state on the `ClaudeSidecarProvider` path, whose wire carries no usage at all. A
+    /// consumer must render `None` as unknown; rendering it as zero re-tells the exact lie this
+    /// field was made an `Option` to stop. No consumer reads it yet
+    /// (`shell/src/agent_bridge.rs::serialize_snapshot_for_js` does not emit it), so the first one
+    /// to do so inherits that obligation.
+    pub usage: Option<UsageInfo>,
     /// True while the last thing folded was assistant text, so the next chunk CONTINUES the same
     /// message instead of starting a new one.
     ///
@@ -295,10 +310,16 @@ impl AgentSessionProjection {
             AgentDomainEvent::PermissionResolved { permission_id, .. } => {
                 self.pending_permissions.remove(permission_id);
             }
-            AgentDomainEvent::TurnCompleted { total_cost_usd, num_turns, .. } => {
+            AgentDomainEvent::TurnCompleted { usage, .. } => {
                 self.active_turn_id = None;
                 self.assistant_message_open = false;
-                self.usage = UsageInfo { total_cost_usd: *total_cost_usd, num_turns: *num_turns };
+                // Conditional, where this arm used to assign unconditionally -- which is how the
+                // sidecar path's fabricated zero reached the projection in the first place. A turn
+                // that reported no usage leaves whatever was last reported standing: silence is not
+                // a measurement, so it must not overwrite one.
+                if let Some(reported) = usage {
+                    self.usage = Some(*reported);
+                }
             }
             // Both endings clear `active_turn_id`, and for one reason: no `TurnCompleted` is ever
             // coming. Leaving it set is what turned a dead session into a spinner that never stops

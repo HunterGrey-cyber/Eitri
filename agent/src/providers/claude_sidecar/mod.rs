@@ -54,9 +54,10 @@ const CAP_FORK_SESSION: &str = "fork_session";
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
-/// Whether THIS client can actually drive resume/fork end to end. Both are `false` until the phase
-/// that implements them lands; flipping either one here is the single switch that turns the feature
-/// on, and it must not be flipped before `resume_session` does something real.
+/// Whether THIS client can actually drive resume/fork end to end. Each stays `false` until the
+/// change that implements it lands; flipping one here is the single switch that turns the feature
+/// on, and it must not be flipped before the call does something real. Resume has since been
+/// through that gate (hence `true` below); fork has not.
 ///
 /// A capability is the INTERSECTION of what the provider advertises and what this side implements.
 /// Reporting the provider's advertisement alone would put a Resume control in the UI the moment the
@@ -201,10 +202,19 @@ impl ClaudeSidecarProvider {
             .into_inner();
 
         // Design doc §9.3: an incompatible major is refused, minor differences are tolerated
-        // (protobuf unknown-field rules cover the new fields a higher minor may add). The sidecar
-        // performs the mirror-image check on the client's major, but that only catches a client
-        // that is too old -- this catches a sidecar that is too new, which is the direction a
-        // stale pinned `rev` in Cargo.toml actually produces.
+        // (protobuf unknown-field rules cover the new fields a higher minor may add).
+        //
+        // Against a CONFORMING peer this branch is unreachable in both directions, and the comment
+        // here used to claim otherwise ("this catches a sidecar that is too new"). It does not:
+        // `runtimeServiceImpl.ts`'s handshake handler throws `INCOMPATIBLE_PROTOCOL` whenever
+        // `clientProtocolMajor !== PROTOCOL_MAJOR` and otherwise answers with its own
+        // `PROTOCOL_MAJOR`, so version skew either way is refused by the peer and arrives at the
+        // `?` above as a failed RPC -- never here with a mismatched number in hand. What survives
+        // is the check's real job: a backstop against a NON-conforming peer, one that answers a
+        // major it did not just require (a broken build, a different implementation of the service,
+        // or -- since proto3 has no presence on a scalar -- a response that simply omits the field
+        // and so arrives as 0). Cheap, and the alternative is issuing commands to a peer whose
+        // wire contract this client cannot name.
         if handshake.protocol_major != CLIENT_PROTOCOL_MAJOR {
             return Err(std::io::Error::other(format!(
                 "claude-sidecar speaks protocol major {} but this client speaks {CLIENT_PROTOCOL_MAJOR}; \
@@ -677,11 +687,33 @@ fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64)
 mod tests {
     use super::*;
 
-    /// The exact shape today's real sidecar returns -- copied from
+    /// The shape the real sidecar returns at the revision this crate pins
+    /// (`EXPECTED_VERDANDI_REVISION`) -- transcribed from
     /// `apps/claude-sidecar/src/runtimeServiceImpl.ts`'s handshake handler, not invented.
+    ///
+    /// **This is a hand-maintained record, NOT a drift detector.** Nothing in Rust observes the real
+    /// sidecar: when Verdandi adds a capability, changes a permission mode, or bumps its protocol
+    /// major, every test below keeps passing against this frozen literal, and it stays wrong until a
+    /// human opens this file and edits it. That is exactly what happened once already -- this
+    /// fixture sat at `protocol_major: 1` with seven capabilities while `CLIENT_PROTOCOL_MAJOR` was
+    /// 2 and the pinned sidecar advertised nine, so it described a peer `connect()` would have
+    /// REFUSED, and `cargo test -p agent` was green throughout.
+    ///
+    /// What these tests do earn is the reverse direction: they pin `capabilities_from_handshake`'s
+    /// own logic against a realistic input, so a change to the intersection rule, a mistyped
+    /// capability constant, or a silently-dropped `ProviderInfo` field fails here. For a check that
+    /// a real sidecar still says this, see
+    /// `agent/tests/claude_sidecar_unary_conformance.rs::the_live_handshake_still_matches_the_fixture_in_mod_rs`
+    /// -- `#[ignore]`d, real-process, and costs no model tokens.
+    ///
+    /// Two of these fields are not protocol facts and that live test deliberately does not pin
+    /// them: `claude_agent_sdk_version` and the two `*claude_code_version`s are whatever happens to
+    /// be installed (the run on 2026-09-15 reported CLI 2.1.272 against the 2.1.269 written here).
+    /// They stay as plausible sample values, because the tests below only check that
+    /// `info_from_handshake` carries them through unchanged.
     fn real_handshake_today() -> HandshakeResponse {
         HandshakeResponse {
-            protocol_major: 1,
+            protocol_major: 2,
             protocol_minor: 0,
             sidecar_version: "0.1.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
@@ -695,6 +727,11 @@ mod tests {
                 "interrupt_turn",
                 "resolve_permission",
                 "close_session",
+                // Not RPC names: resume and fork are parameters of `CreateSession`, so the sidecar
+                // advertises them explicitly because a client cannot discover them from the service
+                // definition. Added on Verdandi's side by `2fd30fb`.
+                "resume_session",
+                "fork_session",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -707,12 +744,15 @@ mod tests {
     }
 
     #[test]
-    fn todays_real_sidecar_advertises_interrupt_and_bypass_but_not_resume_or_fork() {
+    fn todays_real_sidecar_advertises_interrupt_bypass_and_resume_but_this_client_withholds_fork() {
         let capabilities = capabilities_from_handshake(&real_handshake_today());
         assert!(capabilities.interrupt, "interrupt_turn is advertised and works (proven by the conformance suite)");
         assert!(capabilities.bypass_permission_mode, "bypass is advertised, and is this milestone's only permission policy");
-        assert!(!capabilities.resume, "no resume_session capability exists on the wire yet");
-        assert!(!capabilities.fork, "no fork_session capability exists on the wire yet");
+        assert!(capabilities.resume, "resume_session is advertised AND CLIENT_IMPLEMENTS_RESUME is true");
+        assert!(
+            !capabilities.fork,
+            "fork_session IS advertised on the wire -- this reports false because CLIENT_IMPLEMENTS_FORK is still false"
+        );
     }
 
     #[test]
@@ -723,18 +763,25 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_advertising_resume_still_reports_false_until_this_client_implements_it() {
-        // The regression this pins: the day Verdandi starts advertising `resume_session`, this
-        // client must not start reporting `resume: true` -- `resume_session()` here still returns
-        // UnsupportedCapability, so a UI acting on the capability would render a control that
-        // cannot work. Flipping CLIENT_IMPLEMENTS_RESUME is what changes this, and that flip must
-        // happen in the same change that implements the call.
-        let mut response = real_handshake_today();
-        response.capabilities.push("resume_session".into());
-        response.capabilities.push("fork_session".into());
-        let capabilities = capabilities_from_handshake(&response);
-        assert_eq!(capabilities.resume, CLIENT_IMPLEMENTS_RESUME);
-        assert_eq!(capabilities.fork, CLIENT_IMPLEMENTS_FORK);
+    fn a_capability_needs_both_the_provider_advertising_it_and_this_client_implementing_it() {
+        // Both halves have to bite, and today each is demonstrated by a different capability.
+        //
+        // The client half was written for a day that has since arrived. Verdandi added
+        // `resume_session` to the wire (`2fd30fb`) while `resume_session()` here still returned
+        // `UnsupportedCapability`, and reporting the advertisement alone would have put a Resume
+        // control in the UI that could not work. Resume is genuinely implemented now, so `fork`
+        // carries that half: `fork_session` IS advertised by the pinned sidecar, and this still
+        // reports false, because `CLIENT_IMPLEMENTS_FORK` is false.
+        let advertised = capabilities_from_handshake(&real_handshake_today());
+        assert!(advertised.resume, "advertised by the sidecar and implemented here");
+        assert!(!advertised.fork, "advertised by the sidecar, not implemented here");
+
+        // The provider half: implementing a call is not licence to claim it against a peer that
+        // never offered it. A sidecar too old to know the word must read as no-resume even though
+        // `CLIENT_IMPLEMENTS_RESUME` is true -- which the first assertion above just established.
+        let mut older = real_handshake_today();
+        older.capabilities.retain(|c| c != CAP_RESUME_SESSION);
+        assert!(!capabilities_from_handshake(&older).resume);
     }
 
     #[test]
@@ -748,12 +795,12 @@ mod tests {
     fn info_carries_the_advertised_lists_verbatim_for_diagnostics() {
         let info = info_from_handshake(&real_handshake_today(), Some("checkout @ abc1234".into()), vec!["diag".into()]);
         assert_eq!(info.actual_claude_code_version, "2.1.269");
-        assert_eq!(info.protocol_major, 1);
+        assert_eq!(info.protocol_major, 2);
         assert_eq!(info.sidecar_version, "0.1.0");
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        assert_eq!(info.advertised_capabilities.len(), 7);
+        assert_eq!(info.advertised_capabilities.len(), 9);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
