@@ -46,6 +46,19 @@ fn real_multi_turn_conversation_in_one_process() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The allow half of the real round trip -- and, since 2026-09-15, the one place the
+/// permission-to-tool-call link is checked against a real CLI rather than against a fixture.
+///
+/// The `tool_use_id` assertions below close a step the fixture evidence genuinely cannot:
+/// `agent/CAPTURE_NOTES.md` step 5 shows a real hook stdin's id matching a real `tool_result`'s
+/// `tool_use_id` in the same run, and a `tool_result`'s id is by protocol the id of the `tool_use`
+/// block it answers -- but that run's own `tool_use` block was never quoted, so "the id on the
+/// card equals the id on the tool call it marks" was an inference. Here both sides are real
+/// objects in one live conversation.
+///
+/// **This test has not been run since those assertions were added** (adding them cost nothing;
+/// running them costs a real billed turn). If it fails, the interesting output is the two ids, not
+/// the boolean.
 #[test]
 #[ignore]
 fn real_pretooluse_hook_allow_end_to_end() {
@@ -54,17 +67,24 @@ fn real_pretooluse_hook_allow_end_to_end() {
     let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
-    let mut saw_permission_request = false;
+    let mut gated_tool_use_id: Option<Option<String>> = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline && session.projection.pending_permissions.is_empty() && !saw_permission_request {
+    while std::time::Instant::now() < deadline && session.projection.pending_permissions.is_empty() && gated_tool_use_id.is_none() {
         for event in session.pump() {
-            if matches!(event, AgentDomainEvent::PermissionRequested { .. }) {
-                saw_permission_request = true;
+            if let AgentDomainEvent::PermissionRequested { tool_use_id, .. } = event {
+                gated_tool_use_id = Some(tool_use_id);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(saw_permission_request, "expected a real PreToolUse-hook-sourced PermissionRequested");
+    let gated_tool_use_id = gated_tool_use_id.expect("expected a real PreToolUse-hook-sourced PermissionRequested");
+    // Asserted on the real event rather than on the projection record, so a projection that
+    // happened to drop the field could not stand in for the wire carrying it.
+    let gated_tool_use_id = gated_tool_use_id.expect(
+        "a real PreToolUse hook relay must carry the payload's own tool_use_id -- without it the \
+         permission card cannot name the call it gates",
+    );
+
     let permission_id = session.projection.pending_permissions.keys().next().unwrap().clone();
     session.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
     assert!(
@@ -74,6 +94,16 @@ fn real_pretooluse_hook_allow_end_to_end() {
 
     let result = drain_until_finished(&mut session);
     assert!(result.to_lowercase().contains("hello"), "got: {result}");
+
+    // The step the capture notes leave as an inference: the id the hook gated really is the id of
+    // a tool call in this same conversation's transcript. Checked after the turn, because the
+    // assistant `tool_use` block and the `PreToolUse` hook have no guaranteed arrival order.
+    let recorded: Vec<&str> = session.projection.tool_calls.iter().map(|c| c.tool_use_id.as_str()).collect();
+    assert!(
+        recorded.contains(&gated_tool_use_id.as_str()),
+        "the gated tool_use_id {gated_tool_use_id} names no tool call in this conversation; \
+         the transcript recorded {recorded:?}"
+    );
 
     session.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

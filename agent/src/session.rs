@@ -5,7 +5,8 @@
 //! (`start`/`send_turn`/`interrupt`/`respond_permission`/`pump`/`shutdown`).
 //!
 //! `AgentEvent`/`PermissionSource` (the Claude-wire-specific types) never cross this module's own
-//! public boundary as such: `translate_event` (private) is the one place they get turned into
+//! public boundary as such: `translate_wire_event` (`pub(crate)`, so `process`'s own tests can
+//! drive the real relayed event one layer further) is the one place they get turned into
 //! `AgentDomainEvent`s, matching design doc §10.2's "these types are not domain/UI events" list.
 //! The one piece of Claude-wire-specific state this module still has to keep -- which channel
 //! (`PermissionSource::HookRelay` vs `CanUseTool`) a given pending permission arrived on, needed
@@ -185,104 +186,285 @@ impl AgentSession {
         self.event_log.push(event);
     }
 
-    /// Translates one real Claude-wire `AgentEvent` into zero or more `AgentDomainEvent`s, using
-    /// `self.projection.active_turn_id` (already current -- see `pump`'s own doc) to stamp
-    /// `turn_id` onto events that need one, and `self.interrupt_requested` to decide a
-    /// `TurnFinished`'s outcome. Global Constraint: an `AgentEvent` with no domain-event mapping
-    /// (`ControlResponse`, `ProcessStderr`, `RateLimit`, `Unknown`) always returns an empty `Vec`
-    /// -- never a fabricated event, never a panic.
+    /// Hands one wire event to `translate_wire_event` with this session's three pieces of
+    /// translation state borrowed out of `self`. Deliberately holds no logic of its own: the whole
+    /// match lives in the free function so every arm of it is reachable from a test without
+    /// spawning a real `claude`. If you are about to add a branch here, add it there instead.
     fn translate_event(&mut self, event: AgentEvent) -> Vec<AgentDomainEvent> {
+        translate_wire_event(
+            event,
+            self.projection.active_turn_id.as_deref(),
+            &mut self.interrupt_requested,
+            &mut self.pending_permission_sources,
+        )
+    }
+}
+
+/// Translates one real Claude-wire `AgentEvent` into zero or more `AgentDomainEvent`s.
+///
+/// A free function rather than a method, and the reason is a real regression this crate already
+/// shipped once: the `PermissionRequest` arm below is the single line that decides whether a
+/// permission card can name the call it gates, and while this match hung off `&mut AgentSession`
+/// -- a struct owning a live `AgentProcess` -- no test could reach it. The arm was written
+/// `tool_use_id: None` for weeks with a fully green workspace. Everything it needs from the
+/// session is passed in explicitly instead:
+///
+/// - `active_turn_id`: the projection's current turn, already folded (see `pump`'s own doc), used
+///   to stamp `turn_id` onto the events that carry one.
+/// - `interrupt_requested`: read and cleared when deciding a `TurnFinished`'s outcome.
+/// - `pending_permission_sources`: written, so `respond_permission` can later route an answer back
+///   over the channel its request arrived on.
+///
+/// Global Constraint: an `AgentEvent` with no domain-event mapping (`ControlResponse`,
+/// `ProcessStderr`, `RateLimit`, `Unknown`) always returns an empty `Vec` -- never a fabricated
+/// event, never a panic.
+pub(crate) fn translate_wire_event(
+    event: AgentEvent,
+    active_turn_id: Option<&str>,
+    interrupt_requested: &mut bool,
+    pending_permission_sources: &mut HashMap<String, PermissionSource>,
+) -> Vec<AgentDomainEvent> {
+    match event {
+        AgentEvent::SessionStarted { session_id, model, cwd } => {
+            // The legacy CLI backend never distinguishes a sidecar-internal id from the real
+            // provider session id -- `session_id` here already *is* the real Claude CLI UUID
+            // (it comes straight from the CLI's own `init` line), so both fields get the same
+            // value.
+            vec![AgentDomainEvent::SessionOpened { session_id: session_id.clone(), provider_session_id: session_id, model, cwd }]
+        }
+        AgentEvent::AssistantText { text } => {
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
+            vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Text, text }]
+        }
+        AgentEvent::Thinking { text } => {
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
+            vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Thinking, text }]
+        }
+        AgentEvent::ToolStarted { id, name, input } => {
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
+            vec![AgentDomainEvent::ToolCallStarted { turn_id, tool_use_id: id, name, input }]
+        }
+        AgentEvent::ToolResult { id, content, is_error } => {
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
+            vec![AgentDomainEvent::ToolCallCompleted { turn_id, tool_use_id: id, content, is_error }]
+        }
+        AgentEvent::PermissionRequest { request_id, tool_use_id, tool_name, input, source } => {
+            pending_permission_sources.insert(request_id.clone(), source);
+            vec![permission_requested_event(request_id, tool_use_id, tool_name, input)]
+        }
+        AgentEvent::TurnFinished { result_text, is_error, stop_reason, total_cost_usd, num_turns } => {
+            let turn_id = active_turn_id.map(|t| t.to_string()).unwrap_or_else(|| "unknown-turn".to_string());
+            let outcome = if *interrupt_requested {
+                *interrupt_requested = false;
+                TurnOutcome::Interrupted
+            } else if is_error {
+                TurnOutcome::Failed
+            } else {
+                TurnOutcome::Completed
+            };
+            // `Some` unconditionally, and correctly so: both figures came off the CLI's own
+            // terminal `result` line, where `wire.rs::ResultLine` declares them as REQUIRED
+            // (no `serde(default)`) -- a `result` line missing either one fails to deserialize
+            // and becomes `AgentEvent::Unknown`, never a `TurnFinished`. So every value
+            // reaching here was genuinely reported. This backend has real session-cumulative
+            // figures; the sidecar backend has none, and sends `None` rather than a zero
+            // standing in for them.
+            let usage = Some(crate::UsageInfo { total_cost_usd, num_turns });
+            vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, usage }]
+        }
+        AgentEvent::ProcessExited { success: true } => {
+            vec![AgentDomainEvent::SessionClosed { reason: "provider_exited".to_string() }]
+        }
+        AgentEvent::ProcessExited { success: false } => {
+            vec![AgentDomainEvent::SessionUnavailable { reason: "provider process exited unexpectedly".to_string() }]
+        }
+        AgentEvent::ProcessStderr { line } => {
+            eprintln!("[agent] claude stderr: {line}");
+            vec![]
+        }
+        AgentEvent::RateLimit { raw } => {
+            eprintln!("[agent] rate limit notice: {raw}");
+            vec![]
+        }
+        AgentEvent::ControlResponse { .. } | AgentEvent::Unknown { .. } => {
+            vec![]
+        }
+    }
+}
+
+/// Builds the one domain event a legacy-backend permission request becomes. A free function
+/// rather than an inlined match arm purely so it can be unit-tested directly: `translate_event`
+/// hangs off an `AgentSession`, which owns a live `AgentProcess`, and no test should have to spawn
+/// a real `claude` to check how one id is carried.
+///
+/// **What this function does and does not decide.** It never sees `PermissionSource` and so cannot
+/// tell the two channels apart; it applies one rule to an id that whichever producer built the
+/// wire event already decided (see `AgentEvent::PermissionRequest`'s own doc for what each of them
+/// reads). All that happens here is `projection::tool_use_link`, the shared "is this a usable
+/// link" check, which rejects exactly the empty string.
+///
+/// `permission_id` stays the routing key regardless: it is what `respond_permission` needs to find
+/// the pending request again. On the hook-relay path it happens to be the same string as the link,
+/// because filing the connection under the tool-use id is what makes an answer routable -- that is
+/// construction, not coincidence, and the two are kept as separate fields so a change to either
+/// cannot silently redefine the other.
+///
+/// **Why the hook-relay id is believed to be the real tool-call id** (the link this whole field
+/// exists for, evidenced rather than assumed from the string's shape): `agent/CAPTURE_NOTES.md`
+/// step 5 records one real allow-run whose hook stdin carried
+/// `tool_use_id: "toolu_01CtdezhmhUCrBaswxW5HYmC"` (checked in verbatim as
+/// `tests/fixtures/v2_hook_pretooluse_stdin.json`) and whose `tool_result` block in the SAME run
+/// carried that same id -- and a `tool_result`'s `tool_use_id` is by the wire protocol's own
+/// definition the id of the `tool_use` block it answers, which is exactly the id `wire.rs` puts on
+/// `ToolCallStarted`. **One inference step is not closed:** that run's own `tool_use` block is not
+/// quoted in those notes, only the result naming it, and no live turn has been driven through this
+/// code since the change. `agent/tests/backend_conformance.rs`'s `#[ignore]`d
+/// `real_pretooluse_hook_allow_end_to_end` now asserts the equality directly against a real CLI;
+/// it has not been run.
+fn permission_requested_event(
+    request_id: String,
+    tool_use_id: Option<String>,
+    tool_name: String,
+    input: serde_json::Value,
+) -> AgentDomainEvent {
+    AgentDomainEvent::PermissionRequested {
+        permission_id: request_id,
+        tool_use_id: tool_use_id.and_then(crate::projection::tool_use_link),
+        tool_name,
+        input,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const REAL_ID: &str = "toolu_01CtdezhmhUCrBaswxW5HYmC";
+
+    /// **The test across the seam.** Everything else in this module tests
+    /// `permission_requested_event` in isolation, which is one side of a call; the arm that
+    /// actually decides what gets passed into it is the other. This drives the real
+    /// `translate_wire_event` match, so the argument at that call site is what is under test.
+    ///
+    /// Reverting that argument to `tool_use_id: None` -- the literal shape this crate shipped for
+    /// weeks -- makes this test fail and (as far as any test in this workspace was concerned
+    /// before it existed) nothing else.
+    #[test]
+    fn the_permission_arm_passes_the_wire_events_tool_use_id_through_rather_than_dropping_it() {
+        let mut interrupt_requested = false;
+        let mut sources = HashMap::new();
+
+        let produced = translate_wire_event(
+            AgentEvent::PermissionRequest {
+                request_id: REAL_ID.to_string(),
+                tool_use_id: Some(REAL_ID.to_string()),
+                tool_name: "Bash".to_string(),
+                input: json!({"command": "echo hello"}),
+                source: PermissionSource::HookRelay,
+            },
+            None,
+            &mut interrupt_requested,
+            &mut sources,
+        );
+
+        assert_eq!(produced.len(), 1);
+        match &produced[0] {
+            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, .. } => {
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some(REAL_ID),
+                    "the arm must forward the event's own tool_use_id; a hardcoded None here is \
+                     exactly the regression this test exists to catch"
+                );
+                assert_eq!(permission_id, REAL_ID);
+                assert_eq!(tool_name, "Bash");
+            }
+            other => panic!("expected PermissionRequested, got {other:?}"),
+        }
+        assert_eq!(
+            sources.get(REAL_ID),
+            Some(&PermissionSource::HookRelay),
+            "the arm must also file the source, or respond_permission cannot route the answer"
+        );
+    }
+
+    /// The same seam, driven with a source that supplied nothing: the arm must not invent a link
+    /// out of `request_id`, which is the only other string it has in scope.
+    #[test]
+    fn the_permission_arm_does_not_substitute_the_request_id_when_no_tool_use_id_was_supplied() {
+        let mut interrupt_requested = false;
+        let mut sources = HashMap::new();
+
+        let produced = translate_wire_event(
+            AgentEvent::PermissionRequest {
+                request_id: "ctu-1".to_string(),
+                tool_use_id: None,
+                tool_name: "Bash".to_string(),
+                input: json!({}),
+                source: PermissionSource::CanUseTool,
+            },
+            None,
+            &mut interrupt_requested,
+            &mut sources,
+        );
+
+        match &produced[0] {
+            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+                assert_eq!(permission_id, "ctu-1");
+                assert_eq!(*tool_use_id, None);
+            }
+            other => panic!("expected PermissionRequested, got {other:?}"),
+        }
+        assert_eq!(sources.get("ctu-1"), Some(&PermissionSource::CanUseTool));
+    }
+
+    /// The hook-relay shape, which is the one this backend actually gates tools with: the real
+    /// `toolu_*` id from the `PreToolUse` payload survives translation and becomes the domain
+    /// event's link. Fixture-shaped id on purpose -- this is the exact value
+    /// `agent/tests/fixtures/v2_hook_pretooluse_stdin.json` carries.
+    #[test]
+    fn a_hook_relay_request_keeps_the_real_tool_use_id_as_its_link() {
+        let event = permission_requested_event(
+            "toolu_01CtdezhmhUCrBaswxW5HYmC".to_string(),
+            Some("toolu_01CtdezhmhUCrBaswxW5HYmC".to_string()),
+            "Bash".to_string(),
+            json!({"command": "echo hello"}),
+        );
         match event {
-            AgentEvent::SessionStarted { session_id, model, cwd } => {
-                // The legacy CLI backend never distinguishes a sidecar-internal id from the real
-                // provider session id -- `session_id` here already *is* the real Claude CLI UUID
-                // (it comes straight from the CLI's own `init` line), so both fields get the same
-                // value.
-                vec![AgentDomainEvent::SessionOpened { session_id: session_id.clone(), provider_session_id: session_id, model, cwd }]
+            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, .. } => {
+                assert_eq!(permission_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_01CtdezhmhUCrBaswxW5HYmC"));
+                assert_eq!(tool_name, "Bash");
             }
-            AgentEvent::AssistantText { text } => {
-                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
-                vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Text, text }]
+            other => panic!("expected PermissionRequested, got {other:?}"),
+        }
+    }
+
+    /// The `can_use_tool` shape: a permission request whose source supplied no tool-use id at all
+    /// stays unlinked. `permission_id` is still the envelope's `request_id`, because that is what
+    /// the answer has to be routed back with -- it is simply never promoted into a link.
+    #[test]
+    fn a_request_with_no_supplied_id_stays_unlinked_rather_than_borrowing_its_permission_id() {
+        let event = permission_requested_event("ctu-1".to_string(), None, "Bash".to_string(), json!({}));
+        match event {
+            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+                assert_eq!(permission_id, "ctu-1");
+                assert_eq!(tool_use_id, None);
             }
-            AgentEvent::Thinking { text } => {
-                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
-                vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Thinking, text }]
-            }
-            AgentEvent::ToolStarted { id, name, input } => {
-                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
-                vec![AgentDomainEvent::ToolCallStarted { turn_id, tool_use_id: id, name, input }]
-            }
-            AgentEvent::ToolResult { id, content, is_error } => {
-                let Some(turn_id) = self.projection.active_turn_id.clone() else { return vec![] };
-                vec![AgentDomainEvent::ToolCallCompleted { turn_id, tool_use_id: id, content, is_error }]
-            }
-            AgentEvent::PermissionRequest { request_id, tool_name, input, source } => {
-                self.pending_permission_sources.insert(request_id.clone(), source);
-                // `tool_use_id: None` on BOTH sources. On the primary one that is a choice, not a
-                // limit -- the answer, since the frontend comments used to imply otherwise:
-                //
-                //   HookRelay (the documented primary gate) -- `request_id` IS the real Claude
-                //     `toolu_*` id. `process.rs`'s hook listener sets it from the `PreToolUse`
-                //     payload's own `tool_use_id` (a required field on
-                //     `hook_protocol::PreToolUseHookInput`; real capture in
-                //     `tests/fixtures/v2_hook_pretooluse_stdin.json`), and that is the same id
-                //     `ToolCallStarted` carries out of `wire.rs`'s `tool_use` block. So a
-                //     source-aware `Some(request_id.clone())` here would genuinely link a
-                //     permission card to the call it gates.
-                //
-                //   CanUseTool (secondary, best-effort) -- `request_id` is NOT a tool id. It is the
-                //     control_request envelope's own id (`wire.rs`'s `ControlRequestLine.request_id`,
-                //     e.g. "ctu-1"). Whether the real CLI also puts a `tool_use_id` inside the
-                //     request body is UNVERIFIED: the checked-in fixture carries one, but its value
-                //     is a hand-written placeholder, the protocol spec describes this message as
-                //     carrying `tool_name` and `input` only, and `ControlRequestBody` does not
-                //     deserialize the field at all.
-                //
-                // Left unwired deliberately. Doing it honestly means a source-aware value (so the
-                // CanUseTool path keeps saying `None` rather than passing off an envelope id as a
-                // tool id), matching changes in the two layers that render it, and one real-turn
-                // check that the hook's id and the `tool_use` block's id do match in a live
-                // conversation -- a change with its own verification, not a one-liner. Until then
-                // the frontend renders `null` honestly rather than guessing at the most recent call.
-                vec![AgentDomainEvent::PermissionRequested { permission_id: request_id, tool_use_id: None, tool_name, input }]
-            }
-            AgentEvent::TurnFinished { result_text, is_error, stop_reason, total_cost_usd, num_turns } => {
-                let turn_id = self.projection.active_turn_id.clone().unwrap_or_else(|| "unknown-turn".to_string());
-                let outcome = if self.interrupt_requested {
-                    self.interrupt_requested = false;
-                    TurnOutcome::Interrupted
-                } else if is_error {
-                    TurnOutcome::Failed
-                } else {
-                    TurnOutcome::Completed
-                };
-                // `Some` unconditionally, and correctly so: both figures came off the CLI's own
-                // terminal `result` line, where `wire.rs::ResultLine` declares them as REQUIRED
-                // (no `serde(default)`) -- a `result` line missing either one fails to deserialize
-                // and becomes `AgentEvent::Unknown`, never a `TurnFinished`. So every value
-                // reaching here was genuinely reported. This backend has real session-cumulative
-                // figures; the sidecar backend has none, and sends `None` rather than a zero
-                // standing in for them.
-                let usage = Some(crate::UsageInfo { total_cost_usd, num_turns });
-                vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, usage }]
-            }
-            AgentEvent::ProcessExited { success: true } => {
-                vec![AgentDomainEvent::SessionClosed { reason: "provider_exited".to_string() }]
-            }
-            AgentEvent::ProcessExited { success: false } => {
-                vec![AgentDomainEvent::SessionUnavailable { reason: "provider process exited unexpectedly".to_string() }]
-            }
-            AgentEvent::ProcessStderr { line } => {
-                eprintln!("[agent] claude stderr: {line}");
-                vec![]
-            }
-            AgentEvent::RateLimit { raw } => {
-                eprintln!("[agent] rate limit notice: {raw}");
-                vec![]
-            }
-            AgentEvent::ControlResponse { .. } | AgentEvent::Unknown { .. } => {
-                vec![]
-            }
+            other => panic!("expected PermissionRequested, got {other:?}"),
+        }
+    }
+
+    /// An empty id is not a link, even though the type would happily hold one -- see
+    /// `projection::tool_use_link`, whose single definition of that rule this path shares with the
+    /// sidecar provider's own translation step.
+    #[test]
+    fn an_empty_supplied_id_does_not_become_a_link() {
+        let event = permission_requested_event("perm-1".to_string(), Some(String::new()), "Bash".to_string(), json!({}));
+        match event {
+            AgentDomainEvent::PermissionRequested { tool_use_id, .. } => assert_eq!(tool_use_id, None),
+            other => panic!("expected PermissionRequested, got {other:?}"),
         }
     }
 }

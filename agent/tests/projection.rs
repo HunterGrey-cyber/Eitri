@@ -85,6 +85,55 @@ fn permission_requested_populates_pending_permissions_map() {
     assert_eq!(projection.pending_permissions["perm-1"].tool_use_id, Some("tu-1".into()));
 }
 
+/// The link itself, at the level that matters to a reader of the projection: the id a pending
+/// permission carries is the SAME id a `ToolCallRecord` is keyed on, so "which call is this card
+/// gating" is answerable by equality without either side knowing about the other. Two calls of
+/// the same tool are in flight here on purpose -- that is the case where a card saying only
+/// "Bash" identifies nothing.
+#[test]
+fn a_pending_permission_names_one_specific_tool_call_among_several_of_the_same_tool() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "turn-1".into(), tool_use_id: "toolu_first".into(), name: "Bash".into(), input: json!({"command": "echo one"}),
+    });
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "turn-1".into(), tool_use_id: "toolu_second".into(), name: "Bash".into(), input: json!({"command": "rm -rf /"}),
+    });
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "toolu_second".into(),
+        tool_use_id: Some("toolu_second".into()),
+        tool_name: "Bash".into(),
+        input: json!({"command": "rm -rf /"}),
+    });
+
+    let request = &projection.pending_permissions["toolu_second"];
+    let gated: Vec<&str> = projection
+        .tool_calls
+        .iter()
+        .filter(|c| Some(&c.tool_use_id) == request.tool_use_id.as_ref())
+        .map(|c| c.tool_use_id.as_str())
+        .collect();
+    assert_eq!(gated, vec!["toolu_second"], "exactly one call is gated, and it is the second one");
+}
+
+/// The legacy hook-relay shape specifically: its `permission_id` and its `tool_use_id` are the
+/// same string, because the `PreToolUse` payload's own `tool_use_id` is both the id of the gated
+/// call and the key the relay connection is filed under. Nothing downstream may assume the two
+/// differ -- the test above proves the link still resolves when they are equal.
+#[test]
+fn the_legacy_hook_relay_shape_where_both_ids_are_one_string_is_stored_intact() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "toolu_01CtdezhmhUCrBaswxW5HYmC".into(),
+        tool_use_id: Some("toolu_01CtdezhmhUCrBaswxW5HYmC".into()),
+        tool_name: "Bash".into(),
+        input: json!({"command": "echo hello"}),
+    });
+    let record = &projection.pending_permissions["toolu_01CtdezhmhUCrBaswxW5HYmC"];
+    assert_eq!(record.permission_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
+    assert_eq!(record.tool_use_id.as_deref(), Some("toolu_01CtdezhmhUCrBaswxW5HYmC"));
+}
+
 /// The scenario `agent/BACKEND_BASELINE.md` cites by name as pinning concurrent-permission
 /// handling: two simultaneously-pending requests must both be retained and independently
 /// resolvable in EITHER order, not just the order they arrived in.

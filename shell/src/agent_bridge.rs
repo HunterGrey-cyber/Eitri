@@ -235,11 +235,13 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         })
         .collect();
 
-    // `toolUseId` is the link back to the tool call a request gates, and it is genuinely nullable:
-    // the legacy backend sends `None` today, by a decision recorded at `agent/src/session.rs`'s own
-    // `tool_use_id: None` (which also sets out what each of its two permission sources could
-    // supply). Emitted as an explicit `null` rather than omitted, so the frontend can tell "this
-    // backend sent no such id" from "this build predates the field".
+    // `toolUseId` is the link back to the tool call a request gates. It stays genuinely nullable
+    // even though every path in both backends now reads whatever id its own message carried: the
+    // id can still be absent (a `can_use_tool` request without the field, a provider that sends an
+    // empty string, which `projection::tool_use_link` turns into `None`), and this pane must render
+    // that honestly rather than guessing at the most recent call. Emitted as an explicit `null`
+    // rather than omitted, so the frontend can tell "no id was sent for this request" from "this
+    // build predates the field".
     let pending_permissions: Vec<Value> = projection
         .pending_permissions
         .values()
@@ -546,8 +548,9 @@ mod tests {
 
     /// `null`, not an omitted key. The TS side declares the field as `string | null`, and an absent
     /// key would arrive as `undefined` -- which reads as "this build is too old to send it" rather
-    /// than "no id was sent for this request". This pins the serializer's handling of `None`; which
-    /// backends send `None`, and why, is settled at `agent/src/session.rs`'s own `tool_use_id: None`.
+    /// than "no id was sent for this request". This pins the serializer's handling of `None`; when
+    /// a request genuinely has no id to send is settled upstream, at `agent/src/session.rs`'s
+    /// `permission_requested_event` and `agent/src/wire.rs`'s `can_use_tool` arm.
     #[test]
     fn a_permission_with_no_tool_use_id_says_null_rather_than_omitting_the_key() {
         let mut projection = AgentSessionProjection::default();
@@ -573,6 +576,37 @@ mod tests {
             pending.as_object().unwrap().contains_key("toolUseId"),
             "the key must be present and null, not absent"
         );
+    }
+
+    /// The legacy backend's own shape, which the two tests above do not cover between them: on its
+    /// `PreToolUse` hook-relay path the permission id and the tool-use id are the SAME string,
+    /// because the hook payload's `tool_use_id` is both the identity of the gated call and the key
+    /// the live relay socket is filed under. Serializing them as two separate keys with one value
+    /// is correct and must stay that way -- the frontend keys cards on `permissionId` and matches
+    /// tool calls on `toolUseId`, and collapsing either into the other would tie the routing key to
+    /// the rendering link.
+    #[test]
+    fn a_legacy_hook_relay_permission_sends_the_same_id_under_both_keys() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: "toolu_01CtdezhmhUCrBaswxW5HYmC".into(),
+            tool_use_id: Some("toolu_01CtdezhmhUCrBaswxW5HYmC".into()),
+            tool_name: "Bash".into(),
+            input: json!({"command": "echo hello"}),
+        });
+        let view = SnapshotView {
+            backend: "legacy",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let pending = &parsed["state"]["pendingPermissions"][0];
+        assert_eq!(pending["permissionId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
+        assert_eq!(pending["toolUseId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
     }
 
     /// The event path's own half of the same link, pinned here rather than assumed from the derive:

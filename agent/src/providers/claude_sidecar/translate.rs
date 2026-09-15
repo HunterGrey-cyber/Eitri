@@ -78,7 +78,18 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
         ProtoEvent::PermissionRequested(requested) => match serde_json::from_str(&requested.input_json) {
             Ok(input) => Some(AgentDomainEvent::PermissionRequested {
                 permission_id: requested.permission_id,
-                tool_use_id: Some(requested.tool_use_id),
+                // Through the shared rule rather than straight into `Some`: proto3 has no absent
+                // string, so an id the provider never set arrives here as `""`, and `Some("")`
+                // would compare equal to any other record whose id is also `""`.
+                //
+                // **What is NOT known:** whether a real sidecar ever sends one. Until 2026-09-15
+                // this line wrapped unconditionally, which made
+                // `claude_sidecar_conformance.rs`'s `assert!(tool_use_id.is_some(), ..)` true for
+                // every possible wire value including `""` -- so that assertion has never
+                // discriminated anything, and it is `#[ignore]`d and has not been run since this
+                // change made it able to. Treat this as a hole being closed on principle, not as a
+                // behaviour anyone has observed.
+                tool_use_id: crate::projection::tool_use_link(requested.tool_use_id),
                 tool_name: requested.tool_name,
                 input,
             }),
@@ -295,6 +306,22 @@ mod tests {
         }));
         assert_eq!(translate(event), Some(AgentDomainEvent::PermissionRequested {
             permission_id: "perm-1".into(), tool_use_id: Some("tu-1".into()), tool_name: "Write".into(), input: serde_json::json!({}),
+        }));
+    }
+
+    /// proto3 has no absent string, so a `tool_use_id` the provider never set arrives here as
+    /// `""` rather than as a missing field -- and `Some("")` downstream is a link that matches any
+    /// other record whose id is also `""`. The conformance test against the real sidecar asserts
+    /// it always sends a genuine id, so this arm is not expected to fire in practice; it exists
+    /// because the wire type cannot rule it out and "no link" is the honest reading if it ever
+    /// does. See `projection::tool_use_link`, the single definition both backends share.
+    #[test]
+    fn an_unset_proto3_tool_use_id_arrives_as_an_empty_string_and_is_not_treated_as_a_link() {
+        let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
+            permission_id: "perm-1".into(), tool_use_id: String::new(), tool_name: "Write".into(), input_json: "{}".into(),
+        }));
+        assert_eq!(translate(event), Some(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Write".into(), input: serde_json::json!({}),
         }));
     }
 

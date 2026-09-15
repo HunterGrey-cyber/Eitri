@@ -105,8 +105,8 @@ describe("applyEvent", () => {
 
   /* The link back to the tool call a permission gates. Without it a card can only ever say "Bash
      wants to run", never WHICH Bash call -- and with several tool calls in one turn those are not
-     the same question. `null` is the legacy backend's honest answer (its wire protocol has no field
-     independent of the request id to populate this from), never a fabricated id. */
+     the same question. `null` is what a request whose source supplied no such id looks like
+     (today: the legacy backend's secondary `can_use_tool` path), never a fabricated id. */
   it("permission_requested carries the tool_use_id of the call it gates", () => {
     const state = applyEvent(initialState(), {
       type: "permission_requested",
@@ -116,6 +116,38 @@ describe("applyEvent", () => {
       input: {},
     });
     expect(state.pendingPermissions[0].toolUseId).toBe("toolu_01ABC");
+  });
+
+  /* The legacy backend's own shape, new on 2026-09-15: its `PreToolUse` hook payload's
+     `tool_use_id` is BOTH the identity of the gated call and the id the request is answered by, so
+     the two arrive as one string. Nothing in the reducer may assume they differ -- the card is
+     keyed on one and linked by the other, and if either were derived from the other this pair
+     would be where it broke. */
+  it("keeps both ids when a hook-relay request sends the same string as permission_id and tool_use_id", () => {
+    const state = applyEvent(initialState(), {
+      type: "permission_requested",
+      permission_id: "toolu_01CtdezhmhUCrBaswxW5HYmC",
+      tool_use_id: "toolu_01CtdezhmhUCrBaswxW5HYmC",
+      tool_name: "Bash",
+      input: { command: "echo hello" },
+    });
+    expect(state.pendingPermissions).toHaveLength(1);
+    expect(state.pendingPermissions[0].permissionId).toBe("toolu_01CtdezhmhUCrBaswxW5HYmC");
+    expect(state.pendingPermissions[0].toolUseId).toBe("toolu_01CtdezhmhUCrBaswxW5HYmC");
+  });
+
+  /* And it still resolves by permission_id afterwards: the id being shared with the tool call must
+     not make the card outlive its own answer. */
+  it("resolves a hook-relay request whose permission_id is also its tool_use_id", () => {
+    let state = applyEvent(initialState(), {
+      type: "permission_requested",
+      permission_id: "toolu_01CtdezhmhUCrBaswxW5HYmC",
+      tool_use_id: "toolu_01CtdezhmhUCrBaswxW5HYmC",
+      tool_name: "Bash",
+      input: {},
+    });
+    state = applyEvent(state, { type: "permission_resolved", permission_id: "toolu_01CtdezhmhUCrBaswxW5HYmC", outcome: "allowed" });
+    expect(state.pendingPermissions).toEqual([]);
   });
 
   it("permission_requested keeps a backend's honest null rather than inventing an id", () => {

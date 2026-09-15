@@ -52,7 +52,27 @@ pub enum AgentEvent {
     /// A tool-use approval request, regardless of which underlying channel produced it -- see
     /// `PermissionSource`. Callers answer via `AgentSession::respond_permission`, which routes
     /// the answer back on whichever channel this request arrived on.
-    PermissionRequest { request_id: String, tool_name: String, input: Value, source: PermissionSource },
+    ///
+    /// `request_id` and `tool_use_id` are separate fields that happen to hold the same string on
+    /// the hook-relay path today, and that is deliberate: `request_id` is the ROUTING key an
+    /// answer travels back on (`process.rs` files the live socket under it), while `tool_use_id`
+    /// is the IDENTITY of the tool call being gated. Deriving one from the other at a distance is
+    /// how they would silently diverge the first time either side changes.
+    ///
+    /// `tool_use_id` carries whatever id the source's own message carried, verbatim -- an empty
+    /// string is passed on as `Some("")` here rather than being judged. Whether a value counts as a
+    /// usable link is decided once, at the domain boundary (`projection::tool_use_link`). Neither
+    /// producer ever substitutes `request_id` for it. Per source, as of 2026-09-15:
+    ///
+    /// - `HookRelay`: from the `PreToolUse` payload's own required `tool_use_id`
+    ///   (`hook_protocol::PreToolUseHookInput`, non-optional, so a payload without it fails to
+    ///   parse and is denied). Real: this project has captured one.
+    /// - `CanUseTool`: from that message's own `tool_use_id`, which the Agent SDK declares
+    ///   required. `None` only if it is genuinely absent. **This project has never observed a
+    ///   `can_use_tool` control_request on a real wire at all** (`agent/CAPTURE_NOTES.md` step 6),
+    ///   so nothing here is evidence about what that message really carries -- only about how
+    ///   `wire.rs` treats the declared shape.
+    PermissionRequest { request_id: String, tool_use_id: Option<String>, tool_name: String, input: Value, source: PermissionSource },
     /// Any `control_response` line -- acknowledges `initialize`, `interrupt`, or a caller's own
     /// `can_use_tool` answer. `agent` does not correlate these internally; see `process.rs`.
     ControlResponse { request_id: String, subtype: String, raw: Value },

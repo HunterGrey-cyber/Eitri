@@ -167,3 +167,58 @@ fn can_use_tool_control_request_becomes_permission_request_with_can_use_tool_sou
         other => panic!("expected PermissionRequest, got {other:?}"),
     }
 }
+
+/// The guard that keeps the two permission sources from being confused with each other. On the
+/// hook-relay path `request_id` genuinely IS the `toolu_*` id of the gated call; here it is the
+/// control_request ENVELOPE's own id (`"ctu-1"` in this fixture), which names nothing in the
+/// transcript. Passing it off as a tool-use id would produce a permission card claiming to point
+/// at a tool call that does not exist.
+///
+/// The fixture's two ids differ on purpose, so "the envelope id was substituted" and "the real
+/// field was read" cannot both satisfy this test.
+///
+/// **On the fixture's own value:** `toolu_01CTUexamplePlaceholder01` is synthetic. This project
+/// has never observed a `can_use_tool` control_request on a real wire; the field is in the fixture
+/// because the SDK's declared type marks it required (`agent/CAPTURE_NOTES.md` step 6). So this
+/// test pins how `wire.rs` treats the declared shape -- it is not evidence about what the CLI
+/// really sends.
+#[test]
+fn can_use_tool_never_passes_its_envelope_request_id_off_as_a_tool_use_id() {
+    let events = translate_line(fixture("v2_control_request_can_use_tool.json").trim());
+    match &events[0] {
+        AgentEvent::PermissionRequest { request_id, tool_use_id, .. } => {
+            assert_eq!(request_id, "ctu-1");
+            assert_eq!(
+                tool_use_id.as_deref(),
+                Some("toolu_01CTUexamplePlaceholder01"),
+                "the message's own tool_use_id field is what gets read"
+            );
+            assert_ne!(
+                tool_use_id.as_deref(),
+                Some(request_id.as_str()),
+                "the envelope's request_id must never be promoted into a tool-use id"
+            );
+        }
+        other => panic!("expected PermissionRequest, got {other:?}"),
+    }
+}
+
+/// The same message with the declared field absent. Written inline rather than checked in as a
+/// fixture precisely because it is NOT a capture of anything -- it is the degraded shape that
+/// `#[serde(default)]` exists for, and pinning it stops an absent field from being answered with
+/// the envelope id or with a parse failure that would drop a real permission request on the floor.
+#[test]
+fn a_can_use_tool_request_without_the_declared_tool_use_id_is_unlinked_rather_than_unparseable() {
+    let line = r#"{"type":"control_request","request_id":"ctu-9","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi"}}}"#;
+    let events = translate_line(line);
+    assert_eq!(events.len(), 1, "an absent optional field must not turn this into an Unknown");
+    match &events[0] {
+        AgentEvent::PermissionRequest { request_id, tool_use_id, tool_name, source, .. } => {
+            assert_eq!(request_id, "ctu-9");
+            assert_eq!(*tool_use_id, None);
+            assert_eq!(tool_name, "Bash");
+            assert_eq!(*source, PermissionSource::CanUseTool);
+        }
+        other => panic!("expected PermissionRequest, got {other:?}"),
+    }
+}

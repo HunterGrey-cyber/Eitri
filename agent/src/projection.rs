@@ -165,18 +165,50 @@ pub struct ToolCallRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionRequestRecord {
     pub permission_id: String,
-    /// `None` for a backend that does not send one. Today that is the legacy Claude-CLI backend,
-    /// by a decision rather than by an absence on its wire: `agent/src/session.rs`'s translation
-    /// site passes `None` even on the hook-relay path, where the request id it already holds IS the
-    /// real `toolu_*` id -- that site carries the full account, per source. `Some(..)` starting with
-    /// `ClaudeSidecarProvider`, whose proto `PermissionRequested` message carries one directly
-    /// (2026-09-10, Phase 3 of the runtime/provider refactor).
+    /// The id of the tool call this request gates, when the source that raised it supplied one.
+    /// Both backends do today:
     ///
-    /// Note the proto3 shape on the sidecar side: an unset string arrives as `""`, not as an absent
-    /// field, so `Some("")` is a real possibility and every consumer must treat it as "no link".
+    /// - `ClaudeSidecarProvider`, since 2026-09-10 (Phase 3) -- its proto `PermissionRequested`
+    ///   message carries one directly.
+    /// - The legacy Claude-CLI backend, since 2026-09-15, on its `PreToolUse` hook-relay path --
+    ///   the real gate. `agent/src/session.rs`'s `permission_requested_event` carries the account
+    ///   and the evidence. Its other, secondary source (`can_use_tool`, confirmed leaky) reads the
+    ///   id that message's own declared type carries; that message has never been seen on a real
+    ///   wire here, so what it produces in practice is unknown rather than known-absent.
+    ///
+    /// `None` therefore means "this request arrived with no usable link", never "this backend
+    /// cannot supply one".
+    ///
+    /// **`Some("")` is not excluded by anything the type or this crate enforces.** Both in-crate
+    /// producers route their ids through `projection::tool_use_link` -- which exists because proto3
+    /// has no absent string, so an unset sidecar `tool_use_id` arrives as `""` and would compare
+    /// equal to any other record whose id is also `""` -- but `AgentDomainEvent` is public and the
+    /// rule is applied at each call site by convention, not by a constructor or a newtype. A third
+    /// producer that skips it would land `Some("")` here. Consumers outside this crate (the
+    /// frontend) guard the case independently rather than trusting this sentence, and should
+    /// keep doing so.
     pub tool_use_id: Option<String>,
     pub tool_name: String,
     pub input: serde_json::Value,
+}
+
+/// The one definition of "this provider-supplied id is a real link to a tool call", shared by
+/// every producer of a `PermissionRequested` so no layer can invent a second rule.
+///
+/// Rejects exactly one value: the empty string. That is not defensive padding -- it is what an
+/// unset `tool_use_id` genuinely looks like coming out of proto3 on the sidecar path, which has no
+/// absent string. `Some("")` handed onward is worse than `None`, because it compares equal to any
+/// other record whose id is also `""`, cross-linking two unrelated things. Everything else is
+/// passed through byte-for-byte: this function does not own these ids and must not rewrite them,
+/// because every link downstream is an equality test against the id the provider also put on the
+/// tool call itself.
+pub(crate) fn tool_use_link(id: impl Into<String>) -> Option<String> {
+    let id = id.into();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 /// What a provider actually reported about a turn's cost. Only ever constructed from figures a
@@ -407,5 +439,38 @@ pub fn describe_failed_resume(
              instead.",
             attached.unwrap_or("an unnamed session"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The empty-string case is not hypothetical. On the sidecar path `tool_use_id` crosses
+    /// proto3, which has no absent string: a field the provider never set arrives as `""`, not as
+    /// a missing one. `Some("")` would then travel all the way to the frontend as a link, where
+    /// it would match any OTHER record whose id is also `""` -- cross-linking two unrelated
+    /// things. The frontend already refuses `""` on both sides of that link; this makes the
+    /// domain layer refuse to hand it one in the first place.
+    #[test]
+    fn an_empty_tool_use_id_is_not_a_link() {
+        assert_eq!(tool_use_link(""), None);
+    }
+
+    #[test]
+    fn a_real_tool_use_id_is_a_link_and_is_not_rewritten() {
+        assert_eq!(
+            tool_use_link("toolu_01CtdezhmhUCrBaswxW5HYmC"),
+            Some("toolu_01CtdezhmhUCrBaswxW5HYmC".to_string())
+        );
+    }
+
+    /// Whitespace is deliberately NOT trimmed or treated as empty: this function's job is to
+    /// reject the one value that is known to mean "unset" on a real wire, not to sanitize ids it
+    /// does not own. An id that genuinely contained a space would still be the provider's own
+    /// identifier, and silently rewriting it would break the equality every link depends on.
+    #[test]
+    fn a_whitespace_id_is_left_exactly_as_the_provider_sent_it() {
+        assert_eq!(tool_use_link(" "), Some(" ".to_string()));
     }
 }

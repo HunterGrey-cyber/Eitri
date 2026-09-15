@@ -198,6 +198,18 @@ fn spawn_hook_listener(
         pending.lock().unwrap().insert(request_id.clone(), PendingHookConnection { stream });
         let event = AgentEvent::PermissionRequest {
             request_id,
+            // The same string as `request_id` above, filled in separately and on purpose. This
+            // one is the identity of the gated call, taken straight from the `PreToolUse`
+            // payload; `request_id` is the key this connection was just filed under, which
+            // `respond_permission` answers by. They coincide because filing under the tool-use id
+            // is what makes an answer routable.
+            //
+            // Being separate fields buys exactly one thing: neither can be silently redefined into
+            // the other. It does NOT make the two decoupled -- `respond_permission` and
+            // `write_hook_decision` both look this connection up by that same string, and nothing
+            // in this crate pins that they agree. Changing the keying scheme is a change to all
+            // three sites at once; it is not absorbed here.
+            tool_use_id: Some(parsed.tool_use_id),
             tool_name: parsed.tool_name,
             input: parsed.tool_input,
             source: PermissionSource::HookRelay,
@@ -870,8 +882,23 @@ mod tests {
     /// connects over a real `UnixStream` and writes the exact real captured `PreToolUse` stdin
     /// JSON (Task 1's fixture) that `agent-hook` would relay verbatim -- confirms the thread
     /// parses it and emits a matching `AgentEvent::PermissionRequest` with `PermissionSource::
-    /// HookRelay`, and that the connection is stashed in `pending` under the real `tool_use_id`
-    /// (which `respond_permission`/`write_hook_decision` depend on to find it again).
+    /// HookRelay`, that the connection is stashed in `pending` under the real `tool_use_id`
+    /// (which `respond_permission`/`write_hook_decision` depend on to find it again), and that
+    /// the event carries that same real id in its own `tool_use_id` field -- the link a
+    /// permission card needs to name the exact call it gates, which this backend used to drop.
+    ///
+    /// `request_id` and `tool_use_id` are asserted separately although they hold the same string
+    /// today: the first is the key this connection was filed under, the second is the identity of
+    /// the gated call, and a future change to either must not be able to silently redefine the
+    /// other.
+    ///
+    /// The test then keeps going, one layer past this module, through
+    /// `session::translate_wire_event` -- the whole point being that this is the ONE test in the
+    /// crate where the id is never typed out by the test itself between the fixture and the
+    /// domain event. It comes off disk, crosses a real `UnixStream`, is parsed, translated, and
+    /// only then compared. Every earlier version of this coverage stopped at `AgentEvent` and the
+    /// translation step was hand-fed on the other side, which is how a hardcoded `None` in that
+    /// step survived a green workspace.
     #[test]
     fn hook_listener_relays_a_real_pretooluse_connection_into_a_permission_request_event() {
         let fixture = std::fs::read_to_string(format!(
@@ -890,15 +917,45 @@ mod tests {
         writeln!(client, "{}", fixture.trim()).unwrap();
 
         let event = rx.recv_timeout(Duration::from_secs(2)).expect("no PermissionRequest event within 2s");
-        match event {
-            AgentEvent::PermissionRequest { request_id, tool_name, source, .. } => {
+        match &event {
+            AgentEvent::PermissionRequest { request_id, tool_use_id, tool_name, source, .. } => {
                 assert_eq!(request_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some("toolu_01CtdezhmhUCrBaswxW5HYmC"),
+                    "the hook payload's own tool_use_id must reach the event -- it is the only \
+                     thing that can link a permission card to the call it gates"
+                );
                 assert_eq!(tool_name, "Bash");
-                assert_eq!(source, PermissionSource::HookRelay);
+                assert_eq!(*source, PermissionSource::HookRelay);
             }
             other => panic!("expected PermissionRequest, got {other:?}"),
         }
         assert!(pending.lock().unwrap().contains_key("toolu_01CtdezhmhUCrBaswxW5HYmC"));
+
+        // One layer on, with the event the real socket just produced -- not a reconstruction of
+        // it. This is the join the two halves of this feature used to be tested either side of.
+        let mut interrupt_requested = false;
+        let mut sources = std::collections::HashMap::new();
+        let domain = crate::session::translate_wire_event(
+            event,
+            None,
+            &mut interrupt_requested,
+            &mut sources,
+        );
+        assert_eq!(domain.len(), 1);
+        match &domain[0] {
+            crate::projection::AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some("toolu_01CtdezhmhUCrBaswxW5HYmC"),
+                    "the id survived the socket but was dropped in translation -- the domain event \
+                     is what the projection and the frontend actually see"
+                );
+                assert_eq!(permission_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
+            }
+            other => panic!("expected PermissionRequested, got {other:?}"),
+        }
 
         stop.store(true, Ordering::Relaxed);
         let _ = std::fs::remove_file(&socket_path);

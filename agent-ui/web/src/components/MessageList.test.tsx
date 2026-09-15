@@ -130,6 +130,32 @@ describe("MessageList tool calls and permissions", () => {
     expect(awaiting[0].textContent).toContain("rm -rf /");
   });
 
+  /* The legacy backend's hook-relay shape specifically (new on 2026-09-15): permissionId and
+     toolUseId are the same string, because the `PreToolUse` payload's own `tool_use_id` is both.
+     The marker must still land on the right call -- it is matched on toolUseId, and the fact that
+     the card is ALSO keyed on that value changes nothing. */
+  it("marks the right call when the permission's id is also its tool_use_id", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          toolCalls: [
+            { toolUseId: "toolu_first", name: "Bash", input: { command: "echo one" }, result: null },
+            { toolUseId: "toolu_second", name: "Bash", input: { command: "rm -rf /" }, result: null },
+          ],
+          pendingPermissions: [
+            { permissionId: "toolu_second", toolUseId: "toolu_second", toolName: "Bash", input: { command: "rm -rf /" } },
+          ],
+        })}
+        sessionEnded={false}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    const awaiting = Array.from(container.querySelectorAll(".tool-message[data-awaiting-permission='true']"));
+    expect(awaiting).toHaveLength(1);
+    expect(awaiting[0].textContent).toContain("rm -rf /");
+    expect(container.querySelector(".permission-card-tool-use-id")!.textContent).toContain("toolu_second");
+  });
+
   it("marks nothing when the pending permission carries no tool_use_id", () => {
     const { container } = render(
       <MessageList
