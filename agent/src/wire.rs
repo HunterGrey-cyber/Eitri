@@ -88,6 +88,12 @@ struct ControlRequestBody {
     tool_name: Option<String>,
     #[serde(default)]
     input: Option<Value>,
+    /// The id of the tool call this permission request concerns. The SDK declares
+    /// `SDKControlPermissionRequest.tool_use_id` as a required string, but `#[serde(default)]`
+    /// lets a missing id parse as `None`. A request without a tool-call link can still be
+    /// answered instead of failing to parse.
+    #[serde(default)]
+    tool_use_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +202,19 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
             Ok(cr) if cr.request.subtype == "can_use_tool" => {
                 vec![AgentEvent::PermissionRequest {
                     request_id: cr.request_id,
+                    // The message's OWN `tool_use_id`, and never `request_id`: that one belongs to
+                    // the control_request envelope (`"ctu-1"` in the checked-in fixture) and names
+                    // nothing in the transcript, so passing it on as a tool-use id would produce a
+                    // permission card pointing at a tool call that does not exist. Verbatim, not
+                    // judged -- `Some("")` is decided against once, at the domain boundary
+                    // (`projection::tool_use_link`), the same way the hook-relay path's id is.
+                    //
+                    // This being `Some` does not make this path a gate. `can_use_tool` is the
+                    // secondary, confirmed-leaky channel (a real `Bash` call has been observed
+                    // running to completion with no `can_use_tool` in the stream at all); the
+                    // `PreToolUse` hook relay is the gate. What the id affects is only whether a
+                    // request that DID arrive can name its call.
+                    tool_use_id: cr.request.tool_use_id,
                     tool_name: cr.request.tool_name.unwrap_or_default(),
                     input: cr.request.input.unwrap_or(Value::Null),
                     source: PermissionSource::CanUseTool,

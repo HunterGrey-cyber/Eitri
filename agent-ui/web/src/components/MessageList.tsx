@@ -26,8 +26,10 @@ export function MessageList({ state, sessionEnded, onAnswerPermission }: Props) 
 
      Two values are deliberately kept OUT of this set, so a card with no usable id marks nothing
      rather than guessing at the most recent call:
-       null -- what the legacy backend sends today (see `types.ts`, and `agent/src/session.rs` for
-               why it is a choice rather than a limit).
+       null -- a request that arrived carrying no tool-use id. Every permission path in both
+               backends forwards whatever id its own source message carried and none of them
+               substitutes anything when there is nothing to forward, so this is uncommon but
+               real (see `agent/src/wire.rs` and `agent/src/session.rs`).
        ""   -- what the sidecar's proto3 `tool_use_id` arrives as when it is unset, since proto3
                has no absent-string. A `ToolCallRecord.toolUseId` crosses the same boundary and can
                be "" for the same reason, so admitting it would cross-link an arbitrary unrelated

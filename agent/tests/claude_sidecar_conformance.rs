@@ -32,7 +32,10 @@ fn real_pretooluse_permission_allow_end_to_end() {
     });
     let permission_id = events.iter().find_map(|e| match e {
         AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
-            assert!(tool_use_id.is_some(), "the sidecar's own PermissionRequested proto message always carries a tool_use_id");
+            // Meaningful only since 2026-09-15: before that the translator wrapped
+            // `requested.tool_use_id` unconditionally, so this held for every wire value, `""`
+            // included. It now fails if the sidecar leaves the field unset.
+            assert!(tool_use_id.is_some(), "the sidecar sent a PermissionRequested with an unset (proto3 empty-string) tool_use_id");
             Some(permission_id.clone())
         }
         _ => None,

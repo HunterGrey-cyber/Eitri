@@ -48,10 +48,23 @@ pub enum AgentEvent {
     /// exposing that it happened; this may later gain typed fields once something actually
     /// consumes it (e.g. an agent-ui usage indicator).
     RateLimit { raw: Value },
-    /// A tool-use approval request, regardless of which underlying channel produced it -- see
-    /// `PermissionSource`. Callers answer via `AgentSession::respond_permission`, which routes
-    /// the answer back on whichever channel this request arrived on.
-    PermissionRequest { request_id: String, tool_name: String, input: Value, source: PermissionSource },
+    /// A tool-use approval request from any `PermissionSource`. `AgentSession::respond_permission`
+    /// routes the answer back through the channel that delivered it.
+    ///
+    /// `request_id` routes the answer (`process.rs` indexes the live socket by it). `tool_use_id`
+    /// identifies the gated tool call. They hold the same string on the hook-relay path but must
+    /// remain separate so a change to either source does not silently break their meanings.
+    ///
+    /// Pass the source's `tool_use_id` verbatim, including an empty string as `Some("")`.
+    /// `projection::tool_use_link` decides whether it is usable; neither producer substitutes
+    /// `request_id` for it.
+    ///
+    /// - `HookRelay` reads the required `tool_use_id` in `hook_protocol::PreToolUseHookInput`.
+    ///   A payload without it fails to parse and is denied.
+    /// - `CanUseTool` reads the message's `tool_use_id`, declared required by the Agent SDK;
+    ///   `None` means it was absent. This describes `wire.rs` parsing of the declared shape,
+    ///   without claiming that real control requests have been observed on this path.
+    PermissionRequest { request_id: String, tool_use_id: Option<String>, tool_name: String, input: Value, source: PermissionSource },
     /// Any `control_response` line -- acknowledges `initialize`, `interrupt`, or a caller's own
     /// `can_use_tool` answer. `agent` does not correlate these internally; see `process.rs`.
     ControlResponse { request_id: String, subtype: String, raw: Value },

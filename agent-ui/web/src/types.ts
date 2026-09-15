@@ -2,12 +2,15 @@ export type ToolCallRecord = { toolUseId: string; name: string; input: unknown; 
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
  *
- * Genuinely nullable rather than optional, and `null` is what the legacy backend sends today.
- * That is a decision on the Rust side, NOT an absence on the wire: `agent/src/session.rs` passes
- * `None` at a site where the primary hook-relay path already holds the real `toolu_*` id, and the
- * comment there records exactly what each permission source can and cannot supply. Wiring it is a
- * separate change with its own verification. What this type must keep doing either way is render
- * `null` honestly -- never default it, never guess at the most recent call. */
+ * Genuinely nullable rather than optional. Both backends do send a real id on the paths that
+ * actually gate tools -- the sidecar's proto `PermissionRequested` since 2026-09-10, and the
+ * legacy backend's `PreToolUse` hook relay since 2026-09-15 -- so `null` is the uncommon case
+ * rather than the normal one. It is still a case: the Rust side forwards only an id its source
+ * message really carried and substitutes nothing when there is none (`agent/src/session.rs`'s
+ * `permission_requested_event`), and an empty string is normalised to absent before it gets here.
+ *
+ * So `null` means "this request arrived with no usable link", never "this backend cannot supply
+ * one". Render it honestly -- never default it, never guess at the most recent call. */
 export type PermissionRequestRecord = { permissionId: string; toolUseId: string | null; toolName: string; input: unknown };
 export type SessionStatus =
   | { kind: "starting" }
