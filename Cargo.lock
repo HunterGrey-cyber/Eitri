@@ -4401,18 +4401,9 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "clap",
- "terminal-frame 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
+ "terminal-frame",
  "terminal-recorder",
- "terminal-sync 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
-]
-
-[[package]]
-name = "terminal-frame"
-version = "0.1.0"
-source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b#a2f194a8f309814ec457aebdf07f16e5abf6074b"
-dependencies = [
- "alacritty_terminal",
- "bitflags 2.13.1",
+ "terminal-sync",
 ]
 
 [[package]]
@@ -4441,11 +4432,11 @@ dependencies = [
  "gtk4",
  "libloading 0.9.0",
  "skia-safe",
- "terminal-frame 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
+ "terminal-frame",
  "terminal-input",
  "terminal-recorder",
  "terminal-render",
- "terminal-sync 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
+ "terminal-sync",
 ]
 
 [[package]]
@@ -4461,8 +4452,8 @@ dependencies = [
  "hyper-util",
  "libc",
  "prost",
- "terminal-runtime-protocol 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
- "terminal-sync 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
+ "terminal-runtime-protocol",
+ "terminal-sync",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -4477,18 +4468,7 @@ name = "terminal-render"
 version = "0.1.0"
 source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b#a2f194a8f309814ec457aebdf07f16e5abf6074b"
 dependencies = [
- "terminal-frame 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
-]
-
-[[package]]
-name = "terminal-runtime-protocol"
-version = "0.1.0"
-source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b#a2f194a8f309814ec457aebdf07f16e5abf6074b"
-dependencies = [
- "prost",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
+ "terminal-frame",
 ]
 
 [[package]]
@@ -4521,7 +4501,7 @@ dependencies = [
  "hyper-util",
  "prost",
  "tempfile",
- "terminal-runtime-protocol 0.1.0 (git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b)",
+ "terminal-runtime-protocol",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -4530,14 +4510,6 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "uuid",
-]
-
-[[package]]
-name = "terminal-sync"
-version = "0.1.0"
-source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=a2f194a8f309814ec457aebdf07f16e5abf6074b#a2f194a8f309814ec457aebdf07f16e5abf6074b"
-dependencies = [
- "alacritty_terminal",
 ]
 
 [[package]]
