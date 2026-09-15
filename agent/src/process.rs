@@ -668,6 +668,40 @@ impl Drop for AgentProcess {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins the exact contents of `CONSERVATIVE_DISALLOWED_TOOLS`, because a typo in it is silent
+    /// on BOTH sides of a repository boundary.
+    ///
+    /// Verdandi's sidecar applies a conservative deny floor of its own when a session states no
+    /// tool policy — but **any** stated restriction takes that floor off, including one that names
+    /// no real tool. The sidecar cannot distinguish `deny: ["bash"]` (a typo) from a deliberate
+    /// statement: it owns no tool namespace, and a hardcoded list of real tool names on its side
+    /// would rot. So it is named as a known hole in its own proto comment rather than fixed there.
+    ///
+    /// This list is the statement neovibe sends. Lowercasing one entry here would disarm the floor
+    /// over there, install no hook, and emit no notice — nothing anywhere would say so. This repo
+    /// owns this list, so this is the one place the hole can be closed: an edit has to be
+    /// deliberate enough to update an assertion that spells the consequence out.
+    ///
+    /// If you are legitimately changing the list, change it here too and say why in the commit.
+    #[test]
+    fn the_conservative_tool_denylist_is_pinned_exactly_because_a_typo_is_silent_everywhere() {
+        assert_eq!(
+            CONSERVATIVE_DISALLOWED_TOOLS,
+            &["Bash", "Write", "Edit", "NotebookEdit"],
+            "changing this list changes what the sidecar's own conservative floor is replaced by"
+        );
+        for name in CONSERVATIVE_DISALLOWED_TOOLS {
+            let mut chars = name.chars();
+            let first = chars.next().expect("a tool name is never empty");
+            assert!(
+                first.is_ascii_uppercase() && chars.all(|c| c.is_ascii_alphanumeric()),
+                "{name:?} is not shaped like a built-in tool name -- built-ins are CamelCase ASCII, \
+                 and a name the provider does not recognize is accepted verbatim, restricting \
+                 nothing while disarming the default floor"
+            );
+        }
+    }
     use super::*;
 
     /// Real end-to-end: spawns one long-lived process, sends two separate turns over the same
