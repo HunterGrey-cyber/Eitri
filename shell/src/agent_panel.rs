@@ -17,6 +17,7 @@ use crate::agent_bridge::{
     serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
 };
 use gtk4::prelude::*;
+use gtk4::Application;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -69,6 +70,9 @@ struct PendingStart {
 #[derive(Clone)]
 pub(crate) struct AgentPanelHandle {
     state: Rc<RefCell<AgentPanelState>>,
+    /// Held so the panel's document can be re-injected without going back through the widget tree.
+    /// Cheap: a `WebView` is a GObject and cloning it is a refcount bump on the same object.
+    webview: WebView,
 }
 
 impl AgentPanelHandle {
@@ -104,6 +108,22 @@ impl AgentPanelHandle {
                 ),
             }
         }
+    }
+
+    /// Reloads the frontend while keeping the session running in Rust.
+    /// The fresh document sends `ready`, which receives `hello` and a full snapshot of the
+    /// live `AgentSessionProjection`.
+    ///
+    /// Use `load_html`: `WebViewExt::reload()` leaves this substitute-data document blank
+    /// because it has no fetchable URI.
+    ///
+    /// `take_ui_delivery()` consumes events, so envelopes sent by the 33 ms pump between
+    /// `load_html` and the new document's `ready` have no listener and are lost. Recovery
+    /// therefore depends on `Ready` returning a complete snapshot, including tool-call results,
+    /// and on the pump remaining the sole consumer of those events.
+    pub(crate) fn reload_document(&self) {
+        eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
+        self.webview.load_html(AGENT_UI_HTML, None);
     }
 
     /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
@@ -199,7 +219,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
     // state -- every later event would then be dispatched twice.
     start_pump_timer(state.clone(), webview.clone());
 
-    let handle = AgentPanelHandle { state: state.clone() };
+    let handle = AgentPanelHandle { state: state.clone(), webview: webview.clone() };
     (webview.upcast(), handle)
 }
 
@@ -547,4 +567,50 @@ fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
             eprintln!("[agent_panel] evaluate_javascript failed: {e}");
         }
     });
+}
+
+/// Installs `app.reload-agent-panel` and binds Ctrl+Shift+R for the panel `handle` owns.
+/// The action lives outside the WebView so a wedged page can be recovered without
+/// closing the editor, nvim child and agent session.
+///
+/// The app accelerator runs during capture regardless of pane focus. A harness can
+/// invoke the same path with `app.activate_action("reload-agent-panel", None)`.
+/// The accelerator consumes Ctrl+Shift+R before Neovim can receive it.
+///
+/// `main.rs` registers the action before building the top bar. Late registration and
+/// button sensitivity have not been tested here.
+///
+/// The action is application-wide but the handle belongs to one window. A second window
+/// in the same process would replace the action and redirect the first window's reload
+/// controls to the second panel.
+pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle) {
+    let action = gtk4::gio::SimpleAction::new("reload-agent-panel", None);
+    // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
+    // takes it by move.
+    let handle = handle.clone();
+    action.connect_activate(move |_, _| handle.reload_document());
+    app.add_action(&action);
+    app.set_accels_for_action("app.reload-agent-panel", &["<Control><Shift>r"]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Checks that the embedded document contains the frontend and its Rust dispatch entry point.
+    /// A stale or truncated `agent-ui/web/dist/index.html` could load without error yet receive
+    /// no envelopes, causing `reload_document` to reproduce the blank panel it should recover.
+    /// This test does not exercise a WebView reload. Recovery uses `load_html` because
+    /// `WebViewExt::reload()` does not work for this substitute-data document.
+    #[test]
+    fn the_embedded_panel_document_carries_the_frontend_and_its_dispatch_entry_point() {
+        assert!(
+            AGENT_UI_HTML.contains("__neovibeDispatch"),
+            "the embedded document never installs the global Rust pushes into -- every envelope would be dropped"
+        );
+        assert!(
+            AGENT_UI_HTML.contains("neovibeAgent"),
+            "the embedded document never posts through the script-message handler -- no command could reach Rust"
+        );
+    }
 }

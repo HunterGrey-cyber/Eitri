@@ -29,6 +29,18 @@ export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
   return (
     <div className="permission-card">
       <div className="permission-card-tool">Permission requested: {request.toolName}</div>
+      {/* Which call, not just which tool: a turn can have several Bash calls in flight, and this is
+          the same id `MessageList` keys that call's own block on, so the two can be read together.
+          Rendered only when the backend actually sent one -- a placeholder here would read as a
+          lookup that failed rather than as an id this build does not send. The legacy backend sends
+          none today by a decision recorded at `agent/src/session.rs`'s `tool_use_id: None`, which
+          is also where the evidence for what it could send lives.
+          Truthiness rather than `!== null` on purpose: the sidecar's `tool_use_id` crosses proto3,
+          where an unset string arrives as "" rather than as an absent field, and "for tool call "
+          with nothing after it is worse than saying nothing. */}
+      {request.toolUseId && (
+        <div className="permission-card-tool-use-id">for tool call {request.toolUseId}</div>
+      )}
       <pre className="permission-card-input">{JSON.stringify(request.input, null, 2)}</pre>
       <input
         type="text"

@@ -1,5 +1,14 @@
 export type ToolCallRecord = { toolUseId: string; name: string; input: unknown; result: { content: unknown; isError: boolean } | null };
-export type PermissionRequestRecord = { permissionId: string; toolName: string; input: unknown };
+/** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
+ * call is keyed on.
+ *
+ * Genuinely nullable rather than optional, and `null` is what the legacy backend sends today.
+ * That is a decision on the Rust side, NOT an absence on the wire: `agent/src/session.rs` passes
+ * `None` at a site where the primary hook-relay path already holds the real `toolu_*` id, and the
+ * comment there records exactly what each permission source can and cannot supply. Wiring it is a
+ * separate change with its own verification. What this type must keep doing either way is render
+ * `null` honestly -- never default it, never guess at the most recent call. */
+export type PermissionRequestRecord = { permissionId: string; toolUseId: string | null; toolName: string; input: unknown };
 export type SessionStatus =
   | { kind: "starting" }
   | { kind: "running" }
@@ -94,7 +103,7 @@ export type AgentDomainEvent =
   | { type: "content_delta"; turn_id: string; kind: "text" | "thinking"; text: string }
   | { type: "tool_call_started"; turn_id: string; tool_use_id: string; name: string; input: unknown }
   | { type: "tool_call_completed"; turn_id: string; tool_use_id: string; content: unknown; is_error: boolean }
-  | { type: "permission_requested"; permission_id: string; tool_name: string; input: unknown }
+  | { type: "permission_requested"; permission_id: string; tool_use_id: string | null; tool_name: string; input: unknown }
   | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" }
   | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; total_cost_usd: number; num_turns: number }
   /** The provider's verdict on a resume, stated once for a session that asked for one. Mirrors the

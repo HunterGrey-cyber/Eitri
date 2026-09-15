@@ -20,6 +20,25 @@ export function MessageList({ state, sessionEnded, onAnswerPermission }: Props) 
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [state.transcript.length, state.toolCalls.length, state.pendingPermissions.length]);
 
+  /* Which tool calls are blocked on a decision the user has not made yet. A turn can have several
+     calls of the same tool in flight, so "Bash is waiting" identifies nothing on its own -- this is
+     the whole reason `tool_use_id` is carried on a permission request.
+
+     Two values are deliberately kept OUT of this set, so a card with no usable id marks nothing
+     rather than guessing at the most recent call:
+       null -- what the legacy backend sends today (see `types.ts`, and `agent/src/session.rs` for
+               why it is a choice rather than a limit).
+       ""   -- what the sidecar's proto3 `tool_use_id` arrives as when it is unset, since proto3
+               has no absent-string. A `ToolCallRecord.toolUseId` crosses the same boundary and can
+               be "" for the same reason, so admitting it would cross-link an arbitrary unrelated
+               call to an arbitrary unrelated card -- precisely the mis-identification this marker
+               exists to prevent. `PermissionCard` guards the same case on the same grounds. */
+  const awaitingPermission = new Set(
+    state.pendingPermissions
+      .map((p) => p.toolUseId)
+      .filter((id): id is string => id !== null && id !== ""),
+  );
+
   return (
     <div className="message-list">
       {state.transcript.map((text, i) => (
@@ -27,8 +46,15 @@ export function MessageList({ state, sessionEnded, onAnswerPermission }: Props) 
         <div key={i} className="message assistant-message" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(text) as string) }} />
       ))}
       {state.toolCalls.map((call) => (
-        <div key={call.toolUseId} className="message tool-message">
+        <div
+          key={call.toolUseId}
+          className="message tool-message"
+          data-awaiting-permission={awaitingPermission.has(call.toolUseId) ? "true" : undefined}
+        >
           {renderToolCall(call)}
+          {awaitingPermission.has(call.toolUseId) && (
+            <div className="tool-awaiting-permission">Waiting for your decision below.</div>
+          )}
         </div>
       ))}
       {state.pendingPermissions.map((request) => (

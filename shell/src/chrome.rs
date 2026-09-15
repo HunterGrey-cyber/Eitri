@@ -18,8 +18,21 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow) -> gtk4::Widget {
     project_name.set_hexpand(true);
     project_name.set_halign(gtk4::Align::Start);
 
+    // Reload the agent panel through the same `app.reload-agent-panel` action as Ctrl+Shift+R.
+    // The button lives in the window chrome so it remains available when the panel's page hangs.
+    // The shortcut enables recovery; the button makes it discoverable.
+    //
+    // Its appearance has not been verified. It shares `win-btn` with the window controls and sits
+    // immediately before them, so it may look like part of that cluster instead of a panel control.
+    let reload_agent = gtk4::Button::with_label("\u{21BB}");
+    reload_agent.add_css_class("win-btn");
+    reload_agent.set_valign(gtk4::Align::Center);
+    reload_agent.set_tooltip_text(Some("Reload the agent panel (Ctrl+Shift+R) — the session keeps running"));
+    reload_agent.set_action_name(Some("app.reload-agent-panel"));
+
     bar.append(&app_name);
     bar.append(&project_name);
+    bar.append(&reload_agent);
     bar.append(&build_window_controls(window));
 
     let handle = gtk4::WindowHandle::new();
