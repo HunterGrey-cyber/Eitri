@@ -294,3 +294,102 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
 
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
 }
+
+/// Measures the SIDECAR's own write queue during a real partial-streaming turn, using the depth
+/// seam Verdandi added on 2026-09-15 (`VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS`).
+///
+/// **What this can and cannot show, stated first because the distinction is the finding.**
+/// `a_consumer_that_stalls_for_twenty_seconds_loses_nothing` above does not stall the socket: this
+/// client's watch task keeps reading from the transport throughout and pushes into its own `Vec`,
+/// and `pump()` only drains that `Vec`. A consumer that has stopped calling `pump()` is therefore
+/// still, at the transport layer, a perfectly attentive reader — which is why the server-side queue
+/// has never grown in that test and why its `max_delivery_lag_ms < 1000` assertion passes. Unbounded
+/// growth in grpc-js's write buffer needs a subscriber that stops reading the SOCKET, which this
+/// client has no seam for and which cannot be produced by stopping the whole process: that also
+/// blocks the sidecar's stderr pipe, and a sidecar blocked on its own logging is not the thing
+/// under test.
+///
+/// So this reports the queue under the highest event rate a real consumer actually produces, and
+/// under a `pump()` stall, and asserts only what it can honestly see. If `buffered_writes` stays 0
+/// throughout, that is evidence the congestion path is not reached by this consumer at this rate —
+/// not evidence that it cannot be reached.
+#[test]
+#[ignore]
+fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
+    for (k, v) in [("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS", "1000")] {
+        std::env::set_var(k, v);
+    }
+    let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
+        .expect("connecting to a real sidecar should succeed");
+    std::env::remove_var("VERDANDI_CLAUDE_SIDECAR_WRITE_QUEUE_STATS_MS");
+
+    let pid = provider.sidecar_pid();
+    let session_id = open(&provider);
+    let rss = |label: &str| {
+        if let Some(kib) = sidecar_rss_kib(pid) {
+            eprintln!("[rss] {label}: {kib} KiB");
+        }
+    };
+    rss("before the turn");
+
+    provider
+        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .unwrap();
+
+    // Phase 1: drain attentively, the shape a healthy UI has. Highest sustained event rate.
+    let mut all = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut ticks = 0u32;
+    while Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })) {
+        all.extend(provider.pump());
+        ticks += 1;
+        if ticks % 40 == 0 {
+            rss("mid-turn, draining");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    rss("turn complete");
+    summarize("attentive drain", &all);
+
+    // Phase 2: a second turn with NO pumping at all, for 30s. The client's own Vec absorbs it; the
+    // point is to see whether anything moves on the sidecar's side while it does.
+    provider
+        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .unwrap();
+    for i in 0..6 {
+        std::thread::sleep(Duration::from_secs(5));
+        rss(&format!("pump-stalled {}s", (i + 1) * 5));
+    }
+    let backlog = provider.pump();
+    eprintln!("[stall] backlog drained in one pump(): {} events", backlog.len());
+
+    let stats = provider.backpressure_stats();
+    eprintln!(
+        "[client] pending={} received={} max_lag_ms={} last_lag_ms={} watch_reconnects={}",
+        stats.pending_events, stats.events_received, stats.max_delivery_lag_ms,
+        stats.last_delivery_lag_ms, stats.watch_reconnects
+    );
+
+    eprintln!("[sidecar] write-queue lines it printed (ring holds the last 40 stderr lines):");
+    let mut seen_any = false;
+    for line in provider.sidecar_stderr_tail() {
+        if line.contains("write-queue:") {
+            seen_any = true;
+            eprintln!("    {line}");
+        }
+    }
+    assert!(seen_any, "the write-queue seam printed nothing -- is this sidecar built from a revision that has it?");
+
+    provider.close_session(agent::CloseSessionRequest { session_id }).unwrap();
+}
+
+/// The sidecar's resident memory, by the pid this provider reports spawning -- never by name, since
+/// a developer machine's own Claude Code session is itself a process named `claude`.
+fn sidecar_rss_kib(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|kib| kib.parse().ok())
+}
