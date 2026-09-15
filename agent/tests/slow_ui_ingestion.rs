@@ -370,3 +370,44 @@ fn the_projection_advances_while_the_ui_is_asleep() {
     );
     assert_eq!(conversation.ingest_stats().events_ingested, 301);
 }
+
+/// `AgentConversation`'s accessors all share ONE `std::sync::Mutex`, which is not reentrant --
+/// so a caller holding the projection guard must not call any of the others.
+///
+/// This is a characterization test, and it is here because the property is invisible at the call
+/// site: `projection()` returns something that derefs like a plain struct, and
+/// `provider_session_id()` reads like a field access. On 2026-09-15 a `shell` call site put the
+/// second inside the first's scope and deadlocked the GTK main loop outright -- no input, no window
+/// close, the last frame still painted, so it looked alive rather than hung. Only the sidecar path
+/// could show it: the legacy backend's `projection()` borrows a plain field and locks nothing.
+///
+/// Measured across threads rather than re-entered on one, because re-entering is the deadlock and a
+/// test cannot come back from it.
+#[test]
+fn every_accessor_shares_one_lock_with_the_projection_guard() {
+    let provider = Arc::new(ScriptedProvider::new());
+    let conversation = Arc::new(conversation(provider.clone()));
+
+    let holder = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let guard = conversation.projection();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(guard);
+        })
+    };
+    // Long enough that the holder is certainly inside its sleep, short enough to leave most of it.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+
+    let start = std::time::Instant::now();
+    let _ = conversation.provider_session_id();
+    let waited = start.elapsed();
+    holder.join().unwrap();
+
+    assert!(
+        waited >= std::time::Duration::from_millis(200),
+        "provider_session_id() returned in {waited:?} while another thread held the projection \
+         guard -- if the locks have been genuinely split, that is an improvement and this test \
+         should be rewritten deliberately. If they have not, the measurement is wrong."
+    );
+}
