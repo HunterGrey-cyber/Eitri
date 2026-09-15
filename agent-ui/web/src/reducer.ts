@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiState, ToolCallRecord } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ToolCallRecord } from "./types";
 
 /** The state before any snapshot arrives. `backend` defaults to "legacy" only because something
  * must be written here -- the real value always arrives with `hello` (before any session can exist)
@@ -21,10 +21,30 @@ export function initialState(): AgentUiState {
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
     assistantMessageOpen: false,
+    nextSeq: 0,
   };
 }
 
-export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentUiState {
+/**
+ * Folds one event, assigning any item it creates the `seq` that orders it against everything else
+ * in the conversation.
+ *
+ * `nextSeq` advances by exactly one per call -- including for an event that creates nothing, which
+ * is what `AgentSessionProjection::apply` does with `last_revision` too. Keeping the two in step
+ * means a locally-folded item gets the number Rust would have given it, so the live path and a
+ * later snapshot describe the same order rather than two schemes that merely happen to agree.
+ *
+ * The events in one `{kind:"events"}` batch arrive in fold order -- `UiDelivery::Events` is
+ * documented as "apply these events, in order", and `ConversationIngest` queues one entry per event
+ * it folds -- so arrival order here IS the authoritative order, not a guess at it. The one case
+ * where it queues nothing is while a resync is owed, and that ends in a snapshot, which re-seeds
+ * this counter rather than continuing it.
+ */
+export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState {
+  const seq = incoming.nextSeq;
+  // Advanced once, here, so every `return state` below carries it -- including the arms that change
+  // nothing else. An event with no visible effect is still a real, ordered occurrence.
+  const state: AgentUiState = { ...incoming, nextSeq: seq + 1 };
   switch (event.type) {
     case "session_opened":
       // Arrives once PER TURN on the sidecar backend, not once per session: the Agent SDK emits a
@@ -55,13 +75,16 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
       // reducer's own accumulation.
       if (state.assistantMessageOpen && state.transcript.length > 0) {
         const transcript = state.transcript.slice();
-        transcript[transcript.length - 1] += event.text;
+        const open = transcript[transcript.length - 1];
+        // `seq` is untouched: a message is ordered by where it started, so a reply still streaming
+        // does not slide below the tool call that already interrupted it.
+        transcript[transcript.length - 1] = { seq: open.seq, text: open.text + event.text };
         return { ...state, transcript };
       }
-      return { ...state, transcript: [...state.transcript, event.text], assistantMessageOpen: true };
+      return { ...state, transcript: [...state.transcript, { seq, text: event.text }], assistantMessageOpen: true };
     }
     case "tool_call_started": {
-      const record: ToolCallRecord = { toolUseId: event.tool_use_id, name: event.name, input: event.input, result: null };
+      const record: ToolCallRecord = { seq, toolUseId: event.tool_use_id, name: event.name, input: event.input, result: null };
       // A tool call only happens between assistant messages, so the streaming text ended here.
       return { ...state, toolCalls: [...state.toolCalls, record], assistantMessageOpen: false };
     }
@@ -86,6 +109,7 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
           // hook-relay path `permission_id` and `tool_use_id` are the same string, so nothing here
           // may assume they differ.
           {
+            seq,
             permissionId: event.permission_id,
             toolUseId: event.tool_use_id,
             toolName: event.tool_name,
@@ -149,12 +173,26 @@ export function applyEvent(state: AgentUiState, event: AgentDomainEvent): AgentU
   }
 }
 
-export function applySnapshot(_state: AgentUiState, snapshot: AgentUiState): AgentUiState {
-  // A snapshot is a complete replacement, but it carries no `assistantMessageOpen` -- that flag is
-  // reducer-internal on both sides and deliberately not on the wire. Resetting it is the safe
-  // direction: the next content event starts a new transcript entry rather than appending to a
-  // message that may have been closed before the snapshot was taken.
-  return { ...snapshot, assistantMessageOpen: false };
+/**
+ * A snapshot is a complete replacement of this state.
+ *
+ * `throughRevision` comes from the same envelope as `snapshot` and is Rust's `last_revision` for
+ * exactly the state it carries. Rust reads each item's `seq` from that counter BEFORE bumping it,
+ * so every `seq` inside the snapshot is strictly below this number -- which makes it the correct
+ * seed for `nextSeq`: the next event folded here gets a number no item in the snapshot already
+ * holds, and sorts after all of them. This is the whole reason the ordering survives a reload or a
+ * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
+ */
+export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
+  // The snapshot carries neither `assistantMessageOpen` nor `nextSeq` -- both are reducer-internal
+  // on both sides and deliberately not on the wire, which is why the parameter is typed
+  // `AgentUiSnapshot` (the `Omit` of exactly those two) rather than a full `AgentUiState` that would
+  // claim Rust sent them. Supplying them here is the only reason this function exists.
+  //
+  // Resetting `assistantMessageOpen` is the safe direction: the next content event starts a new
+  // transcript entry rather than appending to a message that may have been closed before the
+  // snapshot was taken.
+  return { ...snapshot, assistantMessageOpen: false, nextSeq: throughRevision };
 }
 
 /** The user-facing reason a resume did not continue the session that was asked for.

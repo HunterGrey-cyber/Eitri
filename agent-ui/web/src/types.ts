@@ -1,4 +1,19 @@
-export type ToolCallRecord = { toolUseId: string; name: string; input: unknown; result: { content: unknown; isError: boolean } | null };
+/** The ordering key every item in a conversation carries, shared across `TranscriptMessage`,
+ * `ToolCallRecord` and `PermissionRequestRecord` so the three can be interleaved into the one
+ * sequence they really formed.
+ *
+ * Authoritative, not derived here: Rust's `AgentSessionProjection::apply` assigns it from the same
+ * counter as `last_revision`, and `serialize_snapshot_for_js` ships it. That is what makes the
+ * order survive a reload or a `UiDelivery::Resync` -- both throw this whole state away and rebuild
+ * it from a snapshot, so an order the frontend had accumulated for itself would vanish with it.
+ *
+ * `reducer.ts` continues the same numbering for events folded after a snapshot (see `nextSeq`),
+ * using the wire's own delivery order rather than inventing one. */
+export type Seq = number;
+/** One assistant message. `seq` is where the message STARTED -- appending a streamed chunk never
+ * moves it, or a reply still streaming would keep sliding below the tool call that interrupted it. */
+export type TranscriptMessage = { seq: Seq; text: string };
+export type ToolCallRecord = { seq: Seq; toolUseId: string; name: string; input: unknown; result: { content: unknown; isError: boolean } | null };
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
  *
@@ -11,7 +26,7 @@ export type ToolCallRecord = { toolUseId: string; name: string; input: unknown; 
  *
  * So `null` means "this request arrived with no usable link", never "this backend cannot supply
  * one". Render it honestly -- never default it, never guess at the most recent call. */
-export type PermissionRequestRecord = { permissionId: string; toolUseId: string | null; toolName: string; input: unknown };
+export type PermissionRequestRecord = { seq: Seq; permissionId: string; toolUseId: string | null; toolName: string; input: unknown };
 export type SessionStatus =
   | { kind: "starting" }
   | { kind: "running" }
@@ -70,14 +85,33 @@ export type AgentUiState = {
   sessionId: string | null;
   providerSessionId: string | null;
   model: string | null; cwd: string | null;
-  transcript: string[]; toolCalls: ToolCallRecord[]; status: SessionStatus;
+  transcript: TranscriptMessage[]; toolCalls: ToolCallRecord[]; status: SessionStatus;
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
   capabilities: Capabilities;
   provider: ProviderInfo | null;
   /** Reducer-internal, never on the wire: true while the last folded event was assistant text, so
    * the next chunk continues the same message. See `reducer.ts`'s `content_delta` case. */
   assistantMessageOpen: boolean;
+  /** Reducer-internal, never on the wire: the `seq` the next locally-folded item will take.
+   *
+   * Seeded from a snapshot's own `throughRevision`, which Rust guarantees is strictly greater than
+   * every `seq` inside that snapshot -- so an item folded after a snapshot sorts after everything
+   * the snapshot carried, and cannot collide with one of them. Incremented once per `applyEvent`
+   * call, exactly as `AgentSessionProjection::apply` bumps `last_revision`, so on the healthy path
+   * the numbers are the same numbers Rust would have assigned rather than a parallel scheme. */
+  nextSeq: Seq;
 };
+
+/** A snapshot as it ACTUALLY arrives from Rust, which is not an `AgentUiState`.
+ *
+ * `serialize_snapshot_for_js` emits neither of the two reducer-internal fields above -- they are
+ * marked "never on the wire" for a reason and Rust has no key for either. Typing the inbound
+ * envelope as a full `AgentUiState` asserted both were present and `number`/`boolean` when both are
+ * `undefined` at runtime; `applySnapshot` overrides them immediately so nothing broke, but anything
+ * that read `payload.state.nextSeq` before that -- a resync-diffing path, say, which is exactly the
+ * kind of thing this area attracts -- would have got `undefined` with the compiler insisting on a
+ * number. Subtracting them is the honest shape: what is missing is now missing in the type too. */
+export type AgentUiSnapshot = Omit<AgentUiState, "assistantMessageOpen" | "nextSeq">;
 
 /** The handshake reply, before any session exists: which backend is behind the bridge and what it
  * genuinely offers. The start screen renders from this rather than hardcoding either backend's

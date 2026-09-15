@@ -1155,7 +1155,10 @@ mod tests {
         settle(&fake, &conversation);
 
         assert_eq!(conversation.projection().last_revision, 3);
-        assert_eq!(conversation.projection().transcript, vec!["hi".to_string()]);
+        assert_eq!(
+            conversation.projection().transcript.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            vec!["hi"],
+        );
         assert_eq!(conversation.projection().active_turn_id.as_deref(), Some("t1"));
 
         // And the UI, whenever it gets round to it, is handed exactly those three.

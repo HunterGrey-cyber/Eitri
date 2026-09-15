@@ -23,7 +23,7 @@ describe("applyEvent", () => {
     let state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "text", text: "first" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "pondering" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "second" });
-    expect(state.transcript).toEqual(["firstsecond"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["firstsecond"]);
   });
 
   it("tool_call_started then tool_call_completed links by tool_use_id", () => {
@@ -87,7 +87,7 @@ describe("applyEvent", () => {
     expect(state.status).toEqual({ kind: "unavailable", reason: "3 event(s) were never delivered" });
     // And the half-written text is still there: clearing the turn must not also erase what did
     // arrive. The banner says it may be incomplete; the reducer does not quietly delete it.
-    expect(state.transcript[state.transcript.length - 1]).toBe("half an ans");
+    expect(state.transcript[state.transcript.length - 1].text).toBe("half an ans");
   });
 
   it("session_closed mid-turn clears activeTurnId too", () => {
@@ -200,9 +200,10 @@ describe("applyEvent", () => {
   });
 
   it("applySnapshot replaces the whole state wholesale", () => {
-    const snapshot = { ...initialState(), sessionId: "replaced", transcript: ["from snapshot"] };
-    const state = applySnapshot(initialState(), snapshot);
-    expect(state).toEqual(snapshot);
+    const snapshot = { ...initialState(), sessionId: "replaced", transcript: [{ seq: 0, text: "from snapshot" }] };
+    const state = applySnapshot(initialState(), snapshot, 1);
+    // `nextSeq` is the one field a snapshot does not carry -- it comes from the envelope beside it.
+    expect(state).toEqual({ ...snapshot, nextSeq: 1 });
   });
 });
 
@@ -236,7 +237,7 @@ describe("identity handling", () => {
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "hello" });
     state = applyEvent(state, opened);
-    expect(state.transcript).toEqual(["hello"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["hello"]);
     expect(state.sessionId).toBe("sess-1");
     expect(state.providerSessionId).toBe("claude-1");
   });
@@ -263,7 +264,7 @@ describe("partial assistant streaming", () => {
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     for (const chunk of ["The ", "quick ", "**brown** ", "fox"]) state = applyEvent(state, delta(chunk));
-    expect(state.transcript).toEqual(["The quick **brown** fox"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["The quick **brown** fox"]);
   });
 
   it("starts a new entry after a tool call, because that ends the assistant message", () => {
@@ -272,7 +273,7 @@ describe("partial assistant streaming", () => {
     state = applyEvent(state, delta("I'll check."));
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
     state = applyEvent(state, delta("It printed hi."));
-    expect(state.transcript).toEqual(["I'll check.", "It printed hi."]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["I'll check.", "It printed hi."]);
   });
 
   it("starts a new entry on the next turn", () => {
@@ -282,7 +283,7 @@ describe("partial assistant streaming", () => {
     state = applyEvent(state, { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "first", stop_reason: null, usage: null });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
     state = applyEvent(state, delta("second"));
-    expect(state.transcript).toEqual(["first", "second"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["first", "second"]);
   });
 
   it("a thinking delta does not split the text around it", () => {
@@ -291,17 +292,22 @@ describe("partial assistant streaming", () => {
     state = applyEvent(state, delta("before "));
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
     state = applyEvent(state, delta("after"));
-    expect(state.transcript).toEqual(["before after"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["before after"]);
   });
 
   it("a snapshot resets the open-message flag rather than appending into a closed message", () => {
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, delta("streaming"));
     expect(state.assistantMessageOpen).toBe(true);
-    const restored = applySnapshot(state, { ...state, transcript: ["an earlier reply"], assistantMessageOpen: true });
+    // Built as the WIRE carries it: `serialize_snapshot_for_js` emits neither reducer-internal
+    // field, so the two are stripped here rather than handed in. This test used to pass
+    // `assistantMessageOpen: true` explicitly, which asserted a key Rust has never sent -- the
+    // reset it checks is of the flag on `state`, not of one inside the snapshot.
+    const { assistantMessageOpen: _open, nextSeq: _seq, ...wire } = { ...state, transcript: [{ seq: 0, text: "an earlier reply" }] };
+    const restored = applySnapshot(state, wire, 1);
     expect(restored.assistantMessageOpen).toBe(false);
     const next = applyEvent(restored, delta("new message"));
-    expect(next.transcript).toEqual(["an earlier reply", "new message"]);
+    expect(next.transcript.map((m) => m.text)).toEqual(["an earlier reply", "new message"]);
   });
 });
 
@@ -359,5 +365,75 @@ describe("resume outcome", () => {
     expect(reason).toContain("provider problem");
     expect(reason).toContain("spawn ENOENT");
     expect(reason).not.toContain("does not have session");
+  });
+});
+
+/* Interleaved ordering, the reducer's half (2026-09-15).
+
+   Rust's projection is where the order originates -- these tests pin that the live path continues
+   the same numbering rather than running a scheme of its own, because the two have to describe the
+   same conversation. A frontend-only ordering would look right until the first reload. */
+describe("seq assignment", () => {
+  const opened: AgentDomainEvent = {
+    type: "session_opened", session_id: "s", provider_session_id: "p", model: "m", cwd: "/tmp",
+  };
+
+  it("numbers messages, tool calls and permissions on one counter, so they can be interleaved", () => {
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "I'll check." });
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "Now this." });
+    state = applyEvent(state, { type: "permission_requested", permission_id: "perm-1", tool_use_id: "tu1", tool_name: "Bash", input: {} });
+
+    const merged = [
+      ...state.transcript.map((m) => [m.seq, `text:${m.text}`] as const),
+      ...state.toolCalls.map((c) => [c.seq, `tool:${c.toolUseId}`] as const),
+      ...state.pendingPermissions.map((p) => [p.seq, `perm:${p.permissionId}`] as const),
+    ].sort((a, b) => a[0] - b[0]);
+    expect(merged.map(([, label]) => label)).toEqual(["text:I'll check.", "tool:tu1", "text:Now this.", "perm:perm-1"]);
+  });
+
+  it("advances the counter for an event that creates nothing, exactly as the Rust projection does", () => {
+    // A thinking delta has no visible effect and still consumes a revision on the Rust side. If the
+    // two counters diverged here, a locally-folded item would stop matching the number Rust would
+    // have given it -- harmless for sorting, but the claim in `types.ts` would stop being true.
+    let state = applyEvent(initialState(), opened);
+    const before = state.nextSeq;
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    expect(state.nextSeq).toBe(before + 1);
+    expect(state.transcript).toEqual([]);
+  });
+
+  it("keeps a streamed message at the seq of its first delta", () => {
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "The " });
+    const first = state.transcript[0].seq;
+    for (const chunk of ["quick ", "brown ", "fox"]) {
+      state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: chunk });
+    }
+    expect(state.transcript).toEqual([{ seq: first, text: "The quick brown fox" }]);
+  });
+
+  /* The bug that would appear hours later. A `UiDelivery::Resync` or a panel reload throws this
+     whole state away and rebuilds it from a snapshot; anything folded afterwards has to sort AFTER
+     everything the snapshot carried. Rust guarantees `throughRevision` exceeds every `seq` in the
+     snapshot, which is why it is the seed. */
+  it("continues a snapshot's numbering, so items folded after one sort after everything in it", () => {
+    const snapshot = {
+      ...initialState(),
+      transcript: [{ seq: 40, text: "from the snapshot" }],
+      toolCalls: [{ seq: 41, toolUseId: "tu_old", name: "Bash", input: {}, result: null }],
+    };
+    let state = applySnapshot(initialState(), snapshot, 42);
+    state = applyEvent(state, { type: "content_delta", turn_id: "t9", kind: "text", text: "after the snapshot" });
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t9", tool_use_id: "tu_new", name: "Read", input: {} });
+
+    const highestInSnapshot = 41;
+    expect(state.transcript[1].seq).toBeGreaterThan(highestInSnapshot);
+    expect(state.toolCalls[1].seq).toBeGreaterThan(state.transcript[1].seq);
+    // And no collision with anything the snapshot already held.
+    const seqs = [...state.transcript.map((m) => m.seq), ...state.toolCalls.map((c) => c.seq)];
+    expect(new Set(seqs).size).toBe(seqs.length);
   });
 });

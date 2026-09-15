@@ -202,8 +202,8 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
     // And memory follows the CONVERSATION: 20,000 partial updates are one assistant message.
     let projection = conversation.projection();
     assert_eq!(projection.transcript.len(), 1, "partial updates must coalesce into one message");
-    assert!(projection.transcript[0].starts_with("0 1 2 "));
-    assert!(projection.transcript[0].ends_with("19999 "));
+    assert!(projection.transcript[0].text.starts_with("0 1 2 "));
+    assert!(projection.transcript[0].text.ends_with("19999 "));
     assert_eq!(projection.active_turn_id.as_deref(), Some("turn-1"));
 }
 
@@ -260,7 +260,7 @@ fn an_interrupt_during_a_stall_terminates_the_turn_exactly_once() {
     assert_eq!(projection.active_turn_id, None, "an interrupted turn must not still read as working");
     assert!(!matches!(projection.status, ProjectionStatus::Unavailable { .. }));
     assert_eq!(projection.transcript.len(), 1);
-    assert!(projection.transcript[0].starts_with("0 1 2 "), "text received before the interrupt must survive");
+    assert!(projection.transcript[0].text.starts_with("0 1 2 "), "text received before the interrupt must survive");
     drop(projection);
 
     // The session is reusable: a second turn folds normally on top.

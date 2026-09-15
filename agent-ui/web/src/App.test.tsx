@@ -104,7 +104,7 @@ describe("App rehydration from a snapshot", () => {
     dispatch({
       kind: "snapshot",
       throughRevision: 7,
-      state: snapshotState({ model: "claude-opus-5", transcript: ["pre-reload marker alpha seven."] }),
+      state: snapshotState({ model: "claude-opus-5", transcript: [{ seq: 0, text: "pre-reload marker alpha seven." }] }),
     });
     expect(container.querySelector(".agent-ui-conversation")).not.toBeNull();
     expect(container.querySelector(".mode-selector")).toBeNull();
@@ -116,7 +116,7 @@ describe("App rehydration from a snapshot", () => {
     // a page that has no record of it. It must not be read as this page's own start failing.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ transcript: ["still here"] }) });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ transcript: [{ seq: 0, text: "still here" }] }) });
     dispatch({ kind: "command_result", requestId: "req-from-a-previous-page", ok: true });
     expect(container.textContent).toContain("still here");
     expect(container.querySelector(".mode-selector")).toBeNull();
@@ -192,7 +192,7 @@ describe("App fatal errors", () => {
   it("shows the whole error text and returns to the start screen", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState({ transcript: ["gone"] }) });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState({ transcript: [{ seq: 0, text: "gone" }] }) });
     dispatch({ kind: "error", message: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" });
     const banner = container.querySelector(".fatal-error")!;
     // <pre>, because the sidecar's diagnostics are multi-line and the exact text is the point.

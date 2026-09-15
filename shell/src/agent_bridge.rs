@@ -222,11 +222,25 @@ impl<'a> SnapshotView<'a> {
 /// answers with SESSION_NOT_FOUND.
 pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
     let projection = &*view.projection;
+    // Written out rather than leaning on `TranscriptMessage`'s derive. Both field names happen to
+    // be single lowercase words, so the derive would produce the same JSON today -- but this
+    // function exists precisely because Rust and TS name things differently, and a field added to
+    // that struct later would otherwise reach the frontend in whatever spelling Rust used.
+    let transcript: Vec<Value> = projection
+        .transcript
+        .iter()
+        .map(|message| json!({ "seq": message.seq, "text": message.text }))
+        .collect();
+
     let tool_calls: Vec<Value> = projection
         .tool_calls
         .iter()
         .map(|call| {
             json!({
+                // Where this call sits among the assistant messages and permission cards. Without
+                // it the frontend had three collections and no way to interleave them, so every
+                // tool card rendered below every message. See `AgentSessionProjection::apply`.
+                "seq": call.seq,
                 "toolUseId": call.tool_use_id,
                 "name": call.name,
                 "input": call.input,
@@ -242,11 +256,19 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
     // that honestly rather than guessing at the most recent call. Emitted as an explicit `null`
     // rather than omitted, so the frontend can tell "no id was sent for this request" from "this
     // build predates the field".
-    let pending_permissions: Vec<Value> = projection
-        .pending_permissions
-        .values()
+    //
+    // Sorted by `seq`, which is also the order they were requested in. `pending_permissions` is a
+    // `HashMap` and `values()` order is unspecified, so without this two snapshots of one state
+    // could emit two different card orders.
+    let mut pending: Vec<&agent::PermissionRequestRecord> = projection.pending_permissions.values().collect();
+    pending.sort_by_key(|p| p.seq);
+    let pending_permissions: Vec<Value> = pending
+        .into_iter()
         .map(|p| {
             json!({
+                // Where this card sits in the conversation. Used when it has no `toolUseId` to
+                // anchor it beside its tool call -- which is every card on the legacy backend.
+                "seq": p.seq,
                 "permissionId": p.permission_id,
                 "toolUseId": p.tool_use_id,
                 "toolName": p.tool_name,
@@ -282,7 +304,7 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         "providerSessionId": view.provider_session_id,
         "model": projection.model,
         "cwd": projection.cwd,
-        "transcript": projection.transcript,
+        "transcript": transcript,
         "toolCalls": tool_calls,
         "status": status,
         "activeTurnId": projection.active_turn_id,
@@ -607,6 +629,113 @@ mod tests {
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert_eq!(pending["permissionId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
         assert_eq!(pending["toolUseId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
+    }
+
+    /// The snapshot's half of interleaved ordering (2026-09-15).
+    ///
+    /// The frontend rendered `transcript`, then `toolCalls`, then `pendingPermissions` as three
+    /// sequential lists, so every tool card sat below every assistant message. It could not have
+    /// done better from this payload: before `seq`, nothing here said how the three collections
+    /// interleave. Reconstructing it from the live event stream alone would have been lost on every
+    /// reload and every `UiDelivery::Resync`, which both rebuild the whole frontend state from
+    /// exactly this snapshot.
+    #[test]
+    fn a_snapshot_carries_the_order_of_the_three_collections_against_each_other() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: agent::ContentKind::Text, text: "I'll check.".into() });
+        projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) });
+        projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: agent::ContentKind::Text, text: "And now this.".into() });
+        projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_2".into(), name: "Read".into(), input: json!({}) });
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(), tool_use_id: Some("toolu_2".into()), tool_name: "Read".into(), input: json!({}),
+        });
+
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let state = &parsed["state"];
+
+        let mut merged: Vec<(u64, String)> = Vec::new();
+        for m in state["transcript"].as_array().unwrap() {
+            merged.push((m["seq"].as_u64().unwrap(), format!("text:{}", m["text"].as_str().unwrap())));
+        }
+        for c in state["toolCalls"].as_array().unwrap() {
+            merged.push((c["seq"].as_u64().unwrap(), format!("tool:{}", c["toolUseId"].as_str().unwrap())));
+        }
+        for p in state["pendingPermissions"].as_array().unwrap() {
+            merged.push((p["seq"].as_u64().unwrap(), format!("perm:{}", p["permissionId"].as_str().unwrap())));
+        }
+        merged.sort_by_key(|(seq, _)| *seq);
+
+        assert_eq!(
+            merged.into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
+            vec!["text:I'll check.", "tool:toolu_1", "text:And now this.", "tool:toolu_2", "perm:perm-1"],
+        );
+        // Every seq is below the revision the same envelope reports, so the frontend can seed its
+        // own counter from `throughRevision` and never collide with an item this snapshot carried.
+        assert_eq!(parsed["throughRevision"], 5);
+    }
+
+    /// `pending_permissions` is a `HashMap`, and `HashMap::values()` order is unspecified -- two
+    /// snapshots of the same state could emit two different card orders, and a reader sorting by
+    /// `seq` would still be at the mercy of whatever order the array happened to arrive in for
+    /// anything it could not sort. Emitting them already ordered makes the payload itself
+    /// deterministic.
+    ///
+    /// SIZED AND REPEATED DELIBERATELY, because the thing under test is nondeterminism and a
+    /// careless version of this test inherits it. One `HashMap` iterates in one fixed order for its
+    /// whole life, and a fresh one draws a new `RandomState`, so what decides whether an UNSORTED
+    /// emission passes is how often a fresh map happens to iterate in insertion order. Measured on
+    /// this machine, 200,000 fresh maps each: **5 keys reproduce insertion order 2.53% of the
+    /// time** -- so the five-key version of this test used to pass roughly one run in forty with
+    /// the sort deleted. At 12 keys that fell to 0.001%, and at 16 and 24 keys it was 0 in 200,000.
+    ///
+    /// So: 16 permissions, and `PROJECTIONS` independently built ones, all of which must agree.
+    /// This is not literally deterministic -- nothing that reads a `HashMap` can be -- but a false
+    /// pass now needs every one of those independent maps to draw insertion order at a rate already
+    /// below what 200,000 trials could measure for a single one. Stated as a measurement rather
+    /// than as a guarantee, because that is what it is.
+    #[test]
+    fn pending_permissions_are_emitted_in_the_order_they_were_requested() {
+        const PERMISSIONS: usize = 16;
+        const PROJECTIONS: usize = 8;
+
+        let expected: Vec<String> = (0..PERMISSIONS).map(|i| format!("perm-{i:02}")).collect();
+
+        for attempt in 0..PROJECTIONS {
+            let mut projection = AgentSessionProjection::default();
+            for id in &expected {
+                projection.apply(&AgentDomainEvent::PermissionRequested {
+                    permission_id: id.clone(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+                });
+            }
+            let view = SnapshotView {
+                backend: "legacy",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+            let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
+
+            let ids: Vec<&str> = cards.iter().map(|p| p["permissionId"].as_str().unwrap()).collect();
+            assert_eq!(ids, expected, "projection {attempt} emitted its cards out of request order");
+
+            // The request order IS seq order; asserted separately so a future change that kept the
+            // ids lined up while emitting some other key's order still fails here.
+            let seqs: Vec<u64> = cards.iter().map(|p| p["seq"].as_u64().unwrap()).collect();
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "projection {attempt} emitted seqs {seqs:?}");
+        }
     }
 
     /// The event path's own half of the same link, pinned here rather than assumed from the derive:

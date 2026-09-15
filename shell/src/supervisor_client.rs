@@ -288,7 +288,8 @@ mod tests {
         state.active_turn_id = Some("turn-1".into()); // would otherwise read as Working
         state.pending_permissions.insert(
             "r1".into(),
-            PermissionRequestRecord { permission_id: "r1".into(), tool_use_id: None, tool_name: "Read".into(), input: serde_json::json!({}) },
+            // `seq` orders this card in the panel's own rendering; `derive_status` never reads it.
+            PermissionRequestRecord { seq: 0, permission_id: "r1".into(), tool_use_id: None, tool_name: "Read".into(), input: serde_json::json!({}) },
         );
         assert_eq!(derive_status(Some(&state)), AgentStatus::Blocked);
     }

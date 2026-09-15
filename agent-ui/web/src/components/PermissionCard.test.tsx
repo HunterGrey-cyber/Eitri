@@ -8,6 +8,9 @@ import { PermissionCard } from "./PermissionCard";
 import type { PermissionRequestRecord } from "../types";
 
 const REQUEST: PermissionRequestRecord = {
+  // `seq` places the card in the conversation; this component renders one card in isolation, so
+  // the value is immaterial here. Placement itself is `timeline.ts`'s job and is tested there.
+  seq: 0,
   permissionId: "perm-1",
   toolUseId: "toolu_01ABC",
   toolName: "Bash",

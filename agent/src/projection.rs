@@ -149,8 +149,28 @@ pub struct ToolCallResult {
     pub is_error: bool,
 }
 
+/// One assistant message, with the position it occupies among everything else this conversation
+/// produced.
+///
+/// A bare `String` until 2026-09-15, which is what made the panel render every tool card below
+/// every assistant message: the three collections reached the frontend with nothing saying how they
+/// interleave. See `AgentSessionProjection::transcript` for why the order has to originate here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TranscriptMessage {
+    /// Ordering key, shared with `ToolCallRecord::seq` and `PermissionRequestRecord::seq`. See
+    /// `AgentSessionProjection::apply`.
+    ///
+    /// The seq of the delta that OPENED this message, never updated as it grows -- a streaming
+    /// message must not keep moving below the tool call that already interrupted it.
+    pub seq: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallRecord {
+    /// Ordering key, shared with `TranscriptMessage::seq` and `PermissionRequestRecord::seq`. See
+    /// `AgentSessionProjection::apply`.
+    pub seq: u64,
     pub turn_id: String,
     pub tool_use_id: String,
     pub name: String,
@@ -164,6 +184,13 @@ pub struct ToolCallRecord {
 /// `agent::session`'s own bookkeeping, never in this provider-neutral type.
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionRequestRecord {
+    /// Ordering key, shared with `TranscriptMessage::seq` and `ToolCallRecord::seq`. See
+    /// `AgentSessionProjection::apply`.
+    ///
+    /// Needed even though a request usually has `tool_use_id` to anchor it beside its tool call:
+    /// that link is absent on the legacy backend (`None`) and can arrive as `""` from the sidecar's
+    /// proto3 wire, and a card with no usable link still has to land somewhere sensible.
+    pub seq: u64,
     pub permission_id: String,
     /// The id of the tool call this request gates, when the source that raised it supplied one.
     /// Both backends do today:
@@ -241,12 +268,16 @@ pub struct AgentSessionProjection {
     /// second `send_turn` while this is `Some` must be rejected by the caller (Task 2), not
     /// silently queued.
     pub active_turn_id: Option<String>,
-    /// Plain assistant text, in arrival order -- unchanged in shape from the pre-Phase-1
-    /// `AgentSessionState::transcript`. Design doc §10.3 calls for "ordered transcript items" as a
-    /// single interleaved sequence with tool calls; this phase deliberately keeps the existing
-    /// split transcript/tool_calls shape instead of inventing an interleaved one, since no current
-    /// consumer needs true interleaving -- revisit if one does.
-    pub transcript: Vec<String>,
+    /// Assistant messages, in arrival order, each carrying the `seq` that orders it against
+    /// `tool_calls` and `pending_permissions`.
+    ///
+    /// Design doc §10.3 calls for "ordered transcript items" as a single interleaved sequence with
+    /// tool calls. The three collections are still stored apart -- a consumer that only wants tool
+    /// calls should not have to filter a sum type for them -- but they are no longer unorderable:
+    /// `seq` is a total order over all three, so a reader can interleave them exactly. That is the
+    /// part the frontend genuinely could not do for itself, because a snapshot replaces its whole
+    /// state and carried no arrival order at all.
+    pub transcript: Vec<TranscriptMessage>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub pending_permissions: HashMap<String, PermissionRequestRecord>,
     /// The last usage a provider actually reported, or `None` if none ever has -- which is the
@@ -284,7 +315,25 @@ impl AgentSessionProjection {
     /// able to skip past correctly when replaying from a revision, not something invisible to the
     /// counter). Pure and side-effect-free -- no I/O -- so it's trivially testable without
     /// spawning anything.
+    ///
+    /// Ordering: an item created by this call takes `seq = self.last_revision` as read on entry --
+    /// the value BEFORE the bump at the bottom. Two consequences the rest of the system relies on.
+    /// (1) No two items ever share a `seq`, because no single event creates more than one item and
+    /// every call bumps the counter exactly once, so `seq` is a total order over all three
+    /// collections. (2) Every `seq` is strictly less than `last_revision` afterwards, so a
+    /// snapshot's `throughRevision` is a strict upper bound on the seqs inside it -- which is what
+    /// lets the frontend seed its own counter from that number and never collide with an item the
+    /// snapshot already carried.
+    ///
+    /// Neither half is left as prose: `agent/tests/projection.rs` pins (1) in
+    /// `no_single_event_ever_creates_more_than_one_item` and (2) in
+    /// `every_seq_is_strictly_below_the_revision_a_snapshot_would_report`. (1) needs a test more
+    /// than (2) does, because breaking it fails quietly -- a future arm pushing two items would
+    /// give both the same number, and every consumer that sorts on `seq` (`buildTimeline`, and the
+    /// snapshot merge in `shell/src/agent_bridge.rs`'s own tests) would then tie them in whatever
+    /// order the arrays happened to be in, which is a mis-ordered pair rather than a failure.
     pub fn apply(&mut self, event: &AgentDomainEvent) {
+        let seq = self.last_revision;
         match event {
             AgentDomainEvent::SessionOpened { session_id, provider_session_id, model, cwd } => {
                 self.session_id = Some(session_id.clone());
@@ -299,9 +348,10 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => {
                 match self.transcript.last_mut() {
-                    Some(open) if self.assistant_message_open => open.push_str(text),
+                    // Appending leaves `seq` alone: a message is ordered by where it started.
+                    Some(open) if self.assistant_message_open => open.text.push_str(text),
                     _ => {
-                        self.transcript.push(text.clone());
+                        self.transcript.push(TranscriptMessage { seq, text: text.clone() });
                         self.assistant_message_open = true;
                     }
                 }
@@ -315,6 +365,7 @@ impl AgentSessionProjection {
                 // streaming has ended; the text after it is a new message.
                 self.assistant_message_open = false;
                 self.tool_calls.push(ToolCallRecord {
+                    seq,
                     turn_id: turn_id.clone(),
                     tool_use_id: tool_use_id.clone(),
                     name: name.clone(),
@@ -332,6 +383,7 @@ impl AgentSessionProjection {
                 self.pending_permissions.insert(
                     permission_id.clone(),
                     PermissionRequestRecord {
+                        seq,
                         permission_id: permission_id.clone(),
                         tool_use_id: tool_use_id.clone(),
                         tool_name: tool_name.clone(),

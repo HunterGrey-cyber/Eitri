@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, Hello } from "./types";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -54,7 +54,7 @@ type InboundHandler = (
     | { kind: "command_result"; requestId: string; ok: true }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     | { kind: "events"; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
-    | { kind: "snapshot"; throughRevision: number; state: AgentUiState }
+    | { kind: "snapshot"; throughRevision: number; state: AgentUiSnapshot }
     | { kind: "error"; message: string },
 ) => void;
 
