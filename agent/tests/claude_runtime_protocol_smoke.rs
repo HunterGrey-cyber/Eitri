@@ -21,10 +21,35 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // streaming added 2026-09-12; PARTIAL is what a UI client asks for.
             streaming: claude_runtime_protocol::v1::StreamingMode::Partial as i32,
             executable: claude_runtime_protocol::v1::ExecutableSource::HostCli as i32,
+            // tool_policy and setting_sources added 2026-09-15 with protocol major 3. Both are
+            // stated here rather than left `None`, because this test exists to prove the generated
+            // types carry what the wire declares -- and a `None` would prove only that the field
+            // compiles.
+            tool_policy: Some(claude_runtime_protocol::v1::ToolPolicy {
+                deny: vec!["Bash".to_string()],
+                allow: None,
+            }),
+            setting_sources: Some(claude_runtime_protocol::v1::SettingSourceSelection {
+                sources: vec![
+                    claude_runtime_protocol::v1::SettingSource::Project as i32,
+                    claude_runtime_protocol::v1::SettingSource::Local as i32,
+                ],
+            }),
         }),
     };
     assert_eq!(request.cwd, "/tmp/example");
     let policy = request.policy.unwrap();
+    let tool_policy = policy.tool_policy.clone().expect("a stated tool policy must survive");
+    assert_eq!(tool_policy.deny, vec!["Bash".to_string()]);
+    assert!(tool_policy.allow.is_none(), "absent is not the same as an empty allow list");
+    assert_eq!(
+        policy.setting_sources.clone().expect("a stated tier set must survive").sources,
+        vec![
+            claude_runtime_protocol::v1::SettingSource::Project as i32,
+            claude_runtime_protocol::v1::SettingSource::Local as i32,
+        ],
+        "user is deliberately absent -- see build_create_request"
+    );
     assert_eq!(policy.configuration(), ConfigurationProfile::Native);
     assert_eq!(policy.permissions(), PermissionMode::Interactive);
 }

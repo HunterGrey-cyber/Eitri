@@ -88,7 +88,7 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
 
     // The value `connect()` itself refuses on, so reaching this line already proves it -- asserted
     // anyway, because that number is what the fixture most needs to be right about.
-    assert_eq!(info.protocol_major, 2, "CLIENT_PROTOCOL_MAJOR and the fixture must both say this");
+    assert_eq!(info.protocol_major, 3, "CLIENT_PROTOCOL_MAJOR and the fixture must both say this");
 
     let expected: Vec<String> = [
         "handshake",
@@ -100,6 +100,8 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "close_session",
         "resume_session",
         "fork_session",
+        "setting_sources",
+        "tool_policy",
     ]
     .iter()
     .map(|s| s.to_string())
