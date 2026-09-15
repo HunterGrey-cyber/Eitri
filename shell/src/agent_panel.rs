@@ -45,6 +45,10 @@ struct AgentPanelState {
     backend_kind: BackendKind,
     project_dir: PathBuf,
     supervisor: Option<crate::supervisor_client::SupervisorClient>,
+    /// Set only while a freshly-spawned `neovibe-supervisor` is still coming up. The pump drains
+    /// it into `supervisor` above. A window that spawns the supervisor cannot connect to it
+    /// synchronously -- see `PendingSupervisor` for the failure that taught us that.
+    supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
     /// Set once a start-failure has been reported, so the 33ms tick reports it exactly once rather
     /// than every tick for as long as the dead session is installed.
     reported_start_failure: bool,
@@ -208,7 +212,15 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
-    let supervisor = crate::supervisor_client::SupervisorClient::connect_or_spawn(instance_id, project_name, &project_dir);
+    let (supervisor, supervisor_pending) =
+        match crate::supervisor_client::SupervisorClient::connect_or_spawn(
+            instance_id,
+            project_name,
+            &project_dir,
+        ) {
+            crate::supervisor_client::PendingSupervisor::Ready(client) => (client, None),
+            crate::supervisor_client::PendingSupervisor::Connecting(rx) => (None, Some(rx)),
+        };
     let backend_kind = BackendKind::from_env();
     println!("[agent_panel] backend: {}", backend_kind.as_str());
     let state = Rc::new(RefCell::new(AgentPanelState {
@@ -216,6 +228,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         backend_kind,
         project_dir,
         supervisor,
+        supervisor_pending,
         pending_start: None,
         reported_start_failure: false,
         turn_trace: None,
@@ -267,7 +280,24 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
 
         let (payload, first_text_in_this_batch) = {
             let mut state_ref = state.borrow_mut();
-            let AgentPanelState { session, turn_trace, supervisor, .. } = &mut *state_ref;
+            let AgentPanelState { session, turn_trace, supervisor, supervisor_pending, .. } =
+                &mut *state_ref;
+            // A supervisor this window had to start itself finishes connecting here rather than
+            // during `build_ui`, where waiting for it would have delayed the window appearing.
+            if supervisor.is_none() {
+                if let Some(rx) = supervisor_pending.as_ref() {
+                    match rx.try_recv() {
+                        Ok(client) => {
+                            *supervisor = client;
+                            *supervisor_pending = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            *supervisor_pending = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                }
+            }
             // Folded from the SAME slice the bridge is about to serialize, so the trace describes
             // the events the user is actually about to see rather than a parallel accounting.
             let mut first_text_in_this_batch = false;

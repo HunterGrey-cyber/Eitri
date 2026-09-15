@@ -51,17 +51,49 @@ pub(crate) struct SupervisorClient {
     dead: bool,
 }
 
+/// The outcome of asking for a supervisor connection: either one already existed and is ready
+/// now, or one was just spawned and the connection is being waited for off this thread.
+///
+/// The split exists because the two cases have opposite cost profiles and the old code paid the
+/// slow one on the GTK main thread. A supervisor that is already listening answers instantly,
+/// which is every window after the first. A supervisor that has to be *started* needs a cold GTK4
+/// process to initialize and bind its socket -- far more than the 250ms this used to allow, so the
+/// window that spawned it was systematically the one window the dashboard never showed. Observed
+/// live on 2026-09-15, not theorized: two windows, and only the second one appeared.
+pub(crate) enum PendingSupervisor {
+    Ready(Option<SupervisorClient>),
+    Connecting(std::sync::mpsc::Receiver<Option<SupervisorClient>>),
+}
+
+/// How long to wait before each connect attempt after spawning, in milliseconds.
+///
+/// Doubling from a short first wait, then holding, so a fast machine pays almost nothing and a
+/// slow or loaded one still succeeds. The total would be indefensible on the GTK main thread and
+/// is unremarkable on a worker thread: nothing waits on it, and a window whose dashboard row
+/// appears a few seconds late is a dashboard detail, not a startup delay.
+fn retry_schedule() -> Vec<u64> {
+    vec![25, 50, 100, 200, 400, 800, 1600, 1600, 1600, 1600]
+}
+
 impl SupervisorClient {
-    /// Tries to connect to the well-known socket; if nothing is listening, locates and spawns
-    /// `neovibe-supervisor` as a detached background process and retries a bounded number of
-    /// times (the freshly-spawned process needs a moment to bind its own socket). Returns `None`
-    /// if every attempt fails -- logged, never panics, matching this crate's own established
-    /// "log and continue" posture for non-critical integrations.
-    pub(crate) fn connect_or_spawn(instance_id: String, project_name: String, project_dir: &Path) -> Option<Self> {
+    /// Connects to the well-known socket, spawning `neovibe-supervisor` first if nothing is
+    /// listening. Never blocks the caller for longer than one connect attempt: when a spawn is
+    /// needed, the retry loop runs on a worker thread and the result arrives over the returned
+    /// channel, which `agent_panel`'s existing 33ms pump drains -- the same shape it already uses
+    /// for off-thread backend construction.
+    ///
+    /// Every failure degrades to "this window just doesn't appear in the dashboard", logged and
+    /// never propagated, matching this crate's posture for non-critical integrations.
+    pub(crate) fn connect_or_spawn(instance_id: String, project_name: String, project_dir: &Path) -> PendingSupervisor {
         let socket_path = supervisor::socket_path();
 
         if let Ok(stream) = UnixStream::connect(&socket_path) {
-            return Self::finish_connecting(stream, instance_id, project_name, project_dir);
+            return PendingSupervisor::Ready(Self::finish_connecting(
+                stream,
+                instance_id,
+                project_name,
+                project_dir,
+            ));
         }
 
         match supervisor::locate_supervisor_binary() {
@@ -92,26 +124,40 @@ impl SupervisorClient {
                     }
                     Err(e) => {
                         eprintln!("shell: failed to spawn {binary:?}: {e}");
-                        return None;
+                        return PendingSupervisor::Ready(None);
                     }
                 }
             }
             Err(e) => {
                 eprintln!("shell: could not locate neovibe-supervisor binary: {e}");
-                return None;
+                return PendingSupervisor::Ready(None);
             }
         }
 
-        const RETRY_ATTEMPTS: u32 = 5;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-        for _ in 0..RETRY_ATTEMPTS {
-            std::thread::sleep(RETRY_DELAY);
-            if let Ok(stream) = UnixStream::connect(&socket_path) {
-                return Self::finish_connecting(stream, instance_id, project_name, project_dir);
+        // From here the supervisor is starting but is not listening yet. Waiting for it is the
+        // slow path, so it leaves this thread entirely.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let project_dir = project_dir.to_path_buf();
+        std::thread::spawn(move || {
+            let schedule = retry_schedule();
+            let attempts = schedule.len();
+            let total_ms: u64 = schedule.iter().sum();
+            for wait_ms in schedule {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                if let Ok(stream) = UnixStream::connect(&socket_path) {
+                    let client =
+                        Self::finish_connecting(stream, instance_id, project_name, &project_dir);
+                    let _ = tx.send(client);
+                    return;
+                }
             }
-        }
-        eprintln!("shell: neovibe-supervisor did not accept a connection after spawning and {RETRY_ATTEMPTS} retries");
-        None
+            eprintln!(
+                "shell: neovibe-supervisor did not accept a connection after spawning and \
+                 {attempts} retries over {total_ms}ms"
+            );
+            let _ = tx.send(None);
+        });
+        PendingSupervisor::Connecting(rx)
     }
 
     /// `instance_id` is captured into the returned `Self` (not just used once and discarded) --
@@ -193,6 +239,39 @@ impl SupervisorClient {
 mod tests {
     use super::*;
     use agent::PermissionRequestRecord;
+
+    /// The budget before 2026-09-15 was 5 attempts at a flat 50ms -- 250ms in total, spent on the
+    /// GTK main thread. A cold GTK4 process does not bind its socket that fast, so the window that
+    /// spawned the supervisor was systematically the one window the dashboard never showed
+    /// (observed live, two windows, only the second appeared). This pins the SHAPE of the
+    /// replacement rather than exact numbers: the steps may be retuned, but shortening the total
+    /// back under a few seconds would restore the bug.
+    #[test]
+    fn the_retry_budget_is_long_enough_for_a_cold_gtk_process_to_start() {
+        let schedule = retry_schedule();
+        let total: u64 = schedule.iter().sum();
+        assert!(
+            total >= 5_000,
+            "a cold GTK4 binary needs seconds, not the 250ms this used to allow; got {total}ms"
+        );
+        assert!(
+            schedule.len() >= 8,
+            "a few long sleeps answer a fast machine slowly; got {} attempts",
+            schedule.len()
+        );
+    }
+
+    /// A fast machine must not pay for the slow one: the first attempt is near-immediate and the
+    /// waits only grow. A flat schedule long enough for the worst case would make every dashboard
+    /// row appear late.
+    #[test]
+    fn the_first_attempt_is_prompt_and_the_waits_only_grow() {
+        let schedule = retry_schedule();
+        assert!(schedule[0] <= 50, "first wait should be near-immediate, got {}ms", schedule[0]);
+        for pair in schedule.windows(2) {
+            assert!(pair[1] >= pair[0], "waits must never shrink: {}ms then {}ms", pair[0], pair[1]);
+        }
+    }
 
     fn base_state() -> AgentSessionProjection {
         AgentSessionProjection { status: ProjectionStatus::Running, ..Default::default() }
