@@ -253,9 +253,13 @@ pub(crate) fn persist_record(
     // into "when was it last touched", which `updated_at` already answers. Looked up by SESSION,
     // not by workspace -- a workspace holds one record per session now, so a second session
     // starting in the same directory must not inherit the first one's start time.
-    let created_at = crate::persistence::load_conversation_record(conversation_id, provider_session_id)
-        .map(|existing| existing.created_at)
-        .unwrap_or_else(|_| now.clone());
+    //
+    // Via `created_at_of_existing_record` rather than `load_conversation_record`, because that one
+    // resolves to the directory layout only: resuming a session recorded solely in the
+    // pre-2026-09-15 flat file restamped it to the moment of the resume, and the de-duplication in
+    // `resumable_sessions` then discarded the flat record still holding the real value.
+    let created_at = crate::persistence::created_at_of_existing_record(conversation_id, provider_session_id)
+        .unwrap_or_else(|| now.clone());
     let record = ConversationRecord {
         conversation_id: conversation_id.to_string(),
         provider: PROVIDER_NAME.to_string(),
@@ -486,8 +490,8 @@ impl AgentConversation {
     /// criteria always named, and it lived only in the tests until now: the runtime accepted any
     /// `SessionOpened` and moved on.
     ///
-    /// Bounded and short: this runs on the connect worker, not the UI thread, but a user waiting on
-    /// "Continue previous session" is waiting on it. A session that survives the window is treated
+    /// Bounded and short: this runs on the connect worker, not the UI thread, but a user who picked
+    /// a previous conversation on the start screen is waiting on it. A session that survives the window is treated
     /// as started -- a later termination is a normal session-death, reported through the usual
     /// status path rather than as a construction failure.
     ///

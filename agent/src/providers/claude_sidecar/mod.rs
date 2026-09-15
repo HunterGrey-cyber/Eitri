@@ -64,7 +64,7 @@ const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 /// sidecar learned the word, while this client still returned `UnsupportedCapability` -- a button
 /// that cannot work is worse than no button, and it is exactly the "capability advertisement is a
 /// contract" failure this design is trying to avoid, just with the lie on the client side.
-const CLIENT_IMPLEMENTS_RESUME: bool = true;
+pub const CLIENT_IMPLEMENTS_RESUME: bool = true;
 /// Still false: the wire carries `fork`, and `build_create_request` can set it, but nothing in this
 /// client asks for a fork and nothing has verified one end to end. Flip it in the change that does
 /// both, not before.

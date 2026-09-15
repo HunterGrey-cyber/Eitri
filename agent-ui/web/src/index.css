@@ -277,8 +277,10 @@ body,
   font-size: 12px;
 }
 
-/* The continue-previous-session option: visually distinct from a fresh start, since the two have
-   very different consequences and the wrong click is not obviously wrong afterwards. */
+/* `.resume` marks every previous-conversation row in the picker, visually distinct from the "New
+   session" row beside them, since starting fresh and continuing have very different consequences and
+   the wrong click is not obviously wrong afterwards. (This comment described a single
+   "continue-previous-session" control; that control became a list of rows when the picker landed.) */
 /* Every control on this screen is painted explicitly, none of them inheriting the UA's native button
    appearance. That was a real defect, not tidiness: setting ANY border property on a button drops
    WebKit's native styling, and the fallback is a light `ButtonFace` background. Only `.resume` set a
@@ -311,15 +313,33 @@ body,
 }
 
 /* The which-conversation axis, above the permission-mode buttons. Visually grouped so it reads as a
-   choice between two conversations rather than as two more ways to start one. */
+   choice between conversations rather than as more ways to start one. */
+/* A column, not a row: this list holds one entry per remembered session (up to the Rust side's own
+   retention cap of 16, plus at most one record in the pre-2026-09-15 layout, so 17), and side-by-side
+   columns would get unreadably narrow well before that.
+
+   `max-height` + `overflow-y` caps THE LIST so a long one does not push the permission buttons --
+   the only controls that can start anything -- down the page. It does NOT guarantee they stay on
+   screen, and a comment here used to say it did. The surrounding chrome (the intro paragraph, the
+   note above, both mode buttons, the footer) is uncapped, `.mode-selector` is centred with
+   `margin: auto` inside a `height: 100vh` flex column, and centred overflow in that arrangement
+   splits above and below with the block-start half unreachable by scrolling. In a short agent pane
+   this start screen can therefore exceed the viewport. Never observed -- nobody has looked at this
+   screen with a full 17 rows at any pane height (`shell/MANUAL_VERIFICATION.md` owes it). */
 .mode-selector .session-choice {
   display: flex;
+  flex-direction: column;
   gap: 8px;
   margin-bottom: 12px;
+  max-height: 40vh;
+  overflow-y: auto;
 }
 .mode-selector .session-choice button {
-  flex: 1;
   margin: 0;
+}
+/* Not itself an option -- the note explaining why the rows read as ids and timestamps. */
+.mode-selector .session-choice-note {
+  margin: 0 0 4px;
 }
 /* The selected conversation, distinguished by fill rather than by border alone -- `.resume` already
    carries a blue border unselected, so a border-only cue would make "armed" and "merely available"

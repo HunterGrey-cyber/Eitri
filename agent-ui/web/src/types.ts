@@ -37,10 +37,22 @@ export type BackendKind = "legacy" | "sidecar";
 
 /** A previous conversation offered for continuation. The key is the CLAUDE session id -- the only
  * identity that survives a resume. Resuming mints a new Verdandi session id, so storing that one
- * would point at something that stops existing the moment it is used. */
+ * would point at something that stops existing the moment it is used.
+ *
+ * **This is the whole of it.** There is no title, no first prompt, no message or turn count, and no
+ * model -- Rust's `agent::ConversationRecord` has never stored any of them, and the one file on disk
+ * that could supply a subject line (the Claude CLI's own transcript) is deliberately never read for
+ * its content. A picker built on this can say WHICH session and WHEN. Anything that renders a row
+ * must not manufacture a label the data cannot support. */
 export type ResumableSession = {
   provider: string;
   providerSessionId: string;
+  /** Epoch milliseconds as a string. When this conversation FIRST started, preserved across
+   * resumes. */
+  createdAt: string;
+  /** Epoch milliseconds as a string. When this session was last STARTED OR RESUMED -- not when it
+   * last had activity. Nothing rewrites a record during a conversation, so a session used for an
+   * hour and one opened and abandoned carry the same stamp. Never label this "last active". */
   updatedAt: string;
 };
 export type PermissionModeChoice = "auto" | "bypass";
@@ -138,17 +150,22 @@ export type AgentUiSnapshot = Omit<AgentUiState, "assistantMessageOpen" | "nextS
 export type Hello = {
   backend: BackendKind;
   projectDir: string;
-  /** Only modes with genuinely distinct runtime behavior. The sidecar backend offers `bypass`
-   * alone in this milestone -- its `interactive` and `verdandi_rules` modes are confirmed to
-   * behave identically, so offering them as choices would be a lie. */
+  /** Only modes with genuinely distinct runtime behavior, and deliberately NOT narrowed by which
+   * backend is behind the bridge -- both have a real, separately verified interactive gate, so both
+   * currently offer the same two. (`verdandi_rules` is absent because it is confirmed to behave
+   * identically to `interactive` in the current sidecar; a third button that does nothing different
+   * would be a worse lie than a missing one.) */
   permissionModes: PermissionModeChoice[];
-  /** The previous conversation in this workspace, when there is one worth offering.
+  /** Every previous conversation in this workspace worth offering, newest first.
    *
-   * Non-null only when ALL THREE hold: the provider advertised resume, this client implements it,
-   * and this workspace has a persisted provider session id. The continue-previous control renders
-   * on exactly this field and nothing else, so it cannot appear for a workspace with nothing to
-   * continue. Null is the normal case for a fresh workspace. */
-  resumableSession: ResumableSession | null;
+   * An entry exists only when ALL THREE hold for it: the provider advertised resume, this client
+   * implements it, and this workspace has that persisted provider session id. The conversation
+   * picker renders on exactly this array and nothing else, so no row can appear for a workspace
+   * with nothing to continue. Empty is the normal case for a fresh workspace, and is also what the
+   * legacy backend always sends -- it has no resume, and writes no records either.
+   *
+   * Rust ranks this; the frontend renders it in array order and sorts nothing. */
+  resumableSessions: ResumableSession[];
   expectedVerdandiRevision: string | null;
 };
 

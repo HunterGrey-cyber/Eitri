@@ -143,13 +143,19 @@ export default function App() {
         // computed once at mount. That only ever matches when this session was itself resume-started
         // -- and that is fine, because it is not the durable half of this rule: Rust applies the
         // same suppression when it builds `hello`, on every mount, which is the case that actually
-        // bites (after a reload `agent::resumable_session` names the most recently updated record,
-        // which right after a handoff is the session just given away). See
-        // `agent_panel::ready_payloads`. Any OTHER stored session is untouched on both sides.
+        // bites (the handed-over session is the most recently updated record, so it would otherwise
+        // head the list). See `agent_panel::ready_payloads`. Any OTHER stored session is untouched
+        // on both sides -- this drops exactly the one row that was just given away, rather than
+        // clearing the offer, which would hide every other session the workspace remembers.
         setHello((current) =>
-          current !== null && current.resumableSession?.providerSessionId === payload.providerSessionId
-            ? { ...current, resumableSession: null }
-            : current,
+          current === null
+            ? current
+            : {
+                ...current,
+                resumableSessions: current.resumableSessions.filter(
+                  (s) => s.providerSessionId !== payload.providerSessionId,
+                ),
+              },
         );
       } else if (payload.kind === "error") {
         setSessionStarted(false);
@@ -157,12 +163,32 @@ export default function App() {
         setHandoffRequestId(null);
         setState(initialState());
         setFatalError(payload.message);
+        /* Re-ask for `hello`, because we are about to show the start screen again and the copy we
+           captured at mount is a snapshot of the conversation records as they were then.
+
+           The session that just died is exactly the one the user is most likely to want back, and
+           it was persisted on adoption (`agent/src/ingestion.rs` -> `conversation::persist_record`)
+           -- so it IS on disk and offerable, and only the in-memory list is stale. Without this the
+           picker's own note, "Previous conversations here, newest first", is a claim the component
+           cannot honour at that moment; the only escape hatch was `Ctrl+Shift+R`, which nothing
+           tells the user about.
+
+           Safe to re-post: Rust answers `Ready` from canonical state with a fresh
+           `BackendGreeting::for_kind` and a `command_result`, never with another `error`, so there
+           is no loop here. */
+        requestHello();
       }
     });
+    requestHello();
+  }, []);
+
+  /** Posts `ready` and tracks it as in-flight. Rust replies with `hello` (and a snapshot, if a
+   *  session exists). Called on mount and again whenever the start screen comes back. */
+  function requestHello() {
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
     postToRust({ type: "ready", request_id: requestId });
-  }, []);
+  }
 
   /* Reports how long this WebView took to draw a turn's first assistant text. The effect runs after
      React has committed the DOM; the animation frame runs just before the browser paints it. That is

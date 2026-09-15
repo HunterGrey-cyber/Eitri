@@ -20,8 +20,9 @@
 //! nothing anywhere saying so.
 //!
 //! **Records are capped** (`MAX_RECORDS_PER_CONVERSATION`). Without a cap a project opened daily
-//! accumulates one file per session forever, and `resumable_session` -- which the agent panel calls
-//! on the GTK main thread -- reads and parses every one of them.
+//! accumulates one file per session forever, and `resumable_sessions` -- which the agent panel calls
+//! on the GTK main thread, and whose result is one row each on the start screen's conversation
+//! picker -- reads and parses every one of them.
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -29,11 +30,18 @@ use std::path::{Path, PathBuf};
 
 /// How many session records one conversation keeps, newest-`updated_at` first.
 ///
-/// A cap rather than no cap because `resumable_session` reads the whole directory on the GTK main
+/// A cap rather than no cap because `resumable_sessions` reads the whole directory on the GTK main
 /// thread (`shell::agent_panel`'s `InboundMessage::Ready` handler), so an unbounded directory is an
-/// unbounded stall in the editor pane as well as unbounded disk. 16 is well past what any resume UI
-/// offers -- only the single most recent offerable record is ever shown -- while still leaving room
-/// for several sessions' worth of forensic history in a workspace.
+/// unbounded stall in the editor pane as well as unbounded disk.
+///
+/// It is also very nearly the bound on the resume PICKER: every offerable record is a row on the
+/// start screen. The list can reach this cap PLUS ONE, because `prune` bounds the per-conversation
+/// DIRECTORY and `read_conversation_records` then appends the one pre-2026-09-15 sibling file,
+/// which nothing prunes -- so 17 rows, not 16. (This comment previously read "16 is well past what
+/// any resume UI offers -- only the single most recent offerable record is ever shown", which was
+/// true of the singular offer and stopped being true when the picker landed.) 16 rows is a list a
+/// person can still read, and dropping the number is a product decision rather than a correctness
+/// one -- nothing breaks at any value, older sessions simply stop being offerable sooner.
 const MAX_RECORDS_PER_CONVERSATION: usize = 16;
 
 /// How long a `write_record` temp file must be untouched before a later write deletes it.
@@ -75,49 +83,96 @@ pub struct ConversationRecord {
 }
 
 /// A previous conversation in this workspace that can be offered for continuation.
+///
+/// **This is the whole of what one record knows about a session, and it is thin**: a provider name,
+/// a session id, and two timestamps. There is no title, no first prompt, no turn or message count,
+/// no model -- nothing a picker could use to say what a session was ABOUT. `ConversationRecord` has
+/// never carried any of that, and the one place on disk that does -- the real Claude CLI's own
+/// transcript under `~/.claude/projects/` -- is deliberately off limits: `agent::transcript`'s
+/// module doc states that it "never reads or interprets transcript *content* -- only the file's
+/// existence and modification time", matching this project's repeated decision not to reimplement
+/// Claude's private storage format. So a UI built on this can honestly offer "which session" and
+/// "when", and must not fabricate "what about". Making richer labels possible means recording more
+/// HERE, at write time, not reading someone else's file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumableSession {
     pub provider: String,
     pub provider_session_id: String,
+    /// When this session was FIRST started. Preserved across resumes by
+    /// `conversation::persist_record`, which asks `created_at_of_existing_record` for the stamp the
+    /// session already had and only mints a new one when there is no earlier record at all.
+    ///
+    /// That lookup consults BOTH layouts. It used to read the directory record only, so the first
+    /// resume of a session recorded only in the pre-2026-09-15 flat file reset `created_at` to the
+    /// moment of the resume -- and `resumable_sessions`' de-duplication then discarded the flat
+    /// record that still held the true value, making the loss permanent. The doc here claimed
+    /// preservation unconditionally the whole time.
+    pub created_at: String,
+    /// When this session was last STARTED OR RESUMED -- not when it last had activity. Nothing
+    /// rewrites a record during a conversation, so a session used for an hour and a session opened
+    /// and abandoned carry the same stamp. Anything rendering this must not call it "last active".
     pub updated_at: String,
 }
 
-/// Answers "does this workspace have a session worth offering to continue?" without needing a live
-/// provider -- the start screen has to decide before one exists.
+/// Every session in this workspace worth offering, newest first.
 ///
-/// A workspace can hold several sessions, so this picks the one with the greatest `updated_at`
-/// among the OFFERABLE ones. Filtering before ranking is deliberate: if the most recent session is
-/// not offerable (its provider never advertised resume) the answer is the most recent one that is,
-/// not `None` -- the user still has a conversation worth continuing.
+/// Answers "what is there to continue?" without needing a live provider -- the start screen has to
+/// decide before one exists. Filtering happens before ranking, so a workspace whose most recent
+/// session is not offerable still offers the most recent one that is, rather than nothing.
 ///
-/// Returns `None` rather than an error for every negative case (no records, unreadable records, no
-/// record whose provider advertised resume): none of them are failures a user can act on, and all
-/// of them mean exactly one thing to the caller -- do not offer it.
+/// An empty vector covers every negative case (no records, unreadable records, no record whose
+/// provider advertised resume): none of them are failures a user can act on, and all of them mean
+/// exactly one thing to the caller -- there is nothing to offer.
+///
+/// **De-duplicated by `provider_session_id`**, keeping the higher-ranked record. One Claude session
+/// can legitimately be recorded twice (the pre-2026-09-15 single file, plus a per-session record
+/// written when it was later resumed); that was invisible while only the maximum was ever taken and
+/// would be two identical-looking rows in a list. The row kept is the right one because the flat
+/// file has had no writer since 2026-09-15 (`77569d6`) while the directory record for the same
+/// session is written on every adoption and resume -- so the directory record is stamped later by
+/// `epoch_millis`, and outranks it. (Wall-clock, therefore not a proof: a clock that moved backwards
+/// between the two writes would invert it. The cost of that is one row showing the older of two
+/// records for one session, which is a cosmetic wrong, not a wrong session.)
 ///
 /// **This does synchronous file I/O on the caller's thread**, and its one product caller
 /// (`shell::agent_backend::BackendGreeting::for_kind`, from the agent panel's `Ready` handler) is on
 /// the GTK main loop. That is bounded, not free: one `read_dir` plus at most
 /// `MAX_RECORDS_PER_CONVERSATION` + 1 small JSON parses. The cap is what makes the bound true --
 /// before it existed this grew with every session the workspace had ever had.
-pub fn resumable_session(conversation_id: &str) -> Option<ResumableSession> {
-    let record = read_conversation_records(conversation_id)
+pub fn resumable_sessions(conversation_id: &str) -> Vec<ResumableSession> {
+    let mut records: Vec<ConversationRecord> = read_conversation_records(conversation_id)
         .into_iter()
         .filter(|r| r.provider_advertised_resume && !r.provider_session_id.trim().is_empty())
-        .max_by(|a, b| updated_at_rank(a).cmp(&updated_at_rank(b)))?;
-    Some(ResumableSession {
-        provider: record.provider,
-        provider_session_id: record.provider_session_id,
-        updated_at: record.updated_at,
-    })
+        .collect();
+    // Descending: `updated_at_rank` orders oldest-to-newest, and a picker leads with the newest.
+    records.sort_by(|a, b| updated_at_rank(b).cmp(&updated_at_rank(a)));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    records
+        .into_iter()
+        // After the sort, so the row kept for a twice-recorded session is its higher-ranked one.
+        .filter(|record| seen.insert(record.provider_session_id.clone()))
+        .map(|record| ResumableSession {
+            provider: record.provider,
+            provider_session_id: record.provider_session_id,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        })
+        .collect()
 }
 
 /// Orders records by `updated_at`, then by session id.
 ///
-/// `updated_at` is parsed rather than compared as text: `conversation::epoch_millis` writes
-/// milliseconds since the epoch, and nothing pins that width -- a stamp in some other shape (the
-/// ISO-8601 strings this module's own older records carry) would sort above every real one purely
-/// because `'2' > '1'`. `None` orders below every parsed value, so a stamp we cannot place in time
-/// never wins by accident.
+/// `updated_at` is parsed rather than compared as text. Every stamp this project has ever written
+/// is epoch milliseconds -- `conversation::epoch_millis`, the one and only writer since the first
+/// record was ever persisted (`b567c98`, 2026-09-11), including under the flat pre-2026-09-15
+/// layout -- but nothing pins that WIDTH, and a text compare puts a shorter number above a longer
+/// one. Parsing also means a stamp that is not a number at all (a hand-edited or corrupted record,
+/// which `read_conversation_records` deliberately tolerates rather than discards) yields `None`,
+/// which orders below every parsed value instead of winning on `'2' > '1'`.
+///
+/// This comment previously said the module's own older records carry ISO-8601 strings. They do not:
+/// only the earliest test fixtures in this file ever did, added by `a21b55c` when this module had
+/// no caller and wrote nothing.
 ///
 /// The second component is `provider_session_id`, NOT `updated_at` again. Comparing `updated_at`
 /// against itself is not a tiebreak at all -- two records with byte-identical stamps would compare
@@ -164,8 +219,14 @@ fn read_conversation_records(conversation_id: &str) -> Vec<ConversationRecord> {
 ///
 /// `dir` is the per-conversation directory, so the legacy file is its sibling of the same name plus
 /// `.json`. A record whose `provider_session_id` already appears in the directory is NOT filtered
-/// out here: the ranking prefers the newer stamp on its own, and an ISO-8601 legacy stamp cannot
-/// parse, so it already orders below every record written since.
+/// out here; `resumable_sessions` de-duplicates after ranking instead, and keeps the right one
+/// because a directory record for a session is written LATER in wall-clock time than the flat file
+/// it supersedes -- see that function's doc for why, and for the one way that can be wrong.
+///
+/// It is worth being explicit about what this file holds, because a comment here used to get it
+/// wrong: its stamps are epoch milliseconds, exactly like a directory record's. The flat layout's
+/// only writer went through the same `conversation::epoch_millis`. It does not rank below newer
+/// records by failing to parse; it ranks by its real timestamp, and can legitimately sit above one.
 fn read_legacy_record(dir: &Path) -> Option<ConversationRecord> {
     let legacy = dir.with_extension("json");
     serde_json::from_str(&std::fs::read_to_string(legacy).ok()?).ok()
@@ -231,9 +292,10 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
 /// Writes through a temp file in the SAME directory, then renames over the target.
 ///
 /// `std::fs::write` truncates in place, so a crash (or a reader arriving mid-write) between the
-/// truncate and the last byte leaves a file that parses as nothing -- which `resumable_session`
-/// would read as "this workspace has no session at all". A rename within one directory is atomic,
-/// so a reader sees either the whole old record or the whole new one and never a partial file.
+/// truncate and the last byte leaves a file that parses as nothing -- which `resumable_sessions`
+/// silently skips, so the session it describes simply vanishes from the picker (and from the offer
+/// entirely, when it is the workspace's only record). A rename within one directory is atomic, so a
+/// reader sees either the whole old record or the whole new one and never a partial file.
 ///
 /// Surviving a POWER LOSS needs both fsyncs, not just the one this used to have: `sync_all` on the
 /// temp file puts its contents on the medium, and the `sync_all` on the DIRECTORY afterwards puts
@@ -313,8 +375,8 @@ fn prune(dir: &Path, keep: &Path) {
     if records.len() < MAX_RECORDS_PER_CONVERSATION {
         return;
     }
-    // Same order `resumable_session` ranks by, so what is dropped is exactly what that would never
-    // have offered. `keep` is excluded above and occupies one of the cap's slots.
+    // Same order `resumable_sessions` ranks by, so what is dropped is exactly what that would have
+    // listed last. `keep` is excluded above and occupies one of the cap's slots.
     records.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
     let over = records.len() + 1 - MAX_RECORDS_PER_CONVERSATION;
     for (_, _, path) in records.into_iter().take(over) {
@@ -329,6 +391,30 @@ pub fn load_conversation_record(
     let path = record_path(conversation_id, provider_session_id)?;
     let contents = std::fs::read_to_string(path)?;
     serde_json::from_str(&contents).map_err(std::io::Error::other)
+}
+
+/// The `created_at` this session already has on disk, in EITHER layout, or `None` if it has none.
+///
+/// `conversation::persist_record` calls this so a resume keeps the session's real start time
+/// instead of restamping it. The directory record is preferred; the pre-2026-09-15 flat file is the
+/// fallback, and only when it is genuinely the same session -- that file is keyed by conversation
+/// alone, so a DIFFERENT session's record can be sitting there, and inheriting its stamp would
+/// state one session's start time on another.
+///
+/// The flat-file arm is what makes `ResumableSession::created_at`'s doc true. Without it the first
+/// resume of a flat-layout-only session wrote `created_at = now`, and `resumable_sessions`'
+/// de-duplication then dropped the flat record that still held the real value -- one-way, since
+/// nothing rewrites the flat file either.
+pub(crate) fn created_at_of_existing_record(
+    conversation_id: &str,
+    provider_session_id: &str,
+) -> Option<String> {
+    if let Ok(record) = load_conversation_record(conversation_id, provider_session_id) {
+        return Some(record.created_at);
+    }
+    let dir = conversation_dir(conversation_id).ok()?;
+    let legacy = read_legacy_record(&dir)?;
+    (legacy.provider_session_id == provider_session_id).then_some(legacy.created_at)
 }
 
 #[cfg(test)]
@@ -414,6 +500,17 @@ mod tests {
         assert!(validate_path_component("provider_session_id", "3f2a1b4c-5d6e-4f70-8192-a3b4c5d6e7f8").is_ok());
     }
 
+    /// The most recent offerable session: the head of `resumable_sessions`.
+    ///
+    /// A TEST helper, not a public function. `agent` used to export this as `resumable_session`,
+    /// and nothing outside these tests ever called it once the start screen became a picker -- a
+    /// public API with no product caller, kept green by a test that asserted the head of a list is
+    /// the head of that list. The tests below still ask "which one would you offer", which is a
+    /// real question about the ranking; they just no longer need product code to ask it.
+    fn most_recent_offer(conversation_id: &str) -> Option<ResumableSession> {
+        resumable_sessions(conversation_id).into_iter().next()
+    }
+
     /// A record with the given ids, epoch-millis stamps, and resume advertised.
     fn record(conversation_id: &str, provider_session_id: &str, updated_at: &str) -> ConversationRecord {
         ConversationRecord {
@@ -439,7 +536,7 @@ mod tests {
     fn loading_an_unknown_conversation_is_an_error_and_offers_nothing() {
         let conv = unique_conversation_id("unknown");
         assert!(load_conversation_record(&conv, "prov-1").is_err());
-        assert!(resumable_session(&conv).is_none());
+        assert!(most_recent_offer(&conv).is_none());
     }
 
     #[test]
@@ -458,7 +555,7 @@ mod tests {
     fn a_record_that_advertised_resume_is_offerable() {
         let conv = unique_conversation_id("offerable");
         save_conversation_record(&record(&conv, "prov-1", "1000")).unwrap();
-        let resumable = resumable_session(&conv).expect("a record that advertised resume is offerable");
+        let resumable = most_recent_offer(&conv).expect("a record that advertised resume is offerable");
         assert_eq!(resumable.provider_session_id, "prov-1");
         assert_eq!(resumable.provider, "claude");
     }
@@ -471,18 +568,18 @@ mod tests {
         let mut without = record(&conv, "prov-1", "1000");
         without.provider_advertised_resume = false;
         save_conversation_record(&without).unwrap();
-        assert!(resumable_session(&conv).is_none());
+        assert!(most_recent_offer(&conv).is_none());
     }
 
     /// A blank provider session id can no longer even be written -- it is a path component now, so
     /// the validator rejects it before anything touches the disk. The `trim().is_empty()` guard in
-    /// `resumable_session` stays regardless, because it also covers a record hand-written or left
+    /// `resumable_sessions` stays regardless, because it also covers a record hand-written or left
     /// over from the older layout.
     #[test]
     fn a_blank_provider_session_id_cannot_be_written_and_is_never_offered() {
         let conv = unique_conversation_id("blank");
         assert!(save_conversation_record(&record(&conv, "   ", "1000")).is_err());
-        assert!(resumable_session(&conv).is_none());
+        assert!(most_recent_offer(&conv).is_none());
     }
 
     /// One workspace remembers MORE THAN ONE session, and the offer is the one whose `updated_at`
@@ -500,7 +597,7 @@ mod tests {
         let conv = unique_conversation_id("multi");
         save_conversation_record(&record(&conv, "prov-newer", "2000")).unwrap();
         save_conversation_record(&record(&conv, "prov-older", "1000")).unwrap();
-        let offered = resumable_session(&conv).expect("a workspace with two sessions still offers one");
+        let offered = most_recent_offer(&conv).expect("a workspace with two sessions still offers one");
         assert_eq!(offered.provider_session_id, "prov-newer");
     }
 
@@ -514,9 +611,9 @@ mod tests {
         let conv = unique_conversation_id("tie");
         save_conversation_record(&record(&conv, "prov-aaa", "2000")).unwrap();
         save_conversation_record(&record(&conv, "prov-zzz", "2000")).unwrap();
-        let first = resumable_session(&conv).unwrap().provider_session_id;
+        let first = most_recent_offer(&conv).unwrap().provider_session_id;
         for _ in 0..5 {
-            assert_eq!(resumable_session(&conv).unwrap().provider_session_id, first);
+            assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, first);
         }
         // Which one wins is arbitrary; that it is decided by the session id rather than by
         // directory order is what makes it reproducible.
@@ -530,7 +627,7 @@ mod tests {
         let conv = unique_conversation_id("corrupt");
         save_conversation_record(&record(&conv, "prov-good", "2000")).unwrap();
         std::fs::write(conversations_dir().unwrap().join(&conv).join("prov-corrupt.json"), "{ this is not json").unwrap();
-        let offered = resumable_session(&conv).expect("one unreadable record must not hide the rest");
+        let offered = most_recent_offer(&conv).expect("one unreadable record must not hide the rest");
         assert_eq!(offered.provider_session_id, "prov-good");
     }
 
@@ -542,25 +639,40 @@ mod tests {
         let conv = unique_conversation_id("legacy");
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        let legacy = record(&conv, "prov-legacy", "2026-09-10T00:00:00Z");
+        let legacy = record(&conv, "prov-legacy", "2000");
         std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
 
-        let offered = resumable_session(&conv).expect("an old-layout record must still be offered");
+        let offered = most_recent_offer(&conv).expect("an old-layout record must still be offered");
         assert_eq!(offered.provider_session_id, "prov-legacy");
     }
 
-    /// ...and it loses to any record written since, because its ISO-8601 stamp cannot be placed in
-    /// time at all and so ranks below every epoch-millis one.
+    /// ...and a record written since outranks it only when its stamp really is greater. Both
+    /// layouts hold epoch millis, so there is no free win for either one.
+    ///
+    /// This test used to give the legacy record an ISO-8601 stamp and assert the directory record
+    /// always wins "because an ISO-8601 stamp cannot be placed in time". Production never wrote
+    /// such a stamp; against real data the comparison is an ordinary numeric one, which is what the
+    /// two halves below pin.
     #[test]
-    fn a_new_layout_record_outranks_the_old_single_file_one() {
+    fn a_new_layout_record_outranks_the_old_single_file_one_only_by_its_stamp() {
         let conv = unique_conversation_id("legacy-vs-new");
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        let legacy = record(&conv, "prov-legacy", "2026-09-10T00:00:00Z");
+        let legacy = record(&conv, "prov-legacy", "2000");
         std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
-        save_conversation_record(&record(&conv, "prov-new", "1000")).unwrap();
+        save_conversation_record(&record(&conv, "prov-new", "3000")).unwrap();
+        assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, "prov-new");
 
-        assert_eq!(resumable_session(&conv).unwrap().provider_session_id, "prov-new");
+        let older = unique_conversation_id("new-vs-legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = record(&older, "prov-legacy", "3000");
+        std::fs::write(dir.join(format!("{older}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        save_conversation_record(&record(&older, "prov-new", "2000")).unwrap();
+        assert_eq!(
+            most_recent_offer(&older).unwrap().provider_session_id,
+            "prov-legacy",
+            "a legacy record with the greater stamp really does lead"
+        );
     }
 
     /// Records are capped, so a project opened daily for a year does not turn the agent panel's
@@ -581,7 +693,7 @@ mod tests {
         assert!(kept.contains(&"prov-020.json".to_string()), "the newest must survive: {kept:?}");
         assert!(!kept.contains(&"prov-000.json".to_string()), "the oldest must be dropped: {kept:?}");
         // And the offer is still the newest of what is left.
-        assert_eq!(resumable_session(&conv).unwrap().provider_session_id, "prov-020");
+        assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, "prov-020");
     }
 
     /// A temp file orphaned by a process killed mid-write is swept; one a concurrent writer may
@@ -603,5 +715,187 @@ mod tests {
 
         assert!(!stale.exists(), "an orphaned temp file must be swept");
         assert!(fresh.exists(), "a temp file a concurrent writer may still hold must be left alone");
+    }
+
+    // ---- The list, not just the head ----------------------------------------------------------
+    //
+    // A workspace can hold up to `MAX_RECORDS_PER_CONVERSATION` sessions, plus the one legacy file.
+    // The tests above ask "which ONE would you offer" via `most_recent_offer`; these pin the answer to
+    // "which ONES are there", which is what a picker renders.
+
+    /// The ordering key is `updated_at`, not write order -- the same property the singular offer
+    /// has, asserted across the whole list rather than only at its head.
+    #[test]
+    fn every_offerable_session_is_listed_newest_first() {
+        let conv = unique_conversation_id("list-order");
+        save_conversation_record(&record(&conv, "prov-mid", "2000")).unwrap();
+        save_conversation_record(&record(&conv, "prov-new", "3000")).unwrap();
+        save_conversation_record(&record(&conv, "prov-old", "1000")).unwrap();
+
+        let ids: Vec<String> =
+            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+        assert_eq!(ids, vec!["prov-new", "prov-mid", "prov-old"]);
+    }
+
+    /// The same filter the singular offer applies, applied to every element: a record whose
+    /// provider never advertised resume is not offerable, so a picker must not list it as one.
+    #[test]
+    fn the_list_omits_records_whose_provider_never_advertised_resume() {
+        let conv = unique_conversation_id("list-filter");
+        save_conversation_record(&record(&conv, "prov-yes", "2000")).unwrap();
+        let mut no = record(&conv, "prov-no", "3000");
+        no.provider_advertised_resume = false;
+        save_conversation_record(&no).unwrap();
+
+        let ids: Vec<String> =
+            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+        assert_eq!(ids, vec!["prov-yes"], "the newest record is not offerable and must not be listed");
+    }
+
+    /// The pre-2026-09-15 single file is a row like any other, ranked by its own stamp.
+    ///
+    /// **Not "it sorts last".** A test here used to assert that, using an ISO-8601 fixture stamp and
+    /// reasoning that an unparseable stamp orders below everything. Production never wrote such a
+    /// stamp: the flat layout's only writer (`b567c98`) used `conversation::epoch_millis`, the same
+    /// as today's. So the fixture below is epoch millis, and the legacy record leads the list --
+    /// which is the real behaviour and the opposite of what was pinned before.
+    #[test]
+    fn the_old_single_file_record_is_ranked_by_its_stamp_like_any_other() {
+        let conv = unique_conversation_id("list-legacy");
+        let dir = conversations_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = record(&conv, "prov-legacy", "9000");
+        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        save_conversation_record(&record(&conv, "prov-new", "1000")).unwrap();
+
+        let ids: Vec<String> =
+            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+        assert_eq!(ids, vec!["prov-legacy", "prov-new"], "the greater stamp leads, whichever layout wrote it");
+    }
+
+    /// One Claude session is one row, even when it is recorded in BOTH layouts.
+    ///
+    /// Invisible while only the top-ranked record was ever shown; a real duplicate the moment a
+    /// list is rendered. It happens for real: a workspace with an old `<conversation_id>.json`
+    /// whose session is then resumed gets a `<conversation_id>/<that session>.json` beside it.
+    /// The surviving row is the higher-ranked one, so the newer stamp is what the user sees.
+    ///
+    /// Both stamps here are epoch millis, because that is what both layouts really hold. The
+    /// directory record is the greater one for the reason `resumable_sessions`' doc gives: it is
+    /// written later in wall-clock time than the flat file it supersedes, not because the flat
+    /// file's stamp fails to parse.
+    #[test]
+    fn one_session_recorded_in_both_layouts_is_listed_once() {
+        let conv = unique_conversation_id("list-dedupe");
+        let dir = conversations_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = record(&conv, "prov-same", "4000");
+        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        save_conversation_record(&record(&conv, "prov-same", "5000")).unwrap();
+
+        let listed = resumable_sessions(&conv);
+        assert_eq!(listed.len(), 1, "one Claude session must be one row: {listed:?}");
+        assert_eq!(listed[0].updated_at, "5000", "the higher-ranked record is the one kept");
+    }
+
+    /// Byte-identical stamps must not shuffle the list between runs. `updated_at_rank`'s second
+    /// component (the session id) is what makes the order total; without it two same-millisecond
+    /// sessions would land in whatever order `read_dir` yielded them.
+    #[test]
+    fn the_listed_order_is_total_so_identical_stamps_do_not_shuffle() {
+        let conv = unique_conversation_id("list-tie");
+        save_conversation_record(&record(&conv, "prov-aaa", "2000")).unwrap();
+        save_conversation_record(&record(&conv, "prov-zzz", "2000")).unwrap();
+        let first: Vec<String> =
+            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+        for _ in 0..5 {
+            let again: Vec<String> =
+                resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+            assert_eq!(again, first);
+        }
+        // Which comes first is arbitrary; that it is decided by the id rather than by directory
+        // order is the property. Descending, so the greater id leads -- the same element
+        // `most_recent_offer` picks.
+        assert_eq!(first, vec!["prov-zzz", "prov-aaa"]);
+    }
+
+    /// A resume must keep the session's real start time even when the only record it has is the
+    /// pre-2026-09-15 flat file.
+    ///
+    /// The directory-record case was always covered; this one was not, and was silently broken:
+    /// `conversation::persist_record` looked the old stamp up by `<conv>/<session>.json` only, so
+    /// the first resume of a flat-layout-only session wrote `created_at = now`, and the
+    /// de-duplication in `resumable_sessions` then dropped the flat record that still held the real
+    /// value. One-way, because nothing rewrites the flat file either.
+    #[test]
+    fn a_created_at_recorded_only_in_the_old_layout_survives_the_move_to_the_new_one() {
+        let conv = unique_conversation_id("created-legacy");
+        let dir = conversations_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut legacy = record(&conv, "prov-same", "2000");
+        legacy.created_at = "1234".into();
+        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        assert_eq!(created_at_of_existing_record(&conv, "prov-same").as_deref(), Some("1234"));
+    }
+
+    /// ...but only for the SAME session. The flat file is keyed by conversation alone, so a
+    /// workspace's one legacy record can belong to a different session entirely; inheriting its
+    /// stamp would state one session's start time on another.
+    #[test]
+    fn a_different_sessions_legacy_created_at_is_not_inherited() {
+        let conv = unique_conversation_id("created-legacy-other");
+        let dir = conversations_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut legacy = record(&conv, "prov-other", "2000");
+        legacy.created_at = "1234".into();
+        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        assert_eq!(created_at_of_existing_record(&conv, "prov-same"), None);
+    }
+
+    /// The directory record wins when both exist, and a session with neither has no stamp to keep.
+    #[test]
+    fn the_directory_record_is_preferred_and_an_unknown_session_has_no_created_at() {
+        let conv = unique_conversation_id("created-both");
+        let dir = conversations_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut legacy = record(&conv, "prov-same", "2000");
+        legacy.created_at = "1234".into();
+        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        // `record()` writes created_at "1000".
+        save_conversation_record(&record(&conv, "prov-same", "5000")).unwrap();
+
+        assert_eq!(created_at_of_existing_record(&conv, "prov-same").as_deref(), Some("1000"));
+        assert_eq!(created_at_of_existing_record(&conv, "prov-never-seen"), None);
+    }
+
+    /// A listed session carries both stamps, because they mean different things: `created_at` is
+    /// when the conversation began and `updated_at` is when it was last opened. A picker that
+    /// showed only one would have to pick which question it was answering and would answer the
+    /// other one wrongly.
+    #[test]
+    fn a_listed_session_carries_the_created_at_its_record_was_first_written_with() {
+        let conv = unique_conversation_id("list-created");
+        // `record()` writes created_at "1000"; persist_record's real preservation across resumes is
+        // covered in conversation.rs. This pins only that the field reaches the caller at all.
+        save_conversation_record(&record(&conv, "prov-1", "9000")).unwrap();
+        let listed = resumable_sessions(&conv);
+        assert_eq!(listed[0].created_at, "1000");
+        assert_eq!(listed[0].updated_at, "9000");
+        assert_eq!(listed[0].provider, "claude");
+    }
+
+    /// The retention cap bounds the picker too: whatever a workspace accumulates, a start screen
+    /// renders at most `MAX_RECORDS_PER_CONVERSATION` rows (plus at most one legacy record).
+    #[test]
+    fn the_list_is_bounded_by_the_retention_cap() {
+        let conv = unique_conversation_id("list-cap");
+        for i in 0..(MAX_RECORDS_PER_CONVERSATION as u32 + 5) {
+            save_conversation_record(&record(&conv, &format!("prov-{i:03}"), &(1000 + i).to_string())).unwrap();
+        }
+        let listed = resumable_sessions(&conv);
+        assert_eq!(listed.len(), MAX_RECORDS_PER_CONVERSATION);
+        assert_eq!(listed[0].provider_session_id, "prov-020", "newest first");
     }
 }

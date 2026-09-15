@@ -38,7 +38,7 @@ pub mod transcript;
 
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
-pub use persistence::{resumable_session, ResumableSession};
+pub use persistence::{resumable_sessions, ResumableSession};
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 pub use session::AgentSession;
@@ -54,4 +54,6 @@ pub use provider::{
     InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, StreamingPreference,
 };
-pub use providers::claude_sidecar::{BackpressureStats, ClaudeSidecarProvider, EXPECTED_VERDANDI_REVISION};
+pub use providers::claude_sidecar::{
+    BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME, EXPECTED_VERDANDI_REVISION,
+};

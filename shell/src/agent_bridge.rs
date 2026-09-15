@@ -134,34 +134,46 @@ pub(crate) fn serialize_command_result_for_js(request_id: &str, result: Result<(
     }
 }
 
-/// `{"kind":"hello","backend":...,"permissionModes":[...],"resumeAvailable":false,...}` -- sent once,
+/// `{"kind":"hello","backend":...,"permissionModes":[...],"resumableSessions":[...],...}` -- sent once,
 /// in reply to the frontend's `ready`, BEFORE any snapshot.
 ///
-/// It exists because the frontend's start screen cannot be honest without it. The two backends
-/// genuinely differ in what they can offer: the legacy backend has a real, tested interactive
-/// permission gate, while the sidecar path ships BYPASS only in this milestone (its `interactive`
-/// and `verdandi_rules` modes are confirmed to behave identically in the current sidecar, so
-/// presenting them as distinct choices would be a lie). Hardcoding either shape into the frontend
-/// would make it wrong for the other.
+/// It exists because the frontend's start screen cannot be honest without it. What a backend can
+/// offer is a runtime fact -- which permission policies this client can drive, which Verdandi
+/// baseline it expects, which sessions this workspace remembers -- and hardcoding any of it into
+/// the frontend would make the frontend wrong for whichever backend it was not written against.
 ///
-/// `resumableSession` is the whole resume gate: non-null only when the server advertised resume,
-/// this client implements it, AND this workspace has a persisted provider session id. The frontend
-/// renders "continue previous session" on exactly that field and nothing else, so the control
-/// cannot appear for a workspace with nothing to continue.
+/// `permissionModes` is deliberately NOT narrowed by backend name: both backends have a real,
+/// separately verified interactive gate, so both currently offer the same two. (This doc previously
+/// said "the sidecar path ships BYPASS only in this milestone", which stopped being true when
+/// `CLIENT_IMPLEMENTED_PERMISSION_MODES` replaced the per-backend narrowing -- see
+/// `agent_backend::tests::both_backends_offer_the_same_permission_policies_because_both_implement_them`.)
+///
+/// `resumableSessions` is the whole resume gate: one entry per session for which the server
+/// advertised resume, this client implements it, AND this workspace has a persisted provider
+/// session id. The frontend renders its conversation picker on exactly that array and nothing else,
+/// so no row can appear for a workspace with nothing to continue, and an empty array is the normal
+/// state rather than a missing one.
+///
+/// Each entry carries only what a record knows: a provider name, the Claude session id, and the two
+/// timestamps. There is no title and no summary anywhere in this payload because there is none on
+/// disk -- see `agent::ResumableSession`'s own doc for why the one file that could supply one is
+/// deliberately not read. A frontend rendering this must not invent a label for a row.
 pub(crate) fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
     json!({
         "kind": "hello",
         "backend": greeting.kind.as_str(),
         "projectDir": greeting.project_dir.to_string_lossy(),
         "permissionModes": greeting.permission_modes,
-        // The three-term intersection, already evaluated: server-advertised (last known) ∩
-        // client-implemented ∩ this workspace has a persisted provider session. `null` when any
-        // term fails, and the frontend renders the continue option on exactly that.
-        "resumableSession": greeting.resumable.as_ref().map(|r| json!({
+        // The three-term intersection, already evaluated per session: server-advertised (last
+        // known) ∩ client-implemented ∩ this workspace has that persisted provider session.
+        // Always an array; empty when any term fails, and the frontend renders its picker rows on
+        // exactly this and nothing else.
+        "resumableSessions": greeting.resumable.iter().map(|r| json!({
             "provider": r.provider,
             "providerSessionId": r.provider_session_id,
+            "createdAt": r.created_at,
             "updatedAt": r.updated_at,
-        })),
+        })).collect::<Vec<_>>(),
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
     })
     .to_string()
@@ -847,38 +859,66 @@ mod tests {
         assert!(parsed["expectedVerdandiRevision"].is_string());
     }
 
-    #[test]
-    fn hello_offers_nothing_to_continue_when_the_workspace_has_no_record() {
-        let greeting = crate::agent_backend::BackendGreeting {
+    /// A greeting with the given sessions, for the hello-envelope tests below.
+    fn greeting_with(
+        resumable: Vec<agent::ResumableSession>,
+    ) -> crate::agent_backend::BackendGreeting {
+        crate::agent_backend::BackendGreeting {
             kind: crate::agent_backend::BackendKind::Sidecar,
             project_dir: std::path::PathBuf::from("/tmp/project"),
             permission_modes: &["bypass"],
             expected_verdandi_revision: Some("abc1234"),
-            resumable: None,
-        };
-        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
-        assert!(parsed["resumableSession"].is_null());
+            resumable,
+        }
     }
 
+    fn resumable(provider_session_id: &str, created_at: &str, updated_at: &str) -> agent::ResumableSession {
+        agent::ResumableSession {
+            provider: "claude".into(),
+            provider_session_id: provider_session_id.into(),
+            created_at: created_at.into(),
+            updated_at: updated_at.into(),
+        }
+    }
+
+    /// Every session the workspace can continue reaches the frontend, in the order Rust ranked
+    /// them. The frontend renders rows in array order and does no sorting of its own, so this array
+    /// IS the picker's order.
     #[test]
-    fn hello_offers_the_claude_session_id_when_the_workspace_has_one() {
+    fn hello_lists_every_session_the_workspace_can_continue_in_rank_order() {
+        let greeting = greeting_with(vec![
+            resumable("1857dcd5-973b-46a2", "1757600000000", "1757700000000"),
+            resumable("99b2b206-0000-4000", "1757100000000", "1757200000000"),
+        ]);
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        let sessions = parsed["resumableSessions"].as_array().expect("an array, always");
+        assert_eq!(sessions.len(), 2);
         // The CLAUDE id, not Verdandi's: resuming mints a new Verdandi session, so a record keyed
         // on that one would point at something that stops existing the moment it is used.
-        let greeting = crate::agent_backend::BackendGreeting {
-            kind: crate::agent_backend::BackendKind::Sidecar,
-            project_dir: std::path::PathBuf::from("/tmp/project"),
-            permission_modes: &["bypass"],
-            expected_verdandi_revision: Some("abc1234"),
-            resumable: Some(agent::ResumableSession {
-                provider: "claude".into(),
-                provider_session_id: "1857dcd5-973b-46a2".into(),
-                updated_at: "1757700000000".into(),
-            }),
-        };
+        assert_eq!(sessions[0]["providerSessionId"], "1857dcd5-973b-46a2");
+        assert_eq!(sessions[0]["provider"], "claude");
+        assert_eq!(sessions[0]["createdAt"], "1757600000000");
+        assert_eq!(sessions[0]["updatedAt"], "1757700000000");
+        assert_eq!(sessions[1]["providerSessionId"], "99b2b206-0000-4000");
+    }
+
+    /// Empty, not null or absent: the frontend maps over this field unconditionally, and a workspace
+    /// with nothing to continue is a normal state rather than a missing one.
+    #[test]
+    fn hello_carries_an_empty_list_when_the_workspace_has_nothing_to_continue() {
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting_with(Vec::new()))).unwrap();
+        assert_eq!(parsed["resumableSessions"], json!([]));
+    }
+
+    /// Both stamps cross the bridge, because they answer different questions: `createdAt` is when
+    /// the conversation began and `updatedAt` is when it was last opened. The frontend shows the
+    /// first only when it differs from the second, which it cannot do if only one is sent.
+    #[test]
+    fn hello_carries_both_stamps_for_each_session() {
+        let greeting = greeting_with(vec![resumable("prov-1", "1000", "9000")]);
         let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
-        assert_eq!(parsed["resumableSession"]["providerSessionId"], "1857dcd5-973b-46a2");
-        assert_eq!(parsed["resumableSession"]["provider"], "claude");
-        assert_eq!(parsed["resumableSession"]["updatedAt"], "1757700000000");
+        assert_eq!(parsed["resumableSessions"][0]["createdAt"], "1000");
+        assert_eq!(parsed["resumableSessions"][0]["updatedAt"], "9000");
     }
 
     #[test]
@@ -942,7 +982,11 @@ mod tests {
         let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
         assert_eq!(parsed["backend"], "legacy");
         assert_eq!(parsed["permissionModes"], json!(["auto", "bypass"]));
-        assert!(parsed["resumableSession"].is_null(), "the legacy backend can never offer a resume");
+        assert_eq!(
+            parsed["resumableSessions"],
+            json!([]),
+            "the legacy backend can never offer a resume"
+        );
         assert!(parsed["expectedVerdandiRevision"].is_null());
     }
 }

@@ -631,13 +631,13 @@ fn ready_payloads(
     // A session this panel just handed to a terminal must not also be offered for resume on the
     // start screen: nothing holds a lock on it, so taking the offer would put two writers on one
     // transcript -- which is the exact hazard the handoff card warns about. This has to happen here
-    // rather than only in the frontend, because `hello` is recomputed on every mount and
-    // `agent::resumable_session` picks the record with the greatest `updated_at` -- which, right
-    // after a handoff, is the handed-over session itself. Any OTHER stored session is untouched.
-    if let (Some(command), Some(resumable)) = (last_handoff, greeting.resumable.as_ref()) {
-        if resumable.provider_session_id == command.provider_session_id() {
-            greeting.resumable = None;
-        }
+    // rather than only in the frontend, because `hello` is recomputed on every mount and the
+    // handed-over session has the greatest `updated_at`, so it would otherwise head the list.
+    //
+    // It removes exactly that one row. Clearing the whole offer would hide every other session the
+    // workspace remembers, which is a different and worse bug than the one this prevents.
+    if let Some(command) = last_handoff {
+        greeting.resumable.retain(|r| r.provider_session_id != command.provider_session_id());
     }
 
     let mut payloads = vec![serialize_hello_for_js(&greeting)];
@@ -1057,43 +1057,47 @@ mod tests {
     /// is recomputed here on every mount, and `agent::resumable_session` picks the most recently
     /// updated record, which right after a handoff is the handed-over session itself.
     #[test]
-    fn the_session_that_was_handed_over_is_no_longer_offered_for_resume() {
+    fn a_handoff_drops_exactly_the_session_it_gave_away_and_no_other() {
+        // One list, two rows: the session just handed to a terminal, and an unrelated one the
+        // workspace also remembers. Before the picker landed, `resumable` held at most one record
+        // and these were two tests that could not tell "dropped the right row" from "cleared the
+        // offer" -- the distinction only becomes testable when the list can hold both at once.
         let greeting = BackendGreeting {
             kind: BackendKind::Sidecar,
             project_dir: PathBuf::from("/home/user/project"),
             permission_modes: crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
             expected_verdandi_revision: None,
-            resumable: Some(agent::ResumableSession {
-                provider: "claude".to_string(),
-                provider_session_id: "1857dcd5-973b-46a2".to_string(),
-                updated_at: "1757700000000".to_string(),
-            }),
+            resumable: vec![
+                agent::ResumableSession {
+                    provider: "claude".to_string(),
+                    provider_session_id: "1857dcd5-973b-46a2".to_string(),
+                    created_at: "1757600000000".to_string(),
+                    updated_at: "1757700000000".to_string(),
+                },
+                agent::ResumableSession {
+                    provider: "claude".to_string(),
+                    provider_session_id: "some-other-session".to_string(),
+                    created_at: "1757500000000".to_string(),
+                    updated_at: "1757600000000".to_string(),
+                },
+            ],
         };
         let command = a_command();
         let payloads = ready_payloads(greeting, None, Some(&command));
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
-        assert!(hello["resumableSession"].is_null(), "the handed-over session is still on offer");
-    }
-
-    /// ...and only that one. Suppressing every stored session would hide a conversation nobody gave
-    /// away.
-    #[test]
-    fn an_unrelated_stored_session_stays_on_offer_after_a_handoff() {
-        let greeting = BackendGreeting {
-            kind: BackendKind::Sidecar,
-            project_dir: PathBuf::from("/home/user/project"),
-            permission_modes: crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
-            expected_verdandi_revision: None,
-            resumable: Some(agent::ResumableSession {
-                provider: "claude".to_string(),
-                provider_session_id: "some-other-session".to_string(),
-                updated_at: "1757700000000".to_string(),
-            }),
-        };
-        let command = a_command();
-        let payloads = ready_payloads(greeting, None, Some(&command));
-        let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
-        assert_eq!(hello["resumableSession"]["providerSessionId"], "some-other-session");
+        let offered: Vec<&str> = hello["resumableSessions"]
+            .as_array()
+            .expect("the offer is a list")
+            .iter()
+            .map(|s| s["providerSessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            offered,
+            vec!["some-other-session"],
+            "a handoff must drop the session it gave away -- and only that one. Nothing holds a \
+             lock on it, so re-offering it would put two writers on one transcript; clearing the \
+             whole list instead would hide a conversation nobody gave away."
+        );
     }
 
     /// The sequencing the whole feature's honesty rests on: while the close worker has not reported,
