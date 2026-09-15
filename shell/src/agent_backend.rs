@@ -391,44 +391,73 @@ impl AgentBackend {
 /// current sidecar. A third button that does nothing different is a worse lie than a missing one.
 pub(crate) const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
 
+/// Whether THIS CLIENT can drive a resume for a backend kind, before any provider exists.
+///
+/// Read off the capability constants the two backends own rather than matched on the backend's
+/// name, so the gate cannot drift away from the thing it is standing in for. The legacy value is
+/// additionally pinned at compile time beside `LEGACY_CAPABILITIES`; the sidecar's is
+/// `agent::CLIENT_IMPLEMENTS_RESUME`, whose own doc explains that it stays false until the call
+/// behind it does something real.
+///
+/// This is only the CLIENT half. The server half -- whether the provider advertises resume -- is
+/// the `provider_advertised_resume` flag on each persisted record (last known, since no provider
+/// exists yet), and is re-checked live when a resume is actually attempted.
+fn client_implements_resume(kind: BackendKind) -> bool {
+    match kind {
+        BackendKind::Legacy => LEGACY_CAPABILITIES.resume,
+        BackendKind::Sidecar => agent::CLIENT_IMPLEMENTS_RESUME,
+    }
+}
+
 /// What the frontend is told at handshake time, before any session exists.
 pub(crate) struct BackendGreeting {
     pub(crate) kind: BackendKind,
     pub(crate) project_dir: PathBuf,
     pub(crate) permission_modes: &'static [&'static str],
     pub(crate) expected_verdandi_revision: Option<&'static str>,
-    /// The previous conversation in THIS workspace, when there is one worth offering.
+    /// Every previous conversation in THIS workspace worth offering, newest first. Empty when
+    /// there is nothing to continue, which is the normal case for a fresh workspace.
     ///
-    /// `Some` only when all three terms hold: the provider advertised `resume` when the record was
-    /// written (server side), this backend kind implements resume (client side), and this workspace
-    /// has a persisted provider session id.
+    /// Non-empty only when all three terms hold: the provider advertised `resume` when the record
+    /// was written (server side), this backend kind implements resume (client side), and this
+    /// workspace has at least one persisted provider session id.
     ///
     /// The server term is the LAST-KNOWN advertisement rather than a live one, because the start
     /// screen has to decide before any provider exists. It is re-checked for real when resume is
     /// attempted -- `ClaudeSidecarProvider::resume_session` refuses outright if the live handshake
     /// no longer advertises it -- so a stale `true` here produces an honest failure, never a silent
     /// fresh session.
-    pub(crate) resumable: Option<ResumableSession>,
+    ///
+    /// **What one entry can say is thin, and deliberately not padded.** `agent::ResumableSession`
+    /// carries a provider name, a Claude session id and two timestamps -- no title, no first
+    /// prompt, no turn count. See its own doc for why the one place on disk that could supply a
+    /// subject line (Claude's private transcript) is off limits. A picker built on this offers
+    /// "which session" and "when"; it must not invent "what about".
+    pub(crate) resumable: Vec<ResumableSession>,
 }
 
 impl BackendGreeting {
     /// **Does synchronous file I/O, and its caller is the GTK main loop** (`agent_panel`'s
-    /// `InboundMessage::Ready` handler). `agent::resumable_session` reads one directory and parses
+    /// `InboundMessage::Ready` handler). `agent::resumable_sessions` reads one directory and parses
     /// the small JSON records in it; `agent::persistence`'s own retention cap is what keeps that
     /// bounded rather than growing with every session the workspace has ever had. It has not been
     /// moved off the main thread, and if the cap ever rises far it should be.
     pub(crate) fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
         // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
-        let resumable = match kind {
-            // The legacy backend cannot resume at all, so the client term of the intersection is
-            // false and nothing is offered, however many records exist for this directory.
-            BackendKind::Legacy => None,
-            BackendKind::Sidecar => project_dir
+        //
+        // Gated on the capability rather than on the backend's name: a backend this client cannot
+        // drive a resume through offers nothing, however many records the directory holds. That is
+        // the whole legacy case today, and it also means the lookup is skipped entirely there.
+        let resumable: Vec<ResumableSession> = if client_implements_resume(kind) {
+            project_dir
                 .canonicalize()
                 .ok()
                 .map(|cwd| agent::conversation_id_for_cwd(&cwd))
-                .and_then(|id| agent::resumable_session(&id)),
+                .map(|id| agent::resumable_sessions(&id))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
         match kind {
             BackendKind::Legacy => Self {
@@ -515,13 +544,22 @@ mod tests {
         // capability constant `AgentBackend::capabilities()` returns, and the `hello` envelope's
         // own `resumeAvailable`. They are produced by different code and must not drift apart.
         // (resume/fork being false at all is enforced at compile time next to the constant.)
-        let greeting = BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/tmp"));
+        //
+        // A redirected, empty workspace rather than `/tmp`: `for_kind` really does read the disk
+        // when the capability allows it, so against the real `$XDG_STATE_HOME` this assertion would
+        // depend on which sessions the developer's own machine happens to remember.
+        let greeting = BackendGreeting::for_kind(BackendKind::Legacy, an_empty_workspace());
         let hello: serde_json::Value =
             serde_json::from_str(&crate::agent_bridge::serialize_hello_for_js(&greeting)).unwrap();
-        // `resumableSession` replaced the old boolean `resumeAvailable`: the gate is now "is there a
-        // specific session to continue", not "could this backend resume in principle". For legacy
-        // both answers are no, and they must agree.
-        assert!(hello["resumableSession"].is_null());
+        // `resumableSessions` replaced the old boolean `resumeAvailable`: the gate is now "WHICH
+        // sessions are there to continue", not "could this backend resume in principle". For legacy
+        // the list is always empty, and the two surfaces must agree about that.
+        //
+        // Asserted as an empty ARRAY rather than as "not present": a `serde_json::Value` index with
+        // an unknown key yields `Null`, so an `is_null()` check here would keep passing if the field
+        // were renamed or dropped -- which is exactly how the previous version of this line survived
+        // the rename that made it meaningless.
+        assert_eq!(hello["resumableSessions"], serde_json::json!([]));
         // resume/fork being false is enforced at compile time beside the constant; asserting it
         // again here would be a constant assertion, which is what the previous version of this
         // test was.
@@ -553,5 +591,92 @@ mod tests {
 
         let fatal: BackendError = ConversationError::NoSession.into();
         assert!(!fatal.benign);
+    }
+
+    // ---- The resume offer is a list, and it is gated on a capability ---------------------------
+
+    /// A fresh workspace directory with no conversation records at all, under the redirected root.
+    fn an_empty_workspace() -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        agent::state_dirs::test_workspace_dir("no-records")
+    }
+
+    /// A workspace holding one genuinely offerable record, and the id it is filed under.
+    ///
+    /// Real records under a real (redirected) state root, written through `agent`'s own writer --
+    /// not a stub. `redirect_state_to_a_test_root` is what keeps `cargo test -p shell` out of the
+    /// developer's own `$XDG_STATE_HOME`; without it these tests would read whatever real sessions
+    /// this machine happens to have, which is a machine-dependent answer, not a test.
+    fn a_workspace_with_one_offerable_session() -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("resume-gate");
+        let canonical = dir.canonicalize().expect("a just-created directory canonicalizes");
+        agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
+            conversation_id: agent::conversation_id_for_cwd(&canonical),
+            provider: "claude".into(),
+            provider_session_id: "prov-offerable".into(),
+            canonical_cwd: canonical.to_string_lossy().into_owned(),
+            created_at: "1000".into(),
+            updated_at: "2000".into(),
+            provider_advertised_resume: true,
+        })
+        .expect("writing a record into the test state root should succeed");
+        dir
+    }
+
+    /// The gate really is `LEGACY_CAPABILITIES.resume`, observed through what the greeting offers.
+    ///
+    /// The `assert_eq!` is against the CONSTANT, not against `false`, and the workspace really does
+    /// hold an offerable record -- which is what makes this a test rather than a restatement of the
+    /// function body. Three ways to break it, all caught:
+    ///
+    /// - delete the gate in `for_kind`: the record is found, `true != false`, fail;
+    /// - keep the gate but write it as `Legacy => false` (the name match this is supposed to
+    ///   prevent), then flip `LEGACY_CAPABILITIES.resume` to `true`: nothing is offered,
+    ///   `false != true`, fail -- this is the drift the previous version of this test claimed to
+    ///   catch and could not, because it compared two values that moved together by construction;
+    /// - flip the constant with the gate correctly derived from it: both sides move, pass. A
+    ///   legitimate capability change is not a test failure, and this must not become a change
+    ///   detector for one.
+    ///
+    /// The sidecar half is asserted first, and it is load-bearing rather than decorative: without
+    /// it "Legacy offers nothing" cannot be told apart from "there was nothing to offer".
+    #[test]
+    fn the_resume_offer_is_gated_on_the_capability_not_on_the_backend_name() {
+        let workspace = a_workspace_with_one_offerable_session();
+
+        let sidecar = BackendGreeting::for_kind(BackendKind::Sidecar, workspace.clone());
+        assert_eq!(
+            !sidecar.resumable.is_empty(),
+            agent::CLIENT_IMPLEMENTS_RESUME,
+            "the planted record has to be genuinely offerable, or the legacy half below proves nothing"
+        );
+
+        let legacy = BackendGreeting::for_kind(BackendKind::Legacy, workspace);
+        assert_eq!(
+            !legacy.resumable.is_empty(),
+            LEGACY_CAPABILITIES.resume,
+            "the same record, the same workspace -- only the capability differs"
+        );
+    }
+
+    /// A refused resume must fail AS a resume. The legacy backend has none, and the check happens
+    /// before anything is spawned, so this runs no `claude` process.
+    ///
+    /// The picker makes this reachable from more places (any row, not just one), so it is worth
+    /// pinning here rather than trusting the call site: a resume that quietly became a fresh session
+    /// would hand the user a conversation with none of the history they picked it for.
+    #[test]
+    fn the_legacy_backend_refuses_a_resume_rather_than_starting_a_fresh_session() {
+        let error = AgentBackend::start(
+            BackendKind::Legacy,
+            Path::new("/tmp"),
+            PermissionMode::Bypass,
+            Some("claude-abc"),
+        )
+        .err()
+        .expect("the legacy backend must refuse a resume");
+        assert!(!error.benign, "a refused resume ends the attempt; it is not an ordering complaint");
+        assert!(error.message.contains("cannot continue a previous session"), "got: {}", error.message);
     }
 }

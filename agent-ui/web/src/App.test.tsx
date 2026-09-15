@@ -36,7 +36,7 @@ const HELLO: Hello = {
   backend: "legacy",
   projectDir: "/home/user/project",
   permissionModes: ["auto", "bypass"],
-  resumableSession: null,
+  resumableSessions: [],
   expectedVerdandiRevision: null,
 };
 
@@ -240,7 +240,7 @@ describe("App handoff to a terminal", () => {
     const resumableHello: Hello = {
       ...HELLO,
       backend: "sidecar",
-      resumableSession: { provider: "claude", providerSessionId: "1857dcd5-973b-46a2", updatedAt: "" },
+      resumableSessions: [{ provider: "claude", providerSessionId: "1857dcd5-973b-46a2", createdAt: "", updatedAt: "" }],
     };
     // Nothing to assert before the handoff: the conversation is on screen, so the start screen and
     // its resume offer are not rendered at all. The control for this test is its sibling below,
@@ -298,7 +298,7 @@ describe("App handoff to a terminal", () => {
     const resumableHello: Hello = {
       ...HELLO,
       backend: "sidecar",
-      resumableSession: { provider: "claude", providerSessionId: "some-other-session", updatedAt: "" },
+      resumableSessions: [{ provider: "claude", providerSessionId: "some-other-session", createdAt: "", updatedAt: "" }],
     };
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" }, resumableHello);
     dispatch({
@@ -307,7 +307,16 @@ describe("App handoff to a terminal", () => {
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     });
-    expect(buttonLabelled(container, "Continue previous session")).toBeDefined();
+    // The picker renders one radio per remembered session (plus "New session"), so the assertion
+    // is that the unrelated row survived -- not that some singular "continue" control exists. That
+    // control is gone: the offer became a list the same day this suppression was written.
+    const offered = Array.from(container.querySelectorAll(".session-choice button.resume")).map(
+      (b) => b.textContent ?? "",
+    );
+    // The picker shows `shortId` -- the first eight characters -- so the expected substrings are
+    // the prefixes as rendered, not the full ids.
+    expect(offered.some((label) => label.includes("some-oth"))).toBe(true);
+    expect(offered.some((label) => label.includes("1857dcd5"))).toBe(false);
   });
 });
 
@@ -421,6 +430,38 @@ describe("App fatal errors", () => {
     expect(container.querySelector(".mode-selector")).not.toBeNull();
     // The dead session's transcript is gone with it, rather than left on screen looking live.
     expect(container.textContent).not.toContain("gone");
+  });
+
+  /* The start screen's session picker is built from `hello`, which arrives once on mount. A session
+     that dies is persisted BEFORE it dies (`conversation::persist_record` on adoption), so by the
+     time the user is looking at the picker again that session is on disk and offerable -- but the
+     component is still rendering the list it captured at mount, which does not contain it. Asking
+     for `hello` again is what makes the picker's own "Previous conversations here, newest first"
+     true at the moment it is shown. */
+  it("asks for a fresh hello when a fatal error drops it back to the start screen", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    expect(posted.filter((m) => m.type === "ready")).toHaveLength(1);
+
+    dispatch({ kind: "error", message: "the provider exited" });
+
+    const readies = posted.filter((m) => m.type === "ready");
+    expect(readies).toHaveLength(2);
+    // A distinct request id, not the mount one replayed: Rust answers each `ready` with its own
+    // `command_result`, and two replies to one id is a bookkeeping bug waiting to happen.
+    expect(readies[1].request_id).not.toBe(readies[0].request_id);
+  });
+
+  /* The re-ask must not become a loop. Rust answers `Ready` with `hello` + `command_result`, never
+     with another `error`, so a second error can only come from a second real failure -- and each one
+     gets exactly one re-ask. */
+  it("re-asks once per error rather than compounding", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "error", message: "first" });
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "error", message: "second" });
+    expect(posted.filter((m) => m.type === "ready")).toHaveLength(3);
   });
 
   it("can be dismissed without resurrecting the session", () => {
