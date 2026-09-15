@@ -21,6 +21,7 @@ use crate::{AgentDomainEvent, PermissionMode};
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
     ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
+    SettingSource, SettingSourceSelection, ToolPolicy,
     CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ExecutableSource,
     ErrorDetail, StreamingMode,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
@@ -41,7 +42,7 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The protocol major this client speaks. Connections are refused if the sidecar reports
 /// a different major.
-const CLIENT_PROTOCOL_MAJOR: u32 = 2;
+const CLIENT_PROTOCOL_MAJOR: u32 = 3;
 
 /// Capability strings this client understands, as the sidecar advertises them in
 /// `HandshakeResponse.capabilities`. Named constants rather than inline literals because a typo
@@ -539,6 +540,34 @@ fn build_create_request(
                 StreamingPreference::Complete => StreamingMode::Complete as i32,
                 StreamingPreference::Partial => StreamingMode::Partial as i32,
             },
+            // Explicit settings and tool denials match the legacy backend's
+            // `--setting-sources` and `--disallowedTools` arguments instead of CLI defaults.
+            // `Native` uses the selected tiers to choose what loads. `Isolated` has no
+            // UI, config or Lua selector.
+            setting_sources: Some(SettingSourceSelection {
+                // Not `user`: a spawned session must not inherit user-level
+                // configuration. Confirmed by a real reproduction on the legacy path before it was
+                // written down as a constraint.
+                sources: vec![SettingSource::Project as i32, SettingSource::Local as i32],
+            }),
+            // Sent explicitly even under `Bypass`, and that is parity rather than a new restriction:
+            // the legacy path passes `--disallowedTools` unconditionally and only skips the hook.
+            // Stating it also means it is honoured verbatim; omitting it would earn the sidecar's
+            // own conservative default plus a notice, which is the same list by a less direct route.
+            //
+            // `allow` is left absent, which is not the same as empty. It maps to the SDK's
+            // `Options.tools` -- the real restriction list, not `allowedTools`, which is a
+            // PRE-APPROVAL list a field named `allow` would have quietly widened access through.
+            // Absent means "do not touch the base tool set"; present-and-empty would mean "no
+            // built-in tools at all", stated. Neovibe has no allowlist to express, so it says
+            // nothing rather than saying the empty set.
+            tool_policy: Some(ToolPolicy {
+                deny: crate::process::CONSERVATIVE_DISALLOWED_TOOLS
+                    .iter()
+                    .map(|t| (*t).to_string())
+                    .collect(),
+                allow: None,
+            }),
         }),
         resume_provider_session_id,
         fork,
@@ -698,7 +727,7 @@ mod tests {
     /// `info_from_handshake` carries them through unchanged.
     fn real_handshake_today() -> HandshakeResponse {
         HandshakeResponse {
-            protocol_major: 2,
+            protocol_major: 3,
             protocol_minor: 0,
             sidecar_version: "0.1.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
@@ -717,6 +746,8 @@ mod tests {
                 // show whether they are supported.
                 "resume_session",
                 "fork_session",
+                "setting_sources",
+                "tool_policy",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -775,12 +806,12 @@ mod tests {
     fn info_carries_the_advertised_lists_verbatim_for_diagnostics() {
         let info = info_from_handshake(&real_handshake_today(), Some("checkout @ abc1234".into()), vec!["diag".into()]);
         assert_eq!(info.actual_claude_code_version, "2.1.269");
-        assert_eq!(info.protocol_major, 2);
+        assert_eq!(info.protocol_major, 3);
         assert_eq!(info.sidecar_version, "0.1.0");
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        assert_eq!(info.advertised_capabilities.len(), 9);
+        assert_eq!(info.advertised_capabilities.len(), 11);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }

@@ -91,6 +91,7 @@ impl SpawnedSidecar {
 /// tool execution, reuse after interruption, teardown without orphan processes,
 /// resume verified by content and provider session ID, partial assistant streaming,
 /// replay, recovery, and backpressure.
+/// The unary conformance tests include a live handshake to check protocol agreement.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
@@ -201,16 +202,27 @@ fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
 /// workspace symlink to `packages/claude-runtime/dist`. Building only the app therefore either
 /// fails outright (clean checkout: 8x TS2307) or -- worse -- silently succeeds against whatever
 /// stale kernel `dist` happens to be present. Verdandi gained a kernel-first root fan-out on
-/// 2026-09-11; a checkout predating that has no root `build` script, so this probe is what decides
+/// 2026-09-11; a checkout predating that has no root script at all, so this probe is what decides
 /// between the correct path and the legacy fallback below.
-fn checkout_has_root_build_script(checkout: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(checkout.join("package.json")) else {
-        return false;
-    };
-    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return false;
-    };
-    manifest.get("scripts").and_then(|s| s.get("build")).and_then(|b| b.as_str()).is_some()
+///
+/// It prefers `build:claude` over `build` for a reason with a date on it -- see the comment inside.
+fn root_build_script_for_claude(checkout: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(checkout.join("package.json")).ok()?;
+    let manifest = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let scripts = manifest.get("scripts")?;
+    // `build:claude` first, deliberately. Verdandi's root `build` is
+    // `build:terminal && build:claude`, and the terminal half is a workspace neovibe does not
+    // consume and does not build against -- its `node-pty` is a native module a checkout can
+    // easily be missing. Running the whole fan-out makes a failure in code this crate never loads
+    // into a failure to start the agent panel at all, which is what it did on 2026-09-15:
+    // `packages/terminal-runtime` failed `TS2307: Cannot find module 'node-pty'` and `build:claude`
+    // never ran. Build what we consume.
+    for candidate in ["build:claude", "build"] {
+        if scripts.get(candidate).and_then(|b| b.as_str()).is_some() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 /// Existence check only, not mtime-based staleness (unlike `shell/build.rs`'s own agent-ui
@@ -232,8 +244,8 @@ fn ensure_sidecar_built(checkout: &Path) -> std::io::Result<PathBuf> {
     if !checkout.join("node_modules").exists() {
         run_command(checkout, "npm", &["ci"])?;
     }
-    if checkout_has_root_build_script(checkout) {
-        run_command(checkout, "npm", &["run", "build"])?;
+    if let Some(script) = root_build_script_for_claude(checkout) {
+        run_command(checkout, "npm", &["run", &script])?;
     } else {
         // A Verdandi checkout predating the root fan-out. Do the ordering by hand rather than
         // building only the app, which is what silently produced stale-kernel runs.
