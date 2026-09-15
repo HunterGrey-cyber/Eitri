@@ -188,6 +188,227 @@ describe("App event folding", () => {
   });
 });
 
+describe("App handoff to a terminal", () => {
+  function conversation(overrides: Partial<AgentUiState> = {}, hello: Hello = HELLO) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...hello });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState(overrides) });
+    return rendered;
+  }
+
+  it("offers the control but disabled, with the reason visible, before the first turn", () => {
+    const { container } = conversation({ providerSessionId: null });
+    expect(buttonLabelled(container, "Continue in a terminal")!.disabled).toBe(true);
+    expect(container.querySelector(".handoff-blocked")!.textContent).toContain("first turn");
+  });
+
+  it("asks Rust for the handoff only after the confirmation, never on the first click", () => {
+    const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
+    fireEvent.click(buttonLabelled(container, "Continue in a terminal")!);
+    expect(lastOfType("handoff_to_terminal")).toBeUndefined();
+    fireEvent.click(buttonLabelled(container, "Close it and show me the command")!);
+    const posted = lastOfType("handoff_to_terminal")!;
+    expect(typeof posted.request_id).toBe("string");
+    // Nothing about WHICH session: Rust reads that from canonical state, and a second source for it
+    // is how a panel eventually prints a command resuming some other conversation.
+    expect(Object.keys(posted).sort()).toEqual(["request_id", "type"]);
+  });
+
+  /* The envelope arrives only after the real close has finished, so by the time this renders the
+     conversation genuinely is over -- which is why the transcript goes with it rather than being
+     left on screen looking live. */
+  it("replaces the conversation with the command once the session really has been closed", () => {
+    const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2", transcript: [{ seq: 1, text: "earlier reply" }] });
+    dispatch({
+      kind: "handoff",
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    });
+    expect(container.querySelector("pre.handoff-command")!.textContent).toBe(
+      "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+    );
+    expect(container.querySelector(".agent-ui-conversation")).toBeNull();
+    expect(container.textContent).not.toContain("earlier reply");
+    // A new conversation is still startable; only this one moved.
+    expect(container.querySelector(".mode-selector")).not.toBeNull();
+  });
+
+  /* The session was just given to a terminal with no lock held. Continuing to offer it here is the
+     exact concurrency the card above it warns about, one click away. */
+  it("stops offering to continue the session it just handed over", () => {
+    const resumableHello: Hello = {
+      ...HELLO,
+      backend: "sidecar",
+      resumableSession: { provider: "claude", providerSessionId: "1857dcd5-973b-46a2", updatedAt: "" },
+    };
+    // Nothing to assert before the handoff: the conversation is on screen, so the start screen and
+    // its resume offer are not rendered at all. The control for this test is its sibling below,
+    // which reaches the same start screen by the same route and DOES still see the offer.
+    const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" }, resumableHello);
+    dispatch({
+      kind: "handoff",
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    });
+    expect(buttonLabelled(container, "Continue previous session")).toBeUndefined();
+  });
+
+  /* A start that fails must not take the command with it. On the legacy backend the id in that card
+     is the last reference to the conversation anywhere in the system — Rust keeps its copy until a
+     session is genuinely installed, and this is the frontend half of the same rule. */
+  it("keeps the command on screen when the next session fails to start", () => {
+    const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
+    dispatch({
+      kind: "handoff",
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    });
+    fireEvent.click(buttonLabelled(container, "Auto")!);
+    const requestId = lastOfType("start_session")!.request_id;
+    dispatch({ kind: "command_result", requestId, ok: false, error: "claude is not on PATH" });
+    expect(container.querySelector("pre.handoff-command")!.textContent).toContain("--resume 1857dcd5-973b-46a2");
+  });
+
+  /* ...and a session that really does start replaces it. The card is only ever drawn on the start
+     screen, so the way this becomes visible is the round trip: hand off, start a session that runs,
+     then have THAT session die — the start screen must show the new session's error, not the old
+     conversation's command. */
+  it("clears the command once a real session is running, so a later failure does not resurrect it", () => {
+    const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
+    dispatch({
+      kind: "handoff",
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    });
+    expect(container.querySelector("pre.handoff-command")).not.toBeNull();
+
+    dispatch({ kind: "snapshot", throughRevision: 9, state: snapshotState() });
+    dispatch({ kind: "error", message: "the second session died" });
+    expect(container.querySelector(".mode-selector")).not.toBeNull();
+    expect(container.querySelector("pre.handoff-command")).toBeNull();
+  });
+
+  /* A stored session that is NOT the one handed over is untouched -- suppressing every offer would
+     hide a conversation nobody gave away. */
+  it("leaves an unrelated stored session on offer", () => {
+    const resumableHello: Hello = {
+      ...HELLO,
+      backend: "sidecar",
+      resumableSession: { provider: "claude", providerSessionId: "some-other-session", updatedAt: "" },
+    };
+    const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" }, resumableHello);
+    dispatch({
+      kind: "handoff",
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    });
+    expect(buttonLabelled(container, "Continue previous session")).toBeDefined();
+  });
+});
+
+/* The close window is not instantaneous — on the sidecar path `AgentBackend::shutdown` is a 10s
+   unary RPC plus kill escalation, on legacy ~0.8s of grace periods — and for its whole length Rust
+   holds no session and refuses every command. The frontend has to reflect that. */
+describe("App while a handoff is closing the conversation", () => {
+  function closing() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({
+      kind: "snapshot",
+      throughRevision: 1,
+      state: snapshotState({ providerSessionId: "1857dcd5-973b-46a2" }),
+    });
+    fireEvent.click(buttonLabelled(rendered.container, "Continue in a terminal")!);
+    return rendered;
+  }
+
+  /* The outcome that is not acceptable is the message disappearing with no trace. It is still in
+     the box, nothing was sent, and the box says why it stopped accepting input. */
+  it("does not swallow a message typed before the conversation started closing", () => {
+    const { container } = closing();
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "a long prompt worth not losing" } });
+    fireEvent.click(buttonLabelled(container, "Close it and show me the command")!);
+
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+    expect(lastOfType("send_message")).toBeUndefined();
+    expect(container.querySelector("textarea")!.value).toBe("a long prompt worth not losing");
+    expect(container.querySelector("textarea")!.disabled).toBe(true);
+    expect(container.querySelector(".composer-closing")!.textContent).toContain("not");
+  });
+
+  /* Rust refuses a second handoff ("this conversation is already being handed off"), and that
+     refusal only ever reached a console.warn. The control is not offered again in the first place. */
+  it("stops offering the handoff control while one is already in flight, with the reason visible", () => {
+    const { container } = closing();
+    fireEvent.click(buttonLabelled(container, "Close it and show me the command")!);
+    expect(buttonLabelled(container, "Continue in a terminal")!.disabled).toBe(true);
+    expect(container.querySelector(".handoff-blocked")!.textContent).toContain("being closed");
+  });
+
+  /* A stale-view refusal (a turn started between the render and the click) leaves the session
+     completely untouched on the Rust side, so the panel has to come back to life here too. */
+  it("comes back to life, saying why, when Rust refuses the handoff", () => {
+    const { container } = closing();
+    fireEvent.click(buttonLabelled(container, "Close it and show me the command")!);
+    const requestId = lastOfType("handoff_to_terminal")!.request_id;
+    dispatch({ kind: "command_result", requestId, ok: false, error: "A turn is still running." });
+    expect(container.querySelector("textarea")!.disabled).toBe(false);
+    expect(container.querySelector(".command-notice")!.textContent).toContain("A turn is still running.");
+  });
+});
+
+/* Every Rust refusal carries a real human-readable reason and none of them used to be shown. The
+   send case is the one that also loses data, because the composer clears optimistically. */
+describe("App refused commands", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    return rendered;
+  }
+
+  it("puts a refused message back in the box and says why", () => {
+    const { container } = startedApp();
+    fireEvent.change(container.querySelector("textarea")!, { target: { value: "please keep me" } });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+    const requestId = lastOfType("send_message")!.request_id;
+    // Optimistically cleared, which is only acceptable because of what happens next.
+    expect(container.querySelector("textarea")!.value).toBe("");
+
+    dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+    expect(container.querySelector("textarea")!.value).toBe("please keep me");
+    expect(container.querySelector(".command-notice")!.textContent).toContain("no active session");
+  });
+
+  it("restores the same text a second time when it is refused again", () => {
+    const { container } = startedApp();
+    for (const _ of [0, 1]) {
+      fireEvent.change(container.querySelector("textarea")!, { target: { value: "same text twice" } });
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+      expect(container.querySelector("textarea")!.value).toBe("same text twice");
+      // Cleared by hand so the second round genuinely has to restore it again.
+      fireEvent.change(container.querySelector("textarea")!, { target: { value: "" } });
+    }
+  });
+
+  it("does not double-report a failed start, which already has its own banner", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    fireEvent.click(buttonLabelled(container, "Auto")!);
+    const requestId = lastOfType("start_session")!.request_id;
+    dispatch({ kind: "command_result", requestId, ok: false, error: "claude is not on PATH" });
+    expect(container.querySelector(".command-notice")).toBeNull();
+  });
+});
+
 describe("App fatal errors", () => {
   it("shows the whole error text and returns to the start screen", () => {
     const { container } = render(<App />);

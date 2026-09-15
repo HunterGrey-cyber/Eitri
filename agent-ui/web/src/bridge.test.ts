@@ -45,6 +45,22 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith({ kind: "snapshot", throughRevision: 7, state });
   });
 
+  /* The `handoff` envelope has to survive the kind whitelist: an envelope kind this build does not
+     list is warned about and dropped, so a new one that is not added there arrives nowhere and
+     nothing reports it -- the panel would simply never show the command after a real close. */
+  it("demuxes a handoff envelope, keeping the command and its parts intact", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const envelope = {
+      kind: "handoff",
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    };
+    window.__neovibeDispatch!(JSON.stringify(envelope));
+    expect(handler).toHaveBeenCalledWith(envelope);
+  });
+
   it("demuxes an error envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);

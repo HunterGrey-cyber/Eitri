@@ -10,6 +10,162 @@
 use crate::lease::{LeaseError, SessionLease};
 use std::process::{Command, Stdio};
 
+/// Why no `claude --resume` invocation could be built for a conversation.
+///
+/// `MissingSessionId` is the one a UI has to plan for: it is what "this conversation has never
+/// taken a turn" looks like from here. The other two are malformed input, not a normal state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResumeCommandError {
+    /// No provider session id at all: the conversation has no Claude identity yet.
+    ///
+    /// On the sidecar path this is a measured fact, not an inference -- the id is minted from the
+    /// Agent SDK's own `system`/`init` message, which the SDK emits when a *query* starts, so a
+    /// session that was created and never asked anything has none. `tests/handoff_conformance.rs`
+    /// records a first version of that test timing out waiting for the event before it sent a turn.
+    /// The legacy backend reads the same `system`/`init` line off the CLI's own stdout
+    /// (`wire.rs`); **when that line first appears there has not been measured in this
+    /// repository**, so do not read this variant as a statement about legacy's timing -- only as
+    /// "no id is known yet", which is the actual precondition either way.
+    MissingSessionId,
+    /// The id begins with `-`, so `claude --resume <id>` would parse it as another option rather
+    /// than as the session to continue. Refused rather than passed on: this is displayed to a
+    /// human to run AND handed to `exec`, and neither should carry an argument that silently
+    /// becomes a flag.
+    SessionIdLooksLikeAFlag,
+    /// No working directory. A session's cwd is part of its identity throughout this design
+    /// (`prepare_neovibe_to_cli_handoff` runs the wrapper with `current_dir(canonical_cwd)`, the
+    /// lease key includes it, and design doc §8.4 has the provider validate it on an import), so a
+    /// `--resume` with nowhere to run is not a weaker command -- it is a different one.
+    MissingCwd,
+}
+
+impl std::fmt::Display for ResumeCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResumeCommandError::MissingSessionId => write!(
+                f,
+                "this conversation has no Claude session id yet -- one is issued when its first turn starts"
+            ),
+            ResumeCommandError::SessionIdLooksLikeAFlag => {
+                write!(f, "the provider session id begins with '-', which `claude --resume` would read as an option")
+            }
+            ResumeCommandError::MissingCwd => write!(f, "no project directory to run `claude --resume` in"),
+        }
+    }
+}
+
+impl std::error::Error for ResumeCommandError {}
+
+/// The argv that continues a Claude session interactively: `claude --resume <id>`, and nothing
+/// else.
+///
+/// The one place this project decides what that invocation is. Both consumers call it -- the
+/// `neovibe-claude-handoff` wrapper, which `exec`s it while holding the lease fd, and
+/// `ClaudeResumeCommand`, which renders it for a human to run -- so the command a user is shown is
+/// by construction the command the supported handoff path would run.
+///
+/// Deliberately none of the flags `agent` itself spawns `claude` with. The full list, as
+/// `AgentProcess::spawn_with_binary` really builds it (`crate::process`): `--print`,
+/// `--input-format stream-json`, `--output-format stream-json`, `--verbose`,
+/// `--setting-sources project,local`, `--permission-mode <mode>`, and -- conditionally --
+/// `--disallowedTools <list>` and `--settings <json>`. This is an ordinary interactive session in a
+/// terminal, not another machine-driven one, so none of them belong.
+///
+/// **Two of those omissions widen what the resumed session can do, and that is the substantive
+/// point, not a footnote.** `--settings` is where the `PreToolUse` gate lives, so the resumed
+/// session has no Neovibe permission gate at all and its tool calls raise no card anywhere.
+/// `--permission-mode` and `--disallowedTools` are simply absent, so a session that Neovibe ran in
+/// `auto` with `Bash,Write,Edit,NotebookEdit` disallowed comes back as a plain `claude` at the
+/// user's own default mode with none of those refusals -- it can do MORE than the conversation it
+/// continues could. The user-facing card states the settings difference; this is the precise
+/// version.
+pub fn claude_resume_argv(provider_session_id: &str) -> Result<Vec<String>, ResumeCommandError> {
+    let id = provider_session_id.trim();
+    if id.is_empty() {
+        return Err(ResumeCommandError::MissingSessionId);
+    }
+    if id.starts_with('-') {
+        return Err(ResumeCommandError::SessionIdLooksLikeAFlag);
+    }
+    Ok(vec!["claude".to_string(), "--resume".to_string(), id.to_string()])
+}
+
+/// A `claude --resume` invocation together with the directory it has to run in, ready either to be
+/// executed or to be shown to a human.
+///
+/// Built by the shell's "continue this conversation in a terminal" action. Nothing here starts a
+/// process and nothing here takes a lease -- see `shell/src/terminal_handoff.rs` for what that
+/// action does and does not claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeResumeCommand {
+    cwd: String,
+    argv: Vec<String>,
+}
+
+impl ClaudeResumeCommand {
+    pub fn for_session(canonical_cwd: &str, provider_session_id: &str) -> Result<Self, ResumeCommandError> {
+        if canonical_cwd.trim().is_empty() {
+            return Err(ResumeCommandError::MissingCwd);
+        }
+        Ok(Self { cwd: canonical_cwd.to_string(), argv: claude_resume_argv(provider_session_id)? })
+    }
+
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// The session id this command resumes, read back out of the argv that will actually run
+    /// rather than stored beside it -- so the id anything displays and the id the command resumes
+    /// are the same value by construction, with no second field to drift.
+    ///
+    /// Empty only for an argv with no trailing word, which `claude_resume_argv` cannot produce;
+    /// returning `""` rather than panicking keeps one malformed command from taking a whole GUI
+    /// process down.
+    pub fn provider_session_id(&self) -> &str {
+        self.argv.last().map(String::as_str).unwrap_or_default()
+    }
+
+    /// One POSIX-shell line a user can paste: `cd <dir> && claude --resume <id>`.
+    ///
+    /// The `cd` is part of the command, not decoration: a session's cwd is part of its identity
+    /// everywhere else in this design (see `MissingCwd` above), and the supported handoff wrapper
+    /// is likewise spawned with `current_dir(canonical_cwd)` rather than wherever the host happened
+    /// to be. Running the same `--resume <id>` elsewhere is not the same request.
+    ///
+    /// Every word is quoted only when it needs to be, by the ordinary POSIX rule (a bare word of
+    /// shell-safe characters, otherwise single quotes with embedded quotes escaped). A UUID and a
+    /// plain path therefore read as themselves, and a directory with a space or a quote in it is
+    /// still correct rather than merely tidy.
+    pub fn shell_command_line(&self) -> String {
+        let mut line = format!("cd {}", sh_quote(&self.cwd));
+        line.push_str(" &&");
+        for word in &self.argv {
+            line.push(' ');
+            line.push_str(&sh_quote(word));
+        }
+        line
+    }
+}
+
+/// POSIX `sh` quoting for one word. Bare when every character is one `sh` treats literally,
+/// single-quoted otherwise, with `'` written as `'\''` (close, escaped quote, reopen) -- the only
+/// way to get a single quote inside single quotes.
+fn sh_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if safe {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
 #[derive(Debug)]
 pub enum HandoffError {
     Lease(LeaseError),
@@ -134,4 +290,92 @@ pub fn prepare_neovibe_to_cli_handoff(
     unsafe { libc::close(fd) };
 
     Ok(HandoffOutcome { child_pid: child.id() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the invocation: an ordinary interactive resume, with none of the
+    /// machine-driving flags `agent` itself passes. If this ever grew `--print` or a `--settings`,
+    /// the "continue in a terminal" action would hand the user a session that is not a terminal
+    /// session at all.
+    #[test]
+    fn the_resume_argv_is_the_plain_interactive_invocation() {
+        assert_eq!(
+            claude_resume_argv("1857dcd5-973b-46a2-8d1e-0f0c9b2a4e11").unwrap(),
+            vec!["claude", "--resume", "1857dcd5-973b-46a2-8d1e-0f0c9b2a4e11"]
+        );
+    }
+
+    /// The precondition a UI has to enforce, stated as a value rather than as prose: a conversation
+    /// that has never taken a turn has no Claude session id, and there is no command to give.
+    #[test]
+    fn a_conversation_with_no_session_id_yields_no_command_at_all() {
+        assert_eq!(claude_resume_argv("").unwrap_err(), ResumeCommandError::MissingSessionId);
+        assert_eq!(claude_resume_argv("   ").unwrap_err(), ResumeCommandError::MissingSessionId);
+        assert_eq!(
+            ClaudeResumeCommand::for_session("/tmp/project", "").unwrap_err(),
+            ResumeCommandError::MissingSessionId
+        );
+    }
+
+    /// `claude --resume --anything` would read the id as another option. Refused at the one place
+    /// the argv is built, so neither the displayed line nor the `exec` can carry it.
+    #[test]
+    fn an_id_that_would_read_as_a_flag_is_refused_rather_than_passed_on() {
+        assert_eq!(
+            claude_resume_argv("--dangerously-skip-permissions").unwrap_err(),
+            ResumeCommandError::SessionIdLooksLikeAFlag
+        );
+        assert_eq!(claude_resume_argv("-r").unwrap_err(), ResumeCommandError::SessionIdLooksLikeAFlag);
+    }
+
+    /// Claude stores a session under the directory it was created in, so a command with nowhere to
+    /// run is not a weaker command, it is a different one.
+    #[test]
+    fn a_command_with_no_directory_to_run_in_is_refused() {
+        assert_eq!(ClaudeResumeCommand::for_session("", "abc").unwrap_err(), ResumeCommandError::MissingCwd);
+        assert_eq!(ClaudeResumeCommand::for_session("  ", "abc").unwrap_err(), ResumeCommandError::MissingCwd);
+    }
+
+    /// What this actually pins, stated exactly, because an earlier version of this doc claimed
+    /// more than the body can deliver: the command a user is SHOWN is built from
+    /// `claude_resume_argv` and renders as that literal line. It says nothing about the
+    /// `neovibe-claude-handoff` wrapper -- the first assert is `f(x) == f(x)` (`for_session` calls
+    /// `claude_resume_argv`), and the binary is not in scope of a unit test in this crate at all.
+    ///
+    /// The wrapper's own argv is guarded for real, by running the real binary, in
+    /// `tests/handoff_wrapper_argv.rs`.
+    #[test]
+    fn the_displayed_line_is_the_literal_resume_invocation() {
+        let command = ClaudeResumeCommand::for_session("/home/user/project", "abc-123").unwrap();
+        assert_eq!(command.argv(), claude_resume_argv("abc-123").unwrap().as_slice());
+        assert_eq!(command.shell_command_line(), "cd /home/user/project && claude --resume abc-123");
+        assert_eq!(command.provider_session_id(), "abc-123");
+    }
+
+    /// A path that needs no quoting reads as itself; one that does is still correct. Both matter:
+    /// the common case is a line a human reads and trusts, and the awkward case is a line that has
+    /// to actually work when pasted.
+    #[test]
+    fn a_directory_is_quoted_only_when_the_shell_would_need_it() {
+        let plain = ClaudeResumeCommand::for_session("/home/user/project", "abc").unwrap();
+        assert_eq!(plain.shell_command_line(), "cd /home/user/project && claude --resume abc");
+
+        let spaced = ClaudeResumeCommand::for_session("/home/user/my project", "abc").unwrap();
+        assert_eq!(spaced.shell_command_line(), "cd '/home/user/my project' && claude --resume abc");
+
+        let quoted = ClaudeResumeCommand::for_session("/home/user/it's", "abc").unwrap();
+        assert_eq!(quoted.shell_command_line(), r"cd '/home/user/it'\''s' && claude --resume abc");
+    }
+
+    /// The id is trimmed on the way in, so a stray newline out of a record or a wire field cannot
+    /// reach either consumer.
+    #[test]
+    fn surrounding_whitespace_on_an_id_is_dropped_rather_than_quoted_into_the_command() {
+        let command = ClaudeResumeCommand::for_session("/tmp/p", " abc-123\n").unwrap();
+        assert_eq!(command.argv()[2], "abc-123");
+        assert_eq!(command.shell_command_line(), "cd /tmp/p && claude --resume abc-123");
+    }
 }

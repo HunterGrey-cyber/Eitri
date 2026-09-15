@@ -72,8 +72,25 @@ fn main() {
     let _lease_fd_keepalive = unsafe { std::fs::File::from_raw_fd(fd) };
     std::mem::forget(_lease_fd_keepalive);
 
-    let err = std::process::Command::new("claude").arg("--resume").arg(&resume_id).exec();
+    // Built by `agent::handoff::claude_resume_argv`, the one place this project decides what
+    // "continue this Claude session interactively" means -- the same function the shell's
+    // "continue in a terminal" action renders for a human.
+    //
+    // The guard on that, stated precisely: `tests/handoff_wrapper_argv.rs` RUNS this binary with a
+    // stub `claude` on `PATH` and pins the argv it really `exec`s, both to the literal
+    // `["claude", "--resume", <id>]` and to `claude_resume_argv`'s own output. A flag added to
+    // either side alone fails it. What it cannot detect is this file being re-hardcoded to an argv
+    // that happens to be identical today -- the test pins the argv, not which function produced
+    // it.
+    let argv = match agent::handoff::claude_resume_argv(&resume_id) {
+        Ok(argv) => argv,
+        Err(e) => {
+            eprintln!("neovibe-claude-handoff: {e}");
+            std::process::exit(1);
+        }
+    };
+    let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     // `exec` only returns on failure -- a successful exec never reaches here.
-    eprintln!("neovibe-claude-handoff: failed to exec claude --resume {resume_id}: {err}");
+    eprintln!("neovibe-claude-handoff: failed to exec {}: {err}", argv.join(" "));
     std::process::exit(1);
 }

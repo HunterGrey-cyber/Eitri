@@ -40,6 +40,17 @@ const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.
 /// for why this is a poll at all (agent's own reader-thread channel is intentionally private).
 const PUMP_POLL_INTERVAL_MS: u64 = 33;
 
+/// How long a window close waits for an in-flight terminal-handoff worker before abandoning it.
+/// See `AgentPanelHandle::shutdown` for what this does and does not cover -- it is sized for the
+/// legacy backend's real close time, and is knowingly short of the sidecar path's worst case.
+const HANDOFF_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What the frontend is told when the close worker died inside `shutdown()`. One constant because
+/// it is both logged and dispatched, and the two drifting apart would make a log line unmatchable
+/// to what the user saw.
+const HANDOFF_CLOSE_FAILED_MESSAGE: &str =
+    "the handoff could not finish closing this session; it is no longer running here";
+
 struct AgentPanelState {
     session: Option<AgentBackend>,
     backend_kind: BackendKind,
@@ -56,6 +67,24 @@ struct AgentPanelState {
     /// `command_result` is owed once that finishes -- the reply is deferred, not dropped, which is
     /// exactly what a requestId-addressed protocol is for.
     pending_start: Option<PendingStart>,
+    /// Set while a "continue in a terminal" handoff is closing the session on a worker thread.
+    /// Holds the command that is owed to the frontend once that close has actually finished.
+    pending_handoff: Option<PendingHandoff>,
+    /// The last handoff command this panel produced, kept in the Rust host rather than only in the
+    /// WebView's React state.
+    ///
+    /// **This is the reason a reload cannot destroy it.** The panel ships a real reload affordance
+    /// (`app.reload-agent-panel`, Ctrl+Shift+R and the top bar's `⟳`) that throws the document
+    /// away on purpose, and the frontend's copy goes with it. On the default `legacy` backend the
+    /// provider session id is then recoverable from nowhere at all: no `ConversationRecord` is
+    /// written for that backend and `BackendGreeting::for_kind` returns `resumable: None` for it, so
+    /// the only surviving copy of the id would have been a React `useState`. Holding it here is the
+    /// project's own stated invariant -- agent state lives in the Rust host so the WebView can
+    /// reload or crash without losing it -- applied to the one value this feature produces.
+    ///
+    /// Cleared when a new session is actually installed, not when one is merely requested: a start
+    /// that fails must leave the previous conversation's command still recoverable.
+    last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
     /// The in-flight turn's latency marks, when `NEOVIBE_AGENT_TRACE=1`. `None` the rest of the
     /// time, which is every normal run -- this is a diagnostic, not a metrics pipeline.
     turn_trace: Option<crate::turn_trace::TurnTrace>,
@@ -68,6 +97,23 @@ struct AgentPanelState {
 struct PendingStart {
     request_id: String,
     result_rx: mpsc::Receiver<Result<AgentBackend, crate::agent_backend::BackendError>>,
+}
+
+/// A handoff whose session close is still running on a worker thread.
+///
+/// The command is built BEFORE the session is taken -- it is derived from the session's own state,
+/// which stops being readable the moment ownership moves to the worker -- and dispatched only after
+/// `closed_rx` reports. That ordering is the whole reason this struct exists rather than a straight
+/// reply: design doc §8.3 requires the session to be closed and flushed before the CLI starts, and
+/// the user cannot start it before they have seen the command.
+///
+/// Closing runs off the GTK main loop for the same reason every other teardown here does: the
+/// sidecar path's `close_session` is a unary RPC bounded at 10s, and blocking the main loop on it
+/// would freeze the editor pane too.
+struct PendingHandoff {
+    request_id: String,
+    command: agent::handoff::ClaudeResumeCommand,
+    closed_rx: mpsc::Receiver<()>,
 }
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
@@ -98,8 +144,43 @@ impl AgentPanelHandle {
     /// of installing a session into a panel that has already torn down.
     pub(crate) fn shutdown(&self) {
         let pending = self.state.borrow_mut().pending_start.take();
+        let pending_handoff = self.state.borrow_mut().pending_handoff.take();
         if let Some(mut session) = self.state.borrow_mut().session.take() {
             session.shutdown();
+        }
+        if let Some(handoff) = pending_handoff {
+            // The worker already owns the backend and is already shutting it down -- there is
+            // nothing to start here, only a reason to wait. Exiting the process first would leave
+            // the `claude` child mid-close.
+            //
+            // **A bounded wait, not a guarantee, and the bound is only honest for the default
+            // backend.** On `legacy`, `AgentBackend::shutdown()` is ~0.8s of grace periods
+            // (`NATURAL_EXIT_GRACE_PERIOD` 500ms + `GRACE_PERIOD` 300ms, agent/src/process.rs) plus
+            // three thread joins, so this covers it with room to spare. On `sidecar` it does not:
+            // `close_session` is a unary RPC bounded at 10s (`UNARY_RPC_TIMEOUT`,
+            // agent/src/providers/claude_sidecar/mod.rs) and the spawned sidecar's own drop adds up
+            // to 3s of SIGKILL escalation, so the worst case is ~13s and this wait can expire with
+            // the close still in flight. When it does, `main` quits, the detached worker dies with
+            // the process, and whatever the sidecar and `claude` were doing is abandoned -- the
+            // orphan class this repository keeps having to chase with pid diffs. Raising the wait
+            // to cover it would trade that for a window close that appears to hang for 13 seconds,
+            // so the choice here is to stay short and say so rather than to claim a bound that is
+            // not one. See shell/MANUAL_VERIFICATION.md's owed check for this path.
+            match handoff.closed_rx.recv_timeout(HANDOFF_CLOSE_WAIT) {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
+                    "[agent_panel] window closed while a terminal handoff was closing the session, and \
+                     the worker did not report within {}s; its close is being abandoned",
+                    HANDOFF_CLOSE_WAIT.as_secs()
+                ),
+                // NOT a timeout, and it fires immediately: the worker's sender dropped, which means
+                // it panicked inside `shutdown()`. Logging this as a timeout would send a future
+                // debugger looking for a hang that never happened.
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!(
+                    "[agent_panel] window closed during a terminal handoff and the close worker died \
+                     inside shutdown() without reporting"
+                ),
+            }
         }
         if let Some(pending) = pending {
             // Bounded, and blocking on purpose: this runs on the window-close path, where waiting
@@ -230,6 +311,8 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         supervisor,
         supervisor_pending,
         pending_start: None,
+        pending_handoff: None,
+        last_handoff: None,
         reported_start_failure: false,
         turn_trace: None,
     }));
@@ -270,6 +353,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
 fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(PUMP_POLL_INTERVAL_MS), move || {
         collect_pending_start(&state, &webview);
+        collect_pending_handoff(&state, &webview);
 
         // The payload is built under the borrow and dispatched OUTSIDE it. Calling into WebKit while
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
@@ -423,6 +507,12 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
             let snapshot = {
                 let mut state_ref = state.borrow_mut();
                 state_ref.reported_start_failure = false;
+                // The previous conversation's handoff command belongs to the previous conversation;
+                // a reload from here must not put it above a live one. Cleared on a session
+                // actually being INSTALLED, never on one merely being requested -- a start that
+                // fails has to leave the command still recoverable, since on the legacy backend it
+                // is the only surviving reference to that conversation.
+                state_ref.last_handoff = None;
                 state_ref.session = Some(backend);
                 // The frontend has been showing a connecting state since it sent start_session; give
                 // it the real projection immediately rather than making it wait for the first event.
@@ -438,6 +528,134 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
             evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
         }
     }
+}
+
+/// Non-blocking check on an in-flight terminal handoff, mirroring `collect_pending_start`.
+///
+/// The command is dispatched here and nowhere else, which is what makes the §8.3 ordering real: by
+/// the time the frontend can show a user the line to run, the session's own `shutdown()` has
+/// already returned on the worker thread.
+fn collect_pending_handoff(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let finished = {
+        let mut state_ref = state.borrow_mut();
+        let Some(pending) = state_ref.pending_handoff.as_ref() else { return };
+        let outcome = classify_close_signal(&pending.closed_rx);
+        if outcome == HandoffCloseOutcome::StillClosing {
+            return;
+        }
+        let pending = state_ref.pending_handoff.take().expect("checked Some above");
+        state_ref.reported_start_failure = false;
+        state_ref.turn_trace = None;
+        if outcome == HandoffCloseOutcome::Closed {
+            // Into the Rust host, not only down the wire. See `AgentPanelState::last_handoff` for
+            // why: the panel's own reload affordance would otherwise destroy the only copy, and on
+            // the default legacy backend nothing else anywhere remembers this session id.
+            state_ref.last_handoff = Some(pending.command.clone());
+        }
+        Some((pending, outcome))
+    };
+
+    let Some((pending, outcome)) = finished else { return };
+    if outcome == HandoffCloseOutcome::CloseFailed {
+        eprintln!("[agent_panel] {HANDOFF_CLOSE_FAILED_MESSAGE}");
+    }
+    for payload in handoff_payloads(&outcome, &pending.request_id, &pending.command) {
+        evaluate_js_dispatch(webview, &payload);
+    }
+}
+
+/// What one tick of the handoff collector found, as a value rather than as control flow.
+///
+/// Split out because this is the sequencing the whole feature's honesty rests on -- the card says
+/// "This conversation is closed in Neovibe", which is true only because the command is not released
+/// until `AgentBackend::shutdown()` has returned -- and a property that load-bearing should be
+/// assertable without a `WebView`, a GTK loop or a real backend.
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffCloseOutcome {
+    /// `shutdown()` has not returned yet. Nothing at all is dispatched in this state.
+    StillClosing,
+    /// The worker sent, which it does only after `shutdown()` returned.
+    Closed,
+    /// The worker's sender dropped without a send: it panicked inside `shutdown()`.
+    CloseFailed,
+}
+
+fn classify_close_signal(closed_rx: &mpsc::Receiver<()>) -> HandoffCloseOutcome {
+    match closed_rx.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => HandoffCloseOutcome::StillClosing,
+        Ok(()) => HandoffCloseOutcome::Closed,
+        Err(mpsc::TryRecvError::Disconnected) => HandoffCloseOutcome::CloseFailed,
+    }
+}
+
+/// The envelopes owed for a handoff whose close reached `outcome`, in dispatch order.
+///
+/// The property worth stating: only `Closed` ever produces a `handoff` envelope. A close that is
+/// still running, or one that died partway, must not be followed by a card whose first line claims
+/// the conversation is closed.
+fn handoff_payloads(
+    outcome: &HandoffCloseOutcome,
+    request_id: &str,
+    command: &agent::handoff::ClaudeResumeCommand,
+) -> Vec<String> {
+    match outcome {
+        HandoffCloseOutcome::StillClosing => Vec::new(),
+        HandoffCloseOutcome::Closed => vec![
+            crate::agent_bridge::serialize_handoff_for_js(command),
+            serialize_command_result_for_js(request_id, Ok(())),
+        ],
+        // The session is gone regardless -- it was handed to the worker before this. Saying so is
+        // the only honest option: an `error` envelope returns the frontend to the start screen,
+        // where a failed handoff reads as a dead session rather than as a conversation that is
+        // still there.
+        HandoffCloseOutcome::CloseFailed => vec![
+            serialize_command_result_for_js(request_id, Err(HANDOFF_CLOSE_FAILED_MESSAGE)),
+            serialize_error_for_js(HANDOFF_CLOSE_FAILED_MESSAGE),
+        ],
+    }
+}
+
+/// Everything a freshly-mounted document is owed, in the order it must arrive.
+///
+/// A pure function over plain data, for the same reason `SnapshotView` is one: the reload path has
+/// no `WebView`-free test otherwise, and "what does a reloaded panel get back" is exactly the list
+/// a later change loses something from without any test noticing.
+///
+/// `hello` comes first: it tells the frontend which backend it is talking to and what that backend
+/// genuinely offers, which is what the start screen renders.
+fn ready_payloads(
+    mut greeting: BackendGreeting,
+    snapshot: Option<String>,
+    last_handoff: Option<&agent::handoff::ClaudeResumeCommand>,
+) -> Vec<String> {
+    // A session this panel just handed to a terminal must not also be offered for resume on the
+    // start screen: nothing holds a lock on it, so taking the offer would put two writers on one
+    // transcript -- which is the exact hazard the handoff card warns about. This has to happen here
+    // rather than only in the frontend, because `hello` is recomputed on every mount and
+    // `agent::resumable_session` picks the record with the greatest `updated_at` -- which, right
+    // after a handoff, is the handed-over session itself. Any OTHER stored session is untouched.
+    if let (Some(command), Some(resumable)) = (last_handoff, greeting.resumable.as_ref()) {
+        if resumable.provider_session_id == command.provider_session_id() {
+            greeting.resumable = None;
+        }
+    }
+
+    let mut payloads = vec![serialize_hello_for_js(&greeting)];
+    match snapshot {
+        // A live session wins. `collect_pending_start` clears `last_handoff` when one is installed,
+        // so a stale card and a live conversation cannot both be current -- but this ordering does
+        // not depend on that being right, which is the point of writing it as an either/or.
+        Some(snapshot) => payloads.push(snapshot),
+        // No session yet is not an error: the frontend shows its start screen. If this panel closed
+        // a conversation into a terminal, the command for it belongs on that screen -- including
+        // after a reload, which is the case this whole path exists for.
+        None => {
+            if let Some(command) = last_handoff {
+                payloads.push(crate::agent_bridge::serialize_handoff_for_js(command));
+            }
+        }
+    }
+    payloads
 }
 
 /// Applies one command's outcome to the panel and the frontend, uniformly.
@@ -506,18 +724,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
 
     match message {
         InboundMessage::Ready { .. } => {
-            let (greeting_payload, snapshot_payload) = {
+            // Everything a fresh document is owed is decided by one pure function, so the reload
+            // path is testable without a WebView -- see `ready_payloads`.
+            let payloads = {
                 let state_ref = state.borrow();
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
-                // No session yet is not an error -- the frontend shows its start screen in that
-                // case and does not expect a snapshot until one exists.
                 let snapshot = state_ref.session.as_ref().map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
-                (serialize_hello_for_js(&greeting), snapshot)
+                ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref())
             };
-            // `hello` FIRST: it tells the frontend which backend it is talking to and which
-            // permission policies are genuinely on offer, which is what its start screen renders.
-            evaluate_js_dispatch(webview, &greeting_payload);
-            if let Some(payload) = snapshot_payload {
+            for payload in payloads {
                 evaluate_js_dispatch(webview, &payload);
             }
             evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
@@ -535,6 +750,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // leaking it.
                 drop(state_ref);
                 evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("a session is already starting")));
+                return;
+            }
+            if state_ref.pending_handoff.is_some() {
+                // `session` is already `None` at this point (the handoff took it), so nothing above
+                // catches this. Starting here would spawn a second `claude` alongside the one still
+                // being closed, in the same project.
+                drop(state_ref);
+                evaluate_js_dispatch(
+                    webview,
+                    &serialize_command_result_for_js(&request_id, Err("the previous session is still being handed off to a terminal")),
+                );
                 return;
             }
 
@@ -589,6 +815,84 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     trace.emit();
                 }
             }
+        }
+        InboundMessage::HandoffToTerminal { .. } => {
+            // The command is built from canonical state FIRST, while the session is still readable
+            // -- ownership moves to the shutdown worker below and nothing here can read it after
+            // that. Owned values rather than borrows because `prepare_handoff` is a pure function
+            // and the `RefCell` borrow must not outlive this block.
+            let (project_dir, session_facts, already_handing_off) = {
+                let state_ref = state.borrow();
+                let facts = state_ref.session.as_ref().map(|backend| {
+                    let projection = backend.projection();
+                    (
+                        backend.provider_session_id(),
+                        projection.active_turn_id.clone(),
+                        projection.cwd.clone(),
+                        crate::terminal_handoff::ConversationLiveness::of(&projection.status),
+                    )
+                });
+                (state_ref.project_dir.clone(), facts, state_ref.pending_handoff.is_some())
+            };
+            if already_handing_off {
+                evaluate_js_dispatch(
+                    webview,
+                    &serialize_command_result_for_js(&request_id, Err("this conversation is already being handed off")),
+                );
+                return;
+            }
+            let prepared = crate::terminal_handoff::prepare_handoff(
+                &project_dir,
+                session_facts.as_ref().map(|(provider_session_id, active_turn_id, reported_cwd, liveness)| {
+                    crate::terminal_handoff::HandoffFacts {
+                        provider_session_id: provider_session_id.as_deref(),
+                        active_turn_id: active_turn_id.as_deref(),
+                        reported_cwd: reported_cwd.as_deref(),
+                        liveness: *liveness,
+                    }
+                }),
+            );
+            let command = match prepared {
+                Ok(command) => command,
+                Err(refusal) => {
+                    // The frontend disables the control for exactly these states, so reaching here
+                    // means its view was stale (a turn started between the render and the click).
+                    // The session is untouched.
+                    evaluate_js_dispatch(
+                        webview,
+                        &serialize_command_result_for_js(&request_id, Err(&refusal.message())),
+                    );
+                    return;
+                }
+            };
+
+            // Design doc §8.3 steps 1-5, in the only order that is safe: from here on this panel
+            // holds no session, so no further turn can be sent, and `shutdown()` itself cancels
+            // every pending permission (fail-closed) and closes the provider's session.
+            // Two statements, not one `let ... else`: the same reason `apply_command_outcome`'s
+            // fatal branch is written this way -- it keeps the `RefMut` from being alive during
+            // whatever the failure branch does.
+            let taken = state.borrow_mut().session.take();
+            let Some(mut backend) = taken else {
+                // `prepare_handoff` already returned `NoSession` for this, so it is unreachable
+                // unless something took the session between that call and this line -- both run on
+                // the GTK main loop, so nothing can. Reported rather than unwrapped anyway.
+                evaluate_js_dispatch(
+                    webview,
+                    &serialize_command_result_for_js(&request_id, Err("the conversation ended before it could be handed off")),
+                );
+                return;
+            };
+            let (closed_tx, closed_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                backend.shutdown();
+                // Sent after `shutdown()` returns, which is the whole signal: the command is not
+                // dispatched until this arrives. A panic inside `shutdown()` drops the sender
+                // instead, which `collect_pending_handoff` reads as a failed close.
+                let _ = closed_tx.send(());
+            });
+            state.borrow_mut().pending_handoff = Some(PendingHandoff { request_id, command, closed_rx });
+            // No command_result yet -- `collect_pending_handoff` owes it once the close finishes.
         }
         InboundMessage::PermissionResponse { permission_id, decision, reason, .. } => {
             let decision = decision.into_decision(reason);
@@ -688,6 +992,141 @@ mod tests {
         assert!(
             AGENT_UI_HTML.contains("neovibeAgent"),
             "the embedded document never posts through the script-message handler -- no command could reach Rust"
+        );
+    }
+
+    fn a_command() -> agent::handoff::ClaudeResumeCommand {
+        agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2").unwrap()
+    }
+
+    fn legacy_greeting() -> BackendGreeting {
+        BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/home/user/project"))
+    }
+
+    fn kinds(payloads: &[String]) -> Vec<String> {
+        payloads
+            .iter()
+            .map(|p| {
+                serde_json::from_str::<serde_json::Value>(p).unwrap()["kind"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// The whole point of holding the command in Rust. A document that reloads -- Ctrl+Shift+R, the
+    /// top bar's `⟳`, or a WebKit crash -- gets the command back, because the panel still has it.
+    ///
+    /// The backend here is `legacy` deliberately: it is the default, and it is the case where the
+    /// loss was unrecoverable. The first assert states why, from the greeting's own payload -- legacy
+    /// offers no resume, so `hello` carries no copy of this id and nothing else in the process does
+    /// either.
+    #[test]
+    fn a_reloaded_document_is_handed_back_the_command_the_old_one_was_showing() {
+        let command = a_command();
+        let payloads = ready_payloads(legacy_greeting(), None, Some(&command));
+        let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert!(hello["resumableSession"].is_null(), "legacy has no other record of this session");
+
+        assert_eq!(kinds(&payloads), vec!["hello", "handoff"]);
+        let handoff: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+        assert_eq!(handoff["command"], "cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
+        assert_eq!(handoff["providerSessionId"], "1857dcd5-973b-46a2");
+    }
+
+    /// The ordinary case is unchanged: a panel that never handed anything off sends `hello` alone.
+    #[test]
+    fn a_panel_that_handed_nothing_off_sends_only_the_greeting() {
+        assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None)), vec!["hello"]);
+    }
+
+    /// A live session wins. The card describes a conversation that is over; putting it above a
+    /// running one would read as that one being closed.
+    #[test]
+    fn a_live_session_is_sent_instead_of_a_stale_handoff_card() {
+        let command = a_command();
+        let payloads = ready_payloads(
+            legacy_greeting(),
+            Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
+            Some(&command),
+        );
+        assert_eq!(kinds(&payloads), vec!["hello", "snapshot"]);
+    }
+
+    /// A session handed to a terminal must not also be offered for resume on the start screen --
+    /// accepting that offer would put two writers on one transcript, which is exactly what the card
+    /// beside it warns about. This is the case the frontend's own suppression cannot cover: `hello`
+    /// is recomputed here on every mount, and `agent::resumable_session` picks the most recently
+    /// updated record, which right after a handoff is the handed-over session itself.
+    #[test]
+    fn the_session_that_was_handed_over_is_no_longer_offered_for_resume() {
+        let greeting = BackendGreeting {
+            kind: BackendKind::Sidecar,
+            project_dir: PathBuf::from("/home/user/project"),
+            permission_modes: crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
+            expected_verdandi_revision: None,
+            resumable: Some(agent::ResumableSession {
+                provider: "claude".to_string(),
+                provider_session_id: "1857dcd5-973b-46a2".to_string(),
+                updated_at: "1757700000000".to_string(),
+            }),
+        };
+        let command = a_command();
+        let payloads = ready_payloads(greeting, None, Some(&command));
+        let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert!(hello["resumableSession"].is_null(), "the handed-over session is still on offer");
+    }
+
+    /// ...and only that one. Suppressing every stored session would hide a conversation nobody gave
+    /// away.
+    #[test]
+    fn an_unrelated_stored_session_stays_on_offer_after_a_handoff() {
+        let greeting = BackendGreeting {
+            kind: BackendKind::Sidecar,
+            project_dir: PathBuf::from("/home/user/project"),
+            permission_modes: crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
+            expected_verdandi_revision: None,
+            resumable: Some(agent::ResumableSession {
+                provider: "claude".to_string(),
+                provider_session_id: "some-other-session".to_string(),
+                updated_at: "1757700000000".to_string(),
+            }),
+        };
+        let command = a_command();
+        let payloads = ready_payloads(greeting, None, Some(&command));
+        let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(hello["resumableSession"]["providerSessionId"], "some-other-session");
+    }
+
+    /// The sequencing the whole feature's honesty rests on: while the close worker has not reported,
+    /// the tick decides `StillClosing` -- and `handoff_payloads` dispatches nothing at all for it.
+    /// A real channel across a real send, not a mocked one.
+    #[test]
+    fn the_command_is_not_released_until_the_close_worker_has_reported() {
+        let (closed_tx, closed_rx) = mpsc::channel();
+        assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::StillClosing);
+        assert!(handoff_payloads(&HandoffCloseOutcome::StillClosing, "req-1", &a_command()).is_empty());
+
+        closed_tx.send(()).unwrap();
+        assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::Closed);
+        assert_eq!(
+            kinds(&handoff_payloads(&HandoffCloseOutcome::Closed, "req-1", &a_command())),
+            vec!["handoff", "command_result"]
+        );
+    }
+
+    /// A worker that panicked inside `shutdown()` drops its sender without sending. That is a failed
+    /// close, not a finished one -- and a failed close must NOT be followed by a card whose first
+    /// line says the conversation is closed.
+    #[test]
+    fn a_close_that_died_partway_reports_a_dead_session_rather_than_the_command() {
+        let (closed_tx, closed_rx) = mpsc::channel::<()>();
+        drop(closed_tx);
+        assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::CloseFailed);
+
+        let payloads = handoff_payloads(&HandoffCloseOutcome::CloseFailed, "req-2", &a_command());
+        assert_eq!(kinds(&payloads), vec!["command_result", "error"]);
+        assert!(
+            !payloads.iter().any(|p| p.contains("1857dcd5-973b-46a2")),
+            "a failed close leaked the resume command anyway: {payloads:?}"
         );
     }
 }

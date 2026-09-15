@@ -50,6 +50,13 @@ pub(crate) enum InboundMessage {
     /// timestamp crossing this boundary would be a confident, meaningless number. Diagnostic only --
     /// nothing branches on it, and it gets no `command_result`.
     TurnRendered { request_id: String, receive_to_frame_ms: f64 },
+    /// "Continue this conversation in a real terminal." Carries nothing of its own: every input the
+    /// rule needs already lives in canonical state on the Rust side, and a session id sent from the
+    /// frontend would be a second, stale source for the one value that must not be wrong.
+    ///
+    /// Closes the session before the command is produced -- see `crate::terminal_handoff` for what
+    /// this path does and does not claim, and `agent_panel`'s `PendingHandoff` for the ordering.
+    HandoffToTerminal { request_id: String },
     PermissionResponse {
         request_id: String,
         permission_id: String,
@@ -96,6 +103,7 @@ impl InboundMessage {
             | InboundMessage::SendMessage { request_id, .. }
             | InboundMessage::Interrupt { request_id }
             | InboundMessage::TurnRendered { request_id, .. }
+            | InboundMessage::HandoffToTerminal { request_id }
             | InboundMessage::PermissionResponse { request_id, .. } => request_id,
         }
     }
@@ -319,6 +327,34 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
     });
 
     json!({ "kind": "snapshot", "throughRevision": projection.last_revision, "state": state }).to_string()
+}
+
+/// `{"kind":"handoff","command":...,"cwd":...,"providerSessionId":...}` -- the conversation has
+/// been closed here and this is the command that continues it in the user's own terminal.
+///
+/// Dispatched only AFTER the real session shutdown has completed (`agent_panel`'s
+/// `collect_pending_handoff`), so the ordering design doc §8.3 requires -- close and flush before
+/// the CLI starts -- holds by construction rather than by hope: the command has not been shown yet
+/// while Neovibe is still driving the session.
+///
+/// `providerSessionId` is read back out of the command's own argv rather than passed in beside it,
+/// so the id the panel displays and the id the command resumes are the same value by construction.
+///
+/// **It carries no claim of exclusivity, because there is none to make.** Nothing was spawned and
+/// no lease was taken; the frontend renders the concurrency warning design doc §8.3's closing
+/// paragraph requires of this path, and §8.5/§17.7 reject a stronger claim even where a lease IS
+/// held.
+pub(crate) fn serialize_handoff_for_js(command: &agent::handoff::ClaudeResumeCommand) -> String {
+    json!({
+        "kind": "handoff",
+        "command": command.shell_command_line(),
+        "cwd": command.cwd(),
+        // Read back out of the command's own argv by `ClaudeResumeCommand::provider_session_id`,
+        // which is total rather than indexing -- a malformed argv cannot panic the whole shell
+        // process over one envelope.
+        "providerSessionId": command.provider_session_id(),
+    })
+    .to_string()
 }
 
 /// `{"kind":"error","message":<message>}` -- a fatal, session-ending failure the frontend cannot
@@ -860,6 +896,41 @@ mod tests {
             InboundMessage::StartSession { resume, .. } => assert_eq!(resume.as_deref(), Some("claude-abc")),
             other => panic!("expected StartSession, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_handoff_to_terminal() {
+        let msg = parse_inbound_message(r#"{"type":"handoff_to_terminal","request_id":"r10"}"#).unwrap();
+        assert_eq!(msg.request_id(), "r10");
+        assert!(matches!(msg, InboundMessage::HandoffToTerminal { .. }));
+    }
+
+    /// The command goes over the wire as one ready-to-run line PLUS its parts. The line is what a
+    /// user copies; the parts are what lets the frontend say which session and which directory
+    /// without re-parsing the line it was given.
+    ///
+    /// Built from the real `agent::handoff::ClaudeResumeCommand` rather than a hand-written string,
+    /// so a change to what "continue this session" means reaches this envelope automatically.
+    #[test]
+    fn serialize_handoff_for_js_carries_the_runnable_line_and_its_parts() {
+        let command =
+            agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2").unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(&command)).unwrap();
+        assert_eq!(parsed["kind"], "handoff");
+        assert_eq!(parsed["command"], "cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
+        assert_eq!(parsed["cwd"], "/home/user/project");
+        assert_eq!(parsed["providerSessionId"], "1857dcd5-973b-46a2");
+    }
+
+    /// The id the envelope carries is the ARGUMENT of the command, read back out of the argv --
+    /// never a second copy of the id passed in alongside it. Two sources for one value is how the
+    /// panel would eventually show one session and print a command resuming another.
+    #[test]
+    fn the_envelopes_session_id_is_the_one_the_command_actually_resumes() {
+        let command = agent::handoff::ClaudeResumeCommand::for_session("/tmp/p", " padded-id ").unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(&command)).unwrap();
+        assert_eq!(parsed["providerSessionId"], "padded-id");
+        assert!(parsed["command"].as_str().unwrap().ends_with("claude --resume padded-id"));
     }
 
     #[test]
