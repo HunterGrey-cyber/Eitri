@@ -256,12 +256,12 @@ fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
         ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
             .expect("connecting to a real sidecar should succeed"),
     );
-    let mut conversation = agent::AgentConversation::create(
-        provider.clone(),
-        &std::env::temp_dir(),
-        PermissionMode::Bypass,
-    )
-    .expect("creating a conversation should succeed");
+    // Its own directory, inside this process's disposable state root: a real session writes a real
+    // conversation record and takes a real session lease, and `test_workspace_dir` keeps both out
+    // of the developer's own XDG directories (see `agent::state_dirs`).
+    let cwd = agent::state_dirs::test_workspace_dir("replay-recovery");
+    let mut conversation = agent::AgentConversation::create(provider.clone(), &cwd, PermissionMode::Bypass)
+        .expect("creating a conversation should succeed");
 
     conversation.send_turn(STREAMING_PROMPT).expect("send_turn should succeed");
 

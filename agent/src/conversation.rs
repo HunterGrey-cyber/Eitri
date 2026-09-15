@@ -26,10 +26,24 @@
 //!
 //! - `create` cannot take a lease up front. The lease key includes `provider_session_id`, and that
 //!   value does not exist until the provider's first `SessionOpened` arrives -- so the lease is
-//!   acquired, and the record written, inside `pump()` when that event is folded.
+//!   acquired, and the record written, on the ingestion thread when that event is folded.
 //! - `resume` knows the id before it calls anything, so it probes, acquires, and only THEN asks the
 //!   provider. Acquiring after would leave a window where two clients have both started resuming
 //!   the same Claude session, which is the exact hazard the lease exists to prevent.
+//!
+//! **There is deliberately no lease on the DIRECTORY.** One was written and withdrawn on
+//! 2026-09-15: it delivered prohibition (a second Neovibe window in one project refused to start)
+//! where the requirement is isolation, and it broke `agent`'s own security baseline test, which now
+//! asserts that two sessions in one directory each see only their own `PreToolUse` hook. That
+//! isolation is real and lives elsewhere -- the hook config travels in the CLI's own argv
+//! (`--settings`, see `agent::settings`), not in a `.claude/` file two sessions could share. The
+//! cross-window question "is another window running an agent on this project?" is the `supervisor`
+//! dashboard's job, not a lock's.
+//!
+//! The lease is ADVISORY and nothing here says otherwise (design doc §8.5, §17.7). It binds
+//! processes that take part in this protocol; a `claude` someone runs by hand in the same directory
+//! takes no lease and is not stopped, and Claude's own documentation records that two clients
+//! resuming one session interleave a single transcript.
 
 use crate::lease::{LeaseError, SessionLease};
 use crate::persistence::{save_conversation_record, ConversationRecord};
@@ -114,10 +128,13 @@ impl std::fmt::Display for ConversationError {
             ConversationError::TurnAlreadyActive => write!(f, "a turn is already in progress on this conversation"),
             ConversationError::NoSession => write!(f, "no active session"),
             ConversationError::Cwd(e) => write!(f, "could not resolve the working directory: {e}"),
+            // States the advisory boundary rather than implying a guarantee the lock cannot give
+            // (design doc §8.5): it binds Neovibe windows only.
             ConversationError::LeaseHeld { provider_session_id } => write!(
                 f,
                 "session {provider_session_id} is already open in another Neovibe window -- close it \
-                 there first, or start a new conversation"
+                 there first, or start a new conversation. This only binds Neovibe windows: a \
+                 `claude --resume` you start by hand is not stopped by it"
             ),
             ConversationError::Lease(e) => write!(f, "could not take the session lease: {e}"),
             // Just the reason. It used to be wrapped in "the provider ended session X immediately
@@ -232,9 +249,11 @@ pub(crate) fn persist_record(
 ) {
     let now = epoch_millis();
     // Preserve the original `created_at` when a record already exists: this runs again on every
-    // resume of the same workspace, and rewriting it would turn "when did this conversation start"
-    // into "when was it last touched", which `updated_at` already answers.
-    let created_at = crate::persistence::load_conversation_record(conversation_id)
+    // resume of the same session, and rewriting it would turn "when did this conversation start"
+    // into "when was it last touched", which `updated_at` already answers. Looked up by SESSION,
+    // not by workspace -- a workspace holds one record per session now, so a second session
+    // starting in the same directory must not inherit the first one's start time.
+    let created_at = crate::persistence::load_conversation_record(conversation_id, provider_session_id)
         .map(|existing| existing.created_at)
         .unwrap_or_else(|_| now.clone());
     let record = ConversationRecord {
@@ -298,9 +317,10 @@ pub struct AgentConversation {
 impl AgentConversation {
     /// Creates a fresh provider session for `cwd`.
     ///
-    /// `cwd` is canonicalized first, and the canonical form is what both the conversation id and the
-    /// provider see -- otherwise `/home/x/proj` and `/home/x/../x/proj` would be two conversations
-    /// for one directory, and would later map to two different persisted records.
+    /// `cwd` is canonicalized first, and the canonical form is what the conversation id, the lease
+    /// and the provider all see -- otherwise `/home/x/proj` and `/home/x/../x/proj` would be two
+    /// conversations for one directory, would take two different locks, and would later map to two
+    /// different persisted records.
     pub fn create(
         provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
@@ -339,13 +359,21 @@ impl AgentConversation {
             None,
             None,
         );
-        Self { conversation_id, canonical_cwd, provider, capabilities, info, session_id: Some(session_id), ingest }
+        Self {
+            conversation_id,
+            canonical_cwd,
+            provider,
+            capabilities,
+            info,
+            session_id: Some(session_id),
+            ingest,
+        }
     }
 
     /// Continues an existing Claude session.
     ///
     /// Step order matters and is not the same as `create`'s (see this module's header):
-    ///   1. canonicalize `cwd` -- the lease key and the persisted record both use the canonical form;
+    ///   1. canonicalize `cwd` -- both the lease key and the persisted record use the canonical form;
     ///   2. refuse if the provider does not advertise resume, rather than sending a command on the
     ///      theory the server will ignore it;
     ///   3. probe Claude's own transcript for this session: if it is still being written, something
@@ -690,8 +718,7 @@ impl AgentConversation {
             self.fold(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
         }
         // Released last: the lease must outlive the provider's own session teardown, so no other
-        // client can acquire it while this one is still closing. (Always `None` today -- see this
-        // module's header.)
+        // client can acquire it while this one is still closing.
         self.ingest.release_lease();
     }
 
@@ -793,9 +820,28 @@ mod tests {
         }
     }
 
+    /// A directory no other test shares, inside this process's disposable state root.
+    ///
+    /// Two reasons, and the second is the load-bearing one:
+    ///
+    /// - a distinct cwd is a distinct `conversation_id`, so tests cannot read each other's
+    ///   persisted records or contend on each other's session leases (every test here folds the
+    ///   same `session_opened()`, whose `provider_session_id` is a fixed string);
+    /// - `state_dirs::test_workspace_dir` calls `redirect_state_to_a_test_root()`, which is what
+    ///   stops those records and leases being written into the developer's own
+    ///   `~/.local/state/neovibe/` and `$XDG_RUNTIME_DIR/neovibe/`. That write happens on the
+    ///   INGESTION thread, so no amount of care on this thread avoids it -- only the redirect does.
+    fn unique_dir() -> PathBuf {
+        crate::state_dirs::test_workspace_dir("conversation")
+    }
+
     /// `Box<dyn AgentProvider>` consumes the fake, so tests that need to inspect it afterward keep
     /// a second handle. `AgentProvider`'s methods all take `&self`, so an `Rc` is enough.
     fn conversation_with(fake: Arc<FakeProvider>) -> AgentConversation {
+        conversation_in(fake, &unique_dir()).expect("create should succeed against the fake provider")
+    }
+
+    fn conversation_in(fake: Arc<FakeProvider>, dir: &Path) -> Result<AgentConversation, ConversationError> {
         struct Shared(Arc<FakeProvider>);
         impl AgentProvider for Shared {
             fn capabilities(&self) -> ProviderCapabilities { self.0.capabilities() }
@@ -808,9 +854,7 @@ mod tests {
             fn close_session(&self, r: CloseSessionRequest) -> Result<(), ProviderError> { self.0.close_session(r) }
             fn pump(&self) -> Vec<AgentDomainEvent> { self.0.pump() }
         }
-        // std::env::temp_dir() is guaranteed to exist and canonicalize.
-        AgentConversation::create(Arc::new(Shared(fake)), &std::env::temp_dir(), PermissionMode::Bypass)
-            .expect("create should succeed against the fake provider")
+        AgentConversation::create(Arc::new(Shared(fake)), dir, PermissionMode::Bypass)
     }
 
     /// Waits for the ingestion thread to reach a state, or fails.
@@ -1014,11 +1058,40 @@ mod tests {
     #[test]
     fn create_canonicalizes_cwd_before_deriving_the_id_or_calling_the_provider() {
         let fake = Arc::new(FakeProvider::new());
-        let conversation = conversation_with(fake.clone());
-        let canonical = std::env::temp_dir().canonicalize().unwrap();
+        let dir = unique_dir();
+        let conversation = conversation_in(fake.clone(), &dir).unwrap();
+        let canonical = dir.canonicalize().unwrap();
         assert_eq!(conversation.canonical_cwd(), canonical.as_path());
         assert_eq!(conversation.conversation_id(), conversation_id_for_cwd(&canonical));
         assert_eq!(fake.calls(), vec![format!("create_session(cwd={})", canonical.to_string_lossy())]);
+    }
+
+    /// **The withdrawn A3, pinned so it cannot come back by accident.**
+    ///
+    /// A workspace-wide lease was written on 2026-09-15 and withdrawn the same day: it refused the
+    /// second window outright, where the requirement is that two windows not step on each other. It
+    /// also made `agent`'s own security baseline test
+    /// (`backend_conformance::real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_hooks`)
+    /// impossible to run, since that test starts two sessions in one directory on purpose.
+    ///
+    /// The isolation that test asserts is real and lives elsewhere: the `PreToolUse` hook config
+    /// travels in each CLI process's own argv (`--settings`), so nothing outside that process can
+    /// read, overwrite or delete it. See `agent::settings`.
+    #[test]
+    fn two_fresh_conversations_in_one_directory_can_both_start() {
+        let dir = unique_dir();
+        let _first = conversation_in(Arc::new(FakeProvider::new()), &dir).expect("the first window starts normally");
+
+        let second = Arc::new(FakeProvider::new());
+        assert!(
+            conversation_in(second.clone(), &dir).is_ok(),
+            "a second Neovibe window in one project must not be refused -- see this test's doc comment"
+        );
+        assert_eq!(
+            second.calls(),
+            vec![format!("create_session(cwd={})", dir.canonicalize().unwrap().to_string_lossy())],
+            "the second window must really have asked the provider for its own session"
+        );
     }
 
     #[test]

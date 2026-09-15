@@ -98,8 +98,16 @@ impl AgentProvider for ScriptedProvider {
     }
 }
 
+/// Each conversation gets its own directory inside this process's disposable state root.
+///
+/// Load-bearing rather than tidiness: these tests fold a real `SessionOpened`, and that is what
+/// makes `AgentConversation`'s ingestion thread take a session lease and write a conversation
+/// record. `test_workspace_dir` redirects both away from the developer's own
+/// `~/.local/state/neovibe/` and `$XDG_RUNTIME_DIR/neovibe/` (see `agent::state_dirs`), and a
+/// distinct cwd per conversation keeps these tests from sharing a lease key with each other.
 fn conversation(provider: Arc<ScriptedProvider>) -> AgentConversation {
-    AgentConversation::create(provider, &std::env::temp_dir(), PermissionMode::Bypass)
+    let dir = agent::state_dirs::test_workspace_dir("slow-ui");
+    AgentConversation::create(provider, &dir, PermissionMode::Bypass)
         .expect("create should succeed against the scripted provider")
 }
 

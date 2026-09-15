@@ -6,6 +6,17 @@
 //! a crashed or killed process automatically releases every lock it held (every fd referencing the
 //! lock's underlying open file description closes), so this module needs no heartbeat thread or
 //! stale-lease sweep to stay correct -- see this plan's "Explicitly out of scope" section.
+//!
+//! **One lease domain, and it is per SESSION, not per directory**: `try_acquire(provider,
+//! canonical_cwd, provider_session_id)` answers "may this window drive THIS Claude session?", which
+//! is only answerable once a session id exists -- on resume, or after adoption. It is deliberately
+//! NOT a claim on the directory: two windows may each run their own agent in one project, and
+//! design doc §16.5 asks only that the SECOND window resuming the SAME session be refused.
+//!
+//! It is ADVISORY and this module says so rather than implying otherwise: it binds processes that
+//! participate in this protocol. Nothing here can stop a `claude` someone runs by hand in the same
+//! directory, and Claude's own documentation records that two clients resuming one session
+//! interleave a single transcript. Design doc §8.5 and §17.7 reject any stronger claim.
 
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -48,12 +59,66 @@ impl std::fmt::Display for LeaseError {
 
 impl std::error::Error for LeaseError {}
 
-/// `$XDG_RUNTIME_DIR/neovibe/session-leases/`, matching this project's own established pattern
-/// for ephemeral, per-session state (`supervisor::socket_path`, `agent::process`'s hook sockets).
+/// Where the lock files live -- `state_dirs::leases_dir()`, i.e.
+/// `$XDG_RUNTIME_DIR/neovibe/session-leases/`, unless a test has redirected it.
+///
+/// The thread-local checked first is narrower still and belongs to this module's own tests: several
+/// of them acquire the SAME key (`claude`/`/tmp/project`/`prov-1`) to assert contention, so they
+/// have to be invisible to each other as well as to the real runtime directory.
 fn leases_dir() -> std::io::Result<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
-    Ok(PathBuf::from(runtime_dir).join("neovibe/session-leases"))
+    #[cfg(test)]
+    if let Some(dir) = test_override::current() {
+        return Ok(dir);
+    }
+    crate::state_dirs::leases_dir()
+}
+
+/// A per-TEST-THREAD lease directory, so this module's own tests can isolate themselves from each
+/// other -- two of them deliberately acquire the same key.
+///
+/// They used to do this by setting `XDG_RUNTIME_DIR`, which is not safe in a multi-threaded test
+/// binary: `std::env::set_var`/`remove_var` are process-wide, so this teardown could unset the
+/// variable out from under any other test reading it on another thread. Worse than flaky: the
+/// isolated directory is deleted at the end of each scenario, and a concurrent acquirer would then
+/// recreate and re-lock the same path, so a contention assertion could fail for a reason that has
+/// nothing to do with contention.
+///
+/// A thread-local is the right shape because cargo runs each test on its own thread, so this is
+/// genuinely private to the test that set it and invisible to every other. It is also why it cannot
+/// serve the crate's other tests: `AgentConversation` takes its session lease on an ingestion thread
+/// no test owns. Those use `state_dirs::redirect_state_to_a_test_root()` instead.
+#[cfg(test)]
+mod test_override {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static LEASES_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<PathBuf> {
+        LEASES_DIR.with(|dir| dir.borrow().clone())
+    }
+
+    /// Redirects this thread's lease directory for as long as it is alive, and deletes it on drop
+    /// so a test leaves nothing behind.
+    pub(super) struct IsolatedLeasesDir(PathBuf);
+
+    impl IsolatedLeasesDir {
+        pub(super) fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("agent-lease-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            LEASES_DIR.with(|slot| *slot.borrow_mut() = Some(dir.clone()));
+            Self(dir)
+        }
+    }
+
+    impl Drop for IsolatedLeasesDir {
+        fn drop(&mut self) {
+            LEASES_DIR.with(|slot| *slot.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 /// Design doc §8.2: "文件名使用 key 的 SHA-256，不把路径原文暴露在公共 socket 名称里" -- the key
@@ -182,51 +247,44 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::test_override::IsolatedLeasesDir;
     use super::*;
 
-    fn isolated_runtime_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("agent-lease-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    // These were one long test function, because isolating them meant mutating XDG_RUNTIME_DIR and
+    // that is process-wide. `IsolatedLeasesDir` is per-thread, so they are separate tests again and
+    // each can say in its own name what it pins.
 
-    // SAFETY: this test mutates process-wide env state (XDG_RUNTIME_DIR). All three scenarios
-    // are exercised sequentially within this one test function specifically so no other test in
-    // this crate can interleave with these mutations on a separate thread -- cargo's default
-    // multi-threaded test runner turned this exact shape (3 separate tests, each independently
-    // calling `set_var`) into a real, reproduced race for `persistence.rs`'s own
-    // `XDG_STATE_HOME`-mutating tests earlier in this same plan (4/9 parallel runs failed there
-    // before being merged into one test the same way this one already is). Do not split this
-    // back into 3 separate `#[test]` functions.
     #[test]
-    fn session_lease_acquire_and_contention_behave_correctly() {
-        // Scenario 1: acquire then release allows a fresh acquire.
-        let dir = isolated_runtime_dir();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+    fn a_session_lease_is_reacquirable_once_released() {
+        let _isolated = IsolatedLeasesDir::new();
         let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-1").unwrap();
         assert!(lease.path().exists());
         drop(lease);
-        let lease2 = SessionLease::try_acquire("claude", "/tmp/project", "prov-1").unwrap();
-        drop(lease2);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(SessionLease::try_acquire("claude", "/tmp/project", "prov-1").is_ok());
+    }
 
-        // Scenario 2: a second acquire of the same key while the first is held fails with AlreadyHeld.
-        let dir = isolated_runtime_dir();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+    #[test]
+    fn a_second_acquire_of_a_held_session_lease_reports_contention() {
+        let _isolated = IsolatedLeasesDir::new();
         let _first = SessionLease::try_acquire("claude", "/tmp/project", "prov-1").unwrap();
         let second = SessionLease::try_acquire("claude", "/tmp/project", "prov-1");
         assert!(matches!(second, Err(LeaseError::AlreadyHeld)));
-        drop(_first);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Scenario 3: different keys do not contend.
-        let dir = isolated_runtime_dir();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+    #[test]
+    fn session_leases_for_different_workspaces_do_not_contend() {
+        let _isolated = IsolatedLeasesDir::new();
         let _a = SessionLease::try_acquire("claude", "/tmp/project-a", "prov-1").unwrap();
-        let b = SessionLease::try_acquire("claude", "/tmp/project-b", "prov-1");
-        assert!(b.is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(SessionLease::try_acquire("claude", "/tmp/project-b", "prov-1").is_ok());
+    }
 
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    /// Two DIFFERENT sessions in one directory do not contend, and that is the design, not an
+    /// oversight: the lease claims a Claude session, never the directory. Design doc §16.5 asks
+    /// only that a second window resuming the SAME session be refused, which the test above pins.
+    #[test]
+    fn two_different_sessions_in_one_directory_do_not_contend() {
+        let _isolated = IsolatedLeasesDir::new();
+        let _a = SessionLease::try_acquire("claude", "/tmp/project", "prov-1").unwrap();
+        assert!(SessionLease::try_acquire("claude", "/tmp/project", "prov-2").is_ok());
     }
 }

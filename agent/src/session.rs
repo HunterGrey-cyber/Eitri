@@ -46,6 +46,13 @@ pub struct AgentSession {
 impl AgentSession {
     /// Spawns the underlying `AgentProcess` for a whole conversation. See
     /// `AgentProcess::spawn`'s own doc for what `project_dir`/`mode`/`disallowed_tools` mean.
+    ///
+    /// **Nothing here claims the directory.** Two `AgentSession`s in one project directory is a
+    /// supported shape, not a hazard to be locked out: each one's `PreToolUse` hook config travels
+    /// in its own CLI process's argv (`--settings`, see `agent::settings`), so neither can read,
+    /// overwrite or delete the other's. `backend_conformance`'s
+    /// `real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_hooks`
+    /// asserts exactly that against the real CLI.
     pub fn start(project_dir: &Path, mode: PermissionMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
         let process = AgentProcess::spawn(project_dir, mode, disallowed_tools)?;
         Ok(Self {

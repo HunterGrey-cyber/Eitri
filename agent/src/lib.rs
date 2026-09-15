@@ -33,6 +33,7 @@ pub mod lease;
 pub mod persistence;
 pub mod providers;
 pub mod settings;
+pub mod state_dirs;
 pub mod transcript;
 
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
