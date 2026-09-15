@@ -18,7 +18,6 @@
 
 use crate::event::{AgentEvent, PermissionSource};
 use crate::hook_protocol::parse_pretooluse_input;
-use crate::settings::HookSettings;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -112,9 +111,6 @@ pub struct AgentProcess {
     /// Live `agent-hook` socket connections awaiting a decision, keyed by `tool_use_id` --
     /// written to by the hook-listener thread, read/removed by `respond_permission`.
     pending_hook_connections: Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
-    /// `None` in `PermissionMode::Bypass` (no hook settings are generated at all). Cleaned up on
-    /// `shutdown()`.
-    hook_settings: Option<HookSettings>,
     socket_path: std::path::PathBuf,
     /// Set once this process's exit has been observed via `try_wait()` and a corresponding
     /// `AgentEvent::ProcessExited` has been pushed -- makes that push fire exactly once, no
@@ -299,8 +295,9 @@ fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Op
 
 impl AgentProcess {
     /// Spawns exactly one long-lived process for the whole conversation. `project_dir` is both
-    /// the CLI's cwd (so `--setting-sources project,local` resolves there) and where the
-    /// generated hook settings file (Task 4) and the per-conversation Unix socket live.
+    /// the CLI's cwd (so `--setting-sources project,local` resolves the project's own real
+    /// settings there) and the root this conversation operates on. This crate writes nothing into
+    /// it: the hook configuration goes in argv and the per-conversation socket in the temp dir.
     pub fn spawn(project_dir: &Path, mode: PermissionMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
         Self::spawn_with_binary(project_dir, mode, disallowed_tools, "claude")
     }
@@ -314,11 +311,14 @@ impl AgentProcess {
     /// the hook-listener *thread* is spawned only AFTER `cmd.spawn()` has succeeded. It used to be
     /// spawned before, which meant a failed `cmd.spawn()` (e.g. `claude` not on `PATH`) returned
     /// `Err` while leaving behind a thread whose stop flag no one could ever set again -- it spun
-    /// its poll-plus-sleep loop for the rest of the host process's life, with the socket and
-    /// settings files left on disk too. `HookSettings::generate` still runs first (the CLI reads
-    /// settings at its own startup, so the file must exist before `claude` does) and the listener
-    /// is still *bound* early (cheap, and the socket must be ready before the CLI could possibly
-    /// invoke a hook), but every fallible step after those now cleans up what came before it.
+    /// its poll-plus-sleep loop for the rest of the host process's life, with the socket file
+    /// left on disk too. The listener is still *bound* early (cheap, and the socket must be ready
+    /// before the CLI could possibly invoke a hook), but every fallible step after it now cleans
+    /// up what came before.
+    ///
+    /// The hook configuration itself is an argv value (`--settings`), not a file, so there is no
+    /// longer anything on disk to generate first or to restore afterwards -- see
+    /// `crate::settings` for the real-CLI spike that forced that change.
     fn spawn_with_binary(
         project_dir: &Path,
         mode: PermissionMode,
@@ -329,18 +329,17 @@ impl AgentProcess {
         let socket_path = std::env::temp_dir().join(format!("neovibe-agent-hook-{conversation_id}.sock"));
         let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
-        let hook_settings = if mode == PermissionMode::Bypass {
+        // Bypass mode asks for no gate at all, so no hook is installed. In every other mode the
+        // gate travels in this one process's argv, where no other conversation can reach it.
+        let hook_settings_arg = if mode == PermissionMode::Bypass {
             None
         } else {
-            Some(HookSettings::generate(project_dir, &socket_path)?)
+            Some(crate::settings::hook_settings_arg(&socket_path)?)
         };
         // Undoes everything `spawn` has created so far, for use on the error path of every
         // fallible step below -- no thread has been started at any point where this is called, so
-        // there is never anything to stop, only files to remove.
-        let cleanup_partial_spawn = |settings: &Option<HookSettings>| {
-            if let Some(settings) = settings {
-                let _ = settings.cleanup();
-            }
+        // there is never anything to stop, and now only one file to remove.
+        let cleanup_partial_spawn = || {
             let _ = std::fs::remove_file(&socket_path);
         };
 
@@ -350,7 +349,7 @@ impl AgentProcess {
         let listener = match UnixListener::bind(&socket_path) {
             Ok(listener) => listener,
             Err(e) => {
-                cleanup_partial_spawn(&hook_settings);
+                cleanup_partial_spawn();
                 return Err(e);
             }
         };
@@ -375,13 +374,17 @@ impl AgentProcess {
             cmd.arg("--disallowedTools").arg(disallowed_tools.join(","));
         }
 
+        if let Some(settings) = &hook_settings_arg {
+            cmd.arg("--settings").arg(settings);
+        }
+
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 // No listener thread exists yet (see this function's ordering doc), so the bound
                 // listener just drops here -- only the two files it created need removing.
                 drop(listener);
-                cleanup_partial_spawn(&hook_settings);
+                cleanup_partial_spawn();
                 return Err(e);
             }
         };
@@ -397,7 +400,7 @@ impl AgentProcess {
                     // here rather than returning an Err that orphans it.
                     let _ = child.kill();
                     let _ = child.wait();
-                    cleanup_partial_spawn(&hook_settings);
+                    cleanup_partial_spawn();
                     return Err(e);
                 }
             };
@@ -442,7 +445,6 @@ impl AgentProcess {
             hook_listener_handle: Some(hook_listener_handle),
             hook_listener_stop,
             pending_hook_connections,
-            hook_settings,
             socket_path,
             exit_reported: false,
             shut_down: false,
@@ -577,7 +579,8 @@ impl AgentProcess {
     ///
     /// Everything else is v1's already-proven chain, unchanged: wait for natural exit, escalate
     /// to SIGTERM, escalate to SIGKILL, block until confirmed reaped, join reader threads, join
-    /// the (by now already-signaled) hook-listener thread, clean up generated hook settings.
+    /// the (by now already-signaled) hook-listener thread. There is no settings file to restore
+    /// any more -- the gate lives in the spawned process's argv and dies with it.
     pub fn shutdown(&mut self) {
         if self.shut_down {
             return;
@@ -635,9 +638,6 @@ impl AgentProcess {
         // stashed one final connection in the narrow window between the drain above and its own
         // next stop-flag check, and that peer deserves the same EOF rather than a 600s wait.
         release_pending_hook_connections(&self.pending_hook_connections);
-        if let Some(settings) = self.hook_settings.take() {
-            let _ = settings.cleanup();
-        }
     }
 
     fn send_signal(&self, sig: i32) -> std::io::Result<()> {
@@ -1051,24 +1051,29 @@ mod tests {
     }
 
     /// I4's regression test, exercising the REAL failure path: `spawn_with_binary` runs the exact
-    /// production `spawn` body (real `HookSettings::generate`, real `UnixListener::bind`, real
+    /// production `spawn` body (real hook-settings construction, real `UnixListener::bind`, real
     /// `Command::spawn`) with only the binary name changed to one that does not exist, so
     /// `cmd.spawn()` genuinely fails. Before the fix, that left behind (a) a hook-listener thread
     /// whose stop flag nobody could ever set again, spinning its poll-plus-sleep loop for the rest
-    /// of the process's life, (b) the socket file, and (c) the generated settings file. Runs the
-    /// failing spawn five times so a per-call thread leak would be unmistakable against the noise
-    /// of other tests' own short-lived threads running in parallel.
+    /// of the process's life, and (b) the socket file. Runs the failing spawn five times so a
+    /// per-call thread leak would be unmistakable against the noise of other tests' own
+    /// short-lived threads running in parallel.
+    ///
+    /// The third leak this test used to guard -- a generated settings file -- can no longer exist:
+    /// the hook configuration is an argv value now. The test still asserts no `.claude/` appears,
+    /// since that absence is the property the change bought and a regression would reintroduce it
+    /// silently.
     #[test]
     fn a_failed_spawn_leaks_no_thread_no_socket_and_no_settings_file() {
         let dir = std::env::temp_dir().join(format!("agent-failed-spawn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Precondition: the settings-generation step (which runs BEFORE `cmd.spawn()` and can
-        // itself fail with the same `NotFound` kind if the `agent-hook` binary isn't built) must
-        // genuinely succeed here -- otherwise the assertions below would pass for the wrong reason.
-        let probe = crate::settings::HookSettings::generate(&dir, &dir.join("probe.sock"))
+        // Precondition: building the hook configuration (which happens BEFORE `cmd.spawn()` and
+        // can itself fail with the same `NotFound` kind if the `agent-hook` binary isn't built)
+        // must genuinely succeed here -- otherwise the assertions below would pass for the wrong
+        // reason.
+        crate::settings::hook_settings_arg(&dir.join("probe.sock"))
             .expect("agent-hook must be built for this test to exercise the cmd.spawn() failure path");
-        probe.cleanup().unwrap();
 
         let sockets_before = temp_hook_socket_names();
         let threads_before = live_thread_count();
@@ -1085,13 +1090,13 @@ mod tests {
             }
         }
 
-        // The generated settings file must be gone -- and so must the `.claude/` directory the
-        // generate step created, since nothing else put anything in it.
+        // Nothing may have been written into the project directory at all. This is no longer a
+        // cleanup assertion but an absence-by-construction one: a regression that reintroduced a
+        // file-based hook config would land here first.
         assert!(
-            !dir.join(".claude/settings.local.json").exists(),
-            "a failed spawn must not leave its generated hook settings behind"
+            !dir.join(".claude").exists(),
+            "spawning must not create anything under the project's .claude/ -- the hook config is argv"
         );
-        assert!(!dir.join(".claude").exists());
 
         // No leftover socket file from any of the five attempts (compared as a set difference
         // against a before-snapshot, so unrelated leftovers from other runs can't mask or fake

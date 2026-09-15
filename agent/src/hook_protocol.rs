@@ -1,4 +1,4 @@
-//! The JSON contract for the `PreToolUse` hook this crate generates a `settings.local.json` entry for
+//! The JSON contract for the `PreToolUse` hook this crate installs via `claude --settings`
 //! (see `crate::settings`) and the `agent-hook` companion binary speaks on stdin/stdout. Real
 //! shapes confirmed live against the actual CLI (2026-09-07) -- see
 //! docs/superpowers/specs/2026-09-07-agent-v2-streaming-protocol-design.md and

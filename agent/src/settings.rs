@@ -1,14 +1,33 @@
-//! Generates and tears down the per-conversation `.claude/settings.local.json` that points a
-//! `PreToolUse` hook at the `agent-hook` companion binary (Task 3). Uses `settings.local.json`,
-//! not `settings.json`, specifically so a project's own real, possibly-already-present
-//! `.claude/settings.json` is never read or overwritten -- see
-//! docs/superpowers/specs/2026-09-07-agent-v2-streaming-protocol-design.md.
+//! Builds the `PreToolUse` hook configuration that points the CLI at the `agent-hook` companion
+//! binary, as a value passed on the command line -- `claude --settings '<json>'` -- and NOT as a
+//! file written into the project.
 //!
-//! `settings.local.json` itself is Claude Code's own real per-project, machine-local settings file
-//! (typically gitignored, and a place a user's own permission allowlists genuinely live), so a
-//! pre-existing one is never destroyed either: `generate` captures its exact content before
-//! overwriting it and `cleanup` writes that content back verbatim, deleting the file only when
-//! there was nothing there to begin with. See `HookSettings::original_content`.
+//! **Why this is a command-line argument and not a file.** Until 2026-09-15 this module generated
+//! `<project_dir>/.claude/settings.local.json`, captured any pre-existing content, and restored it
+//! on shutdown. That path is keyed on the project directory alone, so every `claude` invocation in
+//! that directory -- including a real, human-facing terminal session that has nothing to do with
+//! this crate -- read the same hook, and two conversations in one directory shared one file.
+//!
+//! A real-CLI spike on 2026-09-15 (work account, CLI 2.1.272, one long-lived
+//! `--print --input-format stream-json` process, three turns each forced to call a tool) settled
+//! what the old code only assumed, and settled it the dangerous way:
+//!
+//! | turn | file on disk | tool call | `PreToolUse` fired |
+//! |---|---|---|---|
+//! | 1 | hook tagged `VARIANT-A` | yes | `VARIANT-A` |
+//! | 2 | **deleted mid-conversation** | yes, **executed** | **none at all** |
+//! | 3 | restored, tagged `VARIANT-C` | yes | `VARIANT-C` |
+//!
+//! The CLI re-reads that file per tool invocation, live. So one conversation's orderly shutdown
+//! deleting the file did not merely leave a mess for the next run -- it silently removed the
+//! permission gate from a *still-running* second conversation in the same directory, whose tools
+//! then executed with no hook and whose UI never showed a permission card.
+//!
+//! The same spike confirmed the replacement: with the hook passed as `--settings '<json>'`, a
+//! foreign `.claude/settings.local.json` appearing and being deleted mid-conversation left this
+//! process's own hook firing untouched, and the CLI created no `.claude/` directory of its own.
+//! The configuration now lives in one process's argv, where nothing outside that process can reach
+//! it.
 
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -18,116 +37,38 @@ use std::path::{Path, PathBuf};
 /// real human approval must be able to take minutes without the CLI killing the hook early.
 const HOOK_TIMEOUT_SECONDS: u64 = 600;
 
-pub struct HookSettings {
-    settings_path: PathBuf,
-    /// The verbatim content of a `.claude/settings.local.json` that already existed when
-    /// `generate` ran, captured before it was overwritten. `cleanup()` writes this back instead of
-    /// deleting the file, so a project's own real (typically gitignored) machine-local settings --
-    /// permission allowlists and the like -- survive a conversation byte-for-byte. `None` in the
-    /// common case where no such file existed, where `cleanup()` deletes the generated file.
-    ///
-    /// Held in memory only, so restoration depends on `cleanup()` actually running: a hard crash
-    /// of the host process (SIGKILL, a panic that skips `Drop`) still leaves the generated config
-    /// in place with the original unrecoverable -- the same class of on-disk leftover as the
-    /// per-conversation socket file, which `spawn`/`shutdown` likewise only clean up on an orderly
-    /// path. Persisting a backup copy to disk would close that window and is not done here.
-    ///
-    /// Known, accepted limitation (a functionality trade-off, not data loss): if the pre-existing
-    /// file declared its own hooks (e.g. its own `PreToolUse` entry), those are temporarily
-    /// inactive for the lifetime of this conversation, since this crate's generated config
-    /// replaces the whole file rather than merging into it. They come back intact on `cleanup()`.
-    /// Merging two hook configurations is deliberately out of scope.
-    original_content: Option<String>,
-    /// True when `generate` itself created the `.claude/` directory (it did not exist before), so
-    /// `cleanup()` knows it may remove it again -- and only ever when it's still empty, so a
-    /// directory anything else has since put files into is never touched.
-    created_claude_dir: bool,
+/// The value for `claude --settings`: a `PreToolUse` hook on every tool (`matcher: "*"`), running
+/// the `agent-hook` binary with this conversation's own socket path in its environment.
+///
+/// Touches no filesystem. The returned string is meant to be handed straight to `Command::arg`,
+/// so the configuration exists only in the spawned process's argv and dies with it.
+pub fn hook_settings_arg(socket_path: &Path) -> std::io::Result<String> {
+    let agent_hook_path = locate_agent_hook_binary()?;
+    Ok(hook_settings_arg_with_hook_path(socket_path, &agent_hook_path))
 }
 
-impl HookSettings {
-    pub fn generate(project_dir: &Path, socket_path: &Path) -> std::io::Result<Self> {
-        let agent_hook_path = locate_agent_hook_binary()?;
-        Self::generate_with_hook_path(project_dir, socket_path, &agent_hook_path)
-    }
+/// The real body of [`hook_settings_arg`], parameterized only by where `agent-hook` lives, so this
+/// module's tests can build the genuine configuration without a built binary to point at.
+fn hook_settings_arg_with_hook_path(socket_path: &Path, agent_hook_path: &Path) -> String {
+    let command = format!(
+        "NEOVIBE_AGENT_HOOK_SOCKET={} {}",
+        socket_path.display(),
+        agent_hook_path.display()
+    );
 
-    fn generate_with_hook_path(
-        project_dir: &Path,
-        socket_path: &Path,
-        agent_hook_path: &Path,
-    ) -> std::io::Result<Self> {
-        let claude_dir = project_dir.join(".claude");
-        let created_claude_dir = !claude_dir.exists();
-        std::fs::create_dir_all(&claude_dir)?;
-
-        let command = format!(
-            "NEOVIBE_AGENT_HOOK_SOCKET={} {}",
-            socket_path.display(),
-            agent_hook_path.display()
-        );
-
-        let config = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {
-                        "matcher": "*",
-                        "hooks": [
-                            { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECONDS }
-                        ]
-                    }
-                ]
-            }
-        });
-
-        let settings_path = claude_dir.join("settings.local.json");
-        // Capture (never destroy) a pre-existing file first: this is Claude Code's own real
-        // per-project machine-local settings file, and a user's own permission allowlists can
-        // live in it. `cleanup()` restores whatever is captured here.
-        //
-        // Guard against re-persisting our OWN stale leftover instead of a real prior user file:
-        // if a previous conversation in this same `project_dir` was never cleanly `shutdown()`
-        // (a SIGKILL, or a second concurrent session racing this one), what's on disk right now
-        // may already be a generated hook config pointing at a dead socket, not genuine user
-        // content. Restoring that on `cleanup()` would leave the leftover in place forever
-        // instead of ever being deleted -- every future `claude` invocation in that directory
-        // would then invoke a hook whose socket nothing is listening on, fail to connect, and
-        // exit with no decision, which reads as "allow" under `auto` mode (see `agent-hook.rs`'s
-        // own connect-failure exit path). Treat any existing content containing our own marker
-        // env var as "nothing genuinely pre-existing" rather than as a real original to restore.
-        let original_content = match std::fs::read_to_string(&settings_path) {
-            Ok(content) if content.contains("NEOVIBE_AGENT_HOOK_SOCKET") => None,
-            Ok(content) => Some(content),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&config)?)?;
-
-        Ok(Self { settings_path, original_content, created_claude_dir })
-    }
-
-    /// Undoes `generate`: restores a captured pre-existing `settings.local.json` byte-for-byte if
-    /// there was one, otherwise deletes the file this crate generated (and, only if `generate`
-    /// itself created `.claude/` and nothing else has put anything in it since, removes that
-    /// now-empty directory too).
-    pub fn cleanup(&self) -> std::io::Result<()> {
-        match &self.original_content {
-            Some(content) => {
-                std::fs::write(&self.settings_path, content)?;
-            }
-            None => {
-                if self.settings_path.exists() {
-                    std::fs::remove_file(&self.settings_path)?;
+    json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECONDS }
+                    ]
                 }
-                if self.created_claude_dir {
-                    if let Some(claude_dir) = self.settings_path.parent() {
-                        // `remove_dir` only succeeds on an empty directory -- exactly the
-                        // condition wanted here, so a non-empty `.claude/` fails harmlessly.
-                        let _ = std::fs::remove_dir(claude_dir);
-                    }
-                }
-            }
+            ]
         }
-        Ok(())
-    }
+    })
+    .to_string()
 }
 
 /// Locates the `agent-hook` binary as a sibling of the currently-running executable -- Cargo
@@ -138,12 +79,12 @@ impl HookSettings {
 /// --example` binary, though: those land one directory deeper, in `target/<profile>/deps/` or
 /// `target/<profile>/examples/` respectively. The `deps/` case was confirmed for real (Task 5)
 /// when this crate's own real `#[ignore]`d `agent::process` tests called the production
-/// `HookSettings::generate` path from inside `cargo test --lib` and hit exactly this mismatch.
-/// The `examples/` case was confirmed for real (Task 7) when `cargo run --example demo` hit the
+/// hook-settings path from inside `cargo test --lib` and hit exactly this mismatch. The
+/// `examples/` case was confirmed for real (Task 7) when `cargo run --example demo` hit the
 /// identical mismatch trying to run the crate's own shipped example. Rather than push every such
-/// caller onto a test-only bypass (as Task 4's own unit tests already had to, via
-/// `generate_with_hook_path`, since those don't need a real, working `agent-hook` process to
-/// actually be invoked by the CLI), this also checks one directory up from a `deps/` or
+/// caller onto a test-only bypass (as this module's own unit tests already do, via
+/// `hook_settings_arg_with_hook_path`, since those don't need a real, working `agent-hook` process
+/// to actually be invoked by the CLI), this also checks one directory up from a `deps/` or
 /// `examples/` dir, so a real end-to-end test or the shipped example gets the crate's genuine
 /// production code path under real exercise.
 fn locate_agent_hook_binary() -> std::io::Result<PathBuf> {
@@ -174,141 +115,66 @@ fn locate_agent_hook_binary() -> std::io::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn generate_writes_a_pretooluse_hook_pointing_at_agent_hook_with_the_socket_path() {
-        let dir = tempfile_dir();
-        let socket_path = dir.join("test.sock");
-        // Use a fake hook binary path since test binaries are in target/debug/deps/ while
-        // agent-hook is in target/debug/, so locate_agent_hook_binary() would fail.
-        // The real runtime (shell) is always built in the same target/<profile>/ directory as agent-hook.
-        let fake_hook_path = "/usr/bin/fake-agent-hook";
-        let settings = HookSettings::generate_with_hook_path(&dir, &socket_path, fake_hook_path.as_ref()).unwrap();
+    const FAKE_HOOK: &str = "/usr/bin/fake-agent-hook";
 
-        let written = std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+    #[test]
+    fn the_argument_is_a_pretooluse_hook_on_every_tool_naming_this_conversations_socket() {
+        let socket_path = Path::new("/tmp/neovibe-agent-hook-abc123.sock");
+        let arg = hook_settings_arg_with_hook_path(socket_path, FAKE_HOOK.as_ref());
+
+        let parsed: serde_json::Value = serde_json::from_str(&arg).unwrap();
+        let matcher = parsed["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap();
+        assert_eq!(matcher, "*", "the gate must cover every tool, not a subset");
+
         let hook_entry = &parsed["hooks"]["PreToolUse"][0]["hooks"][0];
         let command = hook_entry["command"].as_str().unwrap();
         assert!(command.contains("NEOVIBE_AGENT_HOOK_SOCKET"));
-        assert!(command.contains(socket_path.to_str().unwrap()));
-        assert!(command.contains("agent-hook"));
+        assert!(command.contains("/tmp/neovibe-agent-hook-abc123.sock"));
+        assert!(command.contains("fake-agent-hook"));
         assert!(hook_entry["timeout"].as_u64().unwrap() >= 300);
-
-        settings.cleanup().unwrap();
-        assert!(!dir.join(".claude/settings.local.json").exists());
     }
 
+    /// The whole point of the change this module records. A configuration that exists only in one
+    /// process's argv cannot be read, overwritten, or deleted by a second conversation in the same
+    /// directory -- so this asserts the absence of any filesystem effect, not just the presence of
+    /// the right JSON.
     #[test]
-    fn generate_never_touches_an_existing_settings_json() {
+    fn building_the_argument_writes_nothing_to_disk() {
         let dir = tempfile_dir();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/settings.json"), r#"{"existing": true}"#).unwrap();
+        let before = dir_snapshot(&dir);
 
-        let socket_path = dir.join("test.sock");
-        // Use a fake hook binary path (see comment in the first test)
-        let fake_hook_path = "/usr/bin/fake-agent-hook";
-        let settings = HookSettings::generate_with_hook_path(&dir, &socket_path, fake_hook_path.as_ref()).unwrap();
-        settings.cleanup().unwrap();
+        let _ = hook_settings_arg_with_hook_path(&dir.join("s.sock"), FAKE_HOOK.as_ref());
 
-        let still_there = std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap();
-        assert_eq!(still_there, r#"{"existing": true}"#);
+        assert!(!dir.join(".claude").exists(), "no .claude/ directory may be created");
+        assert_eq!(before, dir_snapshot(&dir), "the project directory must be untouched");
     }
 
+    /// Two conversations in ONE directory get two independent gates. Under the old file-based
+    /// mechanism this was impossible by construction: both wrote `<project_dir>/.claude/
+    /// settings.local.json`, so the second overwrote the first and the first's shutdown deleted
+    /// the second's.
     #[test]
-    fn generate_treats_a_stale_generated_config_as_nothing_to_restore() {
-        // Simulates what's left behind after a prior conversation in this same `project_dir`
-        // was never cleanly shut down (a SIGKILL, or a second concurrent session): a real
-        // generated hook config, pointing at a now-dead socket, is already sitting on disk.
-        // `generate` must NOT capture that as "the original" -- doing so would make `cleanup()`
-        // restore it forever instead of ever deleting it, leaving every future `claude`
-        // invocation in that directory pointed at a dead socket.
-        let dir = tempfile_dir();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        let stale_leftover = r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"NEOVIBE_AGENT_HOOK_SOCKET=/tmp/dead.sock /path/to/agent-hook","timeout":600}]}]}}"#;
-        std::fs::write(dir.join(".claude/settings.local.json"), stale_leftover).unwrap();
+    fn two_conversations_in_one_directory_produce_two_independent_configurations() {
+        let a = hook_settings_arg_with_hook_path(Path::new("/tmp/a.sock"), FAKE_HOOK.as_ref());
+        let b = hook_settings_arg_with_hook_path(Path::new("/tmp/b.sock"), FAKE_HOOK.as_ref());
 
-        let socket_path = dir.join("test.sock");
-        let fake_hook_path = "/usr/bin/fake-agent-hook";
-        let settings = HookSettings::generate_with_hook_path(&dir, &socket_path, fake_hook_path.as_ref()).unwrap();
-        settings.cleanup().unwrap();
-
-        assert!(
-            !dir.join(".claude/settings.local.json").exists(),
-            "a stale generated config must be deleted on cleanup, not restored"
-        );
+        assert_ne!(a, b);
+        assert!(a.contains("/tmp/a.sock") && !a.contains("/tmp/b.sock"));
+        assert!(b.contains("/tmp/b.sock") && !b.contains("/tmp/a.sock"));
     }
 
-    /// The regression test for the real data-loss bug a final review found: `generate` used to
-    /// unconditionally overwrite `.claude/settings.local.json` and `cleanup` to unconditionally
-    /// delete it -- silently destroying a project's own real, typically-gitignored Claude Code
-    /// settings (a user's own permission allowlists live there) with no way to get them back.
-    /// Proves the file survives byte-for-byte, and -- crucially -- that this is a genuine
-    /// overwrite-then-restore, not an accidental no-op: the file is opened mid-way through, after
-    /// `generate()` and before `cleanup()`, and confirmed to hold THIS crate's hook config at that
-    /// point, i.e. the original really was displaced and really was put back.
-    #[test]
-    fn a_pre_existing_settings_local_json_is_restored_byte_for_byte_after_generate_then_cleanup() {
-        let dir = tempfile_dir();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        let original = "{\n  \"permissions\": {\n    \"allow\": [\"Bash(git status:*)\"]\n  }\n}\n";
-        std::fs::write(dir.join(".claude/settings.local.json"), original).unwrap();
-
-        let socket_path = dir.join("test.sock");
-        let settings =
-            HookSettings::generate_with_hook_path(&dir, &socket_path, "/usr/bin/fake-agent-hook".as_ref()).unwrap();
-
-        // Mid-way: the generated hook config must genuinely be in place right now (otherwise this
-        // test would "pass" against a broken implementation that simply never wrote anything).
-        let during = std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap();
-        assert!(during.contains("PreToolUse"), "generate() must actually install its hook config: {during}");
-        assert!(during.contains("NEOVIBE_AGENT_HOOK_SOCKET"));
-        assert!(!during.contains("git status"), "the original content must be displaced while the hook is active");
-
-        settings.cleanup().unwrap();
-
-        let restored = std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap();
-        assert_eq!(restored, original, "a pre-existing settings.local.json must survive byte-for-byte");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The complementary (common) case: with no pre-existing file, `cleanup` still deletes the
-    /// generated one -- and also removes the `.claude/` directory it created, since it's empty
-    /// again. Guards against the restore path above accidentally leaving generated files behind.
-    #[test]
-    fn with_no_pre_existing_file_cleanup_deletes_the_generated_one_and_the_dir_it_created() {
-        let dir = tempfile_dir();
-        assert!(!dir.join(".claude").exists());
-
-        let socket_path = dir.join("test.sock");
-        let settings =
-            HookSettings::generate_with_hook_path(&dir, &socket_path, "/usr/bin/fake-agent-hook".as_ref()).unwrap();
-        assert!(dir.join(".claude/settings.local.json").exists());
-
-        settings.cleanup().unwrap();
-        assert!(!dir.join(".claude/settings.local.json").exists());
-        assert!(!dir.join(".claude").exists(), "an otherwise-empty .claude/ that generate() created must not be left behind");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The `.claude/` removal above must never touch a directory holding anything else -- the far
-    /// more common real case, where a project's own `.claude/settings.json` lives alongside.
-    #[test]
-    fn cleanup_leaves_a_claude_dir_that_still_holds_other_files_alone() {
-        let dir = tempfile_dir();
-        let socket_path = dir.join("test.sock");
-        let settings =
-            HookSettings::generate_with_hook_path(&dir, &socket_path, "/usr/bin/fake-agent-hook".as_ref()).unwrap();
-        // Something else appears in .claude/ during the conversation (a real project's own
-        // settings.json, an agent-written file, anything).
-        std::fs::write(dir.join(".claude/settings.json"), r#"{"existing": true}"#).unwrap();
-
-        settings.cleanup().unwrap();
-        assert!(dir.join(".claude").exists(), "a non-empty .claude/ must never be removed");
-        assert_eq!(std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap(), r#"{"existing": true}"#);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn dir_snapshot(dir: &Path) -> Vec<String> {
+        let mut entries: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        entries
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("agent-settings-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("neovibe-settings-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

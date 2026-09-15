@@ -140,43 +140,53 @@ fn real_pretooluse_hook_deny_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Phase 0 baseline (docs/superpowers/specs/2026-09-09-claude-runtime-provider-refactor-design.md
-/// §2.1, structural problem 2): pins the CURRENT, real cross-session collision this refactor
-/// exists to fix. `agent::settings::HookSettings::generate` writes a directory-scoped
-/// `<project_dir>/.claude/settings.local.json`, so two `AgentSession`s started against the same
-/// `project_dir` silently share one hook config file -- whichever session started more recently
-/// overwrites the file, and a real `PreToolUse` hook fired by ANY tool call in that directory gets
-/// relayed to whichever socket the file currently names.
+/// Was a Phase 0 baseline pinning the cross-session collision this refactor exists to fix; it now
+/// pins the FIX, in the same shape, so a regression is a failure rather than a silence.
 ///
-/// This asserts the failure mode directly and asymmetrically: session B (started after A, so B's
-/// write is the one left on disk) receives session A's own permission request, and session A --
-/// whose real tool call actually triggered the hook -- does not. A weaker "A never sees its own
-/// request" check alone could also be explained by an unrelated bug; proving B receives it is what
-/// makes this a real, unambiguous reproduction of the collision rather than a mere absence.
+/// The collision it used to pin: `HookSettings::generate` wrote a directory-scoped
+/// `<project_dir>/.claude/settings.local.json`, so two `AgentSession`s in one directory shared one
+/// hook config. Whichever started later overwrote it, and a `PreToolUse` hook fired by ANY tool
+/// call in that directory -- including a real human's own terminal session -- was relayed to
+/// whichever socket the file currently named. The old assertion was deliberately asymmetric: B
+/// receives A's request and A does not, because proving B receives it is what made it an
+/// unambiguous reproduction rather than a mere absence.
 ///
-/// If this test starts failing (B no longer receives A's request), the directory-scoped settings
-/// collision described in the design doc's §2.1 has already been fixed by a later phase of that
-/// migration -- update or remove this baseline test as part of that fix, don't just relax the
-/// assertion.
+/// A real-CLI spike on 2026-09-15 found the mechanism was worse than "sessions cross-wire": the
+/// CLI re-reads that file per tool invocation, so the FIRST session to shut down deleted the gate
+/// out from under a still-running second one, whose tools then ran with no `PreToolUse` at all.
+/// See `agent::settings`'s module documentation for the spike's own table.
 ///
-/// Also asserts `session_a.projection.tool_calls` is non-empty, so a run where the collision
-/// simply didn't reproduce (no hook fired at all) can no longer be mistaken for evidence of
-/// anything (Phase 0's own final review, Minor finding).
+/// The fix passes the hook as `claude --settings '<json>'`, so it exists only in one process's
+/// argv. This test therefore asserts the mirror image of what it used to: A -- whose real tool
+/// call fires the hook -- sees its own request, and B sees nothing. It also asserts the directory
+/// stays clean, since "no file exists to collide over" is the actual mechanism of the fix and an
+/// assertion on routing alone would still pass if a file came back for some other reason.
 #[test]
 #[ignore]
-fn real_two_sessions_in_the_same_project_dir_cross_wire_permission_hooks() {
+fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_hooks() {
     let dir = std::env::temp_dir().join(format!("agent-collision-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut session_a = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
     let mut session_b = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
 
+    // The mechanism, asserted before the behavior: starting two sessions must not have written
+    // anything into the project. Under the old code this directory already held one
+    // settings.local.json naming session B's socket.
+    assert!(
+        !dir.join(".claude").exists(),
+        "starting a session must not create {:?} -- the hook config belongs in argv",
+        dir.join(".claude")
+    );
+
     session_a.send_turn("run: echo hello, and tell me the output").unwrap();
 
     let mut a_saw_request = false;
     let mut b_saw_request = false;
+    // Unlike the old version, this loop does NOT stop at the first request seen: it must keep
+    // watching B for the whole window, or "B stayed silent" would only mean "A answered first".
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline && !a_saw_request && !b_saw_request {
+    while std::time::Instant::now() < deadline {
         for event in session_a.pump() {
             if matches!(event, AgentDomainEvent::PermissionRequested { .. }) {
                 a_saw_request = true;
@@ -187,29 +197,44 @@ fn real_two_sessions_in_the_same_project_dir_cross_wire_permission_hooks() {
                 b_saw_request = true;
             }
         }
+        if a_saw_request && !session_a.projection.tool_calls.is_empty() {
+            // Give B a further grace window to (incorrectly) receive it too, rather than declaring
+            // isolation the moment A is served.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            for event in session_b.pump() {
+                if matches!(event, AgentDomainEvent::PermissionRequested { .. }) {
+                    b_saw_request = true;
+                }
+            }
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    // Confirm A really did trigger a real tool call this run, so a run where no hook fired at all
+    // cannot be mistaken for evidence of isolation (kept from the Phase 0 version -- its own final
+    // review raised exactly this).
     assert!(
-        b_saw_request,
-        "expected the CURRENT (buggy) behavior: session B receives session A's real hook request \
-         because both share one settings.local.json in {dir:?}. If this now fails, see this \
-         test's own doc comment -- the collision it pins may have already been fixed."
+        !session_a.projection.tool_calls.is_empty(),
+        "session A never issued a real tool call this run -- re-run, this is not evidence of anything"
     );
     assert!(
-        !a_saw_request,
-        "session A should NOT see its own request once session B's settings.local.json write \
-         took effect -- if both are seeing requests, the collision reproduced differently than \
-         this test assumes and the test needs updating, not just the assertion relaxed"
+        a_saw_request,
+        "session A must receive the permission request its OWN tool call fired, in {dir:?}"
     );
-    // Confirm A really did trigger a real tool call this run (distinguishes "no hook fired at
-    // all this run" from a genuine collision -- see the file's own module-level Minor-finding
-    // note from Phase 0's final review).
-    assert!(!session_a.projection.tool_calls.is_empty(), "session A never issued a real tool call this run -- re-run, this is not evidence of anything");
+    assert!(
+        !b_saw_request,
+        "session B received a request it never asked for -- the directory-scoped hook collision \
+         has come back. See this test's doc comment and `agent::settings`."
+    );
+    assert!(
+        !dir.join(".claude").exists(),
+        "a live conversation must still not have written anything into the project directory"
+    );
 
-    let pending_ids: Vec<String> = session_b.projection.pending_permissions.keys().cloned().collect();
+    let pending_ids: Vec<String> = session_a.projection.pending_permissions.keys().cloned().collect();
     for permission_id in pending_ids {
-        let _ = session_b.respond_permission(&permission_id, PermissionDecision::Deny { reason: Some("test cleanup".to_string()) });
+        let _ = session_a.respond_permission(&permission_id, PermissionDecision::Deny { reason: Some("test cleanup".to_string()) });
     }
     session_a.shutdown();
     session_b.shutdown();
