@@ -4,6 +4,17 @@ use agent::{
 };
 use serde_json::json;
 
+/// The assistant message texts, without their ordering keys.
+///
+/// Test-local on purpose. `AgentSessionProjection` carried a `transcript_text()` accessor for
+/// exactly this until 2026-09-15, but its only callers were ever tests, and a `pub` method with
+/// no production consumer is the thing this crate's own YAGNI rule (see `projection.rs`'s module
+/// doc) exists to keep out -- it also reads as an invitation for a future renderer, which must
+/// use `transcript` itself or it is back to guessing where the tool calls went.
+fn texts(projection: &AgentSessionProjection) -> Vec<&str> {
+    projection.transcript.iter().map(|m| m.text.as_str()).collect()
+}
+
 #[test]
 fn session_opened_populates_identity_and_sets_running() {
     let mut projection = AgentSessionProjection::default();
@@ -37,7 +48,7 @@ fn content_delta_text_accumulates_into_one_message_in_order() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "hello".into() });
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "world".into() });
-    assert_eq!(projection.transcript, vec!["helloworld".to_string()]);
+    assert_eq!(texts(&projection), vec!["helloworld"]);
 }
 
 #[test]
@@ -267,7 +278,7 @@ fn streamed_text_accumulates_into_one_transcript_entry() {
             text: chunk.into(),
         });
     }
-    assert_eq!(projection.transcript, vec!["The quick **brown** fox".to_string()]);
+    assert_eq!(texts(&projection), vec!["The quick **brown** fox"]);
     // Every delta is still its own revision: a consumer replaying from a revision must be able to
     // land between two chunks of one message.
     assert_eq!(projection.last_revision, 5);
@@ -282,7 +293,7 @@ fn a_tool_call_or_a_turn_boundary_starts_a_new_transcript_entry() {
         turn_id: "t1".into(), tool_use_id: "tu1".into(), name: "Bash".into(), input: serde_json::json!({}),
     });
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "It printed hi.".into() });
-    assert_eq!(projection.transcript, vec!["I'll check.".to_string(), "It printed hi.".to_string()]);
+    assert_eq!(texts(&projection), vec!["I'll check.", "It printed hi."]);
 
     projection.apply(&AgentDomainEvent::TurnCompleted {
         turn_id: "t1".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
@@ -300,7 +311,7 @@ fn a_thinking_delta_does_not_split_the_text_around_it() {
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "before ".into() });
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() });
     projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "after".into() });
-    assert_eq!(projection.transcript, vec!["before after".to_string()]);
+    assert_eq!(texts(&projection), vec!["before after"]);
 }
 
 /// The forbidden failure mode, at the projection level.
@@ -331,7 +342,7 @@ fn a_lost_session_stops_looking_like_a_turn_in_progress() {
     assert!(matches!(projection.status, ProjectionStatus::Unavailable { .. }));
     // What DID arrive stays. Clearing the turn must not double as deleting the partial reply: the
     // reason string is what tells the reader it may be incomplete, not its absence.
-    assert_eq!(projection.transcript, vec!["half an ans".to_string()]);
+    assert_eq!(texts(&projection), vec!["half an ans"]);
     // And no completion was invented on the way out. `None` is a stronger statement than the
     // zeroed struct this used to assert: nothing reported usage, as opposed to something reporting
     // nought.
@@ -345,4 +356,196 @@ fn a_session_closed_mid_turn_also_stops_looking_like_a_turn_in_progress() {
     projection.apply(&AgentDomainEvent::SessionClosed { reason: "closed_by_host".into() });
     assert_eq!(projection.active_turn_id, None);
     assert!(matches!(projection.status, ProjectionStatus::Closed { .. }));
+}
+
+/* ------------------------------------------------------------------------------------------------
+   Interleaved ordering (2026-09-15).
+
+   The defect: `agent-ui`'s MessageList rendered `transcript`, then `toolCalls`, then
+   `pendingPermissions` as three sequential lists, so every tool card appeared below every assistant
+   message whatever the turn actually did.
+
+   Why the order is produced HERE rather than in the frontend: a snapshot is a complete replacement
+   of frontend state, and `serialize_snapshot_for_js` emits the three collections separately.
+   Nothing in that payload said how they interleave -- no per-item index, and no turn id (the
+   serializer does not even emit `ToolCallRecord::turn_id`, and a turn id could not order items
+   WITHIN a turn anyway). So a frontend that rebuilt the order from live event arrival alone would
+   lose it on every WebView reload and on every `UiDelivery::Resync`.
+
+   `seq` is read from the same counter as `last_revision`, before `apply` bumps it, so a snapshot's
+   `throughRevision` is strictly greater than every `seq` in that snapshot.
+   ------------------------------------------------------------------------------------------------ */
+
+/// The whole point, at the projection level: three collections, one order.
+#[test]
+fn every_item_carries_a_sequence_number_ordering_it_against_the_other_two_collections() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() });
+    projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "Now the other one.".into() });
+    projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_2".into(), name: "Read".into(), input: json!({}) });
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-1".into(), tool_use_id: Some("toolu_2".into()), tool_name: "Read".into(), input: json!({}),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "Done.".into() });
+
+    // Merge all three by `seq` and check the result is the real turn, not messages-then-tools.
+    let mut merged: Vec<(u64, String)> = Vec::new();
+    merged.extend(projection.transcript.iter().map(|m| (m.seq, format!("text:{}", m.text))));
+    merged.extend(projection.tool_calls.iter().map(|c| (c.seq, format!("tool:{}", c.tool_use_id))));
+    merged.extend(projection.pending_permissions.values().map(|p| (p.seq, format!("perm:{}", p.permission_id))));
+    merged.sort_by_key(|(seq, _)| *seq);
+
+    assert_eq!(
+        merged.into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
+        vec![
+            "text:I'll check.".to_string(),
+            "tool:toolu_1".to_string(),
+            "text:Now the other one.".to_string(),
+            "tool:toolu_2".to_string(),
+            "perm:perm-1".to_string(),
+            "text:Done.".to_string(),
+        ],
+    );
+}
+
+/// A message's `seq` is where it STARTED, not where it was last appended to. Under partial
+/// streaming a reply arrives as hundreds of deltas; if `seq` tracked the latest one, a message that
+/// was still streaming would keep jumping below the tool call that already interrupted it.
+#[test]
+fn a_streamed_message_keeps_the_seq_of_its_first_delta() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "The ".into() });
+    let first = projection.transcript[0].seq;
+    for chunk in ["quick ", "brown ", "fox"] {
+        projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: chunk.into() });
+    }
+    assert_eq!(projection.transcript.len(), 1);
+    assert_eq!(projection.transcript[0].seq, first);
+    assert_eq!(projection.transcript[0].text, "The quick brown fox");
+}
+
+/// `seq` is read from `last_revision` BEFORE the bump, so a snapshot's `throughRevision` is a
+/// strict upper bound on every `seq` it carries. The frontend seeds its own counter from exactly
+/// that number, so an item it folds after a snapshot cannot collide with one from inside it.
+#[test]
+fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "hi".into() });
+    projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) });
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+    });
+
+    let highest = projection
+        .transcript.iter().map(|m| m.seq)
+        .chain(projection.tool_calls.iter().map(|c| c.seq))
+        .chain(projection.pending_permissions.values().map(|p| p.seq))
+        .max()
+        .unwrap();
+    assert!(
+        highest < projection.last_revision,
+        "seq {highest} must be below throughRevision {}",
+        projection.last_revision,
+    );
+}
+
+/// The half of `apply`'s stated ordering invariant that nothing pinned: "no single event creates
+/// more than one item".
+///
+/// Its sibling -- every `seq` below `last_revision` -- has the test above. This one matters more,
+/// because breaking it fails QUIETLY: `seq` is read once per `apply` call, so an arm that pushed
+/// two items would hand both the same number, and every consumer that sorts on `seq`
+/// (`agent-ui`'s `buildTimeline`, and the snapshot merge in `shell/src/agent_bridge.rs`'s tests)
+/// would then tie them in whatever order the arrays happened to be in. A mis-ordered pair, not a
+/// failure -- the exact class of thing that survives one refactor and dies in the next.
+///
+/// Checked after EVERY call rather than once at the end, because a later `PermissionResolved`
+/// removes an item and could carry the collision away with it.
+#[test]
+fn no_single_event_ever_creates_more_than_one_item() {
+    let mut projection = AgentSessionProjection::default();
+    let mut item_count = 0usize;
+
+    for event in every_event_variant() {
+        projection.apply(&event);
+
+        let mut seqs: Vec<u64> = projection
+            .transcript.iter().map(|m| m.seq)
+            .chain(projection.tool_calls.iter().map(|c| c.seq))
+            .chain(projection.pending_permissions.values().map(|p| p.seq))
+            .collect();
+        let before_dedup = seqs.len();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.len(), before_dedup,
+            "two items share a seq after applying {}; `seq` is assigned once per apply call, so \
+             this means one event created more than one item",
+            label(&event),
+        );
+
+        assert!(
+            before_dedup <= item_count + 1,
+            "applying {} grew the three collections by {}; at most one item per event is what makes \
+             seq a total order",
+            label(&event),
+            before_dedup - item_count,
+        );
+        item_count = before_dedup;
+    }
+}
+
+/// One of every `AgentDomainEvent` variant, in an order that exercises the arms that interact
+/// (a tool call and its completion; a permission and its resolution; text on both sides of the
+/// break a tool call forces).
+fn every_event_variant() -> Vec<AgentDomainEvent> {
+    vec![
+        AgentDomainEvent::SessionOpened {
+            session_id: "sess-1".into(), provider_session_id: "prov-1".into(),
+            model: "claude-sonnet-5".into(), cwd: "/tmp/project".into(),
+        },
+        AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() },
+        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() },
+        AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) },
+        AgentDomainEvent::ToolCallCompleted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), content: json!("ok"), is_error: false },
+        AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(), tool_use_id: Some("toolu_1".into()), tool_name: "Bash".into(), input: json!({}),
+        },
+        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "Done.".into() },
+        AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: PermissionOutcome::Allowed },
+        AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(), outcome: TurnOutcome::Completed, result_text: "Done.".into(),
+            stop_reason: None, usage: Some(UsageInfo { total_cost_usd: 0.01, num_turns: 1 }),
+        },
+        AgentDomainEvent::ResumeOutcome {
+            requested_provider_session_id: "prov-1".into(), status: agent::ResumeStatus::Attached,
+            attached_provider_session_id: Some("prov-1".into()), forked: false, detail: None,
+        },
+        AgentDomainEvent::SessionUnavailable { reason: "provider exited".into() },
+        AgentDomainEvent::SessionClosed { reason: "closed_by_host".into() },
+    ]
+}
+
+/// A name per variant, for the assertion messages -- and, more usefully, an exhaustive `match` with
+/// no `_` arm, so a new `AgentDomainEvent` variant stops this test COMPILING. Whoever adds one then
+/// has to decide whether it creates an item and add it to `every_event_variant` above; the compiler
+/// cannot force the second half, so this comment is the reminder.
+fn label(event: &AgentDomainEvent) -> &'static str {
+    match event {
+        AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
+        AgentDomainEvent::TurnStarted { .. } => "TurnStarted",
+        AgentDomainEvent::ContentDelta { kind: ContentKind::Text, .. } => "ContentDelta(Text)",
+        AgentDomainEvent::ContentDelta { kind: ContentKind::Thinking, .. } => "ContentDelta(Thinking)",
+        AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",
+        AgentDomainEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
+        AgentDomainEvent::PermissionRequested { .. } => "PermissionRequested",
+        AgentDomainEvent::PermissionResolved { .. } => "PermissionResolved",
+        AgentDomainEvent::TurnCompleted { .. } => "TurnCompleted",
+        AgentDomainEvent::ResumeOutcome { .. } => "ResumeOutcome",
+        AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
+        AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
+    }
 }

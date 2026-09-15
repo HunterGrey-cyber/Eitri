@@ -10,7 +10,9 @@ import type { ToolCallRecord } from "./types";
 afterEach(cleanup);
 
 function call(overrides: Partial<ToolCallRecord>): ToolCallRecord {
-  return { toolUseId: "toolu_1", name: "Bash", input: { command: "echo hi" }, result: null, ...overrides };
+  // `seq` orders a call against the rest of the conversation; nothing in this file renders more
+  // than one call at a time, so any value does.
+  return { seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo hi" }, result: null, ...overrides };
 }
 
 describe("renderToolCall", () => {

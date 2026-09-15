@@ -18,10 +18,16 @@ function state(overrides: Partial<AgentUiState>): AgentUiState {
   return { ...initialState(), ...overrides };
 }
 
+/* Test fixtures were written before items carried a `seq`, so they are written here as they read
+   best and given ascending seqs. Order-sensitive tests below assign their own seqs explicitly. */
+function texts(...values: string[]) {
+  return values.map((text, i) => ({ seq: i, text }));
+}
+
 describe("MessageList transcript rendering", () => {
   it("renders assistant text as markdown, not as escaped source", () => {
     const { container } = render(
-      <MessageList state={state({ transcript: ["# Heading\n\nsome **bold** text"] })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
+      <MessageList state={state({ transcript: texts("# Heading\n\nsome **bold** text") })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
     );
     expect(container.querySelector(".assistant-message h1")?.textContent).toBe("Heading");
     expect(container.querySelector(".assistant-message strong")?.textContent).toBe("bold");
@@ -29,10 +35,96 @@ describe("MessageList transcript rendering", () => {
 
   it("renders one block per transcript entry, in order", () => {
     const { container } = render(
-      <MessageList state={state({ transcript: ["first", "second"] })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
+      <MessageList state={state({ transcript: texts("first", "second") })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
     );
     const messages = Array.from(container.querySelectorAll(".assistant-message"));
     expect(messages.map((m) => m.textContent?.trim())).toEqual(["first", "second"]);
+  });
+});
+
+/* The defect this closes (2026-09-15). This component mapped `transcript`, then `toolCalls`, then
+   `pendingPermissions` -- three sequential maps -- so however a turn really went, the DOM read as
+   every message, then every tool card, then every permission card. A turn with several tool calls
+   read in the wrong order, which is the panel's most visible untruth about what the agent did.
+
+   The order now comes from `seq`, which Rust's projection assigns and its snapshot ships, so this
+   renders the same sequence after a reload as it did live. */
+describe("MessageList interleaves the conversation in its real order", () => {
+  /** Every rendered block, in DOM order, as a short label. */
+  function rendered(container: HTMLElement): string[] {
+    return Array.from(container.querySelectorAll(".assistant-message, .tool-message, .permission-card")).map((el) => {
+      if (el.classList.contains("assistant-message")) return `text:${el.textContent?.trim()}`;
+      if (el.classList.contains("permission-card")) return "perm";
+      return `tool:${el.querySelector(".tool-call")?.getAttribute("data-tool-name") ?? "?"}`;
+    });
+  }
+
+  it("renders text, tool, text, tool in that order rather than both texts first", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          transcript: [
+            { seq: 1, text: "I'll check." },
+            { seq: 3, text: "And now the other." },
+            { seq: 6, text: "Done." },
+          ],
+          toolCalls: [
+            { seq: 2, toolUseId: "toolu_1", name: "Bash", input: {}, result: null },
+            { seq: 4, toolUseId: "toolu_2", name: "Read", input: {}, result: null },
+          ],
+        })}
+        sessionEnded={false}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    expect(rendered(container)).toEqual([
+      "text:I'll check.",
+      "tool:Bash",
+      "text:And now the other.",
+      "tool:Read",
+      "text:Done.",
+    ]);
+  });
+
+  it("renders a linked permission card directly beneath the tool call it gates", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          transcript: [
+            { seq: 1, text: "before" },
+            { seq: 5, text: "after" },
+          ],
+          toolCalls: [
+            { seq: 2, toolUseId: "toolu_1", name: "Bash", input: {}, result: null },
+            { seq: 3, toolUseId: "toolu_2", name: "Read", input: {}, result: null },
+          ],
+          pendingPermissions: [{ seq: 4, permissionId: "perm-1", toolUseId: "toolu_1", toolName: "Bash", input: {} }],
+        })}
+        sessionEnded={false}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    expect(rendered(container)).toEqual(["text:before", "tool:Bash", "perm", "tool:Read", "text:after"]);
+  });
+
+  /* The legacy backend -- still the default -- sends no `tool_use_id`, so this is the ordinary case
+     on a default install, not an edge case. The card still has to land where it arrived. */
+  it("still places a permission card with no tool-call link, by its own arrival position", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          transcript: [
+            { seq: 1, text: "before" },
+            { seq: 4, text: "after" },
+          ],
+          toolCalls: [{ seq: 2, toolUseId: "toolu_1", name: "Bash", input: {}, result: null }],
+          pendingPermissions: [{ seq: 3, permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }],
+        })}
+        sessionEnded={false}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    expect(rendered(container)).toEqual(["text:before", "tool:Bash", "perm", "text:after"]);
   });
 });
 
@@ -45,7 +137,7 @@ describe("MessageList transcript rendering", () => {
 describe("MessageList sanitizes model output", () => {
   function html(markdown: string): string {
     const { container } = render(
-      <MessageList state={state({ transcript: [markdown] })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
+      <MessageList state={state({ transcript: texts(markdown) })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
     );
     return container.querySelector(".assistant-message")!.innerHTML;
   }
@@ -70,7 +162,7 @@ describe("MessageList sanitizes model output", () => {
   it("does not fire an injected handler even when the element survives", () => {
     const { container } = render(
       <MessageList
-        state={state({ transcript: ['<button onclick="window.__pwned = true">go</button>'] })}
+        state={state({ transcript: texts('<button onclick="window.__pwned = true">go</button>') })}
         sessionEnded={false}
         onAnswerPermission={vi.fn()}
       />,
@@ -93,8 +185,8 @@ describe("MessageList tool calls and permissions", () => {
       <MessageList
         state={state({
           toolCalls: [
-            { toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null },
-            { toolUseId: "toolu_2", name: "Bash", input: { command: "echo two" }, result: { content: "two", isError: false } },
+            { seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null },
+            { seq: 1, toolUseId: "toolu_2", name: "Bash", input: { command: "echo two" }, result: { content: "two", isError: false } },
           ],
         })}
         sessionEnded={false}
@@ -114,11 +206,11 @@ describe("MessageList tool calls and permissions", () => {
       <MessageList
         state={state({
           toolCalls: [
-            { toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null },
-            { toolUseId: "toolu_2", name: "Bash", input: { command: "rm -rf /" }, result: null },
+            { seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null },
+            { seq: 1, toolUseId: "toolu_2", name: "Bash", input: { command: "rm -rf /" }, result: null },
           ],
           pendingPermissions: [
-            { permissionId: "perm-1", toolUseId: "toolu_2", toolName: "Bash", input: { command: "rm -rf /" } },
+            { seq: 2, permissionId: "perm-1", toolUseId: "toolu_2", toolName: "Bash", input: { command: "rm -rf /" } },
           ],
         })}
         sessionEnded={false}
@@ -139,11 +231,11 @@ describe("MessageList tool calls and permissions", () => {
       <MessageList
         state={state({
           toolCalls: [
-            { toolUseId: "toolu_first", name: "Bash", input: { command: "echo one" }, result: null },
-            { toolUseId: "toolu_second", name: "Bash", input: { command: "rm -rf /" }, result: null },
+            { seq: 1, toolUseId: "toolu_first", name: "Bash", input: { command: "echo one" }, result: null },
+            { seq: 2, toolUseId: "toolu_second", name: "Bash", input: { command: "rm -rf /" }, result: null },
           ],
           pendingPermissions: [
-            { permissionId: "toolu_second", toolUseId: "toolu_second", toolName: "Bash", input: { command: "rm -rf /" } },
+            { seq: 3, permissionId: "toolu_second", toolUseId: "toolu_second", toolName: "Bash", input: { command: "rm -rf /" } },
           ],
         })}
         sessionEnded={false}
@@ -160,8 +252,8 @@ describe("MessageList tool calls and permissions", () => {
     const { container } = render(
       <MessageList
         state={state({
-          toolCalls: [{ toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null }],
-          pendingPermissions: [{ permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }],
+          toolCalls: [{ seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null }],
+          pendingPermissions: [{ seq: 1, permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }],
         })}
         sessionEnded={false}
         onAnswerPermission={vi.fn()}
@@ -178,8 +270,8 @@ describe("MessageList tool calls and permissions", () => {
     const { container } = render(
       <MessageList
         state={state({
-          toolCalls: [{ toolUseId: "", name: "Bash", input: { command: "echo one" }, result: null }],
-          pendingPermissions: [{ permissionId: "perm-1", toolUseId: "", toolName: "Bash", input: {} }],
+          toolCalls: [{ seq: 0, toolUseId: "", name: "Bash", input: { command: "echo one" }, result: null }],
+          pendingPermissions: [{ seq: 1, permissionId: "perm-1", toolUseId: "", toolName: "Bash", input: {} }],
         })}
         sessionEnded={false}
         onAnswerPermission={vi.fn()}
@@ -195,8 +287,8 @@ describe("MessageList tool calls and permissions", () => {
       <MessageList
         state={state({
           pendingPermissions: [
-            { permissionId: "perm-1", toolUseId: "toolu_1", toolName: "Bash", input: {} },
-            { permissionId: "perm-2", toolUseId: "toolu_2", toolName: "Write", input: {} },
+            { seq: 0, permissionId: "perm-1", toolUseId: "toolu_1", toolName: "Bash", input: {} },
+            { seq: 1, permissionId: "perm-2", toolUseId: "toolu_2", toolName: "Write", input: {} },
           ],
         })}
         sessionEnded={false}
@@ -213,7 +305,7 @@ describe("MessageList tool calls and permissions", () => {
     const onAnswerPermission = vi.fn();
     const { container } = render(
       <MessageList
-        state={state({ pendingPermissions: [{ permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }] })}
+        state={state({ pendingPermissions: [{ seq: 0, permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }] })}
         sessionEnded
         onAnswerPermission={onAnswerPermission}
       />,

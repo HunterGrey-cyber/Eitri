@@ -413,8 +413,8 @@ mod tests {
         // And the meaning survived in full: 10,000 partial updates coalesced into one assistant
         // message, which is the whole point -- memory follows the conversation, not the event count.
         assert_eq!(state.projection.transcript.len(), 1);
-        assert!(state.projection.transcript[0].starts_with("0 1 2 "));
-        assert!(state.projection.transcript[0].ends_with("9999 "));
+        assert!(state.projection.transcript[0].text.starts_with("0 1 2 "));
+        assert!(state.projection.transcript[0].text.ends_with("9999 "));
     }
 
     #[test]

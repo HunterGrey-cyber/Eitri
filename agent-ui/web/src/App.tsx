@@ -37,7 +37,7 @@ export default function App() {
       if (payload.kind === "hello") {
         setHello(payload);
       } else if (payload.kind === "snapshot") {
-        setState((s) => applySnapshot(s, payload.state));
+        setState((s) => applySnapshot(s, payload.state, payload.throughRevision));
         setSessionStarted(true);
       } else if (payload.kind === "events") {
         // A new turn resets the render trace: each turn reports its own first text, once.
