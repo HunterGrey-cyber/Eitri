@@ -254,29 +254,50 @@ pub struct NeovideEditorPane {
     exited_callback: ExitedCallbackSlot,
 }
 
-impl NeovideEditorPane {
-    /// Builds the `GtkGLArea` and wires every resize/IME/keyboard/mouse/tick/render callback onto
-    /// it and the shared `Rc<RefCell<LiveState>>` -- everything `poc/neovide_embed_live::build_ui`
-    /// did except constructing an `Application`/`ApplicationWindow` and calling
-    /// `.present()`/`.grab_focus()` (the host does those, via `.widget()`/`.grab_focus()` below).
-    /// `clean` is forwarded to `LiveHarnessOptions::extra_nvim_args` as `--clean`, for
-    /// deterministic manual-verification runs.
-    pub fn new(clean: bool) -> Self {
-        Self::with_child_env(clean, Vec::new())
-    }
-
-    /// Same as [`NeovideEditorPane::new`], plus extra `(name, value)` environment variables set on
-    /// the spawned `nvim --embed` child process **only** -- forwarded verbatim to
-    /// `LiveHarnessOptions::child_env`, which reaches the child through `Command::env` at spawn
-    /// time. This pane's own process environment is never touched, so nothing else the host
-    /// spawns can observe the injection.
+/// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
+/// the `LiveHarnessOptions` field of the same name, so this crate stays a pass-through rather than
+/// growing a `with_this_and_that` constructor per combination a host happens to need.
+#[derive(Default)]
+pub struct NeovideEditorPaneOptions {
+    /// Launch nvim with `--clean` (no user plugins/config), for deterministic verification runs.
+    pub clean: bool,
+    /// Extra `(name, value)` environment variables set on the spawned `nvim --embed` child process
+    /// **only** -- forwarded verbatim to `LiveHarnessOptions::child_env`, which reaches the child
+    /// through `Command::env` at spawn time. This pane's own process environment is never touched,
+    /// so nothing else the host spawns can observe the injection.
     ///
     /// This crate takes no view on *what* a host injects or why; it only owns the plumbing. The
     /// one real caller today is `shell`, which uses it to make the embedded nvim believe it is
     /// running inside tmux so `vim-tmux-navigator` forwards boundary-crossing `Ctrl-h`/`Ctrl-l`
     /// out to the host (see `shell/src/pane_switch.rs`). Values are applied on top of the
     /// inherited environment, so a host prepending to `PATH` must compose the whole value itself.
-    pub fn with_child_env(clean: bool, child_env: Vec<(String, String)>) -> Self {
+    pub child_env: Vec<(String, String)>,
+    /// Working directory for the spawned `nvim --embed` child. `None` inherits this process's own
+    /// cwd, which is exactly what `None` means to `LiveHarnessOptions::cwd`.
+    ///
+    /// A host that resolves a project root for its other panes must set this too: an editor left
+    /// on the process cwd while the agent panel and terminal were pointed somewhere else is a
+    /// window whose three panes disagree about which project is open, which is worse than any of
+    /// them being "wrong" consistently.
+    pub cwd: Option<std::path::PathBuf>,
+}
+
+impl NeovideEditorPane {
+    /// Builds the `GtkGLArea` and wires every resize/IME/keyboard/mouse/tick/render callback onto
+    /// it and the shared `Rc<RefCell<LiveState>>` -- everything `poc/neovide_embed_live::build_ui`
+    /// did except constructing an `Application`/`ApplicationWindow` and calling
+    /// `.present()`/`.grab_focus()` (the host does those, via `.widget()`/`.grab_focus()` below).
+    /// `clean` is forwarded to `LiveHarnessOptions::extra_nvim_args` as `--clean`, for
+    /// deterministic manual-verification runs; everything else takes its default. Use
+    /// [`NeovideEditorPane::with_options`] to set anything more.
+    pub fn new(clean: bool) -> Self {
+        Self::with_options(NeovideEditorPaneOptions { clean, ..Default::default() })
+    }
+
+    /// Same as [`NeovideEditorPane::new`], with every construction-time knob this pane forwards to
+    /// `LiveHarnessOptions` spelled out. See [`NeovideEditorPaneOptions`] for what each one means.
+    pub fn with_options(options: NeovideEditorPaneOptions) -> Self {
+        let NeovideEditorPaneOptions { clean, child_env, cwd } = options;
         let gl_area = GLArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -408,9 +429,9 @@ impl NeovideEditorPane {
         {
             let skia_state = skia_state.clone();
             let live_state = live_state.clone();
-            // `child_env` is moved into this closure by the `move` below -- it is not needed
-            // again in this function, and this closure is the only place `LiveHarness` is ever
-            // constructed.
+            // `child_env` and `cwd` are moved into this closure by the `move` below -- neither is
+            // needed again in this function, and this closure is the only place `LiveHarness` is
+            // ever constructed.
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -481,12 +502,13 @@ impl NeovideEditorPane {
                             // every frame -- but this arm is the one-shot construction pass, so
                             // the clone happens exactly once per pane.
                             child_env: child_env.clone(),
+                            cwd: cwd.clone(),
                             ..Default::default()
                         };
                         println!(
                             "[live] constructing LiveHarness::with_options(os_scale_factor={os_scale_factor}, \
-                             clean={clean}) -- this performs a real, synchronous nvim launch and \
-                             WILL block the GTK main loop until it returns"
+                             clean={clean}, cwd={cwd:?}) -- this performs a real, synchronous nvim \
+                             launch and WILL block the GTK main loop until it returns"
                         );
                         let t0 = Instant::now();
                         match LiveHarness::with_options(options) {

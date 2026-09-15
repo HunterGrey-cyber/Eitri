@@ -9,12 +9,13 @@ mod agent_panel;
 mod chrome;
 mod layout;
 mod pane_switch;
+mod project_root;
 mod supervisor_client;
 mod theme;
 mod turn_trace;
 mod lua;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::gdk::{Key, ModifierType};
@@ -23,7 +24,7 @@ use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelEntry, PanelSlot};
-use neovide_editor::NeovideEditorPane;
+use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 // `terminal_panel` now lives in this package's own library target (`src/lib.rs`), not as a
 // `mod` declared here -- so a diagnostic/test harness in a separate `src/bin/*.rs` binary can
 // `use shell::terminal_panel;` too and drive the exact same real wiring, no duplication. See
@@ -46,19 +47,66 @@ fn main() -> glib::ExitCode {
     // Same `--clean` passthrough convenience as `neovide_embed_live`/`shell_composed`: pass
     // `--clean` on this binary's own command line to launch nvim with `--clean` instead of a
     // real embedding host's actual config.
-    let want_clean = std::env::args().any(|arg| arg == "--clean");
+    //
+    // `args_os`, not `args`, throughout this function: `std::env::args()` panics on an argument
+    // that is not valid UTF-8, and `shell <dir>` makes a path a supported argument -- see
+    // `project_root`'s own module doc. A flag match is a byte-for-byte comparison either way.
+    //
+    // Every flag matched here must also appear in `project_root::KNOWN_FLAGS`, which is the only
+    // place that can tell a flag from a project directory; one missing from that list makes
+    // passing it a hard startup failure rather than a silently wrong project root.
+    let want_clean = std::env::args_os().any(|arg| arg == "--clean");
     // `--terminal` adds the native terminal pane along the bottom. Opt-in because it cannot do
     // anything yet -- Verdandi owns the PTY and `Term` and has not shipped them -- so the default
     // window keeps exactly the startup, memory and focus behaviour it had. See
     // `terminal_panel`'s own doc; the flag goes away when a session type lands.
-    let want_terminal = std::env::args().any(|arg| arg == "--terminal");
+    let want_terminal = std::env::args_os().any(|arg| arg == "--terminal");
 
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_ui(app, want_clean, want_terminal));
+    // Resolved once, here, and then carried as a value into every pane that needs it -- see
+    // `project_root`'s own module doc for why three separate `current_dir()` reads were one
+    // process-global too many.
+    let project_root = match project_root::resolve() {
+        Ok(root) => root,
+        Err(message) => {
+            eprintln!("neovibe: {message}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
+    println!("neovibe: project root {}", project_root.display());
+
+    let app = build_application();
+    app.connect_activate(move |app| build_ui(app, want_clean, want_terminal, &project_root));
     app.run_with_args::<&str>(&[])
 }
 
-fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
+/// `NON_UNIQUE`, deliberately, and this is the one decision in this file that changes what a
+/// *second* `shell` launch does.
+///
+/// gio's default is single-instance-per-application-id: a second `shell` process registers the
+/// same id, discovers the first one owns it, relays a remote `activate` and exits -- so `build_ui`
+/// runs a second time *inside the first process*. That gives two windows sharing one process cwd,
+/// one `PaneSwitch` directory and one set of `app.add_action` names, none of which this window was
+/// ever designed to share. `shell` is a per-project window (its own nvim child, its own agent
+/// session, its own project root), so two launches must genuinely be two processes.
+///
+/// `supervisor/src/bin/neovibe_supervisor.rs` solves the same collision the opposite way, with an
+/// `app.windows().first()` guard that raises the existing window instead. That is right *there*
+/// and wrong here: exactly one dashboard is the supervisor's design, whereas a guard in `shell`
+/// would make `shell ~/other-project` silently raise the window for the project already open and
+/// never open the one that was asked for. Turning the singleton off is the mechanism that matches
+/// what this binary is; five sibling *examples* in this workspace already pass the same flag
+/// (`terminal-pane/examples/{two_panes,reparent,live_bridge,live_bridge_corpus}.rs` and
+/// `semantic-pane/examples/standalone.rs`), though none of them is a product binary -- `shell` is
+/// the first here to need it for what a real second launch does rather than to survive a sandbox
+/// that already has one of them running.
+fn build_application() -> Application {
+    Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+        .build()
+}
+
+fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_root: &Path) {
     let theme = theme::Theme::dark();
     chrome::apply_css(&theme.to_css());
 
@@ -72,7 +120,15 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
     // `Rc` because two separate closures need it after this function returns: the agent panel's
     // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
     // `NeovideEditorPane` is deliberately not `Clone`.
-    let pane = Rc::new(NeovideEditorPane::with_child_env(want_clean, nvim_child_env));
+    //
+    // `cwd` is set from the same resolved root the agent panel and the terminal get below, not
+    // left to the nvim child's inherited process cwd: three panes silently disagreeing about which
+    // project is open is a worse failure than any one of them pointing somewhere unexpected.
+    let pane = Rc::new(NeovideEditorPane::with_options(NeovideEditorPaneOptions {
+        clean: want_clean,
+        child_env: nvim_child_env,
+        cwd: Some(project_root.to_path_buf()),
+    }));
 
     let config_dir = config_dir();
     let lua_engine = Rc::new(
@@ -89,7 +145,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
         PanelEntry { id: "editor".into(), title: "Editor".into(), widget: editor_widget },
     );
     let (agent_widget, agent_panel_handle) =
-        agent_panel::build_agent_panel(std::env::current_dir().expect("cwd"));
+        agent_panel::build_agent_panel(project_root.to_path_buf());
     lua_engine.register_builtin_panel(
         PanelSlot::Side,
         PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget },
@@ -100,7 +156,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
     // the agent panel. The `Rc` is kept here rather than only in the registry: focus routing needs
     // `TerminalPane::grab_focus`, and the registry stores an opaque `gtk4::Widget`.
     let terminal = want_terminal.then(|| {
-        let cwd = std::env::current_dir().expect("cwd").to_string_lossy().into_owned();
+        let cwd = project_root.to_string_lossy().into_owned();
         let (terminal, widget) = terminal_panel::build_terminal_panel(cwd);
         lua_engine.register_builtin_panel(
             PanelSlot::Bottom,
@@ -355,7 +411,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
         // fail from the very first keypress. Second, `cleanup()` is called explicitly rather
         // than left to `Drop`: a sandbox run confirmed GTK does not deterministically free a
         // signal-handler closure before the process exits, so relying on `Drop` reproducibly
-        // left `/tmp/neovibe-pane-switch-<pid>/` behind after every close.
+        // left the shim directory behind after every close.
         if let Some(ps) = &pane_switch {
             ps.cleanup();
         }
@@ -382,4 +438,28 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool) {
         window.scale_factor(),
         want_clean,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guard on one builder line, and nothing more than that.
+    ///
+    /// It asserts only that `build_application` still sets the flag -- it does not launch a second
+    /// `shell`, does not exercise gio's registration at all, and would still pass if `build_ui`
+    /// were wired to run twice by some other route. That narrowness is the point: `NON_UNIQUE` has
+    /// no locally observable effect, so deleting the line breaks nothing here and silently
+    /// restores gio's single-instance behaviour, with the damage (`build_ui` running twice in one
+    /// process) showing up only when someone launches a second window by hand.
+    ///
+    /// **That "two launches are two processes" claim is therefore asserted from gio's documented
+    /// semantics, not demonstrated here.** Demonstrating it needs two real `shell` processes in a
+    /// sandbox; that check is listed, unrun, in `shell/MANUAL_VERIFICATION.md`'s
+    /// "Session isolation (A1/A5/A4)" section. See `build_application`'s own doc for the cost.
+    #[test]
+    fn build_application_still_opts_out_of_gios_single_instance_behaviour() {
+        let app = build_application();
+        assert!(app.flags().contains(gtk4::gio::ApplicationFlags::NON_UNIQUE));
+    }
 }
