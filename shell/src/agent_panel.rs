@@ -824,9 +824,19 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let (project_dir, session_facts, already_handing_off) = {
                 let state_ref = state.borrow();
                 let facts = state_ref.session.as_ref().map(|backend| {
+                    // `provider_session_id()` BEFORE `projection()`, and the order is load-bearing
+                    // rather than stylistic. On the sidecar path both reach for the SAME
+                    // `Mutex<IngestState>` -- `projection()` returns a guard that holds it, and
+                    // `provider_session_id()` locks it again. `std::sync::Mutex` is not reentrant,
+                    // so calling the second inside the first's scope deadlocks the GTK main loop
+                    // outright: no clicks, no keys, not even a compositor close request, with the
+                    // last frame still painted so it looks alive. Reproduced 3/3 on 2026-09-15 and
+                    // confirmed by backtrace; the legacy path never showed it because its
+                    // `projection()` borrows a plain field and takes no lock at all.
+                    let provider_session_id = backend.provider_session_id();
                     let projection = backend.projection();
                     (
-                        backend.provider_session_id(),
+                        provider_session_id,
                         projection.active_turn_id.clone(),
                         projection.cwd.clone(),
                         crate::terminal_handoff::ConversationLiveness::of(&projection.status),

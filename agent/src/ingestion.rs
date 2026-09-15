@@ -243,10 +243,20 @@ impl ConversationIngest {
         Self { state, stop, thread: Some(thread) }
     }
 
+    /// Holds the state lock for as long as the returned guard lives.
+    ///
+    /// **Nothing else on this type may be called while that guard is alive.** Every accessor below
+    /// locks the same `std::sync::Mutex`, which is not reentrant, so a second call from the same
+    /// thread blocks on a lock that thread already holds and never wakes. On 2026-09-15 that took
+    /// the whole GTK main loop down from one call site in `shell` that read
+    /// `provider_session_id()` inside this guard's scope -- no input, no window close, and the
+    /// last frame still on screen, so it looked alive. Read what you need from the guard, or take
+    /// the other values first.
     pub fn projection(&self) -> ProjectionGuard<'_> {
         ProjectionGuard(self.state.lock().unwrap())
     }
 
+    /// Locks. See `projection`'s warning: never call this while holding a `ProjectionGuard`.
     pub fn provider_session_id(&self) -> Option<String> {
         self.state.lock().unwrap().provider_session_id.clone()
     }
