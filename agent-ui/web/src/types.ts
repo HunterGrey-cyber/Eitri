@@ -45,6 +45,25 @@ export type ResumableSession = {
 };
 export type PermissionModeChoice = "auto" | "bypass";
 
+/** The command that continues a conversation Neovibe has just closed, in the user's own terminal.
+ *
+ * Arrives once, in a `handoff` envelope, and only AFTER the real session shutdown has finished —
+ * `agent_panel.rs`'s `collect_pending_handoff` dispatches it there and nowhere else, so nobody can
+ * be looking at this line while Neovibe is still driving the session.
+ *
+ * `command` is a ready-to-paste POSIX-shell line (`cd <dir> && claude --resume <id>`), built by
+ * Rust from the same argv the supported `neovibe-claude-handoff` wrapper would `exec`. `cwd` and
+ * `providerSessionId` are its own parts, sent so the panel can name them without re-parsing the
+ * line it was given.
+ *
+ * **It carries no claim of exclusivity, and none may be added here.** Nothing was spawned and no
+ * lease was taken on this path. */
+export type HandoffCommand = {
+  command: string;
+  cwd: string;
+  providerSessionId: string;
+};
+
 /** What the provider said about a resume. `attached` is the late verdict -- the provider only
  *  reports its session id at the start of a turn -- while the two failures arrive promptly. */
 export type ResumeStatus = "attached" | "rejected" | "initialization_failed";

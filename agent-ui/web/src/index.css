@@ -144,9 +144,23 @@ body,
 
 .composer {
   display: flex;
+  /* Wrap so the closing notice below can take a whole row of its own rather than being squeezed in
+     beside the textarea. With no notice present nothing wraps: the textarea is the only flexible
+     item and it shrinks before anything is pushed down. */
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px;
   border-top: 1px solid #313244;
+}
+
+/* Why the box stopped taking input while a terminal handoff closes the conversation. A control that
+   goes inert with no explanation reads as broken, and the specific thing a user needs told here is
+   that whatever they had typed is still theirs. */
+.composer-closing {
+  flex: 0 0 100%;
+  margin: 0;
+  font-size: 12px;
+  color: #f9e2af;
 }
 .composer textarea {
   flex: 1;
@@ -316,4 +330,112 @@ body,
 }
 .mode-selector .session-choice button[aria-checked="false"] {
   opacity: 0.7;
+}
+
+/* "Continue in a terminal", under the composer. Quiet by default: it is a way out of this panel,
+   not one of the things it is for. */
+.handoff {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 0 12px 10px;
+  font-size: 11px;
+}
+.handoff-open {
+  background: none;
+  border: 1px solid #45475a;
+  border-radius: 4px;
+  color: #a6adc8;
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.handoff-open:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+/* The reason the control is unavailable, as VISIBLE text beside it rather than only as a `title`.
+   A disabled button with no explanation reads as broken, and a tooltip is unreadable without a
+   pointer hovering it. */
+.handoff-blocked {
+  color: #a6adc8;
+  flex: 1 1 200px;
+}
+
+/* The confirmation, in place of the button. Bordered because the thing it is about to do -- close
+   the conversation -- is not undoable on a backend with no resume. */
+.handoff-confirm {
+  margin: 0 12px 12px;
+  padding: 10px 12px;
+  border: 1px solid #f9e2af;
+  border-radius: 4px;
+  background: rgba(249, 226, 175, 0.08);
+  font-size: 12px;
+}
+.handoff-confirm p {
+  margin: 0 0 8px;
+}
+.handoff-confirm .warning {
+  color: #f9e2af;
+}
+.handoff-confirm-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+/* The command, on the start screen, after the session really has been closed. It carries a warning
+   about concurrency that must not be dismissible: the whole point of this path is that nothing is
+   holding the session, and a warning that can be clicked away is one that will be. */
+.handoff-card {
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid #89b4fa;
+  border-radius: 4px;
+  background: rgba(137, 180, 250, 0.08);
+  font-size: 12px;
+  text-align: left;
+}
+.handoff-card p {
+  margin: 8px 0 0;
+}
+.handoff-card .warning {
+  color: #f9e2af;
+}
+.handoff-card .detail {
+  color: #a6adc8;
+}
+/* Selectable and wrapping: this is a line to copy character for character, and a long project path
+   must not push it out of the pane. */
+.handoff-command {
+  margin: 8px 0 0;
+  padding: 8px;
+  border-radius: 4px;
+  background: #181825;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, monospace;
+  color: #cdd6f4;
+  user-select: text;
+}
+
+/* A command the host refused, in the words the host used. Distinct from `.fatal-error`, and it has
+   to stay distinct: that one means the whole session is gone, this one means one command did not
+   happen and everything else is fine. Dismissible for the same reason -- there is nothing here a
+   user needs protecting from clicking away, unlike `.session-lost`. */
+.command-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px;
+  padding: 10px;
+  border: 1px solid #f9e2af;
+  border-radius: 4px;
+  background: rgba(249, 226, 175, 0.08);
+  color: #f9e2af;
+  font-size: 12px;
+}
+.command-notice span {
+  flex: 1;
+  user-select: text;
 }

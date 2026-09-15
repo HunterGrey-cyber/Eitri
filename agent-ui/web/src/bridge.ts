@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, Hello } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, HandoffCommand, Hello } from "./types";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -15,7 +15,12 @@ export type OutboundMessage =
    *  and Rust's `Instant` have unrelated epochs, so a timestamp crossing this boundary would be a
    *  confident, meaningless number. Diagnostic only -- Rust expects no reply and nothing branches
    *  on it. */
-  | { type: "turn_rendered"; request_id: string; receive_to_frame_ms: number };
+  | { type: "turn_rendered"; request_id: string; receive_to_frame_ms: number }
+  /** "Close this conversation here and give me the command that continues it in a terminal."
+   *  Carries nothing else: every input the rule needs is already canonical on the Rust side, and a
+   *  session id sent from here would be a second, stale source for the one value that must not be
+   *  wrong. The reply is a `handoff` envelope, deferred until the real close has finished. */
+  | { type: "handoff_to_terminal"; request_id: string };
 
 /** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
  *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send
@@ -55,6 +60,7 @@ type InboundHandler = (
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     | { kind: "events"; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
     | { kind: "snapshot"; throughRevision: number; state: AgentUiSnapshot }
+    | ({ kind: "handoff" } & HandoffCommand)
     | { kind: "error"; message: string },
 ) => void;
 
@@ -69,7 +75,14 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
-      if (obj.kind === "hello" || obj.kind === "command_result" || obj.kind === "events" || obj.kind === "snapshot" || obj.kind === "error") {
+      if (
+        obj.kind === "hello" ||
+        obj.kind === "command_result" ||
+        obj.kind === "events" ||
+        obj.kind === "snapshot" ||
+        obj.kind === "handoff" ||
+        obj.kind === "error"
+      ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;
       }

@@ -16,6 +16,8 @@ function renderComposer(overrides: Overrides = {}) {
       disabled={false}
       turnInProgress={false}
       sessionEnded={false}
+      closing={false}
+      restoredDraft={null}
       canInterrupt
       onSend={onSend}
       onInterrupt={onInterrupt}
@@ -26,6 +28,31 @@ function renderComposer(overrides: Overrides = {}) {
   const button = (label: string) =>
     Array.from(container.querySelectorAll("button")).find((b) => b.textContent === label);
   return { container, textarea, button, onSend, onInterrupt };
+}
+
+/** Same defaults, but able to change props afterwards -- the restored-draft path is driven entirely
+ *  by a prop the host updates. */
+function renderComposerWithRerender(overrides: Overrides = {}) {
+  const onSend = vi.fn();
+  const onInterrupt = vi.fn();
+  const base = {
+    disabled: false,
+    turnInProgress: false,
+    sessionEnded: false,
+    closing: false,
+    restoredDraft: null,
+    canInterrupt: true,
+    onSend,
+    onInterrupt,
+    ...overrides,
+  };
+  const { container, rerender } = render(<Composer {...base} />);
+  return {
+    container,
+    textarea: container.querySelector("textarea")!,
+    onSend,
+    rerender: (next: Overrides) => rerender(<Composer {...base} {...next} />),
+  };
 }
 
 describe("Composer sending", () => {
@@ -104,5 +131,40 @@ describe("Composer on a session that has ended", () => {
   it("keeps the ordinary prompt while the session is alive", () => {
     const { textarea } = renderComposer();
     expect(textarea.placeholder).toBe("Ask the agent...");
+  });
+});
+
+/* The two halves of not eating a typed message: the box refuses while the conversation is closing
+   and says so, and a send the host refused comes back. */
+describe("Composer while the conversation is closing", () => {
+  it("refuses to send, and explains rather than just going grey", () => {
+    const { container, textarea, onSend } = renderComposer({ disabled: true, closing: true });
+    fireEvent.change(textarea, { target: { value: "still mine" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("still mine");
+    expect(container.querySelector(".composer-closing")).not.toBeNull();
+  });
+});
+
+describe("Composer restoring a refused draft", () => {
+  it("puts the text back exactly as it was", () => {
+    const { textarea, rerender } = renderComposerWithRerender();
+    fireEvent.change(textarea, { target: { value: "the one that got away" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("");
+    rerender({ restoredDraft: { text: "the one that got away", seq: 1 } });
+    expect(textarea.value).toBe("the one that got away");
+  });
+
+  /* Two refusals of the SAME text are two distinct restores. A bare string prop would not change
+     identity the second time and the box would silently stay empty. */
+  it("restores identical text a second time", () => {
+    const { textarea, rerender } = renderComposerWithRerender();
+    rerender({ restoredDraft: { text: "same", seq: 1 } });
+    expect(textarea.value).toBe("same");
+    fireEvent.change(textarea, { target: { value: "" } });
+    rerender({ restoredDraft: { text: "same", seq: 2 } });
+    expect(textarea.value).toBe("same");
   });
 });

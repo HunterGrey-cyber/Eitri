@@ -10,6 +10,7 @@ mod layout;
 mod pane_switch;
 mod project_root;
 mod supervisor_client;
+mod terminal_handoff;
 mod theme;
 mod turn_trace;
 mod lua;
