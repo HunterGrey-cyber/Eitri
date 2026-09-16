@@ -386,9 +386,13 @@ fn a_connected_provider_reports_wire_sourced_capabilities_and_versions() {
     let info = provider.info();
     let capabilities = provider.capabilities();
 
-    // 2 since the replay-start change (2026-09-12). A real incompatibility in both directions, which
-    // is what the handshake field is for -- see CLIENT_PROTOCOL_MAJOR's own comment.
-    assert_eq!(info.protocol_major, 2);
+    // Read from the client's own constant rather than a literal. This assertion sat at a literal 2
+    // from 2026-09-12 until the protocol-3 pin landed on 2026-09-15, by which point `connect()`
+    // would have REFUSED any sidecar that could satisfy it -- the test was unrunnable and green,
+    // because it is `#[ignore]`d. A literal here can only ever be stale or redundant: the handshake
+    // already refuses a mismatch, so what is worth pinning is that `info` reports the negotiated
+    // value rather than a default.
+    assert_eq!(info.protocol_major, agent::CLIENT_PROTOCOL_MAJOR);
     assert!(!info.sidecar_version.is_empty(), "got: {info:?}");
     // The provider states how much history it retains, and this client now keeps it. A test that
     // configures a small ring has no other way to confirm the configuration actually took effect.

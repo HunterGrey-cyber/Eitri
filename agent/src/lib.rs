@@ -47,5 +47,5 @@ pub use provider::{
     ProviderError, ProviderErrorCode, ProviderInfo, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
-    BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME, EXPECTED_VERDANDI_REVISION,
+    BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION,
 };

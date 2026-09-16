@@ -1,4 +1,5 @@
-//! Window chrome: top bar, window controls (minimize/maximize/close), status bar, and CSS styling.
+//! Window chrome: top bar, window controls (minimize/maximize/close), status bar. Styling itself
+//! lives in `theme::gtk_css`.
 
 use gtk4::{
     prelude::*,
@@ -94,16 +95,4 @@ pub(crate) fn build_status_bar() -> gtk4::Widget {
     bar.append(&sep);
 
     bar.upcast()
-}
-
-pub(crate) fn apply_css(css: &str) {
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(css);
-
-    let display = gtk4::gdk::Display::default().expect("no default GDK display");
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
 }

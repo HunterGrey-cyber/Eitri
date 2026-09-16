@@ -251,6 +251,23 @@ pub struct NeovideEditorPaneOptions {
     /// window whose three panes disagree about which project is open, which is worse than any of
     /// them being "wrong" consistently.
     pub cwd: Option<std::path::PathBuf>,
+    /// Extra arguments for the `nvim` binary itself, forwarded to
+    /// `LiveHarnessOptions::extra_nvim_args` after `--clean` (when `clean` is set).
+    ///
+    /// Like `child_env`, this crate takes no view on what a host passes. `shell` uses it for one
+    /// `--cmd` that loads its theme feed (see `shell/src/theme/feed.rs`); `--cmd` runs before the
+    /// user's own config, so what it installs is autocommands, not settings.
+    pub extra_nvim_args: Vec<String>,
+}
+
+/// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`.
+fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra.len() + 1);
+    if clean {
+        args.push("--clean".to_string());
+    }
+    args.extend(extra.iter().cloned());
+    args
 }
 
 impl NeovideEditorPane {
@@ -268,7 +285,7 @@ impl NeovideEditorPane {
     /// Same as [`NeovideEditorPane::new`], with every construction-time knob this pane forwards to
     /// `LiveHarnessOptions` spelled out. See [`NeovideEditorPaneOptions`] for what each one means.
     pub fn with_options(options: NeovideEditorPaneOptions) -> Self {
-        let NeovideEditorPaneOptions { clean, child_env, cwd } = options;
+        let NeovideEditorPaneOptions { clean, child_env, cwd, extra_nvim_args } = options;
         let gl_area = GLArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -462,11 +479,7 @@ impl NeovideEditorPane {
                         let os_scale_factor = widget.scale_factor() as f64;
                         let options = LiveHarnessOptions {
                             os_scale_factor,
-                            extra_nvim_args: if clean {
-                                vec!["--clean".to_string()]
-                            } else {
-                                Vec::new()
-                            },
+                            extra_nvim_args: nvim_args(clean, &extra_nvim_args),
                             // Cloned rather than moved because this closure is `Fn` and runs on
                             // every frame -- but this arm is the one-shot construction pass, so
                             // the clone happens exactly once per pane.
@@ -742,5 +755,19 @@ impl NeovideEditorPane {
         } else {
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nvim_args;
+
+    #[test]
+    fn clean_comes_first_and_extra_arguments_follow_in_order() {
+        let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
+        assert_eq!(nvim_args(true, &extra), vec!["--clean", "--cmd", "lua print(1)"]);
+        assert_eq!(nvim_args(false, &extra), vec!["--cmd", "lua print(1)"]);
+        assert_eq!(nvim_args(true, &[]), vec!["--clean"]);
+        assert!(nvim_args(false, &[]).is_empty());
     }
 }

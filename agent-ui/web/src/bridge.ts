@@ -61,6 +61,7 @@ type InboundHandler = (
     | { kind: "events"; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
     | { kind: "snapshot"; throughRevision: number; state: AgentUiSnapshot }
     | ({ kind: "handoff" } & HandoffCommand)
+    | { kind: "theme"; vars: Record<string, string> }
     | { kind: "error"; message: string },
 ) => void;
 
@@ -81,6 +82,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "events" ||
         obj.kind === "snapshot" ||
         obj.kind === "handoff" ||
+        obj.kind === "theme" ||
         obj.kind === "error"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);

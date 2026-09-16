@@ -9,6 +9,11 @@ mod spawn;
 mod translate;
 mod watch;
 
+/// Real, billed A/B runs proving that protocol 3's two narrowing fields do what they say at
+/// runtime. Read its header before running anything in it.
+#[cfg(test)]
+mod runtime_policy_verification;
+
 pub use spawn::EXPECTED_VERDANDI_REVISION;
 
 use crate::provider::{
@@ -42,7 +47,7 @@ const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The protocol major this client speaks. Connections are refused if the sidecar reports
 /// a different major.
-const CLIENT_PROTOCOL_MAJOR: u32 = 3;
+pub const CLIENT_PROTOCOL_MAJOR: u32 = 3;
 
 /// Capability strings this client understands, as the sidecar advertises them in
 /// `HandshakeResponse.capabilities`. Named constants rather than inline literals because a typo

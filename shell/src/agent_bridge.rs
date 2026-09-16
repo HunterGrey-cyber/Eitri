@@ -179,6 +179,18 @@ pub(crate) fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGre
     .to_string()
 }
 
+/// `{"kind":"theme","vars":{"--nv-bg":"#faf4ed",...}}` -- the complete CSS custom-property set the
+/// panel paints with, derived from nvim's highlight groups (`crate::theme`).
+///
+/// Sent in the `ready` batch right after `hello`, and again whenever nvim's colours change. Always
+/// complete, so the frontend's CSS never needs a fallback value of its own. Kept out of `hello`
+/// on purpose: `hello` describes the backend, and a theme change must not resend it.
+pub(crate) fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
+    let vars: serde_json::Map<String, serde_json::Value> =
+        tokens.css_vars().into_iter().map(|(name, value)| (name, serde_json::Value::String(value))).collect();
+    json!({ "kind": "theme", "vars": vars }).to_string()
+}
+
 /// Serializes `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[...]}`.
 /// `AgentDomainEvent`'s `Serialize` implementation supplies each event's tagged JSON shape.
 /// The revisions are the projection's `last_revision` before and after folding the batch.
@@ -368,6 +380,17 @@ pub(crate) fn serialize_error_for_js(message: &str) -> String {
 mod tests {
     use super::*;
     use agent::PermissionOutcome;
+
+    #[test]
+    fn a_theme_envelope_carries_every_css_variable_verbatim() {
+        let tokens = crate::theme::ThemeTokens::fallback();
+        let value: serde_json::Value = serde_json::from_str(&serialize_theme_for_js(&tokens)).unwrap();
+        assert_eq!(value["kind"], "theme");
+        let vars = value["vars"].as_object().unwrap();
+        assert_eq!(vars.len(), tokens.css_vars().len());
+        assert_eq!(vars["--nv-bg"], tokens.bg.hex());
+        assert_eq!(vars["--nv-font-prose"], crate::theme::tokens::PROSE_FONT_STACK);
+    }
 
     #[test]
     fn parses_ready_with_request_id() {
