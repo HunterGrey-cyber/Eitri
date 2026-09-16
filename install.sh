@@ -24,6 +24,24 @@ for b in "${BINS[@]}"; do
 	[[ -x "target/release/$b" ]] || { echo "install: target/release/$b is missing -- build first" >&2; exit 1; }
 done
 
+# The packaged build wins over this one, which is the opposite of what a developer wants. `/usr/bin`
+# precedes `~/.local/bin` in this machine's PATH, so with the distro package installed, `neovibe`
+# keeps running /usr/lib/neovibe/shell no matter what this script writes -- you would be testing the
+# release while believing you were testing your change. Say so rather than let it be discovered.
+if pacman -Q neovibe >/dev/null 2>&1; then
+	installed="$(pacman -Q neovibe | awk '{print $2}')"
+	cat >&2 <<WARN
+
+warning: the distro package neovibe ${installed} is installed, and /usr/bin/neovibe takes
+         precedence over ${BINDIR}/neovibe on this PATH. After this script finishes, typing
+         'neovibe' will still run the PACKAGED build, not the one it just installed.
+
+         To test this build:   sudo pacman -R neovibe     (then re-run this script)
+         Or run it directly:   ${LIBDIR}/shell <project>
+
+WARN
+fi
+
 mkdir -p "$LIBDIR" "$BINDIR" "$APPDIR"
 install -m755 "${BINS[@]/#/target/release/}" "$LIBDIR/"
 
