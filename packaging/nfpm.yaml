@@ -1,0 +1,45 @@
+name: neovibe
+arch: amd64
+version: ${VERSION}
+release: 1
+maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
+description: |
+  Neovim, embedded as a real component, with a Claude agent panel beside it.
+  Pre-MVP: the agent can read, search and talk, but cannot yet edit your files.
+homepage: https://github.com/HunterGrey-cyber/eitri
+license: MIT
+
+# Direct links only -- gtk4 and webkitgtk pull in the other ~100 transitively, and listing those
+# would pin versions this package has no opinion about. `neovim` and `claude` are runtime lookups on
+# PATH rather than link-time: nvim is a real package, `claude` is not in any distro and is named in
+# the description instead of pretended to be resolvable.
+depends:
+  - gtk4
+  - webkitgtk-6.0
+  - neovim
+overrides:
+  deb:
+    depends:
+      - libgtk-4-1
+      - libwebkitgtk-6.0-4
+      - neovim
+
+contents:
+  # All five must land in ONE directory: each companion is located as a sibling of the running
+  # executable (`current_exe()`'s parent). Splitting them produces a build that starts and then
+  # silently has no pane switching, no supervisor, and no permission gate on the legacy backend.
+  - src: ./target/release/shell
+    dst: /usr/lib/neovibe/shell
+  - src: ./target/release/agent-hook
+    dst: /usr/lib/neovibe/agent-hook
+  - src: ./target/release/neovibe-supervisor
+    dst: /usr/lib/neovibe/neovibe-supervisor
+  - src: ./target/release/neovibe-tmux-shim
+    dst: /usr/lib/neovibe/neovibe-tmux-shim
+  - src: ./target/release/neovibe-claude-handoff
+    dst: /usr/lib/neovibe/neovibe-claude-handoff
+
+  - src: ./packaging/neovibe.launcher.sh
+    dst: /usr/bin/neovibe
+  - src: ./packaging/neovibe.desktop
+    dst: /usr/share/applications/neovibe.desktop
