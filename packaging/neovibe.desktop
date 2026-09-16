@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=neovibe
+Comment=Neovim, embedded, with a Claude agent panel
+Exec=/usr/bin/neovibe --quiet %f
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=inode/directory;
+StartupNotify=true
