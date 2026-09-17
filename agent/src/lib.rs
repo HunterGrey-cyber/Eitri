@@ -23,8 +23,12 @@ pub mod hook_protocol;
 pub mod ingestion;
 pub mod lease;
 pub mod persistence;
+#[doc(hidden)]
+pub mod process_probe;
 pub mod providers;
 pub mod settings;
+#[doc(hidden)]
+pub mod socket_path;
 pub mod state_dirs;
 pub mod transcript;
 

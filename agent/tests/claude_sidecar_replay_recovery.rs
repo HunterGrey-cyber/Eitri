@@ -414,14 +414,10 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
 /// only in this client's queue -- the server-side gRPC queue is the one layer neither end exposes a
 /// depth for, and RSS is the only observable it does move.
 ///
-/// Read from `/proc/<pid>/status` for the pid this provider reports having spawned, never by name.
+/// Read through `agent::process_probe` (Linux `/proc/<pid>/status`, macOS `proc_pidinfo`) for the pid
+/// this provider reports having spawned, never by name.
 /// Returns `None` rather than 0 when it cannot be read: a zero printed among real measurements reads
 /// as "measured, and it was zero".
 fn sidecar_rss_kib(pid: u32) -> Option<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find(|line| line.starts_with("VmRSS:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|kib| kib.parse().ok())
+    agent::process_probe::resident_kib(pid)
 }

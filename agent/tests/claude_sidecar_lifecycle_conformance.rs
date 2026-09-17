@@ -358,7 +358,7 @@ fn dropping_the_provider_leaves_no_orphaned_sidecar() {
         let provider = connect();
         let pid = provider.sidecar_pid();
         assert!(
-            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            agent::process_probe::pid_is_alive(pid),
             "the sidecar pid {pid} should exist while the provider is alive"
         );
         let session_id = create_bypass_session(&provider);
@@ -367,11 +367,11 @@ fn dropping_the_provider_leaves_no_orphaned_sidecar() {
     }; // provider dropped here: stdin closes, the sidecar sees EOF and exits
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && std::path::Path::new(&format!("/proc/{sidecar_pid}")).exists() {
+    while Instant::now() < deadline && agent::process_probe::pid_is_alive(sidecar_pid) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        !std::path::Path::new(&format!("/proc/{sidecar_pid}")).exists(),
+        !agent::process_probe::pid_is_alive(sidecar_pid),
         "sidecar pid {sidecar_pid} outlived its provider -- this is a leak to report, not to clean up by hand"
     );
 }

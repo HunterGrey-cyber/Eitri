@@ -24,6 +24,14 @@ fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(provider: &ClaudeSidecarProvi
 #[test]
 #[ignore]
 fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() {
+    // Require Linux before spawning processes or incurring API usage. The check below reads
+    // `/proc/<pid>/comm` to confirm the child has exec'd into `claude`. macOS has no `/proc`,
+    // and its process-name checks have not been verified for a symlinked CLI installation.
+    // Without a verified check, `AlreadyHeld` could pass while the wrapper still holds the lease.
+    assert!(
+        cfg!(target_os = "linux"),
+        "this conformance test's exec check is Linux-only (/proc/<pid>/comm) and has no verified macOS port"
+    );
     let project_dir = std::env::temp_dir().join(format!("agent-handoff-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&project_dir).unwrap();
     let cwd = project_dir.to_string_lossy().to_string();

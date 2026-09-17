@@ -278,9 +278,9 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
 }
 
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
-/// the socket path (mirrors `agent::process`'s own per-conversation UUID socket convention,
-/// `std::env::temp_dir().join(format!("neovibe-agent-hook-{conversation_id}.sock"))`) so multiple
-/// concurrent providers never collide on one path.
+/// the socket path (`crate::socket_path::sidecar_socket`, which mirrors the legacy backend's own
+/// per-conversation UUID socket and keeps both under macOS's 103-byte socket-path limit) so
+/// multiple concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let checkout = locate_verdandi_checkout()?;
     let (checkout_description, checkout_warnings) = describe_checkout(&checkout);
@@ -290,7 +290,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     }
     let checkout = checkout.path;
     let dist_entry = ensure_sidecar_built(&checkout)?;
-    let socket_path = std::env::temp_dir().join(format!("neovibe-claude-sidecar-{instance_id}.sock"));
+    let socket_path = crate::socket_path::sidecar_socket(&std::env::temp_dir(), instance_id)?;
     let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
     let mut command = Command::new("node");

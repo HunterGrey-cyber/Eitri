@@ -350,10 +350,19 @@ fn adopt_provider_session(context: &AdoptionContext, provider_session_id: &str) 
         provider_session_id,
     ) {
         Ok(lease) => Some(lease),
-        Err(e) => {
+        Err(e @ crate::lease::LeaseError::AlreadyHeld) => {
             eprintln!(
                 "agent: could not take the session lease for {provider_session_id}: {e} -- \
                  continuing without it; another Neovibe window may be driving the same session"
+            );
+            None
+        }
+        // The lease could not be taken for a reason other than contention, such as an unusable lease
+        // directory. Do not imply another window holds it: a missing `XDG_RUNTIME_DIR` can cause this path.
+        Err(e) => {
+            eprintln!(
+                "agent: could not take the session lease for {provider_session_id}: {e} -- \
+                 continuing without it; this is not contention, the lease could not be taken at all"
             );
             None
         }
