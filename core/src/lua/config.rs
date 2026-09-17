@@ -11,12 +11,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// `pub`: `shell/src/lua/mod.rs::LuaEngine::new` constructs one directly
+/// (`config::ConfigStore::default()`) to hand to `install`.
 #[derive(Default)]
-pub(crate) struct ConfigStore {
+pub struct ConfigStore {
     values: HashMap<String, String>,
 }
 
-pub(crate) fn install(
+/// `pub`: `LuaEngine::new` calls this.
+pub fn install(
     lua: &Lua,
     neovibe: &Table,
     store: Rc<RefCell<ConfigStore>>,

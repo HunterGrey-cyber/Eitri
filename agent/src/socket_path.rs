@@ -22,9 +22,15 @@
 //! decision rather than a portability fix. A user whose `TMPDIR` is long enough to hit this gets a
 //! clear error where they used to get std's.
 //!
-//! Test code that binds a socket goes through [`in_dir`] too, including `agent/tests/`; this module
-//! is `#[doc(hidden)] pub` only for that. `tests::every_sock_path_in_this_crate_is_built_here` scans
-//! the crate's sources so a new construction site elsewhere fails a test rather than a Mac.
+//! [`in_dir`] is not `#[doc(hidden)]` (removed 2026-09-17, L2 follow-up): it started out as test-
+//! only plumbing -- `agent/tests/` binds through it too -- but `neovibe-core`'s PRODUCT code
+//! (`pane_switch`, `theme::feed`) now builds every socket path it has through this same function,
+//! so hiding it from the docs would hide the one thing every Mac-bound socket path in this
+//! workspace actually depends on. `tests::every_sock_path_in_this_crate_is_built_here` scans this
+//! crate's own sources so a new construction site here fails a test rather than a Mac;
+//! `neovibe-core/src/socket_path_guard.rs` is the reciprocal scanner, over that crate's own
+//! sources, added when L2 T5 put two construction sites there. The two are independent scanners
+//! over two crates, not one shared mechanism -- keep them in step by hand.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,7 +39,6 @@ use std::path::{Path, PathBuf};
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// `dir/file_name`, or `InvalidInput` if that is longer than [`MAX_SOCKET_PATH_BYTES`].
-#[doc(hidden)]
 pub fn in_dir(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     let path = dir.join(file_name);
     let len = path.as_os_str().len();
@@ -144,6 +149,10 @@ mod tests {
     /// line, or on the list below, and
     /// every entry on the list says why that path is never bound. A new socket path built anywhere
     /// else fails here, on Linux, before it fails `bind` on a Mac.
+    ///
+    /// Scoped to this crate only. `neovibe-core/src/socket_path_guard.rs` is the same scan over
+    /// that crate's sources instead -- a separate scanner, not a shared one, so keep both in step
+    /// by hand when either crate's set of socket-building files changes.
     #[test]
     fn every_sock_path_in_this_crate_is_built_here() {
         // (file, a substring of the line) -- each one a path that is never passed to bind/connect.

@@ -6,12 +6,12 @@ use serde::Deserialize;
 
 /// Bumped whenever the Lua snippet and this parser change shape together. A mismatch rejects the
 /// whole payload rather than guessing at a partial reading.
-pub(crate) const PAYLOAD_VERSION: u32 = 1;
+pub const PAYLOAD_VERSION: u32 = 1;
 
 /// The subset of one `nvim_get_hl(0, {name = ..., link = false})` result that derivation reads.
 /// Everything else nvim reports (`bold`, `ctermfg`, ...) is ignored by serde's default.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub(crate) struct HlAttrs {
+pub struct HlAttrs {
     pub fg: Option<u32>,
     pub bg: Option<u32>,
     #[serde(default)]
@@ -19,7 +19,7 @@ pub(crate) struct HlAttrs {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-pub(crate) struct NvimOptions {
+pub struct NvimOptions {
     /// `"light"` or `"dark"`: nvim's `'background'`.
     pub background: String,
     /// nvim's `'guifont'`, verbatim. Empty when unset.
@@ -29,7 +29,7 @@ pub(crate) struct NvimOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-pub(crate) struct NvimThemePayload {
+pub struct NvimThemePayload {
     pub v: u32,
     /// Only groups nvim reported as non-empty are present.
     pub groups: HashMap<String, HlAttrs>,
@@ -38,7 +38,7 @@ pub(crate) struct NvimThemePayload {
 
 impl NvimThemePayload {
     /// What derivation starts from when nvim has pushed nothing at all.
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: HashMap::new(),

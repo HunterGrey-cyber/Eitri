@@ -1,4 +1,3 @@
-// shell/src/turn_trace.rs
 //! Where a turn's latency actually goes, from the click to the pixels.
 //!
 //! Off unless `NEOVIBE_AGENT_TRACE=1`. One line per turn, to stderr.
@@ -56,7 +55,7 @@ fn ms(duration: Duration) -> f64 {
 
 /// One turn's marks. Created when the turn is submitted, emitted when it ends.
 #[derive(Debug)]
-pub(crate) struct TurnTrace {
+pub struct TurnTrace {
     submitted_at: Instant,
     /// The provider's own id for this turn, learned from `TurnStarted`. Not known at submit time:
     /// `send_turn` returns one for the sidecar but not for the legacy backend, and this file must
@@ -78,7 +77,7 @@ pub(crate) struct TurnTrace {
 impl TurnTrace {
     /// Starts a trace, or returns `None` when tracing is off -- so every call site is a cheap
     /// `Option` check rather than a flag test scattered through the panel.
-    pub(crate) fn start() -> Option<Self> {
+    pub fn start() -> Option<Self> {
         enabled().then(|| Self {
             submitted_at: Instant::now(),
             turn_id: None,
@@ -100,7 +99,7 @@ impl TurnTrace {
     ///
     /// Returns true when this batch carried the first assistant text, which is the caller's cue to
     /// stamp the dispatch time.
-    pub(crate) fn observe(&mut self, events: &[AgentDomainEvent]) -> bool {
+    pub fn observe(&mut self, events: &[AgentDomainEvent]) -> bool {
         let mut carried_first_text = false;
         for event in events {
             if self.first_provider_event.is_none() {
@@ -135,7 +134,7 @@ impl TurnTrace {
     }
 
     /// Records when the payload carrying the first assistant text was handed to the WebView.
-    pub(crate) fn mark_first_text_dispatched(&mut self) {
+    pub fn mark_first_text_dispatched(&mut self) {
         if self.first_text_dispatched.is_none() {
             self.first_text_dispatched = Some(self.since_submit());
         }
@@ -143,7 +142,7 @@ impl TurnTrace {
 
     /// The WebView's own receive-to-animation-frame span for that payload. Ignored if it arrives
     /// twice, or before the dispatch it refers to.
-    pub(crate) fn mark_painted(&mut self, receive_to_frame_ms: f64) {
+    pub fn mark_painted(&mut self, receive_to_frame_ms: f64) {
         if self.first_paint_frame.is_some() || !receive_to_frame_ms.is_finite() || receive_to_frame_ms < 0.0 {
             return;
         }
@@ -152,21 +151,21 @@ impl TurnTrace {
         }
     }
 
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.completed.is_some()
     }
 
     /// True once every mark that is still coming has arrived. A turn whose text was never painted
     /// (an interrupt before any text, a session that died first) is finished without it, so this
     /// also reports true when there is nothing left to wait for.
-    pub(crate) fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.is_finished()
             && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none())
     }
 
     /// Prints the line. Idempotent: the caller emits on completion and again on a deadline, and only
     /// the first one produces output.
-    pub(crate) fn emit(&mut self) {
+    pub fn emit(&mut self) {
         if self.emitted {
             return;
         }

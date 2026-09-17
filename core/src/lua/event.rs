@@ -9,8 +9,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// `pub`: `shell/src/lua/mod.rs::LuaEngine::new` constructs one directly
+/// (`event::EventBus::default()`) to hand to `install`.
 #[derive(Default)]
-pub(crate) struct EventBus {
+pub struct EventBus {
     // `Rc<RegistryKey>`, not a bare `RegistryKey`: `RegistryKey` itself doesn't implement
     // `Clone` (verified against the installed mlua 0.12.1's `src/types/registry_key.rs`), and
     // `emit` below needs to clone handles *out* of a borrowed `EventBus` before dropping that
@@ -19,12 +21,15 @@ pub(crate) struct EventBus {
 }
 
 impl EventBus {
+    /// Private: only `install`'s own closure below calls this. Nothing in `shell` (or anywhere
+    /// outside this file) calls `subscribe` directly.
     fn subscribe(&mut self, event_name: String, handler: RegistryKey) {
         self.handlers.entry(event_name).or_default().push(Rc::new(handler));
     }
 }
 
-pub(crate) fn install(lua: &Lua, neovibe: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Result<()> {
+/// `pub`: `LuaEngine::new` calls this.
+pub fn install(lua: &Lua, neovibe: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Result<()> {
     let on_fn = lua.create_function(move |lua, (event_name, handler): (String, mlua::Function)| {
         let key = lua.create_registry_value(handler)?;
         bus.borrow_mut().subscribe(event_name, key);
@@ -48,7 +53,9 @@ pub(crate) fn install(lua: &Lua, neovibe: &Table, bus: Rc<RefCell<EventBus>>) ->
 /// borrow of `bus` were still held while the handler ran. Same reentrancy hazard, and the same
 /// fix (resolve what's needed under the borrow, drop the borrow, then call out), as
 /// `neovide-editor`'s tick callback uses for its `exited_callback`.
-pub(crate) fn emit(lua: &Lua, bus: &RefCell<EventBus>, event_name: &str, payload: Value) {
+///
+/// `pub`: `LuaEngine::emit` calls this.
+pub fn emit(lua: &Lua, bus: &RefCell<EventBus>, event_name: &str, payload: Value) {
     let keys: Vec<Rc<RegistryKey>> = {
         let bus = bus.borrow();
         match bus.handlers.get(event_name) {

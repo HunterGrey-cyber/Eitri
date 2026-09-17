@@ -25,7 +25,7 @@ const UI_CONTRAST: f64 = 3.0;
 /// Only needs to be visibly a band. Not a WCAG figure.
 const CURSORLINE_CONTRAST: f64 = 1.15;
 
-pub(crate) const PROSE_FONT_STACK: &str = "\"IBM Plex Sans\", \"Noto Sans CJK SC\", sans-serif";
+pub const PROSE_FONT_STACK: &str = "\"IBM Plex Sans\", \"Noto Sans CJK SC\", sans-serif";
 /// Neovide's embedded default face, which is what the editor draws with when `guifont` is empty.
 const MONO_FONT_FALLBACK: &str = "\"FiraCode Nerd Font\", monospace";
 
@@ -45,10 +45,20 @@ const SYNTAX: [(&str, &str, &str); 12] = [
     ("tag", "@tag", "Tag"),
 ];
 
-/// Every group [`ThemeTokens::derive`] reads. `nvim_theme.lua` must request each one; a test in
-/// `feed.rs` checks that. **Add a name here in the same edit that makes `derive` read it.**
-/// `#[cfg(test)]`: its only reader is that `feed.rs` test, and a non-test build must stay
-/// warning-free rather than carry a `never used` lint on a constant nothing outside tests reads.
+/// Every group [`ThemeTokens::derive`] reads. `nvim_theme.lua` must request each one;
+/// `crate::theme::feed`'s `the_lua_snippet_requests_every_group_derivation_reads` checks that.
+/// **Add a name here in the same edit that makes `derive` read it.**
+///
+/// `#[cfg(test)]` again, and the round trip is worth recording. It was gated when its reader was a
+/// test in `shell` and this constant was in `shell` too. L2 T1 (2026-09-17) moved the constant into
+/// this crate and left the reader behind, which forced the gate off: `#[cfg(test)]` only compiles an
+/// item in when the crate carrying it is itself built as a test target, not when it is a dependency
+/// of another crate's tests, so a gated constant here would simply not have existed from `shell`'s
+/// side. L2 T5 moved the reader -- and `nvim_theme.lua`, the file it asserts about -- into this
+/// crate as well, so the contract is once more entirely inside one crate and the gate costs nothing.
+///
+/// `pub(crate)`, not `pub`: under `#[cfg(test)]` a `pub` here advertises an item that cannot exist
+/// in any consumer's build, which is a worse thing to read than a narrower one.
 #[cfg(test)]
 pub(crate) const GROUPS_READ: &[&str] = &[
     "Normal", "NormalFloat", "Pmenu", "StatusLine", "WinSeparator", "VertSplit", "Comment", "Visual",
@@ -59,7 +69,7 @@ pub(crate) const GROUPS_READ: &[&str] = &[
 ];
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ThemeTokens {
+pub struct ThemeTokens {
     pub bg: Rgb,
     pub fg: Rgb,
     pub surface: Rgb,
@@ -126,11 +136,11 @@ impl Groups<'_> {
 }
 
 impl ThemeTokens {
-    pub(crate) fn fallback() -> Self {
+    pub fn fallback() -> Self {
         Self::derive(&NvimThemePayload::empty())
     }
 
-    pub(crate) fn derive(payload: &NvimThemePayload) -> Self {
+    pub fn derive(payload: &NvimThemePayload) -> Self {
         let light = payload.options.background == "light";
         let (default_bg, default_fg) = if light { (DEFAULT_DARK_FG, DEFAULT_DARK_BG) } else { (DEFAULT_DARK_BG, DEFAULT_DARK_FG) };
         let normal = payload.groups.get("Normal");
@@ -189,7 +199,7 @@ impl ThemeTokens {
         }
     }
 
-    pub(crate) fn css_vars(&self) -> Vec<(String, String)> {
+    pub fn css_vars(&self) -> Vec<(String, String)> {
         let colours = [
             ("bg", self.bg),
             ("fg", self.fg),

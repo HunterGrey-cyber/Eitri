@@ -284,7 +284,7 @@ pub struct AgentSessionProjection {
     /// steady state on the `ClaudeSidecarProvider` path, whose wire carries no usage at all. A
     /// consumer must render `None` as unknown; rendering it as zero re-tells the exact lie this
     /// field was made an `Option` to stop. No consumer reads it yet
-    /// (`shell/src/agent_bridge.rs::serialize_snapshot_for_js` does not emit it), so the first one
+    /// (`core/src/agent_bridge.rs::serialize_snapshot_for_js` does not emit it), so the first one
     /// to do so inherits that obligation.
     pub usage: Option<UsageInfo>,
     /// True while the last thing folded was assistant text, so the next chunk CONTINUES the same
@@ -330,7 +330,7 @@ impl AgentSessionProjection {
     /// `every_seq_is_strictly_below_the_revision_a_snapshot_would_report`. (1) needs a test more
     /// than (2) does, because breaking it fails quietly -- a future arm pushing two items would
     /// give both the same number, and every consumer that sorts on `seq` (`buildTimeline`, and the
-    /// snapshot merge in `shell/src/agent_bridge.rs`'s own tests) would then tie them in whatever
+    /// snapshot merge in `core/src/agent_bridge.rs`'s own tests) would then tie them in whatever
     /// order the arrays happened to be in, which is a mis-ordered pair rather than a failure.
     pub fn apply(&mut self, event: &AgentDomainEvent) {
         let seq = self.last_revision;

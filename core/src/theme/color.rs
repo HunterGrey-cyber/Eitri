@@ -3,7 +3,7 @@
 /// One opaque sRGB colour. `nvim_get_hl` reports colours as a 24-bit integer, which is what
 /// [`Rgb::from_u32`] takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Rgb {
+pub struct Rgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
@@ -18,7 +18,9 @@ impl Rgb {
         Rgb { r: ((value >> 16) & 0xff) as u8, g: ((value >> 8) & 0xff) as u8, b: (value & 0xff) as u8 }
     }
 
-    pub(crate) fn hex(self) -> String {
+    /// `pub`, not `pub(crate)`: `shell/src/theme/gtk_css.rs` and `agent_panel.rs` call this
+    /// directly on `ThemeTokens`' public `Rgb` fields.
+    pub fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
     }
 
@@ -40,7 +42,9 @@ impl Rgb {
     }
 
     /// WCAG 2.x contrast ratio, from 1.0 to 21.0, symmetric in its arguments.
-    pub(crate) fn contrast(self, other: Rgb) -> f64 {
+    ///
+    /// `pub`, not `pub(crate)`: `shell/src/theme/gtk_css.rs`'s own tests call this directly.
+    pub fn contrast(self, other: Rgb) -> f64 {
         let (a, b) = (self.relative_luminance(), other.relative_luminance());
         let (hi, lo) = if a > b { (a, b) } else { (b, a) };
         (hi + 0.05) / (lo + 0.05)

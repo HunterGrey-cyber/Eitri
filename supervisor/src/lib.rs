@@ -42,10 +42,14 @@ pub fn socket_path() -> PathBuf {
     }
     // Fallback: `std::env::temp_dir()` is world-writable (unlike `$XDG_RUNTIME_DIR`'s 0700
     // permissions), so on a multi-user machine another local user could squat this path before
-    // this process does, or connect to it once bound. Not worth hardening — this fallback is
-    // essentially unreachable in practice (`$XDG_RUNTIME_DIR` is always set under systemd, which
-    // this project already assumes elsewhere) — but worth a comment so a future reader doesn't
-    // assume the fallback carries the same isolation guarantee as the primary path.
+    // this process does, or connect to it once bound. Not worth hardening on Linux — this
+    // fallback is essentially unreachable there in practice (`$XDG_RUNTIME_DIR` is always set
+    // under systemd, which this project already assumes elsewhere) — but worth a comment so a
+    // future reader doesn't assume the fallback carries the same isolation guarantee as the
+    // primary path. **On macOS this is not the unreachable branch, it is the only one taken**:
+    // `XDG_RUNTIME_DIR` is never set there (it is a systemd/Linux convention with no macOS
+    // equivalent), so `neovibe-supervisor` always resolves through here on the Mac -- worth
+    // knowing before assuming the lib's behaviour is Linux-tested and macOS-theoretical.
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     std::env::temp_dir().join(format!("neovibe-supervisor-{user}.sock"))
 }

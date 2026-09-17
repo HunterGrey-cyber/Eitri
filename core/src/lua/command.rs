@@ -10,40 +10,49 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-pub(crate) struct CommandEntry {
+/// `pub`: `shell/src/main.rs` reads `keybinding` off every entry `iter()` yields, and
+/// `LuaEngine::invoke_command` (`shell/src/lua/mod.rs`) reads `action`. `title` is read by
+/// neither yet (`#[allow(dead_code)]` below is original, not new) and stays `pub(crate)`.
+pub struct CommandEntry {
     #[allow(dead_code)] // read by a future command-palette UI; not consumed by this plan
     pub(crate) title: String,
-    pub(crate) keybinding: Option<String>,
+    pub keybinding: Option<String>,
     // `Rc<RegistryKey>`, not a bare `RegistryKey`: `RegistryKey` doesn't implement `Clone`
     // (verified against the installed mlua 0.12.1's `src/types/registry_key.rs`), and
     // `LuaEngine::invoke_command` needs to clone the handle *out* of a borrowed
     // `CommandRegistry` before dropping that borrow, to avoid a reentrant `BorrowMutError` if
     // the action itself calls `neovibe.command.register(...)`.
-    pub(crate) action: Rc<RegistryKey>,
+    pub action: Rc<RegistryKey>,
 }
 
+/// `pub`: `shell/src/lua/mod.rs` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
 #[derive(Default)]
-pub(crate) struct CommandRegistry {
+pub struct CommandRegistry {
     commands: HashMap<String, CommandEntry>,
 }
 
 impl CommandRegistry {
+    /// `pub(crate)`: only `install`'s own closure below calls this; nothing in `shell` registers
+    /// a command directly.
     pub(crate) fn register(&mut self, id: String, entry: CommandEntry) {
         if self.commands.insert(id.clone(), entry).is_some() {
             eprintln!("[lua] command '{id}' re-registered -- replaced");
         }
     }
 
-    pub(crate) fn get(&self, id: &str) -> Option<&CommandEntry> {
+    /// `pub`: `LuaEngine::invoke_command` calls this.
+    pub fn get(&self, id: &str) -> Option<&CommandEntry> {
         self.commands.get(id)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &CommandEntry)> {
+    /// `pub`: `main.rs` iterates every registered command to wire a real GTK action for it.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &CommandEntry)> {
         self.commands.iter()
     }
 }
 
-pub(crate) fn install(
+/// `pub`: `LuaEngine::new` calls this.
+pub fn install(
     lua: &Lua,
     neovibe: &Table,
     registry: Rc<RefCell<CommandRegistry>>,

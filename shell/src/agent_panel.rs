@@ -6,7 +6,7 @@
 //! Backend construction is lazy: this module starts with `None` and only builds one once the
 //! frontend sends `"start_session"` -- `PermissionMode` is a construction-time-only choice on the
 //! real `agent` API (no live mode-switch exists), so the frontend must choose before any real
-//! subprocess is spawned. Which backend gets built is `crate::agent_backend`'s decision.
+//! subprocess is spawned. Which backend gets built is `neovibe_core::agent_backend`'s decision.
 //!
 //! **State is server-originated.** For the sidecar backend this module folds nothing of its own:
 //! `active_turn_id`, tool calls and permissions all arrive as real events through `pump()`. A
@@ -15,9 +15,9 @@
 //! panel's idea of "a turn is running" ahead of the server's, which is the exact shadow state the
 //! runtime design forbids.
 
-use crate::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
+use neovibe_core::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
 use agent::UiDelivery;
-use crate::agent_bridge::{
+use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
     serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
 };
@@ -87,12 +87,12 @@ struct AgentPanelState {
     last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
     /// The in-flight turn's latency marks, when `NEOVIBE_AGENT_TRACE=1`. `None` the rest of the
     /// time, which is every normal run -- this is a diagnostic, not a metrics pipeline.
-    turn_trace: Option<crate::turn_trace::TurnTrace>,
+    turn_trace: Option<neovibe_core::turn_trace::TurnTrace>,
     /// The panel's current theme. Starts on `ThemeTokens::fallback()` and is replaced by
     /// `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
     /// own background colour.
-    theme: crate::theme::ThemeTokens,
+    theme: neovibe_core::theme::ThemeTokens,
 }
 
 /// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
@@ -101,7 +101,7 @@ struct AgentPanelState {
 /// on a worker thread and the result is collected by a poll on the main loop.
 struct PendingStart {
     request_id: String,
-    result_rx: mpsc::Receiver<Result<AgentBackend, crate::agent_backend::BackendError>>,
+    result_rx: mpsc::Receiver<Result<AgentBackend, neovibe_core::agent_backend::BackendError>>,
 }
 
 /// A handoff whose session close is still running on a worker thread.
@@ -250,8 +250,8 @@ impl AgentPanelHandle {
     ///
     /// Safe to call before the page has loaded: the dispatch is guarded, and the `ready` handshake
     /// sends the recorded envelope anyway, so neither ordering loses it.
-    pub(crate) fn set_theme(&self, tokens: &crate::theme::ThemeTokens) {
-        let payload = crate::agent_bridge::serialize_theme_for_js(tokens);
+    pub(crate) fn set_theme(&self, tokens: &neovibe_core::theme::ThemeTokens) {
+        let payload = neovibe_core::agent_bridge::serialize_theme_for_js(tokens);
         self.state.borrow_mut().theme = tokens.clone();
         paint_webview_background(&self.webview, tokens);
         let script = format!(
@@ -341,7 +341,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         last_handoff: None,
         reported_start_failure: false,
         turn_trace: None,
-        theme: crate::theme::ThemeTokens::fallback(),
+        theme: neovibe_core::theme::ThemeTokens::fallback(),
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -523,7 +523,7 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
                 state_ref.pending_start = None;
                 Some((
                     request_id,
-                    Err(crate::agent_backend::BackendError {
+                    Err(neovibe_core::agent_backend::BackendError {
                         message: "the backend connect worker stopped without reporting a result".to_string(),
                         benign: false,
                     }),
@@ -632,7 +632,7 @@ fn handoff_payloads(
     match outcome {
         HandoffCloseOutcome::StillClosing => Vec::new(),
         HandoffCloseOutcome::Closed => vec![
-            crate::agent_bridge::serialize_handoff_for_js(command),
+            neovibe_core::agent_bridge::serialize_handoff_for_js(command),
             serialize_command_result_for_js(request_id, Ok(())),
         ],
         // The session is gone regardless -- it was handed to the worker before this. Saying so is
@@ -689,7 +689,7 @@ fn ready_payloads(
         // after a reload, which is the case this whole path exists for.
         None => {
             if let Some(command) = last_handoff {
-                payloads.push(crate::agent_bridge::serialize_handoff_for_js(command));
+                payloads.push(neovibe_core::agent_bridge::serialize_handoff_for_js(command));
             }
         }
     }
@@ -706,7 +706,7 @@ fn apply_command_outcome(
     state: &Rc<RefCell<AgentPanelState>>,
     webview: &WebView,
     request_id: &str,
-    outcome: Result<Vec<agent::AgentDomainEvent>, crate::agent_backend::BackendError>,
+    outcome: Result<Vec<agent::AgentDomainEvent>, neovibe_core::agent_backend::BackendError>,
 ) {
     match outcome {
         Ok(events) => {
@@ -768,7 +768,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 let state_ref = state.borrow();
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
                 let snapshot = state_ref.session.as_ref().map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
-                let theme = crate::agent_bridge::serialize_theme_for_js(&state_ref.theme);
+                let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
                 ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref(), Some(&theme))
             };
             for payload in payloads {
@@ -826,7 +826,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 let mut state_ref = state.borrow_mut();
                 // Stamped before the call, so the trace's zero is the user's action rather than the
                 // moment the backend got around to accepting it.
-                state_ref.turn_trace = crate::turn_trace::TurnTrace::start();
+                state_ref.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
                 match state_ref.session.as_mut() {
                     Some(session) => session.send_turn(&text),
                     None => Err(no_session_error()),
@@ -959,8 +959,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
 
 /// A command arriving with no session. Benign: the frontend's start screen is showing, or the
 /// session just ended -- either way the panel is healthy and there is nothing to tear down.
-fn no_session_error() -> crate::agent_backend::BackendError {
-    crate::agent_backend::BackendError { message: "no active session".to_string(), benign: true }
+fn no_session_error() -> neovibe_core::agent_backend::BackendError {
+    neovibe_core::agent_backend::BackendError { message: "no active session".to_string(), benign: true }
 }
 
 /// The panel document with `vars` already inlined, so the first frame WebKit paints -- on a cold
@@ -988,7 +988,7 @@ fn themed_document(vars: &[(String, String)]) -> String {
 
 /// The WebView's own background, which shows before the web process has painted anything. WebKit
 /// defaults it to opaque white.
-fn paint_webview_background(webview: &WebView, tokens: &crate::theme::ThemeTokens) {
+fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::ThemeTokens) {
     let bg = tokens.bg;
     webview.set_background_color(&gtk4::gdk::RGBA::new(
         f32::from(bg.r) / 255.0,
@@ -1083,7 +1083,7 @@ mod tests {
     /// is parsed before the script that renders anything, and nothing else in the document moves.
     #[test]
     fn the_panel_document_carries_its_theme_before_its_script() {
-        let tokens = crate::theme::ThemeTokens::fallback();
+        let tokens = neovibe_core::theme::ThemeTokens::fallback();
         let html = themed_document(&tokens.css_vars());
         let style_at = html.find("<style id=\"nv-theme\">").expect("the theme block is inserted");
         let script_at = html.find("<script").expect("the single-file build inlines its script");
@@ -1140,7 +1140,7 @@ mod tests {
     /// A reloaded document must get its colours back before anything it would draw with them.
     #[test]
     fn the_theme_follows_the_greeting_and_precedes_everything_else() {
-        let theme = crate::agent_bridge::serialize_theme_for_js(&crate::theme::ThemeTokens::fallback());
+        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
         assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme))), vec!["hello", "theme"]);
         let payloads = ready_payloads(
             legacy_greeting(),
@@ -1179,7 +1179,7 @@ mod tests {
         let greeting = BackendGreeting {
             kind: BackendKind::Sidecar,
             project_dir: PathBuf::from("/home/user/project"),
-            permission_modes: crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
+            permission_modes: neovibe_core::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
             expected_verdandi_revision: None,
             resumable: vec![
                 agent::ResumableSession {

@@ -17,8 +17,16 @@
 //! "alive" for a zombie and for another user's process. Elsewhere the two measurements return
 //! `None`, which callers report as missing rather than as zero.
 //!
-//! `#[doc(hidden)] pub` because `agent/tests/` uses it; nothing in the product calls it except
-//! `state_dirs::prune_dead_roots`, which is itself test support.
+//! `resident_kib` and `thread_count` are `#[doc(hidden)] pub`: `agent/tests/` and `agent/src/
+//! process.rs`'s own tests use them, and `state_dirs::prune_dead_roots` uses them too, but that one
+//! is itself test support -- nothing else calls either, so hidden-from-docs is an honest signal.
+//!
+//! `pid_is_alive` is deliberately NOT `#[doc(hidden)]` (removed 2026-09-17, L2 T3 follow-up): since
+//! T3, `neovibe-core`'s `instance_dir::sweep_stale_instance_dirs` -- real product code, not test
+//! support -- reads its `false` as permission to delete a directory. See its own doc for the
+//! contract that puts on it; a safety-critical contract a product path depends on belongs where its
+//! callers will actually look for it, not hidden from the docs alongside two functions that really
+//! are test-only.
 
 /// Whether `pid` names a process that exists (running or zombie), by `kill(pid, 0)`.
 ///
@@ -26,7 +34,19 @@
 /// `pid_t`, `0` means this process's own group and `u32::MAX` wraps to `-1`, "every process this
 /// user may signal", and `kill` succeeds for both. `EPERM` means the process exists but belongs to
 /// someone else, so it counts as alive; `ESRCH` means it does not exist.
-#[doc(hidden)]
+///
+/// **Load-bearing contract: `false` must only ever mean ESRCH, never "could not determine".**
+/// `neovibe-core`'s `instance_dir::sweep_stale_instance_dirs` reads a `false` from this function as
+/// permission to `remove_dir_all` a directory -- so a `false` that actually means "unknown" would
+/// delete a live instance's state. The consequence follows directly: a platform this crate cannot
+/// answer the question on must fail to COMPILE, not silently return `false`. `libc::kill` below is
+/// called unconditionally, with no `#[cfg(target_os = ...)]` guard, so a non-unix target simply
+/// fails to build here -- that is the correct outcome, not an oversight to fix. In particular, do
+/// not "fix" a future non-unix build failure by giving this the same shape `resident_kib` and
+/// `thread_count` use just below (`#[cfg(not(any(target_os = "linux", target_os = "macos")))]` ->
+/// a fallback value): those two have an honest "unknown" in `Option::None`, but `bool` has none --
+/// a `false` stub would make every instance directory on that platform silently sweepable
+/// regardless of whether the process it names is actually alive.
 pub fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;

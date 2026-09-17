@@ -2,7 +2,7 @@
 
 use gtk4::CssProvider;
 
-use super::tokens::{ThemeTokens, PROSE_FONT_STACK};
+use neovibe_core::theme::tokens::{ThemeTokens, PROSE_FONT_STACK};
 
 /// Overrides GTK/Adwaita on every class the shell draws, so none of the default theme leaks
 /// through. Class names are unchanged from the placeholder palette this replaced; restyling the
@@ -149,7 +149,7 @@ impl ThemeCss {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::payload::{HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
+    use neovibe_core::theme::payload::{HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
 
     fn dawn() -> ThemeTokens {
         ThemeTokens::derive(&NvimThemePayload {

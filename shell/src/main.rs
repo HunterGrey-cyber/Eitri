@@ -3,18 +3,13 @@
 //! WebView-hosted frontend bridged to a lazily-started `agent::AgentSession`). See
 //! docs/superpowers/specs/2026-09-06-shell-scaffolding-design.md.
 
-mod agent_backend;
-mod agent_bridge;
 mod agent_panel;
 mod chrome;
-mod instance_dir;
 mod layout;
 mod pane_switch;
-mod project_root;
 mod supervisor_client;
 mod terminal_handoff;
 mod theme;
-mod turn_trace;
 mod lua;
 
 use std::path::{Path, PathBuf};
@@ -52,11 +47,13 @@ fn main() -> glib::ExitCode {
     //
     // `args_os`, not `args`, throughout this function: `std::env::args()` panics on an argument
     // that is not valid UTF-8, and `shell <dir>` makes a path a supported argument -- see
-    // `project_root`'s own module doc. A flag match is a byte-for-byte comparison either way.
+    // `neovibe_core::project_root`'s own module doc. A flag match is a byte-for-byte comparison
+    // either way.
     //
-    // Every flag matched here must also appear in `project_root::KNOWN_FLAGS`, which is the only
-    // place that can tell a flag from a project directory; one missing from that list makes
-    // passing it a hard startup failure rather than a silently wrong project root.
+    // Every flag matched here must also appear in `neovibe_core::project_root`'s own (private)
+    // `KNOWN_FLAGS` list, which is the only place that can tell a flag from a project directory;
+    // one missing from that list makes passing it a hard startup failure rather than a silently
+    // wrong project root.
     let want_clean = std::env::args_os().any(|arg| arg == "--clean");
     // `--terminal` adds the native terminal pane along the bottom. Opt-in because it cannot do
     // anything yet -- Verdandi owns the PTY and `Term` and has not shipped them -- so the default
@@ -65,9 +62,9 @@ fn main() -> glib::ExitCode {
     let want_terminal = std::env::args_os().any(|arg| arg == "--terminal");
 
     // Resolved once, here, and then carried as a value into every pane that needs it -- see
-    // `project_root`'s own module doc for why three separate `current_dir()` reads were one
-    // process-global too many.
-    let project_root = match project_root::resolve() {
+    // `neovibe_core::project_root`'s own module doc for why three separate `current_dir()` reads
+    // were one process-global too many.
+    let project_root = match neovibe_core::project_root::resolve() {
         Ok(root) => root,
         Err(message) => {
             eprintln!("neovibe: {message}");
@@ -110,7 +107,7 @@ fn build_application() -> Application {
 
 fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_root: &Path) {
     // Painted with the built-in fallback until the embedded nvim sends its first snapshot.
-    let theme_css = theme::gtk_css::ThemeCss::install(&theme::ThemeTokens::fallback());
+    let theme_css = theme::gtk_css::ThemeCss::install(&neovibe_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
     // nvim only at spawn. `None` (logged) leaves the window on the fallback colours.
     let mut theme_feed = theme::feed::ThemeFeed::new();
@@ -119,7 +116,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // constructor -- those variables reach nvim through `Command::env` at spawn time and cannot
     // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
     // own doc); the editor is constructed with an empty child env and behaves exactly as before.
-    let mut pane_switch = pane_switch::PaneSwitch::new();
+    let mut pane_switch = pane_switch::open();
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     let nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
@@ -224,12 +221,12 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // an inline block on purpose: `build_ui` is being edited by two other tracks of the same plan.
     agent_panel::install_reload_action(app, &agent_panel_handle);
     // The panel starts on the same fallback the chrome does, then both follow nvim together.
-    agent_panel_handle.set_theme(&theme::ThemeTokens::fallback());
+    agent_panel_handle.set_theme(&neovibe_core::theme::ThemeTokens::fallback());
     if let Some(feed) = theme_feed.as_mut() {
         let theme_css = theme_css.clone();
         let agent_panel_handle = agent_panel_handle.clone();
-        feed.listen(move |payload| {
-            let tokens = theme::ThemeTokens::derive(&payload);
+        theme::feed::listen(feed, move |payload| {
+            let tokens = neovibe_core::theme::ThemeTokens::derive(&payload);
             println!(
                 "[theme] following nvim colorscheme {:?} (background={})",
                 payload.options.colors_name, payload.options.background
@@ -256,7 +253,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     if let Some(ps) = pane_switch.as_mut() {
         let side_widget = side_widget.clone();
         let terminal_for_switch = terminal.clone();
-        ps.listen(move |direction| match direction {
+        pane_switch::listen(ps, move |direction| match direction {
             // Ctrl+j past Neovim's own bottom window boundary, when a terminal is down there.
             // Falls through to the no-op arm when there is none, which is what real tmux does at
             // the edge of its pane grid -- not an error, just nothing in that direction.

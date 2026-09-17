@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SessionModeChoice {
+pub enum SessionModeChoice {
     Auto,
     Bypass,
 }
@@ -29,7 +29,7 @@ impl From<SessionModeChoice> for PermissionMode {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum InboundMessage {
+pub enum InboundMessage {
     Ready { request_id: String },
     /// `resume` carries the Claude provider session id to continue. Absent for a fresh session.
     /// One message rather than two so there is exactly one path into backend construction -- a
@@ -76,7 +76,7 @@ pub(crate) enum InboundMessage {
 /// that is not clearly a denial must never end up running the tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DecisionChoice {
+pub enum DecisionChoice {
     Allow,
     Deny,
 }
@@ -85,7 +85,7 @@ impl DecisionChoice {
     /// Pairs the choice with its reason into the typed decision the backends take. An empty or
     /// whitespace-only reason becomes `None`: sending the model an empty string as its explanation
     /// is worse than sending it nothing.
-    pub(crate) fn into_decision(self, reason: Option<String>) -> agent::PermissionDecision {
+    pub fn into_decision(self, reason: Option<String>) -> agent::PermissionDecision {
         match self {
             DecisionChoice::Allow => agent::PermissionDecision::Allow,
             DecisionChoice::Deny => agent::PermissionDecision::Deny {
@@ -96,7 +96,7 @@ impl DecisionChoice {
 }
 
 impl InboundMessage {
-    pub(crate) fn request_id(&self) -> &str {
+    pub fn request_id(&self) -> &str {
         match self {
             InboundMessage::Ready { request_id }
             | InboundMessage::StartSession { request_id, .. }
@@ -115,7 +115,7 @@ impl InboundMessage {
 /// to reply to, so no `command_result` is possible for it -- this mirrors the pre-v2 behavior
 /// exactly (an unparseable message was already silently logged-and-dropped, not surfaced to the
 /// frontend).
-pub(crate) fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
+pub fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
     match serde_json::from_str(json_str) {
         Ok(msg) => Some(msg),
         Err(e) => {
@@ -127,7 +127,7 @@ pub(crate) fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
 
 /// `{"kind":"command_result","requestId":...,"ok":true}` or
 /// `{"kind":"command_result","requestId":...,"ok":false,"error":"..."}`.
-pub(crate) fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str>) -> String {
+pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str>) -> String {
     match result {
         Ok(()) => json!({ "kind": "command_result", "requestId": request_id, "ok": true }).to_string(),
         Err(error) => json!({ "kind": "command_result", "requestId": request_id, "ok": false, "error": error }).to_string(),
@@ -158,7 +158,7 @@ pub(crate) fn serialize_command_result_for_js(request_id: &str, result: Result<(
 /// timestamps. There is no title and no summary anywhere in this payload because there is none on
 /// disk -- see `agent::ResumableSession`'s own doc for why the one file that could supply one is
 /// deliberately not read. A frontend rendering this must not invent a label for a row.
-pub(crate) fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
+pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
     json!({
         "kind": "hello",
         "backend": greeting.kind.as_str(),
@@ -185,7 +185,7 @@ pub(crate) fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGre
 /// Sent in the `ready` batch right after `hello`, and again whenever nvim's colours change. Always
 /// complete, so the frontend's CSS never needs a fallback value of its own. Kept out of `hello`
 /// on purpose: `hello` describes the backend, and a theme change must not resend it.
-pub(crate) fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
+pub fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
     let vars: serde_json::Map<String, serde_json::Value> =
         tokens.css_vars().into_iter().map(|(name, value)| (name, serde_json::Value::String(value))).collect();
     json!({ "kind": "theme", "vars": vars }).to_string()
@@ -201,7 +201,7 @@ pub(crate) fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> Stri
 /// section, check 4) works by re-loading the panel's document from scratch and consuming a fresh
 /// `snapshot`, not by asking for events from a prior revision -- a real revisioned resync
 /// consumer, if one is ever built, is future work, not something already wired up here.
-pub(crate) fn serialize_events_for_js(from_revision: u64, through_revision: u64, events: &[AgentDomainEvent]) -> String {
+pub fn serialize_events_for_js(from_revision: u64, through_revision: u64, events: &[AgentDomainEvent]) -> String {
     json!({ "kind": "events", "fromRevision": from_revision, "throughRevision": through_revision, "events": events }).to_string()
 }
 
@@ -211,24 +211,24 @@ pub(crate) fn serialize_events_for_js(from_revision: u64, through_revision: u64,
 /// hand-built view without constructing a real `AgentBackend`, which would mean spawning a real
 /// sidecar process. `SnapshotView::of` is the one place the gathering happens, so the two can never
 /// disagree about where a field comes from.
-pub(crate) struct SnapshotView<'a> {
-    pub(crate) backend: &'static str,
-    pub(crate) conversation_id: Option<&'a str>,
+pub struct SnapshotView<'a> {
+    pub backend: &'static str,
+    pub conversation_id: Option<&'a str>,
     /// Verdandi's session id, from the backend rather than the projection -- the projection does not
     /// learn it until the first `SessionOpened`, which on the sidecar path is not until the first
     /// turn.
-    pub(crate) session_id: Option<&'a str>,
-    pub(crate) provider_session_id: Option<String>,
-    pub(crate) capabilities: agent::ProviderCapabilities,
-    pub(crate) provider: Option<&'a agent::ProviderInfo>,
+    pub session_id: Option<&'a str>,
+    pub provider_session_id: Option<String>,
+    pub capabilities: agent::ProviderCapabilities,
+    pub provider: Option<&'a agent::ProviderInfo>,
     /// Borrowed, not cloned. On the sidecar path this is a live borrow through the ingestion
     /// thread's lock, so a snapshot is serialized directly out of canonical state rather than from a
     /// copy of a whole conversation.
-    pub(crate) projection: crate::agent_backend::ProjectionRef<'a>,
+    pub projection: crate::agent_backend::ProjectionRef<'a>,
 }
 
 impl<'a> SnapshotView<'a> {
-    pub(crate) fn of(backend: &'a crate::agent_backend::AgentBackend) -> Self {
+    pub fn of(backend: &'a crate::agent_backend::AgentBackend) -> Self {
         Self {
             backend: backend.kind().as_str(),
             conversation_id: backend.conversation_id(),
@@ -252,7 +252,7 @@ impl<'a> SnapshotView<'a> {
 /// projection's `sessionId` is Verdandi's. Collapsing them would defeat the entire point of keeping
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
 /// answers with SESSION_NOT_FOUND.
-pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
+pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
     let projection = &*view.projection;
     // Written out rather than leaning on `TranscriptMessage`'s derive. Both field names happen to
     // be single lowercase words, so the derive would produce the same JSON today -- but this
@@ -368,7 +368,7 @@ pub(crate) fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
 /// no lease was taken; the frontend renders the concurrency warning design doc §8.3's closing
 /// paragraph requires of this path, and §8.5/§17.7 reject a stronger claim even where a lease IS
 /// held.
-pub(crate) fn serialize_handoff_for_js(command: &agent::handoff::ClaudeResumeCommand) -> String {
+pub fn serialize_handoff_for_js(command: &agent::handoff::ClaudeResumeCommand) -> String {
     json!({
         "kind": "handoff",
         "command": command.shell_command_line(),
@@ -385,7 +385,7 @@ pub(crate) fn serialize_handoff_for_js(command: &agent::handoff::ClaudeResumeCom
 /// otherwise detect (e.g. `AgentSession::start` failing because `claude` isn't on `PATH`).
 /// Distinct from `command_result`'s `ok:false` (which reports one command's own failure without
 /// ending the session) -- this envelope means the whole `AgentSession` is gone.
-pub(crate) fn serialize_error_for_js(message: &str) -> String {
+pub fn serialize_error_for_js(message: &str) -> String {
     json!({ "kind": "error", "message": message }).to_string()
 }
 

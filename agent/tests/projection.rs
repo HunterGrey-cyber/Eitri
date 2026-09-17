@@ -457,7 +457,7 @@ fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
 /// Its sibling -- every `seq` below `last_revision` -- has the test above. This one matters more,
 /// because breaking it fails QUIETLY: `seq` is read once per `apply` call, so an arm that pushed
 /// two items would hand both the same number, and every consumer that sorts on `seq`
-/// (`agent-ui`'s `buildTimeline`, and the snapshot merge in `shell/src/agent_bridge.rs`'s tests)
+/// (`agent-ui`'s `buildTimeline`, and the snapshot merge in `core/src/agent_bridge.rs`'s tests)
 /// would then tie them in whatever order the arrays happened to be in. A mis-ordered pair, not a
 /// failure -- the exact class of thing that survives one refactor and dies in the next.
 ///

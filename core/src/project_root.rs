@@ -74,7 +74,7 @@ impl RootSource {
 ///
 /// This function is nothing but the three reads of process state; [`resolve_from`] is the part
 /// with behaviour in it, and is what the tests drive.
-pub(crate) fn resolve() -> Result<PathBuf, String> {
+pub fn resolve() -> Result<PathBuf, String> {
     // argv[0] is this binary, never a project directory.
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     resolve_from(
