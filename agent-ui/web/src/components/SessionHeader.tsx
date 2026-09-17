@@ -30,7 +30,13 @@ export function SessionHeader({ state }: { state: AgentUiState }) {
       {/* Three identities where there really are three. The legacy backend's CLI never separated
           its own session id from Claude's, so `sessionId` and `providerSessionId` are the SAME
           value there -- printing both would invite a reader to conclude the two are distinct and
-          happen to match, which is the opposite of true. Collapse it, and say whose id it is. */}
+          happen to match, which is the opposite of true. Collapse it, and say whose id it is.
+
+          A session that has started but has not yet taken a turn has BOTH ids null -- `sessionId
+          === providerSessionId` is true there too (null === null), so that state must be checked
+          first, or it falls into the "they differ" branch and names a sidecar/claude split that
+          was never involved: on the default legacy backend the two ids are always one value, and
+          nothing here has split into two processes. Say plainly that neither is assigned yet. */}
       <span
         className="identities"
         title={[
@@ -40,7 +46,9 @@ export function SessionHeader({ state }: { state: AgentUiState }) {
         ].join("\n")}
       >
         {state.conversationId !== null && <>conv {shortId(state.conversationId)} · </>}
-        {state.sessionId !== null && state.sessionId === state.providerSessionId ? (
+        {state.sessionId === null && state.providerSessionId === null ? (
+          <>session not yet assigned</>
+        ) : state.sessionId !== null && state.sessionId === state.providerSessionId ? (
           <>session {shortId(state.sessionId)}</>
         ) : (
           <>

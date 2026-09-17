@@ -41,9 +41,16 @@ const LOG_EVERY_N_FRAMES: u64 = 60;
 /// How many `add_tick_callback` invocations between `[tick]` summary log lines (see `TickStats`).
 const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 
-/// Clears the full framebuffer before each `LiveHarness::render_frame` call, including the
-/// inset border around the content from `gl_interop::CONTENT_MARGIN`.
-/// The near-black color blends with dark UI chrome without depending on the host's exact theme.
+/// Defensive clear colour for the whole framebuffer before `LiveHarness::render_frame`.
+///
+/// With `CONTENT_MARGIN` at 0, `compute_content_region` covers the whole framebuffer and every
+/// render state paints over this clear. `Ready` clips `Renderer::draw_frame` to `content_region`
+/// and clears it to nvim's `Normal` background with an `SkBlendMode::kSrc` fill. The other states
+/// use the opaque `STARTING_COLOR` or `FAILED_COLOR`.
+///
+/// The sub-cell remainder at the right and bottom lies inside `content_region` and is also
+/// painted by the renderer. This near-black colour becomes visible if a non-zero margin leaves
+/// pixels outside the content region. There is no host override in this version.
 const OUTSIDE_COLOR: Color4f = Color4f::new(0.102, 0.106, 0.122, 1.0);
 /// Painted across the whole `content_region` while `LiveHarness` is being constructed (the one
 /// real, observed blocking call in this crate) -- distinct from both `OUTSIDE_COLOR` and anything
@@ -454,9 +461,13 @@ impl NeovideEditorPane {
                 let content_region = compute_content_region(fb_w, fb_h);
                 let canvas = surface.canvas();
 
-                // Paint the entire framebuffer the neutral margin color first, then hand only the
-                // inset `content_region` to whatever's actually drawing this frame -- see
-                // `OUTSIDE_COLOR`'s own doc for why this is neutral now rather than a debug work.
+                // Cheap defensive clear, predating this work. Paint the entire framebuffer
+                // `OUTSIDE_COLOR` first, then hand only `content_region` to whatever's actually
+                // drawing this frame. At CONTENT_MARGIN 0 those two are the same rect and *every*
+                // arm below repaints all of it -- the renderer clip-clears `content_region` to
+                // nvim's own background, the placeholder arms fill it opaquely -- so nothing this
+                // clear writes survives the frame today; see `OUTSIDE_COLOR`'s own doc for the
+                // positive-control evidence.
                 canvas.clear(OUTSIDE_COLOR);
 
                 let mut live = live_state.borrow_mut();
@@ -625,10 +636,13 @@ impl NeovideEditorPane {
                         // its final size without ever emitting a *further* `resize` signal after
                         // the Ready-time snapshot the constructor already takes -- leaving nvim's
                         // grid permanently sized for a stale, smaller content_region than the
-                        // widget's real one, visible as leftover `OUTSIDE_COLOR` past the grid's
-                        // real edge. Re-deriving the grid size from the widget's *current* actual
-                        // size on every tick (cheap: a handful of integer ops, no allocation) and
-                        // only calling `resize_grid` -- which is what actually costs anything --
+                        // widget's real one, visible as an undrawn band past the grid's real edge.
+                        // (This comment said "leftover `OUTSIDE_COLOR`" until 2026-09-16; that was
+                        // never right -- `draw_frame` clip-clears the *current* content_region to
+                        // nvim's own background, so the band is that background, not the host's
+                        // clear colour.) Re-deriving the grid size from the widget's *current*
+                        // actual size on every tick (cheap: a handful of integer ops, no
+                        // allocation) and only calling `resize_grid` -- which actually costs --
                         // when it disagrees with `last_grid_size` makes this self-correcting
                         // regardless of which exact GTK/Wayland/compositor timing produced the
                         // staleness, instead of chasing that one root cause.

@@ -238,7 +238,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         });
     }
 
-    root.append(&chrome::build_top_bar(&window));
+    root.append(&chrome::build_top_bar(&window, project_root));
     root.append(&content_widget);
     root.append(&chrome::build_status_bar());
 
