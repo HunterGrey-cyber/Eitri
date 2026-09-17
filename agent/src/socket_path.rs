@@ -9,9 +9,11 @@
 //! bind or spawn. It keeps the requested directory: falling back to world-writable `/tmp`
 //! would change the security properties of the user's private temporary directory.
 //!
-//! Test code, including `agent/tests/`, also binds through [`in_dir`], which is public and
-//! `#[doc(hidden)]` for that use. `tests::every_sock_path_in_this_crate_is_built_here` scans
-//! this crate's sources so new socket construction sites cannot skip the length check.
+//! [`in_dir`] is public and documented because production code in `pane_switch` and
+//! `theme::feed` also builds socket paths through it. Test code, including `agent/tests/`,
+//! uses it too. `tests::every_sock_path_in_this_crate_is_built_here` scans this crate's sources;
+//! `core/src/socket_path_guard.rs` scans the core crate's sources. Keep the two independent
+//! scanners in step so new construction sites cannot skip the length check.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,7 +22,6 @@ use std::path::{Path, PathBuf};
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// `dir/file_name`, or `InvalidInput` if that is longer than [`MAX_SOCKET_PATH_BYTES`].
-#[doc(hidden)]
 pub fn in_dir(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     let path = dir.join(file_name);
     let len = path.as_os_str().len();
@@ -131,6 +132,10 @@ mod tests {
     /// line, or on the list below, and
     /// every entry on the list says why that path is never bound. A new socket path built anywhere
     /// else fails here, on Linux, before it fails `bind` on a Mac.
+    ///
+    /// Scoped to this crate only. `neovibe-core/src/socket_path_guard.rs` is the same scan over
+    /// that crate's sources instead -- a separate scanner, not a shared one, so keep both in step
+    /// by hand when either crate's set of socket-building files changes.
     #[test]
     fn every_sock_path_in_this_crate_is_built_here() {
         // (file, a substring of the line) -- each one a path that is never passed to bind/connect.

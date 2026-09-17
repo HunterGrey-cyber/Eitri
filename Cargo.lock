@@ -2540,6 +2540,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "neovibe-core"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "mlua",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "neovide"
 version = "0.16.2"
 dependencies = [
@@ -3991,9 +4002,9 @@ dependencies = [
  "agent",
  "gtk4",
  "mlua",
+ "neovibe-core",
  "neovide-editor",
  "semantic-pane",
- "serde",
  "serde_json",
  "supervisor",
  "terminal-input",

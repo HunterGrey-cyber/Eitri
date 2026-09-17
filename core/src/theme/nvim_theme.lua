@@ -2,7 +2,7 @@
 -- installs autocommands; it changes no setting. It snapshots the highlight groups `shell` derives
 -- its colours from and writes one JSON line to NEOVIBE_THEME_SOCKET.
 --
--- The group list must cover `GROUPS_READ` in shell/src/theme/tokens.rs; a Rust test checks it.
+-- The group list must cover `GROUPS_READ` in core/src/theme/tokens.rs; a Rust test checks it.
 
 local socket = vim.env.NEOVIBE_THEME_SOCKET
 if not socket or socket == "" then

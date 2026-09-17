@@ -1,5 +1,5 @@
 /** CSS custom properties Rust derived from the embedded nvim's highlight groups
- *  (`shell/src/theme/tokens.rs`). The set is always complete, so nothing here supplies defaults. */
+ *  (`core/src/theme/tokens.rs`). The set is always complete, so nothing here supplies defaults. */
 export type ThemeVars = Record<string, string>;
 
 /** Anything with `setProperty` -- `document.documentElement.style` in the app, a recorder in tests. */

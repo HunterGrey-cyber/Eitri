@@ -56,7 +56,7 @@ const _: () = {
 ///
 /// The sidecar's lives behind the ingestion thread's lock and the legacy backend's is a plain field.
 /// Both deref to the same type, so call sites read `backend.projection().status` either way.
-pub(crate) enum ProjectionRef<'a> {
+pub enum ProjectionRef<'a> {
     Borrowed(&'a AgentSessionProjection),
     Guarded(ProjectionGuard<'a>),
 }
@@ -72,13 +72,13 @@ impl std::ops::Deref for ProjectionRef<'_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackendKind {
+pub enum BackendKind {
     Legacy,
     Sidecar,
 }
 
 impl BackendKind {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             BackendKind::Legacy => "legacy",
             BackendKind::Sidecar => "sidecar",
@@ -88,7 +88,7 @@ impl BackendKind {
     /// Reads `NEOVIBE_AGENT_BACKEND`. Anything unrecognized falls back to `legacy` with a warning
     /// rather than failing to start: a typo must not cost the user their editor, and silently
     /// picking the NEW backend on a typo would be the dangerous direction.
-    pub(crate) fn from_env() -> Self {
+    pub fn from_env() -> Self {
         match std::env::var("NEOVIBE_AGENT_BACKEND").as_deref().map(str::trim) {
             Ok("sidecar") => BackendKind::Sidecar,
             Ok("legacy") | Err(_) => BackendKind::Legacy,
@@ -109,9 +109,9 @@ impl BackendKind {
 /// still healthy -- report it and carry on. Anything else means the session is gone and the panel
 /// must tear it down. Getting this wrong in the benign direction strands a dead session in the UI;
 /// getting it wrong the other way throws away a working conversation over a double-click.
-pub(crate) struct BackendError {
-    pub(crate) message: String,
-    pub(crate) benign: bool,
+pub struct BackendError {
+    pub message: String,
+    pub benign: bool,
 }
 
 impl BackendError {
@@ -144,7 +144,7 @@ impl From<std::io::Error> for BackendError {
 /// this milestone is trying to retire, for a struct that exists at most once per window. Left as is
 /// deliberately.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum AgentBackend {
+pub enum AgentBackend {
     Legacy(AgentSession),
     Sidecar(Box<AgentConversation>),
 }
@@ -159,7 +159,7 @@ impl AgentBackend {
     /// session anywhere on this path -- the whole Phase 4 validation exists to catch exactly that
     /// silent substitution, and doing it in the host would reintroduce one layer above where the
     /// protocol was fixed.
-    pub(crate) fn start(
+    pub fn start(
         kind: BackendKind,
         project_dir: &Path,
         mode: PermissionMode,
@@ -200,7 +200,7 @@ impl AgentBackend {
         }
     }
 
-    pub(crate) fn kind(&self) -> BackendKind {
+    pub fn kind(&self) -> BackendKind {
         match self {
             AgentBackend::Legacy(_) => BackendKind::Legacy,
             AgentBackend::Sidecar(_) => BackendKind::Sidecar,
@@ -214,7 +214,7 @@ impl AgentBackend {
     /// never worked at all, and presenting it as a conversation (empty, marked closed, no
     /// explanation) is indistinguishable to a user from "the agent has nothing to say". The
     /// commonest cause is a resume of a provider session that no longer exists.
-    pub(crate) fn terminated_before_opening(&self) -> Option<String> {
+    pub fn terminated_before_opening(&self) -> Option<String> {
         let projection = self.projection();
         if projection.model.is_some() {
             return None;
@@ -233,7 +233,7 @@ impl AgentBackend {
     /// sidecar path's projection can hold a whole conversation. The sidecar's arrives through the
     /// ingestion thread's lock, the legacy backend's is a plain field -- `ProjectionRef` is what lets
     /// one call site cover both without either paying for the other's shape.
-    pub(crate) fn projection(&self) -> ProjectionRef<'_> {
+    pub fn projection(&self) -> ProjectionRef<'_> {
         match self {
             AgentBackend::Legacy(session) => ProjectionRef::Borrowed(&session.projection),
             AgentBackend::Sidecar(conversation) => ProjectionRef::Guarded(conversation.projection()),
@@ -242,7 +242,7 @@ impl AgentBackend {
 
     /// Neovibe's own conversation identity. `None` for the legacy backend, which has no concept of
     /// one -- it never distinguished its three identities in the first place.
-    pub(crate) fn conversation_id(&self) -> Option<&str> {
+    pub fn conversation_id(&self) -> Option<&str> {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Sidecar(conversation) => Some(conversation.conversation_id()),
@@ -256,7 +256,7 @@ impl AgentBackend {
     /// turn). Reading the projection alone therefore showed an empty session id for the entire
     /// window between "session created" and "first turn sent" -- visible in the panel header as a
     /// dash where the real id already existed.
-    pub(crate) fn session_id(&self) -> Option<&str> {
+    pub fn session_id(&self) -> Option<&str> {
         match self {
             AgentBackend::Legacy(session) => session.projection.session_id.as_deref(),
             AgentBackend::Sidecar(conversation) => conversation.session_id(),
@@ -266,14 +266,14 @@ impl AgentBackend {
     /// The Claude session UUID, once the provider has reported it. Distinct from the projection's
     /// `session_id` (Verdandi's) for the sidecar backend; identical for the legacy one, whose CLI
     /// never separated them.
-    pub(crate) fn provider_session_id(&self) -> Option<String> {
+    pub fn provider_session_id(&self) -> Option<String> {
         match self {
             AgentBackend::Legacy(session) => session.projection.provider_session_id.clone(),
             AgentBackend::Sidecar(conversation) => conversation.provider_session_id(),
         }
     }
 
-    pub(crate) fn provider_info(&self) -> Option<&ProviderInfo> {
+    pub fn provider_info(&self) -> Option<&ProviderInfo> {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Sidecar(conversation) => Some(conversation.provider_info()),
@@ -287,7 +287,7 @@ impl AgentBackend {
     /// The legacy backend advertises nothing over a wire, so its capabilities are stated from what
     /// its code demonstrably does: it interrupts, it has no resume and no fork, and it supports a
     /// real bypass mode.
-    pub(crate) fn capabilities(&self) -> ProviderCapabilities {
+    pub fn capabilities(&self) -> ProviderCapabilities {
         match self {
             AgentBackend::Legacy(_) => LEGACY_CAPABILITIES,
             AgentBackend::Sidecar(conversation) => conversation.capabilities(),
@@ -299,7 +299,7 @@ impl AgentBackend {
     /// (its wire protocol has no such line to translate), while the sidecar backend returns nothing
     /// because Verdandi emits a real one on the event stream. The panel must not invent an event
     /// for the sidecar path to "even that out" -- server-originated state is the authority.
-    pub(crate) fn send_turn(&mut self, text: &str) -> Result<Vec<AgentDomainEvent>, BackendError> {
+    pub fn send_turn(&mut self, text: &str) -> Result<Vec<AgentDomainEvent>, BackendError> {
         match self {
             AgentBackend::Legacy(session) => Ok(session.send_turn(text)?),
             AgentBackend::Sidecar(conversation) => {
@@ -309,7 +309,7 @@ impl AgentBackend {
         }
     }
 
-    pub(crate) fn interrupt(&mut self) -> Result<Vec<AgentDomainEvent>, BackendError> {
+    pub fn interrupt(&mut self) -> Result<Vec<AgentDomainEvent>, BackendError> {
         match self {
             AgentBackend::Legacy(session) => Ok(session.interrupt()?),
             AgentBackend::Sidecar(conversation) => {
@@ -325,7 +325,7 @@ impl AgentBackend {
     /// has no provider event for a resolution and hands back the one it folded itself, while the
     /// sidecar returns nothing because its `PermissionResolved` arrives through `pump()` like every
     /// other provider event. Nothing here invents one on the sidecar's behalf.
-    pub(crate) fn respond_permission(
+    pub fn respond_permission(
         &mut self,
         permission_id: &str,
         decision: PermissionDecision,
@@ -347,7 +347,7 @@ impl AgentBackend {
     /// this only collects what is already canonical, which is why a stalled UI there can no longer
     /// make raw events pile up. Legacy is left as it was deliberately: it is the path being retired,
     /// it has no partial streaming, and one message per turn is not a backlog.
-    pub(crate) fn take_ui_delivery(&mut self) -> UiDelivery {
+    pub fn take_ui_delivery(&mut self) -> UiDelivery {
         match self {
             AgentBackend::Legacy(session) => {
                 let events = session.pump();
@@ -361,7 +361,7 @@ impl AgentBackend {
         }
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) {
         match self {
             AgentBackend::Legacy(session) => session.shutdown(),
             AgentBackend::Sidecar(conversation) => conversation.shutdown(),
@@ -389,7 +389,7 @@ impl AgentBackend {
 ///
 /// `verdandi_rules` is absent because it is confirmed to behave identically to `interactive` in the
 /// current sidecar. A third button that does nothing different is a worse lie than a missing one.
-pub(crate) const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
+pub const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
 
 /// Whether THIS CLIENT can drive a resume for a backend kind, before any provider exists.
 ///
@@ -410,11 +410,11 @@ fn client_implements_resume(kind: BackendKind) -> bool {
 }
 
 /// What the frontend is told at handshake time, before any session exists.
-pub(crate) struct BackendGreeting {
-    pub(crate) kind: BackendKind,
-    pub(crate) project_dir: PathBuf,
-    pub(crate) permission_modes: &'static [&'static str],
-    pub(crate) expected_verdandi_revision: Option<&'static str>,
+pub struct BackendGreeting {
+    pub kind: BackendKind,
+    pub project_dir: PathBuf,
+    pub permission_modes: &'static [&'static str],
+    pub expected_verdandi_revision: Option<&'static str>,
     /// Every previous conversation in THIS workspace worth offering, newest first. Empty when
     /// there is nothing to continue, which is the normal case for a fresh workspace.
     ///
@@ -433,7 +433,7 @@ pub(crate) struct BackendGreeting {
     /// prompt, no turn count. See its own doc for why the one place on disk that could supply a
     /// subject line (Claude's private transcript) is off limits. A picker built on this offers
     /// "which session" and "when"; it must not invent "what about".
-    pub(crate) resumable: Vec<ResumableSession>,
+    pub resumable: Vec<ResumableSession>,
 }
 
 impl BackendGreeting {
@@ -442,7 +442,7 @@ impl BackendGreeting {
     /// the small JSON records in it; `agent::persistence`'s own retention cap is what keeps that
     /// bounded rather than growing with every session the workspace has ever had. It has not been
     /// moved off the main thread, and if the cap ever rises far it should be.
-    pub(crate) fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
+    pub fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
         // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
         //

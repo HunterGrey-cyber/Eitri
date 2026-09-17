@@ -13,6 +13,7 @@ members = [
     "shell",
     "terminal-pane",
     "agent",
+    "core",
     "supervisor",
     "terminal-session",
     "semantic-pane",

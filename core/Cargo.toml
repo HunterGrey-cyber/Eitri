@@ -1,0 +1,12 @@
+[package]
+name = "neovibe-core"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent = { path = "../agent" }
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

@@ -3,13 +3,11 @@
 //! extension points under a `neovibe` global table: `panel.register`, `command.register`, `on`,
 //! `config.get`/`config.set`.
 
-mod command;
-mod config;
-mod event;
 mod panel;
 
-pub(crate) use command::CommandRegistry;
-pub(crate) use panel::{PanelEntry, PanelRegistry, PanelSlot};
+pub(crate) use neovibe_core::lua::command::CommandRegistry;
+pub(crate) use neovibe_core::lua::panel::PanelSlot;
+pub(crate) use panel::{PanelEntry, PanelRegistry};
 
 use mlua::{Lua, Value};
 use std::cell::RefCell;
@@ -20,7 +18,7 @@ pub(crate) struct LuaEngine {
     lua: Lua,
     pub(crate) panels: Rc<RefCell<PanelRegistry>>,
     pub(crate) commands: Rc<RefCell<CommandRegistry>>,
-    events: Rc<RefCell<event::EventBus>>,
+    events: Rc<RefCell<neovibe_core::lua::event::EventBus>>,
 }
 
 impl LuaEngine {
@@ -30,18 +28,18 @@ impl LuaEngine {
 
         let panels = Rc::new(RefCell::new(PanelRegistry::default()));
         let commands = Rc::new(RefCell::new(CommandRegistry::default()));
-        let events = Rc::new(RefCell::new(event::EventBus::default()));
+        let events = Rc::new(RefCell::new(neovibe_core::lua::event::EventBus::default()));
         // Not kept as a `LuaEngine` field: `config::install` clones this `Rc` into the
         // `get`/`set` closures it registers on the `neovibe.config` table, and those closures
         // are themselves kept alive by `lua` (a real field below) for as long as `LuaEngine`
         // lives -- so a separate `LuaEngine.config` field would hold a third clone that nothing
         // ever reads, not one needed to keep the store alive.
-        let config = Rc::new(RefCell::new(config::ConfigStore::default()));
+        let config = Rc::new(RefCell::new(neovibe_core::lua::config::ConfigStore::default()));
 
         panel::install(&lua, &neovibe, panels.clone(), config_dir)?;
-        command::install(&lua, &neovibe, commands.clone())?;
-        event::install(&lua, &neovibe, events.clone())?;
-        config::install(&lua, &neovibe, config)?;
+        neovibe_core::lua::command::install(&lua, &neovibe, commands.clone())?;
+        neovibe_core::lua::event::install(&lua, &neovibe, events.clone())?;
+        neovibe_core::lua::config::install(&lua, &neovibe, config)?;
 
         lua.globals().set("neovibe", neovibe)?;
 
@@ -49,10 +47,10 @@ impl LuaEngine {
     }
 
     pub(crate) fn emit(&self, event_name: &str) {
-        event::emit(&self.lua, &self.events, event_name, Value::Nil);
+        neovibe_core::lua::event::emit(&self.lua, &self.events, event_name, Value::Nil);
     }
 
-    /// Same reentrancy hazard and same fix as `event::emit` (see that function's doc comment):
+    /// Same reentrancy hazard and same fix as `neovibe_core::lua::event::emit` (see that function's doc comment):
     /// the command's `action` key is cloned out of `self.commands` under a scoped borrow, which
     /// is dropped *before* the action is actually called -- so an action that itself calls
     /// `neovibe.command.register(...)` (registering another command, from inside a command's own
