@@ -7,6 +7,7 @@ mod agent_backend;
 mod agent_bridge;
 mod agent_panel;
 mod chrome;
+mod instance_dir;
 mod layout;
 mod pane_switch;
 mod project_root;
@@ -108,15 +109,20 @@ fn build_application() -> Application {
 }
 
 fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_root: &Path) {
-    let theme = theme::Theme::dark();
-    chrome::apply_css(&theme.to_css());
+    // Painted with the built-in fallback until the embedded nvim sends its first snapshot.
+    let theme_css = theme::gtk_css::ThemeCss::install(&theme::ThemeTokens::fallback());
+    // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
+    // nvim only at spawn. `None` (logged) leaves the window on the fallback colours.
+    let mut theme_feed = theme::feed::ThemeFeed::new();
 
     // Built before the editor pane, because its `child_env()` has to be handed to the pane's
     // constructor -- those variables reach nvim through `Command::env` at spawn time and cannot
     // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
     // own doc); the editor is constructed with an empty child env and behaves exactly as before.
     let mut pane_switch = pane_switch::PaneSwitch::new();
-    let nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
+    let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
+    nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
+    let nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
 
     // `Rc` because two separate closures need it after this function returns: the agent panel's
     // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
@@ -129,6 +135,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         clean: want_clean,
         child_env: nvim_child_env,
         cwd: Some(project_root.to_path_buf()),
+        extra_nvim_args: nvim_extra_args,
     }));
 
     let config_dir = config_dir();
@@ -216,8 +223,23 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // unverified -- is in `agent_panel::install_reload_action`'s doc comment. One call rather than
     // an inline block on purpose: `build_ui` is being edited by two other tracks of the same plan.
     agent_panel::install_reload_action(app, &agent_panel_handle);
+    // The panel starts on the same fallback the chrome does, then both follow nvim together.
+    agent_panel_handle.set_theme(&theme::ThemeTokens::fallback());
+    if let Some(feed) = theme_feed.as_mut() {
+        let theme_css = theme_css.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        feed.listen(move |payload| {
+            let tokens = theme::ThemeTokens::derive(&payload);
+            println!(
+                "[theme] following nvim colorscheme {:?} (background={})",
+                payload.options.colors_name, payload.options.background
+            );
+            theme_css.update(&tokens);
+            agent_panel_handle.set_theme(&tokens);
+        });
+    }
 
-    root.append(&chrome::build_top_bar(&window));
+    root.append(&chrome::build_top_bar(&window, project_root));
     root.append(&content_widget);
     root.append(&chrome::build_status_bar());
 
@@ -421,6 +443,11 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         // left the shim directory behind after every close.
         if let Some(ps) = &pane_switch {
             ps.cleanup();
+        }
+        // Same two reasons as `pane_switch` just above: capturing it keeps the socket alive for the
+        // window's lifetime, and cleanup is explicit because `Drop` is not reliably reached.
+        if let Some(feed) = &theme_feed {
+            feed.cleanup();
         }
         // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never
         // left the mode-selector screen) -- without this, a normal window close never runs

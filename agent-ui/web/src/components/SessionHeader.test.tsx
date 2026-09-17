@@ -59,4 +59,18 @@ describe("SessionHeader identities", () => {
     expect(text).not.toContain("verdandi");
     expect(text).not.toContain("conv ");
   });
+
+  it("says neither id is assigned yet, rather than naming a sidecar/claude split, before the first turn", () => {
+    // A session that has started but has taken no turn has BOTH ids null. `null === null` is
+    // true, so this must not fall into the "they differ" branch -- which is exactly the bug: it
+    // rendered "verdandi -- . claude --", naming a backend that was never involved, on the
+    // default legacy backend where the two ids are always a single value.
+    const { container } = render(
+      <SessionHeader state={stateWith({ backend: "legacy", conversationId: null, sessionId: null, providerSessionId: null })} />,
+    );
+    const text = container.querySelector(".identities")?.textContent ?? "";
+    expect(text).not.toContain("verdandi");
+    expect(text).not.toContain("claude");
+    expect(text).not.toContain("conv ");
+  });
 });

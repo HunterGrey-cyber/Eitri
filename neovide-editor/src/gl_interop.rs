@@ -14,7 +14,17 @@ use neovide::live_harness::LiveHarness;
 use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
 
 /// Inset (device pixels) between the GtkGLArea's own framebuffer edge and the content region.
-pub(crate) const CONTENT_MARGIN: f32 = 40.0;
+///
+/// **Zero since 2026-09-16, deliberately.** It was 40.0 as a P0-P5 validation aid inherited from
+/// `poc/neovide_embed*`: a non-zero inset made a viewport-containment bleed -- the renderer
+/// painting outside the rect it was handed -- obvious on screen. That validation is finished (P5:
+/// real screenshots at six scale factors, numeric geometry cross-checks), and what the margin left
+/// behind in the product was a hardcoded near-black frame around the editor, dark around a light
+/// colorscheme. The editor now fills its pane.
+///
+/// Kept as a named constant rather than deleted or inlined: it is what this file's doc comments and
+/// geometry tests name, and the frozen `poc/` crates (ADR §6) still carry their own copies.
+pub(crate) const CONTENT_MARGIN: f32 = 0.0;
 
 /// GL-context-bound Skia state. Identical in spirit/implementation to
 /// `neovide_embed::SkiaState` -- see that crate's own doc comment for the full rationale; nothing
@@ -155,6 +165,12 @@ unsafe fn resolve_gl_proc(
 /// `content_region`, inset from the framebuffer edges by `CONTENT_MARGIN` on every side (falling
 /// back to the full framebuffer if it's too small for that margin to make sense). Identical to
 /// `neovide_embed::compute_content_region`.
+///
+/// At today's `CONTENT_MARGIN` of 0.0 both branches produce the same rect for any framebuffer
+/// wider and taller than 20px, so the guard reads as dead -- it is not. The fallback's `.max(1.0)`
+/// is what keeps a zero-sized framebuffer (a widget that has been allocated nothing yet) from
+/// producing a degenerate rect, and the margin is a constant a host or a future validation pass can
+/// put back.
 pub(crate) fn compute_content_region(fb_width: i32, fb_height: i32) -> PixelRect<f32> {
     let (w, h) = (fb_width as f32, fb_height as f32);
     if w > CONTENT_MARGIN * 2.0 + 20.0 && h > CONTENT_MARGIN * 2.0 + 20.0 {
@@ -248,6 +264,39 @@ pub(crate) fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the 2026-09-16 geometry: `CONTENT_MARGIN` is 0.0, so the editor fills its pane and the
+    /// near-black frame that used to surround it cannot come back unnoticed. Deliberately separate
+    /// from the offset/scale-factor test below, which builds its own `content_region` literal and
+    /// tests the coordinate math rather than this constant.
+    ///
+    /// It is also the reason `lib.rs`'s per-frame `canvas.clear` is currently invisible: the Skia
+    /// surface is wrapped at exactly `fb_width x fb_height` (`ensure_surface`), so a content region
+    /// equal to the framebuffer means whatever draws the frame covers every pixel the clear wrote.
+    /// See `OUTSIDE_COLOR`'s doc in `lib.rs`.
+    #[test]
+    fn content_region_at_zero_margin_is_the_whole_framebuffer() {
+        assert_eq!(CONTENT_MARGIN, 0.0);
+
+        // A realistic pane: the content region is the framebuffer, with nothing inset anywhere.
+        let region = compute_content_region(1280, 760);
+        assert_eq!((region.min.x, region.min.y), (0.0, 0.0));
+        assert_eq!((region.max.x, region.max.y), (1280.0, 760.0));
+
+        // The too-small branch still yields a non-degenerate rect rather than a zero-area one --
+        // the `.max(1.0)` in the fallback, which is why that branch stays even though at margin 0
+        // it agrees with the other one for anything bigger than 20px.
+        let degenerate = compute_content_region(0, 0);
+        assert!(degenerate.max.x - degenerate.min.x > 0.0);
+        assert!(degenerate.max.y - degenerate.min.y > 0.0);
+
+        // And with the content region starting at the origin, framebuffer (0, 0) is cell (0, 0):
+        // there is no longer an inset band of pixels that maps to the first cell.
+        let grid_scale = GridScale::new(PixelSize::new(9.0, 18.0));
+        let grid_size = GridSize::new(142, 42);
+        assert_eq!(pixel_to_grid_pos(0.0, 0.0, 1, &region, grid_scale, grid_size), (0, 0));
+        assert_eq!(pixel_to_grid_pos(9.0, 18.0, 1, &region, grid_scale, grid_size), (1, 1));
+    }
 
     #[test]
     fn pixel_to_grid_pos_accounts_for_content_region_offset_and_scale_factor() {

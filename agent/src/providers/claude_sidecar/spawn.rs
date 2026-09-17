@@ -86,8 +86,8 @@ impl SpawnedSidecar {
 /// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
 /// this session actually running?" is answerable after the fact rather than guessed at.
 ///
-/// Currently `bb487d7` on Verdandi's `sdk-mainline-unblock`, which is also the `rev` that
-/// `agent/Cargo.toml` pins `claude-runtime-protocol` to -- and those two must stay equal, because
+/// Currently `650782f` on Verdandi's `sdk-mainline-unblock-merge-20260915`, which is also the `rev`
+/// that `agent/Cargo.toml` pins `claude-runtime-protocol` to -- and those two must stay equal, because
 /// the generated wire types this crate compiles against come from exactly that revision, so it is
 /// the revision "verified against" can honestly refer to. (The checkout actually RUNNING may differ;
 /// that is what the drift warning below reports, and what `NEOVIBE_VERDANDI_CHECKOUT` is for.)
@@ -105,7 +105,8 @@ impl SpawnedSidecar {
 /// merge on their side and reported the output, and the move was then confirmed locally by the four
 /// FREE `claude_sidecar_unary_conformance` tests -- the live handshake among them -- which is what
 /// proves the protocol-3 client and the merged sidecar actually agree rather than merely compile.
-/// That revision is a real merge whose first parent chain still contains `bb487d7`, so nothing this
+/// That revision sits seven commits past a real merge, `aea4ec0` (Verdandi `main` into
+/// `sdk-mainline-unblock`), and its first-parent chain still contains `bb487d7`, so nothing this
 /// crate pinned before became unreachable.
 ///
 /// Keep this doc comment and the literal in step. They were not, between `6980f69` (which bumped
@@ -303,9 +304,9 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
 }
 
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
-/// the socket path (mirrors `agent::process`'s own per-conversation UUID socket convention,
-/// `std::env::temp_dir().join(format!("neovibe-agent-hook-{conversation_id}.sock"))`) so multiple
-/// concurrent providers never collide on one path.
+/// the socket path (`crate::socket_path::sidecar_socket`, which mirrors the legacy backend's own
+/// per-conversation UUID socket and keeps both under macOS's 103-byte socket-path limit) so
+/// multiple concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let checkout = locate_verdandi_checkout()?;
     let (checkout_description, checkout_warnings) = describe_checkout(&checkout);
@@ -315,7 +316,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     }
     let checkout = checkout.path;
     let dist_entry = ensure_sidecar_built(&checkout)?;
-    let socket_path = std::env::temp_dir().join(format!("neovibe-claude-sidecar-{instance_id}.sock"));
+    let socket_path = crate::socket_path::sidecar_socket(&std::env::temp_dir(), instance_id)?;
     let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
     let mut command = Command::new("node");

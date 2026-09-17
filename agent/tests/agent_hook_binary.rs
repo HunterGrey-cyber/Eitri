@@ -4,7 +4,8 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn agent_hook_relays_stdin_to_socket_and_prints_the_response() {
-    let socket_path = std::env::temp_dir().join(format!("agent-hook-test-{}.sock", std::process::id()));
+    let socket_path = agent::socket_path::in_dir(&std::env::temp_dir(), &format!("agent-hook-test-{}.sock", std::process::id()))
+        .expect("the test socket path must fit the macOS socket-path limit");
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
 

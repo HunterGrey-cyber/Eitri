@@ -61,6 +61,13 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
+  it("demuxes a theme envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "theme", vars: { "--nv-bg": "#faf4ed" } }));
+    expect(handler).toHaveBeenCalledWith({ kind: "theme", vars: { "--nv-bg": "#faf4ed" } });
+  });
+
   it("demuxes an error envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);

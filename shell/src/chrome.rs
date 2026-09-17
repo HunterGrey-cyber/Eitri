@@ -1,11 +1,29 @@
-//! Window chrome: top bar, window controls (minimize/maximize/close), status bar, and CSS styling.
+//! Window chrome: top bar, window controls (minimize/maximize/close), status bar. Styling itself
+//! lives in `theme::gtk_css`.
+
+use std::path::Path;
 
 use gtk4::{
     prelude::*,
     ApplicationWindow,
 };
 
-pub(crate) fn build_top_bar(window: &ApplicationWindow) -> gtk4::Widget {
+/// The top bar's project label shows the directory's own last path component, never the whole
+/// resolved path -- which would run long and, for a project under the user's home directory,
+/// would publish it in every screenshot/screen-share.
+///
+/// `Path::file_name` already does the real work (it strips a trailing slash and any bare `.`/`..`
+/// components on its own), so this exists mainly to give that behaviour a name and a fallback:
+/// the root `/` has no file name at all, and a host that ever hands this a non-canonicalized or
+/// otherwise degenerate path (this crate's own caller always canonicalizes first, but this
+/// function does not assume that) gets the path back verbatim rather than an empty label.
+pub(crate) fn project_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> gtk4::Widget {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("topbar");
     bar.set_valign(gtk4::Align::Fill);
@@ -13,7 +31,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow) -> gtk4::Widget {
     let app_name = gtk4::Label::new(Some("neovibe"));
     app_name.add_css_class("topbar-app-name");
 
-    let project_name = gtk4::Label::new(Some("project"));
+    let project_name = gtk4::Label::new(Some(&project_display_name(project_root)));
     project_name.add_css_class("topbar-project-name");
     project_name.set_hexpand(true);
     project_name.set_halign(gtk4::Align::Start);
@@ -100,14 +118,23 @@ pub(crate) fn build_status_bar() -> gtk4::Widget {
     bar.upcast()
 }
 
-pub(crate) fn apply_css(css: &str) {
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(css);
+#[cfg(test)]
+mod tests {
+    use super::project_display_name;
+    use std::path::Path;
 
-    let display = gtk4::gdk::Display::default().expect("no default GDK display");
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    #[test]
+    fn a_normal_path_shows_its_last_component() {
+        assert_eq!(project_display_name(Path::new("/home/user/src/neovibe")), "neovibe");
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_change_the_answer() {
+        assert_eq!(project_display_name(Path::new("/home/user/src/neovibe/")), "neovibe");
+    }
+
+    #[test]
+    fn the_root_directory_has_no_last_component_so_it_falls_back_to_itself() {
+        assert_eq!(project_display_name(Path::new("/")), "/");
+    }
 }

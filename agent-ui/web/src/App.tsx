@@ -9,6 +9,7 @@ import { MessageList } from "./components/MessageList";
 import { SessionHeader } from "./components/SessionHeader";
 import { ContinueInTerminal, HandoffCommandCard } from "./components/TerminalHandoff";
 import type { HandoffCommand, Hello, PermissionModeChoice } from "./types";
+import { applyTheme } from "./theme";
 
 export default function App() {
   const [state, setState] = useState(initialState());
@@ -68,7 +69,9 @@ export default function App() {
 
   useEffect(() => {
     installDispatch((payload) => {
-      if (payload.kind === "hello") {
+      if (payload.kind === "theme") {
+        applyTheme(payload.vars);
+      } else if (payload.kind === "hello") {
         setHello(payload);
       } else if (payload.kind === "snapshot") {
         setState((s) => applySnapshot(s, payload.state, payload.throughRevision));

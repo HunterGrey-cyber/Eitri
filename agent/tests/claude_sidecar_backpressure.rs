@@ -386,10 +386,5 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
 /// The sidecar's resident memory, by the pid this provider reports spawning -- never by name, since
 /// a developer machine's own Claude Code session is itself a process named `claude`.
 fn sidecar_rss_kib(pid: u32) -> Option<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find(|line| line.starts_with("VmRSS:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|kib| kib.parse().ok())
+    agent::process_probe::resident_kib(pid)
 }

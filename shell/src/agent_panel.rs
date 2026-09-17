@@ -88,6 +88,11 @@ struct AgentPanelState {
     /// The in-flight turn's latency marks, when `NEOVIBE_AGENT_TRACE=1`. `None` the rest of the
     /// time, which is every normal run -- this is a diagnostic, not a metrics pipeline.
     turn_trace: Option<crate::turn_trace::TurnTrace>,
+    /// The panel's current theme. Starts on `ThemeTokens::fallback()` and is replaced by
+    /// `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
+    /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
+    /// own background colour.
+    theme: crate::theme::ThemeTokens,
 }
 
 /// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
@@ -224,7 +229,8 @@ impl AgentPanelHandle {
     /// this into a quiet data-loss path with no test failing.
     pub(crate) fn reload_document(&self) {
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
-        self.webview.load_html(AGENT_UI_HTML, None);
+        let vars = self.state.borrow().theme.css_vars();
+        self.webview.load_html(&themed_document(&vars), None);
     }
 
     /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
@@ -237,6 +243,26 @@ impl AgentPanelHandle {
         } else {
             false
         }
+    }
+
+    /// Records `tokens` as the panel's current theme, repaints the WebView's own background, and
+    /// pushes the variables to the live document.
+    ///
+    /// Safe to call before the page has loaded: the dispatch is guarded, and the `ready` handshake
+    /// sends the recorded envelope anyway, so neither ordering loses it.
+    pub(crate) fn set_theme(&self, tokens: &crate::theme::ThemeTokens) {
+        let payload = crate::agent_bridge::serialize_theme_for_js(tokens);
+        self.state.borrow_mut().theme = tokens.clone();
+        paint_webview_background(&self.webview, tokens);
+        let script = format!(
+            "window.__neovibeDispatch && window.__neovibeDispatch({});",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
+        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
+            if let Err(e) = result {
+                eprintln!("[agent_panel] theme dispatch failed: {e}");
+            }
+        });
     }
 }
 
@@ -315,6 +341,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         last_handoff: None,
         reported_start_failure: false,
         turn_trace: None,
+        theme: crate::theme::ThemeTokens::fallback(),
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -327,7 +354,11 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
         });
     }
 
-    webview.load_html(AGENT_UI_HTML, None);
+    {
+        let tokens = state.borrow().theme.clone();
+        paint_webview_background(&webview, &tokens);
+        webview.load_html(&themed_document(&tokens.css_vars()), None);
+    }
 
     // Started once, at construction, rather than when a session starts: it is also what collects a
     // finished background connect. Previously it was started inside the start_session handler,
@@ -622,11 +653,14 @@ fn handoff_payloads(
 /// a later change loses something from without any test noticing.
 ///
 /// `hello` comes first: it tells the frontend which backend it is talking to and what that backend
-/// genuinely offers, which is what the start screen renders.
+/// genuinely offers, which is what the start screen renders. `theme`, when given, comes second --
+/// before the snapshot or handoff card that would be drawn with it. The `Ready` handler always
+/// gives one, built from the panel's recorded tokens.
 fn ready_payloads(
     mut greeting: BackendGreeting,
     snapshot: Option<String>,
     last_handoff: Option<&agent::handoff::ClaudeResumeCommand>,
+    theme: Option<&str>,
 ) -> Vec<String> {
     // A session this panel just handed to a terminal must not also be offered for resume on the
     // start screen: nothing holds a lock on it, so taking the offer would put two writers on one
@@ -641,6 +675,10 @@ fn ready_payloads(
     }
 
     let mut payloads = vec![serialize_hello_for_js(&greeting)];
+    // Colours before anything drawn with them.
+    if let Some(theme) = theme {
+        payloads.push(theme.to_string());
+    }
     match snapshot {
         // A live session wins. `collect_pending_start` clears `last_handoff` when one is installed,
         // so a stale card and a live conversation cannot both be current -- but this ordering does
@@ -730,7 +768,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 let state_ref = state.borrow();
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
                 let snapshot = state_ref.session.as_ref().map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
-                ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref())
+                let theme = crate::agent_bridge::serialize_theme_for_js(&state_ref.theme);
+                ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref(), Some(&theme))
             };
             for payload in payloads {
                 evaluate_js_dispatch(webview, &payload);
@@ -924,6 +963,41 @@ fn no_session_error() -> crate::agent_backend::BackendError {
     crate::agent_backend::BackendError { message: "no active session".to_string(), benign: true }
 }
 
+/// The panel document with `vars` already inlined, so the first frame WebKit paints -- on a cold
+/// start or after `reload_document` -- is in nvim's colours instead of an unstyled white page.
+/// `applyTheme` later sets the same variables inline on `:root`, which overrides this block for
+/// live colorscheme changes.
+///
+/// Inserted directly after the opening `<head>`, not before `</head>`: the single-file build
+/// inlines its script into `<head>`, and that script contains the literal `<head></head>`
+/// (DOMPurify), so the first `</head>` in the file is not the document's.
+fn themed_document(vars: &[(String, String)]) -> String {
+    let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
+    let style = format!("<style id=\"nv-theme\">:root{{{declarations}}}</style>");
+    match AGENT_UI_HTML.find("<head>") {
+        Some(at) => {
+            let insert = at + "<head>".len();
+            format!("{}{}{}", &AGENT_UI_HTML[..insert], style, &AGENT_UI_HTML[insert..])
+        }
+        None => {
+            eprintln!("[agent_panel] the panel document has no <head>; loading it without an inline theme");
+            AGENT_UI_HTML.to_string()
+        }
+    }
+}
+
+/// The WebView's own background, which shows before the web process has painted anything. WebKit
+/// defaults it to opaque white.
+fn paint_webview_background(webview: &WebView, tokens: &crate::theme::ThemeTokens) {
+    let bg = tokens.bg;
+    webview.set_background_color(&gtk4::gdk::RGBA::new(
+        f32::from(bg.r) / 255.0,
+        f32::from(bg.g) / 255.0,
+        f32::from(bg.b) / 255.0,
+        1.0,
+    ));
+}
+
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!("window.__neovibeDispatch({});", serde_json::to_string(json_payload).unwrap_or_default());
     webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
@@ -1005,6 +1079,21 @@ mod tests {
         );
     }
 
+    /// The first frame of a freshly loaded document must already be in nvim's colours: the theme
+    /// is parsed before the script that renders anything, and nothing else in the document moves.
+    #[test]
+    fn the_panel_document_carries_its_theme_before_its_script() {
+        let tokens = crate::theme::ThemeTokens::fallback();
+        let html = themed_document(&tokens.css_vars());
+        let style_at = html.find("<style id=\"nv-theme\">").expect("the theme block is inserted");
+        let script_at = html.find("<script").expect("the single-file build inlines its script");
+        assert!(style_at < script_at, "the theme must be parsed before the script that renders");
+        assert_eq!(html.matches("<style id=\"nv-theme\">").count(), 1);
+        assert!(html.contains(&format!("--nv-bg:{};", tokens.bg.hex())));
+        let end = style_at + html[style_at..].find("</style>").unwrap() + "</style>".len();
+        assert_eq!(format!("{}{}", &html[..style_at], &html[end..]), AGENT_UI_HTML);
+    }
+
     fn a_command() -> agent::handoff::ClaudeResumeCommand {
         agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2").unwrap()
     }
@@ -1032,7 +1121,7 @@ mod tests {
     #[test]
     fn a_reloaded_document_is_handed_back_the_command_the_old_one_was_showing() {
         let command = a_command();
-        let payloads = ready_payloads(legacy_greeting(), None, Some(&command));
+        let payloads = ready_payloads(legacy_greeting(), None, Some(&command), None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert!(hello["resumableSession"].is_null(), "legacy has no other record of this session");
 
@@ -1045,7 +1134,21 @@ mod tests {
     /// The ordinary case is unchanged: a panel that never handed anything off sends `hello` alone.
     #[test]
     fn a_panel_that_handed_nothing_off_sends_only_the_greeting() {
-        assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None)), vec!["hello"]);
+        assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None, None)), vec!["hello"]);
+    }
+
+    /// A reloaded document must get its colours back before anything it would draw with them.
+    #[test]
+    fn the_theme_follows_the_greeting_and_precedes_everything_else() {
+        let theme = crate::agent_bridge::serialize_theme_for_js(&crate::theme::ThemeTokens::fallback());
+        assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme))), vec!["hello", "theme"]);
+        let payloads = ready_payloads(
+            legacy_greeting(),
+            Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
+            None,
+            Some(&theme),
+        );
+        assert_eq!(kinds(&payloads), vec!["hello", "theme", "snapshot"]);
     }
 
     /// A live session wins. The card describes a conversation that is over; putting it above a
@@ -1057,6 +1160,7 @@ mod tests {
             legacy_greeting(),
             Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
             Some(&command),
+            None,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "snapshot"]);
     }
@@ -1093,7 +1197,7 @@ mod tests {
             ],
         };
         let command = a_command();
-        let payloads = ready_payloads(greeting, None, Some(&command));
+        let payloads = ready_payloads(greeting, None, Some(&command), None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
             .as_array()

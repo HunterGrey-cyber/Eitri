@@ -8,6 +8,20 @@ use std::process::Command;
 
 fn main() {
     let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web");
+    // `CARGO_MANIFEST_DIR` is baked into THIS binary when the build script itself is compiled, so a
+    // build-script binary another checkout left behind in a shared `target/` names a directory that
+    // may no longer exist -- and cargo reuses it whenever the unit hash matches, which two checkouts
+    // of the same workspace readily produce. Every `Command` below would then fail to spawn with
+    // ENOENT, the same errno as a missing `npm`, and `run`'s own message says exactly that. Check the
+    // directory first so the real cause is named instead. Reproduced on 2026-09-17; see CLAUDE.md.
+    if !web_dir.is_dir() {
+        panic!(
+            "agent-ui/web is not at {} -- this build script was compiled for a checkout that is no \
+             longer there, and cargo reused it from a shared target directory. `cargo clean -p \
+             shell` rebuilds it against this one. (Node.js/npm are almost certainly fine.)",
+            web_dir.display()
+        );
+    }
     let dist_index = web_dir.join("dist/index.html");
 
     println!("cargo:rerun-if-changed={}", web_dir.join("src").display());
@@ -68,7 +82,16 @@ fn run(dir: &Path, program: &str, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .status()
-        .unwrap_or_else(|e| panic!("failed to run `{program} {}`: {e} -- is Node.js/npm installed and on PATH?", args.join(" ")));
+        .unwrap_or_else(|e| {
+            // Both halves matter: a missing program and a missing working directory are the same
+            // ENOENT here, and naming only the first one sent a real investigation after `npm`.
+            panic!(
+                "failed to run `{program} {}` in {}: {e} -- is Node.js/npm installed and on PATH, \
+                 and does that directory exist?",
+                args.join(" "),
+                dir.display()
+            )
+        });
     if !status.success() {
         panic!("`{program} {}` failed with {status}", args.join(" "));
     }

@@ -134,13 +134,10 @@ fn settle(provider: &ScriptedProvider, conversation: &AgentConversation) {
 
 /// This process's resident memory, for the "does it follow the conversation or the event count"
 /// question. `None` rather than 0 when unreadable: a zero among real numbers reads as a measurement.
+/// Read through `agent::process_probe`, which covers Linux and macOS; it used to be
+/// `/proc/self/status`, so on macOS this test printed "RSS unreadable" and passed.
 fn rss_kib() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status
-        .lines()
-        .find(|line| line.starts_with("VmRSS:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|kib| kib.parse().ok())
+    agent::process_probe::resident_kib(std::process::id())
 }
 
 /// **The headline property, at a scale a real provider would never reach cheaply.**
@@ -184,7 +181,9 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
     eprintln!("  transcript messages     : {}", conversation.projection().transcript.len());
     match (rss_before, rss_after) {
         (Some(before), Some(after)) => eprintln!("  RSS {before}KiB -> {after}KiB (+{}KiB)", after.saturating_sub(before)),
-        _ => eprintln!("  RSS unreadable"),
+        // Linux and macOS always read it (`process_probe`'s own tests insist); only another
+        // platform reaches this, and it says so rather than printing a number.
+        _ => eprintln!("  RSS unreadable on this platform -- not measured"),
     }
 
     // Every event was folded. Nothing was skipped to keep the queue small.

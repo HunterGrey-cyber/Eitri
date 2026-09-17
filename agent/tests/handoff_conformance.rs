@@ -27,6 +27,16 @@ fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(provider: &ClaudeSidecarProvi
 #[test]
 #[ignore]
 fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() {
+    // Gated to Linux, and refused before anything is spawned or billed. The load-bearing step below
+    // reads `/proc/<pid>/comm` to prove the handoff child has exec'd into `claude`; macOS has no
+    // `/proc`, and what its nearest equivalent (`proc_name`, the kernel's `p_comm`) reads for this
+    // machine's symlinked `claude` install has not been observed. Porting it on a guess would make
+    // the `AlreadyHeld` assertion after it pass for the wrong process. (macOS track M1, 2026-09-17;
+    // listed in docs/canonical/macos_status.md.)
+    assert!(
+        cfg!(target_os = "linux"),
+        "this conformance test's exec check is Linux-only (/proc/<pid>/comm) and has no verified macOS port"
+    );
     let project_dir = std::env::temp_dir().join(format!("agent-handoff-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&project_dir).unwrap();
     let cwd = project_dir.to_string_lossy().to_string();

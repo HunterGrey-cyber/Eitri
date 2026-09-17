@@ -77,6 +77,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// rediscovered.
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// The directory-name prefix `instance_dir` keys this module's directories on.
+const SHIM_DIR_PREFIX: &str = "neovibe-pane-switch-";
+
 /// A live pane-switch channel: a private directory holding the fake-`tmux` symlink and the Unix
 /// socket, plus the bound listener.
 ///
@@ -86,8 +89,8 @@ const READ_TIMEOUT: Duration = Duration::from_millis(50);
 /// before the process exits (see [`PaneSwitch::cleanup`]'s own doc for that finding, and why the
 /// close handler calls it explicitly), and no destructor runs at all on SIGKILL or a hard crash.
 /// What survives such an exit is a dead symlink and a dead socket under `TMPDIR`;
-/// [`sweep_stale_shim_dirs`], which runs at the top of [`PaneSwitch::new`], is what reclaims them
-/// on a later launch.
+/// `crate::instance_dir::sweep_stale_instance_dirs`, which runs at the top of [`PaneSwitch::new`],
+/// is what reclaims them on a later launch.
 pub(crate) struct PaneSwitch {
     dir: PathBuf,
     socket_path: PathBuf,
@@ -102,7 +105,7 @@ impl PaneSwitch {
         // Reclaim whatever earlier, now-dead `shell` processes left behind before adding one more
         // directory of our own. Unconditional and first, so it still happens on a machine where
         // the shim binary is missing and this call is about to return `None`.
-        sweep_stale_shim_dirs(&std::env::temp_dir());
+        crate::instance_dir::sweep_stale_instance_dirs(&std::env::temp_dir(), SHIM_DIR_PREFIX, "switch.sock", "pane_switch");
 
         let shim = locate_shim_binary()?;
 
@@ -218,7 +221,7 @@ impl PaneSwitch {
     /// signal-handler closures before the process exits, so its `Drop` never ran. That matters
     /// more now than it did: a uuid-keyed directory (see [`shim_dir_path`]) is never reused, so a
     /// skipped cleanup leaks rather than being overwritten by the next run at the same pid.
-    /// [`sweep_stale_shim_dirs`] reclaims such a directory at the *next* launch, which is a
+    /// `crate::instance_dir::sweep_stale_instance_dirs` reclaims such a directory at the *next* launch, which is a
     /// backstop for the paths no destructor can reach (SIGKILL, a hard crash) -- not a reason to
     /// skip this call, which is what keeps a normal close from leaving anything behind at all.
     /// `Drop` is kept below for every other path (an early `build_ui` failure, a future
@@ -267,108 +270,15 @@ fn parse_direction(line: &str) -> Option<char> {
 /// honest independently of whether `main()` happens to pass `NON_UNIQUE` today.
 ///
 /// The pid stays in the name for two reasons: `ls "$TMPDIR"` while a window is open still says
-/// which process a directory belongs to, and it is what [`sweep_stale_shim_dirs`] reads to tell a
-/// leaked directory from a live one.
+/// which process a directory belongs to, and it is what `crate::instance_dir::sweep_stale_instance_dirs`
+/// reads to tell a leaked directory from a live one.
 ///
 /// The trade-off is real and worth stating plainly -- a `shell` that dies without running
 /// `cleanup()` or `Drop` (SIGKILL, a hard crash) **leaks** its directory, where the old pid-keyed
-/// path was reclaimed by the next process to draw the same pid. `sweep_stale_shim_dirs` is what
-/// replaces that reclamation; a socket collision between two live windows had no recovery at all.
+/// path was reclaimed by the next process to draw the same pid. `crate::instance_dir::sweep_stale_instance_dirs`
+/// is what replaces that reclamation; a socket collision between two live windows had no recovery at all.
 fn shim_dir_path() -> PathBuf {
-    std::env::temp_dir()
-        .join(format!("neovibe-pane-switch-{}-{}", std::process::id(), uuid::Uuid::new_v4()))
-}
-
-/// Deletes shim directories under `tmp` that belong to `shell` processes which are no longer
-/// running -- the reaper the uuid in [`shim_dir_path`] would otherwise not have.
-///
-/// A directory is removed only when all four of these hold: its name has exactly one of the two
-/// shapes this module has ever produced (see [`stale_shim_dir_pid`]), `/proc/<pid>` does not
-/// exist, nothing answers a `connect()` on its `switch.sock`, and the entry is a real directory
-/// rather than a symlink to one.
-///
-/// **What those liveness checks prove, and what they do not.** Neither proves a directory is
-/// abandoned on its own, which is why both have to agree:
-///
-/// - `/proc/<pid>` proves only that *some* process holds that pid, not that it is the `shell` that
-///   created this directory. Pid reuse is real, so a pid since taken over by something unrelated
-///   reads as "alive", the directory is skipped, and the leak survives to a later launch. It also
-///   answers about **this process's own pid namespace**, and `TMPDIR` is not necessarily shared
-///   with only that namespace -- observed for real in this project's own sandbox, where `/tmp` held
-///   directories named after host pids while `/proc` showed namespace-local ones. So a live
-///   window's directory *can* look pid-dead from here.
-/// - The socket probe closes exactly that hole, because it asks the filesystem rather than the
-///   process table: a running `PaneSwitch` holds a bound, listening `UnixListener` at that path, so
-///   `connect()` succeeds; once the process is gone the socket file is refused
-///   (`ECONNREFUSED`). It cannot stand alone either -- a directory whose creation failed before the
-///   `bind` has no socket at all, and "no socket" and "dead socket" must not be told apart by
-///   guesswork.
-///
-/// The probe is short-circuited behind the pid check, so in the ordinary case (a live window, a
-/// live pid) nothing ever connects to a running listener. When it does run, it connects and
-/// immediately drops the stream; a live listener sees that as a connection carrying an empty line,
-/// which `parse_direction` rejects and logs. It moves nobody's focus.
-///
-/// Every failure is ignored. `TMPDIR` is usually shared and sticky-bit, so a stale-looking entry
-/// may belong to another user and be undeletable; that must not stop this process from starting.
-fn sweep_stale_shim_dirs(tmp: &Path) {
-    let Ok(entries) = std::fs::read_dir(tmp) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(stale_shim_dir_pid) else { continue };
-        let path = entry.path();
-        if pid_is_running(pid) || socket_has_a_listener(&path.join("switch.sock")) {
-            continue;
-        }
-        // `symlink_metadata`, so a symlink that merely *points* at a directory is never followed
-        // -- `TMPDIR` is writable by anyone, and this is the one call here that deletes.
-        let is_real_directory = matches!(path.symlink_metadata(), Ok(meta) if meta.is_dir());
-        if is_real_directory && std::fs::remove_dir_all(&path).is_ok() {
-            println!(
-                "[pane_switch] reclaimed stale {} (pid {pid} is gone and its socket is dead)",
-                path.display()
-            );
-        }
-    }
-}
-
-/// Whether a `PaneSwitch` is still listening on this socket path.
-///
-/// `true` only for a real, successful `connect()`. Every error -- `ECONNREFUSED` (the file is
-/// there, its listener is not), `ENOENT` (never created), `EACCES` (another user's), anything else
-/// -- answers `false`, because the caller pairs this with a pid check and treats "cannot tell" the
-/// same as "cannot connect". An `AF_UNIX` `connect()` does not block waiting on a peer, so this
-/// needs no timeout.
-fn socket_has_a_listener(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
-}
-
-/// The pid named by a directory this module created, or `None` for any other name.
-///
-/// Two shapes are accepted: `neovibe-pane-switch-<pid>-<uuid>`, which [`shim_dir_path`] produces
-/// today, and the bare `neovibe-pane-switch-<pid>` earlier builds produced -- so upgrading past
-/// that change does not strand one of the old ones forever. Nothing else matches, including a name
-/// that merely shares the prefix, so the sweep can never delete something this module did not
-/// create.
-fn stale_shim_dir_pid(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("neovibe-pane-switch-")?;
-    match rest.split_once('-') {
-        // A pid is all digits, so the first hyphen is always the one separating it from the uuid.
-        // Parsing the tail as a uuid (rather than just checking it is non-empty) is what keeps an
-        // unrelated `neovibe-pane-switch-123-scratch` out of the sweep.
-        Some((pid, uuid)) => {
-            uuid::Uuid::parse_str(uuid).ok()?;
-            pid.parse().ok()
-        }
-        None => rest.parse().ok(),
-    }
-}
-
-/// Whether any process currently holds this pid. `/proc/<pid>` rather than `kill(pid, 0)`: it
-/// needs no signal permission, so it answers the same way for a pid owned by another user, and it
-/// cannot be mistaken for actually signalling something.
-fn pid_is_running(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+    crate::instance_dir::instance_dir_path(&std::env::temp_dir(), SHIM_DIR_PREFIX)
 }
 
 /// Finds the `neovibe-tmux-shim` binary next to the currently-running executable. Both are
@@ -424,88 +334,6 @@ mod tests {
             // would still satisfy the `starts_with` above while reintroducing the collision.
             assert_eq!(name.len() - prefix.len(), 36, "expected a uuid suffix in {name}");
         }
-    }
-
-    #[test]
-    fn only_this_modules_own_directory_names_are_sweep_candidates() {
-        let uuid = uuid::Uuid::new_v4();
-        // Today's shape, and the pre-uuid shape earlier builds produced.
-        assert_eq!(stale_shim_dir_pid(&format!("neovibe-pane-switch-4321-{uuid}")), Some(4321));
-        assert_eq!(stale_shim_dir_pid("neovibe-pane-switch-4321"), Some(4321));
-        // Nothing this module made. `TMPDIR` is full of other people's directories and the sweep
-        // is a recursive delete, so the parser is the whole safety story.
-        assert_eq!(stale_shim_dir_pid("neovibe-supervisor.sock"), None);
-        assert_eq!(stale_shim_dir_pid("systemd-private-abcdef"), None);
-        assert_eq!(stale_shim_dir_pid(""), None);
-        // The prefix alone is not enough: the tail must be a real uuid and the head a real pid.
-        assert_eq!(stale_shim_dir_pid("neovibe-pane-switch-4321-scratch"), None);
-        assert_eq!(stale_shim_dir_pid(&format!("neovibe-pane-switch-notapid-{uuid}")), None);
-        assert_eq!(stale_shim_dir_pid("neovibe-pane-switch--1"), None);
-    }
-
-    #[test]
-    fn the_sweep_reclaims_a_dead_pids_directory_and_spares_a_live_ones() {
-        // Named so it is *not* itself a sweep candidate (see the parser test above) and so a
-        // panic before the cleanup at the end leaves something obviously a test's, not a shim
-        // directory. A sibling test uses `nv-sw-`; the two must differ, because cargo runs them
-        // concurrently in one process and so at one pid.
-        let root = std::env::temp_dir().join(format!("nv-sweep-{}", std::process::id()));
-
-        // pid 0 is the dead case without having to race a real pid's reuse: `/proc/0` does not
-        // exist on Linux and `std::process::id()` never returns it, so this is deterministic
-        // where "spawn something, reap it, reuse its pid" would not be.
-        let dead = root.join(format!("neovibe-pane-switch-0-{}", uuid::Uuid::new_v4()));
-        let dead_old_shape = root.join("neovibe-pane-switch-0");
-        // ...and this process's own pid is alive by definition for as long as the test runs.
-        let live = root.join(format!(
-            "neovibe-pane-switch-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        // Dead-looking pid, but not a name this module ever produced.
-        let stranger = root.join("neovibe-pane-switch-0-definitely-not-a-uuid");
-        let unrelated = root.join("some-other-tools-directory");
-        for dir in [&dead, &dead_old_shape, &live, &stranger, &unrelated] {
-            std::fs::create_dir_all(dir.join("bin")).expect("build the fixture");
-        }
-
-        sweep_stale_shim_dirs(&root);
-
-        assert!(!dead.exists(), "a dead pid's directory must be reclaimed");
-        assert!(!dead_old_shape.exists(), "a pre-uuid directory must be reclaimed too");
-        assert!(live.exists(), "a live pid's directory must be left strictly alone");
-        assert!(stranger.exists(), "a name that is not this module's shape must be left alone");
-        assert!(unrelated.exists(), "an unrelated entry must be left alone");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_listening_socket_saves_a_directory_the_pid_check_calls_dead() {
-        // The case the `/proc` check alone gets wrong. `TMPDIR` is not guaranteed to be shared
-        // with only this pid namespace -- this project's own sandbox has `/tmp` carrying host pids
-        // while `/proc` shows namespace-local ones -- so a live window's directory really can look
-        // pid-dead from here. pid 0 stands in for "the pid check says dead" deterministically.
-        // Deliberately terse: an `AF_UNIX` path is capped at ~108 bytes (`SUN_LEN`), and a
-        // fixture named as verbosely as the one above cannot hold a bindable socket at all. The
-        // real `/tmp/neovibe-pane-switch-<pid>-<uuid>/switch.sock` is ~81 bytes and fits.
-        let root = std::env::temp_dir().join(format!("nv-sw-{}", std::process::id()));
-        let listening = root.join(format!("neovibe-pane-switch-0-{}", uuid::Uuid::new_v4()));
-        let silent = root.join(format!("neovibe-pane-switch-0-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&listening).expect("build the fixture");
-        std::fs::create_dir_all(&silent).expect("build the fixture");
-        // A real bound listener, exactly as `PaneSwitch::new` leaves one...
-        let listener = UnixListener::bind(listening.join("switch.sock")).expect("bind");
-        // ...versus a socket-shaped file with nothing behind it, as a crashed process leaves.
-        std::fs::write(silent.join("switch.sock"), b"").expect("write a dead socket file");
-
-        sweep_stale_shim_dirs(&root);
-
-        assert!(listening.exists(), "a directory with a live listener must never be reclaimed");
-        assert!(!silent.exists(), "a directory whose socket answers nothing must be reclaimed");
-
-        drop(listener);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

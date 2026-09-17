@@ -1,7 +1,8 @@
 // agent/src/lease.rs
 //! An exclusive, `flock`-backed advisory lock proving one Neovibe-participating client currently
 //! owns a given provider session (design doc §8.2). Lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared
-//! on logout) -- correct here, unlike the persistent identity in `persistence.rs`, since a lease
+//! on logout) on Linux, and under `~/Library/Application Support` on macOS, which has no such
+//! directory (see `state_dirs::leases_dir` for why not the temp dir) -- correct here, unlike the persistent identity in `persistence.rs`, since a lease
 //! has no meaning across a reboot. `flock`'s own kernel semantics are the actual safety mechanism:
 //! a crashed or killed process automatically releases every lock it held (every fd referencing the
 //! lock's underlying open file description closes), so this module needs no heartbeat thread or
@@ -21,6 +22,7 @@
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -60,7 +62,8 @@ impl std::fmt::Display for LeaseError {
 impl std::error::Error for LeaseError {}
 
 /// Where the lock files live -- `state_dirs::leases_dir()`, i.e.
-/// `$XDG_RUNTIME_DIR/neovibe/session-leases/`, unless a test has redirected it.
+/// `$XDG_RUNTIME_DIR/neovibe/session-leases/` on Linux and
+/// `~/Library/Application Support/neovibe/session-leases/` on macOS, unless a test has redirected it.
 ///
 /// The thread-local checked first is narrower still and belongs to this module's own tests: several
 /// of them acquire the SAME key (`claude`/`/tmp/project`/`prov-1`) to assert contention, so they
@@ -111,6 +114,10 @@ mod test_override {
             LEASES_DIR.with(|slot| *slot.borrow_mut() = Some(dir.clone()));
             Self(dir)
         }
+
+        pub(super) fn path(&self) -> &std::path::Path {
+            &self.0
+        }
     }
 
     impl Drop for IsolatedLeasesDir {
@@ -142,7 +149,15 @@ impl SessionLease {
     /// itself (not this metadata) is what a future acquirer's own `try_acquire` actually checks.
     pub fn try_acquire(provider: &str, canonical_cwd: &str, provider_session_id: &str) -> Result<Self, LeaseError> {
         let dir = leases_dir().map_err(LeaseError::Io)?;
-        std::fs::create_dir_all(&dir).map_err(LeaseError::Io)?;
+        // 0700 for every component this creates. On macOS the directory is under the user's home
+        // rather than an already-private runtime dir (see `state_dirs::leases_dir`), and lock names
+        // are hashes of a cwd and a session id, which are nobody else's business. Directories that
+        // already exist keep their mode.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(LeaseError::Io)?;
         let key = lease_key_hash(provider, canonical_cwd, provider_session_id);
         let path = dir.join(format!("{key}.lock"));
 
@@ -253,6 +268,19 @@ mod tests {
     // These were one long test function, because isolating them meant mutating XDG_RUNTIME_DIR and
     // that is process-wide. `IsolatedLeasesDir` is per-thread, so they are separate tests again and
     // each can say in its own name what it pins.
+
+    /// `try_acquire` creates a missing lease directory private to the user.
+    #[test]
+    fn a_missing_lease_directory_is_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let isolated = IsolatedLeasesDir::new();
+        std::fs::remove_dir_all(isolated.path()).unwrap();
+
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-mode").unwrap();
+        let mode = std::fs::metadata(isolated.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "lease directory mode was {mode:o}");
+        drop(lease);
+    }
 
     #[test]
     fn a_session_lease_is_reacquirable_once_released() {

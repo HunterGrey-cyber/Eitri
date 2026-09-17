@@ -31,8 +31,12 @@ pub mod hook_protocol;
 pub mod ingestion;
 pub mod lease;
 pub mod persistence;
+#[doc(hidden)]
+pub mod process_probe;
 pub mod providers;
 pub mod settings;
+#[doc(hidden)]
+pub mod socket_path;
 pub mod state_dirs;
 pub mod transcript;
 
@@ -55,5 +59,5 @@ pub use provider::{
     ProviderError, ProviderErrorCode, ProviderInfo, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
-    BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME, EXPECTED_VERDANDI_REVISION,
+    BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION,
 };

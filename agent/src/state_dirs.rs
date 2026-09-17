@@ -50,16 +50,89 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/neovibe/conversations"))
 }
 
-/// `$XDG_RUNTIME_DIR/neovibe/session-leases/`, matching this project's own established pattern for
-/// ephemeral, per-session state (`supervisor::socket_path`, `agent::process`'s hook sockets). A
-/// lease has no meaning across a reboot, so tmpfs is right here and wrong for the records above.
+/// Where session-lease lock files live. Two platforms, two answers, and every process of one user
+/// on one machine must reach the SAME directory -- two processes that disagree each take "the"
+/// lock in their own directory, both succeed, and nothing reports it.
+///
+/// - **Linux:** `$XDG_RUNTIME_DIR/neovibe/session-leases/`, matching this project's own established
+///   pattern for ephemeral, per-session state (`supervisor::socket_path`, `agent::process`'s hook
+///   sockets). A lease has no meaning across a reboot, so tmpfs is right here and wrong for the
+///   records above. Unset is still an error, as before M1.
+/// - **macOS:** `<home>/Library/Application Support/neovibe/session-leases/`, where `<home>` is the
+///   account's home directory from the user database (`getpwuid_r`), not `$HOME`. macOS has no
+///   `XDG_RUNTIME_DIR`, and it is deliberately NOT consulted even when someone sets it: a process
+///   launched with it and one launched without would split the lock. Two other homes were
+///   rejected (macOS track M1, 2026-09-17; design §4 M1 item 1):
+///   - `std::env::temp_dir()` reads `$TMPDIR` first, so it has the same split-brain problem, and
+///     this project runs tests with `TMPDIR=/nonexistent`;
+///   - `/var/folders/…/T/` itself is swept by `dirhelper` of files not accessed for 3 days. `flock`
+///     does not touch atime, and the lease file is opened by path with `create(true)`, so a lease
+///     held longer than that (a handed-off `claude --resume` left open) could lose its path and a
+///     second holder could lock a fresh inode alongside the first.
+///
+///   Nothing cleans `Application Support`. `flock` state does not survive a reboot, so a stale lock
+///   file there is only a file. `SessionLease::try_acquire` creates the directory 0700.
+///
+/// Before M1 macOS took the Linux branch and failed on the unset variable: a new session started
+/// without a lease, resume and handoff failed.
 pub(crate) fn leases_dir() -> std::io::Result<PathBuf> {
     if let Some(root) = test_root() {
         return Ok(root.join("session-leases"));
     }
+    platform_leases_dir()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_leases_dir() -> std::io::Result<PathBuf> {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
     Ok(PathBuf::from(runtime_dir).join("neovibe/session-leases"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_leases_dir() -> std::io::Result<PathBuf> {
+    Ok(macos_leases_dir_under(&account_home_dir()?))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_leases_dir_under(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/neovibe/session-leases")
+}
+
+/// This process's real user's home directory, from the user database rather than `$HOME`.
+#[cfg(target_os = "macos")]
+fn account_home_dir() -> std::io::Result<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf_len = 4096;
+    loop {
+        let mut buf = vec![0 as libc::c_char; buf_len];
+        // SAFETY: an all-zero `passwd` is valid (null pointers and integers); `getpwuid_r` fills it
+        // with pointers into `buf`, which outlives every read of them below.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe { libc::getpwuid_r(libc::getuid(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && buf_len < 1 << 20 {
+            buf_len *= 4;
+            continue;
+        }
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+        if result.is_null() || pwd.pw_dir.is_null() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "this user has no entry in the user database"));
+        }
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        let dir = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+        if !dir.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the user database gives a relative home directory {dir:?}"),
+            ));
+        }
+        return Ok(dir);
+    }
 }
 
 /// Points every directory above at a disposable root for the rest of this PROCESS, and returns it.
@@ -107,8 +180,9 @@ pub fn test_workspace_dir(label: &str) -> PathBuf {
 
 /// Removes every sibling root whose owning process is gone.
 ///
-/// Linux-only by construction (`/proc/<pid>`), which this whole workspace already is -- GTK4 on
-/// Wayland, `flock`, `/proc`-based process checks in `agent`'s own handoff tests. A name that is
+/// Liveness is `crate::process_probe::pid_is_alive`, i.e. `kill(pid, 0)`, on Linux and macOS alike.
+/// It used to be `/proc/<pid>` existing, which on macOS is never true, so every root -- including
+/// a concurrently running test binary's -- was deleted (M1, 2026-09-17). A name that is
 /// not a pid, or a pid that is still alive, is left alone; so is anything that fails to delete,
 /// since a test root that cannot be pruned is a cosmetic problem and a panic here would fail an
 /// unrelated test.
@@ -118,7 +192,7 @@ fn prune_dead_roots(parent: &Path) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Ok(pid) = name.parse::<u32>() else { continue };
-        if !Path::new(&format!("/proc/{pid}")).exists() {
+        if !crate::process_probe::pid_is_alive(pid) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -140,6 +214,36 @@ mod tests {
 
     /// The redirect is one-way and single-valued: a second call cannot move an already-redirected
     /// process somewhere else, which is what lets any helper call it without coordinating.
+    /// The unredirected macOS answer, resolved but never created (this must not write into the
+    /// developer's home): under the account's home, in `Application Support`, and not under
+    /// `temp_dir()` -- whose `$TMPDIR` dependence and 3-day sweep are the two reasons it moved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_lease_dir_is_under_the_account_home_and_not_the_temp_dir() {
+        let home = account_home_dir().expect("this user must have a home directory");
+        let dir = platform_leases_dir().unwrap();
+        assert_eq!(dir, macos_leases_dir_under(&home));
+        assert!(dir.ends_with("Library/Application Support/neovibe/session-leases"), "{dir:?}");
+        assert!(!dir.starts_with(std::env::temp_dir()), "{dir:?} must not be under TMPDIR");
+        assert!(!dir.starts_with("/var/folders") && !dir.starts_with("/private/var/folders"), "{dir:?}");
+    }
+
+    /// The home comes from the user database, so it cannot drift with the environment. Compared
+    /// with `dscl`'s answer for the same account, out of process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_account_home_matches_the_directory_service() {
+        let user = std::process::Command::new("id").arg("-un").output().unwrap();
+        let user = String::from_utf8(user.stdout).unwrap();
+        let out = std::process::Command::new("dscl")
+            .args([".", "-read", &format!("/Users/{}", user.trim()), "NFSHomeDirectory"])
+            .output()
+            .unwrap();
+        let out = String::from_utf8(out.stdout).unwrap();
+        let expected = out.trim().strip_prefix("NFSHomeDirectory:").expect("dscl output").trim();
+        assert_eq!(account_home_dir().unwrap(), Path::new(expected));
+    }
+
     #[test]
     fn redirecting_twice_returns_the_same_root() {
         assert_eq!(redirect_state_to_a_test_root(), redirect_state_to_a_test_root());
@@ -155,21 +259,24 @@ mod tests {
     }
 
     /// A root belonging to a pid that no longer exists is removed; a live one is not. Pid 1 always
-    /// exists on Linux, and `u32::MAX` is above `/proc/sys/kernel/pid_max` on every real system, so
-    /// it can never be a live process.
+    /// exists (init on Linux, launchd on macOS), and `u32::MAX` is above any real pid. `u32::MAX`
+    /// and `0` are also the two names a bare `kill(pid, 0)` would call alive -- `-1` and "my own
+    /// process group" -- so they are kept here as the regression cases for that.
     #[test]
     fn pruning_removes_dead_roots_and_leaves_live_ones() {
         let parent = std::env::temp_dir().join(format!("neovibe-prune-test-{}", uuid::Uuid::new_v4()));
         let dead = parent.join(u32::MAX.to_string());
+        let pid_zero = parent.join("0");
         let live = parent.join("1");
         let not_a_pid = parent.join("notapid");
-        for dir in [&dead, &live, &not_a_pid] {
+        for dir in [&dead, &pid_zero, &live, &not_a_pid] {
             std::fs::create_dir_all(dir).unwrap();
         }
 
         prune_dead_roots(&parent);
 
         assert!(!dead.exists(), "a root whose process is gone must be pruned");
+        assert!(!pid_zero.exists(), "pid 0 is never a live test process and must be pruned");
         assert!(live.exists(), "a root whose process is alive must be left alone");
         assert!(not_a_pid.exists(), "a directory that is not a pid must be left alone");
         let _ = std::fs::remove_dir_all(&parent);

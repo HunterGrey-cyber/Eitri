@@ -358,7 +358,7 @@ fn dropping_the_provider_leaves_no_orphaned_sidecar() {
         let provider = connect();
         let pid = provider.sidecar_pid();
         assert!(
-            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            agent::process_probe::pid_is_alive(pid),
             "the sidecar pid {pid} should exist while the provider is alive"
         );
         let session_id = create_bypass_session(&provider);
@@ -367,11 +367,11 @@ fn dropping_the_provider_leaves_no_orphaned_sidecar() {
     }; // provider dropped here: stdin closes, the sidecar sees EOF and exits
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && std::path::Path::new(&format!("/proc/{sidecar_pid}")).exists() {
+    while Instant::now() < deadline && agent::process_probe::pid_is_alive(sidecar_pid) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        !std::path::Path::new(&format!("/proc/{sidecar_pid}")).exists(),
+        !agent::process_probe::pid_is_alive(sidecar_pid),
         "sidecar pid {sidecar_pid} outlived its provider -- this is a leak to report, not to clean up by hand"
     );
 }
@@ -386,9 +386,13 @@ fn a_connected_provider_reports_wire_sourced_capabilities_and_versions() {
     let info = provider.info();
     let capabilities = provider.capabilities();
 
-    // 2 since the replay-start change (2026-09-12). A real incompatibility in both directions, which
-    // is what the handshake field is for -- see CLIENT_PROTOCOL_MAJOR's own comment.
-    assert_eq!(info.protocol_major, 2);
+    // Read from the client's own constant rather than a literal. This assertion sat at a literal 2
+    // from 2026-09-12 until the protocol-3 pin landed on 2026-09-15, by which point `connect()`
+    // would have REFUSED any sidecar that could satisfy it -- the test was unrunnable and green,
+    // because it is `#[ignore]`d. A literal here can only ever be stale or redundant: the handshake
+    // already refuses a mismatch, so what is worth pinning is that `info` reports the negotiated
+    // value rather than a default.
+    assert_eq!(info.protocol_major, agent::CLIENT_PROTOCOL_MAJOR);
     assert!(!info.sidecar_version.is_empty(), "got: {info:?}");
     // The provider states how much history it retains, and this client now keeps it. A test that
     // configures a small ring has no other way to confirm the configuration actually took effect.

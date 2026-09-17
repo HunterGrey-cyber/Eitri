@@ -49,8 +49,9 @@ const LOG_EVERY_N_FRAMES: u64 = 60;
 /// How many `add_tick_callback` invocations between `[tick]` summary log lines (see `TickStats`).
 const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 
-/// Painted by us into the full framebuffer before each `LiveHarness::render_frame` call, filling
-/// `gl_interop::CONTENT_MARGIN`'s inset border around the real content.
+/// The clear colour painted across the whole framebuffer before each `LiveHarness::render_frame`
+/// call (`canvas.clear(OUTSIDE_COLOR)` in the render callback below) -- a cheap defensive clear,
+/// not a colour a host can override any more (see the removal note below).
 ///
 /// **2026-09-07:** this used to be a loud, deliberately-wrong magenta (`(0.55, 0.15, 0.55)`) so a
 /// viewport-clear regression bleeding past `CONTENT_MARGIN` would be visible at a glance during
@@ -58,9 +59,32 @@ const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 /// geometry cross-checks) and this pane is now embedded in the real `shell` product, where a
 /// bright magenta strip around every real window reads as a bug rather than a debug aid -- a real
 /// user asked "what is that purple border, can it go away" the first time they saw it. Now a
-/// neutral near-black that blends with typical dark UI chrome (matches `shell`'s own theme
-/// background, `#1a1b1f`, closely enough to read as intentional there without this crate coupling
-/// itself to that specific theme's exact value).
+/// neutral near-black that blends with typical dark UI chrome.
+///
+/// **2026-09-16, established with a positive control, not just argued:** `CONTENT_MARGIN` is 0.0,
+/// so there is no inset band left for this to paint, and **no pixel on screen shows it at all.**
+/// `compute_content_region` returns the whole framebuffer at margin 0, and every arm of the render
+/// callback repaints that entire rect on top of this clear:
+///
+/// - `Ready` hands `content_region` to the fork's `Renderer::draw_frame`, which `clip_rect`s to it
+///   and *then* does `root_canvas.clear(default_background)` -- an `SkBlendMode::kSrc` fill of the
+///   whole clip with nvim's own `Normal` background (`src/renderer/mod.rs:272-283` at the pinned
+///   rev, fork commit `09b304a`, "only clear the renderer's own clipped viewport").
+/// - `NotStarted`/`Starting`/`Failed` fill the same rect with `STARTING_COLOR`/`FAILED_COLOR`,
+///   both opaque.
+///
+/// A GUI pass proved this with a positive control rather than assuming it from the code alone: a
+/// magenta probe at margin 0 produced 0 pixels anywhere, including across 220 frames of a live
+/// divider drag, while the identical probe at `CONTENT_MARGIN = 40` produced exactly the 40px
+/// frame's own pixel count. A host-settable clear colour (`set_clear_color`) existed for one
+/// release so a host could track nvim's own background in case this ever became visible again; it
+/// was removed once that control confirmed the colour reaches no pixel today, and the sub-cell
+/// remainder a floored `grid_size_for_content_region` leaves at the right and bottom edge lies
+/// *inside* `content_region` and has always been painted by the renderer in nvim's own background,
+/// not this colour. Removing the margin is what fixed the near-black frame on its own, and the
+/// value also matches nothing any more: `#1a1b1f` was the background of the placeholder palette
+/// `shell`'s theme pipeline replaced. If `CONTENT_MARGIN` ever becomes non-zero again, this
+/// constant -- and a reason to bring back a host-settable override -- becomes reachable once more.
 const OUTSIDE_COLOR: Color4f = Color4f::new(0.102, 0.106, 0.122, 1.0);
 /// Painted across the whole `content_region` while `LiveHarness` is being constructed (the one
 /// real, observed blocking call in this crate) -- distinct from both `OUTSIDE_COLOR` and anything
@@ -280,6 +304,23 @@ pub struct NeovideEditorPaneOptions {
     /// window whose three panes disagree about which project is open, which is worse than any of
     /// them being "wrong" consistently.
     pub cwd: Option<std::path::PathBuf>,
+    /// Extra arguments for the `nvim` binary itself, forwarded to
+    /// `LiveHarnessOptions::extra_nvim_args` after `--clean` (when `clean` is set).
+    ///
+    /// Like `child_env`, this crate takes no view on what a host passes. `shell` uses it for one
+    /// `--cmd` that loads its theme feed (see `shell/src/theme/feed.rs`); `--cmd` runs before the
+    /// user's own config, so what it installs is autocommands, not settings.
+    pub extra_nvim_args: Vec<String>,
+}
+
+/// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`.
+fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra.len() + 1);
+    if clean {
+        args.push("--clean".to_string());
+    }
+    args.extend(extra.iter().cloned());
+    args
 }
 
 impl NeovideEditorPane {
@@ -297,7 +338,7 @@ impl NeovideEditorPane {
     /// Same as [`NeovideEditorPane::new`], with every construction-time knob this pane forwards to
     /// `LiveHarnessOptions` spelled out. See [`NeovideEditorPaneOptions`] for what each one means.
     pub fn with_options(options: NeovideEditorPaneOptions) -> Self {
-        let NeovideEditorPaneOptions { clean, child_env, cwd } = options;
+        let NeovideEditorPaneOptions { clean, child_env, cwd, extra_nvim_args } = options;
         let gl_area = GLArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -468,9 +509,13 @@ impl NeovideEditorPane {
                 let content_region = compute_content_region(fb_w, fb_h);
                 let canvas = surface.canvas();
 
-                // Paint the entire framebuffer the neutral margin color first, then hand only the
-                // inset `content_region` to whatever's actually drawing this frame -- see
-                // `OUTSIDE_COLOR`'s own doc for why this is neutral now rather than a debug work.
+                // Cheap defensive clear, predating this work. Paint the entire framebuffer
+                // `OUTSIDE_COLOR` first, then hand only `content_region` to whatever's actually
+                // drawing this frame. At CONTENT_MARGIN 0 those two are the same rect and *every*
+                // arm below repaints all of it -- the renderer clip-clears `content_region` to
+                // nvim's own background, the placeholder arms fill it opaquely -- so nothing this
+                // clear writes survives the frame today; see `OUTSIDE_COLOR`'s own doc for the
+                // positive-control evidence.
                 canvas.clear(OUTSIDE_COLOR);
 
                 let mut live = live_state.borrow_mut();
@@ -493,11 +538,7 @@ impl NeovideEditorPane {
                         let os_scale_factor = widget.scale_factor() as f64;
                         let options = LiveHarnessOptions {
                             os_scale_factor,
-                            extra_nvim_args: if clean {
-                                vec!["--clean".to_string()]
-                            } else {
-                                Vec::new()
-                            },
+                            extra_nvim_args: nvim_args(clean, &extra_nvim_args),
                             // Cloned rather than moved because this closure is `Fn` and runs on
                             // every frame -- but this arm is the one-shot construction pass, so
                             // the clone happens exactly once per pane.
@@ -646,10 +687,13 @@ impl NeovideEditorPane {
                         // its final size without ever emitting a *further* `resize` signal after
                         // the Ready-time snapshot the constructor already takes -- leaving nvim's
                         // grid permanently sized for a stale, smaller content_region than the
-                        // widget's real one, visible as leftover `OUTSIDE_COLOR` past the grid's
-                        // real edge. Re-deriving the grid size from the widget's *current* actual
-                        // size on every tick (cheap: a handful of integer ops, no allocation) and
-                        // only calling `resize_grid` -- which is what actually costs anything --
+                        // widget's real one, visible as an undrawn band past the grid's real edge.
+                        // (This comment said "leftover `OUTSIDE_COLOR`" until 2026-09-16; that was
+                        // never right -- `draw_frame` clip-clears the *current* content_region to
+                        // nvim's own background, so the band is that background, not the host's
+                        // clear colour.) Re-deriving the grid size from the widget's *current*
+                        // actual size on every tick (cheap: a handful of integer ops, no
+                        // allocation) and only calling `resize_grid` -- which actually costs --
                         // when it disagrees with `last_grid_size` makes this self-correcting
                         // regardless of which exact GTK/Wayland/compositor timing produced the
                         // staleness, instead of chasing that one root cause.
@@ -781,5 +825,19 @@ impl NeovideEditorPane {
         } else {
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nvim_args;
+
+    #[test]
+    fn clean_comes_first_and_extra_arguments_follow_in_order() {
+        let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
+        assert_eq!(nvim_args(true, &extra), vec!["--clean", "--cmd", "lua print(1)"]);
+        assert_eq!(nvim_args(false, &extra), vec!["--cmd", "lua print(1)"]);
+        assert_eq!(nvim_args(true, &[]), vec!["--clean"]);
+        assert!(nvim_args(false, &[]).is_empty());
     }
 }

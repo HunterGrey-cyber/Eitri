@@ -41,9 +41,11 @@ const NATURAL_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// turn that never triggers a real tool call).
 const HOOK_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long the hook-listener thread waits for an accepted connection to finish writing its one
-/// line before giving up on it. `accept()` being non-blocking does NOT make the accepted
+/// line before giving up on it. On Linux, `accept()` being non-blocking does NOT make the accepted
 /// `UnixStream` non-blocking too (confirmed real: an accepted socket on Linux does not inherit
-/// `O_NONBLOCK` from a non-blocking listener) -- without this, a connection that starts but never
+/// `O_NONBLOCK` from a non-blocking listener). **macOS is the opposite** -- XNU copies the flag --
+/// so the listener sets every accepted stream blocking explicitly before relying on this timeout
+/// (see `spawn_hook_listener`; M1, 2026-09-17). Either way, without this, a connection that starts but never
 /// completes its line (a real `agent-hook` process killed/orphaned mid-write) would leave
 /// `read_line` blocked forever, with the same practical effect as the accept()-side deadlock this
 /// module already fixed once. A few hundred ms is generous: under normal operation `agent-hook`
@@ -133,8 +135,9 @@ pub struct AgentProcess {
 /// a real run of the earlier blocking-loop version hung for hours in `shutdown()`'s `join()` the
 /// first time a real test exercised a turn that never triggered a tool call (the common case).
 ///
-/// Also bounds the per-connection read via `HOOK_CONNECTION_READ_TIMEOUT`: a non-blocking
-/// listener's accepted streams do NOT themselves come back non-blocking (confirmed real, same
+/// Also bounds the per-connection read via `HOOK_CONNECTION_READ_TIMEOUT`: on Linux a non-blocking
+/// listener's accepted streams do NOT themselves come back non-blocking, and on macOS they do, so
+/// each one is set blocking explicitly right after `accept()` (confirmed real on both, same
 /// class of deadlock as the accept()-side one above, just triggered by "a connection starts but
 /// never completes its line" instead of "nothing ever connects") -- without this, a real
 /// `agent-hook` process killed/orphaned mid-write would park this thread in `read_line` forever.
@@ -175,6 +178,15 @@ fn spawn_hook_listener(
             }
             Err(_) => break, // listener itself is gone/broken -- nothing more to do
         };
+        // Blocking first, explicitly. Linux clears `O_NONBLOCK` on an accepted fd; macOS copies
+        // it from this non-blocking listener (rust-lang/rust#67027), and a non-blocking stream's
+        // `read_line` returns `WouldBlock` whenever `agent-hook` has not finished writing yet --
+        // which the branch below turns into a deny of a tool call nobody refused. A stream whose
+        // mode cannot be set is denied here instead, for the same fail-closed reason.
+        if let Err(e) = stream.set_nonblocking(false) {
+            write_fail_closed_deny(&stream, &format!("could not make the relay connection blocking ({e})"));
+            continue;
+        }
         // See `HOOK_CONNECTION_READ_TIMEOUT`'s doc: without this, a connection that starts but
         // never completes its line would block this thread forever, never re-checking `stop`.
         let _ = stream.set_read_timeout(Some(HOOK_CONNECTION_READ_TIMEOUT));
@@ -338,7 +350,7 @@ impl AgentProcess {
         binary: &str,
     ) -> std::io::Result<Self> {
         let conversation_id = Uuid::new_v4();
-        let socket_path = std::env::temp_dir().join(format!("neovibe-agent-hook-{conversation_id}.sock"));
+        let socket_path = crate::socket_path::hook_socket(&std::env::temp_dir(), conversation_id)?;
         let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
         // Bypass mode asks for no gate at all, so no hook is installed. In every other mode the
@@ -775,7 +787,7 @@ mod tests {
             "shutdown() must return in bounded time, took {:?}",
             shutdown_started.elapsed()
         );
-        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!crate::process_probe::pid_is_alive(pid), "pid {pid} outlived shutdown()");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -793,7 +805,8 @@ mod tests {
     }
 
     fn temp_socket_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("agent-process-listener-test-{}.sock", uuid::Uuid::new_v4()))
+        crate::socket_path::in_dir(&std::env::temp_dir(), &format!("nv-listener-{}.sock", uuid::Uuid::new_v4().simple()))
+            .expect("the listener tests' socket path must fit the macOS limit")
     }
 
     /// The regression test for the real deadlock this task found: no real `claude` process
@@ -875,6 +888,66 @@ mod tests {
         );
 
         drop(stalled_client);
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The macOS regression test for the accepted stream's blocking mode (M1, 2026-09-17).
+    ///
+    /// Linux gives `accept()`'s new fd a clear `O_NONBLOCK` whatever the listener has; XNU copies
+    /// the listener's (rust-lang/rust#67027). This listener is non-blocking, so on macOS the
+    /// accepted stream was too, and a `read_line` that ran before `agent-hook` had written its
+    /// line returned `WouldBlock` -- which the loop treats as a failed read and answers with a
+    /// fail-closed deny. The gate refused a real tool call nobody had refused.
+    ///
+    /// Every other relay test here writes immediately after connecting, which is why none of them
+    /// caught it. This one waits several poll intervals first, so the listener has certainly
+    /// accepted and reached `read_line` with nothing to read, and then writes a payload larger
+    /// than 16 KiB, so the line cannot arrive in one read either (macOS's AF_UNIX stream buffer is
+    /// 8 KiB). It must come out as a `PermissionRequest`, not a deny.
+    #[test]
+    fn a_relayed_request_written_after_a_poll_interval_and_larger_than_16_kib_is_not_denied() {
+        let fixture = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/v2_hook_pretooluse_stdin.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(fixture.trim()).unwrap();
+        payload["tool_input"]["command"] = serde_json::Value::String(format!("echo {}", "x".repeat(32 * 1024)));
+        let line = serde_json::to_string(&payload).unwrap();
+        assert!(line.len() > 16 * 1024);
+
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone()).unwrap();
+
+        let client = UnixStream::connect(&socket_path).unwrap();
+        std::thread::sleep(HOOK_LISTENER_POLL_INTERVAL * 5);
+        // From another thread: 32 KiB does not fit the socket buffer, so this write blocks until
+        // the listener reads, and a listener that has already given up would leave it blocked.
+        let mut writer = client.try_clone().unwrap();
+        let write = std::thread::spawn(move || writeln!(writer, "{line}"));
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(AgentEvent::PermissionRequest { request_id, source, .. }) => {
+                assert_eq!(request_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
+                assert_eq!(source, PermissionSource::HookRelay);
+            }
+            Ok(other) => panic!("expected PermissionRequest, got {other:?}"),
+            Err(_) => {
+                // Best-effort: macOS refuses setsockopt with EINVAL once the peer has shut down.
+                let _ = client.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut reply = String::new();
+                let _ = BufReader::new(&client).read_line(&mut reply);
+                panic!("no PermissionRequest within 2s; the listener answered {reply:?}");
+            }
+        }
+        write.join().unwrap().expect("the whole payload should have been written");
+        assert!(pending.lock().unwrap().contains_key("toolu_01CtdezhmhUCrBaswxW5HYmC"));
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
         let _ = std::fs::remove_file(&socket_path);
     }
 
@@ -1216,10 +1289,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Live thread count for this test process, straight from the kernel (`/proc/self/task`) --
-    /// Linux-only, same platform scope as the rest of this module.
+    /// Live thread count for this test process, straight from the kernel -- `/proc/self/task` on
+    /// Linux, `proc_pidinfo` on macOS (see `crate::process_probe`).
     fn live_thread_count() -> usize {
-        std::fs::read_dir("/proc/self/task").unwrap().count()
+        crate::process_probe::thread_count(std::process::id()).expect("this process's thread count must be readable")
     }
 
     /// Every per-conversation hook socket currently sitting in the temp dir, by name.
@@ -1228,7 +1301,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("neovibe-agent-hook-"))
+            .filter(|name| name.starts_with(crate::socket_path::HOOK_SOCKET_PREFIX))
             .collect()
     }
 

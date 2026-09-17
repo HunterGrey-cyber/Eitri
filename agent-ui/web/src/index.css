@@ -1,5 +1,5 @@
 :root {
-  color-scheme: dark;
+  color-scheme: var(--nv-color-scheme);
 }
 
 * {
@@ -12,9 +12,9 @@ body,
   margin: 0;
   padding: 0;
   height: 100%;
-  background: #1e1e2e;
-  color: #cdd6f4;
-  font-family: -apple-system, "Segoe UI", sans-serif;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-prose);
   font-size: 14px;
 }
 
@@ -45,9 +45,9 @@ body,
   display: flex;
   justify-content: space-between;
   padding: 8px 12px;
-  background: #181825;
-  border-bottom: 1px solid #313244;
-  font-family: ui-monospace, monospace;
+  background: var(--nv-surface);
+  border-bottom: 1px solid var(--nv-border);
+  font-family: var(--nv-font-mono);
   font-size: 12px;
 }
 
@@ -59,22 +59,22 @@ body,
   margin-bottom: 12px;
 }
 .assistant-message pre {
-  background: #11111b;
+  background: var(--nv-bg);
   padding: 8px;
   border-radius: 4px;
   overflow-x: auto;
 }
 
 .tool-card {
-  background: #181825;
-  border-left: 3px solid #89b4fa;
+  background: var(--nv-surface);
+  border-left: 3px solid var(--nv-mode-browse);
   padding: 6px 10px;
   border-radius: 4px;
-  font-family: ui-monospace, monospace;
+  font-family: var(--nv-font-mono);
   font-size: 12.5px;
 }
 .tool-card-skill {
-  border-left-color: #a6e3a1;
+  border-left-color: var(--nv-ok);
   font-style: italic;
 }
 /* A tool call's outcome, drawn for every tool. The three states have to be distinguishable at a
@@ -82,18 +82,27 @@ body,
    only errors were ever printed. */
 .tool-result {
   margin-top: 4px;
-  font-family: ui-monospace, monospace;
+  font-family: var(--nv-font-mono);
   font-size: 12px;
 }
 .tool-result-pending {
-  color: #a6adc8;
+  color: var(--nv-muted);
   font-style: italic;
 }
+/* Signal colours (`--nv-warn`, `--nv-error`, `--nv-ok`, `--nv-mode-*`) are never text colours here.
+   Rust guards the first three at 3:1, which is enough for a border, a rule, a tint or a dot (WCAG
+   1.4.11) and not for 12px text (1.4.3, 4.5:1); the mode colours are not guarded at all. Drawn as
+   text on rose-pine dawn they measured 2.05:1 to 3.84:1. So a warning's or an error's text is
+   `--nv-fg`, and the colour goes on the border or on a rule beside it -- a rule that is there or not
+   is also a cue that does not depend on colour. `indexCss.test.ts` holds every `color:` here to
+   `--nv-fg`/`--nv-muted`. */
 .tool-result-error {
-  color: #f38ba8;
+  color: var(--nv-fg);
+  border-left: 2px solid var(--nv-error);
+  padding-left: 6px;
 }
 .tool-result-body {
-  background: #11111b;
+  background: var(--nv-bg);
   padding: 6px 8px;
   border-radius: 4px;
   margin: 0;
@@ -105,21 +114,23 @@ body,
   word-break: break-word;
 }
 .tool-result-truncated {
-  color: #a6adc8;
+  color: var(--nv-muted);
   font-size: 11px;
   margin-top: 2px;
 }
 /* The tool call a pending permission is blocking, marked where the call itself is rather than only
    on the card further down. */
 .tool-awaiting-permission {
-  color: #f9e2af;
+  color: var(--nv-fg);
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
   font-size: 11px;
   margin-top: 2px;
 }
 
 .permission-card {
-  background: #313244;
-  border: 1px solid #f9e2af;
+  background: var(--nv-surface);
+  border: 1px solid var(--nv-warn);
   border-radius: 6px;
   padding: 10px;
   margin-bottom: 12px;
@@ -127,13 +138,13 @@ body,
 /* Which call, under the tool's name: subdued, because it identifies the request rather than being
    the thing the user is deciding about. */
 .permission-card-tool-use-id {
-  color: #a6adc8;
-  font-family: ui-monospace, monospace;
+  color: var(--nv-muted);
+  font-family: var(--nv-font-mono);
   font-size: 11px;
   margin-bottom: 4px;
 }
 .permission-card-input {
-  background: #11111b;
+  background: var(--nv-bg);
   padding: 6px;
   border-radius: 4px;
   overflow-x: auto;
@@ -150,7 +161,7 @@ body,
   flex-wrap: wrap;
   gap: 8px;
   padding: 10px;
-  border-top: 1px solid #313244;
+  border-top: 1px solid var(--nv-border);
 }
 
 /* Why the box stopped taking input while a terminal handoff closes the conversation. A control that
@@ -160,15 +171,17 @@ body,
   flex: 0 0 100%;
   margin: 0;
   font-size: 12px;
-  color: #f9e2af;
+  color: var(--nv-fg);
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
 }
 .composer textarea {
   flex: 1;
   resize: none;
   min-height: 44px;
-  background: #11111b;
-  color: #cdd6f4;
-  border: 1px solid #313244;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  border: 1px solid var(--nv-border);
   border-radius: 4px;
   padding: 8px;
 }
@@ -193,15 +206,16 @@ body,
 .mode-selector .warning {
   margin-top: 16px;
   padding: 10px 12px;
-  border: 1px solid #f9e2af;
+  border: 1px solid var(--nv-warn);
+  border-left-width: 3px;
   border-radius: 4px;
-  background: rgba(249, 226, 175, 0.08);
-  color: #f9e2af;
+  background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
+  color: var(--nv-fg);
   font-size: 12px;
   text-align: left;
 }
 .mode-selector code {
-  font-family: ui-monospace, monospace;
+  font-family: var(--nv-font-mono);
   opacity: 0.85;
 }
 
@@ -218,9 +232,17 @@ body,
   opacity: 0.7;
   cursor: help; /* every one of these has the full value in its title attribute */
 }
-.session-header .status-unavailable,
-.session-header .status-closed {
-  color: #f38ba8;
+/* The status word stays `--nv-fg`; the error colour is a dot in front of it. */
+.session-header .status-unavailable::before,
+.session-header .status-closed::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--nv-error);
+  vertical-align: middle;
 }
 
 /* Replaces window.alert: copyable, non-blocking, and able to show the sidecar's own multi-line
@@ -228,18 +250,19 @@ body,
 .fatal-error {
   margin: 12px;
   padding: 12px;
-  border: 1px solid #f38ba8;
+  border: 1px solid var(--nv-error);
+  border-left-width: 3px;
   border-radius: 4px;
-  background: rgba(243, 139, 168, 0.08);
-  color: #f38ba8;
+  background: color-mix(in srgb, var(--nv-error) 8%, transparent);
+  color: var(--nv-fg);
   font-size: 12px;
 }
 .fatal-error pre {
   margin: 8px 0;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: ui-monospace, monospace;
-  color: #cdd6f4;
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
   user-select: text;
 }
 
@@ -251,18 +274,19 @@ body,
 .session-lost {
   margin: 12px;
   padding: 12px;
-  border: 1px solid #f38ba8;
+  border: 1px solid var(--nv-error);
+  border-left-width: 3px;
   border-radius: 4px;
-  background: rgba(243, 139, 168, 0.08);
-  color: #f38ba8;
+  background: color-mix(in srgb, var(--nv-error) 8%, transparent);
+  color: var(--nv-fg);
   font-size: 12px;
 }
 .session-lost pre {
   margin: 8px 0 0;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: ui-monospace, monospace;
-  color: #cdd6f4;
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
   user-select: text;
 }
 
@@ -272,8 +296,8 @@ body,
   margin: 12px;
   padding: 8px 12px;
   border-radius: 4px;
-  background: rgba(205, 214, 244, 0.06);
-  color: #a6adc8;
+  background: color-mix(in srgb, var(--nv-fg) 6%, transparent);
+  color: var(--nv-muted);
   font-size: 12px;
 }
 
@@ -288,20 +312,20 @@ body,
    since it continues a conversation instead of starting one -- rendered pale-on-pale while every
    other button stayed correctly dark. */
 .mode-selector button {
-  border: 1px solid #313244;
+  border: 1px solid var(--nv-border);
   border-radius: 4px;
-  background: #1e1e2e;
-  color: #cdd6f4;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
   cursor: pointer;
 }
 .mode-selector button:hover {
-  background: #262637;
+  background: var(--nv-cursorline);
 }
+/* The row's heading is `--nv-fg`, like every other button's; only the border says "resume". It was
+   `--nv-mode-browse` (Function's foreground, which nothing guards), and on rose-pine dawn that drew
+   the label of the control whose misclick costs the most at 2.60:1, and 2.05:1 on its hover band. */
 .mode-selector button.resume {
-  border-color: #89b4fa;
-}
-.mode-selector button.resume strong {
-  color: #89b4fa;
+  border-color: var(--nv-mode-browse);
 }
 
 /* A permission request that outlived its session. Muted rather than alarming: the loud banner above
@@ -309,7 +333,7 @@ body,
 .permission-card-stale {
   margin-top: 8px;
   font-size: 11px;
-  color: #a6adc8;
+  color: var(--nv-muted);
 }
 
 /* The which-conversation axis, above the permission-mode buttons. Visually grouped so it reads as a
@@ -345,12 +369,13 @@ body,
    carries a blue border unselected, so a border-only cue would make "armed" and "merely available"
    look the same on the option where it matters. */
 .mode-selector .session-choice button.selected {
-  border-color: #89b4fa;
-  background: rgba(137, 180, 250, 0.18);
+  border-color: var(--nv-mode-browse);
+  background: color-mix(in srgb, var(--nv-mode-browse) 18%, transparent);
 }
-.mode-selector .session-choice button[aria-checked="false"] {
-  opacity: 0.7;
-}
+/* Unselected rows are not dimmed. They were, with `opacity: 0.7`, and opacity takes the text's
+   contrast down with it: fg at 0.7 is 3.34:1 on rose-pine dawn. Every remembered-session row is
+   unselected until clicked (the picker opens on "New session"), so that was every resume row's
+   heading. The fill above is what marks the selected one. */
 
 /* "Continue in a terminal", under the composer. Quiet by default: it is a way out of this panel,
    not one of the things it is for. */
@@ -364,9 +389,9 @@ body,
 }
 .handoff-open {
   background: none;
-  border: 1px solid #45475a;
+  border: 1px solid var(--nv-border);
   border-radius: 4px;
-  color: #a6adc8;
+  color: var(--nv-muted);
   font-size: 11px;
   padding: 4px 8px;
   cursor: pointer;
@@ -379,7 +404,7 @@ body,
    A disabled button with no explanation reads as broken, and a tooltip is unreadable without a
    pointer hovering it. */
 .handoff-blocked {
-  color: #a6adc8;
+  color: var(--nv-muted);
   flex: 1 1 200px;
 }
 
@@ -388,16 +413,17 @@ body,
 .handoff-confirm {
   margin: 0 12px 12px;
   padding: 10px 12px;
-  border: 1px solid #f9e2af;
+  border: 1px solid var(--nv-warn);
   border-radius: 4px;
-  background: rgba(249, 226, 175, 0.08);
+  background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
   font-size: 12px;
 }
 .handoff-confirm p {
   margin: 0 0 8px;
 }
 .handoff-confirm .warning {
-  color: #f9e2af;
+  border-left: 3px solid var(--nv-warn);
+  padding-left: 8px;
 }
 .handoff-confirm-buttons {
   display: flex;
@@ -410,9 +436,9 @@ body,
 .handoff-card {
   margin: 12px;
   padding: 12px;
-  border: 1px solid #89b4fa;
+  border: 1px solid var(--nv-mode-browse);
   border-radius: 4px;
-  background: rgba(137, 180, 250, 0.08);
+  background: color-mix(in srgb, var(--nv-mode-browse) 8%, transparent);
   font-size: 12px;
   text-align: left;
 }
@@ -420,10 +446,11 @@ body,
   margin: 8px 0 0;
 }
 .handoff-card .warning {
-  color: #f9e2af;
+  border-left: 3px solid var(--nv-warn);
+  padding-left: 8px;
 }
 .handoff-card .detail {
-  color: #a6adc8;
+  color: var(--nv-muted);
 }
 /* Selectable and wrapping: this is a line to copy character for character, and a long project path
    must not push it out of the pane. */
@@ -431,11 +458,11 @@ body,
   margin: 8px 0 0;
   padding: 8px;
   border-radius: 4px;
-  background: #181825;
+  background: var(--nv-surface);
   white-space: pre-wrap;
   word-break: break-all;
-  font-family: ui-monospace, monospace;
-  color: #cdd6f4;
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
   user-select: text;
 }
 
@@ -449,10 +476,11 @@ body,
   gap: 8px;
   margin: 12px;
   padding: 10px;
-  border: 1px solid #f9e2af;
+  border: 1px solid var(--nv-warn);
+  border-left-width: 3px;
   border-radius: 4px;
-  background: rgba(249, 226, 175, 0.08);
-  color: #f9e2af;
+  background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
+  color: var(--nv-fg);
   font-size: 12px;
 }
 .command-notice span {

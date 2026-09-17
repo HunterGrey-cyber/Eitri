@@ -350,10 +350,20 @@ fn adopt_provider_session(context: &AdoptionContext, provider_session_id: &str) 
         provider_session_id,
     ) {
         Ok(lease) => Some(lease),
-        Err(e) => {
+        Err(e @ crate::lease::LeaseError::AlreadyHeld) => {
             eprintln!(
                 "agent: could not take the session lease for {provider_session_id}: {e} -- \
                  continuing without it; another Neovibe window may be driving the same session"
+            );
+            None
+        }
+        // Not contention: the lease directory could not be used at all. Saying "another window"
+        // here sent the reader looking for a process that did not exist -- on macOS before M1,
+        // every session took this branch because `XDG_RUNTIME_DIR` was unset.
+        Err(e) => {
+            eprintln!(
+                "agent: could not take the session lease for {provider_session_id}: {e} -- \
+                 continuing without it; this is not contention, the lease could not be taken at all"
             );
             None
         }
