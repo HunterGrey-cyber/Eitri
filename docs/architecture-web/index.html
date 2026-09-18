@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="neovibe 的运行时架构：嵌入式 Neovim、AI agent 与 Verdandi 面板。">
+  <title>neovibe · architecture</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --void: #101315;
+      --plane: #181d1f;
+      --panel: #202729;
+      --line: #3b4747;
+      --ink: #edf4ed;
+      --muted: #a9b5ae;
+      --subtle: #728079;
+      --blue: #83b6ff;
+      --amber: #ffc76d;
+      --cyan: #72dfd2;
+      --focus: #fbfbf3;
+      --font: Inter, "Noto Sans CJK SC", "PingFang SC", sans-serif;
+      --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+    }
+
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --void: #f4f7f4;
+      --plane: #ffffff;
+      --panel: #edf3f0;
+      --line: #c6d3ce;
+      --ink: #15201b;
+      --muted: #50625a;
+      --subtle: #74837b;
+      --blue: #225fae;
+      --amber: #966000;
+      --cyan: #067c72;
+      --focus: #15201b;
+    }
+
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--void);
+      font: 400 16px/1.58 var(--font);
+    }
+    .page { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 28px;
+      align-items: start;
+      padding: 52px 0 34px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 15ch;
+      margin-bottom: 13px;
+      font-size: clamp(2.2rem, 5vw, 4.5rem);
+      line-height: .98;
+      letter-spacing: -.065em;
+    }
+    .lede { max-width: 58ch; color: var(--muted); font-size: 1.05rem; }
+    .build-note { color: var(--subtle); font: 500 .78rem/1.4 var(--mono); }
+    #theme-toggle {
+      flex: none;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      padding: .6rem .8rem;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: 500 .78rem/1 var(--mono);
+    }
+    #theme-toggle:hover { color: var(--ink); border-color: var(--ink); }
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+
+    section { padding-top: 42px; }
+    h2 { margin-bottom: 7px; font-size: 1.25rem; letter-spacing: -.02em; }
+    .section-note { max-width: 65ch; color: var(--muted); }
+
+    .diagram-frame {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      background: var(--plane);
+    }
+    svg { display: block; min-width: 850px; width: 100%; height: auto; }
+    .zone { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+    .zone-label { fill: var(--subtle); font: 600 11px var(--mono); letter-spacing: 1.3px; }
+    .node { fill: var(--plane); stroke: var(--line); stroke-width: 1.2; }
+    .node-title { fill: var(--ink); font: 600 16px var(--font); }
+    .node-copy { fill: var(--muted); font: 13px var(--font); }
+    .flow { fill: none; stroke-width: 2.5; marker-end: url(#arrow); }
+    .flow-edit { stroke: var(--blue); }
+    .flow-agent { stroke: var(--amber); }
+    .flow-runtime { stroke: var(--cyan); }
+    .flow-label { font: 600 12px var(--mono); }
+    .flow-label.edit { fill: var(--blue); }
+    .flow-label.agent { fill: var(--amber); }
+    .flow-label.runtime { fill: var(--cyan); }
+    .node-group { cursor: default; }
+    .node-group:hover .node, .node-group:focus .node { stroke: var(--ink); stroke-width: 2; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 12px 24px; margin: 16px 0 0; color: var(--muted); font-size: .875rem; }
+    .legend span { display: inline-flex; align-items: center; gap: 8px; }
+    .swatch { display: inline-block; width: 26px; height: 2px; }
+    .edit { background: var(--blue); }
+    .agent { background: var(--amber); }
+    .runtime { background: var(--cyan); }
+
+    .flows { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; border: 1px solid var(--line); background: var(--line); }
+    .flow-card { min-height: 190px; padding: 21px; background: var(--plane); }
+    .flow-card h3 { margin-bottom: 10px; font-size: 1rem; }
+    .flow-card p { margin-bottom: 0; color: var(--muted); font-size: .93rem; }
+    .flow-card code { color: var(--ink); font: .78rem var(--mono); }
+
+    .facts { display: grid; grid-template-columns: 1.15fr 1fr; gap: 40px; padding-bottom: 72px; }
+    .facts p { max-width: 62ch; color: var(--muted); }
+    .fact-list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+    .fact-list li { display: grid; grid-template-columns: 140px 1fr; gap: 18px; padding: 13px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
+    .fact-list b { color: var(--ink); font: 600 .85rem var(--mono); }
+    footer { padding: 18px 0 32px; border-top: 1px solid var(--line); color: var(--subtle); font: .76rem var(--mono); }
+
+    @media (max-width: 700px) {
+      .page { width: min(100% - 24px, 1180px); }
+      header { display: block; padding-top: 32px; }
+      #theme-toggle { margin-top: 10px; }
+      .flows, .facts { grid-template-columns: 1fr; gap: 1px; }
+      .facts { gap: 28px; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>neovibe 的运行时架构</h1>
+        <p class="lede">一个以真实 Neovim 编辑体验为核心的 GTK4 开发环境：编辑、AI 与 Verdandi runtime 各自独立，随后在 shell 中汇合为同一扇窗口。</p>
+        <p class="build-note">architecture overview · 2026-09-18</p>
+      </div>
+      <button id="theme-toggle" type="button" aria-pressed="false">切换为浅色</button>
+    </header>
+
+    <section aria-labelledby="map-title">
+      <h2 id="map-title">一张运行时地图</h2>
+      <p class="section-note">外壳负责组合而不吞没实现；颜色表示数据移动方向，而不是模块的重要程度。</p>
+      <div class="diagram-frame">
+        <svg viewBox="0 0 1100 560" role="img" aria-label="neovibe runtime architecture">
+          <defs>
+            <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M 0 0 L 8 4.5 L 0 9 z" fill="context-stroke"/></marker>
+          </defs>
+          <rect class="zone" x="25" y="25" width="1050" height="155"/>
+          <text class="zone-label" x="48" y="55">PRODUCT WINDOW · SHELL</text>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="48" y="75" width="230" height="75"/><text class="node-title" x="66" y="105">GTK4 shell</text><text class="node-copy" x="66" y="129">窗口、布局、主题、Lua 面板</text>
+          </g>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="330" y="75" width="245" height="75"/><text class="node-title" x="348" y="105">neovide-editor</text><text class="node-copy" x="348" y="129">GtkGLArea · Skia · renderer</text>
+          </g>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="827" y="75" width="220" height="75"/><text class="node-title" x="845" y="105">agent-ui/web</text><text class="node-copy" x="845" y="129">WebKitGTK · React/TS</text>
+          </g>
+          <path class="flow flow-edit" d="M278 112 H330"/><text class="flow-label edit" x="287" y="99">compose</text>
+          <path class="flow flow-agent" d="M575 112 H827"/><text class="flow-label agent" x="662" y="99">WebView bridge</text>
+
+          <rect class="zone" x="25" y="210" width="1050" height="145"/>
+          <text class="zone-label" x="48" y="240">CORE + AGENT LAYER</text>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="48" y="258" width="240" height="70"/><text class="node-title" x="66" y="286">neovibe-core</text><text class="node-copy" x="66" y="309">bridge · tokens · sockets · trace</text>
+          </g>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="385" y="258" width="208" height="70"/><text class="node-title" x="403" y="286">agent · legacy</text><text class="node-copy" x="403" y="309">Claude CLI · stream-json</text>
+          </g>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="700" y="258" width="220" height="70"/><text class="node-title" x="718" y="286">agent · sidecar</text><text class="node-copy" x="718" y="309">gRPC · resume · ingestion</text>
+          </g>
+          <path class="flow flow-agent" d="M288 293 H385"/><path class="flow flow-agent" d="M593 293 H700"/>
+          <path class="flow flow-agent" d="M935 150 V258"/><text class="flow-label agent" x="946" y="210">events</text>
+
+          <rect class="zone" x="25" y="385" width="1050" height="145"/>
+          <text class="zone-label" x="48" y="415">EDITOR + VERDANDI RUNTIMES</text>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="48" y="435" width="245" height="68"/><text class="node-title" x="66" y="463">nvim --embed</text><text class="node-copy" x="66" y="485">真实编辑进程</text>
+          </g>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="395" y="435" width="242" height="68"/><text class="node-title" x="413" y="463">terminal-pane</text><text class="node-copy" x="413" y="485">terminal-session transport</text>
+          </g>
+          <g class="node-group" tabindex="0">
+            <rect class="node" x="735" y="435" width="230" height="68"/><text class="node-title" x="753" y="463">semantic-pane</text><text class="node-copy" x="753" y="485">ConversationProjection</text>
+          </g>
+          <path class="flow flow-edit" d="M452 150 V435 H293"/><text class="flow-label edit" x="462" y="390">input / render</text>
+          <path class="flow flow-runtime" d="M460 328 V435"/><path class="flow flow-runtime" d="M810 328 V435"/>
+        </svg>
+      </div>
+      <div class="legend" aria-label="图例"><span><i class="swatch edit"></i>编辑路径</span><span><i class="swatch agent"></i>智能体路径</span><span><i class="swatch runtime"></i>Verdandi 运行时路径</span></div>
+    </section>
+
+    <section aria-labelledby="flows-title">
+      <h2 id="flows-title">三条关键路径</h2>
+      <div class="flows">
+        <article class="flow-card"><h3>编辑路径</h3><p>键盘与鼠标输入进入 <code>shell</code>，由 <code>neovide-editor</code> 驱动真实的 <code>nvim --embed</code>；Skia/Neovide renderer 将编辑状态直接绘制到 GTK 的 GL 区域。</p></article>
+        <article class="flow-card"><h3>智能体路径</h3><p><code>agent-ui/web</code> 通过 shell/core 桥接会话。默认 <code>legacy</code> 启动 Claude CLI；<code>sidecar</code> 经 Verdandi 提供流式事件、权限往返和会话恢复。</p></article>
+        <article class="flow-card"><h3>Verdandi 运行时路径</h3><p><code>terminal-pane</code> 和 <code>semantic-pane</code> 分别消费终端 runtime 与对话投影。它们是独立面板，而非编辑器或 AI 面板的附属视图。</p></article>
+      </div>
+    </section>
+
+    <section class="facts" aria-labelledby="boundaries-title">
+      <div>
+        <h2 id="boundaries-title">边界比集成更重要</h2>
+        <p>产品窗口只承担编排：GTK 依赖留在 shell 与面板 crate；可测试的协议、路径、主题 token 与 agent backend 边界沉在 <code>neovibe-core</code>。这使 Linux/macOS 的平台工作能从 UI 依赖中分离出来。</p>
+      </div>
+      <ul class="fact-list">
+        <li><b>默认 agent</b><span>legacy；环境变量可选择 sidecar。</span></li>
+        <li><b>权限</b><span>按能力提供 auto / bypass，而非按后端名称硬编码。</span></li>
+        <li><b>会话恢复</b><span>sidecar 可用并受 provider handshake 约束；legacy 不提供恢复。</span></li>
+        <li><b>主题</b><span>nvim colorscheme → core token → GTK chrome 与 WebView 面板。</span></li>
+      </ul>
+    </section>
+    <footer>source: AGENTS.md · README.md · architecture overview is a human-oriented map, not an API contract</footer>
+  </main>
+  <script>
+    const root = document.documentElement;
+    const button = document.querySelector("#theme-toggle");
+    const updateTheme = (light) => {
+      root.dataset.theme = light ? "light" : "dark";
+      button.textContent = light ? "切换为深色" : "切换为浅色";
+      button.setAttribute("aria-pressed", String(light));
+    };
+    button.addEventListener("click", () => updateTheme(root.dataset.theme !== "light"));
+  </script>
+</body>
+</html>
