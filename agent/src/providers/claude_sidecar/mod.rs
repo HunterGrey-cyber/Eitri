@@ -774,6 +774,18 @@ mod tests {
                 "fork_session",
                 "setting_sources",
                 "tool_policy",
+                // Which executable sources this build can actually serve, advertised as capability
+                // strings rather than a new wire field. `executable_host_cli` is always present;
+                // a checkout build adds a 13th, `executable_sdk_bundled`, which a PACKAGED build
+                // cannot serve at all (the SDK resolves its own CLI through `createRequire`, and a
+                // single-file artifact has no node_modules for it to find). This fixture carries
+                // the PACKAGED shape -- twelve -- because that is what a shipped install meets.
+                //
+                // Measured 2026-09-18 against the real artifact
+                // (verdandi-claude-sidecar-0.1.0-linux-x64), not transcribed from a commit
+                // message: a live Handshake returned exactly these twelve, and a CreateSession
+                // carrying SDK_BUNDLED was refused with INVALID_CONFIGURATION naming host_cli.
+                "executable_host_cli",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -842,7 +854,9 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        assert_eq!(info.advertised_capabilities.len(), 11);
+        // Twelve: the PACKAGED shape, which is what a shipped install meets. A checkout build
+        // advertises a thirteenth, executable_sdk_bundled. See real_handshake_today().
+        assert_eq!(info.advertised_capabilities.len(), 12);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }

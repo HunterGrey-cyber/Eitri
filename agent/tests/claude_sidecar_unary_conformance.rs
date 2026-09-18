@@ -102,16 +102,30 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "fork_session",
         "setting_sources",
         "tool_policy",
+        "executable_host_cli",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
-    // Order and length included, not just set membership: the fixture is transcribed from the
-    // sidecar's own literal, and this is what keeps the transcription honest.
+    // Order and length included for the twelve a PACKAGED build serves, not just set membership:
+    // the fixture is transcribed from the sidecar's own literal, and this is what keeps the
+    // transcription honest.
+    //
+    // The one permitted difference is the thirteenth entry: a build running from a Verdandi
+    // CHECKOUT can also serve `executable_sdk_bundled`, and a packaged single-file artifact cannot
+    // (no node_modules for the SDK's own CLI to resolve through). This test spawns whichever the
+    // host has, so it accepts either -- but only that one extra, only in that position. Anything
+    // else means the real list moved and the fixture owes an update.
+    let (common, extra) = info.advertised_capabilities.split_at(expected.len().min(info.advertised_capabilities.len()));
     assert_eq!(
-        info.advertised_capabilities, expected,
+        common, expected.as_slice(),
         "the real sidecar's capability list has moved; update real_handshake_today() in \
          agent/src/providers/claude_sidecar/mod.rs to match"
+    );
+    assert!(
+        extra.is_empty() || extra == ["executable_sdk_bundled".to_string()],
+        "the only capability a checkout build may add past the packaged twelve is \
+         executable_sdk_bundled; got {extra:?}"
     );
 
     assert_eq!(

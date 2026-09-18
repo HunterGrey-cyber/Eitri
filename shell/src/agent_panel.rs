@@ -476,6 +476,17 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
 /// no equivalent check: either way the user is returned to the start screen with the provider's own
 /// reason, where "start a new session" is available. It is never turned into a fresh session
 /// automatically.
+///
+/// **`reason` used to be a fixed, generic string on the legacy backend** ("provider process
+/// exited unexpectedly") for every non-zero exit, regardless of cause -- and that generic text
+/// actively misdirected a real investigation (2026-09-18, work, production binary): the child
+/// died before opening because a `PATH`-resolved multi-account launcher refused the gate-bearing
+/// `--settings` flag outright, and the launcher's own one-line explanation had already gone past
+/// on stderr with nowhere for this banner to recover it from. `agent::session`'s translation of
+/// `AgentEvent::ProcessExited` now folds the child's own retained stderr tail into
+/// `SessionUnavailable.reason` itself (see `agent/src/session.rs`), so this function needed no
+/// change to benefit: `reason` below is already the specific one when the provider produced any
+/// stderr at all before dying, and only falls back to the generic text when it produced none.
 fn report_a_session_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let failure = {
         let state_ref = state.borrow();

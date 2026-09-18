@@ -52,6 +52,12 @@ const HOOK_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// writes its one already-fully-read-from-its-own-stdin line immediately after connecting.
 const HOOK_CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How many of the child's most recent stderr lines are retained (newest evicting oldest) so a
+/// later `ProcessExited { success: false, .. }` can carry the real reason instead of a generic
+/// one. A handful is enough for a startup refusal (typically one line) without this becoming an
+/// unbounded log of a long conversation's entire stderr.
+const STDERR_TAIL_CAPACITY: usize = 20;
+
 /// A conservative, documented starting point for `disallowed_tools` -- see this plan's Global
 /// Constraint on why this is best-effort, not a guarantee. Callers may pass their own list
 /// instead; this is a suggested default, not hardcoded into `spawn`.
@@ -114,6 +120,14 @@ pub struct AgentProcess {
     /// written to by the hook-listener thread, read/removed by `respond_permission`.
     pending_hook_connections: Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
     socket_path: std::path::PathBuf,
+    /// The child's own last few stderr lines, verbatim, newest last -- shared with the stderr
+    /// thread so `poll_events` can stamp them onto `AgentEvent::ProcessExited` when the child dies.
+    /// Before this existed, a child that died before opening (the exact shape of the 2026-09-18
+    /// launcher-collision bug) surfaced only as the generic "provider process exited
+    /// unexpectedly", even though the real reason was sitting in `AgentEvent::ProcessStderr`
+    /// events this same process had already emitted and only `eprintln!`'d -- never reaching the
+    /// panel, which has no way to correlate a past stderr line with a later exit.
+    stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
     /// Set once this process's exit has been observed via `try_wait()` and a corresponding
     /// `AgentEvent::ProcessExited` has been pushed -- makes that push fire exactly once, no
     /// matter how many more times `poll_events()` is called afterward.
@@ -231,6 +245,105 @@ fn spawn_hook_listener(
         }
     });
     Ok((handle, stop))
+}
+
+/// Runs the resolved binary once with the EXACT `--settings` value the real spawn is about to
+/// pass, plus `--version` as a terminating flag, and requires exit 0 -- see `spawn_with_binary`'s
+/// call site for why this exists and what it caught. Deliberately synchronous (`Command::output`)
+/// rather than going through the same piped-stdio/background-thread machinery as the real spawn:
+/// this process is expected to exit in well under a second and produce no interleaved-stream
+/// hazard worth guarding against.
+///
+/// Returns the resolved-binary's own stderr (falling back to stdout, then to the bare exit
+/// status) in the error, verbatim, un-summarized -- that text is the whole point: a generic
+/// "preflight failed" would reproduce exactly the diagnostic gap this function exists to close.
+///
+/// **What this does NOT prove, and the claim must not be widened.** `--version` terminates before
+/// the CLI reads the settings content, so a pass means only that the resolved binary ACCEPTS the
+/// flag -- never that a `PreToolUse` hook sourced from it will actually run. That distinction is
+/// not hypothetical: on 2026-09-18, `--managed-settings` and `CLAUDE_CODE_MANAGED_SETTINGS_PATH`
+/// were both measured to exit 0, run a normal session, and fire no hook at all. If anything ever
+/// answers `--settings` with exit 0 while routing it to a tier that does not execute hooks, this
+/// preflight goes green and the session runs with no gate -- worse than the crash it replaces.
+/// Only a real turn that observes a hook firing can close that gap; this closes the cheaper one.
+///
+/// A binary that cannot be spawned at all (does not exist, not executable) is passed through as
+/// the underlying `io::Error` unchanged -- `spawn_with_binary`'s real `cmd.spawn()` a few lines
+/// down would fail on it identically, so this just surfaces the same failure slightly earlier and
+/// before anything else (a socket, a listener thread) has been created.
+fn preflight_gate_flag_is_accepted(
+    binary: &str,
+    settings_json: &str,
+    project_dir: &Path,
+) -> std::io::Result<()> {
+    let output = Command::new(binary)
+        // The same working directory the real spawn sets, and this is load-bearing rather than
+        // tidiness: a wrapper standing in for `claude` may decide whether to run FROM THE CWD --
+        // this host's multi-account launcher derives a per-repository key from `pwd -P` and
+        // refuses a directory name it cannot use. Measured 2026-09-18: identical argv exits 0
+        // from one directory and 64 from another. Probing this process's own cwd while the real
+        // spawn uses the project directory reproduces exactly the failure the preflight exists to
+        // prevent -- green here, dead there -- and the inverse refuses a spawn that would work.
+        .current_dir(project_dir)
+        .arg("--settings")
+        .arg(settings_json)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exited with {:?} and produced no output on stdout or stderr", output.status)
+    };
+    Err(std::io::Error::other(format!(
+        "the resolved `{binary}` binary refused the --settings flag this permission gate needs \
+         (probed harmlessly with --version, before starting a real session or spending any \
+         tokens): {detail}"
+    )))
+}
+
+/// Resolves `binary` (as `Command::spawn` itself would via `execvp`) to the absolute path it
+/// actually names, for the one-line diagnostic `spawn_with_binary` logs on every spawn attempt.
+/// Nothing in this crate recorded this before 2026-09-18 -- when this host's `PATH` turned out to
+/// point `claude` at a multi-account launcher rather than the real CLI, working that out took
+/// four separate investigations because nothing anywhere said which absolute path had actually
+/// been exec'd.
+///
+/// Best-effort and never fatal: `None` (rendered as a placeholder by the caller) means only that
+/// this diagnostic could not resolve a path, never that the real spawn is expected to fail --
+/// `cmd.spawn()` does its own, authoritative resolution independently of this.
+fn resolve_binary_absolute_path(binary: &str) -> Option<std::path::PathBuf> {
+    if binary.contains('/') {
+        return Path::new(binary).canonicalize().ok();
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let Ok(meta) = candidate.metadata() else { continue };
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(candidate.canonicalize().unwrap_or(candidate));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Writes an explicit `deny` back over a hook connection whose relay failed, so a broken relay can
@@ -360,6 +473,26 @@ impl AgentProcess {
         } else {
             Some(crate::settings::hook_settings_arg(&socket_path)?)
         };
+
+        // Preflight: in every mode that installs a gate, confirm the resolved binary actually
+        // accepts `--settings` before doing anything else -- binding the socket, spawning the
+        // real long-lived process, any of it. This is the fix for a real, reproduced failure
+        // (2026-09-18, work, production binary): a multi-account launcher on this host's
+        // `PATH` refuses `--settings` outright (`claude-wrapper: production launcher owns
+        // --settings for autoMemoryDirectory`, exit 64) because ITS OWN wrapper needs that flag
+        // for something else and treats a caller's use of it as a collision, not an override.
+        // The real spawn then died before ever emitting `system`/`init`, and the panel had
+        // nothing more specific to show than "the provider process exited unexpectedly" --
+        // which is exactly the generic text this whole check exists to avoid reaching.
+        //
+        // `--version` was chosen, and verified live against that exact launcher, specifically
+        // because it is the cheapest terminating flag known to open no session and spend no
+        // tokens: the CLI prints its version and exits before doing anything else, so this is
+        // safe to run unconditionally rather than only when something looks wrong.
+        if let Some(settings) = &hook_settings_arg {
+            preflight_gate_flag_is_accepted(binary, settings, project_dir)?;
+        }
+
         // Undoes everything `spawn` has created so far, for use on the error path of every
         // fallible step below -- no thread has been started at any point where this is called, so
         // there is never anything to stop, and now only one file to remove.
@@ -401,6 +534,19 @@ impl AgentProcess {
         if let Some(settings) = &hook_settings_arg {
             cmd.arg("--settings").arg(settings);
         }
+
+        // Logged once per spawn attempt, unconditionally -- see `resolve_binary_absolute_path`'s
+        // doc for why nothing recorded this before 2026-09-18. Deliberately placed after every
+        // `cmd.arg(...)` call above and before `cmd.spawn()`, so it shows exactly the argv the
+        // real spawn is about to attempt (including `--settings`'s value), not a reconstruction of
+        // it -- and BEFORE the outcome is known, so a spawn that then hangs or dies is not the only
+        // way this line reaches stderr.
+        let resolved_path = resolve_binary_absolute_path(binary)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| format!("<could not resolve {binary:?} on PATH>"));
+        let argv: Vec<String> =
+            std::iter::once(binary.to_string()).chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned())).collect();
+        eprintln!("[agent] spawning resolved binary {resolved_path} -- argv: {argv:?}");
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -450,10 +596,19 @@ impl AgentProcess {
         });
 
         let stderr_tx = tx;
+        let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(STDERR_TAIL_CAPACITY)));
+        let stderr_tail_writer = stderr_tail.clone();
         let stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
+                {
+                    let mut tail = stderr_tail_writer.lock().unwrap();
+                    if tail.len() == STDERR_TAIL_CAPACITY {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.clone());
+                }
                 if stderr_tx.send(AgentEvent::ProcessStderr { line }).is_err() {
                     return;
                 }
@@ -470,6 +625,7 @@ impl AgentProcess {
             hook_listener_stop,
             pending_hook_connections,
             socket_path,
+            stderr_tail,
             exit_reported: false,
             shut_down: false,
         })
@@ -489,7 +645,12 @@ impl AgentProcess {
         if !self.exit_reported {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.exit_reported = true;
-                events.push(AgentEvent::ProcessExited { success: status.success() });
+                // Snapshotted here, at the moment the exit is observed, rather than read later
+                // out of a stale reference -- by the time a caller reacts to this event, the
+                // stderr thread may have already exited too (having hit EOF right alongside the
+                // child), so the tail must travel with the event itself.
+                let stderr_tail: Vec<String> = self.stderr_tail.lock().unwrap().iter().cloned().collect();
+                events.push(AgentEvent::ProcessExited { success: status.success(), stderr_tail });
             }
         }
         events
@@ -1339,5 +1500,176 @@ mod tests {
         let payload = build_can_use_tool_response_payload("req-3", false, None);
         assert_eq!(payload["response"]["response"]["behavior"], "deny");
         assert!(payload["response"]["response"].get("message").is_none());
+    }
+
+    /// Writes a small shell script to a fresh temp file, makes it executable, and returns its
+    /// path -- a fake `claude` binary standing in for the real one, so the preflight tests below
+    /// can drive both its accept and refuse paths deterministically, with no real CLI, no
+    /// network, and no tokens.
+    fn fake_binary_script(body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("agent-process-fake-binary-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// The preflight must probe the PROJECT directory, not this process's own cwd.
+    ///
+    /// Not a hypothetical: on 2026-09-18 this host's `claude` was a multi-account launcher that
+    /// derives a per-repository key from `pwd -P` and refuses a directory name it cannot use, and
+    /// identical argv was measured exiting 0 from one directory and 64 from another. A preflight
+    /// probing the wrong directory is worse than none -- it goes green and the real spawn then
+    /// dies, reproducing exactly the unexplained failure the preflight was added to prevent, and
+    /// the inverse refuses a spawn that would have worked.
+    ///
+    /// The fake binary here stands in for that launcher: it accepts from `allowed` and refuses
+    /// from anywhere else. If `preflight_gate_flag_is_accepted` ever drops its `current_dir`, this
+    /// goes red instead of the next GUI session going unexplained.
+    #[test]
+    fn the_preflight_probes_the_project_directory_not_the_hosts_own_cwd() {
+        let root = std::env::temp_dir().join(format!("agent-preflight-cwd-{}", uuid::Uuid::new_v4()));
+        let allowed = root.join("allowed");
+        let refused = root.join("refused");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&refused).unwrap();
+        let script = fake_binary_script(
+            "case \"$(basename \"$PWD\")\" in allowed) exit 0 ;; *) echo 'unsafe repository name' >&2; exit 64 ;; esac",
+        );
+
+        let from_allowed = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &allowed);
+        assert!(from_allowed.is_ok(), "the project directory is the one probed: {from_allowed:?}");
+
+        let from_refused = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &refused);
+        let err = from_refused.expect_err("a project directory the binary refuses must fail the preflight");
+        assert!(
+            err.to_string().contains("unsafe repository name"),
+            "the refusal must carry the binary's own stderr, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The happy path: a binary that accepts `--settings` unconditionally (as the real CLI does
+    /// when it is not sitting behind a launcher that owns that flag) must pass the preflight.
+    #[test]
+    fn preflight_gate_flag_is_accepted_passes_when_the_binary_accepts_settings() {
+        let script = fake_binary_script("exit 0");
+        let result = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &std::env::temp_dir());
+        assert!(result.is_ok(), "expected the preflight to pass, got {result:?}");
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The regression test for the real 2026-09-18 bug: a fake `claude-wrapper`-shaped launcher
+    /// that refuses any invocation carrying `--settings`, with the exact stderr message the real
+    /// launcher printed on this host. The preflight must fail, and -- this is the point of the
+    /// whole feature -- its error must carry that message verbatim rather than a generic
+    /// "preflight failed", since the message is the one thing this task exists to surface.
+    #[test]
+    fn preflight_gate_flag_is_accepted_surfaces_the_binarys_own_stderr_when_it_refuses() {
+        let script = fake_binary_script(
+            r#"for arg in "$@"; do
+  if [ "$arg" = "--settings" ]; then
+    echo "claude-wrapper: production launcher owns --settings for autoMemoryDirectory" >&2
+    exit 64
+  fi
+done
+exit 0"#,
+        );
+        let result = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &std::env::temp_dir());
+        let err = result.expect_err("a binary that refuses --settings must fail the preflight");
+        assert!(
+            err.to_string().contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
+            "the real launcher's own refusal message must reach the caller verbatim, got: {err}"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The same fake launcher, but exercised through the real `spawn_with_binary` in `Auto` mode
+    /// (which is exactly when a gate is installed) rather than calling the preflight function in
+    /// isolation -- proving the preflight is actually wired into the real spawn path and runs
+    /// BEFORE the socket is ever bound, so a doomed spawn leaves nothing behind to clean up.
+    #[test]
+    fn spawn_with_binary_fails_fast_via_preflight_and_binds_no_socket_when_the_resolved_binary_refuses_settings() {
+        let dir = std::env::temp_dir().join(format!("agent-process-preflight-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::settings::hook_settings_arg(&dir.join("probe.sock"))
+            .expect("agent-hook must be built for this test to exercise the real preflight path");
+
+        let script = fake_binary_script(
+            r#"for arg in "$@"; do
+  if [ "$arg" = "--settings" ]; then
+    echo "claude-wrapper: production launcher owns --settings for autoMemoryDirectory" >&2
+    exit 64
+  fi
+done
+exit 0"#,
+        );
+
+        let sockets_before = temp_hook_socket_names();
+        let outcome = AgentProcess::spawn_with_binary(&dir, PermissionMode::Auto, &[], script.to_str().unwrap());
+        let err = outcome.err().expect("spawn must fail when the resolved binary refuses the gate flag");
+        assert!(
+            err.to_string().contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
+            "spawn_with_binary's error must carry the launcher's own refusal, got: {err}"
+        );
+
+        let new_sockets: Vec<_> =
+            temp_hook_socket_names().into_iter().filter(|name| !sockets_before.contains(name)).collect();
+        assert!(
+            new_sockets.is_empty(),
+            "a preflight failure must happen before the hook socket is ever bound, found: {new_sockets:?}"
+        );
+
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Bypass` mode installs no gate and therefore builds no `--settings` value, so the
+    /// preflight must never run at all -- a binary that would refuse `--settings` is irrelevant
+    /// to a mode that never passes it, and this is also the mode this project explicitly calls
+    /// out as the current workaround for today's launcher (see `PermissionMode`'s own doc), so a
+    /// regression that started preflighting Bypass too would break the one mode that currently
+    /// works on this host.
+    #[test]
+    fn spawn_with_binary_never_preflights_in_bypass_mode() {
+        let dir = std::env::temp_dir().join(format!("agent-process-bypass-preflight-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // This script would refuse ANY invocation -- if Bypass mode ever preflighted it, this
+        // test would see this script's own refusal message in the error instead of a real
+        // process actually spawning (Bypass installs no --settings, so nothing here should ever
+        // read this script's stderr as a preflight failure).
+        let script = fake_binary_script("echo \"should never be invoked for a preflight check\" >&2\nexit 1");
+
+        let outcome = AgentProcess::spawn_with_binary(&dir, PermissionMode::Bypass, &[], script.to_str().unwrap());
+        match outcome {
+            Ok(mut process) => process.shutdown(),
+            Err(e) => panic!("Bypass mode must not preflight the resolved binary at all, got: {e}"),
+        }
+
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resolve_binary_absolute_path` with a name (no `/`) must find it on `PATH`, exactly as
+    /// `execvp` (and therefore `Command::spawn`) would -- `sh` is used because every Unix-like
+    /// environment that can run this test suite at all necessarily has one.
+    #[test]
+    fn resolve_binary_absolute_path_finds_a_path_relative_name() {
+        let resolved = resolve_binary_absolute_path("sh");
+        let resolved = resolved.expect("sh must be found on PATH in any environment that can run a shell test");
+        assert!(resolved.is_absolute(), "resolved path must be absolute, got {resolved:?}");
+        assert!(resolved.is_file(), "resolved path must actually exist, got {resolved:?}");
+    }
+
+    /// A name that exists on no `PATH` entry resolves to `None`, not a fabricated guess -- the
+    /// caller renders that as an explicit placeholder rather than a wrong path.
+    #[test]
+    fn resolve_binary_absolute_path_returns_none_for_a_name_on_no_path_entry() {
+        let resolved = resolve_binary_absolute_path("definitely-not-a-real-binary-name-2026-09-18");
+        assert!(resolved.is_none(), "a nonexistent name must resolve to None, got {resolved:?}");
     }
 }

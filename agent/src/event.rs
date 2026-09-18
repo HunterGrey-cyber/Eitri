@@ -91,5 +91,11 @@ pub enum AgentEvent {
     /// (the CLI's own terminal `result` line). A process that exits WITHOUT ever having emitted
     /// `TurnFinished` (crash, bad `--resume` id, auth failure, spawn-then-die) would otherwise
     /// produce no observable signal at all that anything went wrong.
-    ProcessExited { success: bool },
+    ///
+    /// `stderr_tail` carries the child's own last few stderr lines (see
+    /// `process::STDERR_TAIL_CAPACITY`), verbatim and newest-last, so a caller that only ever saw
+    /// `ProcessStderr` events flow past on their way to an `eprintln!` (as `session.rs` does) can
+    /// still recover the real reason once the process is gone. Empty when the child produced no
+    /// stderr output at all before exiting -- not a sentinel for "unknown", a true absence.
+    ProcessExited { success: bool, stderr_tail: Vec<String> },
 }

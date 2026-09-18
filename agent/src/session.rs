@@ -272,11 +272,26 @@ pub(crate) fn translate_wire_event(
             let usage = Some(crate::UsageInfo { total_cost_usd, num_turns });
             vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, usage }]
         }
-        AgentEvent::ProcessExited { success: true } => {
+        AgentEvent::ProcessExited { success: true, .. } => {
             vec![AgentDomainEvent::SessionClosed { reason: "provider_exited".to_string() }]
         }
-        AgentEvent::ProcessExited { success: false } => {
-            vec![AgentDomainEvent::SessionUnavailable { reason: "provider process exited unexpectedly".to_string() }]
+        AgentEvent::ProcessExited { success: false, stderr_tail } => {
+            // The generic text alone actively misdirected a real investigation (2026-09-18): a
+            // multi-account launcher on this host's `PATH` refused the gate-bearing `--settings`
+            // flag and the child died before ever emitting `system`/`init`, so nothing upstream of
+            // this arm had any more specific signal to offer than "exited unexpectedly" -- even
+            // though the launcher's own one-line refusal had already gone past as a
+            // `ProcessStderr` event moments earlier. Folding the retained tail into the reason
+            // itself (rather than adding a second field nothing downstream reads) means every
+            // existing consumer of `SessionUnavailable.reason` -- in particular
+            // `AgentBackend::terminated_before_opening` and the panel banner built from it --
+            // gets the improvement with no further change on their part.
+            let reason = if stderr_tail.is_empty() {
+                "provider process exited unexpectedly".to_string()
+            } else {
+                format!("provider process exited unexpectedly: {}", stderr_tail.join(" | "))
+            };
+            vec![AgentDomainEvent::SessionUnavailable { reason }]
         }
         AgentEvent::ProcessStderr { line } => {
             eprintln!("[agent] claude stderr: {line}");
