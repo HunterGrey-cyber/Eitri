@@ -9,18 +9,18 @@
 //! **One source, three indicators.** GTK's own focus widget (`GtkWindow:focus-widget`) is the only
 //! input. Every change to it recomputes which pane holds it and updates all three at once:
 //!
-//! 1. the `pane-focused` CSS class on that pane's frame, which `theme::gtk_css` draws as an outline;
+//! 1. the `pane-focused` CSS class on that pane's frame, which `theme::gtk_css` draws as a line along the pane's bottom edge;
 //! 2. the status bar's focus label (`chrome::build_status_bar`);
 //! 3. the agent panel's mode block, via a `pane_focus` envelope
 //!    (`AgentPanelHandle::set_pane_focused`), which dims the block when the panel is not focused.
 //!
 //! A class toggled from here, not GTK's `:focus-within`. `:focus-within` would have been one CSS
-//! rule, but then the outline would be decided by GTK's state flags while the status label and
+//! rule, but then the focus line would be decided by GTK's state flags while the status label and
 //! the panel were decided by this code. Two mechanisms can disagree, and on a screen nobody could
 //! tell which one was wrong. With one input and one function, all three agree by construction.
 //! The cost is a `notify::focus-widget` handler.
 //!
-//! **What "focused" means here:** the pane holding the window's focus widget. The outline and the
+//! **What "focused" means here:** the pane holding the window's focus widget. The focus line and the
 //! status bar label do not track whether the window itself is active: after alt-tabbing away they
 //! still name the pane that will get the keys on return, and they do not dim.
 //!
@@ -38,10 +38,10 @@ use gtk4::prelude::*;
 pub(crate) struct Pane {
     /// Focus inside this widget, or on it, counts as this pane having focus.
     pub(crate) content: gtk4::Widget,
-    /// The widget that gets the `pane-focused` class and draws the outline. It differs from
+    /// The widget that gets the `pane-focused` class and draws the focus line. It differs from
     /// `content` for the side slot: the WebView sits inside the resize-throttle `Overlay`
     /// (`layout::install_webview_resize_throttle`) and may be sized smaller than its slot mid-drag.
-    /// The outline belongs to the slot.
+    /// The focus line belongs to the slot.
     pub(crate) frame: gtk4::Widget,
     /// What the status bar shows. It is the panel registry's own title, so a Lua plugin that
     /// replaces a slot is named by its own title and not by the built-in one.

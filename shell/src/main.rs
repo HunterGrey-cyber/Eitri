@@ -247,7 +247,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     window.set_child(Some(&root));
 
-    // Which pane has focus: one tracker drives the pane outline, the status bar and the agent
+    // Which pane has focus: one tracker drives the pane's focus line, the status bar and the agent
     // panel's mode block, so the three cannot disagree. See `pane_focus`'s module doc.
     {
         let (main_title, side_title, bottom_title) = titles;

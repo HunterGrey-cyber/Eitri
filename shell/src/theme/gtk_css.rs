@@ -128,14 +128,25 @@ paned.content-area > separator {{
     padding-left: 5px;
 }}
 
-/* `outline`, never `border`: a border takes space from the widget's content box, so focusing the
-   editor would shrink the GL area by 4px and resize nvim's grid on every Ctrl+h / Ctrl+l. An
-   outline takes no layout space. GTK draws it after the widget's content, and the negative offset
-   keeps it inside the pane's own allocation, where the neighbouring pane cannot paint over it.
-   None of that has been seen on a screen. */
+/* A line along the bottom of the focused pane, not a frame around it. The owner tried the 2px
+   outline this replaced and found it ugly; `outline` cannot be drawn on one side only.
+
+   The width is constant and only the colour changes. That is the whole trick: a border takes space
+   from the widget's content box, so a border that appeared on focus would shrink the GL area and
+   resize nvim's grid on every Ctrl+h / Ctrl+l. A border that is always there costs the same 2px
+   whether or not the pane has focus, so the grid is sized once and focus changes nothing but a
+   colour.
+
+   Unfocused, the line is `border`, the divider colour, so it sits directly on the status bar's own
+   1px `border` top rule and reads as one slightly heavier divider. Focused, it turns `muted`: the
+   divider lights up under the pane that has the keys. Not `bg`, which would draw a stripe of the
+   editor's background under nvim's statusline, the band this project just spent a day removing.
+   None of this has been seen on a screen. */
+.pane {{
+    border-bottom: 2px solid {border};
+}}
 .pane.pane-focused {{
-    outline: 2px solid {focus_ring};
-    outline-offset: -2px;
+    border-bottom-color: {focus_ring};
 }}
 "#
     )
@@ -258,12 +269,13 @@ mod tests {
         assert_eq!(text_colours, vec![expected.as_str()], "{body}");
     }
 
-    /// The outline is drawn on `bg`, so its colour must reach 3:1 against `bg` (WCAG 1.4.11) on
-    /// every scheme. This includes the reversed-StatusLine schemes that broke the chrome tokens.
-    /// `muted` is guarded at 4.5 against `bg`, and the test checks the colour the rule uses rather
-    /// than trusting that.
+    /// The focus line swaps colour and never width, and the colour it swaps to is visible against
+    /// the one it replaces on every scheme -- including the reversed-StatusLine schemes that broke
+    /// the chrome tokens. Width is the load-bearing half: a focused rule that set a width would
+    /// resize the editor's grid on every focus change, which is why the frame this replaced was an
+    /// outline in the first place.
     #[test]
-    fn the_focus_outline_is_visible_against_the_background_it_sits_on() {
+    fn the_focus_line_changes_colour_and_never_width() {
         let lunaperche = ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: [
@@ -276,11 +288,16 @@ mod tests {
         });
         for t in [dawn(), ThemeTokens::fallback(), lunaperche] {
             let css = gtk_css(&t);
-            let body = rule(&css, ".pane.pane-focused");
-            assert!(body.contains(&format!("\n    outline: 2px solid {};", t.muted.hex())), "{body}");
-            assert!(t.muted.contrast(t.bg) >= 3.0, "the focus outline is not visible on bg");
-            // Never a border: that would resize the editor's grid on every focus change.
-            assert!(!body.contains("border"), "{body}");
+            let base = rule(&css, ".pane");
+            let focused = rule(&css, ".pane.pane-focused");
+            assert!(base.contains(&format!("\n    border-bottom: 2px solid {};", t.border.hex())), "{base}");
+            assert!(focused.contains(&format!("\n    border-bottom-color: {};", t.muted.hex())), "{focused}");
+            // Colour only. Any width, style or other border side here would change the layout on focus.
+            let props: Vec<&str> = focused.lines().map(str::trim).filter(|l| l.contains(':')).collect();
+            assert_eq!(props, vec![format!("border-bottom-color: {};", t.muted.hex()).as_str()], "{focused}");
+            assert!(!css.contains("outline:"), "the old frame is gone");
+            let c = t.muted.contrast(t.border);
+            assert!(c >= 3.0, "focused line barely differs from the unfocused one: {c:.2}:1");
         }
     }
 
