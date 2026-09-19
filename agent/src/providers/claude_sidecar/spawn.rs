@@ -92,6 +92,11 @@ impl SpawnedSidecar {
 /// resume verified by content and provider session ID, partial assistant streaming,
 /// replay, recovery, and backpressure.
 /// The unary conformance tests include a live handshake to check protocol agreement.
+///
+/// A packaged sidecar may have no checkout or `.git` directory to compare.
+/// Protocol major is checked at handshake. It and the build-time `sidecar_version`
+/// are carried on `ProviderInfo`. Keep this diagnostic until the client checks
+/// the supported sidecar version range.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
