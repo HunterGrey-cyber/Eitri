@@ -105,7 +105,9 @@ fn claude_resolved_from_inherited_path_accepts_the_products_gate_bearing_setting
          Auto-mode session on this host will die before opening until that is resolved -- see \
          agent::process's preflight check (`preflight_gate_flag_is_accepted`), which exists to \
          catch this before a real spawn rather than let a session fail silently, and \
-         poc/tools/work-claude.sh's own note on the production/PATH binary split.",
+         docs/canonical/dated_record.md's 2026-09-18 'Auto mode could not start...' entry, which \
+         carries the note on the production/PATH binary split that poc/tools/work-claude.sh \
+         (deleted 2026-09-19) used to carry.",
         output.status,
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),

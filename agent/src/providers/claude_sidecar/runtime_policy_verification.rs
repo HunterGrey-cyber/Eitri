@@ -1,9 +1,11 @@
 // agent/src/providers/claude_sidecar/runtime_policy_verification.rs
-//! **Every test in this file spends real Claude tokens and must be run against the work account.**
+//! **Every test in this file spends real Claude tokens and must be run against the TEST Claude
+//! profile, via the test-account wrapper** (`/home/user/.local/bin/a test-account wrapper`; see
+//! `docs/canonical/dated_record.md`'s 2026-09-19 entry for why this replaced billing work).
 //!
 //! ```text
 //! NEOVIBE_VERDANDI_CHECKOUT=$HOME/src/verdandi-old-checkout \
-//!   poc/tools/work-claude.sh cargo test -p agent --lib runtime_policy -- --ignored --test-threads=1 --nocapture
+//!   cargo test -p agent --lib runtime_policy -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
 //! ## Why these are unit tests and not integration tests
