@@ -12,9 +12,25 @@ type Props = {
  * creation, with what the provider advertises -- a backend whose provider does not offer a policy
  * fails loudly there rather than being quietly given a different one. It is deliberately not keyed
  * on which backend this is: both have a real, separately verified interactive gate. */
+/* The two modes differ in what the agent MAY do, not only in whether it asks -- and since
+   2026-09-18 that difference is real rather than a manner of speaking. The gate is the `PreToolUse`
+   hook, and Bypass installs none, so editing tools are denied there: an edit under Bypass would be
+   a file rewritten under a live buffer with no diff, no decision and nothing in the transcript that
+   had to be read. `agent::disallowed_tools_for` is where that lives.
+
+   The Bypass line used to read "Every tool call proceeds immediately", which stopped being true the
+   moment the lists diverged. A start screen that says a mode does something it does not is worse
+   than one that says less: this is the screen whose own text already promises the choice cannot be
+   changed afterwards. */
 const MODE_LABELS: Record<PermissionModeChoice, { title: string; detail: string }> = {
-  auto: { title: "Auto", detail: "Tool calls that could change things ask first." },
-  bypass: { title: "Bypass", detail: "No permission prompts. Every tool call proceeds immediately." },
+  auto: {
+    title: "Auto",
+    detail: "Asks before each tool call, and can edit files once you approve.",
+  },
+  bypass: {
+    title: "Bypass",
+    detail: "Never asks — and cannot edit files, because nothing would be there to ask.",
+  },
 };
 
 function shortId(id: string): string {
@@ -135,11 +151,11 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
       ))}
 
       {onlyBypass && (
-        // Said plainly rather than buried: this backend offers exactly one policy, and it runs every
-        // tool without asking. Calling that a "choice" would imply an alternative exists.
+        // Said plainly rather than buried: this backend offers exactly one policy. Calling that a
+        // "choice" would imply an alternative exists.
         <p className="warning">
           This backend ({hello.backend}) offers <strong>Bypass only</strong>. Tool calls run without
-          asking.
+          asking, and file-editing tools are unavailable — there would be no card to answer.
         </p>
       )}
     </div>
