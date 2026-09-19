@@ -13,8 +13,11 @@
 //! you will land when you come back.**
 //!
 //! - The editor forwards focus to Neovide (`NeovideEditorPane::set_focused`, fork `8f043a2`),
-//!   whose cursor renderer already draws a hollow block when unfocused and which also tells nvim
-//!   (`FocusGained`/`FocusLost`).
+//!   which also tells nvim (`FocusGained`/`FocusLost`). **Correction (2026-09-19, later): the
+//!   editor draws no cursor at all when unfocused, not a hollow one.** Neovide's own hollow block
+//!   was what shipped first; the owner saw it on an installed build and asked for it to go.
+//!   `neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD` (fork `0862c35`) removes it; the panel's hollow
+//!   sign cell below is unchanged. So "where you will land" is shown by the panel, not the editor.
 //! - The agent panel gets a `pane_focus` envelope (`AgentPanelHandle::set_pane_focused`) and draws
 //!   its current row's sign cell the same way: solid with focus, hollow without.
 //! - The status bar names the focused pane, as a secondary cue.
@@ -144,7 +147,7 @@ mod tests {
 
     #[test]
     fn an_inactive_window_gives_no_pane_the_keys() {
-        // Alt-tab away: the editor's cursor goes hollow, as a real Neovide window's does.
+        // Alt-tab away: the editor stops drawing its cursor.
         assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), false), vec![(0, false)]);
         // Focus on the top bar: neither pane has the keys.
         assert_eq!(focus_changes(&[Some(false), Some(true)], None, true), vec![(1, false)]);

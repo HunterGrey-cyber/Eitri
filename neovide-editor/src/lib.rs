@@ -330,12 +330,29 @@ pub struct NeovideEditorPaneOptions {
     pub extra_nvim_args: Vec<String>,
 }
 
-/// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`.
+/// The `--cmd` that makes the editor draw **no cursor** while it does not have the keys.
+///
+/// `g:neovide_cursor_unfocused_outline_width` is Neovide's own setting (default 1/8 em, a hollow
+/// block). The fork (`0862c35`) makes a width `<= 0` mean "draw nothing while unfocused, any
+/// shape" -- stock Neovide at width 0 still leaves an anti-aliased sliver at fractional cell sizes
+/// (measured: 33 pixels at scale 1.5). The owner asked for no cursor at all, 2026-09-19.
+///
+/// It is a `--cmd`, so it runs before the user's own config: a user who wants the hollow block
+/// back sets the variable in their `init.lua` (e.g. `vim.g.neovide_cursor_unfocused_outline_width
+/// = 0.125`) and wins. Neovide watches the variable, so a change at runtime applies too. Proved on
+/// real frames by `tests/unfocused_cursor.rs`.
+pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outline_width = 0";
+
+/// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`
+/// if asked for, then this pane's own default (`HIDE_UNFOCUSED_CURSOR_CMD`), then the host's
+/// extras -- so a host's `--cmd` can override the default too.
 fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(extra.len() + 1);
+    let mut args = Vec::with_capacity(extra.len() + 3);
     if clean {
         args.push("--clean".to_string());
     }
+    args.push("--cmd".to_string());
+    args.push(HIDE_UNFOCUSED_CURSOR_CMD.to_string());
     args.extend(extra.iter().cloned());
     args
 }
@@ -871,16 +888,16 @@ impl NeovideEditorPane {
     /// widget -- call this once the host's window is actually shown (mirroring the reference
     /// probe's own `window.present(); gl_area.grab_focus(); im_context.focus_in();` sequence,
     /// minus the `.present()`, which is the host's own window's job).
-    /// Tells the editor whether it has the keyboard, so it can say so the way a terminal does:
-    /// a solid block cursor when it has focus, a hollow one when it does not. It forwards to
+    /// Tells the editor whether it has the keyboard, so it can say so through its cursor: a solid
+    /// block when it has focus, **no cursor at all** when it does not (`HIDE_UNFOCUSED_CURSOR_CMD`;
+    /// a user who sets the width back gets upstream's hollow block). It forwards to
     /// `LiveHarness::set_focused` (fork `8f043a2`), which also tells nvim through
     /// `nvim_ui_set_focus`. Before this, nvim never heard about focus at all, and nothing fired
     /// `FocusGained` or `FocusLost`.
     ///
     /// This is a separate call from [`grab_focus`](Self::grab_focus), and the host decides what
     /// "focused" means. `shell` passes `true` only while this pane holds the window's focus widget
-    /// AND the window is active. That matches a real Neovide window, whose cursor goes hollow when
-    /// you alt-tab away. It may be called before nvim has started, and on every focus event:
+    /// AND the window is active, so alt-tabbing away hides the cursor too. It may be called before nvim has started, and on every focus event:
     /// repeats are dropped by the harness.
     pub fn set_focused(&self, focused: bool) {
         self.focused.set(Some(focused));
@@ -946,11 +963,15 @@ mod tests {
     use super::nvim_args;
 
     #[test]
-    fn clean_comes_first_and_extra_arguments_follow_in_order() {
+    fn clean_comes_first_then_the_cursor_default_then_the_hosts_extras() {
+        let hide = super::HIDE_UNFOCUSED_CURSOR_CMD;
         let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
-        assert_eq!(nvim_args(true, &extra), vec!["--clean", "--cmd", "lua print(1)"]);
-        assert_eq!(nvim_args(false, &extra), vec!["--cmd", "lua print(1)"]);
-        assert_eq!(nvim_args(true, &[]), vec!["--clean"]);
-        assert!(nvim_args(false, &[]).is_empty());
+        assert_eq!(
+            nvim_args(true, &extra),
+            vec!["--clean", "--cmd", hide, "--cmd", "lua print(1)"]
+        );
+        assert_eq!(nvim_args(false, &extra), vec!["--cmd", hide, "--cmd", "lua print(1)"]);
+        assert_eq!(nvim_args(true, &[]), vec!["--clean", "--cmd", hide]);
+        assert_eq!(nvim_args(false, &[]), vec!["--cmd", hide]);
     }
 }

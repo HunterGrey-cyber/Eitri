@@ -18,3 +18,9 @@ skia-safe = { version = "0.153.3", features = ["gl"] }
 # should never silently change what a `cargo build` here actually compiles against. Bump the
 # `rev` deliberately (and re-verify) when the fork gains something this crate needs.
 neovide = { path = "../neovide" }
+
+# A plain `main`, not libtest: winit allows one `EventLoop` per process and only on the main
+# thread, so each real `LiveHarness` case runs in a fresh child copy of this binary.
+[[test]]
+name = "unfocused_cursor"
+harness = false

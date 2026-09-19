@@ -245,8 +245,8 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     window.set_child(Some(&root));
 
-    // Which pane has the keys. One tracker drives the editor's cursor (solid or hollow, via
-    // Neovide itself), the agent panel's cursor and mode block, and the status bar, so they cannot
+    // Which pane has the keys. One tracker drives the editor's cursor (solid, or not drawn,
+    // via Neovide itself), the agent panel's cursor and mode block, and the status bar, so they cannot
     // disagree. See `pane_focus`'s module doc.
     let pane_contents: Vec<gtk4::Widget> = {
         let mut v = vec![main_widget.clone(), side_widget.clone()];
