@@ -112,6 +112,14 @@ impl SpawnedSidecar {
 /// Keep this doc comment and the literal in step. They were not, between `6980f69` (which bumped
 /// only the literal) and the 2026-09-15 cross-repository review that caught it: the prose said
 /// `c331615` while the constant said `bb487d7`, two revisions apart, and nothing failed.
+/// **Slated for retirement, and the replacement is already on the wire.** A git revision is a
+/// development-machine concept: a packaged install will spawn a shipped sidecar ARTIFACT with no
+/// checkout and no `.git` to read, so this check has nothing to compare and the description line
+/// above it has nothing to describe. Agreed with Verdandi 2026-09-18: the compatibility token
+/// becomes protocol major (already checked at handshake) plus `sidecar_version`, which they now
+/// stamp from `package.json` at build time -- both already carried on `ProviderInfo`. Until this
+/// client range-checks that version, this constant is what warns about skew, so it is kept
+/// accurate rather than deleted early.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
