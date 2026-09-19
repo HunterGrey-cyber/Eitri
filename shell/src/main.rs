@@ -5,6 +5,7 @@
 
 mod agent_panel;
 mod chrome;
+mod editor_context;
 mod layout;
 mod pane_switch;
 mod supervisor_client;
@@ -117,9 +118,15 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
     // own doc); the editor is constructed with an empty child env and behaves exactly as before.
     let mut pane_switch = pane_switch::open();
+    // wire 1's feed, built here for the same reason the other two are: its `child_env()` and its
+    // `--cmd` must be handed to the editor pane's constructor, and neither can be added to a child
+    // that is already running.
+    let mut context_feed = editor_context::EditorContextFeed::new();
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
-    let nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
+    nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
+    let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
+    nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
 
     // `Rc` because two separate closures need it after this function returns: the agent panel's
     // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
@@ -149,8 +156,14 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         PanelSlot::Main,
         PanelEntry { id: "editor".into(), title: "Editor".into(), widget: editor_widget },
     );
+    // A feed that failed to start yields a source that always answers `None`, so the panel needs no
+    // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
+    let editor_context_source = match context_feed.as_mut() {
+        Some(feed) => editor_context::listen(feed),
+        None => std::rc::Rc::new(|| None),
+    };
     let (agent_widget, agent_panel_handle) =
-        agent_panel::build_agent_panel(project_root.to_path_buf());
+        agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source);
     lua_engine.register_builtin_panel(
         PanelSlot::Side,
         PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget },
@@ -444,6 +457,12 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         // Same two reasons as `pane_switch` just above: capturing it keeps the socket alive for the
         // window's lifetime, and cleanup is explicit because `Drop` is not reliably reached.
         if let Some(feed) = &theme_feed {
+            feed.cleanup();
+        }
+        // wire 1's feed, for the same two reasons again. Its directory is swept by the next launch
+        // if this is ever missed, but a sweep is a backstop, not a substitute: a leaked directory
+        // per window close is how the other two protocols each learned this.
+        if let Some(feed) = &context_feed {
             feed.cleanup();
         }
         // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never

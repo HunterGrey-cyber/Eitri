@@ -55,6 +55,10 @@ struct AgentPanelState {
     session: Option<AgentBackend>,
     backend_kind: BackendKind,
     project_dir: PathBuf,
+    /// Where the user is, asked for at send time. Never stored across turns: what the editor was
+    /// showing when the LAST turn went out is not context, it is a stale claim, and the composer
+    /// has no way to tell the model which it is.
+    editor_context: neovibe_core::editor_context::ContextSource,
     supervisor: Option<crate::supervisor_client::SupervisorClient>,
     /// Set only while a freshly-spawned `neovibe-supervisor` is still coming up. The pump drains
     /// it into `supervisor` above. A window that spawns the supervisor cannot connect to it
@@ -266,7 +270,10 @@ impl AgentPanelHandle {
     }
 }
 
-pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPanelHandle) {
+pub(crate) fn build_agent_panel(
+    project_dir: PathBuf,
+    editor_context: neovibe_core::editor_context::ContextSource,
+) -> (gtk4::Widget, AgentPanelHandle) {
     let content_manager = UserContentManager::new();
     let webview = WebView::builder().user_content_manager(&content_manager).build();
     webview.set_hexpand(true);
@@ -332,6 +339,7 @@ pub(crate) fn build_agent_panel(project_dir: PathBuf) -> (gtk4::Widget, AgentPan
     println!("[agent_panel] backend: {}", backend_kind.as_str());
     let state = Rc::new(RefCell::new(AgentPanelState {
         session: None,
+        editor_context,
         backend_kind,
         project_dir,
         supervisor,
@@ -835,6 +843,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         InboundMessage::SendMessage { text, .. } => {
             let outcome = {
                 let mut state_ref = state.borrow_mut();
+                // wire 1's one composition point. Above both backends on purpose: the turn's String
+                // travels unmodified from here to `send_turn` on either path, so composing here
+                // gives legacy the feature for free and changes no wire format. The context is read
+                // NOW rather than remembered, and a `None` means the turn goes out exactly as the
+                // user typed it.
+                let text = neovibe_core::editor_context::compose_turn_text(
+                    &text,
+                    (state_ref.editor_context)().as_ref(),
+                );
                 // Stamped before the call, so the trace's zero is the user's action rather than the
                 // moment the backend got around to accepting it.
                 state_ref.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
