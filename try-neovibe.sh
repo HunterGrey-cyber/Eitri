@@ -27,7 +27,7 @@ done
 PROJECT="$(realpath -e -- "${PROJECT:-$PWD}")"
 
 LOG="${TMPDIR:-/tmp}/neovibe-try-$(date +%H%M%S).log"
-VERDANDI="${NEOVIBE_VERDANDI_CHECKOUT:-$HOME/src/verdandi-old-checkout}"
+VERDANDI="${NEOVIBE_VERDANDI_CHECKOUT:-$HOME/src/verdandi}"
 
 echo "project     $PROJECT"
 echo "backend     $BACKEND"
