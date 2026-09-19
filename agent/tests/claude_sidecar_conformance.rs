@@ -151,3 +151,81 @@ fn real_close_session_fail_closes_a_pending_permission() {
     assert_eq!(resolved_outcome, Some(PermissionOutcome::CancelledBySessionClose), "got: {events:?}");
     assert!(events.iter().any(|e| matches!(e, AgentDomainEvent::SessionClosed { .. })));
 }
+
+/// The MVP sentence's CLI-settleable clauses on the SIDECAR path.
+///
+/// The legacy twin is `backend_conformance.rs::real_edit_under_the_auto_gate_…`. This one matters
+/// separately because the two backends express the same policy through different mechanisms: legacy
+/// passes `--disallowedTools` on the command line, the sidecar sends `ClaudeHostPolicy.tool_policy`
+/// over gRPC, and since 2026-09-18 both are built from `disallowed_tools_for(mode)`. A change that
+/// kept one working and broke the other would be invisible in the other file.
+#[test]
+#[ignore]
+fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
+    let dir = std::env::temp_dir().join(format!("sc-edit-mvp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("greeting.txt");
+    std::fs::write(&target, "alpha\nbravo\ncharlie\n").unwrap();
+
+    let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
+    let session_id = provider
+        .create_session(CreateSessionRequest {
+            cwd: dir.to_string_lossy().to_string(),
+            permission_mode: PermissionMode::Auto,
+            streaming: agent::StreamingPreference::Partial,
+        })
+        .unwrap();
+    provider
+        .send_turn(agent::SendTurnRequest {
+            session_id: session_id.clone(),
+            text: format!(
+                "Use the Edit tool to change the word 'bravo' to 'BRAVO' in {}. Do not use a shell.",
+                target.display()
+            ),
+        })
+        .unwrap();
+
+    // Every permission, by its own id -- tools are deferred on 2.1.272, so one turn raises several.
+    let mut edit_input: Option<serde_json::Value> = None;
+    let mut answered = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline && !completed {
+        for event in provider.pump() {
+            match &event {
+                AgentDomainEvent::PermissionRequested { permission_id, tool_name, input, .. } => {
+                    if tool_name == "Edit" {
+                        edit_input = Some(input.clone());
+                    }
+                    if answered.insert(permission_id.clone()) {
+                        provider
+                            .resolve_permission(agent::ResolvePermissionRequest {
+                                session_id: session_id.clone(),
+                                permission_id: permission_id.clone(),
+                                decision: PermissionDecision::Allow,
+                            })
+                            .unwrap();
+                    }
+                }
+                AgentDomainEvent::TurnCompleted { .. } => completed = true,
+                _ => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(completed, "the turn never completed after answering {} request(s)", answered.len());
+
+    let input = edit_input.expect(
+        "the model never reached for `Edit` on the sidecar path -- check that tool_policy.deny is \
+         built from disallowed_tools_for(mode) and not from the conservative list in every mode",
+    );
+    for field in ["file_path", "old_string", "new_string"] {
+        assert!(input.get(field).is_some(), "a reviewable Edit request must carry {field}: {input}");
+    }
+
+    let after = std::fs::read_to_string(&target).unwrap();
+    assert!(after.contains("BRAVO"), "the approved edit did not land; the file holds: {after:?}");
+
+    provider.close_session(agent::CloseSessionRequest { session_id }).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
