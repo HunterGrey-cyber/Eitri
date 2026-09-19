@@ -10,20 +10,6 @@ agent = { path = "../agent" }
 neovibe-core = { path = "../core" }
 supervisor = { path = "../supervisor" }
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
-terminal-pane = { path = "../terminal-pane" }
-terminal-render = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "a2f194a8f309814ec457aebdf07f16e5abf6074b" }
-# Same revision terminal-pane already pins terminal-render/terminal-input to. Needed directly here
-# (not just transitively) because terminal_input::encode()/NormalizedInput are not re-exported by
-# terminal-pane's own public API -- this crate calls them to finish the write-path terminal-pane's
-# own doc comment describes as "one call short of the PTY".
-terminal-input = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "a2f194a8f309814ec457aebdf07f16e5abf6074b" }
-terminal-session = { path = "../terminal-session" }
-semantic-pane = { path = "../semantic-pane" }
-# Same revision semantic-pane already pins terminal-semantic to. Needed directly here (not just
-# transitively) because `PresentationBlock` is not re-exported by semantic-pane's own public API
-# -- `TerminalBottomSlot::semantic_blocks` names it directly for structural (not merely visual)
-# verification of what the semantic view actually contains.
-terminal-semantic = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "a2f194a8f309814ec457aebdf07f16e5abf6074b" }
 webkit6 = "0.6"
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
 serde_json = "1"

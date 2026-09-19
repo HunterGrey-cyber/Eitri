@@ -10,7 +10,7 @@ use mlua::Table;
 /// tabs, no arbitrary panel count per slot; a later registration to an already-occupied slot
 /// replaces the earlier one, logging a warning). `main` is the left/primary pane (today: the
 /// editor); `side` is the right/secondary pane (today: the agent panel); `bottom` spans the full
-/// width beneath both (today: the native terminal, when `--terminal` asks for it). A plugin
+/// width beneath both and is plugin-only -- nothing built-in claims it. A plugin
 /// registering to any of them will replace whatever built-in is there -- accepted as this
 /// project's stated personal-tool risk tolerance, not guarded against with a "protected slots"
 /// concept nobody has asked for.

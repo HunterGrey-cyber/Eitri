@@ -23,11 +23,6 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelEntry, PanelSlot};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
-// `terminal_panel` now lives in this package's own library target (`src/lib.rs`), not as a
-// `mod` declared here -- so a diagnostic/test harness in a separate `src/bin/*.rs` binary can
-// `use shell::terminal_panel;` too and drive the exact same real wiring, no duplication. See
-// `lib.rs`'s own doc comment.
-use shell::terminal_panel;
 
 const APP_ID: &str = "cn.huntergrey.neovibe";
 
@@ -56,11 +51,6 @@ fn main() -> glib::ExitCode {
     // one missing from that list makes passing it a hard startup failure rather than a silently
     // wrong project root.
     let want_clean = std::env::args_os().any(|arg| arg == "--clean");
-    // `--terminal` adds the native terminal pane along the bottom. Opt-in because it cannot do
-    // anything yet -- Verdandi owns the PTY and `Term` and has not shipped them -- so the default
-    // window keeps exactly the startup, memory and focus behaviour it had. See
-    // `terminal_panel`'s own doc; the flag goes away when a session type lands.
-    let want_terminal = std::env::args_os().any(|arg| arg == "--terminal");
 
     // Resolved once, here, and then carried as a value into every pane that needs it -- see
     // `neovibe_core::project_root`'s own module doc for why three separate `current_dir()` reads
@@ -75,7 +65,7 @@ fn main() -> glib::ExitCode {
     println!("neovibe: project root {}", project_root.display());
 
     let app = build_application();
-    app.connect_activate(move |app| build_ui(app, want_clean, want_terminal, &project_root));
+    app.connect_activate(move |app| build_ui(app, want_clean, &project_root));
     app.run_with_args::<&str>(&[])
 }
 
@@ -94,11 +84,8 @@ fn main() -> glib::ExitCode {
 /// and wrong here: exactly one dashboard is the supervisor's design, whereas a guard in `shell`
 /// would make `shell ~/other-project` silently raise the window for the project already open and
 /// never open the one that was asked for. Turning the singleton off is the mechanism that matches
-/// what this binary is; five sibling *examples* in this workspace already pass the same flag
-/// (`terminal-pane/examples/{two_panes,reparent,live_bridge,live_bridge_corpus}.rs` and
-/// `semantic-pane/examples/standalone.rs`), though none of them is a product binary -- `shell` is
-/// the first here to need it for what a real second launch does rather than to survive a sandbox
-/// that already has one of them running.
+/// what this binary is -- `shell` is the first product binary in this workspace to need it for
+/// what a real second launch does, rather than to survive a sandbox that already has one running.
 fn build_application() -> Application {
     Application::builder()
         .application_id(APP_ID)
@@ -106,7 +93,7 @@ fn build_application() -> Application {
         .build()
 }
 
-fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_root: &Path) {
+fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // Painted with the built-in fallback until the embedded nvim sends its first snapshot.
     let theme_css = theme::gtk_css::ThemeCss::install(&neovibe_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
@@ -137,9 +124,9 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
     // `NeovideEditorPane` is deliberately not `Clone`.
     //
-    // `cwd` is set from the same resolved root the agent panel and the terminal get below, not
-    // left to the nvim child's inherited process cwd: three panes silently disagreeing about which
-    // project is open is a worse failure than any one of them pointing somewhere unexpected.
+    // `cwd` is set from the same resolved root the agent panel gets below, not left to the nvim
+    // child's inherited process cwd: the two panes silently disagreeing about which project is
+    // open is a worse failure than either one pointing somewhere unexpected.
     let pane = Rc::new(NeovideEditorPane::with_options(NeovideEditorPaneOptions {
         clean: want_clean,
         child_env: nvim_child_env,
@@ -174,20 +161,6 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget },
     );
 
-    // Through the same `register` path as the other two built-ins, and BEFORE init.lua, so a
-    // plugin can replace the terminal in the bottom slot exactly as it can replace the editor or
-    // the agent panel. The `Rc` is kept here rather than only in the registry: focus routing needs
-    // `TerminalPane::grab_focus`, and the registry stores an opaque `gtk4::Widget`.
-    let terminal = want_terminal.then(|| {
-        let cwd = project_root.to_string_lossy().into_owned();
-        let (terminal, widget) = terminal_panel::build_terminal_panel(cwd);
-        lua_engine.register_builtin_panel(
-            PanelSlot::Bottom,
-            PanelEntry { id: "terminal".into(), title: "Terminal".into(), widget },
-        );
-        terminal
-    });
-
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
     // Build the real layout from whatever ended up in the registry -- this is what makes
@@ -196,8 +169,8 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // point (the two `register_builtin_panel` calls above ran unconditionally, and even if
     // init.lua replaced one, replacement never leaves a slot empty).
     //
-    // The bottom slot is the one that can legitimately be empty -- no `--terminal` and no plugin
-    // claiming it -- so it is an `Option` rather than an `expect`, and an empty one means the
+    // The bottom slot is the one that can legitimately be empty -- no plugin claiming it -- so
+    // it is an `Option` rather than an `expect`, and an empty one means the
     // window is built with no vertical split at all.
     let (main_widget, side_widget, bottom_widget) = {
         let panels = lua_engine.panels.borrow();
@@ -270,16 +243,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // never sees the keypresses that Neovim resolved internally.
     if let Some(ps) = pane_switch.as_mut() {
         let side_widget = side_widget.clone();
-        let terminal_for_switch = terminal.clone();
         pane_switch::listen(ps, move |direction| match direction {
-            // Ctrl+j past Neovim's own bottom window boundary, when a terminal is down there.
-            // Falls through to the no-op arm when there is none, which is what real tmux does at
-            // the edge of its pane grid -- not an error, just nothing in that direction.
-            'D' if terminal_for_switch.is_some() => {
-                let terminal = terminal_for_switch.as_ref().expect("guarded by the match arm");
-                terminal.grab_focus();
-                println!("[pane_switch] direction D -> focusing the terminal pane");
-            }
             'R' => {
                 // A `WebView` is an ordinary focusable GTK widget -- unlike a bare `GtkGLArea`,
                 // which needs `focusable(true)` set explicitly before `grab_focus()` does
@@ -321,33 +285,6 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         side_widget.add_controller(controller);
     }
 
-    // --- Ctrl+k: terminal -> editor.
-    //
-    // Same shape as the agent panel's Ctrl+h above and for the same reason: `vim-tmux-navigator`
-    // lives inside Neovim, which is not focused here, so nothing on that side would ever run. This
-    // is the third focusable surface in the window, which is the situation that produced a real
-    // bug once already -- the editor stopped receiving click-focus when the agent panel became the
-    // second one. Capture phase so the chord is claimed before the pane's own key controller
-    // forwards it, since `TerminalPane` claims every key it is focused on (a terminal is the
-    // consumer of its own keyboard) and a bubble-phase handler here would never see it.
-    if let Some(terminal) = terminal.as_ref() {
-        let pane = pane.clone();
-        let controller = EventControllerKey::new();
-        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-            if key == Key::k && state.contains(ModifierType::CONTROL_MASK) {
-                // The pane's own method, not `widget().grab_focus()`: it also drives the editor's
-                // IM context, without which the input method keeps believing the terminal has the
-                // keyboard.
-                pane.grab_focus();
-                println!("[pane_switch] Ctrl+k in the terminal -> focusing the editor");
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        terminal.widget().add_controller(controller);
-    }
-
     // nvim exiting on its own (e.g. `:qa!`) has no window to close by itself -- ask this
     // host's window to close, which in turn drives the connect_close_request handler below.
     // Mirrors neovide-editor's own `examples/standalone.rs` exactly.
@@ -377,31 +314,6 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         }
     }
 
-    // --- Ctrl+Shift+S: toggle the terminal bottom slot between its raw and semantic views.
-    //
-    // A real `gio::SimpleAction`, same pattern as the Lua-command actions just above, rather than
-    // the widget-scoped `EventControllerKey` this used to be: `TerminalBottomSlot::toggle_view`
-    // is the one authoritative switch (see `terminal_panel`'s own doc comment), and routing the
-    // keyboard path through a named app action means a test/diagnostic harness can trigger the
-    // exact same path with `app.activate_action("toggle-terminal-view", None)` -- no synthetic
-    // keyboard chord required at all, which is also why this no longer depends on `wtype`
-    // reliably delivering `Ctrl+Shift+<letter>` (a real, separate, previously-undocumented
-    // limitation -- see `shell/MANUAL_VERIFICATION.md`'s 2026-09-13 entries). An app-level accel
-    // additionally runs in the window's capture phase, ahead of any focused widget's own
-    // bubble-phase key controller (confirmed empirically elsewhere in this project, see
-    // CLAUDE.md's Ctrl+h/Ctrl+l section), so it fires regardless of which pane currently has
-    // keyboard focus -- strictly more reliable than the old Stack-scoped controller, which only
-    // saw the chord when the terminal happened to be an ancestor of the focused widget.
-    if let Some(terminal) = terminal.as_ref() {
-        let action = gtk4::gio::SimpleAction::new("toggle-terminal-view", None);
-        let terminal_for_action = terminal.clone();
-        action.connect_activate(move |_, _| {
-            terminal_for_action.toggle_view();
-        });
-        app.add_action(&action);
-        app.set_accels_for_action("app.toggle-terminal-view", &["<Control><Shift>s"]);
-    }
-
     window.present();
     // grab_focus() after present(), matching standalone.rs's own
     // `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
@@ -429,11 +341,6 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
         });
     }
 
-    // Same load-bearing-clone reasoning as `agent_panel_handle`/`lua_engine` above: the
-    // `connect_close_request` closure below takes `terminal` by move, and the final `println!`
-    // after it still needs `terminal.is_some()`.
-    let terminal_for_close = terminal.clone();
-
     // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in
     // outright rather than cloned again. (`pane` is an `Rc<NeovideEditorPane>` because the side
     // panel's Ctrl+h handler above needs it too; `NeovideEditorPane` doesn't derive `Clone`, and
@@ -442,12 +349,6 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     // either way, regardless of whether a clean `NeovimExited` was actually observed.
     window.connect_close_request(move |_window| {
         pane.shutdown();
-        // Closes the live terminal session, if one was ever opened -- window close must not leave
-        // an orphaned sidecar-hosted terminal any more than it may leave an orphaned `claude`
-        // process (see `agent_panel_handle.shutdown()` below for that side).
-        if let Some(terminal) = &terminal_for_close {
-            terminal.close();
-        }
         // Capturing `pane_switch` here is load-bearing twice over. First, it keeps the
         // `PaneSwitch` alive for the window's whole lifetime -- it is otherwise a local of
         // `build_ui`, and its directory (holding the fake-`tmux` symlink and the live socket)
@@ -488,8 +389,7 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     });
 
     println!(
-        "shell running: chrome+editor+agent-panel{}. scale_factor={} clean={}",
-        if terminal.is_some() { "+terminal" } else { "" },
+        "shell running: chrome+editor+agent-panel. scale_factor={} clean={}",
         window.scale_factor(),
         want_clean,
     );
