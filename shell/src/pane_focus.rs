@@ -5,7 +5,7 @@
 //! Each change updates the `pane-focused` CSS class, the status bar's focus label
 //! (`chrome::build_status_bar`), and the agent panel's mode block through a
 //! `pane_focus` envelope (`AgentPanelHandle::set_pane_focused`).
-//! `theme::gtk_css` draws the class as an outline around the pane.
+//! `theme::gtk_css` draws the class as a line along the pane's bottom edge.
 //! The class is toggled here so all indicators share one focus calculation.
 //! Using GTK's `:focus-within` for the frame would give it a separate mechanism
 //! that could disagree with the label and panel. This needs a `notify::focus-widget` handler.
@@ -23,10 +23,10 @@ use gtk4::prelude::*;
 pub(crate) struct Pane {
     /// Focus inside this widget, or on it, counts as this pane having focus.
     pub(crate) content: gtk4::Widget,
-    /// The widget that gets the `pane-focused` class and draws the outline. It differs from
+    /// The widget that gets the `pane-focused` class and draws the focus line. It differs from
     /// `content` for the side slot: the WebView sits inside the resize-throttle `Overlay`
     /// (`layout::install_webview_resize_throttle`) and may be sized smaller than its slot mid-drag.
-    /// The outline belongs to the slot.
+    /// The focus line belongs to the slot.
     pub(crate) frame: gtk4::Widget,
     /// What the status bar shows. It is the panel registry's own title, so a Lua plugin that
     /// replaces a slot is named by its own title and not by the built-in one.
