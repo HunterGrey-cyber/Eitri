@@ -480,8 +480,13 @@ impl AgentBackend {
     /// this only collects what is already canonical, which is why a stalled UI there can no longer
     /// make raw events pile up. Legacy is left as it was deliberately: it is the path being retired,
     /// it has no partial streaming, and one message per turn is not a backlog.
-    pub fn take_ui_delivery(&mut self) -> UiDelivery {
-        match self {
+    /// **This is also where a tool call that needs no human is answered and never becomes a card**
+    /// -- see `answer_what_needs_no_human`. `project_root` is the session's canonical project
+    /// directory, which is the boundary `Read`/`Grep`/`Glob` are judged against; it is a parameter
+    /// rather than state on this enum because `AgentBackend` is an enum its own tests construct
+    /// variant-by-variant, and a caller that forgets it does not compile.
+    pub fn take_ui_delivery(&mut self, project_root: &Path) -> UiDelivery {
+        let delivery = match self {
             AgentBackend::Legacy(session) => {
                 let events = session.pump();
                 if events.is_empty() {
@@ -491,7 +496,94 @@ impl AgentBackend {
                 }
             }
             AgentBackend::Sidecar(conversation) => conversation.take_ui_delivery(),
+        };
+        match delivery {
+            UiDelivery::Events(events) => {
+                let kept = self.answer_what_needs_no_human(events, project_root);
+                if kept.is_empty() {
+                    UiDelivery::Nothing
+                } else {
+                    UiDelivery::Events(kept)
+                }
+            }
+            // A `Resync` carries no events to filter: the UI is about to rebuild from the
+            // projection instead. See `answer_what_needs_no_human`'s own note on the window that
+            // leaves open.
+            other => other,
         }
+    }
+
+    /// Answers every `PermissionRequested` in this batch that `agent::permission_policy` says needs
+    /// no human, and returns the events the UI should still see.
+    ///
+    /// **This is the single point both backends converge on, and that is why the fix lives here.**
+    /// Both install a `PreToolUse` gate whose matcher is `*` -- legacy generates the hook, the
+    /// sidecar gets one from Verdandi's own broker -- and both are right to: "the host sees every
+    /// call" is the correct layering, because the policy of what needs a human belongs to the
+    /// product that has the human. What was wrong was equating "the host was asked" with "the user
+    /// must answer", which is what put a card in front of the owner for every single `Read`. Fixing
+    /// it here needs no change in Verdandi and no change on any wire.
+    ///
+    /// An auto-answered request is dropped from the delivery entirely, so the frontend never learns
+    /// it existed and no card is drawn. The tool call itself still arrives as
+    /// `ToolCallStarted`/`ToolCallCompleted`, so the transcript still shows what ran -- this
+    /// suppresses the question, never the record.
+    ///
+    /// **If the answer fails to send, the event is delivered after all.** A request left pending in
+    /// the projection with no card on screen is a session the user cannot unstick, which is a worse
+    /// failure than an extra click.
+    ///
+    /// Two honest gaps, neither of which any test here covers:
+    ///
+    /// - The resolution is dropped too, but only the legacy backend's, which is returned
+    ///   synchronously. The sidecar's `PermissionResolved` arrives on a later pump and IS delivered,
+    ///   for a `permission_id` the frontend never saw; its reducer filters `pendingPermissions` by
+    ///   id, so that is a no-op there rather than an error.
+    /// - On the sidecar path the projection keeps the request pending until that resolution
+    ///   arrives. A `UiDelivery::Resync` landing inside that window would rebuild the frontend from
+    ///   a snapshot that still holds the card, which would then vanish on the next pump. A resync
+    ///   needs 256 queued events to happen at all, so this has never been observed; it is written
+    ///   down because it is reachable, not because it was seen.
+    fn answer_what_needs_no_human(
+        &mut self,
+        events: Vec<AgentDomainEvent>,
+        project_root: &Path,
+    ) -> Vec<AgentDomainEvent> {
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            let AgentDomainEvent::PermissionRequested { permission_id, tool_name, input, .. } = &event
+            else {
+                kept.push(event);
+                continue;
+            };
+            let classification = agent::classify_permission_request(tool_name, input, project_root);
+            if classification.needs_a_human() {
+                kept.push(event);
+                continue;
+            }
+            // Cloned before the mutable borrow below, not for tidiness: `event` borrows from the
+            // same value `respond_permission` needs `&mut self` for.
+            let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+            match self.respond_permission(&permission_id, PermissionDecision::Allow) {
+                Ok(_resolution) => {
+                    // Said on stderr rather than silently: this is the only record anywhere of a
+                    // tool call that ran without the user being asked. One short line, whose reason
+                    // is a fixed label from the policy rather than anything the model wrote.
+                    eprintln!(
+                        "[permission] allowed without asking: {tool_name} ({})",
+                        classification.reason
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[permission] could not auto-answer {tool_name}, showing a card instead: {}",
+                        error.message
+                    );
+                    kept.push(event);
+                }
+            }
+        }
+        kept
     }
 
     pub fn shutdown(&mut self) {
@@ -980,6 +1072,181 @@ mod tests {
             error.folded_events.is_empty(),
             "the sidecar's prompt reaches the UI through the pump, never through the error"
         );
+    }
+
+    // ---- The permission policy, wired through the one point both backends converge on ---------
+
+    /// A provider that queues whatever events a test wants and records every resolution it is
+    /// handed. The twin of `RejectingProvider` above, for the opposite question: that one exists to
+    /// make a send fail, this one to see what the host answered.
+    #[derive(Default)]
+    struct RecordingProvider {
+        queued: std::sync::Mutex<Vec<AgentDomainEvent>>,
+        resolved: std::sync::Mutex<Vec<(String, bool)>>,
+    }
+
+    impl RecordingProvider {
+        fn queue(&self, event: AgentDomainEvent) {
+            self.queued.lock().unwrap().push(event);
+        }
+        fn resolutions(&self) -> Vec<(String, bool)> {
+            self.resolved.lock().unwrap().clone()
+        }
+    }
+
+    impl agent::AgentProvider for RecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo::default()
+        }
+        fn create_session(&self, _request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+            Ok("fake-session".into())
+        }
+        fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+            Err(agent::ProviderError::UnsupportedCapability("resume"))
+        }
+        fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+            Ok("turn-1".into())
+        }
+        fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+            Ok(())
+        }
+        fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+            self.resolved.lock().unwrap().push((request.permission_id, request.decision.allows()));
+            Ok(())
+        }
+        fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+            Ok(())
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            std::mem::take(&mut *self.queued.lock().unwrap())
+        }
+    }
+
+    /// A real workspace with a real file in it, because the policy's path branch canonicalizes for
+    /// real -- a fabricated root would make "inside the project" and "does not exist" the same
+    /// answer.
+    fn a_workspace_holding_one_file() -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("permission-policy");
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    /// Drives the pump until it yields something or the deadline passes. The sidecar's events cross
+    /// the ingestion thread, so the first call after a queue is normally empty.
+    fn pump_until_delivery(backend: &mut AgentBackend, project_root: &Path) -> Vec<AgentDomainEvent> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match backend.take_ui_delivery(project_root) {
+                UiDelivery::Events(events) => return events,
+                _ if std::time::Instant::now() > deadline => return Vec::new(),
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// The owner's defect, in one assertion: a `Read` of a file inside his own project produced a
+    /// card. It must now produce no card at all, and the request must really have been answered --
+    /// not merely hidden, which would leave the model waiting forever.
+    #[test]
+    fn a_read_inside_the_project_is_answered_here_and_never_becomes_a_card() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-read".into(),
+            tool_use_id: Some("tool-1".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+        });
+        // One `ToolCallStarted` alongside it, so this also pins that the FILTER is selective: the
+        // record of what ran must still reach the transcript.
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "turn-1".into(),
+            tool_use_id: "tool-1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+        });
+
+        let delivered = pump_until_delivery(&mut backend, &dir);
+        assert!(
+            !delivered.iter().any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+            "a read inside the project must not reach the UI as a card: {delivered:?}"
+        );
+        assert!(
+            delivered.iter().any(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. })),
+            "the tool call itself is still owed to the transcript: {delivered:?}"
+        );
+        assert_eq!(
+            provider.resolutions(),
+            vec![("perm-read".to_string(), true)],
+            "suppressing the card without answering the request would hang the model"
+        );
+        backend.shutdown();
+    }
+
+    /// The other direction, which is the one a permissive bug would break silently: a `Write` still
+    /// reaches the user, and nothing answers it on their behalf.
+    #[test]
+    fn a_write_still_reaches_the_user_and_is_answered_by_nobody_else() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-write".into(),
+            tool_use_id: Some("tool-2".into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+        });
+
+        let delivered = pump_until_delivery(&mut backend, &dir);
+        assert!(
+            delivered.iter().any(|e| matches!(
+                e,
+                AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "perm-write"
+            )),
+            "a write must reach the user: {delivered:?}"
+        );
+        assert!(provider.resolutions().is_empty(), "nothing may answer a write for the user");
+        backend.shutdown();
+    }
+
+    /// A read OUTSIDE the project root is the same tool and the same shape of input, and it still
+    /// gets a card. Asserted through the backend rather than only against the policy function,
+    /// because the wiring has to pass the real project root down -- passing `"/"`, or the process
+    /// cwd, would auto-allow this and every test that only calls `classify_permission_request`
+    /// directly would still pass.
+    #[test]
+    fn a_read_outside_the_project_still_reaches_the_user() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-escape".into(),
+            tool_use_id: Some("tool-3".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "/etc/hostname" }),
+        });
+
+        let delivered = pump_until_delivery(&mut backend, &dir);
+        assert!(
+            delivered.iter().any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+            "a read outside the project must reach the user: {delivered:?}"
+        );
+        assert!(provider.resolutions().is_empty());
+        backend.shutdown();
     }
 
     /// A refusal that now carries events must still be a refusal.

@@ -30,6 +30,7 @@ pub mod handoff;
 pub mod hook_protocol;
 pub mod ingestion;
 pub mod lease;
+pub mod permission_policy;
 pub mod persistence;
 #[doc(hidden)]
 pub mod process_probe;
@@ -42,6 +43,7 @@ pub mod transcript;
 
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
+pub use permission_policy::{classify_permission_request, Classification, PermissionVerdict};
 pub use persistence::{resumable_sessions, ResumableSession};
 pub use event::{AgentEvent, PermissionSource};
 pub use process::{disallowed_tools_for, AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};

@@ -403,7 +403,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
 
         let (payload, first_text_in_this_batch) = {
             let mut state_ref = state.borrow_mut();
-            let AgentPanelState { session, turn_trace, supervisor, supervisor_pending, .. } =
+            let AgentPanelState { session, turn_trace, supervisor, supervisor_pending, project_dir, .. } =
                 &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
             // during `build_ui`, where waiting for it would have delayed the window appearing.
@@ -426,7 +426,10 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
             let mut first_text_in_this_batch = false;
             let payload = session.as_mut().and_then(|session| {
                 let from_revision = session.projection().last_revision;
-                match session.take_ui_delivery() {
+                // The project root travels in because the permission policy judges
+                // `Read`/`Grep`/`Glob` paths against it -- see
+                // `AgentBackend::answer_what_needs_no_human`.
+                match session.take_ui_delivery(project_dir) {
                     UiDelivery::Nothing => None,
                     UiDelivery::Events(events) => {
                         if let Some(trace) = turn_trace.as_mut() {
