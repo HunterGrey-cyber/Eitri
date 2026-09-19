@@ -40,6 +40,11 @@ function toolSign(call: ToolCallRecord): string {
  *  never scrolled up on purpose. Arbitrary and not tuned against a real screen. */
 const BOTTOM_FOLLOW_THRESHOLD_PX = 24;
 
+/** Within this of the true bottom counts as AT it, whatever direction the last scroll went: sub-pixel
+ *  rounding, and the browser clamping `scrollTop` when content below shrinks. Smaller than any `k`
+ *  step (three lines), so a deliberate scroll up can never read as "at the bottom". */
+const AT_BOTTOM_PX = 1;
+
 export function MessageList({ state, sessionEnded, expanded, cursor, focused = true, onAnswerPermission }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -59,11 +64,18 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
   const onScroll = () => {
     const list = listRef.current;
     if (list === null) return;
+    // Check the true bottom before upward movement, then the downward re-entry threshold.
+    // An upward scroll stops following even near the bottom, so the next delta cannot undo `k`.
+    // An upward clamp after content shrinks stays followed if it ends within `AT_BOTTOM_PX`.
+    // Only downward movement near the bottom re-arms following through the larger threshold;
+    // a synchronous check after content changes must not re-arm a reader who just scrolled up.
     const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
-    if (distance <= BOTTOM_FOLLOW_THRESHOLD_PX) {
+    if (distance <= AT_BOTTOM_PX) {
       followingRef.current = true;
     } else if (list.scrollTop < lastScrollTopRef.current) {
       followingRef.current = false;
+    } else if (list.scrollTop > lastScrollTopRef.current && distance <= BOTTOM_FOLLOW_THRESHOLD_PX) {
+      followingRef.current = true;
     }
     lastScrollTopRef.current = list.scrollTop;
   };
@@ -93,6 +105,10 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
     const list = listRef.current;
     if (list !== null && list.scrollHeight - list.scrollTop - list.clientHeight > 0) {
       list.scrollTop = list.scrollHeight;
+      // Record where the snap put the view. Found in review: this ref kept the PRE-snap value, so
+      // a `k` pressed before the snap's own scroll event arrived ended above the snap but not above
+      // the stale value, was not seen as a scroll up, and the next delta snapped the view back.
+      lastScrollTopRef.current = list.scrollTop;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);

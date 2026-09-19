@@ -283,8 +283,9 @@ pub struct NeovideEditorPaneOptions {
 /// otherwise leave an anti-aliased sliver at fractional cell sizes: 33 pixels at scale 1.5.
 ///
 /// `--cmd` runs before user configuration, so `init.lua` can restore the hollow block with
-/// `vim.g.neovide_cursor_unfocused_outline_width = 0.125`. Runtime changes to the variable
-/// apply to the renderer too.
+/// `vim.g.neovide_cursor_unfocused_outline_width = 0.125`. The initial value is read by
+/// `settings.read_initial_values` before `ui_attach`. Configuration at `ui_attach` and later
+/// runtime changes reach the renderer through the `WatchGlobal` watcher and `setting_changed`.
 pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outline_width = 0";
 
 /// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`
