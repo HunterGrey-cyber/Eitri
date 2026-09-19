@@ -314,8 +314,30 @@ describe("ModeSelector conversation picker", () => {
     const rows = document.querySelectorAll(".row");
     expect(rows.length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText(/新会话|New session/)).toBeTruthy();
-    // The data cannot supply a title and the screen must say so rather than invent one.
-    expect(screen.getByTestId("no-title-note")).toBeTruthy();
+    // The screen says what a row's name is, and what an old row without one shows instead.
+    expect(screen.getByTestId("session-choice-note").textContent).toMatch(/first message sent in it here/);
+  });
+
+  it("names a session by its title, keeping its id and time in the detail line", () => {
+    const titled = { ...session("abc12345", "1737200000000"), title: "fix the resume picker" };
+    render(<ModeSelector hello={hello({ resumableSessions: [titled] })} connecting={false} onStart={() => {}} />);
+    const row = screen.getByText("fix the resume picker").closest("button")!;
+    expect(row.textContent).toMatch(/claude abc12345/);
+    expect(row.textContent).toMatch(/last opened/);
+  });
+
+  it("shows an untitled session exactly as before, inventing nothing", () => {
+    const untitled = { ...session("abc12345", "1737200000000"), title: null };
+    render(<ModeSelector hello={hello({ resumableSessions: [untitled] })} connecting={false} onStart={() => {}} />);
+    const row = screen.getByText("claude abc12345").closest("button")!;
+    expect(row.querySelector(".session-title")).toBeNull();
+  });
+
+  it("says which titled session a mode button will continue", () => {
+    const titled = { ...session("abc12345", "1737200000000"), title: "fix the resume picker" };
+    render(<ModeSelector hello={hello({ resumableSessions: [titled], permissionModes: ["auto"] })} connecting={false} onStart={() => {}} />);
+    fireEvent.click(screen.getByText("fix the resume picker").closest("button")!);
+    expect(screen.getByText("Auto").closest("button")!.textContent).toMatch(/Continues “fix the resume picker”/);
   });
 
 });
