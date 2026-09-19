@@ -761,6 +761,11 @@ export default function App() {
       (scrollCursorRowBox(root, action.delta) || scrollCursorRow(root, action.delta))
     ) {
       event.preventDefault();
+      // A scroll step returns DOM focus to the conversation root, as a row move does. Otherwise a card
+      // control could scroll out of view while still responding to Enter.
+      if (root !== null && document.activeElement !== root && root.contains(document.activeElement)) {
+        root.focus({ preventScroll: true });
+      }
       return;
     }
     if (action.kind === "move" || action.kind === "control" || action.kind === "answer") {
