@@ -544,6 +544,35 @@ impl NeovideEditorPane {
                             // the clone happens exactly once per pane.
                             child_env: child_env.clone(),
                             cwd: cwd.clone(),
+                            // Off, unconditionally, for this embedding -- the opposite of the
+                            // `LiveHarnessOptions` default, and the one place this crate takes a
+                            // view rather than passing a host's choice through.
+                            //
+                            // Neovide's startup-message capture attaches with `ext_messages` on
+                            // and, on the first flush, restores the built-in message UI by writing
+                            // the *pre-attach* `cmdheight` back. That value is the stock `1`: nvim
+                            // has not read the user's config when it is sampled. For a config that
+                            // externalises the cmdline itself (noice.nvim, which LazyVim ships),
+                            // the `1` lands on top of the `0` that config chose and nvim then
+                            // reserves a row nothing ever paints -- measured on this pane as a
+                            // one-cell band of nvim's own `Normal` background along the bottom,
+                            // 44px at a 44px cell, sitting above the shell's status bar and never
+                            // filling.
+                            //
+                            // Turning the capture off is not just a smaller evil here, it is the
+                            // right shape: `ext_messages` is set only inside the same branch that
+                            // reads the pre-attach `cmdheight`, so opting out leaves nvim's own
+                            // message UI in place rather than externalising messages with nothing
+                            // to restore them. Verified at the nvim protocol level against both a
+                            // cmdline-externalising config and a plain one with no message handler
+                            // at all: the plain config keeps a real, functional command line (still
+                            // `cmdheight=1`, still painted -- an `:echomsg` reaches the built-in
+                            // message grid either way), and the externalising config gets the row
+                            // back. What is given up is narrow and was measured too: an error
+                            // raised while loading the config is painted onto nvim's own message
+                            // grid, where it can want a keypress to dismiss, instead of being held
+                            // and replayed after the first frame.
+                            startup_message_capture: false,
                             ..Default::default()
                         };
                         println!(
