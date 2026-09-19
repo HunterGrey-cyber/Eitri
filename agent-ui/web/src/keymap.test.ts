@@ -66,5 +66,41 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("y", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("r", { ctrlKey: true }), { sessionEnded: true })).toBeNull();
     expect(resolveKey("input", key("Escape", { shiftKey: true }), ctx)).toBeNull();
+    // The three chords it DOES name (below) are named exactly: every other modifier set on the
+    // same letters, and every other Ctrl/Shift letter a vim user might reach for, is still refused.
+    expect(resolveKey("browse", key("d", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("U", { shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("g", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("G", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("b", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("e", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("J", { shiftKey: true }), ctx)).toBeNull();
+    // And the named ones belong to BROWSE only: in the composer they are the text box's own.
+    expect(resolveKey("input", key("d", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("input", key("u", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("input", key("G", { shiftKey: true }), ctx)).toBeNull();
+  });
+
+  /* Checked ahead of the plain-key switch: a browser reports `key === "d"` for Ctrl+d, so a Ctrl+d
+     that reached `case "d"` would DENY a pending permission. */
+  it("names Ctrl+d, Ctrl+u and Shift+G, and a Ctrl+d is never a deny", () => {
+    expect(resolveKey("browse", key("d", { ctrlKey: true }), ctx)).toEqual({ kind: "half-page", delta: 1 });
+    expect(resolveKey("browse", key("u", { ctrlKey: true }), ctx)).toEqual({ kind: "half-page", delta: -1 });
+    expect(resolveKey("browse", key("G", { shiftKey: true }), ctx)).toEqual({ kind: "jump", to: "last" });
+    expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+    // Scrolling a dead session's transcript is still reading it.
+    expect(resolveKey("browse", key("d", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "half-page", delta: 1 });
+  });
+
+  /* The table keeps no memory: whether a `g` is the second of `gg` is the caller's fact, passed in. */
+  it("reads gg from a pending g the caller holds, and a lone g does nothing but ask to be remembered", () => {
+    expect(resolveKey("browse", key("g"), ctx)).toEqual({ kind: "pending-g" });
+    expect(resolveKey("browse", key("g"), { ...ctx, pendingG: false })).toEqual({ kind: "pending-g" });
+    expect(resolveKey("browse", key("g"), { ...ctx, pendingG: true })).toEqual({ kind: "jump", to: "first" });
+    // A pending g changes nothing about any other key.
+    expect(resolveKey("browse", key("j"), { ...ctx, pendingG: true })).toEqual({ kind: "move", delta: 1 });
+    expect(resolveKey("input", key("g"), { ...ctx, pendingG: true })).toBeNull();
   });
 });

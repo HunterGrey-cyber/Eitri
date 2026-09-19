@@ -493,6 +493,10 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       // otherwise. jsdom's all-zero rects would read as off screen.
       const rect = (top: number, bottom: number) => ({ top, bottom }) as DOMRect;
       box.getBoundingClientRect = () => rect(boxTop, boxTop + clientHeight);
+      // The row around the box sits where the box does. Since `scrollCursorRow` (2026-09-19) also
+      // measures the ROW, a row left at jsdom's all-zero rect would read as off screen here.
+      const row = box.closest(".row-current") as HTMLElement;
+      row.getBoundingClientRect = () => rect(boxTop, boxTop + clientHeight);
       const list = box.closest(".message-list") as HTMLElement;
       list.getBoundingClientRect = () => rect(0, 800);
     }
@@ -847,6 +851,223 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     expect(document.activeElement).toBe(modes[1]);
     press("k");
     expect(document.activeElement).toBe(modes[0]);
+  });
+});
+
+/* The owner, on an installed build (2026-09-19): "现在jk没法在选中输出的时候滚动屏幕，特别是在最后
+   输出很长的时候，没法滚动看下面的". `j`/`k` moved row to row only, so a reply taller than the view was
+   skipped over, and on the LAST row there was nowhere to move and the rest of it was unreachable.
+
+   jsdom implements no layout, so `fakeLayout` stands one in: the rows stacked at the given heights in
+   a list viewport `viewport` px tall at y = 0, every rect following the list's `scrollTop`, which
+   clamps to [0, scrollHeight - clientHeight] the way a browser's does. Each row's line height is set
+   inline to 20px, so one step is 3 x 20 = 60px. None of this proves what a real WebKit draws. */
+describe("App keyboard: scrolling through the conversation", () => {
+  function started(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  function prompts(...texts: string[]) {
+    events(...texts.map((text): AgentDomainEvent => ({ type: "user_prompt_submitted", text })));
+  }
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const press = (key: string, over: { ctrlKey?: boolean; shiftKey?: boolean } = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
+  const current = (c: HTMLElement) => c.querySelector(".row-current .row-body")!.textContent;
+
+  function fakeLayout(container: HTMLElement, heights: number[], viewport = 400) {
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+    expect(rows.length).toBe(heights.length);
+    const total = heights.reduce((a, b) => a + b, 0);
+    let scrollTop = 0;
+    Object.defineProperty(list, "clientHeight", { value: viewport, configurable: true });
+    Object.defineProperty(list, "scrollHeight", { value: total, configurable: true });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = Math.max(0, Math.min(total - viewport, v));
+      },
+    });
+    list.getBoundingClientRect = () => ({ top: 0, bottom: viewport }) as DOMRect;
+    let y = 0;
+    rows.forEach((row, i) => {
+      const top = y;
+      y += heights[i];
+      row.getBoundingClientRect = () => ({ top: top - scrollTop, bottom: top + heights[i] - scrollTop }) as DOMRect;
+      row.style.lineHeight = "20px";
+    });
+    act(() => root(container).focus());
+    return list;
+  }
+
+  it("j scrolls through a tall middle row, landing on its top, and moves on only once its end is on screen", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 990, 100]);
+
+    press("j");
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(100); // the tall row's TOP at the top of the view
+
+    // 590px of it is below the view: nine 60px steps, then a 50px one -- never past the edge.
+    const seen: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      press("j");
+      seen.push(list.scrollTop);
+    }
+    expect(current(container)).toBe("b");
+    expect(seen).toEqual([160, 220, 280, 340, 400, 460, 520, 580, 640, 690]);
+    expect(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[1].getBoundingClientRect().bottom).toBe(400);
+
+    press("j");
+    expect(current(container)).toBe("c");
+  });
+
+  it("j reads a tall LAST row to its end, then stops", () => {
+    const { container } = started();
+    prompts("a", "b");
+    const list = fakeLayout(container, [100, 990]);
+
+    for (let i = 0; i < 30; i++) press("j");
+
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(690); // the very end of the list
+  });
+
+  it("k is the mirror: lands on a tall row's BOTTOM and scrolls up through it before moving", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 990, 100]);
+    for (let i = 0; i < 12; i++) press("j");
+    expect(current(container)).toBe("c");
+    expect(list.scrollTop).toBe(690);
+    // "c" fits, so landing on it used `scrollIntoView({ block: "nearest" })` -- a mock here. Do what
+    // a browser would: bring "c" fully on screen, which is also the end of the list.
+    list.scrollTop = 790;
+
+    press("k");
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(690); // the tall row's BOTTOM at the bottom of the view
+
+    const seen: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      press("k");
+      seen.push(list.scrollTop);
+    }
+    expect(seen).toEqual([630, 570, 510, 450, 390, 330, 270, 210, 150, 100]);
+    expect(current(container)).toBe("b");
+
+    press("k");
+    expect(current(container)).toBe("a");
+  });
+
+  it("from the Stop button, k moves back to the row rather than scrolling it", () => {
+    const { container } = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
+    events({ type: "turn_started", turn_id: "t1" });
+    prompts("a", "b");
+    act(() => root(container).focus());
+    press("j"); // no layout yet: a plain move onto "b"
+    const list = fakeLayout(container, [100, 1000]);
+    list.scrollTop = 300; // "b" runs past both edges
+    const stop = buttonLabelled(container, "Stop")!;
+    act(() => stop.focus());
+
+    press("k");
+
+    expect(document.activeElement).toBe(root(container));
+    expect(list.scrollTop).toBe(300);
+    expect(current(container)).toBe("b");
+  });
+
+  it("Ctrl+d and Ctrl+u scroll half a view, and bring the cursor to a row that is still on screen", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+
+    press("d", { ctrlKey: true });
+    expect(list.scrollTop).toBe(200);
+    expect(current(container)).toBe("r0"); // still partly on screen: the cursor stays
+
+    scrollIntoView.mockClear();
+    press("d", { ctrlKey: true });
+    expect(list.scrollTop).toBe(400);
+    expect(current(container)).toBe("r1"); // r0 left the view; r1 is the first row on screen
+    expect(list.scrollTop).toBe(400); // and the view stayed where Ctrl+d put it
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    press("G", { shiftKey: true }); // cursor to r4, the view at the very end
+    expect(current(container)).toBe("r4");
+    expect(list.scrollTop).toBe(1100);
+    press("u", { ctrlKey: true });
+    expect(list.scrollTop).toBe(900);
+    expect(current(container)).toBe("r4");
+    press("u", { ctrlKey: true });
+    expect(list.scrollTop).toBe(700);
+    expect(current(container)).toBe("r3"); // the LAST row still on screen
+  });
+
+  it("Ctrl+d never answers a permission, whatever the plain d does", () => {
+    const { container } = started();
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    act(() => root(container).focus());
+    press("d", { ctrlKey: true });
+    expect(lastOfType("permission_response")).toBeUndefined();
+  });
+
+  it("G goes to the last row and the very end of the list; gg to the first row and the top", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 990, 100]);
+
+    press("G", { shiftKey: true });
+    expect(current(container)).toBe("c");
+    expect(list.scrollTop).toBe(790);
+
+    press("g");
+    press("g");
+    expect(current(container)).toBe("a");
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it("G on a long last reply shows its end, not its top", () => {
+    const { container } = started();
+    prompts("a", "b");
+    const list = fakeLayout(container, [100, 990]);
+    press("G", { shiftKey: true });
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(690);
+  });
+
+  it("a lone g does nothing, and any other key cancels it", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [100, 100, 100]);
+    list.scrollTop = 0;
+
+    press("g");
+    expect(current(container)).toBe("a");
+
+    press("j");
+    press("j");
+    expect(current(container)).toBe("c");
+    press("g");
+    press("x"); // not a key the table knows -- still cancels
+    press("g");
+    expect(current(container)).toBe("c");
+    press("j"); // and a key it does know cancels too
+    press("g");
+    expect(current(container)).toBe("c");
   });
 });
 

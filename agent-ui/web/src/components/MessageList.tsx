@@ -92,11 +92,35 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
     }
     lastScrollTopRef.current = list.scrollTop;
   };
+  //
+  // **A reply growing while it streams is followed too, since 2026-09-19** -- the "flip side" above
+  // is closed. The owner's panel design: with the view at the bottom, new streamed text stays in
+  // view; `k` or a scroll up stops that, as it always stopped the new-row follow. This effect now
+  // runs on every `state` (the reducer replaces it on each folded event) and tells the two cases
+  // apart by the four lengths: a new row keeps the smooth `scrollIntoView` it always had; growth
+  // inside an existing row snaps `scrollTop` to the end instead, because a smooth animation
+  // restarted on every 33ms pump batch would never finish.
+  //
+  // `onScroll()` is called first, synchronously: a browser delivers scroll events at the next
+  // frame, so a `k` that scrolled up a moment ago may not have been seen yet, and without this the
+  // next delta would snap the view straight back down under the user. **Not looked at on a screen.**
+  const rowCountsRef = useRef<string | null>(null);
   useEffect(() => {
-    if (followingRef.current) {
+    onScroll();
+    const counts = `${state.userPrompts.length}/${state.transcript.length}/${state.toolCalls.length}/${state.pendingPermissions.length}`;
+    const newRow = counts !== rowCountsRef.current;
+    rowCountsRef.current = counts;
+    if (!followingRef.current) return;
+    if (newRow) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      return;
     }
-  }, [state.userPrompts.length, state.transcript.length, state.toolCalls.length, state.pendingPermissions.length]);
+    const list = listRef.current;
+    if (list !== null && list.scrollHeight - list.scrollTop - list.clientHeight > 0) {
+      list.scrollTop = list.scrollHeight;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
 
   /* Which tool calls are blocked on a decision the user has not made yet. A turn can have several
      calls of the same tool in flight, so "Bash is waiting" identifies nothing on its own -- this is

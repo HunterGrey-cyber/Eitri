@@ -498,6 +498,56 @@ describe("MessageList auto-follow", () => {
   });
 });
 
+/* The owner's panel design (2026-09-19), point D: with the view at the bottom, a reply that grows
+   while it streams stays in view -- before this, only a NEW row was ever followed. Growth is one
+   transcript entry getting longer, so the four lengths do not change; the list's `scrollTop` is
+   snapped to its end rather than smooth-scrolled. */
+describe("MessageList follows a reply growing while it streams", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  it("snaps to the end when the last reply grows and the view was at the bottom", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("par") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 1600 });
+
+    rerender(<MessageList state={state({ transcript: texts("partial reply, longer now") })} {...props} />);
+
+    expect(list.scrollTop).toBe(2300);
+  });
+
+  it("leaves the view alone when the user has scrolled up", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("par") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 800 });
+
+    rerender(<MessageList state={state({ transcript: texts("partial reply, longer now") })} {...props} />);
+
+    expect(list.scrollTop).toBe(800);
+  });
+
+  /* A browser delivers `scroll` at the next frame, so a `k` that scrolled up can still be
+     unannounced when the next delta arrives. The effect reads the position itself first; without
+     that, this delta would snap the user straight back down. */
+  it("honours a scroll up whose scroll event has not arrived yet", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("par") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    // Scrolled up, no event dispatched; the content then grows.
+    setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 1540 });
+
+    rerender(<MessageList state={state({ transcript: texts("partial reply, longer now") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1540);
+  });
+});
+
 describe("MessageList cursor highlight", () => {
   it("marks only the row at `cursor`, by position, with row-current and aria-current", () => {
     const { container } = render(

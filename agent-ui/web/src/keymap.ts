@@ -17,6 +17,15 @@ export type PanelAction =
   | { kind: "toggle-expand" }
   | { kind: "copy" }
   | { kind: "restart" }
+  /** `Ctrl+d` (+1) / `Ctrl+u` (-1): scroll the conversation by half its visible height. `App.tsx`
+   *  measures the list and re-homes the cursor if the scroll carried its row out of sight. */
+  | { kind: "half-page"; delta: 1 | -1 }
+  /** `gg` (first) / `G` (last): the cursor to that end row, the list scrolled to that very end. */
+  | { kind: "jump"; to: "first" | "last" }
+  /** A lone `g`: nothing happens yet. `App.tsx` remembers it and passes it back in as
+   *  `KeyContext.pendingG` with the next key, which is how `gg` is read without this table
+   *  keeping any memory of its own. */
+  | { kind: "pending-g" }
   | null;
 
 /** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
@@ -26,7 +35,13 @@ export type KeyLike = { key: string; ctrlKey: boolean; shiftKey: boolean; isComp
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
  *  screen) and what REFUSES `i` (a dead session's composer is disabled, so INPUT has no box). The
  *  rule both serve is that no on-screen hint may promise a key the current mode drops. */
-export type KeyContext = { sessionEnded: boolean };
+export type KeyContext = {
+  sessionEnded: boolean;
+  /** The previous key was a lone `g` in BROWSE and nothing has come since. Held by the caller
+   *  (`App.tsx`), never by this table, so `resolveKey` stays a function of its three arguments.
+   *  The caller clears it on every key, so any key other than a second `g` cancels it. */
+  pendingG?: boolean;
+};
 
 /**
  * The key table, as a pure function: mode plus key plus context in, one action or nothing out.
@@ -35,11 +50,25 @@ export type KeyContext = { sessionEnded: boolean };
  * component that owns focus (`App.tsx`) is left with only "apply this action".
  */
 export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): PanelAction {
-  // A key carrying a modifier this table does not name is not claimed. None of the rows below need
-  // Ctrl or Shift, so any chord holding either falls through unclaimed -- an ordinary Shift+letter,
-  // and any Ctrl+letter GTK or a future binding wants, both included. `KeyLike` has carried these
-  // two fields since the table was first written; this is what makes reading them, rather than
-  // deleting them, the correct fix once something actually checked whether they were used.
+  // The three chords this table names, checked BEFORE the blanket modifier refusal below and before
+  // the plain-key switch. The order is load-bearing: a browser reports `key === "d"` for Ctrl+d just
+  // as for a bare `d` (Ctrl does not remap `key` the way Shift does), so a Ctrl+d that reached the
+  // switch would land on `case "d"` and DENY a pending permission. Each chord is matched on its
+  // exact modifier set -- Ctrl+Shift+d is none of them and is refused below like any other chord.
+  // GTK claims none of these before the WebView (checked against `shell/src/main.rs` and
+  // `shell/src/agent_panel.rs`, 2026-09-19): only a user's own Lua `keybinding` could.
+  if (mode !== "input") {
+    if (event.ctrlKey && !event.shiftKey && (event.key === "d" || event.key === "u")) {
+      return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
+    }
+    if (event.shiftKey && !event.ctrlKey && event.key === "G") return { kind: "jump", to: "last" };
+  }
+  // A key carrying a modifier this table does not name is not claimed. Apart from the three chords
+  // just above, no row needs Ctrl or Shift, so any other chord holding either falls through
+  // unclaimed -- an ordinary Shift+letter, and any Ctrl+letter GTK or a future binding wants, both
+  // included. `KeyLike` has carried these two fields since the table was first written; this is what
+  // makes reading them, rather than deleting them, the correct fix once something actually checked
+  // whether they were used.
   if (event.ctrlKey || event.shiftKey) return null;
   if (mode === "input") {
     // An Esc mid-composition belongs to the input method -- fcitx uses it to cancel the preedit.
@@ -59,6 +88,9 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return { kind: "move", delta: 1 };
     case "k":
       return { kind: "move", delta: -1 };
+    case "g":
+      // `gg` is the only thing `g` begins; a lone `g` does nothing until the second one arrives.
+      return ctx.pendingG === true ? { kind: "jump", to: "first" } : { kind: "pending-g" };
     case "l":
       return { kind: "control", delta: 1 };
     case "h":
