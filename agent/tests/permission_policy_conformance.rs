@@ -1,50 +1,19 @@
-//! The permission policy, checked against the real Claude CLI instead of against a table copied
-//! out of documentation.
+//! Tests that the permission policy is never more permissive than the real Claude CLI.
+//! The headless CLI provides an observable permission result: under `default`, with no hook,
+//! `Read` ran and `Write` was denied without creating a file. Under `auto`, a classifier
+//! approved `Bash`, `Read` and `Write`, so that mode cannot serve as the same comparison.
 //!
-//! # The oracle, and why one exists at all
+//! A CLI denial that the policy would auto-allow fails the test. A CLI allowance that the
+//! policy sends for approval is printed and counted, but passes. The policy requires approval
+//! for compound shell syntax, `WebFetch` and unknown tool names, so equality is not required.
+//! Each probe must call its expected tool to avoid passing without exercising it.
+//! Reads outside the root, including paths containing `..`, exercise path-based classification.
 //!
-//! `agent::permission_policy` reproduces the CLI's *interactive* `default`-mode rules: which tool
-//! calls it would put in front of a human. An interactive prompt is not something a test can read
-//! -- but on 2026-09-19, on CLI 2.1.272, the headless CLI was measured doing the same
-//! classification with a different ending:
-//!
-//! - `claude --print` with **no** `--permission-mode` flag (`init.permissionMode` reports
-//!   `default`) ran `Read` and **denied** `Write` -- `is_error: true`, "Claude requested permissions
-//!   to write to ..., but you haven't granted it yet", and the file was really not created.
-//! - `claude --print --permission-mode auto` ran `Bash`, `Read` **and** `Write` with no prompt,
-//!   because `auto` means "a classifier model approves in your place".
-//!
-//! So under `default`, with no hook installed, **what the CLI allows is what needs no human, and
-//! what it denies is what does**. That is a real oracle, and it is why this file exists: a table
-//! transcribed from docs drifts silently when a release changes the rules, and a test against the
-//! binary does not.
-//!
-//! # What this asserts, exactly
-//!
-//! Not equality. The policy is deliberately **stricter** than the CLI in several places (it refuses
-//! to parse compound shell syntax, it always cards `WebFetch`, it cards any tool name it has never
-//! heard of), and each of those is a documented decision rather than a defect. So the assertion is
-//! one-sided:
-//!
-//! > the policy is never MORE PERMISSIVE than the CLI.
-//!
-//! A call the CLI denied and the policy would have auto-allowed is a security defect and fails the
-//! test, naming the call. A call the CLI allowed and the policy cards is printed, counted, and
-//! passes -- that is the cost side of rule (c), and seeing it listed is the point.
-//!
-//! # Running it
-//!
-//! Real turns, real money, on the TEST Claude profile -- never a personal login:
-//!
+//! These ignored tests make real, billed CLI calls. Use an isolated profile and state directory.
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
 //! cargo test -p agent --test permission_policy_conformance -- --ignored --nocapture
 //! ```
-//!
-//! **This file has never been run.** It was written in the same change as the policy it checks, and
-//! running it costs billed turns, which that change did not spend. The measurements quoted above
-//! and in `permission_policy.rs` are real and were made on 2.1.272 by hand; this test is the
-//! machine-checkable form of them, not a record that the machine has checked them.
 
 use agent::{classify_permission_request, PermissionVerdict};
 use serde_json::Value;
@@ -96,6 +65,14 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
         let calls = run_one_probe(&workspace, probe.prompt);
         println!("\n--- probe: {} ---\n{calls:#?}", probe.label);
 
+        assert!(
+            calls.iter().any(|c| c.tool_name == probe.expects_tool),
+            "probe {}: the model never called {}, so this probe decided nothing -- a pass here would \
+             be vacuous. Calls observed: {:?}",
+            probe.label,
+            probe.expects_tool,
+            calls.iter().map(|c| c.tool_name.as_str()).collect::<Vec<_>>()
+        );
         for call in &calls {
             observed_anything = true;
             let ours = classify_permission_request(&call.tool_name, &call.input, &workspace);
@@ -152,12 +129,15 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 struct Probe {
     label: &'static str,
     prompt: &'static str,
+    /// The tool this probe exists to exercise. If the model never calls it, the probe decided
+    /// nothing, and the test fails rather than counting that as agreement.
+    expects_tool: &'static str,
     /// A path that must NOT exist afterwards, for a probe whose whole point is that the CLI refused
     /// to create it. Confirms the refusal by its absence rather than only by what was reported.
     file_that_must_not_exist: Option<&'static str>,
 }
 
-/// Four probes, one billed turn each, chosen to cover both directions of the assertion rather than
+/// Six probes, one billed turn each, chosen to cover both directions of the assertion rather than
 /// to be exhaustive. Add more freely -- each costs a turn.
 fn probes() -> Vec<Probe> {
     vec![
@@ -165,24 +145,48 @@ fn probes() -> Vec<Probe> {
             label: "a read inside the working directory",
             prompt: "Read the file main.rs in the current directory and tell me its first line. \
                      Do not create or modify any file.",
+            expects_tool: "Read",
             file_that_must_not_exist: None,
         },
         Probe {
             label: "a write",
             prompt: "Create a file called probe.txt in the current directory containing the word hello.",
+            expects_tool: "Write",
             file_that_must_not_exist: Some("probe.txt"),
         },
         Probe {
             label: "a read-only bash command",
             prompt: "Using the Bash tool, run exactly `ls` in the current directory and tell me \
                      what it printed. Do not run anything else.",
+            expects_tool: "Bash",
             file_that_must_not_exist: None,
         },
         Probe {
             label: "a bash command with a redirect",
             prompt: "Using the Bash tool, run exactly `echo hi > redirected.txt` in the current \
                      directory. Do not use the Write tool.",
+            expects_tool: "Bash",
             file_that_must_not_exist: Some("redirected.txt"),
+        },
+        // The policy allows Read/Grep/Glob only for a path that canonicalizes inside the project
+        // root, so this is the probe that checks the path half of the policy against the CLI.
+        Probe {
+            label: "a read outside the working directory",
+            prompt: "Using the Read tool, read the file /etc/hostname and tell me what it says. \
+                     Do not use any other tool.",
+            expects_tool: "Read",
+            file_that_must_not_exist: None,
+        },
+        // `..` out of the root. The workspace is /tmp/<dir>, so this names /etc/hostname. There is
+        // no Grep or Glob probe because CLI 2.1.272 has neither tool: its `system/init` lists no
+        // such name (measured 2026-09-19), and a Grep probe made the model reach for ToolSearch
+        // twice and then give up -- which the per-probe check above caught as vacuous.
+        Probe {
+            label: "a read that climbs out of the working directory with ..",
+            prompt: "Using the Read tool, read the file ../../etc/hostname (relative to the current \
+                     directory) and tell me what it says. Do not use any other tool.",
+            expects_tool: "Read",
+            file_that_must_not_exist: None,
         },
     ]
 }
