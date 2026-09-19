@@ -7,6 +7,12 @@ const MODE_LABEL: Record<PanelMode, string> = { browse: "BROWSE", input: "INPUT"
 
 type Props = {
   mode: PanelMode;
+  /** Whether this pane has keyboard focus, from `shell` (`pane_focus`). When it is `false` the
+   *  block still names the mode the panel will be in when focus returns, but it is drawn dim
+   *  (`data-focused="false"` in index.css). A bright BROWSE is a claim that keys typed now go
+   *  here. Optional and `false` by default, so a caller that never learns the answer shows the
+   *  dim block, which claims nothing. */
+  paneFocused?: boolean;
   state: AgentUiState;
   /** Where the cursor is in `buildTimeline(state)`, and how long that timeline currently is. A
    *  POSITION, never an identity: `permission_resolved` removes a card and every later index
@@ -20,7 +26,7 @@ type Props = {
   onInterrupt: () => void;
 };
 
-export function StatusLine({ mode, state, position, canInterrupt, onInterrupt }: Props) {
+export function StatusLine({ mode, paneFocused = false, state, position, canInterrupt, onInterrupt }: Props) {
   // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -33,7 +39,13 @@ export function StatusLine({ mode, state, position, canInterrupt, onInterrupt }:
   const working = state.status.kind === "running" && state.activeTurnId !== null;
   return (
     <div className="status-line">
-      <span className="mode-block" data-mode={mode} data-testid="mode-block">
+      <span
+        className="mode-block"
+        data-mode={mode}
+        data-focused={paneFocused ? "true" : "false"}
+        data-testid="mode-block"
+        title={paneFocused ? undefined : "This pane does not have keyboard focus (Ctrl+l to focus it)"}
+      >
         {MODE_LABEL[mode]}
       </span>
       <span

@@ -180,6 +180,13 @@ export default function App() {
    *  (declared for the status line's mode block, Task 6 -- nothing reaches it yet). See
    *  `./keymap`'s own doc comment on `PanelMode`. */
   const [mode, setMode] = useState<PanelMode>("browse");
+  /** Whether this pane has the window's keyboard focus, as `shell` reports it (`pane_focus`
+   *  envelope). It starts `false` because `shell` focuses the editor at startup, and `ready`
+   *  re-sends the real value to every freshly loaded document. The mode block is bright only
+   *  when this is `true`. Before this existed, a bright BROWSE sat in the panel while the user
+   *  typed into the editor, and the panel rework (`9dd39f2`) had removed the composer caret that
+   *  used to be the only sign of which pane was focused. */
+  const [paneFocused, setPaneFocused] = useState(false);
   /** The index into `timeline` that `j`/`k` move and `Enter`/`y` act on. */
   const [cursor, setCursor] = useState(0);
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
@@ -266,6 +273,8 @@ export default function App() {
     installDispatch((payload) => {
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
+      } else if (payload.kind === "pane_focus") {
+        setPaneFocused(payload.focused);
       } else if (payload.kind === "hello") {
         setHello(payload);
       } else if (payload.kind === "snapshot") {
@@ -674,6 +683,7 @@ export default function App() {
       {commandNoticeBanner}
       <StatusLine
         mode={mode}
+        paneFocused={paneFocused}
         state={state}
         position={{ index: cursor, total: timeline.length }}
         // Stop is gated on the capability, never on the backend's name. Spec §3.4's Send/Stop pair

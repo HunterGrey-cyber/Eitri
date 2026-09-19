@@ -97,6 +97,11 @@ struct AgentPanelState {
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
     /// own background colour.
     theme: neovibe_core::theme::ThemeTokens,
+    /// Whether this panel's pane holds the window's keyboard focus, as `crate::pane_focus` last
+    /// reported it. It is held here so that a freshly loaded document (first load or a
+    /// `Ctrl+Shift+R` reload) is told on `ready`. A document is otherwise told only when focus
+    /// changes, and a reload does not change focus.
+    pane_focused: bool,
 }
 
 /// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
@@ -270,6 +275,25 @@ impl AgentPanelHandle {
     }
 }
 
+impl AgentPanelHandle {
+    /// Records whether this panel's pane has keyboard focus and tells the live document, which
+    /// dims its mode block when it does not. Safe before the page has loaded for the same reason
+    /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
+    pub(crate) fn set_pane_focused(&self, focused: bool) {
+        self.state.borrow_mut().pane_focused = focused;
+        let payload = neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused);
+        let script = format!(
+            "window.__neovibeDispatch && window.__neovibeDispatch({});",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
+        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
+            if let Err(e) = result {
+                eprintln!("[agent_panel] pane focus dispatch failed: {e}");
+            }
+        });
+    }
+}
+
 pub(crate) fn build_agent_panel(
     project_dir: PathBuf,
     editor_context: neovibe_core::editor_context::ContextSource,
@@ -350,6 +374,7 @@ pub(crate) fn build_agent_panel(
         reported_start_failure: false,
         turn_trace: None,
         theme: neovibe_core::theme::ThemeTokens::fallback(),
+        pane_focused: false,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -817,7 +842,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
                 let snapshot = state_ref.session.as_ref().map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
-                ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref(), Some(&theme))
+                let mut payloads = ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref(), Some(&theme));
+                // Last, so nothing the document draws from the payloads above can reset it.
+                payloads.push(neovibe_core::agent_bridge::serialize_pane_focus_for_js(state_ref.pane_focused));
+                payloads
             };
             for payload in payloads {
                 evaluate_js_dispatch(webview, &payload);

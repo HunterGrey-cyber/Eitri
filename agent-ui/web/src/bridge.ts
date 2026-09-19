@@ -62,6 +62,11 @@ type InboundHandler = (
     | { kind: "snapshot"; throughRevision: number; state: AgentUiSnapshot }
     | ({ kind: "handoff" } & HandoffCommand)
     | { kind: "theme"; vars: Record<string, string> }
+    /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from
+     *  GTK's focus widget (`shell/src/pane_focus.rs`). It is not decided from this page's own
+     *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
+     *  status bar and the pane outline, so the three agree. */
+    | { kind: "pane_focus"; focused: boolean }
     | { kind: "error"; message: string },
 ) => void;
 
@@ -83,6 +88,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "snapshot" ||
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
+        obj.kind === "pane_focus" ||
         obj.kind === "error"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);

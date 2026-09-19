@@ -102,20 +102,33 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
     controls.upcast()
 }
 
-/// Bottom status bar strip, carried over from `shell_chrome::build_status_bar` unchanged.
-pub(crate) fn build_status_bar() -> gtk4::Widget {
+/// Bottom status bar strip. Returns the bar and the label that names the focused pane, which
+/// `pane_focus::install` keeps current.
+///
+/// **It used to say `NORMAL  —  Ln 1, Col 1`, hardcoded, and those strings never changed.** Nothing
+/// here reads nvim's mode or cursor. They were placeholders carried over from
+/// `poc/shell_chrome`, and a placeholder that looks like live data is a lie
+/// (`shell/MANUAL_VERIFICATION.md` recorded it reading `NORMAL` while nvim was in another mode).
+/// Both were removed and not replaced with a guess. nvim already draws its own mode and position in
+/// its own statusline, so a second copy here would only be worth having if it were live. Making it
+/// live means an RPC subscription this crate does not have. The one thing this bar can say
+/// truthfully is which pane has keyboard focus, so that is what it says now.
+pub(crate) fn build_status_bar() -> (gtk4::Widget, gtk4::Label) {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("statusbar");
+    bar.set_tooltip_text(Some("The pane with keyboard focus. Ctrl+l / Ctrl+h switch panes."));
 
-    let mode = gtk4::Label::new(Some("NORMAL"));
-    mode.add_css_class("statusbar-accent");
+    let caption = gtk4::Label::new(Some("focus"));
+    caption.add_css_class("statusbar-caption");
 
-    let sep = gtk4::Label::new(Some("  \u{2014}  Ln 1, Col 1"));
+    // Empty until `pane_focus::install` applies the real focus, which it does at once.
+    let focused = gtk4::Label::new(None);
+    focused.add_css_class("statusbar-focus");
 
-    bar.append(&mode);
-    bar.append(&sep);
+    bar.append(&caption);
+    bar.append(&focused);
 
-    bar.upcast()
+    (bar.upcast(), focused)
 }
 
 #[cfg(test)]

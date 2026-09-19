@@ -407,6 +407,21 @@ body,
 .status-line .mode-block[data-mode="input"] {
   border-left-color: var(--nv-mode-input);
 }
+/* The pane does not have keyboard focus, so the block is dim: the label in `--nv-chrome-muted`
+   (guarded for text against chrome, the same as every other secondary text in this bar, and never
+   `opacity`, which would multiply that guarantee down), no weight, and the per-mode colour taken
+   off the rule. The mode name stays, because it is still the mode the panel returns to. Without
+   this the block was equally bright whether or not the panel had focus, so a bright BROWSE sat
+   beside an editor being typed into.
+
+   Specificity: this is (0,3,0), the same as the `[data-mode="input"]` rule above, and it has to
+   come AFTER that rule to beat its `border-left-color`. The cascade test in `indexCss.test.ts`
+   checks that it wins for INPUT. */
+.status-line .mode-block[data-focused="false"] {
+  color: var(--nv-chrome-muted);
+  font-weight: 400;
+  border-left-color: var(--nv-chrome-muted);
+}
 .status-line .position {
   margin-left: auto;
   color: var(--nv-chrome-muted);

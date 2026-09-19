@@ -7,6 +7,7 @@ mod agent_panel;
 mod chrome;
 mod editor_context;
 mod layout;
+mod pane_focus;
 mod pane_switch;
 mod supervisor_client;
 mod terminal_handoff;
@@ -172,18 +173,15 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // The bottom slot is the one that can legitimately be empty -- no plugin claiming it -- so
     // it is an `Option` rather than an `expect`, and an empty one means the
     // window is built with no vertical split at all.
-    let (main_widget, side_widget, bottom_widget) = {
+    let (main_widget, side_widget, bottom_widget, titles) = {
         let panels = lua_engine.panels.borrow();
-        let main_widget = panels
-            .get(PanelSlot::Main)
-            .map(|e| e.widget.clone())
-            .expect("main slot must be populated by this point");
-        let side_widget = panels
-            .get(PanelSlot::Side)
-            .map(|e| e.widget.clone())
-            .expect("side slot must be populated by this point");
-        let bottom_widget = panels.get(PanelSlot::Bottom).map(|e| e.widget.clone());
-        (main_widget, side_widget, bottom_widget)
+        let main = panels.get(PanelSlot::Main).expect("main slot must be populated by this point");
+        let side = panels.get(PanelSlot::Side).expect("side slot must be populated by this point");
+        let bottom = panels.get(PanelSlot::Bottom);
+        // The status bar names the focused pane by the registry's title, so a plugin that replaces a
+        // slot is shown under its own name.
+        let titles = (main.title.clone(), side.title.clone(), bottom.map(|e| e.title.clone()));
+        (main.widget.clone(), side.widget.clone(), bottom.map(|e| e.widget.clone()), titles)
     };
 
     let window = ApplicationWindow::builder()
@@ -200,7 +198,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
 
-    let (content_widget, _paned) = layout::build_content_area(&main_widget, &side_widget);
+    let (content_widget, paned) = layout::build_content_area(&main_widget, &side_widget);
+    // The side slot's frame is the resize-throttle `Overlay` that `build_content_area` put in the
+    // paned, not the WebView. See `pane_focus::Pane::frame`.
+    let side_frame = paned.end_child().expect("build_content_area always sets an end child");
     let content_widget = match &bottom_widget {
         Some(bottom) => layout::build_vertical_split(&content_widget, bottom).0,
         None => content_widget,
@@ -241,9 +242,28 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     root.append(&chrome::build_top_bar(&window, project_root));
     root.append(&content_widget);
-    root.append(&chrome::build_status_bar());
+    let (status_bar, focus_label) = chrome::build_status_bar();
+    root.append(&status_bar);
 
     window.set_child(Some(&root));
+
+    // Which pane has focus: one tracker drives the pane outline, the status bar and the agent
+    // panel's mode block, so the three cannot disagree. See `pane_focus`'s module doc.
+    {
+        let (main_title, side_title, bottom_title) = titles;
+        let mut panes = vec![
+            pane_focus::Pane { content: main_widget.clone(), frame: main_widget.clone(), title: main_title },
+            pane_focus::Pane { content: side_widget.clone(), frame: side_frame, title: side_title },
+        ];
+        if let (Some(bottom), Some(title)) = (&bottom_widget, bottom_title) {
+            panes.push(pane_focus::Pane { content: bottom.clone(), frame: bottom.clone(), title });
+        }
+        let agent_panel_handle = agent_panel_handle.clone();
+        pane_focus::install(&window, panes, focus_label, 1, move |focused| {
+            println!("[pane_focus] side panel focused={focused}");
+            agent_panel_handle.set_pane_focused(focused);
+        });
+    }
 
     // --- Ctrl+l: editor -> agent panel, decided by Neovim itself.
     //

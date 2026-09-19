@@ -276,6 +276,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   // when this fixture held only the unselected row.
   const CHOICE_ROW = `<div class="mode-selector"><div class="session-choice"><button type="button" class="row row-choice"><span class="row-sign">›</span><span class="row-body">y</span></button><button type="button" class="row row-choice selected"><span class="row-sign">›</span><span class="row-body">z</span></button></div></div>`;
   const MODE_BLOCK = `<div class="status-line"><span class="mode-block" data-mode="input">INPUT</span></div>`;
+  const UNFOCUSED_INPUT_BLOCK = `<div class="status-line"><span class="mode-block" data-mode="input" data-focused="false">INPUT</span></div>`;
 
   it("paints a code block on --nv-surface even inside an assistant row", () => {
     expect(computed(CODE_BLOCK, "pre").background).toBe("var(--nv-surface)");
@@ -353,6 +354,27 @@ describe("index.css cascade (which rule actually wins)", () => {
     // control is the weaker "later, equal-specificity shorthand", which is enough to show the
     // assertion above can fail. cssstyle drops a var() shorthand entirely, hence the empty string.
     expect(clobbered.borderLeftColor).not.toBe("var(--nv-mode-input)");
+  });
+
+  it("dims an unfocused mode block even in INPUT, whose own rule has equal specificity", () => {
+    // `[data-mode="input"]` and `[data-focused="false"]` are both (0,3,0), so source order decides
+    // and the unfocused rule must come second. Both sides are `var()` longhands, the combination
+    // this engine resolves correctly (see the big comment above).
+    const block = computed(UNFOCUSED_INPUT_BLOCK, ".mode-block");
+    expect(block.borderLeftColor).toBe("var(--nv-chrome-muted)");
+    expect(block.color).toBe("var(--nv-chrome-muted)");
+    // A focused block keeps its per-mode rule and inherits the bright label colour.
+    const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".mode-block");
+    expect(focused.borderLeftColor).toBe("var(--nv-mode-input)");
+    expect(focused.color).not.toBe("var(--nv-chrome-muted)");
+    // Negative control: the INPUT rule re-declared after the unfocused one wins it back. That is
+    // what swapping the two rules in index.css would do.
+    const clobbered = computed(
+      UNFOCUSED_INPUT_BLOCK,
+      ".mode-block",
+      '.status-line .mode-block[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
+    );
+    expect(clobbered.borderLeftColor).toBe("var(--nv-mode-input)");
   });
 });
 

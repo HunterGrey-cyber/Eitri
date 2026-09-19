@@ -191,6 +191,15 @@ pub fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
     json!({ "kind": "theme", "vars": vars }).to_string()
 }
 
+/// `{"kind":"pane_focus","focused":bool}`: whether the agent panel's pane holds the window's
+/// keyboard focus, as `shell`'s GTK focus tracking decides it (`shell::pane_focus`). The panel dims
+/// its mode block when this is `false`. `shell` is the source rather than the page's own
+/// `window` focus/blur because `shell` decides Ctrl+h/Ctrl+l, and because the same answer also
+/// drives the status bar and the pane outline, so the three cannot disagree.
+pub fn serialize_pane_focus_for_js(focused: bool) -> String {
+    json!({ "kind": "pane_focus", "focused": focused }).to_string()
+}
+
 /// `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
 /// `AgentDomainEvent`'s own `#[derive(Serialize)]` produces the tagged shape directly for each
 /// element. `from_revision` is the projection's `last_revision` BEFORE this batch was folded;
@@ -414,6 +423,14 @@ mod tests {
         assert_eq!(vars.len(), tokens.css_vars().len());
         assert_eq!(vars["--nv-bg"], tokens.bg.hex());
         assert_eq!(vars["--nv-font-prose"], crate::theme::tokens::PROSE_FONT_STACK);
+    }
+
+    #[test]
+    fn pane_focus_is_a_kind_tagged_boolean() {
+        for focused in [true, false] {
+            let value: serde_json::Value = serde_json::from_str(&serialize_pane_focus_for_js(focused)).unwrap();
+            assert_eq!(value, serde_json::json!({ "kind": "pane_focus", "focused": focused }));
+        }
     }
 
     #[test]
