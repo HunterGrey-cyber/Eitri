@@ -27,27 +27,58 @@ fn real_pretooluse_permission_allow_end_to_end() {
 
     provider.send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "run: echo hello, and tell me the output".into() }).unwrap();
 
-    let events = drain_until(&provider, 30, |events| {
-        events.iter().any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
-    });
-    let permission_id = events.iter().find_map(|e| match e {
-        AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
-            // Meaningful only since 2026-09-15: before that the translator wrapped
-            // `requested.tool_use_id` unconditionally, so this held for every wire value, `""`
-            // included. It now fails if the sidecar leaves the field unset.
-            assert!(tool_use_id.is_some(), "the sidecar sent a PermissionRequested with an unset (proto3 empty-string) tool_use_id");
-            Some(permission_id.clone())
+    // Answer EVERY permission this turn raises, each by its own id, until the turn completes.
+    //
+    // This used to answer exactly one and then wait for `TurnCompleted`, which was written when
+    // `Bash` was in a session's initial tool set. On CLI 2.1.272 tools are deferred: the model
+    // cannot call `Bash` until it has found it, the search is itself a gated tool call, and a real
+    // turn therefore raises SEVERAL permission requests -- the first of them for `ToolSearch`, not
+    // for the tool the prompt is about. Answering one and waiting stalls behind the second, and the
+    // symptom is not a permission error: the turn simply never completes and the assistant text is
+    // empty, which is why this read as a streaming bug for a day and cost a sibling project a fix
+    // it did not owe. Verdandi's permission broker now documents the same rule from its side:
+    // resolve every request by its own permissionId, assume no count, and assume nothing about
+    // which tool the first one is for.
+    //
+    // Neovibe's own product path was always right about this -- `AgentSessionProjection`'s
+    // `pending_permissions` is a map and `agent-ui`'s is an array -- so what this fixes is the test,
+    // not the client.
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut saw_a_permission = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut all_events: Vec<AgentDomainEvent> = Vec::new();
+    let mut completed = false;
+    while std::time::Instant::now() < deadline && !completed {
+        for event in provider.pump() {
+            match &event {
+                AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+                    // Meaningful only since 2026-09-15: before that the translator wrapped
+                    // `requested.tool_use_id` unconditionally, so this held for every wire value,
+                    // `""` included. It now fails if the sidecar leaves the field unset.
+                    assert!(tool_use_id.is_some(), "the sidecar sent a PermissionRequested with an unset (proto3 empty-string) tool_use_id");
+                    saw_a_permission = true;
+                    if answered.insert(permission_id.clone()) {
+                        provider
+                            .resolve_permission(agent::ResolvePermissionRequest {
+                                session_id: session_id.clone(),
+                                permission_id: permission_id.clone(),
+                                decision: PermissionDecision::Allow,
+                            })
+                            .unwrap();
+                    }
+                }
+                AgentDomainEvent::TurnCompleted { .. } => completed = true,
+                _ => {}
+            }
+            all_events.push(event);
         }
-        _ => None,
-    });
-    let permission_id = permission_id.expect("expected a real PreToolUse-sourced PermissionRequested");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
-    provider.resolve_permission(agent::ResolvePermissionRequest { session_id: session_id.clone(), permission_id, decision: PermissionDecision::Allow }).unwrap();
+    assert!(saw_a_permission, "expected at least one real PreToolUse-sourced PermissionRequested");
+    assert!(completed, "the turn never completed after answering {} permission request(s)", answered.len());
 
-    let events = drain_until(&provider, 30, |events| {
-        events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
-    });
-    let full_text: String = events
+    let full_text: String = all_events
         .iter()
         .filter_map(|e| match e { AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()), _ => None })
         .collect();
