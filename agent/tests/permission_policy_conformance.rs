@@ -41,10 +41,15 @@
 //! cargo test -p agent --test permission_policy_conformance -- --ignored --nocapture
 //! ```
 //!
-//! **This file has never been run.** It was written in the same change as the policy it checks, and
-//! running it costs billed turns, which that change did not spend. The measurements quoted above
-//! and in `permission_policy.rs` are real and were made on 2.1.272 by hand; this test is the
-//! machine-checkable form of them, not a record that the machine has checked them.
+//! **First run: 2026-09-19, CLI 2.1.272 on the TEST profile, passed** with four probes: the CLI and
+//! the policy agreed on four calls, and the policy was stricter on one (`pwd; readlink -f /tmp; ls
+//! -la`, which the CLI ran and the policy cards because it contains `;`). Nothing was more
+//! permissive. That run could not have noticed a probe that produced no call at all -- the only
+//! vacuity check was global -- and no probe reached a path outside the project, which is the one
+//! place the policy allows by *reasoning about a path* rather than by name. Both were fixed the same
+//! day: every probe now names the tool it exists to exercise and fails if that tool was never
+//! called, and two probes were added (a `Read` of an absolute path outside the root, and one that
+//! climbs out with `..`). The dated record says what the re-run found.
 
 use agent::{classify_permission_request, PermissionVerdict};
 use serde_json::Value;
@@ -96,6 +101,14 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
         let calls = run_one_probe(&workspace, probe.prompt);
         println!("\n--- probe: {} ---\n{calls:#?}", probe.label);
 
+        assert!(
+            calls.iter().any(|c| c.tool_name == probe.expects_tool),
+            "probe {}: the model never called {}, so this probe decided nothing -- a pass here would \
+             be vacuous. Calls observed: {:?}",
+            probe.label,
+            probe.expects_tool,
+            calls.iter().map(|c| c.tool_name.as_str()).collect::<Vec<_>>()
+        );
         for call in &calls {
             observed_anything = true;
             let ours = classify_permission_request(&call.tool_name, &call.input, &workspace);
@@ -152,12 +165,15 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 struct Probe {
     label: &'static str,
     prompt: &'static str,
+    /// The tool this probe exists to exercise. If the model never calls it, the probe decided
+    /// nothing, and the test fails rather than counting that as agreement.
+    expects_tool: &'static str,
     /// A path that must NOT exist afterwards, for a probe whose whole point is that the CLI refused
     /// to create it. Confirms the refusal by its absence rather than only by what was reported.
     file_that_must_not_exist: Option<&'static str>,
 }
 
-/// Four probes, one billed turn each, chosen to cover both directions of the assertion rather than
+/// Six probes, one billed turn each, chosen to cover both directions of the assertion rather than
 /// to be exhaustive. Add more freely -- each costs a turn.
 fn probes() -> Vec<Probe> {
     vec![
@@ -165,24 +181,48 @@ fn probes() -> Vec<Probe> {
             label: "a read inside the working directory",
             prompt: "Read the file main.rs in the current directory and tell me its first line. \
                      Do not create or modify any file.",
+            expects_tool: "Read",
             file_that_must_not_exist: None,
         },
         Probe {
             label: "a write",
             prompt: "Create a file called probe.txt in the current directory containing the word hello.",
+            expects_tool: "Write",
             file_that_must_not_exist: Some("probe.txt"),
         },
         Probe {
             label: "a read-only bash command",
             prompt: "Using the Bash tool, run exactly `ls` in the current directory and tell me \
                      what it printed. Do not run anything else.",
+            expects_tool: "Bash",
             file_that_must_not_exist: None,
         },
         Probe {
             label: "a bash command with a redirect",
             prompt: "Using the Bash tool, run exactly `echo hi > redirected.txt` in the current \
                      directory. Do not use the Write tool.",
+            expects_tool: "Bash",
             file_that_must_not_exist: Some("redirected.txt"),
+        },
+        // The policy allows Read/Grep/Glob only for a path that canonicalizes inside the project
+        // root, so this is the probe that checks the path half of the policy against the CLI.
+        Probe {
+            label: "a read outside the working directory",
+            prompt: "Using the Read tool, read the file /etc/hostname and tell me what it says. \
+                     Do not use any other tool.",
+            expects_tool: "Read",
+            file_that_must_not_exist: None,
+        },
+        // `..` out of the root. The workspace is /tmp/<dir>, so this names /etc/hostname. There is
+        // no Grep or Glob probe because CLI 2.1.272 has neither tool: its `system/init` lists no
+        // such name (measured 2026-09-19), and a Grep probe made the model reach for ToolSearch
+        // twice and then give up -- which the per-probe check above caught as vacuous.
+        Probe {
+            label: "a read that climbs out of the working directory with ..",
+            prompt: "Using the Read tool, read the file ../../etc/hostname (relative to the current \
+                     directory) and tell me what it says. Do not use any other tool.",
+            expects_tool: "Read",
+            file_that_must_not_exist: None,
         },
     ]
 }

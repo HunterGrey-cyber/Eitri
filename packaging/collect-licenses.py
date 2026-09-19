@@ -15,7 +15,10 @@ It FAILS -- exit 1, and no output file -- rather than warn, on:
   * a package whose licence text it cannot find, unless allowlisted below with a reason;
   * a vendored override that no longer matches (the package now ships its own text, or its version
     moved), so an override never silently covers a release it was not checked against;
-  * native code found in a shipped binary that it has no licence text for;
+  * native code found in a shipped binary that it has no licence text for, including any C source
+    file that still owns code and belongs to no known component;
+  * a shipped binary with no symbol table (a stripped binary would otherwise hide all native code);
+  * binaries built by a different rustc from the one whose standard-library notice it reads;
   * a sidecar artifact that does not match the Verdandi checkout it is reading the npm tree from.
 
 Deterministic by construction: every list is sorted, nothing reads the clock, and identical texts
@@ -31,6 +34,7 @@ Inputs it expects to exist (publish.sh produces all of them before calling it):
 
 import glob
 import hashlib
+import html.parser
 import json
 import os
 import re
@@ -92,6 +96,10 @@ ALLOWLIST = {
         "Its own LICENSE.md is reproduced verbatim; neovibe's MIT licence does not and cannot "
         "cover it."),
 }
+
+# Allowlisted for its licence, NOT for its text: the header promises this one's own licence file
+# is reproduced, so a release of it without one must fail rather than print an empty entry.
+ALLOWLIST_TEXT_REQUIRED = {("npm", "@anthropic-ai/claude-agent-sdk")}
 
 # In the npm tree, and deliberately NOT in the shipped artifact. Verified on every run: the
 # artifact must not contain the package name at all (the SDK's resolver would name it if the
@@ -330,6 +338,9 @@ def resolve(pkg, by_nv, counts):
     if key in ALLOWLIST:
         status = "allowlisted: " + ALLOWLIST[key]
         label = lic or "(no licence declared)"
+        if key in ALLOWLIST_TEXT_REQUIRED and not found:
+            raise Fail(f"{eco} {name} {ver} is allowlisted on the grounds that its own licence file is "
+                       "reproduced, and it now ships none")
     else:
         if not lic:
             raise Fail(f"{eco} {name} {ver} declares no licence and is not allowlisted")
@@ -346,7 +357,8 @@ def resolve(pkg, by_nv, counts):
         if not os.path.isfile(f):
             raise Fail(f"licence text {f} for {name} {ver} does not exist")
     counts[label] = counts.get(label, 0) + 1
-    return {"title": f"{name} {ver}", "license": label, "status": status, "note": note,
+    return {"title": f"{name} {ver}", "name": name, "version": ver, "license": label, "status": status, "note": note,
+            "copyleft": key in COPYLEFT_ACK,
             "files": [(os.path.basename(f), read_text(f)) for f in found]}
 
 
@@ -356,7 +368,43 @@ def resolve(pkg, by_nv, counts):
 
 def defined_symbols(path):
     out = run(["nm", "--defined-only", path], REPO)
-    return set(l.split()[-1] for l in out.splitlines() if len(l.split()) >= 3)
+    syms = set(l.split()[-1] for l in out.splitlines() if len(l.split()) >= 3)
+    # `nm` on a stripped binary prints "no symbols" and exits 0. Every detector below would then see
+    # an empty set and report nothing -- a silent pass that drops Lua, Skia and the rest from the
+    # notices. Every Rust binary defines `main`, so its absence means there is no symbol table.
+    if "main" not in syms:
+        raise Fail(f"{path} has no symbol table (stripped?): the native-code detectors cannot see "
+                   "inside it. Build without stripping, or teach this script another way in.")
+    return syms
+
+
+# Symbols the linker itself synthesizes: they sort after the last input file's FILE entry in the
+# symbol table, so they must not be attributed to that file.
+LINKER_LOCALS = {"__FRAME_END__", "__TMC_END__", "_GLOBAL_OFFSET_TABLE_", "_DYNAMIC", "_init",
+                 "_fini", "__dso_handle", "__GNU_EH_FRAME_HDR"}
+
+
+def c_files_with_code(path):
+    """Names of the C source files (STT_FILE entries ending in .c) that still own at least one
+    local symbol in a real section after --gc-sections.
+
+    A FILE entry alone is not evidence: the prebuilt Skia archive leaves FILE entries for whole
+    libraries whose code the linker then discarded (on 2026-09-19 `shell` carried FILE entries for
+    HarfBuzz, ICU, libjpeg-turbo, expat and Wuffs, and not one symbol or runtime string of any of
+    them). A C file that kept a local symbol did link code in."""
+    out = run(["readelf", "-sW", path], REPO)
+    cur, found = None, set()
+    for l in out.splitlines():
+        p = l.split()
+        if len(p) < 8:
+            continue
+        if p[3] == "FILE":
+            cur = p[7]
+            continue
+        if cur and p[4] == "LOCAL" and p[6] not in ("ABS", "UND") and p[7] not in LINKER_LOCALS:
+            if cur.endswith(".c"):
+                found.add(cur)
+    return found
 
 
 def font_copyright(path):
@@ -416,6 +464,45 @@ def native_components(by_nv, shipped):
     if any(re.search(rb"^u_\w+_\d+$", s.encode()) for b in SHIPPED_BINARIES for s in syms[b] if s.startswith("u_")):
         raise Fail("ICU appears statically linked into a shipped binary and this script has no licence text for it")
 
+    # The named detectors above only catch libraries someone thought of. This closes the set for C:
+    # every C source file that still owns code in a shipped binary must belong to a component this
+    # script has a text for, or the run fails naming the file. (C++ is NOT closed this way: Skia's
+    # own sources have no common naming scheme to tell them from a third party's.)
+    lua_files = set()
+    for d in glob.glob(os.path.join(pkg_dir("lua-src"), "lua-*")):
+        lua_files |= {f for f in os.listdir(d) if f.endswith(".c")}
+    freetype_modules = {"autofit.c", "bdf.c", "cff.c", "gxvalid.c", "otvalid.c", "pcf.c", "pfr.c",
+                        "psaux.c", "pshinter.c", "psnames.c", "raster.c", "sdf.c", "sfnt.c", "smooth.c",
+                        "svg.c", "truetype.c", "type1.c", "type1cid.c", "type42.c", "winfnt.c"}
+    zlib_files = {"adler32.c", "compress.c", "crc32.c", "deflate.c", "gzclose.c", "gzlib.c", "gzread.c",
+                  "gzwrite.c", "infback.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c",
+                  "uncompr.c", "zutil.c"}
+    chromium_zlib_files = {"adler32_simd.c", "crc32_simd.c", "cpu_features.c", "inffast_chunk.c",
+                           "crc_folding.c"}
+    libpng_extra = {"intel_init.c", "filter_sse2_intrinsics.c"}
+
+    def c_component(f):
+        if f in lua_files:
+            return "Lua"
+        if f in freetype_modules or re.match(r"^ft\w*\.c$", f):
+            return "FreeType"
+        if f in libpng_extra or re.match(r"^png\w*\.c$", f):
+            return "libpng"
+        if f in zlib_files:
+            return "zlib"
+        if f in chromium_zlib_files:
+            return "Chromium zlib"
+        return None
+
+    c_seen = {}
+    for b in SHIPPED_BINARIES:
+        for f in c_files_with_code(shipped[b]):
+            comp = c_component(f)
+            if comp is None:
+                raise Fail(f"{b} contains code compiled from {f}, which belongs to no component this "
+                           "script has a licence text for. Find which library it is and add it.")
+            c_seen.setdefault(comp, set()).add(b)
+
     # Lua, compiled from lua-src's vendored C by mlua-sys's build script.
     hit = any_sym({"lua_newstate"})
     if hit:
@@ -454,11 +541,28 @@ def native_components(by_nv, shipped):
         ("FreeType", {"FT_Init_FreeType"}, None, "FTL (FreeType is FTL-or-GPLv2; this package takes the FTL)",
          ["freetype-FTL.TXT"], "Portions of this software are copyright (c) The FreeType Project (www.freetype.org). All rights reserved."),
         ("libpng", {"png_create_read_struct"}, None, "libpng-2.0", ["libpng.LICENSE"], None),
-        ("zlib (inflate)", {"inflateInit2_"}, None, "Zlib", ["zlib.NOTICE"], None),
-        ("Wuffs", set(), b"wuffs-v0", "Apache-2.0", ["Apache-2.0.txt"], "Copyright 2017 The Wuffs Authors."),
+        ("zlib (inflate)", {"inflateInit2_", "Cr_z_inflateInit2_"}, None, "Zlib", ["zlib.NOTICE"], None),
+        # Chromium's zlib fork (symbols prefixed Cr_z_, version string "1.3.0.1-motley" in `shell`)
+        # adds SIMD adler32/crc32 and a chunked inflate_fast, whose files say "Copyright 2017 The
+        # Chromium Authors ... governed by a BSD-style license that can be found in the Chromium
+        # source repository LICENSE file" (chunkcopy.h adds ARM, Inc.). zlib's own notice does not
+        # cover those.
+        ("Chromium zlib (SIMD and chunked-inflate additions)",
+         {"Cr_z_adler32_simd_", "Cr_z_crc32_sse42_simd_", "Cr_z_inflate_fast_chunk_", "Cr_z_cpu_check_features"},
+         None, "BSD-3-Clause", ["chromium.LICENSE"],
+         "Copyright 2017 The Chromium Authors. Copyright (C) 2017 ARM, Inc."),
+        # Detected by code, NOT by the "wuffs-v0.3.c" string: that string is an STT_FILE entry the
+        # prebuilt archive leaves behind even when --gc-sections discards every byte of Wuffs, which
+        # is exactly what `shell` looked like on 2026-09-19 (no wuffs_ symbol, no Wuffs status
+        # string). The first version of this script matched the FILE entry and listed Wuffs wrongly.
+        ("Wuffs", set(), b"#base: ", "Apache-2.0", ["Apache-2.0.txt"], "Copyright 2017 The Wuffs Authors."),
     ]
     for comp, names, marker, lic, files, credit in embedded:
-        hit = any_sym(names) if names else sorted(b for b in SHIPPED_BINARIES if marker in blobs[b])
+        if comp == "Wuffs":
+            hit = sorted(b for b in SHIPPED_BINARIES
+                         if any("wuffs_" in s for s in syms[b]) or marker in blobs[b])
+        else:
+            hit = any_sym(names)
         if not hit:
             continue
         fl = [(f, read_text(os.path.join(TEXTS, f))) for f in files]
@@ -483,7 +587,75 @@ def native_components(by_nv, shipped):
                       "note": f"embedded by the Neovide fork into {', '.join(hit)}; copyright from the font's own name table",
                       "files": [("copyright", font_copyright(os.path.join(fonts_dir, font)) + "\n"),
                                 ("assets/fonts/LICENSE", read_text(os.path.join(fonts_dir, "LICENSE")))]})
+
+    # Every C file that kept code must have produced an entry above; a classified file whose
+    # component then was not emitted would be a gap this function reports as coverage.
+    titles = {c["title"] for c in comps}
+    need = {"Lua": lambda t: t.startswith("Lua "), "FreeType": lambda t: t == "FreeType",
+            "libpng": lambda t: t == "libpng", "zlib": lambda t: t == "zlib (inflate)",
+            "Chromium zlib": lambda t: t.startswith("Chromium zlib")}
+    for comp, bins in sorted(c_seen.items()):
+        if not any(need[comp](t) for t in titles):
+            raise Fail(f"{', '.join(sorted(bins))} contains {comp} code (by its C source files) but "
+                       f"no {comp} entry was emitted: its symbol detector missed it")
+
+    comps.insert(0, rust_std_component())
     return comps
+
+
+class _HtmlText(html.parser.HTMLParser):
+    BLOCK = {"p", "br", "li", "h1", "h2", "h3", "h4", "pre", "div", "tr", "dt", "dd"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("style", "script", "head"):
+            self.skip += 1
+        if tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("style", "script", "head"):
+            self.skip -= 1
+        if tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(data)
+
+
+def rust_std_component():
+    """The Rust standard library (std, core, alloc, compiler_builtins and the crates.io crates std
+    itself depends on) is statically linked into every Rust binary, and no `cargo tree` lists it.
+    The toolchain ships the notice file meant for exactly this, COPYRIGHT-library.html; it is
+    reproduced as text. The compiler that built the binaries must be the one whose notice is read."""
+    built = set()
+    for b in SHIPPED_BINARIES:
+        out = run(["readelf", "-p", ".comment", os.path.join(REPO, "target", "release", b)], REPO)
+        m = re.search(r"rustc version (\S+ \([0-9a-f]+ [0-9-]+\))", out)
+        if not m:
+            raise Fail(f"target/release/{b} names no rustc in its .comment section")
+        built.add(m.group(1))
+    here = run(["rustc", "--version"], REPO).strip()
+    if len(built) != 1 or f"rustc {next(iter(built))}" != here:
+        raise Fail(f"the shipped binaries were built by rustc {sorted(built)}, but `rustc` here is "
+                   f"{here!r}: its notice file would describe a different standard library")
+    sysroot = run(["rustc", "--print", "sysroot"], REPO).strip()
+    src = os.path.join(sysroot, "share", "doc", "rust", "COPYRIGHT-library.html")
+    if not os.path.isfile(src):
+        raise Fail(f"no {src}: the toolchain's standard-library notice is missing")
+    p = _HtmlText()
+    with open(src, encoding="utf-8") as f:
+        p.feed(f.read())
+    lines = [l.rstrip() for l in "".join(p.out).splitlines()]
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
+    return {"title": f"Rust standard library ({here})", "license": "MIT OR Apache-2.0, and the licences it lists",
+            "status": None,
+            "note": "statically linked into all five binaries; text is the toolchain's share/doc/rust/COPYRIGHT-library.html, tags removed",
+            "files": [("COPYRIGHT-library", text)]}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -551,6 +723,28 @@ def render_entries(entries, printed, lines):
                 lines.append("")
 
 
+def vite_runtime(shipped, counts):
+    """Code the bundler itself writes into the web bundle, which `npm ls --omit=dev` cannot list
+    because Vite is a devDependency: its module-preload polyfill (measured present in `shell` on
+    2026-09-19). Vite's own MIT notice, without the licences of Vite's bundled build-time
+    dependencies, none of which reach the output."""
+    with open(shipped["shell"], "rb") as f:
+        if b'supports("modulepreload")' not in f.read():
+            return []
+    vite = os.path.join(REPO, "agent-ui", "web", "node_modules", "vite")
+    with open(os.path.join(vite, "package.json")) as f:
+        ver = json.load(f)["version"]
+    text = read_text(os.path.join(vite, "LICENSE.md"))
+    cut = text.find("# Licenses of bundled dependencies")
+    if cut <= 0 or "MIT License" not in text[:cut]:
+        raise Fail(f"{vite}/LICENSE.md no longer starts with Vite's own MIT notice; re-check it")
+    counts["MIT"] = counts.get("MIT", 0) + 1
+    return [{"title": f"vite {ver} (runtime code it injects: the module-preload polyfill)", "name": "vite",
+             "version": ver, "license": "MIT", "status": None, "copyleft": False,
+             "note": "a devDependency, so not in the npm tree above; its polyfill is in the built bundle",
+             "files": [("LICENSE.md (Vite core licence section)", text[:cut])]}]
+
+
 def collect(sidecar_artifact, verdandi):
     shipped = {b: os.path.join(REPO, "target", "release", b) for b in SHIPPED_BINARIES}
     for b, p in shipped.items():
@@ -562,6 +756,7 @@ def collect(sidecar_artifact, verdandi):
     rust = [resolve(p, by_nv, counts_rust) for p in crates]
     native = native_components(by_nv, shipped)
     web = [resolve(p, by_nv, counts_web) for p in npm_packages(os.path.join(REPO, "agent-ui", "web"))]
+    web += vite_runtime(shipped, counts_web)
     sc = sidecar_facts(sidecar_artifact, verdandi)
     sc_pkgs = []
     excluded = []
@@ -585,10 +780,17 @@ def collect(sidecar_artifact, verdandi):
         "reproduced verbatim in part 4. The Claude Code CLI itself is NOT included: the sidecar",
         "runs the `claude` you install yourself.",
         "",
-        "Copyleft parts (acknowledged individually in part 1): nvim-rs (LGPL-3.0, statically",
-        "linked into /usr/lib/neovibe/shell) and option-ext (MPL-2.0, unmodified). Their source",
-        "is published on crates.io; neovibe's own source is at",
-        "https://github.com/HunterGrey-cyber/eitri.",
+        "Copyleft parts, each acknowledged individually in part 1, and where their",
+        "unmodified source is published:",
+    ]
+    copyleft = [e for e in rust if e["copyleft"]]
+    if sorted((e["name"] for e in copyleft)) != sorted(n for (eco, n) in COPYLEFT_ACK if eco == "cargo"):
+        raise Fail(f"COPYLEFT_ACK names {sorted(n for _, n in COPYLEFT_ACK)} but the tree ships "
+                   f"{sorted(e['name'] for e in copyleft)}: drop the stale acknowledgement")
+    for e in copyleft:
+        L.append(f"  {e['title']} [{e['license']}]  https://crates.io/crates/{e['name']}/{e['version']}")
+    L += [
+        "neovibe's own source is at https://github.com/HunterGrey-cyber/eitri.",
         "",
         "Libraries this package links dynamically from your system (GTK 4, WebKitGTK, GLib and",
         "their dependencies) are not redistributed here and are not listed.",
@@ -596,7 +798,7 @@ def collect(sidecar_artifact, verdandi):
         "Generated by packaging/collect-licenses.py from the dependency trees of exactly what the",
         "package installs. Contents:",
         f"  part 1  Rust crates linked into the five binaries in /usr/lib/neovibe   ({len(rust)})",
-        f"  part 2  native code and fonts compiled into those binaries               ({len(native)})",
+        f"  part 2  the Rust standard library, native code and fonts in those binaries ({len(native)})",
         f"  part 3  npm packages in the agent panel's web bundle, inside `shell`      ({len(web)})",
         f"  part 4  the sidecar: Node.js {sc['node']} and its npm packages              ({len(sc_pkgs)})",
         "",
@@ -610,7 +812,7 @@ def collect(sidecar_artifact, verdandi):
     printed = {}
     L += [RULE, "PART 1 -- Rust crates linked into the shipped binaries", RULE, ""]
     render_entries(rust, printed, L)
-    L += ["", RULE, "PART 2 -- native code and fonts compiled into the shipped binaries", RULE, ""]
+    L += ["", RULE, "PART 2 -- the Rust standard library, native code and fonts in the shipped binaries", RULE, ""]
     render_entries(native, printed, L)
     L += ["", RULE, "PART 3 -- the agent panel's web bundle (embedded in shell)", RULE, ""]
     render_entries(web, printed, L)
