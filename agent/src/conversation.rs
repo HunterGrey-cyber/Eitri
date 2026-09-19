@@ -241,11 +241,16 @@ fn ensure_transcript_is_not_being_written(
 
 /// Best-effort. A conversation that runs but was not recorded is a lost resume offer next time, not
 /// a broken session -- so this logs rather than failing the caller.
+///
+/// `title` is the session's title if the caller knows one (ingestion hands over the first prompt's,
+/// when that prompt was sent before the session was adopted). A title the record already has always
+/// wins, the same way `created_at` does: a resume must not rename a session.
 pub(crate) fn persist_record(
     conversation_id: &str,
     canonical_cwd: &str,
     provider_session_id: &str,
     provider_advertised_resume: bool,
+    title: Option<&str>,
 ) {
     let now = epoch_millis();
     // Preserve the original `created_at` when a record already exists: this runs again on every
@@ -254,12 +259,14 @@ pub(crate) fn persist_record(
     // not by workspace -- a workspace holds one record per session now, so a second session
     // starting in the same directory must not inherit the first one's start time.
     //
-    // Via `created_at_of_existing_record` rather than `load_conversation_record`, because that one
+    // Via `existing_record` (formerly `created_at_of_existing_record`) rather than
+    // `load_conversation_record`, because that one
     // resolves to the directory layout only: resuming a session recorded solely in the
     // pre-2026-09-15 flat file restamped it to the moment of the resume, and the de-duplication in
     // `resumable_sessions` then discarded the flat record still holding the real value.
-    let created_at = crate::persistence::created_at_of_existing_record(conversation_id, provider_session_id)
-        .unwrap_or_else(|| now.clone());
+    let existing = crate::persistence::existing_record(conversation_id, provider_session_id);
+    let created_at = existing.as_ref().map(|r| r.created_at.clone()).unwrap_or_else(|| now.clone());
+    let title = existing.and_then(|r| r.title).or_else(|| title.map(str::to_string));
     let record = ConversationRecord {
         conversation_id: conversation_id.to_string(),
         provider: PROVIDER_NAME.to_string(),
@@ -268,6 +275,7 @@ pub(crate) fn persist_record(
         created_at,
         updated_at: now,
         provider_advertised_resume,
+        title,
     };
     if let Err(e) = save_conversation_record(&record) {
         eprintln!("agent: could not persist the conversation record for {conversation_id}: {e}");
@@ -316,6 +324,9 @@ pub struct AgentConversation {
     /// an unbounded `Vec` holding every raw event forever with no reader anywhere in the product;
     /// it is gone, because memory must follow the conversation rather than the event count.
     ingest: ConversationIngest,
+    /// Whether `note_title` has already taken this conversation's title, so later turns touch
+    /// neither the lock nor the disk.
+    title_noted: bool,
 }
 
 impl AgentConversation {
@@ -371,6 +382,7 @@ impl AgentConversation {
             info,
             session_id: Some(session_id),
             ingest,
+            title_noted: false,
         }
     }
 
@@ -444,6 +456,7 @@ impl AgentConversation {
             info,
             session_id: Some(session_id),
             ingest,
+            title_noted: false,
         };
 
         // A resume the provider ACCEPTS can still fail moments later. The sidecar's CreateSession
@@ -472,7 +485,7 @@ impl AgentConversation {
             }
         }
 
-        persist_record(conversation.conversation_id(), &cwd_string, provider_session_id, capabilities.resume);
+        persist_record(conversation.conversation_id(), &cwd_string, provider_session_id, capabilities.resume, None);
         Ok(conversation)
     }
 
@@ -631,6 +644,35 @@ impl AgentConversation {
                 }
                 other => ConversationError::Provider(other),
             })
+    }
+
+    /// Records what this session is about, for the resume picker: the first line of `as_typed`, the
+    /// prompt as the user typed it (the owner's choice, 2026-09-19: "存首句当标题"). Pass the typed
+    /// text, never the turn sent on the wire -- that one carries editor context above the user's
+    /// words. Only the first prompt with visible text counts; after that this does nothing.
+    ///
+    /// The Agent SDK reports Claude's session id at the start of the first TURN, so the record
+    /// usually does not exist yet when the first prompt is sent. This only hands the title to the
+    /// ingestion thread (`ConversationIngest::note_title`), which writes it with the record when it
+    /// adopts the session, or into the record once it is on disk. Nothing here touches the disk --
+    /// this runs on the GTK main loop. Best-effort: a failed write is a row without a title next
+    /// time, not a broken session, so it logs.
+    ///
+    /// **Correction (review of `7fb787b`):** the first version wrote the title here when the session
+    /// id was already known, and claimed the lock made that race-free. It did not: the id becomes
+    /// visible before the record is written, and a title handed over in between found no record and
+    /// was dropped, silently, for good (reproduced 20/20). It also did a record write on the UI
+    /// thread for every resumed session.
+    ///
+    /// A resumed session keeps the title it was first given; one recorded before titles existed
+    /// takes its first prompt after the resume.
+    pub fn note_title(&mut self, as_typed: &str) {
+        if self.title_noted {
+            return;
+        }
+        let Some(title) = crate::persistence::title_from_prompt(as_typed) else { return };
+        self.title_noted = true;
+        self.ingest.note_title(title);
     }
 
     /// Cancels the in-flight turn. Does not end the session -- a real interrupt is followed by a
@@ -904,6 +946,79 @@ mod tests {
             model: "claude-sonnet-5".into(),
             cwd: "/tmp".into(),
         }
+    }
+
+    /// The record adoption writes for `session_opened()`, once it exists.
+    fn adopted_record(conversation: &AgentConversation) -> ConversationRecord {
+        wait_for(conversation, "the adopted session's record on disk", |c| {
+            crate::persistence::load_conversation_record(c.conversation_id(), "claude-uuid-abc").is_ok()
+        });
+        crate::persistence::load_conversation_record(conversation.conversation_id(), "claude-uuid-abc").unwrap()
+    }
+
+    /// The normal order: the first prompt goes out before the SDK reports Claude's session id (it
+    /// does that at the start of the first turn), so the title waits for adoption and is written
+    /// with the record.
+    #[test]
+    fn a_title_noted_before_adoption_is_written_with_the_record() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(Arc::clone(&fake));
+        conversation.note_title("\n  fix   the picker\nsecond line");
+        fake.queue(session_opened());
+        assert_eq!(adopted_record(&conversation).title.as_deref(), Some("fix the picker"));
+    }
+
+    /// Waits until the adopted session's record carries a title, and returns it.
+    fn titled_record(conversation: &AgentConversation) -> Option<String> {
+        wait_for(conversation, "the record's title written", |c| {
+            crate::persistence::load_conversation_record(c.conversation_id(), "claude-uuid-abc")
+                .is_ok_and(|r| r.title.is_some())
+        });
+        adopted_record(conversation).title
+    }
+
+    /// The other order: the session was already adopted, so the record exists and gets the title
+    /// -- written by the ingestion thread, never by the caller's.
+    #[test]
+    fn a_title_noted_after_adoption_is_written_into_the_record() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        assert_eq!(adopted_record(&conversation).title, None);
+        conversation.note_title("later prompt");
+        assert_eq!(titled_record(&conversation).as_deref(), Some("later prompt"));
+    }
+
+    /// The gap the first version fell into: the session id is visible (adoption has set it under
+    /// the lock) but the record is not written yet. A title handed over there was dropped, 20 runs
+    /// out of 20, in the review of `7fb787b`. Noting it the moment the id shows is as close to that
+    /// gap as a test can aim; the title must still arrive.
+    #[test]
+    fn a_title_noted_the_moment_the_session_id_appears_is_not_lost() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        wait_for(&conversation, "the session id visible", |c| c.provider_session_id().is_some());
+        conversation.note_title("said in the gap");
+        assert_eq!(titled_record(&conversation).as_deref(), Some("said in the gap"));
+    }
+
+    /// A blank prompt names nothing, and after the first real one nothing renames the session.
+    #[test]
+    fn only_the_first_prompt_with_text_names_the_session() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut conversation = conversation_with(Arc::clone(&fake));
+        conversation.note_title("   \n\t");
+        conversation.note_title("the real subject");
+        conversation.note_title("a follow-up");
+        fake.queue(session_opened());
+        assert_eq!(adopted_record(&conversation).title.as_deref(), Some("the real subject"));
+        conversation.note_title("after adoption");
+        // A rename would be written by the ingestion thread within a poll or two; give it several.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let record =
+            crate::persistence::load_conversation_record(conversation.conversation_id(), "claude-uuid-abc").unwrap();
+        assert_eq!(record.title.as_deref(), Some("the real subject"));
     }
 
     fn resume_outcome(

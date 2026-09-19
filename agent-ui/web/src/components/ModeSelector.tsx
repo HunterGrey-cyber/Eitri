@@ -38,6 +38,12 @@ function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
+/** How the mode buttons name the selected session: by its title in quotes when it has one, else by
+ *  provider and short id, as the row itself does. */
+function sessionName(session: ResumableSession): string {
+  return session.title ? `“${session.title}”` : `${session.provider} ${shortId(session.providerSessionId)}`;
+}
+
 export function ModeSelector({ hello, connecting, onStart }: Props) {
   /* WHICH conversation to start, as a provider session id, or null for a fresh one. Two axes, not
      one: which conversation and under what permission policy are independent choices, and a resume
@@ -93,12 +99,15 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
         <>
           {/* Outside the radiogroup, not inside it: a `radiogroup` owns its radios, and a paragraph
               among them is a child a screen reader has to walk past to reach the options. Said
-              plainly at all because the rows genuinely look opaque, and a user deserves to know why
-              rather than assuming the labels failed to load -- nothing here stands in for a title
-              that exists elsewhere. No title is stored anywhere. */}
-          <p className="detail session-choice-note" data-testid="no-title-note">
-            Previous conversations here, newest first. A session is identified by its provider and
-            session id and when it was last opened; no title or summary of a conversation is stored.
+              plainly because a row without a name looks opaque, and a user deserves to know why
+              rather than assuming the name failed to load. The wording is "the first message sent
+              in it here", not "the message that began it": a session recorded before names were
+              kept takes the first prompt after it is resumed, and a first prompt the provider
+              refused names nothing, so the row's name is not always the conversation's opening. */}
+          <p className="detail session-choice-note" data-testid="session-choice-note">
+            Previous conversations here, newest first, each named by the first line of the first
+            message sent in it here. One without a name shows only its session id and when it was
+            last opened.
           </p>
           {/* Both choice rows go through `Row` (`./Row`), the one component that owns the two-cell
               sign grid. It also switches its cells to `<span>` for the button shape, which is what
@@ -138,8 +147,22 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
                       not support, the one word naming the provider was the one word not read from
                       it. Rendered as stored, lowercase and all: a display-name table here would be
                       a second place to keep in sync with the provider list. */}
-                  <strong>{session.provider} {shortId(session.providerSessionId)}</strong>
-                  <span className="detail">{describeWhen(session)}</span>
+                  {/* The title leads when there is one (the owner's choice, 2026-09-19: "存首句当标题"),
+                      and the id moves into the detail line, still there for telling two sessions
+                      with the same opening line apart. Without one the row is what it always was. */}
+                  {session.title ? (
+                    <>
+                      <strong className="session-title">{session.title}</strong>
+                      <span className="detail">
+                        {session.provider} {shortId(session.providerSessionId)} · {describeWhen(session)}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <strong>{session.provider} {shortId(session.providerSessionId)}</strong>
+                      <span className="detail">{describeWhen(session)}</span>
+                    </>
+                  )}
                 </Row>
               );
             })}
@@ -156,7 +179,7 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
           <strong>{MODE_LABELS[mode].title}</strong>
           <span className="detail">
             {MODE_LABELS[mode].detail}
-            {selected === null ? "" : ` Continues ${selected.provider} ${shortId(selected.providerSessionId)}.`}
+            {selected === null ? "" : ` Continues ${sessionName(selected)}.`}
           </span>
         </button>
       ))}
@@ -173,7 +196,8 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
   );
 }
 
-/** The two timestamps a record carries, and nothing else -- there is no title to fall back to.
+/** The two timestamps a record carries. A titled row shows this after its id; an untitled row
+ *  shows it as its only detail.
  *
  * "last opened", not "last used" or "last active": `updatedAt` marks when the session was last
  * STARTED OR RESUMED. Nothing rewrites a record during a conversation, so an hour of work and a

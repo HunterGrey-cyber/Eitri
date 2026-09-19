@@ -164,6 +164,10 @@ pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str
 /// timestamps. There is no title and no summary anywhere in this payload because there is none on
 /// disk -- see `agent::ResumableSession`'s own doc for why the one file that could supply one is
 /// deliberately not read. A frontend rendering this must not invent a label for a row.
+/// **Correction (2026-09-19): there is a `title` now** -- the first line of the session's first
+/// prompt, recorded by this project at write time (`agent::persistence::title_from_prompt`), not read
+/// from anyone else's file. It is `null` for a session recorded before titles were kept, and the
+/// rule stands for those rows: no label is invented.
 pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
     json!({
         "kind": "hello",
@@ -179,6 +183,7 @@ pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) 
             "providerSessionId": r.provider_session_id,
             "createdAt": r.created_at,
             "updatedAt": r.updated_at,
+            "title": r.title,
         })).collect::<Vec<_>>(),
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
     })
@@ -1014,6 +1019,7 @@ mod tests {
             provider_session_id: provider_session_id.into(),
             created_at: created_at.into(),
             updated_at: updated_at.into(),
+            title: None,
         }
     }
 
@@ -1044,6 +1050,18 @@ mod tests {
     fn hello_carries_an_empty_list_when_the_workspace_has_nothing_to_continue() {
         let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting_with(Vec::new()))).unwrap();
         assert_eq!(parsed["resumableSessions"], json!([]));
+    }
+
+    /// The title crosses as a string, and a session without one crosses as `null` -- present, so the
+    /// frontend reads one shape, and not an empty string it might render as a blank row.
+    #[test]
+    fn hello_carries_each_sessions_title_or_null() {
+        let mut titled = resumable("prov-1", "1000", "9000");
+        titled.title = Some("fix the picker".into());
+        let greeting = greeting_with(vec![titled, resumable("prov-2", "1000", "8000")]);
+        let parsed: Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(parsed["resumableSessions"][0]["title"], "fix the picker");
+        assert_eq!(parsed["resumableSessions"][1]["title"], Value::Null);
     }
 
     /// Both stamps cross the bridge, because they answer different questions: `createdAt` is when

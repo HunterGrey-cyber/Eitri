@@ -80,13 +80,50 @@ pub struct ConversationRecord {
     /// read as `false`, which correctly means "we cannot claim this is resumable".
     #[serde(default)]
     pub provider_advertised_resume: bool,
+    /// The first line of the first prompt typed in this session, cut to `TITLE_MAX_CHARS`: what the
+    /// resume picker names the row by (the owner's choice, 2026-09-19: "存首句当标题"). Written from
+    /// the prompt AS TYPED -- never the editor context composed above it -- and never rewritten once
+    /// set, so a resume keeps the session's original subject (`set_title_if_missing`,
+    /// `conversation::persist_record`).
+    ///
+    /// `None` for a record written before this field existed, and for a session whose first prompt
+    /// had not been sent when the record was last written. Absent from the JSON rather than `null`
+    /// when `None`, so a record without one reads exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// The longest title stored, in characters (not bytes: most of the owner's prompts are Chinese). A
+/// row on the start screen is one line of a narrow panel; this is about two of them, and the CSS
+/// does the rest.
+pub const TITLE_MAX_CHARS: usize = 80;
+
+/// A title for a session from the prompt that began it: its first line with visible text, with runs
+/// of whitespace collapsed to one space, cut to `TITLE_MAX_CHARS` characters with `…` when anything
+/// was cut. `None` for a prompt with no visible text.
+///
+/// "Visible" leaves out the zero-width characters a pasted line can consist of (a line of nothing
+/// but U+200B would otherwise be a title that renders as a blank row). The cut is by Unicode scalar,
+/// not grapheme cluster, so a title cut at character 79 can split an emoji sequence or a combining
+/// accent. Cosmetic, and accepted: grapheme segmentation is a dependency for one character.
+pub fn title_from_prompt(prompt: &str) -> Option<String> {
+    let visible = |c: char| !c.is_whitespace() && !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}');
+    let line = prompt.lines().map(str::trim).find(|l| l.chars().any(visible))?;
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= TITLE_MAX_CHARS {
+        return Some(collapsed);
+    }
+    let cut: String = collapsed.chars().take(TITLE_MAX_CHARS - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
 }
 
 /// A previous conversation in this workspace that can be offered for continuation.
 ///
 /// **This is the whole of what one record knows about a session, and it is thin**: a provider name,
 /// a session id, and two timestamps. There is no title, no first prompt, no turn or message count,
-/// no model -- nothing a picker could use to say what a session was ABOUT. `ConversationRecord` has
+/// no model -- nothing a picker could use to say what a session was ABOUT. **Correction
+/// (2026-09-19): there is a title now**, `title` below -- recorded here at write time, exactly the
+/// route the last sentence of this paragraph names; the rest of what follows still holds. `ConversationRecord` has
 /// never carried any of that, and the one place on disk that does -- the real Claude CLI's own
 /// transcript under `~/.claude/projects/` -- is deliberately off limits: `agent::transcript`'s
 /// module doc states that it "never reads or interprets transcript *content* -- only the file's
@@ -99,7 +136,7 @@ pub struct ResumableSession {
     pub provider: String,
     pub provider_session_id: String,
     /// When this session was FIRST started. Preserved across resumes by
-    /// `conversation::persist_record`, which asks `created_at_of_existing_record` for the stamp the
+    /// `conversation::persist_record`, which asks `existing_record` for the stamp the
     /// session already had and only mints a new one when there is no earlier record at all.
     ///
     /// That lookup consults BOTH layouts. It used to read the directory record only, so the first
@@ -111,7 +148,10 @@ pub struct ResumableSession {
     /// When this session was last STARTED OR RESUMED -- not when it last had activity. Nothing
     /// rewrites a record during a conversation, so a session used for an hour and a session opened
     /// and abandoned carry the same stamp. Anything rendering this must not call it "last active".
+    /// (Setting the title rewrites the record once, and leaves this stamp as it was.)
     pub updated_at: String,
+    /// `ConversationRecord::title`. `None` for a session recorded before titles were kept.
+    pub title: Option<String>,
 }
 
 /// Every session in this workspace worth offering, newest first.
@@ -156,6 +196,7 @@ pub fn resumable_sessions(conversation_id: &str) -> Vec<ResumableSession> {
             provider_session_id: record.provider_session_id,
             created_at: record.created_at,
             updated_at: record.updated_at,
+            title: record.title,
         })
         .collect()
 }
@@ -393,7 +434,8 @@ pub fn load_conversation_record(
     serde_json::from_str(&contents).map_err(std::io::Error::other)
 }
 
-/// The `created_at` this session already has on disk, in EITHER layout, or `None` if it has none.
+/// The record this session already has on disk, in EITHER layout, or `None` if it has none -- which
+/// is where its `created_at` survives a resume from.
 ///
 /// `conversation::persist_record` calls this so a resume keeps the session's real start time
 /// instead of restamping it. The directory record is preferred; the pre-2026-09-15 flat file is the
@@ -405,16 +447,39 @@ pub fn load_conversation_record(
 /// resume of a flat-layout-only session wrote `created_at = now`, and `resumable_sessions`'
 /// de-duplication then dropped the flat record that still held the real value -- one-way, since
 /// nothing rewrites the flat file either.
-pub(crate) fn created_at_of_existing_record(
-    conversation_id: &str,
-    provider_session_id: &str,
-) -> Option<String> {
+///
+/// **Renamed 2026-09-19** from `created_at_of_existing_record`, when it began returning the whole
+/// record: `persist_record` now keeps the session's title across a resume the same way, and needs
+/// both from one read. What this doc says of `created_at` holds for `title` too.
+pub(crate) fn existing_record(conversation_id: &str, provider_session_id: &str) -> Option<ConversationRecord> {
     if let Ok(record) = load_conversation_record(conversation_id, provider_session_id) {
-        return Some(record.created_at);
+        return Some(record);
     }
     let dir = conversation_dir(conversation_id).ok()?;
     let legacy = read_legacy_record(&dir)?;
-    (legacy.provider_session_id == provider_session_id).then_some(legacy.created_at)
+    (legacy.provider_session_id == provider_session_id).then_some(legacy)
+}
+
+/// Gives this session's directory record `title`, if it has none yet. `Ok(false)` when there is no
+/// directory record or the record already has a title -- the first one wins, for good. Called only
+/// by the ingestion thread, and only once it knows the record is on disk (`ingestion::flush_title`):
+/// a caller that cannot know that loses the title to the `Ok(false)`, which is how the first version
+/// of this feature dropped one (review of `7fb787b`).
+/// `updated_at` is left alone: it means "last started or resumed", and titling is neither.
+pub(crate) fn set_title_if_missing(
+    conversation_id: &str,
+    provider_session_id: &str,
+    title: &str,
+) -> std::io::Result<bool> {
+    let Ok(mut record) = load_conversation_record(conversation_id, provider_session_id) else {
+        return Ok(false);
+    };
+    if record.title.is_some() {
+        return Ok(false);
+    }
+    record.title = Some(title.to_string());
+    save_conversation_record(&record)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -468,6 +533,7 @@ mod tests {
             created_at: "2026-09-10T00:00:00Z".into(),
             updated_at: "2026-09-10T00:00:00Z".into(),
             provider_advertised_resume: true,
+            title: None,
         };
         assert!(save_conversation_record(&record).is_err());
         assert!(load_conversation_record("../../../../tmp/pwned", "prov-1").is_err());
@@ -486,6 +552,7 @@ mod tests {
             created_at: "1".into(),
             updated_at: "2".into(),
             provider_advertised_resume: true,
+            title: None,
         };
         let error = save_conversation_record(&record).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -521,6 +588,7 @@ mod tests {
             created_at: "1000".into(),
             updated_at: updated_at.into(),
             provider_advertised_resume: true,
+            title: None,
         }
     }
 
@@ -836,7 +904,7 @@ mod tests {
         legacy.created_at = "1234".into();
         std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
 
-        assert_eq!(created_at_of_existing_record(&conv, "prov-same").as_deref(), Some("1234"));
+        assert_eq!(existing_record(&conv, "prov-same").map(|r| r.created_at).as_deref(), Some("1234"));
     }
 
     /// ...but only for the SAME session. The flat file is keyed by conversation alone, so a
@@ -851,7 +919,7 @@ mod tests {
         legacy.created_at = "1234".into();
         std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
 
-        assert_eq!(created_at_of_existing_record(&conv, "prov-same"), None);
+        assert_eq!(existing_record(&conv, "prov-same").map(|r| r.created_at), None);
     }
 
     /// The directory record wins when both exist, and a session with neither has no stamp to keep.
@@ -866,8 +934,8 @@ mod tests {
         // `record()` writes created_at "1000".
         save_conversation_record(&record(&conv, "prov-same", "5000")).unwrap();
 
-        assert_eq!(created_at_of_existing_record(&conv, "prov-same").as_deref(), Some("1000"));
-        assert_eq!(created_at_of_existing_record(&conv, "prov-never-seen"), None);
+        assert_eq!(existing_record(&conv, "prov-same").map(|r| r.created_at).as_deref(), Some("1000"));
+        assert_eq!(existing_record(&conv, "prov-never-seen").map(|r| r.created_at), None);
     }
 
     /// A listed session carries both stamps, because they mean different things: `created_at` is
@@ -897,5 +965,65 @@ mod tests {
         let listed = resumable_sessions(&conv);
         assert_eq!(listed.len(), MAX_RECORDS_PER_CONVERSATION);
         assert_eq!(listed[0].provider_session_id, "prov-020", "newest first");
+    }
+
+    /// The title is the prompt's first line with visible text, as typed, whitespace collapsed.
+    #[test]
+    fn a_title_is_the_first_line_with_text_in_it() {
+        assert_eq!(title_from_prompt("fix the resume picker").as_deref(), Some("fix the resume picker"));
+        assert_eq!(title_from_prompt("\n  \n  两个  空格\t和制表符\nsecond line").as_deref(), Some("两个 空格 和制表符"));
+        assert_eq!(title_from_prompt(""), None);
+        assert_eq!(title_from_prompt(" \n\t\n"), None);
+        assert_eq!(title_from_prompt("\u{200B}\u{FEFF}\nthe real line").as_deref(), Some("the real line"));
+        assert_eq!(title_from_prompt("line one\r\nline two").as_deref(), Some("line one"));
+    }
+
+    /// Cut by characters, not bytes: an 80-byte cut would split a Chinese character (3 bytes in
+    /// UTF-8) and panic, or land 27 characters in.
+    #[test]
+    fn a_long_title_is_cut_by_characters_and_says_so() {
+        let exact: String = "字".repeat(TITLE_MAX_CHARS);
+        assert_eq!(title_from_prompt(&exact).as_deref(), Some(exact.as_str()), "at the limit nothing is cut");
+        let long: String = "字".repeat(TITLE_MAX_CHARS + 20);
+        let title = title_from_prompt(&long).unwrap();
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
+        assert!(title.ends_with('…'));
+    }
+
+    /// A record from before titles existed loads, and one without a title is written exactly as
+    /// before -- no `"title": null` appears in a file an older build might read.
+    #[test]
+    fn a_record_without_a_title_reads_and_writes_as_it_always_did() {
+        let json = r#"{"conversation_id":"c","provider":"claude","provider_session_id":"p","canonical_cwd":"/","created_at":"1","updated_at":"2","provider_advertised_resume":true}"#;
+        let record: ConversationRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.title, None);
+        assert!(!serde_json::to_string(&record).unwrap().contains("title"));
+    }
+
+    /// The first title wins, for good, and titling does not count as opening the session.
+    #[test]
+    fn set_title_if_missing_sets_it_once_and_leaves_updated_at_alone() {
+        let conv = unique_conversation_id("title-once");
+        assert!(!set_title_if_missing(&conv, "prov-1", "nothing to title").unwrap(), "no record, nothing written");
+        save_conversation_record(&record(&conv, "prov-1", "5000")).unwrap();
+
+        assert!(set_title_if_missing(&conv, "prov-1", "first").unwrap());
+        assert!(!set_title_if_missing(&conv, "prov-1", "second").unwrap());
+        let loaded = load_conversation_record(&conv, "prov-1").unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("first"));
+        assert_eq!(loaded.updated_at, "5000");
+    }
+
+    /// The title reaches the picker's row.
+    #[test]
+    fn a_listed_session_carries_its_title() {
+        let conv = unique_conversation_id("list-title");
+        let mut titled = record(&conv, "prov-titled", "9000");
+        titled.title = Some("what it was about".into());
+        save_conversation_record(&titled).unwrap();
+        save_conversation_record(&record(&conv, "prov-untitled", "8000")).unwrap();
+        let listed = resumable_sessions(&conv);
+        assert_eq!(listed[0].title.as_deref(), Some("what it was about"));
+        assert_eq!(listed[1].title, None);
     }
 }

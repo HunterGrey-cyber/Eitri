@@ -50,7 +50,11 @@ export type BackendKind = "legacy" | "sidecar";
  * model -- Rust's `agent::ConversationRecord` has never stored any of them, and the one file on disk
  * that could supply a subject line (the Claude CLI's own transcript) is deliberately never read for
  * its content. A picker built on this can say WHICH session and WHEN. Anything that renders a row
- * must not manufacture a label the data cannot support. */
+ * must not manufacture a label the data cannot support.
+ *
+ * **Correction (2026-09-19): there is a title now** (`title` below), recorded by this project when
+ * the session's first prompt is sent -- still not read out of anyone else's file. Everything else
+ * above stands, and so does the last sentence, for the rows that have none. */
 export type ResumableSession = {
   provider: string;
   providerSessionId: string;
@@ -61,6 +65,11 @@ export type ResumableSession = {
    * last had activity. Nothing rewrites a record during a conversation, so a session used for an
    * hour and one opened and abandoned carry the same stamp. Never label this "last active". */
   updatedAt: string;
+  /** The first line of the prompt that began this session, as typed, cut to 80 characters (Rust's
+   *  `agent::persistence::title_from_prompt`). `null` -- or absent, from a build before this field
+   *  -- for a session recorded before titles were kept; such a row still shows only its id and time,
+   *  and nothing may be made up in its place. */
+  title?: string | null;
 };
 export type PermissionModeChoice = "auto" | "bypass";
 

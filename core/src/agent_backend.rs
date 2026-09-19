@@ -437,6 +437,11 @@ impl AgentBackend {
                 // which is exactly what makes a rejected turn still show its prompt.
                 conversation.fold_locally(user_prompt_event(as_typed));
                 conversation.send_turn(wire_text)?;
+                // The resume picker's title for this session: the prompt as typed, never
+                // `wire_text`, which carries the editor context composed above it. Only a turn the
+                // provider accepted names a session. Legacy writes no records, so it has nothing to
+                // name.
+                conversation.note_title(as_typed);
                 Ok(Vec::new())
             }
         }
@@ -881,6 +886,7 @@ mod tests {
             created_at: "1000".into(),
             updated_at: "2000".into(),
             provider_advertised_resume: true,
+            title: None,
         })
         .expect("writing a record into the test state root should succeed");
         dir
@@ -1072,6 +1078,37 @@ mod tests {
             error.folded_events.is_empty(),
             "the sidecar's prompt reaches the UI through the pump, never through the error"
         );
+    }
+
+    /// The resume picker's title is the prompt AS TYPED. `wire_text` carries the editor context
+    /// above the user's words, and its first line would name every session after a file path.
+    #[test]
+    fn a_sidecar_sessions_title_is_the_prompt_as_typed_not_the_wire_text() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("title-as-typed");
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Bypass).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let conversation_id = backend.conversation_id().expect("a sidecar backend has one").to_string();
+
+        let sent = backend.send_turn("Editor context: /p/src/main.rs, line 3\n\nfix the picker", "fix the picker");
+        assert!(sent.is_ok(), "RecordingProvider accepts every turn");
+        provider.queue(AgentDomainEvent::SessionOpened {
+            session_id: "fake-session".into(),
+            provider_session_id: "claude-title".into(),
+            model: "m".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let record = loop {
+            if let Ok(record) = agent::persistence::load_conversation_record(&conversation_id, "claude-title") {
+                break record;
+            }
+            assert!(std::time::Instant::now() < deadline, "adoption never wrote the record");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_eq!(record.title.as_deref(), Some("fix the picker"));
     }
 
     // ---- The permission policy, wired through the one point both backends converge on ---------

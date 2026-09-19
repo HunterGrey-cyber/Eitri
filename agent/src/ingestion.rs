@@ -121,6 +121,17 @@ struct IngestState {
     resync_pending: bool,
     resume_outcome: Option<ResumeOutcomeRecord>,
     stats: IngestStats,
+    /// The session's title, noted by the UI thread and written by this one: with the record when
+    /// adoption finds it here (the normal order, since the Agent SDK reports Claude's id at the
+    /// start of the first turn), else into the record once `record_written` says it exists. See
+    /// `ConversationIngest::note_title`.
+    pending_title: Option<String>,
+    /// Whether this session's record is on disk. NOT the same moment as `provider_session_id`
+    /// becoming `Some`: adoption sets the id under the lock and writes the record after releasing
+    /// it, and a title written into that gap found no record and was lost (review of `7fb787b`,
+    /// reproduced 20/20). `true` from the start for a resume, whose record `resume()` writes before
+    /// it returns.
+    record_written: bool,
 }
 
 impl IngestState {
@@ -219,6 +230,7 @@ impl ConversationIngest {
         initial_provider_session_id: Option<String>,
         initial_lease: Option<SessionLease>,
     ) -> Self {
+        let record_written = initial_provider_session_id.is_some();
         let state = Arc::new(Mutex::new(IngestState {
             projection: AgentSessionProjection::default(),
             provider_session_id: initial_provider_session_id,
@@ -227,6 +239,8 @@ impl ConversationIngest {
             resync_pending: false,
             resume_outcome: None,
             stats: IngestStats::default(),
+            pending_title: None,
+            record_written,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let context = AdoptionContext { conversation_id, canonical_cwd, provider_advertises_resume };
@@ -263,6 +277,15 @@ impl ConversationIngest {
 
     pub fn stats(&self) -> IngestStats {
         self.state.lock().unwrap().stats
+    }
+
+    /// Keeps `title` for the ingestion thread to write (`AgentConversation::note_title`). Nothing
+    /// here touches the disk: the caller is the GTK main loop, and a record write is two fsyncs.
+    /// The ingestion thread writes it with the record if adoption has not happened yet, or into the
+    /// record once it exists (`flush_title`), so there is no moment in which a title can be handed
+    /// over and then find nowhere to go. Only the first title is kept.
+    pub(crate) fn note_title(&self, title: String) {
+        self.state.lock().unwrap().pending_title.get_or_insert(title);
     }
 
     /// The provider's resume verdict, once it has stated one.
@@ -314,6 +337,8 @@ fn ingest_loop(
 ) {
     while !stop.load(Ordering::Relaxed) {
         let events = provider.pump();
+        // Before the idle check, so a title noted while the provider is quiet still gets written.
+        flush_title(&state, &context);
         if events.is_empty() {
             std::thread::sleep(INGEST_POLL_INTERVAL);
             continue;
@@ -322,6 +347,7 @@ fn ingest_loop(
         // a `flock` and a JSON write would block every UI tick reading the projection for the
         // duration.
         let mut adopt: Option<String> = None;
+        let mut title: Option<String> = None;
         {
             let mut guard = state.lock().unwrap();
             for event in events {
@@ -332,6 +358,10 @@ fn ingest_loop(
                     // every single turn.
                     if guard.provider_session_id.is_none() {
                         adopt = Some(provider_session_id.clone());
+                        // A title noted before this point goes into the record adoption writes. One
+                        // noted after it waits in `pending_title` until `record_written`, and
+                        // `flush_title` writes it then.
+                        title = guard.pending_title.take();
                     }
                     guard.provider_session_id = Some(provider_session_id.clone());
                 }
@@ -339,13 +369,37 @@ fn ingest_loop(
             }
         }
         if let Some(provider_session_id) = adopt {
-            let lease = adopt_provider_session(&context, &provider_session_id);
-            state.lock().unwrap().lease = lease;
+            let lease = adopt_provider_session(&context, &provider_session_id, title.as_deref());
+            let mut guard = state.lock().unwrap();
+            guard.lease = lease;
+            guard.record_written = true;
         }
     }
 }
 
-fn adopt_provider_session(context: &AdoptionContext, provider_session_id: &str) -> Option<SessionLease> {
+/// Writes a title noted after this session's record was written -- into that record, on this
+/// thread. A no-op until `record_written`, and whenever nothing is pending: one uncontended lock
+/// per poll. Best-effort, like the record itself: a failure is a row without a title next time.
+fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
+    let (title, provider_session_id) = {
+        let mut guard = state.lock().unwrap();
+        if !guard.record_written {
+            return;
+        }
+        let Some(title) = guard.pending_title.take() else { return };
+        let Some(id) = guard.provider_session_id.clone() else { return };
+        (title, id)
+    };
+    if let Err(e) = crate::persistence::set_title_if_missing(&context.conversation_id, &provider_session_id, &title) {
+        eprintln!("agent: could not record the title of session {provider_session_id}: {e}");
+    }
+}
+
+fn adopt_provider_session(
+    context: &AdoptionContext,
+    provider_session_id: &str,
+    title: Option<&str>,
+) -> Option<SessionLease> {
     let lease = match SessionLease::try_acquire(
         crate::conversation::PROVIDER_NAME,
         &context.canonical_cwd,
@@ -375,6 +429,7 @@ fn adopt_provider_session(context: &AdoptionContext, provider_session_id: &str) 
         &context.canonical_cwd,
         provider_session_id,
         context.provider_advertises_resume,
+        title,
     );
     lease
 }
@@ -393,6 +448,8 @@ mod tests {
             resync_pending: false,
             resume_outcome: None,
             stats: IngestStats::default(),
+            pending_title: None,
+            record_written: false,
         }
     }
 

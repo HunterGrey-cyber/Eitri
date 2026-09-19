@@ -1378,12 +1378,14 @@ mod tests {
                     provider_session_id: "1857dcd5-973b-46a2".to_string(),
                     created_at: "1757600000000".to_string(),
                     updated_at: "1757700000000".to_string(),
+                    title: None,
                 },
                 agent::ResumableSession {
                     provider: "claude".to_string(),
                     provider_session_id: "some-other-session".to_string(),
                     created_at: "1757500000000".to_string(),
                     updated_at: "1757600000000".to_string(),
+                    title: None,
                 },
             ],
         };
