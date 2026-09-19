@@ -288,7 +288,7 @@ describe("ModeSelector conversation picker", () => {
    *  one policy with nothing making the compiler compare them, so what is pinned here is that the
    *  screen does not promise unconditional execution. */
   it("does not promise Bypass runs every tool, because it does not", () => {
-    render(<ModeSelector hello={hello(["auto", "bypass"])} connecting={false} onStart={() => {}} />);
+    render(<ModeSelector hello={hello({ permissionModes: ["auto", "bypass"] })} connecting={false} onStart={() => {}} />);
     const bypass = screen.getByText("Bypass").closest("button")!;
     expect(bypass.textContent).not.toMatch(/every tool call proceeds/i);
     expect(bypass.textContent).toMatch(/cannot edit files/i);
