@@ -289,6 +289,10 @@ pub struct NeovideEditorPane {
     exited_callback: ExitedCallbackSlot,
     /// Shared with the render callback. See [`NeovideEditorPane::set_clear_color`].
     clear_color: Rc<Cell<Color4f>>,
+    /// The focus state the host last reported, shared with the render callback so a report that
+    /// arrives before nvim has started is applied the moment the harness exists. See
+    /// [`NeovideEditorPane::set_focused`].
+    focused: Rc<Cell<Option<bool>>>,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -387,6 +391,7 @@ impl NeovideEditorPane {
         let skia_state: Rc<RefCell<Option<SkiaState>>> = Rc::new(RefCell::new(None));
         let live_state: Rc<RefCell<LiveState>> = Rc::new(RefCell::new(LiveState::NotStarted));
         let clear_color = Rc::new(Cell::new(OUTSIDE_COLOR));
+        let focused: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
 
         // --- resize: GtkGLArea's FBO can be resized/recreated under us, so drop the cached
@@ -514,6 +519,7 @@ impl NeovideEditorPane {
             // needed again in this function, and this closure is the only place `LiveHarness` is
             // ever constructed.
             let clear_color = clear_color.clone();
+            let focused = focused.clone();
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -646,6 +652,12 @@ impl NeovideEditorPane {
                                     (content_region.max.y - content_region.min.y) as i32,
                                 );
                                 harness.resize_grid(grid_size);
+                                // A focus report can arrive before nvim exists -- the host tracks
+                                // GTK focus from the first frame. Hand it over now, or the cursor
+                                // would stay solid until the next focus change.
+                                if let Some(state) = focused.get() {
+                                    harness.set_focused(state);
+                                }
                                 *live = LiveState::Ready(Box::new(LiveSession::new(harness, grid_size)));
                             }
                             Err(err) => {
@@ -846,7 +858,7 @@ impl NeovideEditorPane {
             });
         }
 
-        Self { widget: gl_area, im_context, live_state, exited_callback, clear_color }
+        Self { widget: gl_area, im_context, live_state, exited_callback, clear_color, focused }
     }
 
     /// The `GtkGLArea` this pane renders into. The host places this into its own window (e.g. as
@@ -859,6 +871,26 @@ impl NeovideEditorPane {
     /// widget -- call this once the host's window is actually shown (mirroring the reference
     /// probe's own `window.present(); gl_area.grab_focus(); im_context.focus_in();` sequence,
     /// minus the `.present()`, which is the host's own window's job).
+    /// Tells the editor whether it has the keyboard, so it can say so the way a terminal does:
+    /// a solid block cursor when it has focus, a hollow one when it does not. It forwards to
+    /// `LiveHarness::set_focused` (fork `8f043a2`), which also tells nvim through
+    /// `nvim_ui_set_focus`. Before this, nvim never heard about focus at all, and nothing fired
+    /// `FocusGained` or `FocusLost`.
+    ///
+    /// This is a separate call from [`grab_focus`](Self::grab_focus), and the host decides what
+    /// "focused" means. `shell` passes `true` only while this pane holds the window's focus widget
+    /// AND the window is active. That matches a real Neovide window, whose cursor goes hollow when
+    /// you alt-tab away. It may be called before nvim has started, and on every focus event:
+    /// repeats are dropped by the harness.
+    pub fn set_focused(&self, focused: bool) {
+        self.focused.set(Some(focused));
+        if let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() {
+            session.harness.set_focused(focused);
+            session.wants_frame.set(true);
+        }
+        self.widget.queue_render();
+    }
+
     pub fn grab_focus(&self) {
         self.widget.grab_focus();
         self.im_context.focus_in();

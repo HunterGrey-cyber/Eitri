@@ -19,6 +19,10 @@ type Props = {
    *  `buildTimeline(state)` over the same `state`, a pure function, so the two computations always
    *  agree on what sits at a given index for a given `state` even though each holds its own copy. */
   cursor: number;
+  /** Whether the panel has the keyboard (the `pane_focus` envelope). Drives the cursor's solid
+   *  and hollow states in `index.css`; see the `.row-current .row-sign` rule there. Defaults to
+   *  `true`, the state with no host to say otherwise; `App.tsx` always passes it explicitly. */
+  focused?: boolean;
   onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string) => void;
 };
 
@@ -36,7 +40,7 @@ function toolSign(call: ToolCallRecord): string {
  *  never scrolled up on purpose. Arbitrary and not tuned against a real screen. */
 const BOTTOM_FOLLOW_THRESHOLD_PX = 24;
 
-export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPermission }: Props) {
+export function MessageList({ state, sessionEnded, expanded, cursor, focused = true, onAnswerPermission }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -133,7 +137,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   const timeline = useMemo(() => buildTimeline(state), [state]);
 
   return (
-    <div className="message-list" ref={listRef} onScroll={onScroll}>
+    <div className="message-list" data-focused={String(focused)} ref={listRef} onScroll={onScroll}>
       {timeline.map((item, index) => {
         const current = index === cursor;
         switch (item.kind) {

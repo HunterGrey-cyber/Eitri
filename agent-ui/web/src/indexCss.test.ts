@@ -23,6 +23,8 @@ const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
 /** A selector branch that sits inside the winbar or the status line -- `.winbar`, `.status-line`,
  *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
+/** The panel cursor's solid block: the current row's sign cell and nothing else. */
+const CURSOR_BRANCH = /^\.row-current \.row-sign$/;
 
 /**
  * The rule this file actually enforces, in one sentence: **a colour may be used as text only where
@@ -52,9 +54,14 @@ function unguardedTextColorDeclarations(source: string): string[] {
     const onHljsSurface = everyBranchIsOnSurface(selector, HLJS_BRANCH);
     const onChromeSurface = everyBranchIsOnSurface(selector, CHROME_BRANCH);
     const body = rule.slice(rule.indexOf("{") + 1, -1);
+    const onCursorSurface =
+      everyBranchIsOnSurface(selector, CURSOR_BRANCH) && /(?:^|;)\s*background: var\(--nv-fg\);/.test(body);
     for (const declaration of body.match(/(?<![a-z-])color:[^;]*;/g) ?? []) {
       if (onHljsSurface && /^color: var\(--nv-syn-[a-z]+\);$/.test(declaration)) continue;
       if (onChromeSurface && /^color: var\(--nv-chrome-(fg|muted)\);$/.test(declaration)) continue;
+      // The panel's cursor: `--nv-bg` text on an `--nv-fg` fill, the body's own pair reversed.
+      // Only where the SAME rule paints that fill, so the exemption cannot outlive the fill.
+      if (onCursorSurface && /^color: var\(--nv-bg\);$/.test(declaration)) continue;
       declarations.push(declaration);
     }
   }
@@ -160,6 +167,22 @@ describe("index.css", () => {
     );
     expect(declarations).toEqual(["color: var(--nv-chrome-muted);"]);
     expect(declarations[0]).not.toMatch(/^color: var\(--nv-(fg|muted)\);$/);
+  });
+
+  it("admits --nv-bg as text only on the cursor cell that is filled with --nv-fg", () => {
+    const filled = ".row-current .row-sign { background: var(--nv-fg); color: var(--nv-bg); }";
+    expect(unguardedTextColorDeclarations(filled)).toEqual([]);
+    // The same colour with the fill gone is --nv-bg on --nv-bg: invisible, and refused.
+    expect(unguardedTextColorDeclarations(".row-current .row-sign { color: var(--nv-bg); }")).toEqual([
+      "color: var(--nv-bg);",
+    ]);
+    // Anywhere else it is refused, and so is a group with one branch on the cursor cell.
+    expect(unguardedTextColorDeclarations(".row-sign { background: var(--nv-fg); color: var(--nv-bg); }")).toEqual([
+      "color: var(--nv-bg);",
+    ]);
+    expect(
+      unguardedTextColorDeclarations(".row-current .row-sign, .row-body { background: var(--nv-fg); color: var(--nv-bg); }"),
+    ).toEqual(["color: var(--nv-bg);"]);
   });
 
   it("does not dim a conversation-picker row with opacity", () => {
@@ -354,6 +377,31 @@ describe("index.css cascade (which rule actually wins)", () => {
     // control is the weaker "later, equal-specificity shorthand", which is enough to show the
     // assertion above can fail. cssstyle drops a var() shorthand entirely, hence the empty string.
     expect(clobbered.borderLeftColor).not.toBe("var(--nv-mode-input)");
+  });
+
+  it("draws the panel's cursor solid with focus and hollow without", () => {
+    const row = (focused: string) =>
+      `<div class="message-list" data-focused="${focused}"><div class="row row-tool row-current"><span class="row-sign">⚙</span><div class="row-body">x</div></div></div>`;
+    const solid = computed(row("true"), ".row-sign");
+    expect(solid.background).toBe("var(--nv-fg)");
+    expect(solid.color).toBe("var(--nv-bg)");
+    expect(computed(row("true"), ".row").background).toBe("var(--nv-cursorline)");
+    const hollow = computed(row("false"), ".row-sign");
+    // jsdom resolves `background: none` to a transparent colour rather than echoing it, so this
+    // asserts what matters: neither fill survives.
+    expect(hollow.background).not.toBe("var(--nv-fg)");
+    expect(hollow.color).toBe("var(--nv-fg)");
+    expect(hollow.boxShadow).toBe("inset 0 0 0 1.5px var(--nv-fg)");
+    expect(computed(row("false"), ".row").background).not.toBe("var(--nv-cursorline)");
+    // Negative control: a solid-cursor rule at the unfocused rule's own specificity, placed after
+    // it, wins the fill back. That is what moving the unfocused rules above the solid one, or
+    // weakening their selector, would do.
+    const clobbered = computed(
+      row("false"),
+      ".row-sign",
+      '.message-list[data-focused="false"] .row-current .row-sign { background: var(--nv-fg); }',
+    );
+    expect(clobbered.background).toBe("var(--nv-fg)");
   });
 
   it("dims an unfocused mode block even in INPUT, whose own rule has equal specificity", () => {

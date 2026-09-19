@@ -14,17 +14,10 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     let chrome_fg = tokens.chrome_fg.hex();
     // Every text colour drawn on `chrome` comes from a token guarded against `chrome`. The
     // bg-guarded `muted` and the unguarded `mode_browse` are never used on chrome: a reversed
-    // StatusLine makes `chrome` the colour they were pushed toward. `muted` does appear below, as
-    // the focus outline, and that outline is drawn on `bg`, which is the surface it is guarded against.
+    // StatusLine makes `chrome` the colour they were pushed toward.
     let chrome_muted = tokens.chrome_muted.hex();
     let chrome_accent = tokens.chrome_accent.hex();
     let border = tokens.border.hex();
-    // The focused pane's outline. It is drawn on `bg`: the editor paints nvim's `Normal` background,
-    // and the panel paints `--nv-bg`. So it needs a colour guarded against `bg`. The accent tokens
-    // are not: `chrome_accent` is guarded against `chrome`, and `mode_browse` is not guarded at all.
-    // `muted` is guarded at TEXT_CONTRAST (4.5:1) against `bg`. That is more than the 3:1 WCAG
-    // 1.4.11 asks of a focus indicator, so this reuses an existing token and derives no new one.
-    let focus_ring = tokens.muted.hex();
     let hover = tokens.cursorline.hex();
     let error = tokens.error.hex();
     let font = PROSE_FONT_STACK;
@@ -128,25 +121,15 @@ paned.content-area > separator {{
     padding-left: 5px;
 }}
 
-/* A line along the bottom of the focused pane, not a frame around it. The owner tried the 2px
-   outline this replaced and found it ugly; `outline` cannot be drawn on one side only.
-
-   The width is constant and only the colour changes. That is the whole trick: a border takes space
-   from the widget's content box, so a border that appeared on focus would shrink the GL area and
-   resize nvim's grid on every Ctrl+h / Ctrl+l. A border that is always there costs the same 2px
-   whether or not the pane has focus, so the grid is sized once and focus changes nothing but a
-   colour.
-
-   Unfocused, the line is `border`, the divider colour, so it sits directly on the status bar's own
-   1px `border` top rule and reads as one slightly heavier divider. Focused, it turns `muted`: the
-   divider lights up under the pane that has the keys. Not `bg`, which would draw a stripe of the
-   editor's background under nvim's statusline, the band this project just spent a day removing.
-   None of this has been seen on a screen. */
-.pane {{
-    border-bottom: 2px solid {border};
-}}
-.pane.pane-focused {{
-    border-bottom-color: {focus_ring};
+/* The top bar's keyboard cursor. `Ctrl+k` brings focus here, and the focused item is drawn the
+   way every other cursor in this window is: a solid block with the glyph knocked out. The editor's
+   block is Neovide's own, the panel's is its current row's sign cell. That is the whole focus
+   language: solid means the keys go here. The pair is `chrome_fg` behind `chrome` text, the
+   reverse of the bar's guarded `chrome_fg`-on-`chrome` text pair, so it has the same 4.5:1.
+   Placed after `.win-btn:hover` so a hovered AND focused button still shows the cursor. */
+.topbar-item:focus {{
+    background-color: {chrome_fg};
+    color: {chrome};
 }}
 "#
     )
@@ -269,35 +252,21 @@ mod tests {
         assert_eq!(text_colours, vec![expected.as_str()], "{body}");
     }
 
-    /// The focus line swaps colour and never width, and the colour it swaps to is visible against
-    /// the one it replaces on every scheme -- including the reversed-StatusLine schemes that broke
-    /// the chrome tokens. Width is the load-bearing half: a focused rule that set a width would
-    /// resize the editor's grid on every focus change, which is why the frame this replaced was an
-    /// outline in the first place.
+    /// Focus is shown by cursors, never by chrome around the panes (2026-09-19). The owner found a
+    /// frame ugly and a line under the pane a stopgap; any rule on `.pane` would also risk taking
+    /// layout space and resizing nvim's grid on every focus change. The top bar's own cursor is the
+    /// guarded chrome pair, reversed.
     #[test]
-    fn the_focus_line_changes_colour_and_never_width() {
-        let lunaperche = ThemeTokens::derive(&NvimThemePayload {
-            v: PAYLOAD_VERSION,
-            groups: [
-                ("Normal".to_string(), HlAttrs { fg: Some(0xc6c6c6), bg: Some(0x000000), reverse: false }),
-                ("StatusLine".to_string(), HlAttrs { fg: None, bg: None, reverse: true }),
-                ("Comment".to_string(), HlAttrs { fg: Some(0x949494), bg: None, reverse: false }),
-            ]
-            .into(),
-            options: NvimOptions { background: "dark".into(), guifont: String::new(), colors_name: "lunaperche".into() },
-        });
-        for t in [dawn(), ThemeTokens::fallback(), lunaperche] {
+    fn focus_is_a_cursor_not_a_frame() {
+        for t in [dawn(), ThemeTokens::fallback()] {
             let css = gtk_css(&t);
-            let base = rule(&css, ".pane");
-            let focused = rule(&css, ".pane.pane-focused");
-            assert!(base.contains(&format!("\n    border-bottom: 2px solid {};", t.border.hex())), "{base}");
-            assert!(focused.contains(&format!("\n    border-bottom-color: {};", t.muted.hex())), "{focused}");
-            // Colour only. Any width, style or other border side here would change the layout on focus.
-            let props: Vec<&str> = focused.lines().map(str::trim).filter(|l| l.contains(':')).collect();
-            assert_eq!(props, vec![format!("border-bottom-color: {};", t.muted.hex()).as_str()], "{focused}");
-            assert!(!css.contains("outline:"), "the old frame is gone");
-            let c = t.muted.contrast(t.border);
-            assert!(c >= 3.0, "focused line barely differs from the unfocused one: {c:.2}:1");
+            assert!(!css.contains("\n.pane {") && !css.contains("pane-focused"), "no pane focus chrome");
+            assert!(!css.contains("outline:"), "no outline");
+            let item = rule(&css, ".topbar-item:focus");
+            assert!(item.contains(&format!("background-color: {};", t.chrome_fg.hex())), "{item}");
+            assert!(item.contains(&format!("color: {};", t.chrome.hex())), "{item}");
+            assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
+            assert!(css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(), "hover must not win");
         }
     }
 

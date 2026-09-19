@@ -1,4 +1,4 @@
-//! Which pane has keyboard focus, and the three places that say so.
+//! Which pane has keyboard focus, and how the window says so without drawing anything extra.
 //!
 //! Before this existed nothing in the window said which pane was focused. The composer's caret
 //! used to do it by accident: `Ctrl+l` put focus in the panel's textarea, and a blinking caret
@@ -6,43 +6,37 @@
 //! caret, so that signal went away. The owner hit this on an installed build: "切换到右边之后没有提示
 //! ... 我没法确定我在哪个pane". The three-mode keyboard model is kept. This module puts a signal back.
 //!
-//! **One source, three indicators.** GTK's own focus widget (`GtkWindow:focus-widget`) is the only
-//! input. Every change to it recomputes which pane holds it and updates all three at once:
+//! **The signal is the cursor, not a frame** (2026-09-19, the same day). The first version drew a
+//! 2px outline around the focused pane, then a line under it; the owner found the first ugly and
+//! asked for a design that needs no extra lines at all. The rule now is the one terminals use:
+//! **a solid cursor means the keys go here, a hollow one means they do not -- and it shows where
+//! you will land when you come back.**
 //!
-//! 1. the `pane-focused` CSS class on that pane's frame, which `theme::gtk_css` draws as a line along the pane's bottom edge;
-//! 2. the status bar's focus label (`chrome::build_status_bar`);
-//! 3. the agent panel's mode block, via a `pane_focus` envelope
-//!    (`AgentPanelHandle::set_pane_focused`), which dims the block when the panel is not focused.
+//! - The editor forwards focus to Neovide (`NeovideEditorPane::set_focused`, fork `8f043a2`),
+//!   whose cursor renderer already draws a hollow block when unfocused and which also tells nvim
+//!   (`FocusGained`/`FocusLost`).
+//! - The agent panel gets a `pane_focus` envelope (`AgentPanelHandle::set_pane_focused`) and draws
+//!   its current row's sign cell the same way: solid with focus, hollow without.
+//! - The status bar names the focused pane, as a secondary cue.
 //!
-//! A class toggled from here, not GTK's `:focus-within`. `:focus-within` would have been one CSS
-//! rule, but then the focus line would be decided by GTK's state flags while the status label and
-//! the panel were decided by this code. Two mechanisms can disagree, and on a screen nobody could
-//! tell which one was wrong. With one input and one function, all three agree by construction.
-//! The cost is a `notify::focus-widget` handler.
+//! **One source.** GTK's own focus widget (`GtkWindow:focus-widget`) is the only input, and every
+//! change to it re-runs one function that updates all of the above, so they agree by construction.
 //!
-//! **What "focused" means here:** the pane holding the window's focus widget. The focus line and the
-//! status bar label do not track whether the window itself is active: after alt-tabbing away they
-//! still name the pane that will get the keys on return, and they do not dim.
-//!
-//! **The panel's mode block does, since 2026-09-19 (later).** Its own doc (`StatusLine.tsx`) says a
-//! bright BROWSE is a claim that keys typed NOW go there, and that claim is false while another
-//! window is active -- a review finding, since this paragraph used to say nothing dims at all and
-//! the two docs contradicted each other. So `on_side_focus` gets `true` only when the side pane
-//! holds the focus widget AND the window is active, and `notify::is-active` re-runs the same
-//! function. **Not looked at on a screen**: whether `is-active` notifies promptly on this
-//! compositor after an alt-tab was not observed.
+//! **What "focused" means for the cursors: the pane holds the window's focus widget AND the window
+//! is active.** That is what a real Neovide window does -- its cursor goes hollow when you alt-tab
+//! away -- and what the panel's mode block claims: a bright BROWSE says keys typed now go there.
+//! `notify::is-active` re-runs the same function. The status-bar label deliberately ignores
+//! whether the window is active and keeps naming the pane that will get the keys on return.
+//! **Not looked at on a screen.**
 
 use gtk4::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// One pane the tracker knows about.
 pub(crate) struct Pane {
     /// Focus inside this widget, or on it, counts as this pane having focus.
     pub(crate) content: gtk4::Widget,
-    /// The widget that gets the `pane-focused` class and draws the focus line. It differs from
-    /// `content` for the side slot: the WebView sits inside the resize-throttle `Overlay`
-    /// (`layout::install_webview_resize_throttle`) and may be sized smaller than its slot mid-drag.
-    /// The focus line belongs to the slot.
-    pub(crate) frame: gtk4::Widget,
     /// What the status bar shows. It is the panel registry's own title, so a Lua plugin that
     /// replaces a slot is named by its own title and not by the built-in one.
     pub(crate) title: String,
@@ -65,45 +59,53 @@ pub(crate) fn status_text(focused: Option<&str>) -> String {
     focused.unwrap_or("\u{2014}").to_string()
 }
 
+/// Which panes' "has the keys" answer changed, as `(index, now)`. `last` holds the previous
+/// answer per pane (`None` before the first report), `focused` is the pane holding focus, and
+/// `active` is whether the window is. Only changes are reported, so a focus move between two
+/// widgets inside the editor sends nothing, and every pane gets one report on the first run.
+pub(crate) fn focus_changes(last: &[Option<bool>], focused: Option<usize>, active: bool) -> Vec<(usize, bool)> {
+    last.iter()
+        .enumerate()
+        .filter_map(|(i, prev)| {
+            let now = focused == Some(i) && active;
+            (*prev != Some(now)).then_some((i, now))
+        })
+        .collect()
+}
+
 /// Wires the tracker to `window` and applies it once for the current focus.
 ///
-/// `on_side_focus` gets `true` when the pane at `side_index` is the focused one and the window is
-/// active, and `false` otherwise. It is called only when that answer changes, so a focus move between two widgets
-/// inside the editor does not send a WebView dispatch.
+/// `on_pane_focus(index, has_keys)` is called when a pane's answer changes. Returns the index of
+/// the pane that most recently held focus, which the top bar's `Ctrl+j` uses to go back to it.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
     panes: Vec<Pane>,
     status_label: gtk4::Label,
-    side_index: usize,
-    on_side_focus: impl Fn(bool) + 'static,
-) {
-    for pane in &panes {
-        pane.frame.add_css_class("pane");
-    }
-    let last_side: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+    on_pane_focus: impl Fn(usize, bool) + 'static,
+) -> Rc<Cell<usize>> {
+    let last_pane = Rc::new(Cell::new(0));
+    let last: std::cell::RefCell<Vec<Option<bool>>> = std::cell::RefCell::new(vec![None; panes.len()]);
+    let remembered = last_pane.clone();
     let apply = move |window: &gtk4::ApplicationWindow| {
         let chain = std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent());
         let contents: Vec<gtk4::Widget> = panes.iter().map(|p| p.content.clone()).collect();
         let focused = owning_pane(chain, &contents);
-        for (i, pane) in panes.iter().enumerate() {
-            if Some(i) == focused {
-                pane.frame.add_css_class("pane-focused");
-            } else {
-                pane.frame.remove_css_class("pane-focused");
-            }
+        if let Some(i) = focused {
+            remembered.set(i);
         }
         status_label.set_text(&status_text(focused.map(|i| panes[i].title.as_str())));
-        let side = focused == Some(side_index) && window.is_active();
-        if last_side.get() != Some(side) {
-            last_side.set(Some(side));
-            on_side_focus(side);
+        let changes = focus_changes(&last.borrow(), focused, window.is_active());
+        for (i, now) in changes {
+            last.borrow_mut()[i] = Some(now);
+            on_pane_focus(i, now);
         }
     };
     apply(window);
-    let apply = std::rc::Rc::new(apply);
+    let apply = Rc::new(apply);
     let on_active = apply.clone();
     window.connect_notify_local(Some("focus-widget"), move |window, _| apply(window));
     window.connect_notify_local(Some("is-active"), move |window, _| on_active(window));
+    last_pane
 }
 
 #[cfg(test)]
@@ -131,6 +133,21 @@ mod tests {
         // A pane nested inside another pane (a Lua plugin could do this) belongs to the inner one:
         // that is the one whose keys are being typed into.
         assert_eq!(owning_pane(["inner", "outer", "window"], &["outer", "inner"]), Some(1));
+    }
+
+    #[test]
+    fn every_pane_gets_one_first_report_then_only_changes() {
+        assert_eq!(focus_changes(&[None, None], Some(0), true), vec![(0, true), (1, false)]);
+        assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), true), vec![]);
+        assert_eq!(focus_changes(&[Some(true), Some(false)], Some(1), true), vec![(0, false), (1, true)]);
+    }
+
+    #[test]
+    fn an_inactive_window_gives_no_pane_the_keys() {
+        // Alt-tab away: the editor's cursor goes hollow, as a real Neovide window's does.
+        assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), false), vec![(0, false)]);
+        // Focus on the top bar: neither pane has the keys.
+        assert_eq!(focus_changes(&[Some(false), Some(true)], None, true), vec![(1, false)]);
     }
 
     #[test]

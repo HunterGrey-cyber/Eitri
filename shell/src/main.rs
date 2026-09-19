@@ -198,10 +198,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
 
-    let (content_widget, paned) = layout::build_content_area(&main_widget, &side_widget);
-    // The side slot's frame is the resize-throttle `Overlay` that `build_content_area` put in the
-    // paned, not the WebView. See `pane_focus::Pane::frame`.
-    let side_frame = paned.end_child().expect("build_content_area always sets an end child");
+    let (content_widget, _paned) = layout::build_content_area(&main_widget, &side_widget);
     let content_widget = match &bottom_widget {
         Some(bottom) => layout::build_vertical_split(&content_widget, bottom).0,
         None => content_widget,
@@ -240,30 +237,66 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         });
     }
 
-    root.append(&chrome::build_top_bar(&window, project_root));
+    let (top_bar, top_items) = chrome::build_top_bar(&window, project_root);
+    root.append(&top_bar);
     root.append(&content_widget);
     let (status_bar, focus_label) = chrome::build_status_bar();
     root.append(&status_bar);
 
     window.set_child(Some(&root));
 
-    // Which pane has focus: one tracker drives the pane's focus line, the status bar and the agent
-    // panel's mode block, so the three cannot disagree. See `pane_focus`'s module doc.
-    {
+    // Which pane has the keys. One tracker drives the editor's cursor (solid or hollow, via
+    // Neovide itself), the agent panel's cursor and mode block, and the status bar, so they cannot
+    // disagree. See `pane_focus`'s module doc.
+    let pane_contents: Vec<gtk4::Widget> = {
+        let mut v = vec![main_widget.clone(), side_widget.clone()];
+        v.extend(bottom_widget.clone());
+        v
+    };
+    let last_pane = {
         let (main_title, side_title, bottom_title) = titles;
         let mut panes = vec![
-            pane_focus::Pane { content: main_widget.clone(), frame: main_widget.clone(), title: main_title },
-            pane_focus::Pane { content: side_widget.clone(), frame: side_frame, title: side_title },
+            pane_focus::Pane { content: main_widget.clone(), title: main_title },
+            pane_focus::Pane { content: side_widget.clone(), title: side_title },
         ];
         if let (Some(bottom), Some(title)) = (&bottom_widget, bottom_title) {
-            panes.push(pane_focus::Pane { content: bottom.clone(), frame: bottom.clone(), title });
+            panes.push(pane_focus::Pane { content: bottom.clone(), title });
         }
         let agent_panel_handle = agent_panel_handle.clone();
-        pane_focus::install(&window, panes, focus_label, 1, move |focused| {
-            println!("[pane_focus] side panel focused={focused}");
-            agent_panel_handle.set_pane_focused(focused);
-        });
-    }
+        let editor = pane.clone();
+        // A Lua plugin can take the main slot, in which case the editor is not pane 0 and must not
+        // be told it has the keys when that plugin does.
+        let editor_is_main = main_widget == editor.widget().clone().upcast::<gtk4::Widget>();
+        pane_focus::install(&window, panes, focus_label, move |index, has_keys| {
+            println!("[pane_focus] pane {index} has_keys={has_keys}");
+            match index {
+                0 if editor_is_main => editor.set_focused(has_keys),
+                1 => agent_panel_handle.set_pane_focused(has_keys),
+                _ => {}
+            }
+        })
+    };
+
+    // Moves focus back to the pane that last had it. Used by the top bar's `Ctrl+j`/`Esc`. The
+    // editor goes through `NeovideEditorPane::grab_focus`, which also tells the input method.
+    let return_to_pane = {
+        let pane = pane.clone();
+        let pane_contents = pane_contents.clone();
+        let main_widget = main_widget.clone();
+        let last_pane = last_pane.clone();
+        std::rc::Rc::new(move || {
+            let target = &pane_contents[last_pane.get().min(pane_contents.len() - 1)];
+            if *target == main_widget {
+                pane.grab_focus();
+            } else {
+                target.grab_focus();
+            }
+        })
+    };
+    let focus_top_bar = {
+        let top_items = top_items.clone();
+        std::rc::Rc::new(move || top_items.first().is_some_and(|item| item.grab_focus()))
+    };
 
     // --- Ctrl+l: editor -> agent panel, decided by Neovim itself.
     //
@@ -275,6 +308,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // never sees the keypresses that Neovim resolved internally.
     if let Some(ps) = pane_switch.as_mut() {
         let side_widget = side_widget.clone();
+        let focus_top_bar = focus_top_bar.clone();
         pane_switch::listen(ps, move |direction| match direction {
             'R' => {
                 // A `WebView` is an ordinary focusable GTK widget -- unlike a bare `GtkGLArea`,
@@ -283,6 +317,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // `shell/MANUAL_VERIFICATION.md`.
                 let grabbed = side_widget.grab_focus();
                 println!("[pane_switch] direction R -> focusing the side panel (grab_focus={grabbed})");
+            }
+            // Ctrl+k at nvim's topmost window: the top bar is above every pane.
+            'U' => {
+                let grabbed = focus_top_bar();
+                println!("[pane_switch] direction U -> focusing the top bar (grab_focus={grabbed})");
             }
             // The editor is already the leftmost pane, and nothing routes focus into the bottom
             // slot: a Lua-registered panel can still occupy it (`layout::build_vertical_split`
@@ -304,9 +343,15 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // otherwise consume the chord before a bubble-phase controller on the same widget ran.
     {
         let pane = pane.clone();
+        let focus_top_bar = focus_top_bar.clone();
         let controller = EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            if key == Key::k && state.contains(ModifierType::CONTROL_MASK) {
+                focus_top_bar();
+                println!("[pane_switch] Ctrl+k in the side panel -> focusing the top bar");
+                return glib::Propagation::Stop;
+            }
             if key == Key::h && state.contains(ModifierType::CONTROL_MASK) {
                 // `NeovideEditorPane::grab_focus()`, not a bare `widget().grab_focus()`: the
                 // pane's own method also calls `im_context.focus_in()`, without which the input
@@ -318,6 +363,40 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             glib::Propagation::Proceed
         });
         side_widget.add_controller(controller);
+    }
+
+    // --- The top bar, from the keyboard. `h`/`l` move between its items, `Enter`/`Space`
+    // activate one (a GTK button's own behaviour), and `Ctrl+j` or `Esc` go back to the pane that
+    // last had the keys. Capture phase on the bar, so the chords are seen before a focused button
+    // gets them. Only the items `build_top_bar` returned are reachable: the window controls are
+    // not focusable at all, so `Enter` here can never close the window.
+    {
+        let top_items = top_items.clone();
+        let return_to_pane = return_to_pane.clone();
+        let window = window.clone();
+        let controller = EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            let ctrl = state.contains(ModifierType::CONTROL_MASK);
+            if (key == Key::j && ctrl) || key == Key::Escape {
+                return_to_pane();
+                return glib::Propagation::Stop;
+            }
+            if ctrl {
+                return glib::Propagation::Proceed;
+            }
+            let step: isize = match key {
+                Key::h | Key::Left => -1,
+                Key::l | Key::Right => 1,
+                _ => return glib::Propagation::Proceed,
+            };
+            let focus = gtk4::prelude::GtkWindowExt::focus(&window);
+            let current = top_items.iter().position(|item| Some(item) == focus.as_ref()).unwrap_or(0);
+            let next = (current as isize + step).clamp(0, top_items.len() as isize - 1) as usize;
+            top_items[next].grab_focus();
+            glib::Propagation::Stop
+        });
+        top_bar.add_controller(controller);
     }
 
     // nvim exiting on its own (e.g. `:qa!`) has no window to close by itself -- ask this

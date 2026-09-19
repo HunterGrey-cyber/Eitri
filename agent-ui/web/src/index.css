@@ -131,6 +131,31 @@ body,
   line-height: 1.65;
   user-select: none;
 }
+/* The panel's cursor is its current row's sign cell, drawn the way the editor's cursor sits on a
+   character: a solid block with the glyph knocked out while the panel has the keys, the same block
+   hollow while it does not (2026-09-19). The editor's is Neovide's own hollow-when-unfocused block
+   (fork `8f043a2`), and the top bar's focused item is the same shape again, so the whole window
+   says "the keys go here" one way: solid. It replaced a 2px frame and then a line under the pane,
+   which the owner found ugly. A hollow cursor also shows where you land on coming back.
+
+   The solid block is `--nv-bg` text on an `--nv-fg` fill: the body's own guarded text pair,
+   reversed, so the same contrast. `indexCss.test.ts` admits `--nv-bg` as text ONLY in a rule that
+   is entirely `.row-current .row-sign` and fills it with `--nv-fg`. The unfocused state lives on
+   `.message-list[data-focused]`, set by `App.tsx` from the `pane_focus` envelope. It drops the row's
+   cursorline fill too, so the one thing still marking the row is the hollow cell. */
+.row-current .row-sign {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+  border-radius: 2px;
+}
+.message-list[data-focused="false"] .row-current {
+  background: none;
+}
+.message-list[data-focused="false"] .row-current .row-sign {
+  background: none;
+  color: var(--nv-fg);
+  box-shadow: inset 0 0 0 1.5px var(--nv-fg);
+}
 .row-body {
   font-family: var(--nv-font-prose);
   font-size: 15px;

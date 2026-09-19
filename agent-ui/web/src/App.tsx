@@ -694,7 +694,7 @@ export default function App() {
       {/* `sessionEnded` makes every pending card inert. The cards themselves are NOT removed: a
           permission that was still open when the session died is real history, and deleting it
           would read as a resolution nobody made. */}
-      <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} onAnswerPermission={answerPermission} />
+      <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused} onAnswerPermission={answerPermission} />
       {sessionEndedBanner}
       {commandNoticeBanner}
       <StatusLine
