@@ -5,9 +5,16 @@
 //! and for the terminal pane, and the editor pane read nothing at all (its `nvim --embed` child
 //! simply inherited the process cwd). Three reads of one process-global is one read too many in a
 //! process that may hold more than one window's worth of state: whatever a later `chdir` or a
-//! second `activate` does, the three panes must not be able to disagree about which directory they
+//! second `activate` does, the panes must not be able to disagree about which directory they
 //! are looking at. Resolving once and passing the answer down makes that disagreement
 //! unrepresentable rather than merely unlikely, and gives `shell <dir>` somewhere to land.
+//!
+//! The count in that paragraph is history, and is deliberately left at what it was: the terminal
+//! pane was frozen out of this line of development on 2026-09-19 (`freeze/terminal-stack`), so the
+//! resolved root reaches **two** panes today -- the `nvim --embed` child and the agent panel --
+//! plus the top bar's project-name label, which is not a pane. The invariant is the same at any
+//! count, which is why the mechanism did not change with it; `canonicalize_source`'s own comments
+//! below name today's two consumers rather than this paragraph's three.
 //!
 //! Everything here works in `OsStr`/`OsString`, never `String`. `std::env::args()` is documented
 //! to panic on an argument that is not valid UTF-8, and a filesystem path is exactly the argument
@@ -224,10 +231,19 @@ mod tests {
         // The escape hatch the error above advertises has to actually work, including for a name
         // that is character-for-character one of the real flags.
         assert_eq!(select(["--", "-myproj"], None), Ok(argument("-myproj")));
-        // `--terminal` is no longer one of `KNOWN_FLAGS` at all (the terminal pane was cut), so
-        // this case is stronger than it used to be: it shows that even a string that *used to be*
-        // a recognized flag is just an ordinary directory name once it follows `--`, regardless of
-        // whether it is known.
+        // The load-bearing half, and the reason this is not a duplicate of the line above: the
+        // token after `--` here *is* a member of `KNOWN_FLAGS`, so this is the only assertion in
+        // the suite that pins `END_OF_FLAGS` short-circuiting the `KNOWN_FLAGS` membership test
+        // rather than merely beating the leading-`-` check. Reorder those two in
+        // `select_root_source` and `shell -- --clean` silently swallows the token as a flag and
+        // opens the cwd instead of the directory literally named `--clean` -- the exact
+        // silent-wrong-project outcome this module exists to make unreachable.
+        //
+        // This case used to be spelled with `--terminal`, which was a known flag until the
+        // terminal pane was frozen out on 2026-09-19. Once `KNOWN_FLAGS` lost it, that spelling
+        // stopped testing anything the `-myproj` line above did not already cover, so it is kept
+        // below as the *unknown*-token case and `--clean` carries the known-token one.
+        assert_eq!(select(["--", "--clean"], None), Ok(argument("--clean")));
         assert_eq!(select(["--clean", "--", "--terminal"], None), Ok(argument("--terminal")));
         // A bare trailing `--` is "no positional argument", not an error and not an empty path.
         assert_eq!(select(["--clean", "--"], Some("/from/env")), Ok(RootSource::Env(OsString::from("/from/env"))));

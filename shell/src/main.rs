@@ -252,8 +252,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 let grabbed = side_widget.grab_focus();
                 println!("[pane_switch] direction R -> focusing the side panel (grab_focus={grabbed})");
             }
-            // The editor is already the leftmost pane, and `shell` has no vertical layout, so
-            // these are the same no-ops real tmux performs at the edge of its own pane grid.
+            // The editor is already the leftmost pane, and nothing routes focus into the bottom
+            // slot: a Lua-registered panel can still occupy it (`layout::build_vertical_split`
+            // above), but the `'D'` arm went with the native terminal pane on 2026-09-19 and was
+            // never wired for plugin panels, so that slot is mouse-reachable only. These are
+            // therefore the same no-ops real tmux performs at the edge of its own pane grid.
             other => println!("[pane_switch] direction {other} -> no pane in that direction, ignoring"),
         });
     }
