@@ -146,9 +146,15 @@ mod tests {
         assert!(err.to_string().contains("unsupported content.type"));
     }
 
-    /// `bottom` is a real slot, not only something `main.rs` reaches for internally. Without this
-    /// a plugin could not claim it, and the built-in terminal would be the one panel in the app
-    /// that does not actually share the plugin path.
+    /// `bottom` is a real slot. Since the terminal pane was frozen out (2026-09-19,
+    /// `freeze/terminal-stack`) nothing built-in registers into it, so Lua is now the *only* way
+    /// to claim it -- which makes this the only test in the workspace pinning `"bottom"` as
+    /// parseable at all.
+    ///
+    /// **Do not delete it as terminal-era leftover.** Without it, `PanelSlot::parse`'s `"bottom"`
+    /// arm, `ParsedPanelSpec`'s slot handling and `main.rs`'s `panels.get(PanelSlot::Bottom)` read
+    /// have no coverage, and a later refactor could drop `Bottom` from the parser and ship a green
+    /// build in which `neovibe.panel.register{ position = "bottom" }` errors at runtime.
     #[test]
     fn accepts_the_bottom_position() {
         let lua = Lua::new();
