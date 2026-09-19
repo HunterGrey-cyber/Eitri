@@ -168,17 +168,42 @@ impl BackendKind {
 pub struct BackendError {
     pub message: String,
     pub benign: bool,
+    /// Events the backend had ALREADY folded into its own projection before this command failed,
+    /// and which the caller therefore still owes the UI.
+    ///
+    /// Not bookkeeping: it is what keeps the live panel and a reloaded one telling the same story.
+    /// `send_turn` folds the user's prompt BEFORE the send is attempted (see its own doc for the
+    /// ordering race that forces that), so a REFUSED send still leaves the prompt in the
+    /// projection -- and therefore in the next snapshot. The legacy arm used to build
+    /// `[UserPromptSubmitted]` and then throw the vec away on `?`, so the user saw "that message
+    /// was not sent" and NO prompt row, and then `Ctrl+Shift+R` -- a supported, separately verified
+    /// workflow -- resynced from the snapshot and the row appeared, reading as a message that had
+    /// been sent. Snapshot-vs-live indistinguishability is the property this whole panel rests on.
+    ///
+    /// The sidecar arm never had the defect and does not use this field: its `fold_locally` queues
+    /// to the ingestion pump, which delivers regardless of what the send returns. This carries the
+    /// legacy arm's synchronous events, which have no other route out.
+    ///
+    /// Empty for every error that folded nothing, which is all of them but that one.
+    pub folded_events: Vec<AgentDomainEvent>,
 }
 
 impl BackendError {
     fn fatal(message: String) -> Self {
-        Self { message, benign: false }
+        Self { message, benign: false, folded_events: Vec::new() }
+    }
+
+    /// Attaches events the projection has already taken, so the caller can deliver them even though
+    /// the command failed. See `folded_events`.
+    fn with_folded_events(mut self, events: Vec<AgentDomainEvent>) -> Self {
+        self.folded_events = events;
+        self
     }
 }
 
 impl From<ConversationError> for BackendError {
     fn from(error: ConversationError) -> Self {
-        Self { benign: error.is_benign(), message: error.to_string() }
+        Self { benign: error.is_benign(), message: error.to_string(), folded_events: Vec::new() }
     }
 }
 
@@ -191,8 +216,14 @@ impl From<std::io::Error> for BackendError {
             error.kind(),
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
         );
-        Self { benign, message: error.to_string() }
+        Self { benign, message: error.to_string(), folded_events: Vec::new() }
     }
+}
+
+/// The event a submitted prompt becomes. Free function so `send_turn` and its test build it the
+/// same way.
+fn user_prompt_event(as_typed: &str) -> AgentDomainEvent {
+    AgentDomainEvent::UserPromptSubmitted { text: as_typed.to_string() }
 }
 
 /// `AgentSession` is ~576 bytes while `AgentConversation` is boxed, so clippy flags the size
@@ -355,11 +386,57 @@ impl AgentBackend {
     /// (its wire protocol has no such line to translate), while the sidecar backend returns nothing
     /// because Verdandi emits a real one on the event stream. The panel must not invent an event
     /// for the sidecar path to "even that out" -- server-originated state is the authority.
-    pub fn send_turn(&mut self, text: &str) -> Result<Vec<AgentDomainEvent>, BackendError> {
+    ///
+    /// Two strings because they are two different things. `wire_text` is what goes to the model --
+    /// the user's text with wire 1's editor context composed in (`shell/src/agent_panel.rs`, the
+    /// one composition point). `as_typed` is what the user wrote, which is what a reader of the
+    /// conversation is owed.
+    ///
+    /// **The prompt is folded BEFORE the backend's send is even attempted, on both arms -- not
+    /// after acceptance, which is what an earlier revision of this comment argued for and got
+    /// wrong.** `AgentConversation::send_turn` returns as soon as the server ACKs the unary RPC;
+    /// `active_turn_id` is set later, when the provider's own event arrives on the ingestion
+    /// thread (see that method's own doc). Folding the prompt AFTER that ack raced this thread's
+    /// `fold_locally` against the ingestion thread's `IngestState::fold` for the SAME mutex, with
+    /// no ordering guarantee -- if the server's `TurnStarted`/first `ContentDelta` won that race,
+    /// the reply got a lower `seq` than the prompt that caused it, inverting the panel's display
+    /// order for that turn. Folding first closes the race by construction rather than by timing:
+    /// before the RPC is even sent, the ingestion thread has nothing of this turn's to fold yet.
+    ///
+    /// The accepted cost: a rejected send (no session, a turn already active) now leaves the
+    /// prompt recorded even though its turn never happened. That is deliberate, and it is the
+    /// better failure -- the user genuinely typed it, and the caller's own error reporting
+    /// accompanies the row, whereas racing the ordering the way the previous revision did was a
+    /// silent, undetectable corruption of the transcript.
+    ///
+    /// **Both arms pay that cost in the same currency, which took a second fix.** A rejection's
+    /// events go out on `BackendError::folded_events` rather than being dropped by `?`: the legacy
+    /// arm's prompt is returned synchronously and has no other route to the UI, so discarding it
+    /// left the panel showing no prompt row LIVE while the projection -- and therefore the next
+    /// snapshot, one `Ctrl+Shift+R` away -- held one. The sidecar arm never needed it (its
+    /// `fold_locally` queues to the ingestion pump regardless of the send), and that asymmetry is
+    /// exactly what made the legacy hole easy to miss.
+    pub fn send_turn(&mut self, wire_text: &str, as_typed: &str) -> Result<Vec<AgentDomainEvent>, BackendError> {
         match self {
-            AgentBackend::Legacy(session) => Ok(session.send_turn(text)?),
+            AgentBackend::Legacy(session) => {
+                let prompt = session.fold_locally(user_prompt_event(as_typed));
+                let mut events = vec![prompt];
+                match session.send_turn(wire_text) {
+                    Ok(from_send) => {
+                        events.extend(from_send);
+                        Ok(events)
+                    }
+                    // NOT `?`. The prompt is already in the projection; dropping it here is what
+                    // made live and post-reload disagree.
+                    Err(error) => Err(BackendError::from(error).with_folded_events(events)),
+                }
+            }
             AgentBackend::Sidecar(conversation) => {
-                conversation.send_turn(text)?;
+                // Reaches the UI through the pump like every other event, because `fold_locally`
+                // queues it -- and it does so regardless of whether `send_turn` below succeeds,
+                // which is exactly what makes a rejected turn still show its prompt.
+                conversation.fold_locally(user_prompt_event(as_typed));
+                conversation.send_turn(wire_text)?;
                 Ok(Vec::new())
             }
         }
@@ -573,6 +650,7 @@ mod tests {
         assert_eq!(BackendKind::choose(Some("sidcar"), true), BackendKind::Legacy);
     }
     use super::*;
+    use crate::editor_context::{EditorContext, Selection};
 
     #[test]
     fn backend_kind_round_trips_its_wire_name() {
@@ -770,5 +848,162 @@ mod tests {
         .expect("the legacy backend must refuse a resume");
         assert!(!error.benign, "a refused resume ends the attempt; it is not an ordering complaint");
         assert!(error.message.contains("cannot continue a previous session"), "got: {}", error.message);
+    }
+
+    /// The turn that goes on the wire and the turn the panel shows are different strings, and the
+    /// difference is wire 1's editor context. A panel that echoed the wire text would show the user
+    /// a file path and a selection they never typed.
+    ///
+    /// **Scope, stated plainly because the name used to overclaim it:** this pins `user_prompt_event`
+    /// itself -- the free function both arms of `send_turn` call to build the folded event -- and
+    /// nothing more. It never calls `AgentBackend::send_turn`, on either arm.
+    ///
+    /// The Sidecar arm's actual use of this helper (that a real `send_turn` call folds `as_typed`,
+    /// not `wire_text`) IS separately verified end-to-end by
+    /// `a_rejected_sidecar_turn_still_leaves_the_prompt_recorded` below, which builds a real
+    /// `AgentBackend::Sidecar` and calls `send_turn` on it.
+    ///
+    /// **The Legacy arm has no equivalent, anywhere in this file.** No test in this module ever
+    /// holds an `AgentBackend::Legacy` and calls `send_turn` on it -- the only way to get one is
+    /// `AgentBackend::start` -> `AgentSession::start` -> `AgentProcess::spawn`, which spawns a real
+    /// `claude` process, and there is no injectable provider on that path the way `AgentConversation`
+    /// has one (same asymmetry `a_rejected_sidecar_turn_still_leaves_the_prompt_recorded`'s own doc
+    /// records for that fix). So the Legacy arm of `send_turn` --
+    /// `session.fold_locally(user_prompt_event(as_typed))` -- is dead under `cargo test`: if it were
+    /// changed to fold `wire_text` instead, a plausible copy/paste since the two arms sit five lines
+    /// apart and look alike, nothing here would fail.
+    #[test]
+    fn user_prompt_event_records_what_was_typed_not_what_went_on_the_wire() {
+        let typed = "what does this do?";
+        // `crate::`, not `neovibe_core::` -- this module IS that crate, and its own unit tests
+        // cannot address it by its external name the way `shell` does.
+        let wire = crate::editor_context::compose_turn_text(
+            typed,
+            Some(&EditorContext {
+                file: "/p/src/main.rs".into(),
+                selection: Some(Selection { start_line: 3, end_line: 4, text: "fn main() {}".into() }),
+            }),
+        );
+        assert!(wire.contains("/p/src/main.rs"), "the fixture must actually differ: {wire}");
+
+        let event = user_prompt_event(typed);
+        let AgentDomainEvent::UserPromptSubmitted { text } = event else { panic!("wrong variant") };
+        assert_eq!(text, typed);
+        assert!(!text.contains("/p/src/main.rs"));
+    }
+
+    // ---- Fix round 1's accepted cost: a rejected send still leaves the prompt recorded ----------
+
+    /// A minimal `agent::AgentProvider` built only to make `AgentConversation::create` succeed and
+    /// its `send_turn` genuinely fail -- the public equivalent of `agent::conversation`'s own
+    /// private `FakeProvider` (its `send_turn_error` field does exactly this), rewritten here
+    /// against the PUBLIC trait because that private double belongs to `agent` and is not
+    /// exported. Nothing in `agent` was widened to make this possible: `AgentProvider` and every
+    /// request/error type it uses were already `pub` at the crate root.
+    struct RejectingProvider;
+
+    impl agent::AgentProvider for RejectingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo::default()
+        }
+        fn create_session(&self, _request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+            Ok("fake-session".into())
+        }
+        fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+            Err(agent::ProviderError::UnsupportedCapability("resume"))
+        }
+        /// The one rigged method. `TurnAlreadyActive` is the same rejection reason
+        /// `AgentBackend::send_turn`'s own doc names ("a turn already active") and the same one
+        /// `agent::conversation`'s sibling test
+        /// (`a_providers_own_turn_already_active_maps_to_the_same_benign_error`) uses for the
+        /// identical shape of failure.
+        fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+            Err(agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::TurnAlreadyActive,
+                message: "a turn is already in progress on this session".into(),
+            })
+        }
+        fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+            Ok(())
+        }
+        fn resolve_permission(&self, _request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+            Ok(())
+        }
+        fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+            Ok(())
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            // Never queued, so the ingestion thread this spawns just polls and sleeps for the
+            // whole test -- harmless, and the same shape every sibling test in this file that
+            // never calls `fake.queue(...)` already relies on.
+            Vec::new()
+        }
+    }
+
+    /// Pins fix round 1's accepted cost (see `AgentBackend::send_turn`'s own doc) rather than
+    /// leaving it to inspection: folding the prompt BEFORE the send means a REJECTED turn still
+    /// leaves it in the projection, on purpose -- the user genuinely typed it.
+    ///
+    /// **Sidecar half only.** The legacy half of the same claim has no equivalent test here: the
+    /// only way to make `AgentSession::send_turn` reject is a live session with a turn already in
+    /// flight, and the only way to get a live `AgentSession` at all is `AgentSession::start` ->
+    /// `AgentProcess::spawn`, which spawns a REAL `claude` process -- there is no injectable
+    /// provider/trait on that path the way `AgentConversation` has one. That asymmetry is a real
+    /// fact about the two backends (this module's own header doc says as much: "NOT
+    /// interchangeable at the type level"), not an oversight in this test.
+    #[test]
+    fn a_rejected_sidecar_turn_still_leaves_the_prompt_recorded() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("rejected-turn-keeps-prompt");
+        let conversation =
+            AgentConversation::create(std::sync::Arc::new(RejectingProvider), &dir, PermissionMode::Bypass)
+                .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        let result = backend.send_turn("wire text with context composed in", "what does this do?");
+
+        let error = result.expect_err("RejectingProvider's send_turn always fails");
+        assert_eq!(
+            backend.projection().user_prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            vec!["what does this do?"],
+            "the prompt was folded BEFORE the rejected send, so it survives the rejection"
+        );
+        // And the sidecar arm carries NOTHING in `folded_events`, which is not an omission: its
+        // `fold_locally` queued the prompt to the ingestion pump, so the UI gets it by the ordinary
+        // route whether or not the send succeeded. The legacy arm has no such route -- its events
+        // are returned synchronously -- which is why that arm attaches them here instead, and why
+        // the hole was in exactly one of the two.
+        assert!(
+            error.folded_events.is_empty(),
+            "the sidecar's prompt reaches the UI through the pump, never through the error"
+        );
+    }
+
+    /// A refusal that now carries events must still be a refusal.
+    ///
+    /// `AgentBackend::send_turn`'s legacy arm builds its error as
+    /// `BackendError::from(io_error).with_folded_events(..)`, and `benign` is what decides whether
+    /// the panel reports the refusal or tears the whole conversation down (`apply_command_outcome`).
+    /// Attaching the prompt must not flip that: a turn refused because one is already running is an
+    /// ordering complaint, and treating it as fatal would throw away a working session over a
+    /// double Enter. The fatal direction is pinned too, so this cannot pass by `benign` being
+    /// hardcoded either way.
+    #[test]
+    fn attaching_folded_events_does_not_change_how_an_error_is_classified() {
+        let folded = || vec![user_prompt_event("what does this do?")];
+
+        let benign: BackendError =
+            BackendError::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, "a turn is already in progress"))
+                .with_folded_events(folded());
+        assert!(benign.benign, "a refused turn must stay benign once it carries the prompt");
+        assert_eq!(benign.folded_events.len(), 1);
+
+        let fatal: BackendError =
+            BackendError::from(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone")).with_folded_events(folded());
+        assert!(!fatal.benign, "a dead process is still fatal, events or no events");
+        assert_eq!(fatal.folded_events.len(), 1);
     }
 }

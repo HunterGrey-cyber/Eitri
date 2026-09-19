@@ -712,24 +712,30 @@ impl AgentConversation {
 
         let pending: Vec<String> = self.projection().pending_permissions.keys().cloned().collect();
         for permission_id in pending {
-            self.fold(AgentDomainEvent::PermissionResolved {
+            self.fold_locally(AgentDomainEvent::PermissionResolved {
                 permission_id,
                 outcome: PermissionOutcome::CancelledBySessionClose,
             });
         }
         let already_closed = matches!(self.projection().status, crate::ProjectionStatus::Closed { .. });
         if !already_closed {
-            self.fold(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
+            self.fold_locally(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
         }
         // Released last: the lease must outlive the provider's own session teardown, so no other
         // client can acquire it while this one is still closing.
         self.ingest.release_lease();
     }
 
-    /// Folds an event this side produced because the provider no longer can -- shutdown's
-    /// fail-closed terminal events, and nothing else. Provider lifecycle events stay the provider's
-    /// to state.
-    fn fold(&mut self, event: AgentDomainEvent) {
+    /// Folds an event this side produced rather than the provider.
+    ///
+    /// `ConversationIngest::fold_locally` both applies it to the projection and queues it for the
+    /// UI, so this one call is the whole sidecar half -- nothing else has to route it to the pump.
+    ///
+    /// Was private and named `fold`, used only by `shutdown`'s fail-closed terminal events. Widened
+    /// to `pub` for a second, non-terminal case: the user's own prompt, which no provider reports
+    /// back (see `core/src/agent_backend.rs::send_turn`). Still never for provider lifecycle state,
+    /// which is the provider's to state.
+    pub fn fold_locally(&self, event: AgentDomainEvent) {
         self.ingest.fold_locally(event);
     }
 

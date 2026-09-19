@@ -472,7 +472,8 @@ fn no_single_event_ever_creates_more_than_one_item() {
         projection.apply(&event);
 
         let mut seqs: Vec<u64> = projection
-            .transcript.iter().map(|m| m.seq)
+            .user_prompts.iter().map(|p| p.seq)
+            .chain(projection.transcript.iter().map(|m| m.seq))
             .chain(projection.tool_calls.iter().map(|c| c.seq))
             .chain(projection.pending_permissions.values().map(|p| p.seq))
             .collect();
@@ -497,6 +498,30 @@ fn no_single_event_ever_creates_more_than_one_item() {
     }
 }
 
+/// The panel currently has no way to show what the user asked -- `transcript` is assistant text
+/// only. This pins the projection half of the fix: a submitted prompt is its own item, ordered
+/// against `transcript` by the same `seq`, and (just as important) it closes whatever assistant
+/// message was open so the next turn's reply does not get appended to the previous one's.
+#[test]
+fn a_user_prompt_is_an_item_of_its_own_and_closes_an_open_assistant_message() {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(), kind: ContentKind::Text, text: "first".into(),
+    });
+    projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "and now this".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t2".into(), kind: ContentKind::Text, text: "second".into(),
+    });
+
+    assert_eq!(projection.user_prompts.len(), 1);
+    assert_eq!(projection.user_prompts[0].text, "and now this");
+    // Two SEPARATE assistant messages: a prompt between them must break the run, or the reply to
+    // turn 2 is appended to the reply to turn 1 and rendered as one bubble.
+    assert_eq!(projection.transcript.len(), 2, "{:?}", projection.transcript);
+    assert!(projection.user_prompts[0].seq > projection.transcript[0].seq);
+    assert!(projection.user_prompts[0].seq < projection.transcript[1].seq);
+}
+
 /// One of every `AgentDomainEvent` variant, in an order that exercises the arms that interact
 /// (a tool call and its completion; a permission and its resolution; text on both sides of the
 /// break a tool call forces).
@@ -507,6 +532,7 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             model: "claude-sonnet-5".into(), cwd: "/tmp/project".into(),
         },
         AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+        AgentDomainEvent::UserPromptSubmitted { text: "what does this do?".into() },
         AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() },
         AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() },
         AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) },
@@ -537,6 +563,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
     match event {
         AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
         AgentDomainEvent::TurnStarted { .. } => "TurnStarted",
+        AgentDomainEvent::UserPromptSubmitted { .. } => "UserPromptSubmitted",
         AgentDomainEvent::ContentDelta { kind: ContentKind::Text, .. } => "ContentDelta(Text)",
         AgentDomainEvent::ContentDelta { kind: ContentKind::Thinking, .. } => "ContentDelta(Thinking)",
         AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",

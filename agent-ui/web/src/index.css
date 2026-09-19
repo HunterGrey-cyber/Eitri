@@ -26,7 +26,10 @@ body,
 
 .agent-ui-conversation {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  /* winbar, the scrolling message list, the status line, the composer -- panel-as-document task 6
+     split what used to be one `.session-header` row into a winbar (identity/model, above) and a
+     status line (mode/status/position/Stop, directly above the composer). */
+  grid-template-rows: auto 1fr auto auto;
 }
 
 .mode-selector {
@@ -34,35 +37,161 @@ body,
   padding: 24px;
   text-align: center;
 }
-.mode-selector button {
+/* `:not(.row-choice)`: a `.row-choice` button (panel-as-document task 7) is a row on the
+   sign-column grid, not this screen's own boxed control -- `.row` supplies `display: grid` and
+   `.row-choice` supplies its own `padding`, and both lose to this rule's `display: block`/
+   `padding: 10px` on specificity alone (`.mode-selector button` is one class plus one type,
+   `.row`/`.row-choice` are one class each -- the type selector's extra weight wins regardless of
+   source order). Left unscoped, the sign and body would never actually land in two columns. */
+.mode-selector button:not(.row-choice) {
   display: block;
   width: 100%;
   margin: 8px 0;
   padding: 10px;
 }
 
-.session-header {
+/* The winbar (identity/model, above the conversation) and the status line (mode/status/position/
+   Stop, directly above the composer) -- panel-as-document task 6 split what used to be one
+   `.session-header` row into these two, the way an editor window separates its winbar from its
+   own command/status line. Painted in nvim's OWN `StatusLine` colours, not the panel body's: `bg`/
+   `fg`/`surface` are Normal-derived, but `chrome`/`chrome-fg` come from `StatusLine` itself
+   (`core/src/theme/tokens.rs`'s `derive`), which is exactly what makes these two bars read as part
+   of the editor window rather than of the WebView document sitting inside it. `chrome-fg` is
+   guarded to `TEXT_CONTRAST` (4.5:1) against `chrome`, not against `bg` -- a reversed StatusLine
+   makes `chrome` Normal's `fg`, so guarding against `bg` would measure the wrong pair. */
+.winbar,
+.status-line {
   display: flex;
-  justify-content: space-between;
-  padding: 8px 12px;
-  background: var(--nv-surface);
-  border-bottom: 1px solid var(--nv-border);
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  min-height: 28px;
+  background: var(--nv-chrome);
+  color: var(--nv-chrome-fg);
   font-family: var(--nv-font-mono);
   font-size: 12px;
+}
+.winbar {
+  border-bottom: 1px solid var(--nv-border);
+  flex-wrap: wrap;
+}
+.status-line {
+  border-top: 1px solid var(--nv-border);
+}
+/* A Chinese fragment inside a monospace run gets its letter-spacing stretched (spec §1.3, measured
+   on a real mockup). Nothing rendered in either bar today is Chinese, but nothing here should have
+   to remember that fact later -- any text that becomes Chinese switches back to the prose font by
+   adding this class, rather than by a fresh audit of `--nv-font-mono` at that point. */
+.winbar .prose,
+.status-line .prose {
+  font-family: var(--nv-font-prose);
 }
 
 .message-list {
   overflow-y: auto;
   padding: 12px;
 }
-.message {
-  margin-bottom: 12px;
+/* `.row-assistant pre` used to style every fenced code block here, back when `renderMarkdown` (then
+   inlined in `MessageList.tsx`) used marked's plain default renderer and emitted a bare `<pre>`.
+   Removed rather than kept alongside `.code-block` below (panel-as-document task 4): a descendant
+   selector with an element (`.row-assistant pre`, specificity 0,1,1) beats a single class
+   (`.code-block`, 0,1,0), so keeping both would have silently won the `background` back to
+   `--nv-bg` regardless of source order. `renderMarkdown` puts `class="code-block"` on every `<pre>`
+   it emits and nothing else in an assistant row renders a bare `<pre>`, so this rule is fully
+   superseded, not narrowed. */
+
+/* --- the sign-column grid (panel-as-document, task 3) --------------------------------------
+   One grid for every row, so signs line up down the whole document however the body is built. */
+.row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 62ch);
+  gap: 0 8px;
+  align-items: start;
+  padding: 2px 0;
+  /* Every row reserves the same 2px, transparent unless a state below gives it a real colour.
+     With the global `box-sizing: border-box`, a border-left shrinks the content box it is on --
+     so a row that had NO border-left at all sat 2px further left than one that did, and the sign
+     column (this rule's whole reason to exist) was on two different x positions down the page.
+     Only the colour differs below; the width must not, or this same misalignment comes back. */
+  border-left: 2px solid transparent;
 }
-.assistant-message pre {
-  background: var(--nv-bg);
-  padding: 8px;
-  border-radius: 4px;
-  overflow-x: auto;
+/* The cursor `j`/`k` move and `Enter`/`y` act on (panel-as-document task 5, review round 1):
+   `--nv-cursorline` is a BACKGROUND (nvim's own `Visual` highlight token, the same one
+   `.mode-selector button:hover` already paints with), not text, so `indexCss.test.ts`'s
+   text-colour guard does not apply to this rule at all. Kept separate from the signal-colour
+   border rules above: a row can be both the current row and, say, an error row at once, and the
+   two cues must not fight each other for the same 2px border. */
+.row-current {
+  background: var(--nv-cursorline);
+}
+.row-sign {
+  font-family: var(--nv-font-mono);
+  color: var(--nv-muted);
+  text-align: center;
+  line-height: 1.65;
+  user-select: none;
+}
+.row-body {
+  font-family: var(--nv-font-prose);
+  font-size: 15px;
+  line-height: 1.65;
+  min-width: 0;
+}
+.row-prompt .row-body {
+  color: var(--nv-muted);
+  white-space: pre-wrap;
+}
+.row-tool .row-body {
+  font-family: var(--nv-font-mono);
+  font-size: 12.5px;
+}
+/* Signal colour goes on a border, never on the sign's own text. `indexCss.test.ts` pins every
+   `color:` declaration in this file to --nv-fg/--nv-muted -- Rust guards only those two for text;
+   --nv-warn/--nv-error/--nv-ok are guarded to 3:1, enough for a border or a rule (WCAG 1.4.11), not
+   for text (1.4.3 wants 4.5:1), and this file already once measured 2.05-3.84:1 the other time a
+   signal colour went on text. The glyph (◐/✓/✗/!/→) is what actually carries the state; the border
+   is the second, non-load-bearing cue -- never colour alone, but never colour ON the glyph either. */
+.row-permission {
+  border-left: 2px solid var(--nv-warn);
+}
+.row-tool[data-sign="✗"] {
+  border-left: 2px solid var(--nv-error);
+}
+.row-tool[data-sign="✓"] {
+  border-left: 2px solid var(--nv-ok);
+}
+.row-error {
+  border-left: 2px solid var(--nv-error);
+}
+/* `state.status.reason` on the lost-session row: restores the wrapping `.session-lost pre` had
+   before panel-as-document task 3 dropped it with no replacement. Without it the reason (often a
+   long transport-error string) renders on one unwrapped line and overflows the 62ch column, which
+   is the opposite of `App.tsx`'s own comment that this text "is rendered in full". */
+.row-error pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
+  user-select: text;
+}
+/* An ordinary ending (the host closed it, the provider exited cleanly) -- deliberately NOT
+   `row-error`. Round 1 of this task's review put both branches on `row-error`/`✗` on a misreading
+   of spec §3.2's single "会话断开 / 错误" table row: that row is about a session that BROKE, and a
+   clean end is not an error. Carried forward from the `.session-over` rule this replaced:
+   "Informational, not alarming -- styling this like a loss would train the eye to ignore the one
+   that matters." No signal colour and no `✗`, so a reader cannot mistake this for the row above. */
+.row-ended .row-body {
+  color: var(--nv-muted);
+}
+.row-hint {
+  color: var(--nv-muted);
+  font-size: 12.5px;
+  margin-top: 4px;
+}
+.tool-result-folded {
+  color: var(--nv-muted);
+  font-size: 12.5px;
 }
 
 .tool-card {
@@ -185,6 +314,23 @@ body,
   border-radius: 4px;
   padding: 8px;
 }
+/* BROWSE's stand-in for the textarea (`Composer.tsx`): same slot in the flex row, but nothing here
+   accepts a keystroke. The left border carries the mode signal -- `--nv-mode-browse` is not
+   guarded for text contrast (see the big comment near `.tool-result-error` below), which is why
+   the label itself stays `--nv-muted` and the colour goes on a border instead. */
+.composer-browse-hint {
+  flex: 1;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  background: var(--nv-bg);
+  color: var(--nv-muted);
+  border: 1px solid var(--nv-border);
+  border-left: 3px solid var(--nv-mode-browse);
+  border-radius: 4px;
+  padding: 8px;
+  cursor: text;
+}
 
 /* --- Phase 3: backend-aware start screen, identities, and in-panel errors ------------------- */
 
@@ -219,22 +365,55 @@ body,
   opacity: 0.85;
 }
 
-/* The header now carries four independent readouts rather than two, so it needs real spacing
-   instead of `justify-content: space-between` pushing the outermost pair to the edges. */
-.session-header {
-  justify-content: flex-start;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-.session-header .identities,
-.session-header .provider,
-.session-header .backend {
-  opacity: 0.7;
+/* Secondary text on chrome: `--nv-chrome-muted` (guarded to `TEXT_CONTRAST` against `chrome`,
+   `tokens.rs:209-210`), never `opacity` on top of `--nv-chrome-fg` -- opacity multiplies contrast
+   down with it, the same reason `.mode-selector .session-choice` rows are not dimmed that way
+   either (see `indexCss.test.ts`'s "does not dim a conversation-picker row" test). */
+.winbar .identities,
+.winbar .provider,
+.winbar .backend,
+.winbar .permission-mode {
+  color: var(--nv-chrome-muted);
   cursor: help; /* every one of these has the full value in its title attribute */
 }
-/* The status word stays `--nv-fg`; the error colour is a dot in front of it. */
-.session-header .status-unavailable::before,
-.session-header .status-closed::before {
+/* The Verdandi skew warning, on the right (`margin-left: auto` pushes it there whether or not it
+   is actually warning -- the CLI badge lives in the same slot either way). Signal colour on a
+   border, never on this text: `--nv-warn` is guarded only to 3:1 (WCAG 1.4.11's border/rule
+   threshold), not the 4.5:1 12px text wants -- see the big comment near `.tool-result-error`. */
+.winbar .provider {
+  margin-left: auto;
+}
+.winbar .provider.provider-warn {
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
+  /* Full-strength chrome text, not the muted secondary tone above: a warning earns more visual
+     weight than ordinary identity metadata, the same way `.tool-result-error` stays `--nv-fg`
+     rather than `--nv-muted` among otherwise-quiet rows. */
+  color: var(--nv-chrome-fg);
+}
+/* The mode block's LABEL is `--nv-chrome-fg` (inherited from `.status-line`, not re-declared here).
+   Its per-mode colour is a border, never `color:` on the text -- and deliberately not
+   `--nv-chrome-accent` either, even though that token names this very block: `tokens.rs` guards it
+   at `UI_CONTRAST` (3.0), the WCAG 1.4.11 non-text threshold, not the 4.5:1 a 12px label needs
+   (`tokens.rs`'s own test only asserts `>= 3.0`). That token's doc comment used to call it "accent
+   TEXT", which is what this paragraph was arguing against; it names its tier now, so the two agree.
+   `--nv-mode-browse`/`--nv-mode-input` are not guarded at all, which is worse -- so both go on a
+   border exactly the way `.composer-browse-hint` already does. */
+.status-line .mode-block {
+  font-weight: 600;
+  padding: 1px 6px;
+  border-left: 3px solid var(--nv-mode-browse);
+}
+.status-line .mode-block[data-mode="input"] {
+  border-left-color: var(--nv-mode-input);
+}
+.status-line .position {
+  margin-left: auto;
+  color: var(--nv-chrome-muted);
+}
+/* The status word stays `--nv-chrome-fg`; the error colour is a dot in front of it. */
+.status-line .status-unavailable::before,
+.status-line .status-closed::before {
   content: "";
   display: inline-block;
   width: 7px;
@@ -266,40 +445,11 @@ body,
   user-select: text;
 }
 
-/* A session that was LOST, as opposed to one that ended normally. Shares the fatal-error palette
-   deliberately: both mean "stop trusting what you see", and the whole point of this banner is that
-   a truncated reply must not look like a finished one. It sits directly above the composer, in the
-   reading path between the last message and the box, and has no dismiss control -- a warning about
-   incomplete output that can be clicked away is a warning that will be. */
-.session-lost {
-  margin: 12px;
-  padding: 12px;
-  border: 1px solid var(--nv-error);
-  border-left-width: 3px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-error) 8%, transparent);
-  color: var(--nv-fg);
-  font-size: 12px;
-}
-.session-lost pre {
-  margin: 8px 0 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
-  user-select: text;
-}
-
-/* An ordinary ending (the host closed it, the provider exited cleanly). Informational, not alarming
-   -- styling this like a loss would train the eye to ignore the one that matters. */
-.session-over {
-  margin: 12px;
-  padding: 8px 12px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-fg) 6%, transparent);
-  color: var(--nv-muted);
-  font-size: 12px;
-}
+/* A session that was LOST, and one that ended normally, used to be two separately boxed banners
+   here (`.session-lost` in the fatal-error palette, `.session-over` muted). Panel-as-document
+   task 3 put both on the plain row grid instead (`App.tsx`'s `sessionEndedBanner`); they are
+   `row-error`/`row-ended` respectively now, styled above under "the sign-column grid", including
+   the wrapping their `<pre>`/text needs -- that is not left to `.row-body`'s own defaults. */
 
 /* `.resume` marks every previous-conversation row in the picker, visually distinct from the "New
    session" row beside them, since starting fresh and continuing have very different consequences and
@@ -311,7 +461,13 @@ body,
    border, so the start screen's one blue-labelled control -- the one whose misclick costs the most,
    since it continues a conversation instead of starting one -- rendered pale-on-pale while every
    other button stayed correctly dark. */
-.mode-selector button {
+/* Same `:not(.row-choice)` reason as above: this rule's `border`/`background` are the boxed look
+   for the Auto/Bypass buttons, and at equal-or-higher specificity than `.row-choice`'s own `border:
+   none`/`background: none` they would win and put the box back around a row. `:hover` is left
+   unscoped -- `.row-choice` sets no hover state of its own, and this one's `--nv-cursorline` fill is
+   the same value `.row-choice.selected` uses below, so hovering a row (selected or not) is still a
+   correct, harmless fill rather than a conflict. */
+.mode-selector button:not(.row-choice) {
   border: 1px solid var(--nv-border);
   border-radius: 4px;
   background: var(--nv-bg);
@@ -321,12 +477,29 @@ body,
 .mode-selector button:hover {
   background: var(--nv-cursorline);
 }
-/* The row's heading is `--nv-fg`, like every other button's; only the border says "resume". It was
-   `--nv-mode-browse` (Function's foreground, which nothing guards), and on rose-pine dawn that drew
-   the label of the control whose misclick costs the most at 2.60:1, and 2.05:1 on its hover band. */
-.mode-selector button.resume {
-  border-color: var(--nv-mode-browse);
+/* `.resume` used to be told apart from "New session" by this border-color alone (`--nv-mode-browse`,
+   set only here). Task 7 put both on the `.row-choice` grid below, whose `border` is `none` for
+   every choice row -- so a `border-color` here would have nothing left to color. The "↺" sign
+   (JSX, `data-sign`) and, once picked, `.row-choice.selected`'s fill now carry that distinction. */
+
+/* `display`, `grid-template-columns` and `gap` come from `.row`, which every choice also carries.
+   Repeating them here would be two places to change the grid. */
+/* `color: var(--nv-fg)`, not the brief's literal `inherit`: `indexCss.test.ts`'s guard holds every
+   unexempted `color:` declaration to `--nv-fg`/`--nv-muted` exactly, and `inherit` fails that match
+   even though it resolves to the identical value here (the body sets `color: var(--nv-fg)`, and
+   nothing between it and this button sets its own `color`). Same rendered colour, a declaration the
+   guard can actually check. */
+.row-choice {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--nv-fg);
+  font: inherit;
+  padding: 4px 0;
+  cursor: pointer;
 }
+.row-choice.selected { background: var(--nv-cursorline); }
 
 /* A permission request that outlived its session. Muted rather than alarming: the loud banner above
    already says the session was lost -- this only explains why these buttons no longer do anything. */
@@ -365,17 +538,17 @@ body,
 .mode-selector .session-choice-note {
   margin: 0 0 4px;
 }
-/* The selected conversation, distinguished by fill rather than by border alone -- `.resume` already
-   carries a blue border unselected, so a border-only cue would make "armed" and "merely available"
-   look the same on the option where it matters. */
-.mode-selector .session-choice button.selected {
-  border-color: var(--nv-mode-browse);
-  background: color-mix(in srgb, var(--nv-mode-browse) 18%, transparent);
-}
-/* Unselected rows are not dimmed. They were, with `opacity: 0.7`, and opacity takes the text's
-   contrast down with it: fg at 0.7 is 3.34:1 on rose-pine dawn. Every remembered-session row is
-   unselected until clicked (the picker opens on "New session"), so that was every resume row's
-   heading. The fill above is what marks the selected one. */
+/* The selected conversation used to be distinguished by a fill declared here (`--nv-mode-browse` at
+   18%) rather than by border alone, because `.resume` carried a blue border unselected and a
+   border-only cue would have made "armed" and "merely available" look the same. Task 7 moved every
+   choice row onto `.row-choice` (above), which every button in this list carries now including
+   "New session", and its own `.row-choice.selected` sets the fill instead -- at higher specificity
+   here (3 classes + a type) this rule would otherwise win and paint the old colour back over it, so
+   it is removed rather than narrowed. Unselected rows are still not dimmed: they were, with
+   `opacity: 0.7`, and opacity takes the text's contrast down with it (fg at 0.7 is 3.34:1 on
+   rose-pine dawn). Every remembered-session row is unselected until clicked (the picker opens on
+   "New session"), so that was every resume row's heading -- `.row-choice.selected`'s fill is what
+   marks the selected one now. */
 
 /* "Continue in a terminal", under the composer. Quiet by default: it is a way out of this panel,
    not one of the things it is for. */
@@ -442,6 +615,14 @@ body,
   font-size: 12px;
   text-align: left;
 }
+/* `.handoff-card` now lives on `.row-body` (`TerminalHandoff.tsx`'s `HandoffCommandCard`), and its
+   own `margin: 12px` is the same specificity as `.row-body` and later in the file, so it was
+   winning outright rather than adding to it -- the handoff row sat 12px off the grid every other
+   row lines up on. Keep the box, drop only the outer margin the grid already provides; `12px`
+   below the card (rather than nothing) is what `margin: 12px` gave it on every side before. */
+.row-handoff .handoff-card {
+  margin: 0 0 12px;
+}
 .handoff-card p {
   margin: 8px 0 0;
 }
@@ -469,7 +650,9 @@ body,
 /* A command the host refused, in the words the host used. Distinct from `.fatal-error`, and it has
    to stay distinct: that one means the whole session is gone, this one means one command did not
    happen and everything else is fine. Dismissible for the same reason -- there is nothing here a
-   user needs protecting from clicking away, unlike `.session-lost`. */
+   user needs protecting from clicking away, unlike the lost-session row (`App.tsx`'s
+   `sessionEndedBanner`, `row-error`, no dismiss control) that says the transcript may be
+   incomplete. */
 .command-notice {
   display: flex;
   align-items: flex-start;
@@ -509,3 +692,69 @@ body,
 .diff-added { border-left: 3px solid var(--nv-ok); }
 .diff-removed { border-left: 3px solid var(--nv-error); }
 .diff-context { border-left: 3px solid transparent; }
+
+/* --- syntax highlighting (panel-as-document, task 4) -------------------------------------------
+   highlight.js emits plain `hljs-*` classes; these are the only place they get colour, and it comes
+   from the same nvim highlight groups the editor draws with -- so a Rust keyword is the same colour
+   in the panel and in the buffer three inches to its left. */
+.code-block {
+  font-family: var(--nv-font-mono);
+  font-size: 12px;
+  line-height: 18px;
+  /* --nv-surface, not --nv-bg: the --nv-syn-* colours below are derived against Normal's
+     background, so painting them on --nv-surface is a small (~4%) departure from an exact editor
+     match. A visually distinct code block is worth that. */
+  background: var(--nv-surface);
+  border: 1px solid var(--nv-border);
+  border-radius: 3px;
+  padding: 8px 10px;
+  overflow-x: auto;
+}
+/* These rules are the deliberate, narrow exception to the "text is only --nv-fg/--nv-muted" guard
+   below: they are the whole feature this task adds, and `indexCss.test.ts` allows exactly this --
+   `--nv-syn-*` as `color:`, and only inside a selector that is ENTIRELY `hljs-*` classes. See that
+   test for why a signal colour (`--nv-warn`/`--nv-error`/`--nv-ok`/`--nv-mode-*`) as text is still
+   refused. */
+.hljs-keyword, .hljs-built_in { color: var(--nv-syn-keyword); }
+.hljs-title, .hljs-title.function_ { color: var(--nv-syn-function); }
+/* Go's grammar wraps a WHOLE function signature (`func name(params)`) in one outer `hljs-function`
+   span around its own already-coloured `hljs-keyword`/`hljs-title`/`hljs-params` children -- found
+   by `highlightCoverage.test.ts` failing on it: the outer span's only direct, un-wrapped text is a
+   single space, so this rule is close to a no-op today, but the class is real and the coverage test
+   checks presence, not visible effect. */
+.hljs-function { color: var(--nv-syn-function); }
+.hljs-string { color: var(--nv-syn-string); }
+.hljs-type { color: var(--nv-syn-type); }
+/* TOML/INI's `[section]` header (highlight.js's `ini` grammar, which is what `toml` is registered
+   from) -- a named structural grouping, closest among the twelve tokens to a type/namespace
+   declaration. Also found by `highlightCoverage.test.ts`. */
+.hljs-section { color: var(--nv-syn-type); }
+.hljs-title.class_ { color: var(--nv-syn-type); }
+.hljs-comment { color: var(--nv-syn-comment); }
+.hljs-number { color: var(--nv-syn-number); }
+.hljs-literal { color: var(--nv-syn-constant); }
+.hljs-variable, .hljs-params { color: var(--nv-syn-variable); }
+.hljs-operator { color: var(--nv-syn-operator); }
+.hljs-punctuation { color: var(--nv-syn-punctuation); }
+.hljs-attr, .hljs-property { color: var(--nv-syn-property); }
+/* Added on review: both classes are live (Rust attributes/shebangs; YAML list markers) and were
+   unstyled by the rules above, so they fell through to plain --nv-fg. Nearest Treesitter analogues,
+   since neither `SYNTAX` group in `core/src/theme/tokens.rs` names a "meta" or "bullet" token. */
+.hljs-meta { color: var(--nv-syn-constant); }
+.hljs-bullet { color: var(--nv-syn-punctuation); }
+/* Dead with the language set this task registers -- no xml/html grammar is registered, so nothing
+   ever emits these two classes today. Left in rather than removed: it costs nothing, and the
+   registered set may grow to include a markup language. */
+.hljs-tag, .hljs-name { color: var(--nv-syn-tag); }
+
+/* `diff` is one of the twelve registered languages, and highlighting what changed is its whole
+   reason to exist -- `.hljs-addition`/`.hljs-deletion` were the one pairing left completely
+   unstyled by the rules above, so a ```diff block rendered monochrome. Deliberately NOT `color:`:
+   spec guards --nv-ok/--nv-error at 3:1 for "borders, rules, tints and dots", never for text
+   (4.5:1) -- the same reasoning `.diff-added`/`.diff-removed` above already rely on for their
+   border, so `indexCss.test.ts`'s text-colour guard need not (and does not) exempt these two.
+   `display: block`, because highlight.js's diff grammar wraps the WHOLE line in the span
+   (`begin: '^\+.*$'`/`'^-.*$'`), and an inline element's background does not fill the row the way
+   a line-level diff tint is expected to. */
+.hljs-addition { display: block; background: color-mix(in srgb, var(--nv-ok) 15%, transparent); }
+.hljs-deletion { display: block; background: color-mix(in srgb, var(--nv-error) 15%, transparent); }

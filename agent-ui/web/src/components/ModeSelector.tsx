@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Hello, PermissionModeChoice, ResumableSession } from "../types";
+import { Row } from "./Row";
 
 type Props = {
   hello: Hello | null;
@@ -95,31 +96,38 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
               plainly at all because the rows genuinely look opaque, and a user deserves to know why
               rather than assuming the labels failed to load -- nothing here stands in for a title
               that exists elsewhere. No title is stored anywhere. */}
-          <p className="detail session-choice-note">
+          <p className="detail session-choice-note" data-testid="no-title-note">
             Previous conversations here, newest first. A session is identified by its provider and
             session id and when it was last opened; no title or summary of a conversation is stored.
           </p>
+          {/* Both choice rows go through `Row` (`./Row`), the one component that owns the two-cell
+              sign grid. It also switches its cells to `<span>` for the button shape, which is what
+              these rows need: a `<button>`'s content model is phrasing content. */}
           <div className="session-choice" role="radiogroup" aria-label="Which conversation">
-            <button
-              type="button"
+            <Row
+              as="button"
+              kind="choice"
+              sign="›"
               role="radio"
               aria-checked={selected === null}
-              className={selected === null ? "selected" : ""}
+              className={selected === null ? "selected" : undefined}
               onClick={() => setSelectedSessionId(null)}
             >
               <strong>New session</strong>
-            </button>
+            </Row>
             {/* Array order, unsorted: Rust ranked these by a timestamp it can compare as a number,
                 and re-deriving that here from strings would be a second ranking free to disagree. */}
             {sessions.map((session) => {
               const checked = selected?.providerSessionId === session.providerSessionId;
               return (
-                <button
+                <Row
                   key={session.providerSessionId}
-                  type="button"
+                  as="button"
+                  kind="choice"
+                  sign="↺"
                   role="radio"
                   aria-checked={checked}
-                  className={`resume ${checked ? "selected" : ""}`}
+                  className={checked ? "resume selected" : "resume"}
                   onClick={() => setSelectedSessionId(session.providerSessionId)}
                 >
                   {/* The provider name comes from the record, not from a literal. It was `Claude`
@@ -130,7 +138,7 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
                       a second place to keep in sync with the provider list. */}
                   <strong>{session.provider} {shortId(session.providerSessionId)}</strong>
                   <span className="detail">{describeWhen(session)}</span>
-                </button>
+                </Row>
               );
             })}
           </div>

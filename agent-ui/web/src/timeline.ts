@@ -2,13 +2,13 @@ import type { AgentUiState, PermissionRequestRecord, Seq, ToolCallRecord } from 
 
 /** One thing that happened in the conversation, ready to render in order.
  *
- * A view over the three collections rather than a fourth copy of them: `AgentUiState` stays the
+ * A view over the four collections rather than a fifth copy of them: `AgentUiState` stays the
  * shape Rust's `AgentSessionProjection` serializes, and nothing here can drift out of sync with it
  * because nothing here is stored. */
 /** `key` is a React key, unique across the whole timeline and stable for as long as the item is.
  *
- * ALL THREE kinds key on `seq` rather than on their own identity, which is what makes uniqueness
- * real rather than hoped for. `seq` is unique by construction across all three collections:
+ * ALL FOUR kinds key on `seq` rather than on their own identity, which is what makes uniqueness
+ * real rather than hoped for. `seq` is unique by construction across all four collections:
  * `AgentSessionProjection::apply` assigns it once per event and no event creates two items
  * (`agent/tests/projection.rs::no_single_event_ever_creates_more_than_one_item` pins that half),
  * and `reducer.ts` continues the same counter from a snapshot's `throughRevision`.
@@ -25,6 +25,7 @@ import type { AgentUiState, PermissionRequestRecord, Seq, ToolCallRecord } from 
  * still filters by `permissionId`, so resolving one of two `""` cards removes both. That is a
  * reducer-level consequence of the same hazard and wants its own change. */
 export type TimelineItem =
+  | { kind: "prompt"; seq: Seq; key: string; text: string }
   | { kind: "message"; seq: Seq; key: string; text: string }
   | { kind: "tool"; seq: Seq; key: string; call: ToolCallRecord }
   | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord };
@@ -32,17 +33,25 @@ export type TimelineItem =
 /** Whether a `toolUseId` can identify a tool call at all.
  *
  * Two values cannot, and both are real:
- *   null -- the legacy backend, still the default, sends no id (`agent/src/session.rs`).
+ *   null -- the legacy backend, still the default for a source build, sends no id
+ *           (`agent/src/session.rs`).
  *   ""   -- proto3 has no absent-string, so an unset `tool_use_id` arrives as "" from the sidecar.
  *           A `ToolCallRecord.toolUseId` crosses the same boundary and can be "" for the same
  *           reason, so admitting it would anchor an arbitrary card to an arbitrary call.
- * `MessageList`'s awaiting-permission marker and `PermissionCard` guard the identical case. */
-function isUsableLink(toolUseId: string | null): toolUseId is string {
+ *
+ * **Exported because three places need exactly this question and all three used to answer it
+ * themselves**: this function, `MessageList`'s awaiting-permission marker (an inline `id !== null
+ * && id !== ""`) and `PermissionCard`'s "for tool call …" line (a truthiness test). Each carried a
+ * paragraph saying the other two guarded the identical case, which is documentation standing in
+ * for a shared definition -- the same duplicated-guard defect this branch already fixed once for
+ * the colour guard. One predicate, three call sites, so a change to the rule cannot reach two of
+ * them and miss the third. */
+export function isUsableLink(toolUseId: string | null): toolUseId is string {
   return toolUseId !== null && toolUseId !== "";
 }
 
 /**
- * The three collections merged into the one sequence they actually formed.
+ * The four collections merged into the one sequence they actually formed.
  *
  * Ordering comes from `seq`, which Rust's `AgentSessionProjection::apply` assigns and
  * `serialize_snapshot_for_js` ships -- this function sorts by an authoritative key, it does not
@@ -58,13 +67,19 @@ function isUsableLink(toolUseId: string | null): toolUseId is string {
  *
  * SAY IT PLAINLY, because a reader will otherwise assume this function is uniformly exercised: that
  * anchoring branch -- `anchored`, `knownToolUseIds`, the per-call sibling sort, the `anchored.delete`
- * guard, roughly half of what is below -- CANNOT RUN ON THE LEGACY BACKEND, which is the default
- * and the only backend this project's own machine can run today. Every legacy permission carries
- * `toolUseId: null` (`agent/src/session.rs` passes `tool_use_id: None`, deliberately, with its
- * reasons written out there), so `isUsableLink` rejects all of them and every card takes the
- * `unanchored` path. Only the sidecar backend sends a real id, and this host's `claude` 2.1.272 is
- * refused by that sidecar's CLI-version gate, so the anchoring half ships on unit tests alone --
- * `timeline.test.ts` and `MessageList.test.tsx` cover it, no live run ever has.
+ * guard, roughly half of what is below -- CANNOT RUN ON THE LEGACY BACKEND, which is what a source
+ * build still starts on. Every legacy permission carries `toolUseId: null` (`agent/src/session.rs`
+ * passes `tool_use_id: None`, deliberately, with its reasons written out there), so `isUsableLink`
+ * rejects all of them and every card takes the `unanchored` path.
+ *
+ * Only the sidecar backend sends a real id. That half is NOT unit-tests-only any more, and this
+ * paragraph said it was for three days after it stopped being true: the sidecar was driven on a
+ * screen on 2026-09-15 -- against this host's own `claude` 2.1.272, whose version the panel header
+ * reported as `CLI 2.1.272 ⚠`, so the CLI-version gate this paragraph blamed had already moved --
+ * and the linked-permission anchoring was exercised for real there (`shell/MANUAL_VERIFICATION.md`,
+ * "the sidecar backend, verified on a screen for the first time"; `CLAUDE.md`'s own table carries
+ * the same row). `timeline.test.ts` and `MessageList.test.tsx` still cover it, and remain the only
+ * coverage of the branch on the DEFAULT backend, where it is unreachable by construction.
  *
  * The half that DOES run on legacy, and that fixes the reported defect, is the transcript-vs-tool
  * interleaving: the `base` merge and its sort.
@@ -89,6 +104,7 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
   for (const siblings of anchored.values()) siblings.sort((a, b) => a.seq - b.seq);
 
   const base: TimelineItem[] = [
+    ...state.userPrompts.map((prompt): TimelineItem => ({ kind: "prompt", seq: prompt.seq, key: `u-${prompt.seq}`, text: prompt.text })),
     ...state.transcript.map((message): TimelineItem => ({ kind: "message", seq: message.seq, key: `m-${message.seq}`, text: message.text })),
     ...state.toolCalls.map((call): TimelineItem => ({ kind: "tool", seq: call.seq, key: `t-${call.seq}`, call })),
     ...unanchored.map((request): TimelineItem => ({ kind: "permission", seq: request.seq, key: `p-${request.seq}`, request })),

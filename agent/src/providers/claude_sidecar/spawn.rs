@@ -812,19 +812,22 @@ mod tests {
                 .lines()
                 .filter(|l| l.contains("NEOVIBE_VERDANDI_CHECKOUT:-"))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                uses.len(),
-                1,
-                "{script} should name the default checkout exactly once, found {}:\n{}",
-                uses.len(),
-                uses.join("\n"),
-            );
-            assert!(
-                uses[0].contains(&expected),
-                "{script} defaults the Verdandi checkout somewhere this code does not:\n  \
-                 script: {}\n  expected to contain: {expected}",
-                uses[0].trim(),
-            );
+            // At least one, and EVERY one agreeing -- not "exactly one". This asserted exactly one
+            // and went red on `c3375e0`, which legitimately added a second use to `install.sh`
+            // (one in the artifact-copying helper, one in the checkout guard below it). "Exactly
+            // one" was only ever a way of making `uses[0]` cover the whole file; checking all of
+            // them covers it properly, and does not stand in the way of a script that honestly
+            // needs the default twice. What must not happen -- a script defaulting somewhere this
+            // code does not -- is still caught, now on every line rather than the first.
+            assert!(!uses.is_empty(), "{script} never names the default Verdandi checkout");
+            for line in &uses {
+                assert!(
+                    line.contains(&expected),
+                    "{script} defaults the Verdandi checkout somewhere this code does not:\n  \
+                     script: {}\n  expected to contain: {expected}",
+                    line.trim(),
+                );
+            }
         }
     }
 

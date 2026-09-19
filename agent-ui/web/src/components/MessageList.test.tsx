@@ -24,20 +24,66 @@ function texts(...values: string[]) {
   return values.map((text, i) => ({ seq: i, text }));
 }
 
+/* `cursor` was added to `Props` in panel-as-document task 5's review round 1 (the cursor must be
+   visible, `.row-current`/`aria-current`). Every test above this line predates it and is not
+   testing the cursor -- `cursor={-1}` is passed throughout them (never a real timeline index) so
+   none of their rows render as current, preserving exactly the rendering these tests already
+   assert on. The cursor-highlight behaviour itself is its own describe block, at the bottom. */
+
+/* Task 3 of the panel-as-document plan: every conversation item is now a row on one sign-column
+   grid (`.row.row-<kind>`, `.row-sign`, `.row-body`), and the row's state is never colour alone --
+   the glyph in `data-sign` differs too. This is the one test asserting the glyphs themselves. */
+describe("MessageList row structure", () => {
+  it("gives every row a sign column, and distinguishes state by glyph not only colour", () => {
+    render(
+      <MessageList
+        state={{
+          ...initialState(),
+          userPrompts: [{ seq: 1, text: "do the thing" }],
+          transcript: [{ seq: 2, text: "on it" }],
+          toolCalls: [
+            { seq: 3, toolUseId: "a", name: "Read", input: {}, result: null },
+            { seq: 4, toolUseId: "b", name: "Read", input: {}, result: { content: "ok", isError: false } },
+            { seq: 5, toolUseId: "c", name: "Read", input: {}, result: { content: "boom", isError: true } },
+          ],
+        }}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={() => {}}
+      />,
+    );
+    const signs = Array.from(document.querySelectorAll<HTMLElement>(".row")).map((r) => r.dataset.sign);
+    expect(signs).toEqual(["›", "", "◐", "✓", "✗"]);
+  });
+});
+
 describe("MessageList transcript rendering", () => {
   it("renders assistant text as markdown, not as escaped source", () => {
     const { container } = render(
-      <MessageList state={state({ transcript: texts("# Heading\n\nsome **bold** text") })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
+      <MessageList
+        state={state({ transcript: texts("# Heading\n\nsome **bold** text") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
     );
-    expect(container.querySelector(".assistant-message h1")?.textContent).toBe("Heading");
-    expect(container.querySelector(".assistant-message strong")?.textContent).toBe("bold");
+    expect(container.querySelector(".row-assistant h1")?.textContent).toBe("Heading");
+    expect(container.querySelector(".row-assistant strong")?.textContent).toBe("bold");
   });
 
   it("renders one block per transcript entry, in order", () => {
     const { container } = render(
-      <MessageList state={state({ transcript: texts("first", "second") })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
+      <MessageList
+        state={state({ transcript: texts("first", "second") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
     );
-    const messages = Array.from(container.querySelectorAll(".assistant-message"));
+    const messages = Array.from(container.querySelectorAll(".row-assistant"));
     expect(messages.map((m) => m.textContent?.trim())).toEqual(["first", "second"]);
   });
 });
@@ -50,12 +96,16 @@ describe("MessageList transcript rendering", () => {
    The order now comes from `seq`, which Rust's projection assigns and its snapshot ships, so this
    renders the same sequence after a reload as it did live. */
 describe("MessageList interleaves the conversation in its real order", () => {
-  /** Every rendered block, in DOM order, as a short label. */
+  /** Every rendered row, in DOM order, as a short label. */
   function rendered(container: HTMLElement): string[] {
-    return Array.from(container.querySelectorAll(".assistant-message, .tool-message, .permission-card")).map((el) => {
-      if (el.classList.contains("assistant-message")) return `text:${el.textContent?.trim()}`;
-      if (el.classList.contains("permission-card")) return "perm";
-      return `tool:${el.querySelector(".tool-call")?.getAttribute("data-tool-name") ?? "?"}`;
+    return Array.from(container.querySelectorAll<HTMLElement>(".row")).map((el) => {
+      if (el.classList.contains("row-assistant")) return `text:${el.textContent?.trim()}`;
+      if (el.classList.contains("row-permission")) return "perm";
+      if (el.classList.contains("row-tool")) return `tool:${el.querySelector(".tool-call")?.getAttribute("data-tool-name") ?? "?"}`;
+      // This helper only knows the three kinds these tests mix (text/perm/tool). A silent
+      // `else -> tool:` used to swallow anything else (a `row-prompt` fixture added later, say)
+      // into a mislabelled "tool:?" instead of a failure -- fail loudly instead.
+      throw new Error(`rendered(): row has none of the classes this helper knows about: "${el.className}"`);
     });
   }
 
@@ -74,6 +124,8 @@ describe("MessageList interleaves the conversation in its real order", () => {
           ],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
@@ -101,6 +153,8 @@ describe("MessageList interleaves the conversation in its real order", () => {
           pendingPermissions: [{ seq: 4, permissionId: "perm-1", toolUseId: "toolu_1", toolName: "Bash", input: {} }],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
@@ -121,6 +175,8 @@ describe("MessageList interleaves the conversation in its real order", () => {
           pendingPermissions: [{ seq: 3, permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
@@ -137,9 +193,15 @@ describe("MessageList interleaves the conversation in its real order", () => {
 describe("MessageList sanitizes model output", () => {
   function html(markdown: string): string {
     const { container } = render(
-      <MessageList state={state({ transcript: texts(markdown) })} sessionEnded={false} onAnswerPermission={vi.fn()} />,
+      <MessageList
+        state={state({ transcript: texts(markdown) })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
     );
-    return container.querySelector(".assistant-message")!.innerHTML;
+    return container.querySelector(".row-assistant .row-body")!.innerHTML;
   }
 
   it("strips a raw <script> payload out of model output", () => {
@@ -164,10 +226,12 @@ describe("MessageList sanitizes model output", () => {
       <MessageList
         state={state({ transcript: texts('<button onclick="window.__pwned = true">go</button>') })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
-    const button = container.querySelector(".assistant-message button");
+    const button = container.querySelector(".row-assistant button");
     if (button) fireEvent.click(button);
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
   });
@@ -190,6 +254,12 @@ describe("MessageList tool calls and permissions", () => {
           ],
         })}
         sessionEnded={false}
+        // t-0 is still running, which always renders regardless of `expanded` -- see
+        // `renderToolCall`. t-1 is finished, and this test is about tool_use_id keying, not about
+        // the fold added in this task, so it is expanded here to keep asserting the state it always
+        // asserted rather than the folded placeholder.
+        expanded={{ "t-1": true }}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
@@ -197,6 +267,27 @@ describe("MessageList tool calls and permissions", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0].querySelector(".tool-result")!.getAttribute("data-state")).toBe("running");
     expect(calls[1].querySelector(".tool-result")!.getAttribute("data-state")).toBe("done");
+  });
+
+  /* Spec §3.2's default: a FINISHED call with no entry in `expanded` shows the folded placeholder,
+     not its result. Round 1 review found this had zero coverage -- every other test here either
+     leaves a call running (which always shows, folded or not) or opts out of the fold via
+     `expanded`, so a regression that ignored `showResult` entirely, or a flipped `=== true` /
+     `!== false` comparison at the call site, would pass all 206 tests unnoticed. */
+  it("folds a finished call's result by default, per the empty `expanded` map", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          toolCalls: [{ seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo hi" }, result: { content: "hi", isError: false } }],
+        })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".tool-result-folded")).not.toBeNull();
+    expect(container.querySelector(".tool-result")).toBeNull();
   });
 
   /* The whole point of plumbing tool_use_id to the frontend: with two Bash calls in one turn, a card
@@ -214,10 +305,12 @@ describe("MessageList tool calls and permissions", () => {
           ],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
-    const awaiting = Array.from(container.querySelectorAll(".tool-message[data-awaiting-permission='true']"));
+    const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
     expect(awaiting).toHaveLength(1);
     expect(awaiting[0].textContent).toContain("rm -rf /");
   });
@@ -239,10 +332,12 @@ describe("MessageList tool calls and permissions", () => {
           ],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
-    const awaiting = Array.from(container.querySelectorAll(".tool-message[data-awaiting-permission='true']"));
+    const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
     expect(awaiting).toHaveLength(1);
     expect(awaiting[0].textContent).toContain("rm -rf /");
     expect(container.querySelector(".permission-card-tool-use-id")!.textContent).toContain("toolu_second");
@@ -256,10 +351,12 @@ describe("MessageList tool calls and permissions", () => {
           pendingPermissions: [{ seq: 1, permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
-    expect(container.querySelector(".tool-message[data-awaiting-permission='true']")).toBeNull();
+    expect(container.querySelector(".row-tool [data-awaiting-permission='true']")).toBeNull();
   });
 
   /* proto3 has no absent-string: an unset `tool_use_id` arrives as "" on both the permission and
@@ -274,10 +371,12 @@ describe("MessageList tool calls and permissions", () => {
           pendingPermissions: [{ seq: 1, permissionId: "perm-1", toolUseId: "", toolName: "Bash", input: {} }],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={vi.fn()}
       />,
     );
-    expect(container.querySelector(".tool-message[data-awaiting-permission='true']")).toBeNull();
+    expect(container.querySelector(".row-tool [data-awaiting-permission='true']")).toBeNull();
     expect(container.querySelector(".tool-awaiting-permission")).toBeNull();
   });
 
@@ -292,6 +391,8 @@ describe("MessageList tool calls and permissions", () => {
           ],
         })}
         sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={onAnswerPermission}
       />,
     );
@@ -307,6 +408,8 @@ describe("MessageList tool calls and permissions", () => {
       <MessageList
         state={state({ pendingPermissions: [{ seq: 0, permissionId: "perm-1", toolUseId: null, toolName: "Bash", input: {} }] })}
         sessionEnded
+        expanded={{}}
+        cursor={-1}
         onAnswerPermission={onAnswerPermission}
       />,
     );
@@ -314,5 +417,36 @@ describe("MessageList tool calls and permissions", () => {
     expect(approve.disabled).toBe(true);
     fireEvent.click(approve);
     expect(onAnswerPermission).not.toHaveBeenCalled();
+  });
+});
+
+describe("MessageList cursor highlight", () => {
+  it("marks only the row at `cursor`, by position, with row-current and aria-current", () => {
+    const { container } = render(
+      <MessageList
+        state={state({ userPrompts: texts("first", "second", "third") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    const rows = Array.from(container.querySelectorAll(".row-prompt"));
+    expect(rows).toHaveLength(3);
+    expect(rows.map((r) => r.classList.contains("row-current"))).toEqual([false, true, false]);
+    expect(rows.map((r) => r.getAttribute("aria-current"))).toEqual([null, "true", null]);
+  });
+
+  it("marks no row when cursor does not name a real index", () => {
+    const { container } = render(
+      <MessageList
+        state={state({ userPrompts: texts("only one") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".row-current")).toBeNull();
   });
 });

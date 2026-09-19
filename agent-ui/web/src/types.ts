@@ -1,6 +1,6 @@
 /** The ordering key every item in a conversation carries, shared across `TranscriptMessage`,
- * `ToolCallRecord` and `PermissionRequestRecord` so the three can be interleaved into the one
- * sequence they really formed.
+ * `ToolCallRecord`, `PermissionRequestRecord` and `UserPromptRecord` so the four can be
+ * interleaved into the one sequence they really formed.
  *
  * Authoritative, not derived here: Rust's `AgentSessionProjection::apply` assigns it from the same
  * counter as `last_revision`, and `serialize_snapshot_for_js` ships it. That is what makes the
@@ -13,6 +13,13 @@ export type Seq = number;
 /** One assistant message. `seq` is where the message STARTED -- appending a streamed chunk never
  * moves it, or a reply still streaming would keep sliding below the tool call that interrupted it. */
 export type TranscriptMessage = { seq: Seq; text: string };
+/** One prompt the user sent, as they typed it.
+ *
+ * NOT what went on the wire: wire 1 composes editor context into the outgoing turn above both
+ * backends, and Rust deliberately records the pre-composition text (`agent/src/projection.rs`'s
+ * `UserPromptSubmitted`). Rendering the wire text would show the user a file path and a selection
+ * they never wrote. */
+export type UserPromptRecord = { seq: Seq; text: string };
 export type ToolCallRecord = { seq: Seq; toolUseId: string; name: string; input: unknown; result: { content: unknown; isError: boolean } | null };
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
@@ -116,6 +123,7 @@ export type AgentUiState = {
   sessionId: string | null;
   providerSessionId: string | null;
   model: string | null; cwd: string | null;
+  userPrompts: UserPromptRecord[];
   transcript: TranscriptMessage[]; toolCalls: ToolCallRecord[]; status: SessionStatus;
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
   capabilities: Capabilities;
@@ -185,6 +193,7 @@ export type UsageInfo = { total_cost_usd: number; num_turns: number };
 export type AgentDomainEvent =
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "turn_started"; turn_id: string }
+  | { type: "user_prompt_submitted"; text: string }
   | { type: "content_delta"; turn_id: string; kind: "text" | "thinking"; text: string }
   | { type: "tool_call_started"; turn_id: string; tool_use_id: string; name: string; input: unknown }
   | { type: "tool_call_completed"; turn_id: string; tool_use_id: string; content: unknown; is_error: boolean }

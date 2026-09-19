@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { PermissionRequestRecord } from "../types";
 import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
+import { isUsableLink } from "../timeline";
 
 type Props = {
   request: PermissionRequestRecord;
@@ -32,14 +33,16 @@ export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
       <div className="permission-card-tool">Permission requested: {request.toolName}</div>
       {/* Which call, not just which tool: a turn can have several Bash calls in flight, and this is
           the same id `MessageList` keys that call's own block on, so the two can be read together.
-          Rendered only when the request actually carries one -- a placeholder here would read as a
-          lookup that failed rather than as an id that was never sent. Every permission path in both
-          backends now forwards whatever id its own source message carried, so this is normally
-          present; it can still be absent, and the Rust side deliberately does not invent one.
-          Truthiness rather than `!== null` on purpose: the sidecar's `tool_use_id` crosses proto3,
-          where an unset string arrives as "" rather than as an absent field, and "for tool call "
-          with nothing after it is worse than saying nothing. */}
-      {request.toolUseId && (
+          Rendered only when the request actually carries a USABLE one -- a placeholder here would
+          read as a lookup that failed rather than as an id that was never sent, and "for tool call "
+          with nothing after it is worse than saying nothing. Every permission path in both backends
+          forwards whatever id its own source message carried, so this is normally present; it can
+          still be absent, and the Rust side deliberately does not invent one.
+          `isUsableLink` (`../timeline`) is that question, asked once for the whole panel: it rules
+          out `null` AND the `""` the sidecar's proto3 wire produces for an unset field. This was a
+          bare truthiness test, which happened to agree -- the point of routing it through the
+          shared predicate is that it now cannot stop agreeing. */}
+      {isUsableLink(request.toolUseId) && (
         <div className="permission-card-tool-use-id">for tool call {request.toolUseId}</div>
       )}
       <ToolInput toolName={request.toolName} input={request.input} />

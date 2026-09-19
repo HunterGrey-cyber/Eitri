@@ -545,6 +545,10 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
                     Err(neovibe_core::agent_backend::BackendError {
                         message: "the backend connect worker stopped without reporting a result".to_string(),
                         benign: false,
+                        // Nothing was ever folded: this failure is the ABSENCE of a backend, so
+                        // there is no projection it could have written into. See
+                        // `BackendError::folded_events`.
+                        folded_events: Vec::new(),
                     }),
                 ))
             }
@@ -715,6 +719,27 @@ fn ready_payloads(
     payloads
 }
 
+/// The events a command's outcome owes the frontend, SUCCESS OR FAILURE.
+///
+/// A failure carries any the backend had already folded into its own projection before it failed
+/// (`BackendError::folded_events`) -- today that is the legacy arm's user prompt, which `send_turn`
+/// folds before it even attempts the send, deliberately. Dispatching only on the `Ok` arm is what
+/// let a refused send show no prompt row live while the next snapshot carried one: the same message
+/// read as unsent until a panel reload and as sent afterwards, which is precisely the
+/// snapshot-vs-live indistinguishability this panel rests on.
+///
+/// A free function, not three arms of the `match` below deciding separately: separate arms is how
+/// the success and failure paths diverged in the first place, and it makes the rule testable
+/// without a WebView.
+fn events_owed(
+    outcome: &Result<Vec<agent::AgentDomainEvent>, neovibe_core::agent_backend::BackendError>,
+) -> &[agent::AgentDomainEvent] {
+    match outcome {
+        Ok(events) => events,
+        Err(error) => &error.folded_events,
+    }
+}
+
 /// Applies one command's outcome to the panel and the frontend, uniformly.
 ///
 /// The benign/fatal split is the whole point: a benign failure (a turn sent while one was running,
@@ -727,18 +752,19 @@ fn apply_command_outcome(
     request_id: &str,
     outcome: Result<Vec<agent::AgentDomainEvent>, neovibe_core::agent_backend::BackendError>,
 ) {
+    let events = events_owed(&outcome);
+    if !events.is_empty() {
+        // Only the legacy backend ever gets here with a non-empty batch: it synthesizes events its
+        // own wire protocol cannot provide. The sidecar backend returns an empty vec and its state
+        // arrives through the pump, from the server.
+        let state_ref = state.borrow();
+        let through_revision = state_ref.session.as_ref().map(|s| s.projection().last_revision).unwrap_or(0);
+        let from_revision = through_revision.saturating_sub(events.len() as u64);
+        drop(state_ref);
+        evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, events));
+    }
     match outcome {
-        Ok(events) => {
-            if !events.is_empty() {
-                // Only the legacy backend ever gets here with a non-empty batch: it synthesizes
-                // events its own wire protocol cannot provide. The sidecar backend returns an empty
-                // vec and its state arrives through the pump, from the server.
-                let state_ref = state.borrow();
-                let through_revision = state_ref.session.as_ref().map(|s| s.projection().last_revision).unwrap_or(0);
-                let from_revision = through_revision.saturating_sub(events.len() as u64);
-                drop(state_ref);
-                evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, &events));
-            }
+        Ok(_) => {
             evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Ok(())));
         }
         Err(error) if error.benign => {
@@ -848,7 +874,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // gives legacy the feature for free and changes no wire format. The context is read
                 // NOW rather than remembered, and a `None` means the turn goes out exactly as the
                 // user typed it.
-                let text = neovibe_core::editor_context::compose_turn_text(
+                let composed = neovibe_core::editor_context::compose_turn_text(
                     &text,
                     (state_ref.editor_context)().as_ref(),
                 );
@@ -856,7 +882,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // moment the backend got around to accepting it.
                 state_ref.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
                 match state_ref.session.as_mut() {
-                    Some(session) => session.send_turn(&text),
+                    // `&text` second, and it is the user's own: the panel shows what was typed,
+                    // never the composed wire text.
+                    Some(session) => session.send_turn(&composed, &text),
                     None => Err(no_session_error()),
                 }
             };
@@ -988,7 +1016,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
 /// A command arriving with no session. Benign: the frontend's start screen is showing, or the
 /// session just ended -- either way the panel is healthy and there is nothing to tear down.
 fn no_session_error() -> neovibe_core::agent_backend::BackendError {
-    neovibe_core::agent_backend::BackendError { message: "no active session".to_string(), benign: true }
+    // `folded_events` empty for the same reason: with no session there is no projection, so this
+    // command changed nothing the frontend is owed. See `BackendError::folded_events`.
+    neovibe_core::agent_backend::BackendError {
+        message: "no active session".to_string(),
+        benign: true,
+        folded_events: Vec::new(),
+    }
 }
 
 /// The panel document with `vars` already inlined, so the first frame WebKit paints -- on a cold
@@ -1083,6 +1117,35 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused command still delivers what the backend already folded.
+    ///
+    /// **Scope, stated because the name would otherwise overclaim it.** This pins `events_owed`,
+    /// the rule `apply_command_outcome` now reads the events off -- not a real refused legacy send.
+    /// It cannot: the only way to get an `AgentBackend::Legacy` is `AgentSession::start` ->
+    /// `AgentProcess::spawn`, which spawns a real `claude` process, and there is no injectable
+    /// provider on that path the way `AgentConversation` has one (`core/src/agent_backend.rs`'s own
+    /// test doc records that asymmetry, and that the Legacy arm of `send_turn` is dead under
+    /// `cargo test` for the same reason). So the arm that POPULATES `folded_events` is unverified
+    /// by any automated test in this workspace, on purpose rather than by oversight; what is
+    /// verified is that a populated one is delivered instead of dropped, which is the half that was
+    /// broken.
+    #[test]
+    fn a_failed_command_still_owes_the_events_its_backend_already_folded() {
+        let folded = vec![agent::AgentDomainEvent::UserPromptSubmitted { text: "what does this do?".into() }];
+        let refused: Result<Vec<agent::AgentDomainEvent>, _> =
+            Err(neovibe_core::agent_backend::BackendError {
+                message: "a turn is already in progress".into(),
+                benign: true,
+                folded_events: folded.clone(),
+            });
+        assert_eq!(events_owed(&refused), folded.as_slice(), "a refusal must not swallow a folded prompt");
+
+        // The other two shapes, so this is a rule rather than one case: a success delivers its own
+        // events, and a failure that folded nothing delivers nothing.
+        assert_eq!(events_owed(&Ok(folded.clone())), folded.as_slice());
+        assert!(events_owed(&Err(no_session_error())).is_empty());
+    }
 
     /// The document this panel loads -- at startup, and again on every `reload_document()` -- has to
     /// actually carry the frontend and the global Rust dispatches into. A stale or truncated

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { HandoffCommand } from "../types";
+import { Row } from "./Row";
 
 /** Why "continue in a terminal" cannot be used right now, or `null` when it can.
  *
@@ -118,11 +119,24 @@ export function ContinueInTerminal({
  * hold a lease. So this says what is true and no more. */
 export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
   return (
-    <div className="handoff-card" role="status">
+    // Same two-cell shape as the rest of the panel-as-document grid (panel-as-document task 3):
+    // a `→` sign beside the body, so this row's sign lines up with every other row's. `handoff-card`
+    // stays on the BODY cell rather than being replaced -- it carries its own box (border,
+    // background, spacing) that has nothing to do with the sign column, and every child selector
+    // below (`.handoff-card p`, `.warning`, `.detail`) still matches unchanged since the nesting
+    // relative to `.handoff-card` itself has not moved. `bodyClassName` is `Row`'s own way of
+    // saying that (`./Row`), rather than this file re-writing the two-cell grid by hand.
+    <Row kind="handoff" sign="→" role="status" bodyClassName="handoff-card">
       <strong>This conversation is closed in Neovibe.</strong>
       <p>Run this in your own terminal to continue it:</p>
       {/* <pre>, so it can be selected and copied character for character. */}
       <pre className="handoff-command">{handoff.command}</pre>
+      {/* `y` here is handled by `App.tsx`'s `handleStartScreenKeyDown`, not by the conversation's
+          `onKeyDown`/`resolveKey` table -- this card only ever renders on the start screen (once
+          `sessionStarted` is false), a different render branch with its own tiny key handler,
+          because this is the only key this screen offers and there is no cursor here to gate it
+          on. */}
+      <div className="row-hint">Press y to copy.</div>
       <p className="warning">
         Neovibe took <strong>no lock</strong> on this session and is not watching it. If anything
         else resumes the same session while your terminal has it open, both write into the{" "}
@@ -133,6 +147,6 @@ export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
         <strong>your own Claude Code settings</strong>, not the permission gate this panel installs,
         so tool calls there will not appear here as permission cards.
       </p>
-    </div>
+    </Row>
   );
 }

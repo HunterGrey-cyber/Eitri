@@ -254,6 +254,16 @@ impl<'a> SnapshotView<'a> {
 /// answers with SESSION_NOT_FOUND.
 pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
     let projection = &*view.projection;
+    // Written out for the same stated reason as `transcript` just below: both field names happen
+    // to be single lowercase words today, so the derive would produce the same JSON, but this
+    // function exists precisely because Rust and TS name things differently and a field added
+    // later would otherwise reach the frontend in whatever spelling Rust used.
+    let user_prompts: Vec<Value> = projection
+        .user_prompts
+        .iter()
+        .map(|prompt| json!({ "seq": prompt.seq, "text": prompt.text }))
+        .collect();
+
     // Written out rather than leaning on `TranscriptMessage`'s derive. Both field names happen to
     // be single lowercase words, so the derive would produce the same JSON today -- but this
     // function exists precisely because Rust and TS name things differently, and a field added to
@@ -336,6 +346,7 @@ pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         "providerSessionId": view.provider_session_id,
         "model": projection.model,
         "cwd": projection.cwd,
+        "userPrompts": user_prompts,
         "transcript": transcript,
         "toolCalls": tool_calls,
         "status": status,
@@ -807,6 +818,29 @@ mod tests {
             let seqs: Vec<u64> = cards.iter().map(|p| p["seq"].as_u64().unwrap()).collect();
             assert!(seqs.windows(2).all(|w| w[0] < w[1]), "projection {attempt} emitted seqs {seqs:?}");
         }
+    }
+
+    /// The panel's half of what the user asked (Task 2 of the panel-as-document plan): a snapshot
+    /// must carry `user_prompts` too, or a reload/resync loses every prompt the live event stream
+    /// already showed. There is no shared `view_of`/`SnapshotView` builder in this module -- every
+    /// neighbouring test constructs one inline with the fields it needs and defaults for the rest,
+    /// so this follows that pattern rather than inventing a helper.
+    #[test]
+    fn a_snapshot_carries_the_user_prompts_and_their_seqs() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "hello".into() });
+        let view = SnapshotView {
+            backend: "legacy",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let json: serde_json::Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        assert_eq!(json["state"]["userPrompts"][0]["text"], "hello");
+        assert_eq!(json["state"]["userPrompts"][0]["seq"], 0);
     }
 
     /// The event path's own half of the same link, pinned here rather than assumed from the derive:

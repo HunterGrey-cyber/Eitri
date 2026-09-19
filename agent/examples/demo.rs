@@ -70,6 +70,7 @@ fn print_event(event: &AgentDomainEvent) {
             println!("[session opened] id={session_id} provider_session_id={provider_session_id} model={model} cwd={cwd}");
         }
         AgentDomainEvent::TurnStarted { turn_id } => println!("[turn started] {turn_id}"),
+        AgentDomainEvent::UserPromptSubmitted { text } => println!("[user] {text}"),
         AgentDomainEvent::ContentDelta { kind: agent::ContentKind::Text, text, .. } => println!("[assistant] {text}"),
         AgentDomainEvent::ContentDelta { kind: agent::ContentKind::Thinking, .. } => println!("[thinking...]"),
         AgentDomainEvent::ToolCallStarted { name, input, .. } => println!("[tool call] {name}({input})"),

@@ -78,7 +78,15 @@ pub struct ThemeTokens {
     /// Secondary text drawn on `chrome`. Guarded against `chrome`, not `bg`: a reversed StatusLine
     /// makes `chrome` Normal's fg, the very colour `muted` is pushed toward.
     pub chrome_muted: Rgb,
-    /// Accent text drawn on `chrome` (the status bar's mode label).
+    /// Accent drawn on `chrome` -- the status bar's mode block. Guarded at `UI_CONTRAST` (3:1,
+    /// WCAG 1.4.11's NON-text threshold), not at `TEXT_CONTRAST`, and this crate's own test
+    /// asserts only `>= 3.0` for it. So it belongs on a border, a rule or a fill beside a label,
+    /// never on the label's own glyphs, the same way `warn`/`error`/`ok` do below.
+    ///
+    /// Said in those words because it did not used to be: this line read "Accent TEXT drawn on
+    /// chrome", which invited exactly the use its guard cannot support, and `index.css` ended up
+    /// carrying a paragraph about why it does not follow the doc. `indexCss.test.ts` refuses this
+    /// token as a `color:` even inside the winbar, which is the mechanism; this is the sign.
     pub chrome_accent: Rgb,
     pub border: Rgb,
     pub muted: Rgb,

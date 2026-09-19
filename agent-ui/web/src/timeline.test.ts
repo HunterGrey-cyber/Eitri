@@ -20,6 +20,8 @@ function state(overrides: Partial<AgentUiState>): AgentUiState {
 function labels(s: AgentUiState): string[] {
   return buildTimeline(s).map((item) => {
     switch (item.kind) {
+      case "prompt":
+        return `prompt:${item.text}`;
       case "message":
         return `text:${item.text}`;
       case "tool":
@@ -170,5 +172,34 @@ describe("buildTimeline", () => {
 
   it("is empty for a conversation that has produced nothing", () => {
     expect(buildTimeline(initialState())).toEqual([]);
+  });
+
+  /* The fourth source (Task 2 of panel-as-document): a user prompt is its own timeline item,
+     ordered by `seq` exactly like the other three -- this is the merge's only new input, not a
+     new merge rule.
+     A second turn is included, and its prompt's `seq` (4) is neither the smallest nor the largest
+     value in the fixture -- it must land BETWEEN the first tool call (3) and the second message
+     (5). A fixture whose only prompt sits at the smallest `seq` cannot tell a real sort from a
+     regression that special-cases prompts to always come first: `buildTimeline` spreads
+     `userPrompts` into `base` before the other three collections, so "prompt first, by insertion
+     order" and "prompt first, by seq" would coincide there. Landing this prompt in the middle
+     requires the sort to actually run. */
+  it("places a user prompt among the other three kinds by seq", () => {
+    const items = buildTimeline(
+      state({
+        userPrompts: [{ seq: 1, text: "do the thing" }, { seq: 4, text: "and this too" }],
+        transcript: [msg(2, "on it"), msg(5, "sure")],
+        toolCalls: [tool(3, "toolu_1"), tool(6, "toolu_2")],
+      }),
+    );
+    expect(items.map((i) => [i.kind, i.seq])).toEqual([
+      ["prompt", 1],
+      ["message", 2],
+      ["tool", 3],
+      ["prompt", 4],
+      ["message", 5],
+      ["tool", 6],
+    ]);
+    expect(new Set(items.map((i) => i.key)).size).toBe(6);
   });
 });

@@ -219,7 +219,9 @@ const ToolResult = memo(function ToolResult({ result }: { result: ToolCallRecord
   );
 });
 
-export function renderToolCall(call: ToolCallRecord): ReactNode {
+/** `showResult` folded by default, per spec §3.2. A parameter rather than a second exported
+ *  renderer: `ToolResult` owns the head/tail truncation and nothing else should grow a copy. */
+export function renderToolCall(call: ToolCallRecord, showResult = true): ReactNode {
   // Skill calls are ordinary tool_use blocks with name === "Skill" -- there is no distinct wire
   // event for this (confirmed real behavior, see the agent-v2 spec) -- so this is purely a
   // rendering-layer special case, not something the reducer or Rust side needs to know about.
@@ -236,10 +238,18 @@ export function renderToolCall(call: ToolCallRecord): ReactNode {
       )
     );
 
+  // A call still running has no result to fold -- `result === null` always goes through
+  // `ToolResult`, which is what renders the "Running…" indicator. Folding only ever applies to a
+  // FINISHED call, which is also why the default `showResult = true` reproduces the pre-fold
+  // behaviour exactly: `call.result === null || showResult` is then always true.
   return (
     <div className="tool-call" data-tool-name={call.name}>
       {invocation}
-      <ToolResult result={call.result} />
+      {call.result === null || showResult ? (
+        <ToolResult result={call.result} />
+      ) : (
+        <div className="tool-result-folded">result folded — Enter to expand</div>
+      )}
     </div>
   );
 }

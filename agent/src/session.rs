@@ -155,6 +155,23 @@ impl AgentSession {
         &self.event_log
     }
 
+    /// Folds an event this side produced rather than the provider, and hands it back for the UI.
+    ///
+    /// The legacy twin of `AgentConversation::fold_locally`. Only for facts this side genuinely
+    /// owns -- what the user typed is the case it exists for -- never for provider state, which is
+    /// the provider's to report.
+    ///
+    /// Routed through the same private `fold` every provider-translated event uses, rather than
+    /// calling `self.projection.apply` directly: `fold`'s own doc claims to be "the one place
+    /// either [the projection or `event_log`] happens", and a locally-produced event is still a
+    /// real, ordered occurrence of this conversation -- `event_log()` is documented as "a full raw
+    /// log of every domain event", and a caller replaying it to reconstruct the transcript must see
+    /// the prompt too, not just what the provider said back.
+    pub fn fold_locally(&mut self, event: AgentDomainEvent) -> AgentDomainEvent {
+        self.fold(event.clone());
+        event
+    }
+
     pub fn pid(&self) -> u32 {
         self.process.pid()
     }

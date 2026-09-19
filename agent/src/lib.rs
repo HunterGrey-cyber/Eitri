@@ -51,7 +51,7 @@ pub use wire::translate_line;
 pub use projection::{
     AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
     ToolCallRecord, ToolCallResult, PermissionRequestRecord, TranscriptMessage, UsageInfo,
-    TurnOutcome, ResumeStatus, describe_failed_resume,
+    TurnOutcome, ResumeStatus, describe_failed_resume, UserPromptRecord,
 };
 pub use provider::{
     AgentProvider, CreateSessionRequest, ResumeSessionRequest, SendTurnRequest,

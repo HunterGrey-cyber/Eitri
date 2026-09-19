@@ -283,8 +283,10 @@ impl ConversationIngest {
 
     /// Folds an event this side produced rather than the provider.
     ///
-    /// Only for the terminal events `shutdown` must record when the provider can no longer be asked
-    /// -- never for provider lifecycle events, which are the provider's to state.
+    /// Two callers, and the rule is the same for both: only for facts THIS side owns. `shutdown`'s
+    /// terminal events, which the provider can no longer be asked for; and the user's own prompt,
+    /// which no provider reports back. Never for provider lifecycle state, which is the provider's
+    /// to state.
     pub(crate) fn fold_locally(&self, event: AgentDomainEvent) {
         self.state.lock().unwrap().fold(event);
     }
