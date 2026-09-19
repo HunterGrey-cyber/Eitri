@@ -145,6 +145,10 @@ export default function App() {
    *. See
    *  `./keymap`'s own doc comment on `PanelMode`. */
   const [mode, setMode] = useState<PanelMode>("browse");
+  /** Whether this pane has keyboard focus, reported by `shell` in `pane_focus`.
+   *  Starts false because startup focuses the editor; `ready` resends the value to a new document.
+   *  The mode block is bright only while the pane is focused, so it identifies which pane receives keys. */
+  const [paneFocused, setPaneFocused] = useState(false);
   /** The index into `timeline` that `j`/`k` move and `Enter`/`y` act on. */
   const [cursor, setCursor] = useState(0);
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
@@ -213,6 +217,8 @@ export default function App() {
     installDispatch((payload) => {
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
+      } else if (payload.kind === "pane_focus") {
+        setPaneFocused(payload.focused);
       } else if (payload.kind === "hello") {
         setHello(payload);
       } else if (payload.kind === "snapshot") {
@@ -617,6 +623,7 @@ export default function App() {
       {commandNoticeBanner}
       <StatusLine
         mode={mode}
+        paneFocused={paneFocused}
         state={state}
         position={{ index: cursor, total: timeline.length }}
         // Gate Stop on the interrupt capability. This status line is the only mouse Stop control; Enter

@@ -68,6 +68,13 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith({ kind: "theme", vars: { "--nv-bg": "#faf4ed" } });
   });
 
+  it("demuxes a pane_focus envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "pane_focus", focused: true }));
+    expect(handler).toHaveBeenCalledWith({ kind: "pane_focus", focused: true });
+  });
+
   it("demuxes an error envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);

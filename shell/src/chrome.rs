@@ -98,20 +98,28 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
     controls.upcast()
 }
 
-/// Bottom status bar strip, carried over from `shell_chrome::build_status_bar` unchanged.
-pub(crate) fn build_status_bar() -> gtk4::Widget {
+/// Builds the bottom status bar and returns its focused-pane label, kept current by
+/// `pane_focus::install`.
+///
+/// The bar shows keyboard focus only. This crate has no RPC subscription for nvim's mode or
+/// cursor position, so static placeholders would look like live data. Nvim already displays
+/// its actual mode and position in its own statusline.
+pub(crate) fn build_status_bar() -> (gtk4::Widget, gtk4::Label) {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("statusbar");
+    bar.set_tooltip_text(Some("The pane with keyboard focus. Ctrl+l / Ctrl+h switch panes."));
 
-    let mode = gtk4::Label::new(Some("NORMAL"));
-    mode.add_css_class("statusbar-accent");
+    let caption = gtk4::Label::new(Some("focus"));
+    caption.add_css_class("statusbar-caption");
 
-    let sep = gtk4::Label::new(Some("  \u{2014}  Ln 1, Col 1"));
+    // Empty until `pane_focus::install` applies the real focus, which it does at once.
+    let focused = gtk4::Label::new(None);
+    focused.add_css_class("statusbar-focus");
 
-    bar.append(&mode);
-    bar.append(&sep);
+    bar.append(&caption);
+    bar.append(&focused);
 
-    bar.upcast()
+    (bar.upcast(), focused)
 }
 
 #[cfg(test)]

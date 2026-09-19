@@ -28,6 +28,25 @@ describe("StatusLine", () => {
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
   });
 
+  it("claims focus only when told it has it", () => {
+    const props = {
+      mode: "browse" as const,
+      state: stateWith({ status: { kind: "running" }, activeTurnId: null }),
+      position: { index: 0, total: 1 },
+      canInterrupt: false,
+      onInterrupt: () => {},
+    };
+    const { rerender } = render(<StatusLine {...props} />);
+    // Omitted means unknown, and unknown draws dim: it must never default to a bright claim.
+    expect(screen.getByTestId("mode-block").dataset.focused).toBe("false");
+    rerender(<StatusLine {...props} paneFocused />);
+    expect(screen.getByTestId("mode-block").dataset.focused).toBe("true");
+    expect(screen.getByTestId("mode-block").title).toBe("");
+    rerender(<StatusLine {...props} paneFocused={false} />);
+    expect(screen.getByTestId("mode-block").dataset.focused).toBe("false");
+    expect(screen.getByTestId("mode-block").title).toMatch(/does not have keyboard focus/);
+  });
+
   it("labels INPUT mode too", () => {
     render(
       <StatusLine

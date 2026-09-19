@@ -89,6 +89,39 @@ function buttonLabelled(container: HTMLElement, label: string): HTMLButtonElemen
   return Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes(label));
 }
 
+describe("pane focus", () => {
+  function modeBlock(container: HTMLElement): HTMLElement {
+    return container.querySelector<HTMLElement>("[data-testid=mode-block]")!;
+  }
+
+  it("draws the mode block dim until shell says this pane has focus, and follows it both ways", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    // shell focuses the editor at startup, so the panel claims nothing until told otherwise.
+    expect(modeBlock(container).dataset.focused).toBe("false");
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(modeBlock(container).dataset.focused).toBe("true");
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(modeBlock(container).dataset.focused).toBe("false");
+    // The mode itself is untouched: focus is a separate fact from which mode the panel is in.
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+  });
+
+  it("does not change the mode or what i does", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "pane_focus", focused: true });
+    enterInputMode(container);
+    expect(modeBlock(container).textContent).toBe("INPUT");
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.focused).toBe("false");
+  });
+});
+
 describe("App handshake", () => {
   it("announces itself with a `ready` carrying a request id, before anything else", () => {
     render(<App />);
