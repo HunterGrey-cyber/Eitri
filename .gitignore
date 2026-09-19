@@ -4,3 +4,10 @@
 /docs/workspace/
 /.worktrees/
 /dist/
+
+# Editor/agent scratch that was tracked by accident. `.codex/hooks.json` in particular carried a
+# real absolute host path and a socket name from an earlier scheme that was renamed away (2026-09-17) -- the
+# mechanism that wrote it into the project directory was deleted, which is why nothing
+# regenerates it.
+.aider.tags.cache.v4/
+.codex/
