@@ -29,9 +29,9 @@ const PROJECT_DIR_ENV: &str = "NEOVIBE_PROJECT_DIR";
 ///
 /// **Adding an option to `main()` without adding it here makes `shell --that-option` a hard
 /// startup failure** -- loudly, at the first launch, rather than by silently opening the wrong
-/// directory, which is the trade this module exists to make. Neither flag takes a value; one that
-/// did would need more than a membership test here (see [`select_root_source`]'s doc).
-const KNOWN_FLAGS: [&str; 2] = ["--clean", "--terminal"];
+/// directory, which is the trade this module exists to make. It takes no value; one that did
+/// would need more than a membership test here (see [`select_root_source`]'s doc).
+const KNOWN_FLAGS: [&str; 1] = ["--clean"];
 
 /// The conventional end-of-flags separator. The first token after it is the project directory
 /// verbatim, so a directory whose name really does begin with `-` is reachable.
@@ -162,15 +162,15 @@ fn canonicalize_source(source: &RootSource, cwd: io::Result<PathBuf>) -> Result<
             )
         })?,
     };
-    // Canonicalized, not merely made absolute. This one path is handed to the nvim child, to the
-    // agent panel and to the terminal session, and `agent`'s lease and conversation records key on
-    // a "canonical cwd" of their own -- two spellings of one directory (a symlink, a `..`, a
-    // relative argument) would read downstream as two different projects.
+    // Canonicalized, not merely made absolute. This one path is handed to the nvim child and to
+    // the agent panel, and `agent`'s lease and conversation records key on a "canonical cwd" of
+    // their own -- two spellings of one directory (a symlink, a `..`, a relative argument) would
+    // read downstream as two different projects.
     let resolved = raw
         .canonicalize()
         .map_err(|e| format!("cannot open {} as a project directory: {e}", source.describe()))?;
-    // `canonicalize` succeeds for a regular file, so `shell README.md` would otherwise reach nvim,
-    // the agent and the terminal as a cwd and fail three different ways, none of them here.
+    // `canonicalize` succeeds for a regular file, so `shell README.md` would otherwise reach nvim
+    // and the agent as a cwd and fail two different ways, none of them here.
     if !resolved.is_dir() {
         return Err(format!("{} is not a directory ({})", source.describe(), resolved.display()));
     }
@@ -201,10 +201,10 @@ mod tests {
 
     #[test]
     fn flags_are_not_positional_arguments() {
-        // `shell --clean --terminal` must still resolve to the cwd, not to a project named
-        // "--clean" -- both flags are real and are matched by `main()` itself.
-        assert_eq!(select(["--clean", "--terminal"], None), Ok(RootSource::Cwd));
-        // ...and a real path after them is still found.
+        // `shell --clean` must still resolve to the cwd, not to a project named "--clean" -- it
+        // is a real flag, matched by `main()` itself.
+        assert_eq!(select(["--clean"], None), Ok(RootSource::Cwd));
+        // ...and a real path after it is still found.
         assert_eq!(select(["--clean", "/srv/project"], None), Ok(argument("/srv/project")));
     }
 
@@ -224,6 +224,10 @@ mod tests {
         // The escape hatch the error above advertises has to actually work, including for a name
         // that is character-for-character one of the real flags.
         assert_eq!(select(["--", "-myproj"], None), Ok(argument("-myproj")));
+        // `--terminal` is no longer one of `KNOWN_FLAGS` at all (the terminal pane was cut), so
+        // this case is stronger than it used to be: it shows that even a string that *used to be*
+        // a recognized flag is just an ordinary directory name once it follows `--`, regardless of
+        // whether it is known.
         assert_eq!(select(["--clean", "--", "--terminal"], None), Ok(argument("--terminal")));
         // A bare trailing `--` is "no positional argument", not an error and not an empty path.
         assert_eq!(select(["--clean", "--"], Some("/from/env")), Ok(RootSource::Env(OsString::from("/from/env"))));
@@ -290,8 +294,8 @@ mod tests {
 
     #[test]
     fn a_file_is_rejected_rather_than_used_as_a_project_root() {
-        // `shell README.md` would otherwise hand a regular file to nvim's cwd, to the agent's
-        // project_dir and to the terminal's cwd, each of which fails differently and later.
+        // `shell README.md` would otherwise hand a regular file to nvim's cwd and to the agent's
+        // project_dir, each of which fails differently and later.
         let file = std::env::temp_dir().join(format!(
             "neovibe-project-root-test-{}-{}",
             std::process::id(),

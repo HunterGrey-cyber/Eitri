@@ -11,12 +11,9 @@ members = [
     "poc/webkit_pane",
     "neovide-editor",
     "shell",
-    "terminal-pane",
     "agent",
     "core",
     "supervisor",
-    "terminal-session",
-    "semantic-pane",
 ]
 # The Neovide fork is a submodule with its own workspace; it is a path dependency, not a member.
 exclude = ["neovide"]
