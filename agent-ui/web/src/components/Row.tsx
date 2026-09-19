@@ -37,6 +37,9 @@ type RowProps = {
   role?: string;
   "aria-checked"?: boolean;
   onClick?: () => void;
+  /** Makes this row a keyboard stop (`../nav`): `"row"` for a conversation row, which carries the
+   *  cursor; any other name for a row that is reached by focusing it, like a start-screen choice. */
+  navStop?: string;
   children: ReactNode;
 };
 
@@ -50,6 +53,7 @@ export function Row({
   role,
   "aria-checked": ariaChecked,
   onClick,
+  navStop,
   children,
 }: RowProps) {
   const classes = ["row", `row-${kind}`, current ? "row-current" : null, className ?? null]
@@ -70,13 +74,13 @@ export function Row({
 
   if (as === "button") {
     return (
-      <button type="button" className={classes} data-sign={sign} role={role} aria-checked={ariaChecked} onClick={onClick}>
+      <button type="button" className={classes} data-sign={sign} data-nav-stop={navStop} role={role} aria-checked={ariaChecked} onClick={onClick}>
         {cells}
       </button>
     );
   }
   return (
-    <div className={classes} data-sign={sign} role={role} aria-current={current || undefined}>
+    <div className={classes} data-sign={sign} data-nav-stop={navStop} role={role} aria-current={current || undefined}>
       {cells}
     </div>
   );

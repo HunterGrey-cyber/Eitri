@@ -69,7 +69,7 @@ export function ContinueInTerminal({
 
   if (confirming && blocked === null) {
     return (
-      <div className="handoff-confirm">
+      <div className="handoff-confirm" data-nav-stop="handoff">
         <p>
           Neovibe will <strong>close this conversation here</strong> first, and then show you the
           command that continues it in your own terminal.
@@ -96,7 +96,7 @@ export function ContinueInTerminal({
   }
 
   return (
-    <div className="handoff">
+    <div className="handoff" data-nav-stop="handoff">
       <button
         className="handoff-open"
         disabled={blocked !== null}

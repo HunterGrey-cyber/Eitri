@@ -7,7 +7,13 @@ export type PanelMode = "browse" | "input" | "hint";
 
 export type PanelAction =
   | { kind: "mode"; to: PanelMode }
-  | { kind: "cursor"; to: number }
+  /** `j`/`k`: to the next or previous stop (a row, a banner, the status line, ...), top to bottom.
+   *  Which stop that is depends on the document, so `App.tsx` resolves it (`./nav`'s `nextStop`). */
+  | { kind: "move"; delta: 1 | -1 }
+  /** `h`/`l`: to the previous or next control inside the current stop (`./nav`'s `nextControl`). */
+  | { kind: "control"; delta: 1 | -1 }
+  /** `a`/`d`: answer the permission card under the cursor, or the one gating the tool call under it. */
+  | { kind: "answer"; decision: "allow" | "deny" }
   | { kind: "toggle-expand" }
   | { kind: "copy" }
   | { kind: "restart" }
@@ -20,7 +26,7 @@ export type KeyLike = { key: string; ctrlKey: boolean; shiftKey: boolean; isComp
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
  *  screen) and what REFUSES `i` (a dead session's composer is disabled, so INPUT has no box). The
  *  rule both serve is that no on-screen hint may promise a key the current mode drops. */
-export type KeyContext = { cursor: number; itemCount: number; sessionEnded: boolean };
+export type KeyContext = { sessionEnded: boolean };
 
 /**
  * The key table, as a pure function: mode plus key plus context in, one action or nothing out.
@@ -50,10 +56,17 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       // the same moment, so no on-screen text promises a key this table has stopped resolving.
       return ctx.sessionEnded ? null : { kind: "mode", to: "input" };
     case "j":
-      // Clamped rather than wrapped: a list that jumps to the top when you hold `j` loses your place.
-      return { kind: "cursor", to: Math.min(ctx.cursor + 1, Math.max(ctx.itemCount - 1, 0)) };
+      return { kind: "move", delta: 1 };
     case "k":
-      return { kind: "cursor", to: Math.max(ctx.cursor - 1, 0) };
+      return { kind: "move", delta: -1 };
+    case "l":
+      return { kind: "control", delta: 1 };
+    case "h":
+      return { kind: "control", delta: -1 };
+    case "a":
+    case "d":
+      // A dead session's cards are inert: there is nobody left to answer.
+      return ctx.sessionEnded ? null : { kind: "answer", decision: event.key === "a" ? "allow" : "deny" };
     case "Enter":
       return { kind: "toggle-expand" };
     case "y":
