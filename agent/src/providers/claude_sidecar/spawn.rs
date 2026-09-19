@@ -86,19 +86,23 @@ impl SpawnedSidecar {
 /// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
 /// this session actually running?" is answerable after the fact rather than guessed at.
 ///
-/// Currently `650782f` on Verdandi's `sdk-mainline-unblock-merge-20260915`, which is also the `rev`
-/// that `agent/Cargo.toml` pins `claude-runtime-protocol` to -- and those two must stay equal, because
-/// the generated wire types this crate compiles against come from exactly that revision, so it is
-/// the revision "verified against" can honestly refer to. (The checkout actually RUNNING may differ;
-/// that is what the drift warning below reports, and what `NEOVIBE_VERDANDI_CHECKOUT` is for.)
+/// Currently `8936a10`, "merge: land the claude sidecar line onto main" (2026-09-18) -- on Verdandi
+/// **`main`**, which is where this line lives now; `650782f` is its ancestor, 11 commits back. It is
+/// also the `rev` that `agent/Cargo.toml` pins `claude-runtime-protocol` to, and those two must stay
+/// equal, because the generated wire types this crate compiles against come from exactly that
+/// revision, so it is the revision "verified against" can honestly refer to. (The checkout actually
+/// RUNNING may differ; that is what the drift warning below reports, and what
+/// `NEOVIBE_VERDANDI_CHECKOUT` is for.)
 ///
 /// The value earns its way here by the real suite, never by a version bump: the whole `#[ignore]`d
 /// real-sidecar set is re-run against the exact pushed revision first (multi-turn with a content
 /// oracle, BYPASS tool execution, post-interrupt reuse, orphan-free teardown, a real resume proven
 /// by both a content oracle and a provider-session-id match, partial assistant streaming measured
 /// before/after, and the replay/recovery and backpressure suites). Moved here
-/// `eb70aa3 -> 2fd30fb -> c331615 -> ff05677 -> bb487d7 -> 650782f` on those terms each time; move
-/// it again on the same terms, not before.
+/// `eb70aa3 -> 2fd30fb -> c331615 -> ff05677 -> bb487d7 -> 650782f -> 8936a10` on those terms each
+/// time; move it again on the same terms, not before. (`8936a10` on 2026-09-18 is the newest such move; it
+/// landed the same sidecar line on Verdandi `main`, which is what let this crate stop naming a
+/// branch nobody outside that work would find.)
 ///
 /// The `650782f` move (2026-09-15) is the one exception worth naming, because it was NOT earned by
 /// re-running the whole billed suite here: Verdandi ran this crate's own real tests against the
@@ -132,6 +136,64 @@ pub(crate) struct VerdandiCheckout {
     pub(crate) revision: Option<String>,
     /// True when `NEOVIBE_VERDANDI_CHECKOUT` chose this path rather than the default.
     pub(crate) from_override: bool,
+    /// A release artifact this checkout has ALREADY built for this machine, if any.
+    ///
+    /// When present it is run directly and `node <dist entry>` is never reached -- so a source tree
+    /// and an installed copy execute the same executable rather than two shapes of the same code.
+    /// Before this, every sidecar measurement taken on a development machine was of `node` out of a
+    /// `dist/` tree while the shipped product ran a Node SEA binary, and nothing said so.
+    pub(crate) prebuilt: Option<PathBuf>,
+}
+
+/// Where a checkout's own release build leaves its artifacts, relative to the checkout root.
+/// Verdandi's `apps/claude-sidecar/scripts/buildBinary.mjs` writes
+/// `dist-bin/verdandi-claude-sidecar-<version>-<platform>-<arch>`.
+const CHECKOUT_ARTIFACT_DIR: &str = "apps/claude-sidecar/dist-bin";
+
+/// The `<platform>-<arch>` suffix an artifact built for THIS machine carries, in Node's own
+/// spelling (`process.platform`-`process.arch`), which is what that build script names files with.
+///
+/// Load-bearing rather than cosmetic. `dist-bin/` is one directory holding whatever was built last,
+/// and a Verdandi checkout can be synced between machines -- this environment already syncs
+/// `~/src` to a Mac. Running a `linux-x64` artifact on an arm64 Mac fails with an exec
+/// error that names neither the platform nor this decision. `None` on a target this mapping does
+/// not know, which simply leaves that machine on the `node <dist>` path rather than guessing.
+fn node_platform_suffix() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        _ => None,
+    }
+}
+
+/// A release artifact already built inside `checkout`, for this machine, if there is one.
+///
+/// Newest by mtime when several versions are present, which is the same rule `publish.sh` stages
+/// with. Purely a lookup: it never builds anything, which is the whole point -- an artifact that is
+/// already there costs nothing, and "run npm first" is exactly what must not happen behind a
+/// backend that was chosen for the user.
+fn prebuilt_artifact_in(checkout: &Path) -> Option<PathBuf> {
+    let suffix = node_platform_suffix()?;
+    let prefix = format!("{PACKAGED_SIDECAR_BINARY}-");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(checkout.join(CHECKOUT_ARTIFACT_DIR)).ok()?.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(suffix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(best, _)| modified > *best) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    newest.map(|(_, path)| path)
 }
 
 /// Locates a real Verdandi checkout.
@@ -188,7 +250,8 @@ fn locate_verdandi_checkout(explicit: Option<&str>) -> std::io::Result<VerdandiC
     }
 
     let revision = git_short_revision(&path);
-    Ok(VerdandiCheckout { path, revision, from_override })
+    let prebuilt = prebuilt_artifact_in(&path);
+    Ok(VerdandiCheckout { path, revision, from_override, prebuilt })
 }
 
 /// Best-effort `git rev-parse --short HEAD`. Any failure (not a repo, no `git`, detached weirdness)
@@ -223,7 +286,12 @@ fn git_short_revision(checkout: &Path) -> Option<String> {
 fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
     let source = if checkout.from_override { "NEOVIBE_VERDANDI_CHECKOUT" } else { "default path" };
     let revision = checkout.revision.as_deref().unwrap_or("unknown revision");
-    let description = format!("Verdandi checkout: {} @ {revision} (via {source})", checkout.path.display());
+    let shape = match &checkout.prebuilt {
+        Some(artifact) => format!(", running its prebuilt artifact {}", artifact.display()),
+        None => String::new(),
+    };
+    let description =
+        format!("Verdandi checkout: {} @ {revision} (via {source}){shape}", checkout.path.display());
 
     let mut warnings = Vec::new();
     // `starts_with` rather than equality: `git rev-parse --short` picks its own abbreviation length,
@@ -382,28 +450,65 @@ fn resolve_sidecar_program(
     Ok(SidecarProgram::Checkout(locate_verdandi_checkout(None)?))
 }
 
-/// True when a SHIPPED sidecar artifact is available without a checkout.
+/// True when a sidecar artifact is available to run **without building anything**.
 ///
-/// This is the question "can this installation run the sidecar backend out of the box?", and it is
-/// deliberately narrower than [`resolve_sidecar_program`]: a Verdandi CHECKOUT does not count.
+/// This is the question "can this installation start the sidecar backend right now, with no stall
+/// the user did not ask for?", and it is what decides the default backend
+/// (`neovibe_core::agent_backend::BackendKind::choose`) when `NEOVIBE_AGENT_BACKEND` is unset.
 ///
-/// **Why a checkout must not count.** A developer machine has one, and treating it as availability
-/// would silently switch every source build to a backend whose first start runs `npm ci` and a
-/// TypeScript build -- a multi-minute stall with no UI saying why. Worse, it would make the backend
-/// a property of what happens to be in `~/src`, which is not a decision anyone made.
-/// A checkout stays what it has always been: an explicit override, reached through
-/// `NEOVIBE_VERDANDI_CHECKOUT` or `NEOVIBE_AGENT_BACKEND=sidecar`.
+/// **Corrected 2026-09-18, and the correction is the point.** This first read "a shipped artifact,
+/// and a Verdandi CHECKOUT deliberately does not count", reasoned from: every developer machine has
+/// a checkout, and counting it would switch every source build to a backend whose first start runs
+/// `npm ci` and a TypeScript build with no UI saying why. The conclusion was right and the object
+/// was wrong. What must not happen behind a backend nobody chose is **a build**, not a checkout --
+/// and a checkout that already holds a built artifact for this machine involves no build at all. So
+/// a checkout counts exactly when `prebuilt_artifact_in` finds one, and a checkout with nothing
+/// built still does not count, which keeps the original guarantee intact where it was actually
+/// about something.
 ///
-/// So this answers for the shipped shape only, and the moment the artifact is installed beside the
-/// product the default flips for real users with no further change here.
+/// It buys a second thing the first version gave away: with this, a source build and an installed
+/// copy run the SAME executable. Before, `cargo run` ran `node` out of a `dist/` tree while the
+/// package ran a Node SEA binary, so a developer-machine measurement was never of the shipped shape.
 pub fn packaged_sidecar_available() -> bool {
-    if std::env::var("NEOVIBE_SIDECAR_BINARY").ok().is_some_and(|v| !v.trim().is_empty()) {
+    sidecar_artifact_available(
+        std::env::var("NEOVIBE_SIDECAR_BINARY").ok().as_deref(),
+        std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)).as_deref(),
+        checkout_path_for(std::env::var("NEOVIBE_VERDANDI_CHECKOUT").ok().as_deref()).as_deref(),
+    )
+}
+
+/// `packaged_sidecar_available` with its three inputs passed in, so the matrix is testable without
+/// mutating the process environment -- the same reason `BackendKind::choose` takes this as an
+/// argument rather than calling it.
+///
+/// Deliberately does NOT mirror `resolve_sidecar_program`'s precedence, because it answers a
+/// different question: any one of these being runnable makes the backend startable, so this is an
+/// OR and that is a ranking. One consequence worth knowing: an explicit checkout with nothing built
+/// alongside an installed artifact answers `true` here and still resolves to the checkout there, so
+/// that start does run `npm`. That is the operator's own override doing what it says, not a default
+/// chosen for them.
+fn sidecar_artifact_available(
+    named_binary: Option<&str>,
+    exe_dir: Option<&Path>,
+    checkout: Option<&Path>,
+) -> bool {
+    if named_binary.map(str::trim).is_some_and(|b| !b.is_empty()) {
         return true;
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(PACKAGED_SIDECAR_BINARY)))
-        .is_some_and(|path| path.is_file())
+    if exe_dir.map(|dir| dir.join(PACKAGED_SIDECAR_BINARY)).is_some_and(|path| path.is_file()) {
+        return true;
+    }
+    checkout.is_some_and(|path| prebuilt_artifact_in(path).is_some())
+}
+
+/// The checkout path that would be used, override first, `$HOME` default second. Unvalidated on
+/// purpose: this feeds a "does an artifact exist" probe, and a path that is not a checkout simply
+/// holds no artifact. Refusing belongs in `locate_verdandi_checkout`, where it can say so.
+fn checkout_path_for(explicit: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
 }
 
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
@@ -426,10 +531,18 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
         ),
         SidecarProgram::Checkout(checkout) => {
             let (description, warnings) = describe_checkout(&checkout);
-            // `npm` runs only on this path. A packaged artifact has nothing to build, and reaching
-            // for a build step there would be the bug this branch exists to avoid.
-            let dist_entry = ensure_sidecar_built(&checkout.path)?;
-            (description, warnings, PathBuf::from("node"), vec![dist_entry])
+            match checkout.prebuilt {
+                // The same executable the package ships, found already built in the checkout. Taken
+                // over `node <dist>` deliberately: a developer machine then runs the shape that
+                // ships, and nothing here has to start `npm`.
+                Some(artifact) => (description, warnings, artifact, Vec::new()),
+                // `npm` runs only on this path. A packaged artifact has nothing to build, and
+                // reaching for a build step there would be the bug this branch exists to avoid.
+                None => {
+                    let dist_entry = ensure_sidecar_built(&checkout.path)?;
+                    (description, warnings, PathBuf::from("node"), vec![dist_entry])
+                }
+            }
         }
     };
     eprintln!("agent: {build_description}");
@@ -713,5 +826,120 @@ mod tests {
                 uses[0].trim(),
             );
         }
+    }
+
+    /// Builds a directory that `locate_verdandi_checkout` accepts, optionally holding artifacts.
+    /// Returns the checkout root; the caller removes it.
+    fn fake_checkout(artifacts: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("nv-checkout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("apps/claude-sidecar")).unwrap();
+        std::fs::write(root.join("apps/claude-sidecar/package.json"), b"{}").unwrap();
+        if !artifacts.is_empty() {
+            std::fs::create_dir_all(root.join(CHECKOUT_ARTIFACT_DIR)).unwrap();
+        }
+        for name in artifacts {
+            std::fs::write(root.join(CHECKOUT_ARTIFACT_DIR).join(name), b"#!/bin/sh\nexit 0\n").unwrap();
+        }
+        root
+    }
+
+    /// A platform suffix this machine is definitely not, so a test can plant an artifact that must
+    /// be ignored. Derived from the real mapping rather than hardcoded, so it stays wrong-on-purpose
+    /// on every target instead of only on x86_64 Linux.
+    fn foreign_platform_suffix() -> &'static str {
+        match node_platform_suffix() {
+            Some("darwin-arm64") => "linux-x64",
+            _ => "darwin-arm64",
+        }
+    }
+
+    /// The correction this predicate carries in its own doc, as a test: a checkout that has ALREADY
+    /// built an artifact for this machine makes the sidecar startable, because running it involves
+    /// no build. Before 2026-09-18 this answered `false` and every source build silently stayed on
+    /// the legacy backend -- which is the backend with no partial streaming, so the product's most
+    /// visible complaint was reachable by the default on the machine its author uses.
+    #[test]
+    fn a_checkout_holding_a_built_artifact_counts_as_available() {
+        let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
+        let root = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
+        assert!(sidecar_artifact_available(None, None, Some(&root)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// And the half of the original guarantee that was actually about something: a checkout with
+    /// nothing built still does not count. Counting it would put the first start of a source build
+    /// into `npm ci` and a TypeScript build, with no UI saying why, behind a backend nobody chose.
+    #[test]
+    fn a_checkout_with_nothing_built_is_not_availability() {
+        let root = fake_checkout(&[]);
+        assert!(!sidecar_artifact_available(None, None, Some(&root)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An artifact built for a different machine is not an artifact. `dist-bin/` holds whatever was
+    /// built last and this environment syncs `~/src` to a Mac, so a `linux-x64` binary
+    /// really can be sitting in an arm64 machine's checkout. Picking it would fail at exec with a
+    /// message naming neither the platform nor this decision.
+    #[test]
+    fn an_artifact_built_for_another_platform_is_neither_picked_nor_counted() {
+        let root = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{}", foreign_platform_suffix())]);
+        assert_eq!(prebuilt_artifact_in(&root), None);
+        assert!(!sidecar_artifact_available(None, None, Some(&root)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Several versions in one `dist-bin/` resolve to the newest, the same rule `publish.sh` stages
+    /// with -- so a rebuild takes effect without anyone cleaning the directory first.
+    #[test]
+    fn the_newest_artifact_wins_when_a_checkout_holds_several() {
+        let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
+        let older = format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}");
+        let newer = format!("{PACKAGED_SIDECAR_BINARY}-0.2.0-{suffix}");
+        let root = fake_checkout(&[&older, &newer]);
+        // Written in one loop above, so mtimes can tie at this filesystem's resolution. Make the
+        // ordering real rather than assuming creation order survived.
+        let newer_path = root.join(CHECKOUT_ARTIFACT_DIR).join(&newer);
+        filetime_bump(&newer_path);
+        assert_eq!(prebuilt_artifact_in(&root), Some(newer_path));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Rewrites `path` so its mtime is strictly later than its siblings', without depending on the
+    /// clock: `std::fs::write` stamps the current time, and a second write after a real sleep is the
+    /// only portable way to guarantee a difference on a coarse-resolution filesystem.
+    fn filetime_bump(path: &Path) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+    }
+
+    /// The whole reason for the widening: a checkout with a built artifact runs THAT, not `node` out
+    /// of a `dist/` tree, so a developer machine executes the same binary the package ships.
+    #[test]
+    fn a_checkout_with_a_built_artifact_resolves_to_running_it() {
+        let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
+        let artifact_name = format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}");
+        let root = fake_checkout(&[&artifact_name]);
+        let resolved = resolve_sidecar_program(None, root.to_str(), None).expect("the checkout resolves");
+        let SidecarProgram::Checkout(checkout) = resolved else {
+            panic!("an explicit checkout must resolve to the checkout shape: {resolved:?}");
+        };
+        assert_eq!(checkout.prebuilt, Some(root.join(CHECKOUT_ARTIFACT_DIR).join(&artifact_name)));
+        // And it says so, because "which of the two shapes ran" is not otherwise visible.
+        let (description, _) = describe_checkout(&checkout);
+        assert!(description.contains("prebuilt artifact"), "{description}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A checkout with nothing built keeps the `node <dist>` shape, and says nothing about an
+    /// artifact -- the negative control for the assertion above.
+    #[test]
+    fn a_checkout_with_nothing_built_still_describes_the_node_shape() {
+        let root = fake_checkout(&[]);
+        let resolved = resolve_sidecar_program(None, root.to_str(), None).expect("the checkout resolves");
+        let SidecarProgram::Checkout(checkout) = resolved else { panic!("{resolved:?}") };
+        assert_eq!(checkout.prebuilt, None);
+        let (description, _) = describe_checkout(&checkout);
+        assert!(!description.contains("prebuilt"), "{description}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
