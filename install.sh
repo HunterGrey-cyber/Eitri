@@ -73,7 +73,7 @@ PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "neovibe: n
 # protocol major 1, which this client (major 3) refuses at the handshake. The symptom is a sidecar
 # that exits before binding its socket, which reads as "it will not start" rather than as a version
 # mismatch. So the checkout is stated here, not defaulted.
-VERDANDI="${NEOVIBE_VERDANDI_CHECKOUT:-$HOME/src/verdandi-old-checkout}"
+VERDANDI="${NEOVIBE_VERDANDI_CHECKOUT:-$HOME/src/verdandi}"
 
 if [[ "$BACKEND" == sidecar ]]; then
 	if [[ ! -d "$VERDANDI/apps/claude-sidecar" ]]; then
@@ -131,7 +131,7 @@ echo "  desktop    $APPDIR/neovibe.desktop   (also offered for folders in Files)
 echo
 echo "runtime dependencies this does NOT contain:"
 echo "  nvim, claude            on PATH"
-echo "  a Verdandi checkout     for the sidecar backend -- currently ~/src/verdandi-old-checkout"
+echo "  a Verdandi checkout     for the sidecar backend -- currently ~/src/verdandi"
 echo "                          (node + npm, built on first use)"
 echo
 echo "this is a snapshot: re-run ./install.sh after changing the source."

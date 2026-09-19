@@ -15,7 +15,7 @@ mod watch;
 #[cfg(test)]
 mod runtime_policy_verification;
 
-pub use spawn::EXPECTED_VERDANDI_REVISION;
+pub use spawn::{packaged_sidecar_available, EXPECTED_VERDANDI_REVISION};
 
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,

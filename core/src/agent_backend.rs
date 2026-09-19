@@ -88,10 +88,58 @@ impl BackendKind {
     /// rather than failing to start: a typo must not cost the user their editor, and silently
     /// picking the NEW backend on a typo would be the dangerous direction.
     pub fn from_env() -> Self {
-        match std::env::var("NEOVIBE_AGENT_BACKEND").as_deref().map(str::trim) {
-            Ok("sidecar") => BackendKind::Sidecar,
-            Ok("legacy") | Err(_) => BackendKind::Legacy,
-            Ok(other) => {
+        Self::choose(
+            std::env::var("NEOVIBE_AGENT_BACKEND").ok().as_deref().map(str::trim),
+            agent::packaged_sidecar_available(),
+        )
+    }
+
+    /// [`from_env`](Self::from_env)'s decision, over values a caller supplies.
+    ///
+    /// Separate so the matrix is testable without mutating the process environment, which every
+    /// other test in this binary shares. That is not hygiene for its own sake: the same shape --
+    /// a function taking an override as a signal while reading its value from the environment
+    /// itself -- was a real bug in `locate_verdandi_checkout` earlier the same day, and a test is
+    /// what found it.
+    pub fn choose(explicit: Option<&str>, packaged_sidecar_available: bool) -> Self {
+        match explicit {
+            Some("sidecar") => BackendKind::Sidecar,
+            Some("legacy") => BackendKind::Legacy,
+            // Unset is the interesting case, and it is no longer a constant.
+            //
+            // **The sidecar is the intended backend** -- it has partial streaming, resume, bounded
+            // ingestion and typed permission outcomes, and it is immune to the class of failure
+            // that broke legacy's only permission gate on this host (a wrapper owning `--settings`;
+            // the sidecar delivers its hook as an in-process SDK callback). What kept legacy the
+            // default was never a preference: the sidecar needed a source checkout and Node, which
+            // an installed copy does not have.
+            //
+            // So the default follows what this installation can actually run, and asks a NARROW
+            // question -- is a shipped artifact here? A checkout deliberately does not count: see
+            // `agent::packaged_sidecar_available` for why treating one as availability would make
+            // the backend a property of what happens to be in someone's home directory and stall
+            // the first start on an `npm` build nothing explains.
+            // An empty value is "not set", the way a wrapper script's `VAR=` means it.
+            None | Some("") => {
+                if packaged_sidecar_available {
+                    eprintln!(
+                        "[agent_backend] using the sidecar backend: a packaged sidecar artifact is \
+                         installed beside this binary"
+                    );
+                    BackendKind::Sidecar
+                } else {
+                    // Said every time, not once: on a source build this is the line that explains
+                    // why streaming and resume are missing, and a reader who does not see it will
+                    // look for the reason in the code.
+                    eprintln!(
+                        "[agent_backend] using the legacy backend: no packaged sidecar artifact \
+                         beside this binary. Set NEOVIBE_AGENT_BACKEND=sidecar with a Verdandi \
+                         checkout to use the sidecar from source"
+                    );
+                    BackendKind::Legacy
+                }
+            }
+            Some(other) => {
                 eprintln!(
                     "[agent_backend] NEOVIBE_AGENT_BACKEND={other:?} is not recognized \
                      (expected \"legacy\" or \"sidecar\"); using legacy"
@@ -479,6 +527,42 @@ impl BackendGreeting {
 
 #[cfg(test)]
 mod tests {
+
+    /// The explicit variable wins in both directions, whatever is installed. Someone who names a
+    /// backend is testing that backend, and an installation that happens to carry an artifact must
+    /// not quietly overrule them.
+    #[test]
+    fn an_explicit_choice_beats_what_is_installed() {
+        for available in [true, false] {
+            assert_eq!(BackendKind::choose(Some("sidecar"), available), BackendKind::Sidecar);
+            assert_eq!(BackendKind::choose(Some("legacy"), available), BackendKind::Legacy);
+        }
+    }
+
+    /// The default follows what this installation can actually run. This is the change that makes
+    /// the sidecar the real default the moment the artifact ships -- with no further edit here,
+    /// which is the point: a constant would have to be flipped by hand in a release nobody
+    /// remembers to do it in.
+    #[test]
+    fn with_nothing_set_the_default_is_whichever_backend_this_installation_can_run() {
+        assert_eq!(BackendKind::choose(None, true), BackendKind::Sidecar);
+        assert_eq!(BackendKind::choose(None, false), BackendKind::Legacy);
+    }
+
+    /// `VAR=` in a wrapper script means "not set", and honouring it literally would take the
+    /// unrecognised branch and pin every such launch to legacy however the machine is equipped.
+    #[test]
+    fn an_empty_variable_is_not_a_choice() {
+        assert_eq!(BackendKind::choose(Some(""), true), BackendKind::Sidecar);
+        assert_eq!(BackendKind::choose(Some(""), false), BackendKind::Legacy);
+    }
+
+    /// A typo must not silently select the newer backend -- that is the dangerous direction, and it
+    /// stays legacy even where the sidecar is available.
+    #[test]
+    fn an_unrecognized_value_falls_back_to_legacy_even_where_the_sidecar_is_available() {
+        assert_eq!(BackendKind::choose(Some("sidcar"), true), BackendKind::Legacy);
+    }
     use super::*;
 
     #[test]

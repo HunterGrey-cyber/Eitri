@@ -39,6 +39,20 @@ contents:
   - src: ./target/release/neovibe-claude-handoff
     dst: /usr/lib/neovibe/neovibe-claude-handoff
 
+  # The Verdandi sidecar, as a self-contained executable with no Node runtime dependency (its own
+  # build bundles one). Installed as a SIXTH sibling, under a versionless name: the artifact's own
+  # file name carries its version and architecture, which is right for a download and wrong for an
+  # installed path -- encoding it here would make every sidecar upgrade a change to this file. The
+  # compatibility statement lives in the handshake (protocol major plus sidecar_version).
+  #
+  # Its presence is what makes the sidecar the default: `BackendKind::choose` asks whether a shipped
+  # artifact sits beside the binary, so nothing here has to be flipped when it starts shipping.
+  #
+  # `publish.sh` stages it; see that script for where it comes from and why the build refuses rather
+  # than quietly producing a package that silently falls back to legacy.
+  - src: ./dist/verdandi-claude-sidecar
+    dst: /usr/lib/neovibe/verdandi-claude-sidecar
+
   - src: ./packaging/neovibe.launcher.sh
     dst: /usr/bin/neovibe
   - src: ./packaging/neovibe.desktop

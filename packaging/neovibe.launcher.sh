@@ -28,34 +28,52 @@ while [[ $# -gt 0 ]]; do
 done
 PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "neovibe: no such directory" >&2; exit 1; }
 
-# The sidecar backend needs a Verdandi source checkout, Node and npm; it is not in this package and
-# cannot be until Verdandi's own packaging story exists. So the default is chosen by what is
-# actually present rather than compiled in, and the choice is announced -- an agent panel that
-# silently runs a different backend than you think is the failure this line exists to prevent.
-VERDANDI="${NEOVIBE_VERDANDI_CHECKOUT:-$HOME/src/verdandi-old-checkout}"
-SIDECAR_AVAILABLE=""
-[[ -d "$VERDANDI/apps/claude-sidecar" ]] && SIDECAR_AVAILABLE=1
+# WHO DECIDES THE BACKEND, and why it is no longer this script.
+#
+# It used to choose here, from whether a Verdandi checkout existed. The binary now makes the same
+# decision from a better question -- is a shipped sidecar artifact installed beside it? -- and
+# announces it on stderr (`neovibe_core::agent_backend::BackendKind::choose`). Two places deciding
+# one thing is how they drift, so this script only OVERRIDES, when asked.
+#
+# The artifact is a self-contained executable with no Node runtime dependency, so when it is in the
+# package the sidecar is simply the default: partial streaming, resume, bounded ingestion, and
+# immunity to the wrapper collision that broke legacy's only permission gate on hosts where
+# something owns `--settings`.
+# This default must stay equal to the binary's own
+# (agent::providers::claude_sidecar::spawn::locate_verdandi_checkout). It was
+# ~/src/verdandi-old-checkout, a detached checkout from while Verdandi's
+# protocol-3 merge was outstanding; their main absorbed it on 2026-09-18, and the two
+# defaults pointing at different directories is the drift this section is about.
+VERDANDI="${NEOVIBE_VERDANDI_CHECKOUT:-$HOME/src/verdandi}"
+PACKAGED_SIDECAR="$LIBDIR/verdandi-claude-sidecar"
 
-if [[ -z "$BACKEND" ]]; then
-	if [[ -n "$SIDECAR_AVAILABLE" ]]; then BACKEND=sidecar; else BACKEND=legacy; fi
-fi
-if [[ "$BACKEND" == sidecar && -z "$SIDECAR_AVAILABLE" ]]; then
-	echo "neovibe: --sidecar needs a Verdandi checkout and $VERDANDI is not one." >&2
-	echo "         Set NEOVIBE_VERDANDI_CHECKOUT, or drop --sidecar to use the packaged backend." >&2
+if [[ "$BACKEND" == sidecar && ! -x "$PACKAGED_SIDECAR" && ! -d "$VERDANDI/apps/claude-sidecar" ]]; then
+	echo "neovibe: --sidecar needs either the packaged sidecar at $PACKAGED_SIDECAR" >&2
+	echo "         or a Verdandi checkout; $VERDANDI is not one." >&2
+	echo "         Set NEOVIBE_VERDANDI_CHECKOUT, or drop --sidecar." >&2
 	exit 1
 fi
 
-export NEOVIBE_AGENT_BACKEND="$BACKEND"
-[[ "$BACKEND" == sidecar ]] && export NEOVIBE_VERDANDI_CHECKOUT="$VERDANDI"
+# Only exported when the caller actually chose: an empty value means "not set", and the binary
+# reads that as "decide for yourself".
+[[ -n "$BACKEND" ]] && export NEOVIBE_AGENT_BACKEND="$BACKEND"
+# Handed over only when there is no packaged artifact -- otherwise an unrelated checkout in the
+# operator's home directory would silently outrank the binary that shipped with the product.
+[[ "$BACKEND" == sidecar && ! -x "$PACKAGED_SIDECAR" ]] && export NEOVIBE_VERDANDI_CHECKOUT="$VERDANDI"
 [[ -n "$ACCOUNT" ]] && export VERDANDI_CLAUDE_ACCOUNT="$ACCOUNT"
 
 if [[ -z "$QUIET" ]]; then
 	{
 		echo "neovibe  project $PROJECT"
-		if [[ "$BACKEND" == sidecar ]]; then
-			echo "         backend sidecar -- $VERDANDI @ $(git -C "$VERDANDI" rev-parse --short HEAD 2>/dev/null || echo '?')"
+		# Says what this script did, not what the backend will be -- the binary announces that
+		# itself, from the same decision it acts on. A second guess printed here could disagree
+		# with the first, and the reader has no way to tell which one ran.
+		if [[ -n "$BACKEND" ]]; then
+			echo "         backend $BACKEND (requested here)"
+		elif [[ -x "$PACKAGED_SIDECAR" ]]; then
+			echo "         backend chosen by neovibe; the packaged sidecar is installed"
 		else
-			echo "         backend legacy (self-contained; --sidecar needs a Verdandi checkout)"
+			echo "         backend chosen by neovibe; no packaged sidecar here, so legacy"
 		fi
 		if [[ -n "$ACCOUNT_FROM_FLAG" ]]; then
 			echo "         account $ACCOUNT (--account)"

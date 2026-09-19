@@ -149,6 +149,13 @@ pub(crate) struct VerdandiCheckout {
 /// has to know whether an override was supplied, in order to rank it against a packaged artifact, so
 /// reading it in both places made the value and the decision two separate sources of truth -- a test
 /// could pass one path and this function would use another. Found by exactly that test.
+/// Where a dev machine's Verdandi checkout is looked for when nothing overrides it, relative to
+/// `$HOME`. Named rather than inlined because the packaging scripts carry the same default and
+/// nothing but `packaging_scripts_default_to_the_same_checkout_this_code_does` makes them agree --
+/// they drifted for real: three of them said `verdandi-old-checkout`, a detached checkout from while
+/// Verdandi's protocol-3 merge was outstanding, after their main absorbed it on 2026-09-18.
+const DEFAULT_CHECKOUT_UNDER_HOME: &str = "src/verdandi";
+
 fn locate_verdandi_checkout(explicit: Option<&str>) -> std::io::Result<VerdandiCheckout> {
     let (path, from_override) = match explicit.map(str::trim).filter(|p| !p.is_empty()) {
         Some(path) => (PathBuf::from(path), true),
@@ -159,7 +166,7 @@ fn locate_verdandi_checkout(explicit: Option<&str>) -> std::io::Result<VerdandiC
                     "HOME is unset and NEOVIBE_VERDANDI_CHECKOUT was not provided",
                 )
             })?;
-            (PathBuf::from(home).join("src/verdandi"), false)
+            (PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME), false)
         }
     };
 
@@ -373,6 +380,30 @@ fn resolve_sidecar_program(
         return Ok(SidecarProgram::Packaged(sibling));
     }
     Ok(SidecarProgram::Checkout(locate_verdandi_checkout(None)?))
+}
+
+/// True when a SHIPPED sidecar artifact is available without a checkout.
+///
+/// This is the question "can this installation run the sidecar backend out of the box?", and it is
+/// deliberately narrower than [`resolve_sidecar_program`]: a Verdandi CHECKOUT does not count.
+///
+/// **Why a checkout must not count.** A developer machine has one, and treating it as availability
+/// would silently switch every source build to a backend whose first start runs `npm ci` and a
+/// TypeScript build -- a multi-minute stall with no UI saying why. Worse, it would make the backend
+/// a property of what happens to be in `~/src`, which is not a decision anyone made.
+/// A checkout stays what it has always been: an explicit override, reached through
+/// `NEOVIBE_VERDANDI_CHECKOUT` or `NEOVIBE_AGENT_BACKEND=sidecar`.
+///
+/// So this answers for the shipped shape only, and the moment the artifact is installed beside the
+/// product the default flips for real users with no further change here.
+pub fn packaged_sidecar_available() -> bool {
+    if std::env::var("NEOVIBE_SIDECAR_BINARY").ok().is_some_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(PACKAGED_SIDECAR_BINARY)))
+        .is_some_and(|path| path.is_file())
 }
 
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
@@ -643,5 +674,44 @@ mod tests {
         }
         assert!(exited, "sidecar did not exit within 5s of its stdin being closed");
         let _ = std::fs::remove_file(&sidecar.socket_path);
+    }
+
+    /// The packaging scripts hardcode the same default checkout this code computes, and nothing
+    /// else keeps the two equal. They were not equal: `packaging/neovibe.launcher.sh`,
+    /// `install.sh` and `try-neovibe.sh` all said `~/src/verdandi-old-checkout` -- the
+    /// detached checkout used while Verdandi's protocol-3 merge was outstanding -- while this file
+    /// said `~/src/verdandi`. Both directories exist on the machine that wrote them,
+    /// so the disagreement was invisible: the launcher's own guard would pass against one
+    /// directory and, where it did not export the override, the binary would read the other.
+    ///
+    /// Asserted on the literal text rather than by running the scripts, because the value has to be
+    /// right on a machine where neither directory exists.
+    #[test]
+    fn packaging_scripts_default_to_the_same_checkout_this_code_does() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("agent/ has a parent");
+        let expected = format!("${{NEOVIBE_VERDANDI_CHECKOUT:-$HOME/{DEFAULT_CHECKOUT_UNDER_HOME}}}");
+
+        for script in ["packaging/neovibe.launcher.sh", "install.sh", "try-neovibe.sh", "publish.sh"] {
+            let path = repo_root.join(script);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let uses = text
+                .lines()
+                .filter(|l| l.contains("NEOVIBE_VERDANDI_CHECKOUT:-"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                uses.len(),
+                1,
+                "{script} should name the default checkout exactly once, found {}:\n{}",
+                uses.len(),
+                uses.join("\n"),
+            );
+            assert!(
+                uses[0].contains(&expected),
+                "{script} defaults the Verdandi checkout somewhere this code does not:\n  \
+                 script: {}\n  expected to contain: {expected}",
+                uses[0].trim(),
+            );
+        }
     }
 }
