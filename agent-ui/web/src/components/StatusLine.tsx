@@ -7,7 +7,9 @@ const MODE_LABEL: Record<PanelMode, string> = { browse: "BROWSE", input: "INPUT"
 
 type Props = {
   mode: PanelMode;
-  /** Whether this pane has keyboard focus, from `shell` (`pane_focus`). When it is `false` the
+  /** Whether this pane has keyboard focus AND the window is active, from `shell` (`pane_focus`;
+   *  the window-active half since 2026-09-19 later -- before it, alt-tabbing away left this `true`
+   *  and the block bright, which contradicted the sentence below). When it is `false` the
    *  block still names the mode the panel will be in when focus returns, but it is drawn dim
    *  (`data-focused="false"` in index.css). A bright BROWSE is a claim that keys typed now go
    *  here. Optional and `false` by default, so a caller that never learns the answer shows the

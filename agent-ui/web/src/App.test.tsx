@@ -457,10 +457,19 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     /* jsdom implements no layout: `scrollHeight`/`clientHeight` read 0 for every element, which is
        why `scrollCursorRowBox` always sees "no room to scroll" unless a test overrides them, as
        these two do -- not the true browser geometry, just enough to drive the same arithmetic. */
-    function makeScrollable(box: HTMLElement, { scrollHeight, clientHeight }: { scrollHeight: number; clientHeight: number }) {
+    function makeScrollable(
+      box: HTMLElement,
+      { scrollHeight, clientHeight, boxTop = 100 }: { scrollHeight: number; clientHeight: number; boxTop?: number },
+    ) {
       Object.defineProperty(box, "scrollHeight", { value: scrollHeight, configurable: true });
       Object.defineProperty(box, "clientHeight", { value: clientHeight, configurable: true });
       Object.defineProperty(box, "scrollTop", { value: 0, configurable: true, writable: true });
+      // Where the box sits relative to the list's viewport -- on screen unless a test says
+      // otherwise. jsdom's all-zero rects would read as off screen.
+      const rect = (top: number, bottom: number) => ({ top, bottom }) as DOMRect;
+      box.getBoundingClientRect = () => rect(boxTop, boxTop + clientHeight);
+      const list = box.closest(".message-list") as HTMLElement;
+      list.getBoundingClientRect = () => rect(0, 800);
     }
 
     it("scrolls the box instead of the cursor while it still has room to scroll", () => {
@@ -483,6 +492,23 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       fireEvent.keyDown(conversationRoot(container), { key: "j" });
 
       expect(container.querySelector(".row-current")!.textContent).toContain("after");
+    });
+
+    /* Review finding: with the box scrolled off screen (the user mouse-scrolled the list away), `j`
+       used to scroll the hidden box and change nothing visible. Now the first press brings the row
+       back into view instead. */
+    it("brings the row back into view, rather than scrolling a box that is off screen", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 500, clientHeight: 260, boxTop: -2000 });
+      const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+      scrollIntoView.mockClear();
+
+      fireEvent.keyDown(conversationRoot(container), { key: "j" });
+
+      expect(box.scrollTop).toBe(0);
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
     });
 
     it("scrolls the box upward on k, the same way", () => {

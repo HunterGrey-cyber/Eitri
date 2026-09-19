@@ -86,6 +86,22 @@ const TOOL_RESULT_SCROLL_STEP_PX = 40;
 function scrollCursorRowBox(container: HTMLDivElement | null, direction: 1 | -1): boolean {
   const box = container?.querySelector<HTMLElement>(".row-current .tool-result-body") ?? null;
   if (box === null) return false;
+  // The box can be off screen: the user mouse-scrolled the list elsewhere while the cursor stayed
+  // on this row. Scrolling it then changes nothing visible, and since the cursor does not move the
+  // cursor-follow effect never brings it back -- `j` would look dead for many presses, the very
+  // symptom this function exists to fix (review finding, 2026-09-19 later). So the first press
+  // brings the cursor row back into view and is consumed; the next one scrolls the box as usual.
+  // Tests must mock both rects, because jsdom reports every rect as all zeros, which reads as
+  // "not visible" here. Not looked at on a screen.
+  const list = box.closest(".message-list");
+  if (list !== null) {
+    const b = box.getBoundingClientRect();
+    const l = list.getBoundingClientRect();
+    if (b.bottom <= l.top || b.top >= l.bottom) {
+      box.closest(".row-current")?.scrollIntoView({ block: "nearest" });
+      return true;
+    }
+  }
   const atStart = box.scrollTop <= 0;
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
   if (direction > 0 ? atEnd : atStart) return false;

@@ -20,9 +20,17 @@
 //! tell which one was wrong. With one input and one function, all three agree by construction.
 //! The cost is a `notify::focus-widget` handler.
 //!
-//! **What "focused" means here:** the pane holding the window's focus widget. It does not track
-//! whether the window itself is active. After alt-tabbing away, the indicator still names the pane
-//! that will get the keys on return. It does not dim.
+//! **What "focused" means here:** the pane holding the window's focus widget. The outline and the
+//! status bar label do not track whether the window itself is active: after alt-tabbing away they
+//! still name the pane that will get the keys on return, and they do not dim.
+//!
+//! **The panel's mode block does, since 2026-09-19 (later).** Its own doc (`StatusLine.tsx`) says a
+//! bright BROWSE is a claim that keys typed NOW go there, and that claim is false while another
+//! window is active -- a review finding, since this paragraph used to say nothing dims at all and
+//! the two docs contradicted each other. So `on_side_focus` gets `true` only when the side pane
+//! holds the focus widget AND the window is active, and `notify::is-active` re-runs the same
+//! function. **Not looked at on a screen**: whether `is-active` notifies promptly on this
+//! compositor after an alt-tab was not observed.
 
 use gtk4::prelude::*;
 
@@ -59,8 +67,8 @@ pub(crate) fn status_text(focused: Option<&str>) -> String {
 
 /// Wires the tracker to `window` and applies it once for the current focus.
 ///
-/// `on_side_focus` gets `true` when the pane at `side_index` is the focused one and `false`
-/// otherwise. It is called only when that answer changes, so a focus move between two widgets
+/// `on_side_focus` gets `true` when the pane at `side_index` is the focused one and the window is
+/// active, and `false` otherwise. It is called only when that answer changes, so a focus move between two widgets
 /// inside the editor does not send a WebView dispatch.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
@@ -85,14 +93,17 @@ pub(crate) fn install(
             }
         }
         status_label.set_text(&status_text(focused.map(|i| panes[i].title.as_str())));
-        let side = focused == Some(side_index);
+        let side = focused == Some(side_index) && window.is_active();
         if last_side.get() != Some(side) {
             last_side.set(Some(side));
             on_side_focus(side);
         }
     };
     apply(window);
+    let apply = std::rc::Rc::new(apply);
+    let on_active = apply.clone();
     window.connect_notify_local(Some("focus-widget"), move |window, _| apply(window));
+    window.connect_notify_local(Some("is-active"), move |window, _| on_active(window));
 }
 
 #[cfg(test)]

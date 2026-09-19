@@ -420,59 +420,81 @@ describe("MessageList tool calls and permissions", () => {
   });
 });
 
-/* The other half of "j无法在长输出内部下滑": before this, a new message unconditionally scrolled
-   the view to the bottom, which fought the cursor the moment a user had used `j`/`k` to read
-   something further up -- every streamed delta snapped the viewport straight back down mid-read.
-   The guard reads `.message-list`'s own scroll position, not the cursor: see `MessageList.tsx`'s
-   doc comment on the effect for why gating on the cursor instead would have broken ordinary
-   mouse-only auto-follow for everyone who never touches `j`/`k`. jsdom implements no layout, so
-   `scrollHeight`/`scrollTop`/`clientHeight` all read 0 by default -- which the guard's arithmetic
-   reads as "already at the bottom", which is exactly what every OTHER test in this file relies on
-   for the follow-to-bottom effect to keep firing unconditionally. These two tests are the ones
-   that override those three to reach the other branch at all. */
+/* The other half of "j无法在长输出内部下滑": before this, a new ROW unconditionally scrolled the
+   view to the bottom, which fought the cursor the moment a user had used `j`/`k` to read something
+   further up. (Not every streamed delta, as this comment first said: deltas merge into one
+   transcript entry and never re-ran the effect -- see `MessageList.tsx`'s own comment.) The guard is
+   driven by scroll events on `.message-list`, not by the cursor and not by a measurement taken after
+   the new row is already in the DOM -- see that same comment for why each of those was wrong. jsdom
+   implements no layout and fires no scroll events on its own, so these tests set the three
+   dimensions and dispatch `scroll` themselves. */
+function setScroll(list: HTMLElement, dims: { scrollHeight: number; clientHeight: number; scrollTop: number }) {
+  Object.defineProperty(list, "scrollHeight", { value: dims.scrollHeight, configurable: true });
+  Object.defineProperty(list, "clientHeight", { value: dims.clientHeight, configurable: true });
+  Object.defineProperty(list, "scrollTop", { value: dims.scrollTop, configurable: true, writable: true });
+}
+
 describe("MessageList auto-follow", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
   it("still follows a new item to the bottom when the viewport was already near it", () => {
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    const { rerender } = render(
-      <MessageList state={state({ transcript: texts("first") })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={vi.fn()} />,
-    );
+    const { rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     scrollIntoView.mockClear();
 
-    rerender(
-      <MessageList
-        state={state({ transcript: texts("first", "second") })}
-        sessionEnded={false}
-        expanded={{}}
-        cursor={0}
-        onAnswerPermission={vi.fn()}
-      />,
-    );
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
 
     expect(scrollIntoView).toHaveBeenCalled();
   });
 
-  it("does not fight a user reading further up: skips the follow once the list has scrolled away from the bottom", () => {
+  /* The review's finding: the first guard measured AFTER the new row was in the DOM, so a row taller
+     than the 24px threshold made a user sitting exactly at the bottom look scrolled away. Here the
+     user is at the very bottom, and the new row grows the list by 600px with no scroll event -- which
+     is what real content growth does. Checked against the old guard: it fails this test. */
+  it("still follows when the new row alone is taller than the threshold", () => {
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    const { container, rerender } = render(
-      <MessageList state={state({ transcript: texts("first") })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={vi.fn()} />,
-    );
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
-    Object.defineProperty(list, "scrollHeight", { value: 2000, configurable: true });
-    Object.defineProperty(list, "clientHeight", { value: 400, configurable: true });
-    Object.defineProperty(list, "scrollTop", { value: 0, configurable: true, writable: true });
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2600, clientHeight: 400, scrollTop: 1600 });
     scrollIntoView.mockClear();
 
-    rerender(
-      <MessageList
-        state={state({ transcript: texts("first", "second") })}
-        sessionEnded={false}
-        expanded={{}}
-        cursor={0}
-        onAnswerPermission={vi.fn()}
-      />,
-    );
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
+
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("does not fight a user reading further up: skips the follow once the user scrolled toward the top", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
+    fireEvent.scroll(list);
+    scrollIntoView.mockClear();
+
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
 
     expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("resumes following once the user scrolls back to the bottom", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1590 });
+    fireEvent.scroll(list);
+    scrollIntoView.mockClear();
+
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
+
+    expect(scrollIntoView).toHaveBeenCalled();
   });
 });
 

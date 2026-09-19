@@ -46,24 +46,50 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   // wrote this effect predates prompts being a row and said to keep it exactly as it was --
   // correct then, wrong once `userPrompts` became one more thing that can grow this list.
   //
-  // **Guarded on the list's own scroll position, since 2026-09-19.** Unconditional, this fought
-  // `App.tsx`'s cursor-follow effect (`.row-current`'s own `scrollIntoView`) the moment a turn kept
-  // streaming while the user had used `j`/`k` to read something further up: every new delta snapped
-  // the viewport straight back down mid-read -- half of the owner's "j无法在长输出内部下滑" report,
-  // see the dated record. The guard reads `.message-list`'s actual scroll position rather than the
-  // cursor index on purpose: a great many people never touch `j`/`k` at all and still expect
-  // ordinary chat-style auto-follow while they only type and read, and gating on the cursor (which
-  // defaults to 0 and stays there for exactly those people) would have silently broken that for
-  // them instead of fixing anything. jsdom implements no layout, so `scrollHeight`/`scrollTop`/
-  // `clientHeight` all read 0 there, which this arithmetic reads as "already at the bottom" -- the
-  // guard is therefore a genuine no-op in every test below that does not override those three, and
-  // is why none of them needed to change for it; `MessageList.test.tsx`'s own "auto-follow" tests
-  // cover both branches by overriding them.
-  useEffect(() => {
+  // **Guarded on whether the user has scrolled away from the bottom, since 2026-09-19.**
+  // Unconditional, this fought `App.tsx`'s cursor-follow effect (`.row-current`'s own
+  // `scrollIntoView`) whenever the user had used `j`/`k` to read something further up and a NEW ROW
+  // arrived -- a tool call, a permission card, a new assistant message: the viewport snapped back
+  // down mid-read. Half of the owner's "j无法在长输出内部下滑" report, see the dated record.
+  //
+  // Correction (later the same day, from review): an earlier version of this comment said "every
+  // new delta" snapped the view. That was wrong. Streamed deltas are merged into ONE transcript
+  // entry (`reducer.ts`, `content_delta`), and this effect is keyed only on the four collections'
+  // LENGTHS, so it never ran on a delta at all. The flip side, not fixed here and written down so it
+  // is not mistaken for fixed: **a long reply growing while it streams is never followed** -- not
+  // before this guard, not after it. Only a new row triggers a follow.
+  //
+  // Correction (same review): the first guard measured distance-to-bottom INSIDE this effect, which
+  // runs after the new row is already in the DOM. Any single row taller than
+  // `BOTTOM_FOLLOW_THRESHOLD_PX` therefore made a user sitting exactly at the bottom read as
+  // "scrolled away", and following stopped for good. The decision is now made from SCROLL EVENTS,
+  // which content growth does not produce: `followingRef` turns off only when the list's `scrollTop`
+  // goes DOWN (the user -- wheel, `k`, or the cursor-follow effect moving up -- scrolled toward the
+  // top), and turns back on whenever a scroll event finds the view within the threshold of the
+  // bottom. A smooth scroll toward the bottom only ever increases `scrollTop`, so this effect's own
+  // animation cannot switch following off mid-flight.
+  //
+  // It still reads the list's scroll position rather than the cursor index on purpose: a great
+  // many people never touch `j`/`k` at all and still expect ordinary chat-style auto-follow, and
+  // gating on the cursor (which defaults to 0 and stays there for exactly those people) would have
+  // silently broken that for them. jsdom implements no layout and fires no scroll event on its own,
+  // so every test that does not dispatch one sees `followingRef` at its initial `true`;
+  // `MessageList.test.tsx`'s "auto-follow" tests dispatch them. **Not looked at on a screen.**
+  const followingRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const onScroll = () => {
     const list = listRef.current;
-    const nearBottom =
-      list === null || list.scrollHeight - list.scrollTop - list.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
-    if (nearBottom) {
+    if (list === null) return;
+    const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
+    if (distance <= BOTTOM_FOLLOW_THRESHOLD_PX) {
+      followingRef.current = true;
+    } else if (list.scrollTop < lastScrollTopRef.current) {
+      followingRef.current = false;
+    }
+    lastScrollTopRef.current = list.scrollTop;
+  };
+  useEffect(() => {
+    if (followingRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [state.userPrompts.length, state.transcript.length, state.toolCalls.length, state.pendingPermissions.length]);
@@ -107,7 +133,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   const timeline = useMemo(() => buildTimeline(state), [state]);
 
   return (
-    <div className="message-list" ref={listRef}>
+    <div className="message-list" ref={listRef} onScroll={onScroll}>
       {timeline.map((item, index) => {
         const current = index === cursor;
         switch (item.kind) {
