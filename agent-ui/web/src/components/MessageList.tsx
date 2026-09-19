@@ -145,13 +145,13 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
             // Plain text, never markdown: this is what the user typed, and parsing it would render
             // their literal backticks and asterisks as formatting they did not ask for.
             return (
-              <Row key={item.key} kind="prompt" sign="›" current={current}>
+              <Row key={item.key} kind="prompt" sign="›" current={current} navStop="row">
                 {item.text}
               </Row>
             );
           case "message":
             return (
-              <Row key={item.key} kind="assistant" sign="" current={current}>
+              <Row key={item.key} kind="assistant" sign="" current={current} navStop="row">
                 {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
                     that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
                     -- one function so no caller can run half of it. */}
@@ -160,7 +160,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
             );
           case "tool":
             return (
-              <Row key={item.key} kind="tool" sign={toolSign(item.call)} current={current}>
+              <Row key={item.key} kind="tool" sign={toolSign(item.call)} current={current} navStop="row">
                 <div data-awaiting-permission={awaitingPermission.has(item.call.toolUseId) ? "true" : undefined}>
                   {renderToolCall(item.call, expanded[item.key] === true)}
                   {awaitingPermission.has(item.call.toolUseId) && (
@@ -178,7 +178,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
             );
           case "permission":
             return (
-              <Row key={item.key} kind="permission" sign="!" current={current}>
+              <Row key={item.key} kind="permission" sign="!" current={current} navStop="row">
                 <PermissionCard request={item.request} sessionEnded={sessionEnded} onAnswer={onAnswerPermission} />
               </Row>
             );

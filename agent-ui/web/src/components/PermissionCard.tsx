@@ -48,14 +48,18 @@ export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
       <ToolInput toolName={request.toolName} input={request.input} />
       <input
         type="text"
+        data-nav-order={3}
         placeholder="Reason (shown to the agent if you deny)"
         value={reason}
         onChange={(e) => setReason(e.target.value)}
         disabled={inert}
       />
       <div className="permission-card-buttons">
-        <button onClick={() => handleAnswer("allow")} disabled={inert}>Approve</button>
-        <button onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
+        {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the reason
+            box above them. `data-nav-action` is how `a`/`d` press these very buttons, so the card's
+            own `inert`/`answered` guard against a double answer applies to the keyboard too. */}
+        <button data-nav-order={1} data-nav-action="allow" onClick={() => handleAnswer("allow")} disabled={inert}>Approve</button>
+        <button data-nav-order={2} data-nav-action="deny" onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
       </div>
       {sessionEnded && !answered && (
         <div className="permission-card-stale">

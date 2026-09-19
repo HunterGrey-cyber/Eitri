@@ -687,15 +687,18 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        environment -- Enter's BROWSE action is "expand the current row", and a tool call with no
        result yet renders identically expanded or not, so it would assert nothing. The guard is one
        selector test shared by every key, so what holds for `y` holds for Enter. */
-    it("does not run a BROWSE action when the key came from a button", () => {
+    /* Narrowed 2026-09-19, deliberately. This used to assert that NO key from a focused button runs a
+       BROWSE action, with `y` standing in for Enter. Since every control became keyboard-reachable
+       (`./nav`), a focused button is an ordinary place for the keys to be, so `h`/`j`/`k`/`l` from
+       it must still navigate. What the original regression needs is narrower and is asserted
+       directly: Enter and Space from a button are left to the button. */
+    it("leaves Enter and Space on a focused button to the button, and still navigates from it", () => {
       const { container } = withAToolCallAndAPermission();
-      const clipboard = stubClipboard();
-      fireEvent.keyDown(buttonLabelled(container, "Approve")!, { key: "y" });
-      expect(clipboard.writeText).not.toHaveBeenCalled();
-      // The same key at the panel root still DOES act -- otherwise this would pass with the whole
-      // handler deleted.
-      fireEvent.keyDown(conversationRoot(container), { key: "y" });
-      expect(clipboard.writeText).toHaveBeenCalledWith(JSON.stringify({ cmd: "ls" }, null, 2));
+      const approve = buttonLabelled(container, "Approve")!;
+      // `fireEvent` returns false when the handler called preventDefault, i.e. claimed the key.
+      expect(fireEvent.keyDown(approve, { key: "Enter" })).toBe(true);
+      expect(fireEvent.keyDown(approve, { key: " " })).toBe(true);
+      expect(fireEvent.keyDown(approve, { key: "k" })).toBe(false);
     });
 
     /* `<summary>` is the third activatable shape in this panel (the generic tool card's
@@ -737,6 +740,113 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       fireEvent.keyDown(document.activeElement!, { key: "r" });
       expect(container.querySelector(".mode-selector")).not.toBeNull();
     });
+  });
+});
+
+describe("App keyboard: every control is reachable with hjkl", () => {
+  function started(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  /** Presses `key` wherever focus is, the way a real key arrives. */
+  const press = (key: string) => fireEvent.keyDown(document.activeElement ?? document.body, { key });
+
+  /** A running turn with a tool call and the card gating it, on a provider that can interrupt, so
+   *  the status line has a Stop button below the rows. */
+  function withACardAndStop() {
+    const rendered = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    act(() => root(rendered.container).focus());
+    return rendered;
+  }
+
+  it("a on the tool call answers the card that gates it, without moving onto the card", () => {
+    withACardAndStop();
+    press("a");
+    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+  });
+
+  it("d on the card itself denies it", () => {
+    withACardAndStop();
+    press("j");
+    press("d");
+    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "deny" });
+  });
+
+  it("l walks the card's Approve, Deny and reason box; h and Esc come back to the row", () => {
+    const { container } = withACardAndStop();
+    press("j");
+    press("l");
+    expect(document.activeElement?.textContent).toBe("Approve");
+    press("l");
+    expect(document.activeElement?.textContent).toBe("Deny");
+    press("h");
+    press("h");
+    expect(document.activeElement).toBe(root(container));
+    press("l");
+    press("l");
+    press("l");
+    expect((document.activeElement as HTMLElement).tagName).toBe("INPUT");
+    // In the reason box letters are text, so only Esc leaves it.
+    expect(press("h")).toBe(true);
+    press("Escape");
+    expect(document.activeElement).toBe(root(container));
+  });
+
+  it("j past the last row lands on Stop, draws the row cursor hollow, and k comes back", () => {
+    const { container } = withACardAndStop();
+    press("j");
+    press("j");
+    expect(document.activeElement?.textContent).toBe("Stop");
+    expect(container.querySelector(".message-list")!.getAttribute("data-focused")).toBe("false");
+    press("k");
+    expect(document.activeElement).toBe(root(container));
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+  });
+
+  it("does not answer a card from Stop, where the row cursor is not what the keys act on", () => {
+    withACardAndStop();
+    press("j");
+    press("j");
+    press("a");
+    expect(lastOfType("permission_response")).toBeUndefined();
+  });
+
+  it("hands a key that lands on <body> back to the panel", () => {
+    const { container } = withACardAndStop();
+    act(() => (document.activeElement as HTMLElement).blur());
+    expect(document.activeElement).toBe(document.body);
+    act(() => {
+      fireEvent.keyDown(document.body, { key: "j" });
+    });
+    expect(document.activeElement).toBe(root(container));
+    // And the key itself was not lost: the cursor moved onto the card.
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+  });
+
+  it("walks the start screen's buttons with j and k", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const modes = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="mode"]'));
+    expect(modes).toHaveLength(2);
+    press("j");
+    expect(document.activeElement).toBe(modes[0]);
+    press("j");
+    expect(document.activeElement).toBe(modes[1]);
+    press("j");
+    expect(document.activeElement).toBe(modes[1]);
+    press("k");
+    expect(document.activeElement).toBe(modes[0]);
   });
 });
 

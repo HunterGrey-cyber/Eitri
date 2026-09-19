@@ -6,6 +6,8 @@ import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
 import type { KeyLike, PanelMode } from "./keymap";
 import { buildTimeline } from "./timeline";
+import { controlsOf, currentStop, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
+import type { AnswerableItem } from "./nav";
 import type { TimelineItem } from "./timeline";
 import { ModeSelector } from "./components/ModeSelector";
 import { Composer } from "./components/Composer";
@@ -209,11 +211,28 @@ export default function App() {
    *  is also passed to `Composer` as `focusRequest`, which re-focuses a textarea that is already
    *  mounted, since `setMode("input")` alone does nothing when the mode was already INPUT. */
   const [inputRequest, setInputRequest] = useState(0);
+  /** Whether keyboard focus is on a stop that is NOT a conversation row -- a banner's Dismiss, the
+   *  status line's Stop, the handoff button (`./nav`). While it is, the row cursor is drawn hollow,
+   *  the same way it is when another pane has the keys: it is where `k` brings you back to, and it
+   *  is not what the keys act on now. Derived from DOM focus (`onFocus` on the root), never set by
+   *  the key handler alone, so a click or a `Tab` onto one of those buttons agrees with `j`/`k`. */
+  const [edgeFocused, setEdgeFocused] = useState(false);
   /** The index into `timeline` that `j`/`k` move and `Enter`/`y` act on. */
   const [cursor, setCursor] = useState(0);
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
    *  `MessageList`'s own copy of this memo for why it is keyed on `state` as a whole. */
   const timeline = useMemo(() => buildTimeline(state), [state]);
+  const answerableItems = useMemo(
+    (): AnswerableItem[] =>
+      timeline.map((item) =>
+        item.kind === "permission"
+          ? { kind: "permission", toolUseId: item.request.toolUseId }
+          : item.kind === "tool"
+            ? { kind: "tool", toolUseId: item.call.toolUseId }
+            : { kind: "other" },
+      ),
+    [timeline],
+  );
   /** Kept focused so BROWSE's keydown handler actually receives keys: a keydown bubbles from
    *  whatever DOM node has real focus, which is a browser fact, not a React one. `Escape` leaving
    *  INPUT removes the composer's textarea from the DOM, which drops focus onto whatever the
@@ -232,6 +251,41 @@ export default function App() {
     if (isEditableElement(document.activeElement)) return;
     containerRef.current?.focus();
   }, [mode, sessionStarted]);
+  /* Keys that land on <body> are handed back to the panel. That happens whenever the focused
+     control stops existing or stops being focusable: a Dismiss that removes its own banner, an
+     Approve that goes disabled once answered. A browser moves focus to <body> in both cases without
+     reliably firing `blur` (a removed node fires nothing), and a disabled button receives no key
+     events, so the next key would sail past `onKeyDown` and the panel would stop answering its own
+     keys. The key is REPLAYED on the root rather than dropped, so the keystroke that noticed the
+     problem still does what it says. The replay targets the root, so it never re-enters here. */
+  useEffect(() => {
+    function onDocumentKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.target !== document.body && event.target !== document.documentElement) return;
+      const root = containerRef.current ?? startScreenRef.current;
+      if (root === null) return;
+      root.focus({ preventScroll: true });
+      const replay = new globalThis.KeyboardEvent("keydown", {
+        key: event.key,
+        code: event.code,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        metaKey: event.metaKey,
+        bubbles: true,
+        cancelable: true,
+      });
+      if (!root.dispatchEvent(replay)) event.preventDefault();
+    }
+    document.addEventListener("keydown", onDocumentKeyDown);
+    return () => document.removeEventListener("keydown", onDocumentKeyDown);
+  }, []);
+  // The same removal leaves `edgeFocused` claiming a banner that is gone, since no focus event
+  // announced its disappearance. Any render after it corrects that, so the row cursor goes solid
+  // again as soon as the banner is gone rather than on the next keypress.
+  useEffect(() => {
+    if (edgeFocused && !containerRef.current?.contains(document.activeElement)) setEdgeFocused(false);
+  });
+
   /* The cursor is an index into `timeline`, which shrinks on its own -- a permission card resolving
      removes one row without anything here asking for it. Without this, a cursor left pointing past
      the new end copies/expands nothing (`timeline[cursor]` is `undefined`) rather than sliding onto
@@ -555,9 +609,26 @@ export default function App() {
    *  ever mean, because it only exists in a state where the session has already ended and there is
    *  no live conversation row left to compete with it for the key. */
   function handleStartScreenKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (handoff === null) return;
     if (isEditableElement(event.target)) return;
-    if (event.key !== "y" || event.nativeEvent.isComposing || event.ctrlKey || event.shiftKey) return;
+    if (event.nativeEvent.isComposing || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const root = startScreenRef.current;
+    // The same structural reach as the conversation (`./nav`), over the start screen's stops: each
+    // conversation choice and each mode button, top to bottom, plus any banner. There is no row
+    // cursor here, so every stop is reached by focusing it and Enter/Space activate it natively.
+    if (root !== null && (event.key === "j" || event.key === "k")) {
+      event.preventDefault();
+      const target = nextStop(root, null, event.key === "j" ? 1 : -1);
+      if (target !== null) controlsOf(target)[0]?.focus();
+      return;
+    }
+    if (root !== null && (event.key === "h" || event.key === "l")) {
+      event.preventDefault();
+      const stop = currentStop(root, null);
+      const target = stop === null ? null : nextControl(stop, event.key === "l" ? 1 : -1);
+      if (target instanceof HTMLElement) target.focus();
+      return;
+    }
+    if (handoff === null || event.key !== "y") return;
     event.preventDefault();
     void navigator.clipboard?.writeText(handoff.command);
   }
@@ -567,7 +638,7 @@ export default function App() {
      the time it could be read. */
   const commandNoticeBanner =
     commandNotice === null ? null : (
-      <div className="command-notice" role="alert">
+      <div className="command-notice" role="alert" data-nav-stop="notice">
         <span>{commandNotice}</span>
         <button onClick={() => setCommandNotice(null)}>Dismiss</button>
       </div>
@@ -575,7 +646,7 @@ export default function App() {
 
   const errorBanner =
     fatalError === null ? null : (
-      <div className="fatal-error" role="alert">
+      <div className="fatal-error" role="alert" data-nav-stop="error">
         <strong>The agent session ended.</strong>
         {/* <pre>, not a <p>: the sidecar's startup diagnostics are multi-line and the exact text
             (a CLI version, a checkout revision) is the whole point. */}
@@ -623,30 +694,64 @@ export default function App() {
    *  only keyboard route to Approve/Deny/Stop/Dismiss/Cancel. That was a real, reported regression,
    *  not a hypothetical. */
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (isEditableElement(event.target) && !(event.target as HTMLElement).closest(".composer")) return;
-    if (isActivatableControl(event.target)) return;
-    const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, {
-      cursor,
-      itemCount: timeline.length,
-      sessionEnded,
-    });
+    const root = containerRef.current;
+    if (isEditableElement(event.target) && !(event.target as HTMLElement).closest(".composer")) {
+      // A text box inside a row (a permission card's reason) takes every key as text, except Esc,
+      // which hands the keys back to the row it sits in. Esc mid-composition still belongs to the
+      // input method, as it does in the composer.
+      if (event.key === "Escape" && !event.nativeEvent.isComposing && root !== null) {
+        event.preventDefault();
+        root.focus({ preventScroll: true });
+      }
+      return;
+    }
+    // A focused button activates on Enter and Space natively; claiming those would swallow the only
+    // keyboard route to Approve (found by the owner on an installed build). Every OTHER key still
+    // reaches the table, which is what lets `h`/`j`/`k`/`l` carry on from a focused button.
+    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
+    const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, { sessionEnded });
     if (action === null) return;
-    // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move the
-    // cursor off it -- the vim behaviour the owner expected, and the reason this check cannot live
-    // in `resolveKey` itself is spelled out on `scrollCursorRowBox`'s own doc comment. Only "cursor"
-    // actions come from `j`/`k` today, so `event.key` alone is enough to tell which direction was
-    // pressed; nothing else in `./keymap`'s table returns this action kind.
-    if (action.kind === "cursor" && scrollCursorRowBox(containerRef.current, event.key === "j" ? 1 : -1)) {
+    // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move off it
+    // -- the vim behaviour the owner expected; `scrollCursorRowBox`'s own doc says why this cannot
+    // live in `resolveKey`. Only while the row cursor has the keys: from a banner's button, `j` is a
+    // move, not a scroll of a row that is not current.
+    if (action.kind === "move" && !edgeFocused && scrollCursorRowBox(root, action.delta)) {
       event.preventDefault();
+      return;
+    }
+    if (action.kind === "move" || action.kind === "control" || action.kind === "answer") {
+      event.preventDefault();
+      if (root === null) return;
+      if (action.kind === "move") {
+        const target = nextStop(root, cursor, action.delta);
+        if (target === null) return;
+        const row = rowIndexOf(root, target);
+        if (row !== null) {
+          setCursor(row);
+          root.focus({ preventScroll: true });
+        } else {
+          controlsOf(target)[0]?.focus();
+        }
+      } else if (action.kind === "control") {
+        const stop = currentStop(root, cursor);
+        const target = stop === null ? null : nextControl(stop, action.delta);
+        if (target === "stop") root.focus({ preventScroll: true });
+        else target?.focus();
+      } else if (!edgeFocused) {
+        // `a`/`d` press the card's own button, so its guard against a second answer applies here
+        // too. Not from a banner's button: the row cursor is hollow there, and not what keys act on.
+        const target = permissionTarget(answerableItems, cursor);
+        const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
+        const button =
+          target === null ? null : rows[target]?.querySelector<HTMLButtonElement>(`[data-nav-action="${action.decision}"]`);
+        button?.click();
+      }
       return;
     }
     event.preventDefault();
     switch (action.kind) {
       case "mode":
         setMode(action.to);
-        break;
-      case "cursor":
-        setCursor(action.to);
         break;
       case "toggle-expand": {
         // Keyed on the timeline KEY, not the cursor index -- see the doc comment on `expanded`
@@ -705,13 +810,17 @@ export default function App() {
       // effect above `onKeyDown` that keeps focus here whenever `mode` is "browse".
       tabIndex={0}
       onKeyDown={onKeyDown}
+      onFocus={(event) => {
+        const stop = (event.target as HTMLElement).closest("[data-nav-stop]");
+        setEdgeFocused(stop !== null && stop.getAttribute("data-nav-stop") !== "row");
+      }}
     >
       <Winbar state={state} permissionMode={startedPermissionMode} />
       {errorBanner}
       {/* `sessionEnded` makes every pending card inert. The cards themselves are NOT removed: a
           permission that was still open when the session died is real history, and deleting it
           would read as a resolution nobody made. */}
-      <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused} onAnswerPermission={answerPermission} />
+      <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused && !edgeFocused} onAnswerPermission={answerPermission} />
       {sessionEndedBanner}
       {commandNoticeBanner}
       <StatusLine

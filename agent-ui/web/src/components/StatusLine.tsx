@@ -40,7 +40,7 @@ export function StatusLine({ mode, paneFocused = false, state, position, canInte
   // session that dies some OTHER way (nothing here has found one) from reading "working" forever.
   const working = state.status.kind === "running" && state.activeTurnId !== null;
   return (
-    <div className="status-line">
+    <div className="status-line" data-nav-stop="status">
       <span
         className="mode-block"
         data-mode={mode}

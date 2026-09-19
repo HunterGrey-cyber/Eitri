@@ -3,7 +3,7 @@ import { resolveKey } from "./keymap";
 
 const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; isComposing: boolean }> = {}) =>
   ({ key: k, ctrlKey: false, shiftKey: false, isComposing: false, ...over });
-const ctx = { cursor: 1, itemCount: 4, sessionEnded: false };
+const ctx = { sessionEnded: false };
 
 describe("resolveKey", () => {
   it("enters INPUT on i and leaves it on Esc", () => {
@@ -15,16 +15,27 @@ describe("resolveKey", () => {
     expect(resolveKey("input", key("Escape", { isComposing: true }), ctx)).toBeNull();
   });
 
-  it("moves the cursor with j and k, and stops at both ends", () => {
-    expect(resolveKey("browse", key("j"), ctx)).toEqual({ kind: "cursor", to: 2 });
-    expect(resolveKey("browse", key("k"), ctx)).toEqual({ kind: "cursor", to: 0 });
-    expect(resolveKey("browse", key("k"), { ...ctx, cursor: 0 })).toEqual({ kind: "cursor", to: 0 });
-    expect(resolveKey("browse", key("j"), { ...ctx, cursor: 3 })).toEqual({ kind: "cursor", to: 3 });
+  it("moves between stops with j and k, and between a stop's controls with h and l", () => {
+    // Which stop or control that is depends on the document, so the table only names a direction.
+    // The clamping at both ends lives in `./nav` and is tested there.
+    expect(resolveKey("browse", key("j"), ctx)).toEqual({ kind: "move", delta: 1 });
+    expect(resolveKey("browse", key("k"), ctx)).toEqual({ kind: "move", delta: -1 });
+    expect(resolveKey("browse", key("l"), ctx)).toEqual({ kind: "control", delta: 1 });
+    expect(resolveKey("browse", key("h"), ctx)).toEqual({ kind: "control", delta: -1 });
+  });
+
+  it("answers a permission with a and d, but never on a session that ended", () => {
+    expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
+    expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+    expect(resolveKey("browse", key("a"), { sessionEnded: true })).toBeNull();
+    expect(resolveKey("browse", key("d"), { sessionEnded: true })).toBeNull();
+    // Typing an `a` into the composer is typing an `a`.
+    expect(resolveKey("input", key("a"), ctx)).toBeNull();
   });
 
   it("offers restart only on a session that ended", () => {
     expect(resolveKey("browse", key("r"), ctx)).toBeNull();
-    expect(resolveKey("browse", key("r"), { ...ctx, sessionEnded: true })).toEqual({ kind: "restart" });
+    expect(resolveKey("browse", key("r"), { sessionEnded: true })).toEqual({ kind: "restart" });
   });
 
   /* The other direction of the same flag, and the reason it is one flag: INPUT on a dead session
@@ -36,9 +47,9 @@ describe("resolveKey", () => {
      screen promises `i` either. */
   it("refuses i on a session that ended, because INPUT there has no box and drops r", () => {
     expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input" });
-    expect(resolveKey("browse", key("i"), { ...ctx, sessionEnded: true })).toBeNull();
+    expect(resolveKey("browse", key("i"), { sessionEnded: true })).toBeNull();
     // Still nothing but Escape once in INPUT -- which is why the entrance is what had to close.
-    expect(resolveKey("input", key("r"), { ...ctx, sessionEnded: true })).toBeNull();
+    expect(resolveKey("input", key("r"), { sessionEnded: true })).toBeNull();
   });
 
   it("ignores browse keys while typing", () => {
@@ -53,7 +64,7 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("i", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("j", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("y", { shiftKey: true }), ctx)).toBeNull();
-    expect(resolveKey("browse", key("r", { ctrlKey: true }), { ...ctx, sessionEnded: true })).toBeNull();
+    expect(resolveKey("browse", key("r", { ctrlKey: true }), { sessionEnded: true })).toBeNull();
     expect(resolveKey("input", key("Escape", { shiftKey: true }), ctx)).toBeNull();
   });
 });

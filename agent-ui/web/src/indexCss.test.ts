@@ -23,8 +23,9 @@ const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
 /** A selector branch that sits inside the winbar or the status line -- `.winbar`, `.status-line`,
  *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
-/** The panel cursor's solid block: the current row's sign cell and nothing else. */
-const CURSOR_BRANCH = /^\.row-current \.row-sign$/;
+/** The solid cursor block: the current row's sign cell, and a focused button with its children
+ *  (every control is keyboard-reachable and the selected one is drawn as the cursor). Nothing else. */
+const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?)$/;
 
 /**
  * The rule this file actually enforces, in one sentence: **a colour may be used as text only where
@@ -167,6 +168,17 @@ describe("index.css", () => {
     );
     expect(declarations).toEqual(["color: var(--nv-chrome-muted);"]);
     expect(declarations[0]).not.toMatch(/^color: var\(--nv-(fg|muted)\);$/);
+  });
+
+  it("admits --nv-bg as text on a focused button only where the rule paints the --nv-fg fill", () => {
+    const rule = ".agent-ui-root button:focus, .agent-ui-root button:focus * { background: var(--nv-fg); color: var(--nv-bg); }";
+    expect(unguardedTextColorDeclarations(rule)).toEqual([]);
+    expect(unguardedTextColorDeclarations(".agent-ui-root button:focus { color: var(--nv-bg); }")).toEqual([
+      "color: var(--nv-bg);",
+    ]);
+    expect(unguardedTextColorDeclarations(".agent-ui-root button { background: var(--nv-fg); color: var(--nv-bg); }")).toEqual([
+      "color: var(--nv-bg);",
+    ]);
   });
 
   it("admits --nv-bg as text only on the cursor cell that is filled with --nv-fg", () => {
@@ -377,6 +389,35 @@ describe("index.css cascade (which rule actually wins)", () => {
     // control is the weaker "later, equal-specificity shorthand", which is enough to show the
     // assertion above can fail. cssstyle drops a var() shorthand entirely, hence the empty string.
     expect(clobbered.borderLeftColor).not.toBe("var(--nv-mode-input)");
+  });
+
+  it("draws a focused button as the solid cursor, even a mode button whose own rule ties it", () => {
+    // `.mode-selector button:not(.row-choice)` is (0,2,1), the same as the focus rule, so only
+    // source order makes the focus rule win. The negative control re-declares it after.
+    const html = `<div class="agent-ui-root mode-selector"><button type="button">Auto<span class="detail">d</span></button></div>`;
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = html;
+    const button = document.body.querySelector("button")!;
+    button.focus();
+    expect(getComputedStyle(button).background).toBe("var(--nv-fg)");
+    expect(getComputedStyle(button).color).toBe("var(--nv-bg)");
+    expect(getComputedStyle(button.querySelector(".detail")!).color).toBe("var(--nv-bg)");
+    document.head.innerHTML = `<style>${css}.mode-selector button:not(.row-choice) { background: var(--nv-bg); }</style>`;
+    expect(getComputedStyle(button).background).toBe("var(--nv-bg)");
+  });
+
+  it("steps the row cursor back to hollow while a control inside the row has focus", () => {
+    const html = `<div class="message-list" data-focused="true"><div class="row row-permission row-current"><span class="row-sign">!</span><div class="row-body"><button type="button">Approve</button></div></div></div>`;
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = html;
+    expect(getComputedStyle(document.body.querySelector(".row-sign")!).background).toBe("var(--nv-fg)");
+    // A fresh copy for the focused state: jsdom does not recompute an element's style when focus
+    // moves, so reading the same element twice would return the first answer.
+    document.body.innerHTML = html;
+    document.body.querySelector("button")!.focus();
+    const sign = document.body.querySelector<HTMLElement>(".row-sign")!;
+    expect(getComputedStyle(sign).background).not.toBe("var(--nv-fg)");
+    expect(getComputedStyle(sign).boxShadow).toBe("inset 0 0 0 1.5px var(--nv-fg)");
   });
 
   it("draws the panel's cursor solid with focus and hollow without", () => {

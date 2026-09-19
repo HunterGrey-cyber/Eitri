@@ -109,6 +109,7 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
               kind="choice"
               sign="›"
               role="radio"
+              navStop="choice"
               aria-checked={selected === null}
               className={selected === null ? "selected" : undefined}
               onClick={() => setSelectedSessionId(null)}
@@ -126,6 +127,7 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
                   kind="choice"
                   sign="↺"
                   role="radio"
+                  navStop="choice"
                   aria-checked={checked}
                   className={checked ? "resume selected" : "resume"}
                   onClick={() => setSelectedSessionId(session.providerSessionId)}
@@ -148,6 +150,7 @@ export function ModeSelector({ hello, connecting, onStart }: Props) {
       {hello.permissionModes.map((mode) => (
         <button
           key={mode}
+          data-nav-stop="mode"
           onClick={() => onStart(mode, selected === null ? undefined : selected.providerSessionId)}
         >
           <strong>{MODE_LABELS[mode].title}</strong>

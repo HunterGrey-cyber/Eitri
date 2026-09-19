@@ -798,3 +798,29 @@ body,
    a line-level diff tint is expected to. */
 .hljs-addition { display: block; background: color-mix(in srgb, var(--nv-ok) 15%, transparent); }
 .hljs-deletion { display: block; background: color-mix(in srgb, var(--nv-error) 15%, transparent); }
+
+/* The selected control is drawn as a cursor, the same solid block as everywhere else in the window
+   (2026-09-19): `h`/`l`/`j`/`k` reach every button (`./nav`), and "the keys go here" is said one
+   way -- solid -- whether it is the editor's block, a row's sign cell, the top bar's item or a
+   button. The selected control IS the focused one, so a click and `Tab` show the same thing.
+   `* ` recolours the button's own children (a mode button's description, a choice row's cells),
+   which would otherwise keep their muted colours on the fg fill and vanish.
+
+   `--nv-bg` text on an `--nv-fg` fill is the body's own guarded pair reversed, so the same
+   contrast; `indexCss.test.ts` admits `--nv-bg` as text only in a rule that is entirely these two
+   selectors and paints that fill. LAST in the file on purpose: `.mode-selector
+   button:not(.row-choice)` and its `:hover` have the same (0,2,1) specificity and would otherwise
+   win back the fill, which the cascade test checks. */
+.agent-ui-root button:focus,
+.agent-ui-root button:focus * {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+  outline: none;
+}
+/* A control inside the current row has the keys, so the row's own cursor steps back to hollow:
+   one solid mark at a time, and the hollow one says which row `h` returns to. */
+.message-list .row-current:focus-within .row-sign {
+  background: none;
+  color: var(--nv-fg);
+  box-shadow: inset 0 0 0 1.5px var(--nv-fg);
+}
