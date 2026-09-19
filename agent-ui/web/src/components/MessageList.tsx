@@ -30,13 +30,29 @@ function toolSign(call: ToolCallRecord): string {
   return call.result.isError ? "✗" : "✓";
 }
 
+/** How close to the true bottom of `.message-list` still counts as "following the tail," for the
+ *  auto-follow guard below. Some slack rather than an exact `0`: a smooth scroll already in flight,
+ *  or ordinary sub-pixel rounding, can leave the true bottom a few pixels away even though the user
+ *  never scrolled up on purpose. Arbitrary and not tuned against a real screen. */
+const BOTTOM_FOLLOW_THRESHOLD_PX = 24;
+
 export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPermission }: Props) {
+  const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Include `userPrompts` among the effect dependencies. A fresh prompt can add a row without
-  // changing transcript, tool-call, or permission counts, and must still scroll into view.
+  // Include `userPrompts` because a prompt can add a row without changing the other collections.
+  // Follow only when `.message-list` is near the bottom, so a new row cannot pull a reader down
+  // from an earlier row reached with `j`/`k`. Use scroll position rather than cursor index so
+  // mouse-only readers, whose cursor stays at zero, can still follow. jsdom reports zero for
+  // `scrollHeight`, `scrollTop`, and `clientHeight`, which reads as already at the bottom. The
+  // auto-follow tests override those dimensions to exercise both branches.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const list = listRef.current;
+    const nearBottom =
+      list === null || list.scrollHeight - list.scrollTop - list.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
+    if (nearBottom) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [state.userPrompts.length, state.transcript.length, state.toolCalls.length, state.pendingPermissions.length]);
 
   /* Match pending permissions to tool calls by `tool_use_id`, since several calls of the same
@@ -65,7 +81,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   const timeline = useMemo(() => buildTimeline(state), [state]);
 
   return (
-    <div className="message-list">
+    <div className="message-list" ref={listRef}>
       {timeline.map((item, index) => {
         const current = index === cursor;
         switch (item.kind) {

@@ -379,6 +379,87 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector(".row-current")!.textContent).toContain("second");
   });
 
+  /* Moving the cursor with `j` must scroll its row into view, or movement below the viewport is invisible.
+     jsdom has no layout, so this checks the call to the right element's `scrollIntoView`.
+     Actual row visibility needs a browser check. */
+  it("scrolls the cursor row into view when j/k move the cursor", () => {
+    const { container } = startedApp();
+    events(
+      { type: "user_prompt_submitted", text: "first" },
+      { type: "user_prompt_submitted", text: "second" },
+    );
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoView.mockClear();
+
+    fireEvent.keyDown(conversationRoot(container), { key: "j" });
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+    expect(container.querySelector(".row-current")!.textContent).toContain("second");
+  });
+
+  /* An expanded tool result can scroll inside `.tool-result-body` past its 260px fold.
+     `j`/`k` must scroll that box before moving off the row, until it cannot move in that direction.
+     `scrollCursorRowBox` in `App.tsx` handles this. */
+  describe("j/k scroll a long tool result before moving off it", () => {
+    function startedAppWithExpandedResult() {
+      const rendered = startedApp();
+      events(
+        { type: "user_prompt_submitted", text: "before" },
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "long" } },
+        { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_1", content: "a lot of output", is_error: false },
+        { type: "user_prompt_submitted", text: "after" },
+      );
+      const root = conversationRoot(rendered.container);
+      fireEvent.keyDown(root, { key: "j" }); // cursor: prompt "before" -> the tool row
+      fireEvent.keyDown(root, { key: "Enter" }); // unfold its result, so `.tool-result-body` exists
+      expect(rendered.container.querySelector(".row-current .tool-result-body")).not.toBeNull();
+      return rendered;
+    }
+
+    /* jsdom implements no layout: `scrollHeight`/`clientHeight` read 0 for every element, which is
+       why `scrollCursorRowBox` always sees "no room to scroll" unless a test overrides them, as
+       these two do -- not the true browser geometry, just enough to drive the same arithmetic. */
+    function makeScrollable(box: HTMLElement, { scrollHeight, clientHeight }: { scrollHeight: number; clientHeight: number }) {
+      Object.defineProperty(box, "scrollHeight", { value: scrollHeight, configurable: true });
+      Object.defineProperty(box, "clientHeight", { value: clientHeight, configurable: true });
+      Object.defineProperty(box, "scrollTop", { value: 0, configurable: true, writable: true });
+    }
+
+    it("scrolls the box instead of the cursor while it still has room to scroll", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 500, clientHeight: 260 });
+
+      fireEvent.keyDown(conversationRoot(container), { key: "j" });
+
+      // Still the tool row -- the cursor did not advance to "after".
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
+      expect(box.scrollTop).toBeGreaterThan(0);
+    });
+
+    it("moves to the next row once the box has reached its end", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 260, clientHeight: 260 }); // nothing left to scroll
+
+      fireEvent.keyDown(conversationRoot(container), { key: "j" });
+
+      expect(container.querySelector(".row-current")!.textContent).toContain("after");
+    });
+
+    it("scrolls the box upward on k, the same way", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 500, clientHeight: 260 });
+      Object.defineProperty(box, "scrollTop", { value: 100, configurable: true, writable: true });
+
+      fireEvent.keyDown(conversationRoot(container), { key: "k" });
+
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
+      expect(box.scrollTop).toBeLessThan(100);
+    });
+  });
+
   it("writes nothing to the clipboard when the timeline is empty, rather than clobbering it with an empty string", () => {
     const { container } = startedApp();
     // No prompts/messages/tools/permissions at all -- timeline.length === 0, cursor stays 0.

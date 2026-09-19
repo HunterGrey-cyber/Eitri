@@ -38,6 +38,26 @@ function isActivatableControl(el: EventTarget | null): el is HTMLElement {
   return el.closest("button, summary, a[href], [role=button]") !== null;
 }
 
+/** Pixel step for one `j`/`k` scroll inside a tool result's overflow box.
+ *  The value is intended to feel like a row step and has not been checked on screen. */
+const TOOL_RESULT_SCROLL_STEP_PX = 40;
+
+/** Scroll the cursor row's overflow box before applying a pending `j`/`k` cursor move.
+ *  This keeps long tool results reachable from the keyboard instead of skipping unseen content.
+ *  DOM measurements belong here, after `resolveKey` chooses a motion, outside the pure key table.
+ *  Return `false` when there is no box or it has reached its limit in that direction, so the cursor moves.
+ *  Write `scrollTop` directly for a clamped pixel step.
+ *  jsdom tests must stub the box dimensions to exercise scrolling because it has no layout. */
+function scrollCursorRowBox(container: HTMLDivElement | null, direction: 1 | -1): boolean {
+  const box = container?.querySelector<HTMLElement>(".row-current .tool-result-body") ?? null;
+  if (box === null) return false;
+  const atStart = box.scrollTop <= 0;
+  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
+  if (direction > 0 ? atEnd : atStart) return false;
+  box.scrollTop += direction * TOOL_RESULT_SCROLL_STEP_PX;
+  return true;
+}
+
 export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
@@ -155,6 +175,12 @@ export default function App() {
   useEffect(() => {
     setCursor((c) => Math.min(c, Math.max(timeline.length - 1, 0)));
   }, [timeline.length]);
+  /** Keeps the cursor row visible when the cursor moves, using `.row-current` through `containerRef`.
+   *  Following new messages depends on scroll position, so reading earlier text does not force the view
+   *  to the bottom. jsdom can check which element is revealed but cannot prove the resulting layout. */
+  useEffect(() => {
+    containerRef.current?.querySelector<HTMLElement>(".row-current")?.scrollIntoView({ block: "nearest" });
+  }, [cursor]);
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
    *  effect under it is a hook and cannot live after a conditional return. */
   const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
@@ -506,6 +532,15 @@ export default function App() {
       sessionEnded,
     });
     if (action === null) return;
+    // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move the
+    // cursor off it -- the vim behaviour, and the reason this check cannot live
+    // in `resolveKey` itself is spelled out on `scrollCursorRowBox`'s own doc comment. Only "cursor"
+    // actions come from `j`/`k` today, so `event.key` alone is enough to tell which direction was
+    // pressed; nothing else in `./keymap`'s table returns this action kind.
+    if (action.kind === "cursor" && scrollCursorRowBox(containerRef.current, event.key === "j" ? 1 : -1)) {
+      event.preventDefault();
+      return;
+    }
     event.preventDefault();
     switch (action.kind) {
       case "mode":

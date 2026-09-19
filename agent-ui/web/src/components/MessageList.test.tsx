@@ -416,6 +416,57 @@ describe("MessageList tool calls and permissions", () => {
   });
 });
 
+/* Following a new row must not pull a reader away from an earlier row reached with `j`/`k`. The
+   guard uses `.message-list`'s scroll position so mouse-only readers can still follow without
+   moving the cursor. jsdom defaults `scrollHeight`, `scrollTop`, and `clientHeight` to zero,
+   which reads as already at the bottom. These tests override the dimensions to exercise both
+   branches. */
+describe("MessageList auto-follow", () => {
+  it("still follows a new item to the bottom when the viewport was already near it", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { rerender } = render(
+      <MessageList state={state({ transcript: texts("first") })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={vi.fn()} />,
+    );
+    scrollIntoView.mockClear();
+
+    rerender(
+      <MessageList
+        state={state({ transcript: texts("first", "second") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={0}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("does not fight a user reading further up: skips the follow once the list has scrolled away from the bottom", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("first") })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={vi.fn()} />,
+    );
+    const list = container.querySelector(".message-list") as HTMLElement;
+    Object.defineProperty(list, "scrollHeight", { value: 2000, configurable: true });
+    Object.defineProperty(list, "clientHeight", { value: 400, configurable: true });
+    Object.defineProperty(list, "scrollTop", { value: 0, configurable: true, writable: true });
+    scrollIntoView.mockClear();
+
+    rerender(
+      <MessageList
+        state={state({ transcript: texts("first", "second") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={0}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+});
+
 describe("MessageList cursor highlight", () => {
   it("marks only the row at `cursor`, by position, with row-current and aria-current", () => {
     const { container } = render(
