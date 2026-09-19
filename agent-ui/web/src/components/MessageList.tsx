@@ -41,16 +41,30 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Include `userPrompts` because a prompt can add a row without changing the other collections.
-  // Follow only when `.message-list` is near the bottom, so a new row cannot pull a reader down
-  // from an earlier row reached with `j`/`k`. Use scroll position rather than cursor index so
-  // mouse-only readers, whose cursor stays at zero, can still follow. jsdom reports zero for
-  // `scrollHeight`, `scrollTop`, and `clientHeight`, which reads as already at the bottom. The
-  // auto-follow tests override those dimensions to exercise both branches.
-  useEffect(() => {
+  // Only collection lengths trigger this follow effect; streamed deltas merge into one transcript
+  // entry, so a growing reply is not followed here. Guard following so a new row cannot pull a
+  // reader back down after `j`/`k` or a wheel scroll moves them up. Use scroll events to set
+  // `followingRef`: measuring after a tall new row mounts could falsely report that a reader at the
+  // bottom had scrolled away. Decreasing `scrollTop` away from the bottom stops following; a scroll
+  // event within the bottom threshold resumes it. A smooth scroll toward the bottom increases
+  // `scrollTop`, so it cannot stop itself. Read scroll position rather than cursor index so
+  // mouse-only readers, whose cursor stays at zero, can still follow. jsdom has no layout or
+  // automatic scroll events, so the auto-follow tests dispatch them explicitly.
+  const followingRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const onScroll = () => {
     const list = listRef.current;
-    const nearBottom =
-      list === null || list.scrollHeight - list.scrollTop - list.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
-    if (nearBottom) {
+    if (list === null) return;
+    const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
+    if (distance <= BOTTOM_FOLLOW_THRESHOLD_PX) {
+      followingRef.current = true;
+    } else if (list.scrollTop < lastScrollTopRef.current) {
+      followingRef.current = false;
+    }
+    lastScrollTopRef.current = list.scrollTop;
+  };
+  useEffect(() => {
+    if (followingRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [state.userPrompts.length, state.transcript.length, state.toolCalls.length, state.pendingPermissions.length]);
@@ -81,7 +95,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   const timeline = useMemo(() => buildTimeline(state), [state]);
 
   return (
-    <div className="message-list" ref={listRef}>
+    <div className="message-list" ref={listRef} onScroll={onScroll}>
       {timeline.map((item, index) => {
         const current = index === cursor;
         switch (item.kind) {

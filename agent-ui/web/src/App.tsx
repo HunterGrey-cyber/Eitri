@@ -51,6 +51,19 @@ const TOOL_RESULT_SCROLL_STEP_PX = 40;
 function scrollCursorRowBox(container: HTMLDivElement | null, direction: 1 | -1): boolean {
   const box = container?.querySelector<HTMLElement>(".row-current .tool-result-body") ?? null;
   if (box === null) return false;
+  // The user can scroll the list away while the cursor stays on this row. Scrolling an
+  // off-screen box changes nothing visible, and an unchanged cursor runs no reveal effect.
+  // Consume the first press to bring the row back into view; later presses scroll its box.
+  // Tests must mock both rects because jsdom's zero rects read as off screen.
+  const list = box.closest(".message-list");
+  if (list !== null) {
+    const b = box.getBoundingClientRect();
+    const l = list.getBoundingClientRect();
+    if (b.bottom <= l.top || b.top >= l.bottom) {
+      box.closest(".row-current")?.scrollIntoView({ block: "nearest" });
+      return true;
+    }
+  }
   const atStart = box.scrollTop <= 0;
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
   if (direction > 0 ? atEnd : atStart) return false;

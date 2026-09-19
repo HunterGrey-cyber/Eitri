@@ -1,20 +1,21 @@
-//! Tracks keyboard focus and updates the three pane indicators from GTK's focus widget.
+//! Tracks keyboard focus and updates three indicators. Keyboard arrival in the
+//! panel enters BROWSE without a composer caret, so the caret cannot show focus.
 //!
-//! `Ctrl+l` enters the panel in BROWSE without a textarea caret. These indicators make the
-//! focused pane visible while keeping the three-mode keyboard model.
+//! GTK's `GtkWindow:focus-widget` identifies the pane holding keyboard focus.
+//! Each change updates the `pane-focused` CSS class, the status bar's focus label
+//! (`chrome::build_status_bar`), and the agent panel's mode block through a
+//! `pane_focus` envelope (`AgentPanelHandle::set_pane_focused`).
+//! `theme::gtk_css` draws the class as an outline around the pane.
+//! The class is toggled here so all indicators share one focus calculation.
+//! Using GTK's `:focus-within` for the frame would give it a separate mechanism
+//! that could disagree with the label and panel. This needs a `notify::focus-widget` handler.
 //!
-//! Each change to `GtkWindow:focus-widget` updates the `pane-focused` class on the pane's frame,
-//! the status bar's focus label, and the panel's mode block through a `pane_focus` envelope
-//! (`AgentPanelHandle::set_pane_focused`). `theme::gtk_css` draws the class as an outline;
-//! the panel dims its mode block when unfocused.
-//!
-//! Toggling the class here instead of using GTK's `:focus-within` keeps the outline, status label,
-//! and panel on one input and one function. Separate mechanisms could disagree.
-//! This requires a `notify::focus-widget` handler.
-//!
-//! Focus here means holding the window's focus widget, regardless of window activity.
-//! After switching to another application, the indicators keep naming the pane that will receive
-//! keys on return. They do not dim merely because the window is inactive.
+//! The frame and status label keep naming the focused pane when the window is
+//! inactive, showing where keys will go on return. The panel's mode block dims:
+//! a bright BROWSE means keys typed now go there. `on_side_focus` receives `true`
+//! only when the side pane holds the focus widget and the window is active.
+//! `notify::is-active` reruns the same function. Prompt notification after
+//! switching windows has not been checked on screen.
 
 use gtk4::prelude::*;
 
@@ -51,8 +52,8 @@ pub(crate) fn status_text(focused: Option<&str>) -> String {
 
 /// Wires the tracker to `window` and applies it once for the current focus.
 ///
-/// `on_side_focus` gets `true` when the pane at `side_index` is the focused one and `false`
-/// otherwise. It is called only when that answer changes, so a focus move between two widgets
+/// `on_side_focus` gets `true` when the pane at `side_index` is the focused one and the window is
+/// active, and `false` otherwise. It is called only when that answer changes, so a focus move between two widgets
 /// inside the editor does not send a WebView dispatch.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
@@ -77,14 +78,17 @@ pub(crate) fn install(
             }
         }
         status_label.set_text(&status_text(focused.map(|i| panes[i].title.as_str())));
-        let side = focused == Some(side_index);
+        let side = focused == Some(side_index) && window.is_active();
         if last_side.get() != Some(side) {
             last_side.set(Some(side));
             on_side_focus(side);
         }
     };
     apply(window);
+    let apply = std::rc::Rc::new(apply);
+    let on_active = apply.clone();
     window.connect_notify_local(Some("focus-widget"), move |window, _| apply(window));
+    window.connect_notify_local(Some("is-active"), move |window, _| on_active(window));
 }
 
 #[cfg(test)]
