@@ -27,6 +27,8 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     ("src/pane_switch.rs", "const SWEPT_NAMES:"),
     ("src/theme/feed.rs", "const SOCKET_NAME: &str = \"t.sock\""),
     ("src/theme/feed.rs", "const SWEPT_NAMES:"),
+    ("src/editor_context/feed.rs", "const SOCKET_NAME: &str = \"e.sock\""),
+    ("src/editor_context/feed.rs", "const SWEPT_NAMES:"),
 ];
 
 #[test]
