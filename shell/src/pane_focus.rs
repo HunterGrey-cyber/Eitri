@@ -4,9 +4,10 @@
 //! focused pane visible while keeping the three-mode keyboard model.
 //!
 //! The editor forwards focus through `NeovideEditorPane::set_focused`, which also sends nvim
-//! `FocusGained`/`FocusLost`. Its cursor becomes hollow when unfocused. The panel receives a
-//! `pane_focus` envelope through `AgentPanelHandle::set_pane_focused` and draws its current
-//! row's sign cell solid with focus and hollow without. The hollow cursor marks the return position.
+//! `FocusGained`/`FocusLost`. `neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD` hides the editor cursor
+//! when unfocused. The panel receives a `pane_focus` envelope through
+//! `AgentPanelHandle::set_pane_focused`. Its current row's sign cell is solid with focus and
+//! hollow without, so the panel still shows where focus will return.
 //!
 //! Changes to `GtkWindow:focus-widget` update all indicators through one function so they agree.
 //! A pane has the keys only when it holds the focus widget and the window is active.
@@ -130,7 +131,7 @@ mod tests {
 
     #[test]
     fn an_inactive_window_gives_no_pane_the_keys() {
-        // Alt-tab away: the editor's cursor goes hollow, as a real Neovide window's does.
+        // Alt-tab away: the editor stops drawing its cursor.
         assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), false), vec![(0, false)]);
         // Focus on the top bar: neither pane has the keys.
         assert_eq!(focus_changes(&[Some(false), Some(true)], None, true), vec![(1, false)]);

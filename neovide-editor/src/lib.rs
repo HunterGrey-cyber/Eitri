@@ -276,12 +276,27 @@ pub struct NeovideEditorPaneOptions {
     pub extra_nvim_args: Vec<String>,
 }
 
-/// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`.
+/// The `--cmd` that hides the cursor while the pane does not have keyboard focus.
+///
+/// `g:neovide_cursor_unfocused_outline_width` defaults to a hollow block of width 1/8 em.
+/// Here, a width `<= 0` suppresses every unfocused cursor shape. Drawing a zero-width outline can
+/// otherwise leave an anti-aliased sliver at fractional cell sizes: 33 pixels at scale 1.5.
+///
+/// `--cmd` runs before user configuration, so `init.lua` can restore the hollow block with
+/// `vim.g.neovide_cursor_unfocused_outline_width = 0.125`. Runtime changes to the variable
+/// apply to the renderer too.
+pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outline_width = 0";
+
+/// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`
+/// if asked for, then this pane's own default (`HIDE_UNFOCUSED_CURSOR_CMD`), then the host's
+/// extras -- so a host's `--cmd` can override the default too.
 fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(extra.len() + 1);
+    let mut args = Vec::with_capacity(extra.len() + 3);
     if clean {
         args.push("--clean".to_string());
     }
+    args.push("--cmd".to_string());
+    args.push(HIDE_UNFOCUSED_CURSOR_CMD.to_string());
     args.extend(extra.iter().cloned());
     args
 }
@@ -805,7 +820,8 @@ impl NeovideEditorPane {
 
     /// Tells the editor whether it has keyboard focus through `LiveHarness::set_focused`.
     /// This updates the cursor and sends `nvim_ui_set_focus` so nvim can fire `FocusGained` and
-    /// `FocusLost`. The cursor is solid while focused and hollow otherwise.
+    /// `FocusLost`. `HIDE_UNFOCUSED_CURSOR_CMD` hides the unfocused cursor unless the user restores
+    /// the outline width.
     ///
     /// This is separate from [`grab_focus`](Self::grab_focus). The host defines focus; `shell`
     /// requires both this pane to hold the window's focus widget and the window to be active.
@@ -874,11 +890,15 @@ mod tests {
     use super::nvim_args;
 
     #[test]
-    fn clean_comes_first_and_extra_arguments_follow_in_order() {
+    fn clean_comes_first_then_the_cursor_default_then_the_hosts_extras() {
+        let hide = super::HIDE_UNFOCUSED_CURSOR_CMD;
         let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
-        assert_eq!(nvim_args(true, &extra), vec!["--clean", "--cmd", "lua print(1)"]);
-        assert_eq!(nvim_args(false, &extra), vec!["--cmd", "lua print(1)"]);
-        assert_eq!(nvim_args(true, &[]), vec!["--clean"]);
-        assert!(nvim_args(false, &[]).is_empty());
+        assert_eq!(
+            nvim_args(true, &extra),
+            vec!["--clean", "--cmd", hide, "--cmd", "lua print(1)"]
+        );
+        assert_eq!(nvim_args(false, &extra), vec!["--cmd", hide, "--cmd", "lua print(1)"]);
+        assert_eq!(nvim_args(true, &[]), vec!["--clean", "--cmd", hide]);
+        assert_eq!(nvim_args(false, &[]), vec!["--cmd", hide]);
     }
 }
