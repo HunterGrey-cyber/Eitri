@@ -233,9 +233,9 @@ impl ClaudeSidecarProvider {
         // Warnings only. The checkout DESCRIPTION is always present and travels separately as
         // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
         // a permanent warning indicator in the UI for every healthy session.
-        let mut diagnostics = sidecar.checkout_warnings.clone();
+        let mut diagnostics = sidecar.build_warnings.clone();
         diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
-        let info = info_from_handshake(&handshake, Some(sidecar.checkout_description.clone()), diagnostics);
+        let info = info_from_handshake(&handshake, Some(sidecar.build_description.clone()), diagnostics);
         for diagnostic in &info.startup_diagnostics {
             eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
         }

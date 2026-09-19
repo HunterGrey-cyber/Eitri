@@ -55,9 +55,9 @@ pub(crate) struct SpawnedSidecar {
     pub(crate) socket_path: PathBuf,
     /// Which Verdandi checkout and revision this sidecar was built and launched from. Descriptive,
     /// always present -- reaches the UI as `ProviderInfo::verdandi_checkout`, NOT as a diagnostic.
-    pub(crate) checkout_description: String,
+    pub(crate) build_description: String,
     /// Only things genuinely worth warning about (today: baseline drift). Usually empty.
-    pub(crate) checkout_warnings: Vec<String>,
+    pub(crate) build_warnings: Vec<String>,
     stdin_keepalive: Option<ChildStdin>,
     child: Child,
     stderr_tail: Arc<Mutex<StderrTail>>,
@@ -124,6 +124,7 @@ pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.
+#[derive(Debug)]
 pub(crate) struct VerdandiCheckout {
     pub(crate) path: PathBuf,
     /// `git rev-parse --short HEAD`, or `None` when the checkout is not a git repo or `git` is
@@ -144,10 +145,14 @@ pub(crate) struct VerdandiCheckout {
 ///
 /// Either way this is a dev-machine story, not a production distribution one -- spec §13's
 /// packaging profiles remain separately deferred.
-fn locate_verdandi_checkout() -> std::io::Result<VerdandiCheckout> {
-    let (path, from_override) = match std::env::var("NEOVIBE_VERDANDI_CHECKOUT") {
-        Ok(path) if !path.trim().is_empty() => (PathBuf::from(path.trim()), true),
-        _ => {
+/// Takes the override as an argument rather than reading it here. `resolve_sidecar_program` already
+/// has to know whether an override was supplied, in order to rank it against a packaged artifact, so
+/// reading it in both places made the value and the decision two separate sources of truth -- a test
+/// could pass one path and this function would use another. Found by exactly that test.
+fn locate_verdandi_checkout(explicit: Option<&str>) -> std::io::Result<VerdandiCheckout> {
+    let (path, from_override) = match explicit.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => (PathBuf::from(path), true),
+        None => {
             let home = std::env::var("HOME").map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -311,25 +316,101 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
     Ok(())
 }
 
+/// The name a PACKAGED sidecar artifact is installed under, beside this binary.
+///
+/// Versionless on purpose: Verdandi's release output carries its version and architecture in the
+/// file name (`verdandi-claude-sidecar-0.1.0-linux-x64`), which is right for a download and wrong
+/// for an installed path -- an install that encoded the version here would make every sidecar
+/// upgrade a change to this crate. The compatibility statement lives in the handshake
+/// (`protocol_major` plus `sidecar_version`), not in a file name.
+const PACKAGED_SIDECAR_BINARY: &str = "verdandi-claude-sidecar";
+
+/// Where the sidecar comes from, resolved once per spawn.
+///
+/// Two genuinely different shapes, which is why this is an enum rather than a path plus a flag: a
+/// packaged artifact is one self-contained executable with no checkout, no `.git` to describe and
+/// nothing to build, while the development path is `node <dist entry>` out of a checkout that may
+/// need `npm` run first and whose revision is worth reporting.
+#[derive(Debug)]
+enum SidecarProgram {
+    /// A shipped, self-contained executable -- normally a sibling of the running binary, the same
+    /// convention `agent-hook`, `neovibe-supervisor` and `neovibe-tmux-shim` already follow.
+    Packaged(PathBuf),
+    /// A Verdandi checkout, run through `node`.
+    Checkout(VerdandiCheckout),
+}
+
+/// Decides which of the two shapes to use, from values the caller supplies rather than from the
+/// process environment, so the precedence is testable without mutating it.
+///
+/// Precedence, and each step earns its place:
+/// 1. `NEOVIBE_SIDECAR_BINARY` -- an explicit artifact wins over everything, including a checkout,
+///    because someone who names a binary is testing that binary.
+/// 2. `NEOVIBE_VERDANDI_CHECKOUT` -- an explicit checkout beats an installed artifact for the same
+///    reason in the other direction: a developer pointing at a branch wants that branch, and
+///    silently preferring the shipped artifact would make that override look broken.
+/// 3. A packaged artifact beside this binary -- the shape a real install has.
+/// 4. The default checkout -- the shape a source tree has.
+fn resolve_sidecar_program(
+    explicit_binary: Option<&str>,
+    explicit_checkout: Option<&str>,
+    exe_dir: Option<&Path>,
+) -> std::io::Result<SidecarProgram> {
+    if let Some(binary) = explicit_binary.map(str::trim).filter(|b| !b.is_empty()) {
+        let path = PathBuf::from(binary);
+        if !path.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("NEOVIBE_SIDECAR_BINARY points at {path:?}, which is not a file"),
+            ));
+        }
+        return Ok(SidecarProgram::Packaged(path));
+    }
+    if explicit_checkout.map(str::trim).is_some_and(|c| !c.is_empty()) {
+        return Ok(SidecarProgram::Checkout(locate_verdandi_checkout(explicit_checkout)?));
+    }
+    if let Some(sibling) = exe_dir.map(|d| d.join(PACKAGED_SIDECAR_BINARY)).filter(|p| p.is_file()) {
+        return Ok(SidecarProgram::Packaged(sibling));
+    }
+    Ok(SidecarProgram::Checkout(locate_verdandi_checkout(None)?))
+}
+
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
 /// the socket path (`crate::socket_path::sidecar_socket`, which mirrors the legacy backend's own
 /// per-conversation UUID socket and keeps both under macOS's 103-byte socket-path limit) so
 /// multiple concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
-    let checkout = locate_verdandi_checkout()?;
-    let (checkout_description, checkout_warnings) = describe_checkout(&checkout);
-    eprintln!("agent: {checkout_description}");
-    for line in &checkout_warnings {
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let program = resolve_sidecar_program(
+        std::env::var("NEOVIBE_SIDECAR_BINARY").ok().as_deref(),
+        std::env::var("NEOVIBE_VERDANDI_CHECKOUT").ok().as_deref(),
+        exe_dir.as_deref(),
+    )?;
+    let (build_description, build_warnings, program_path, program_args) = match program {
+        SidecarProgram::Packaged(path) => (
+            format!("packaged sidecar artifact: {}", path.display()),
+            Vec::new(),
+            path,
+            Vec::new(),
+        ),
+        SidecarProgram::Checkout(checkout) => {
+            let (description, warnings) = describe_checkout(&checkout);
+            // `npm` runs only on this path. A packaged artifact has nothing to build, and reaching
+            // for a build step there would be the bug this branch exists to avoid.
+            let dist_entry = ensure_sidecar_built(&checkout.path)?;
+            (description, warnings, PathBuf::from("node"), vec![dist_entry])
+        }
+    };
+    eprintln!("agent: {build_description}");
+    for line in &build_warnings {
         eprintln!("agent: {line}");
     }
-    let checkout = checkout.path;
-    let dist_entry = ensure_sidecar_built(&checkout)?;
     let socket_path = crate::socket_path::sidecar_socket(&std::env::temp_dir(), instance_id)?;
     let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
-    let mut command = Command::new("node");
+    let mut command = Command::new(&program_path);
     command
-        .arg(&dist_entry)
+        .args(&program_args)
         .env("VERDANDI_CLAUDE_SIDECAR_SOCKET", &socket_path)
         .stdin(Stdio::piped())
         // stdout/stderr are captured, not nulled -- `supervisor`'s own follow-up review found that
@@ -356,7 +437,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     const RETRY_DELAY: Duration = Duration::from_millis(50);
     for _ in 0..RETRY_ATTEMPTS {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            return Ok(SpawnedSidecar { socket_path, checkout_description, checkout_warnings, stdin_keepalive, child, stderr_tail });
+            return Ok(SpawnedSidecar { socket_path, build_description, build_warnings, stdin_keepalive, child, stderr_tail });
         }
         // Check for a dead child BEFORE sleeping again. The sidecar fails closed on a policy
         // violation (an incompatible Claude CLI, a socket already in use) by throwing before it
@@ -457,6 +538,86 @@ impl Drop for SpawnedSidecar {
 
 #[cfg(test)]
 mod tests {
+
+    /// An explicit artifact wins over everything, including an explicit checkout.
+    ///
+    /// The precedence matters more than it looks: these two overrides select DIFFERENT SHAPES, not
+    /// two spellings of one, so a wrong order is not a tie-break -- it silently runs `node` out of a
+    /// tree when someone asked for a binary, or the reverse. Resolution takes its inputs as
+    /// arguments precisely so this is checkable without mutating the process environment, which is
+    /// shared by every other test in this binary.
+    #[test]
+    fn an_explicit_binary_beats_an_explicit_checkout() {
+        let artifact = std::env::temp_dir().join(format!("nv-sidecar-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
+        let resolved = resolve_sidecar_program(
+            artifact.to_str(),
+            Some("/definitely/not/a/checkout"),
+            None,
+        )
+        .expect("an existing artifact resolves");
+        assert!(matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact), "{resolved:?}");
+        let _ = std::fs::remove_file(&artifact);
+    }
+
+    /// A named artifact that does not exist is a hard error, not a silent fall-through to a
+    /// checkout. Falling through would run a DIFFERENT build than the one named and report success,
+    /// which is the failure mode every override in this crate is written to avoid.
+    #[test]
+    fn a_named_artifact_that_is_missing_fails_rather_than_falling_back() {
+        let err = resolve_sidecar_program(Some("/no/such/sidecar/binary"), None, None)
+            .expect_err("a named artifact that is absent must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("NEOVIBE_SIDECAR_BINARY"), "{err}");
+    }
+
+    /// A sibling artifact is used when nothing was named -- the shape a real install has, and the
+    /// same `current_exe()`-sibling convention `agent-hook` and `neovibe-supervisor` already follow.
+    #[test]
+    fn a_sibling_artifact_is_found_when_nothing_is_named() {
+        let dir = std::env::temp_dir().join(format!("nv-sidecar-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
+        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
+        let resolved = resolve_sidecar_program(None, None, Some(&dir)).expect("the sibling resolves");
+        assert!(matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact), "{resolved:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit checkout beats a sibling artifact. A developer pointing at a branch wants that
+    /// branch; preferring the shipped artifact would make `NEOVIBE_VERDANDI_CHECKOUT` look broken
+    /// on exactly the machines where both exist -- which, once neovibe ships the artifact, is every
+    /// developer machine.
+    #[test]
+    fn an_explicit_checkout_beats_a_sibling_artifact() {
+        let dir = std::env::temp_dir().join(format!("nv-sidecar-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PACKAGED_SIDECAR_BINARY), b"#!/bin/sh\nexit 0\n").unwrap();
+        // Points at a directory that is not a checkout, so this resolves to the Checkout ARM and
+        // then fails inside it -- which is the observation: the sibling was not chosen.
+        let err = resolve_sidecar_program(None, Some("/definitely/not/a/checkout"), Some(&dir))
+            .expect_err("an explicit checkout that is not one must fail rather than silently using the sibling");
+        assert!(
+            !err.to_string().contains(PACKAGED_SIDECAR_BINARY),
+            "the sibling artifact was used despite an explicit checkout: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty override is treated as absent. `NEOVIBE_SIDECAR_BINARY=` in a wrapper script is a
+    /// way of saying "not set", and honouring it literally would fail every spawn with a path that
+    /// is the empty string.
+    #[test]
+    fn an_empty_override_is_not_an_override() {
+        let dir = std::env::temp_dir().join(format!("nv-sidecar-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
+        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
+        let resolved = resolve_sidecar_program(Some("   "), Some(""), Some(&dir))
+            .expect("blank overrides fall through to the sibling");
+        assert!(matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact), "{resolved:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     /// Real, not mocked -- spawns the actual compiled sidecar (building it first if needed) and
