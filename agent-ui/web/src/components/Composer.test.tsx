@@ -10,40 +10,37 @@ type Overrides = Partial<Parameters<typeof Composer>[0]>;
 
 function renderComposer(overrides: Overrides = {}) {
   const onSend = vi.fn();
-  const onInterrupt = vi.fn();
   const { container } = render(
     <Composer
       disabled={false}
-      turnInProgress={false}
       sessionEnded={false}
       closing={false}
       restoredDraft={null}
-      canInterrupt
+      // Defaulted to INPUT: every existing test in this file exercises the textarea directly, and
+      // BROWSE's stand-in for it (`.composer-browse-hint`) is covered by its own describe block
+      // below rather than by threading a mode override through every other test here.
+      mode="input"
+      onModeChange={vi.fn()}
       onSend={onSend}
-      onInterrupt={onInterrupt}
       {...overrides}
     />,
   );
   const textarea = container.querySelector("textarea")!;
-  const button = (label: string) =>
-    Array.from(container.querySelectorAll("button")).find((b) => b.textContent === label);
-  return { container, textarea, button, onSend, onInterrupt };
+  return { container, textarea, onSend };
 }
 
 /** Same defaults, but able to change props afterwards -- the restored-draft path is driven entirely
  *  by a prop the host updates. */
 function renderComposerWithRerender(overrides: Overrides = {}) {
   const onSend = vi.fn();
-  const onInterrupt = vi.fn();
   const base = {
     disabled: false,
-    turnInProgress: false,
     sessionEnded: false,
     closing: false,
     restoredDraft: null,
-    canInterrupt: true,
+    mode: "input" as const,
+    onModeChange: vi.fn(),
     onSend,
-    onInterrupt,
     ...overrides,
   };
   const { container, rerender } = render(<Composer {...base} />);
@@ -74,52 +71,28 @@ describe("Composer sending", () => {
     expect(textarea.value).toBe("first line");
   });
 
-  it("sends on a Send click too", () => {
-    const { textarea, button, onSend } = renderComposer();
-    fireEvent.change(textarea, { target: { value: "via the button" } });
-    fireEvent.click(button("Send")!);
-    expect(onSend).toHaveBeenCalledWith("via the button");
-  });
-
   it("refuses a whitespace-only turn rather than spending one on nothing", () => {
-    const { textarea, button, onSend } = renderComposer();
+    const { textarea, onSend } = renderComposer();
     fireEvent.change(textarea, { target: { value: "   \n  " } });
-    fireEvent.click(button("Send")!);
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  /* `disabled` is the whole guard against a second turn being sent while one is running -- the
-     backend rejects it, but the UI must not offer it. */
-  it("cannot send while disabled, by click or by key", () => {
-    const { textarea, button, onSend } = renderComposer({ disabled: true });
+  /* `disabled` prevents sending a second turn while one runs. The backend rejects it too,
+     but the UI must not offer it. There is no Send button; Enter is the remaining send path,
+     so this checks that Enter cannot send while disabled. */
+  it("cannot send while disabled, even via Enter", () => {
+    const { textarea, onSend } = renderComposer({ disabled: true });
     expect(textarea.disabled).toBe(true);
-    expect(button("Send")!.disabled).toBe(true);
     fireEvent.change(textarea, { target: { value: "anything" } });
-    fireEvent.click(button("Send")!);
+    fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
   });
 });
 
-describe("Composer stop control", () => {
-  it("offers Stop only while a turn is actually in flight", () => {
-    const idle = renderComposer({ turnInProgress: false });
-    expect(idle.button("Stop")!.disabled).toBe(true);
-    cleanup();
-    const running = renderComposer({ turnInProgress: true, disabled: true });
-    expect(running.button("Stop")!.disabled).toBe(false);
-    fireEvent.click(running.button("Stop")!);
-    expect(running.onInterrupt).toHaveBeenCalledTimes(1);
-  });
-
-  /* Gated on the advertised capability, not on the backend's name: a provider that reports it
-     cannot interrupt gets no control at all, rather than one that posts a command the server
-     rejects. */
-  it("hides Stop entirely when the provider cannot interrupt", () => {
-    const { button } = renderComposer({ canInterrupt: false, turnInProgress: true });
-    expect(button("Stop")).toBeUndefined();
-  });
-});
+// The composer sends on Enter and inserts a newline on Shift+Enter. The mouse Stop button lives
+// in `StatusLine`, gated by the provider's `interrupt` capability. Its behavior is tested in
+// `StatusLine.test.tsx`.
 
 describe("Composer on a session that has ended", () => {
   it("says the session ended rather than inviting a turn that cannot be taken", () => {
@@ -166,5 +139,30 @@ describe("Composer restoring a refused draft", () => {
     fireEvent.change(textarea, { target: { value: "" } });
     rerender({ restoredDraft: { text: "same", seq: 2 } });
     expect(textarea.value).toBe("same");
+  });
+});
+
+/* BROWSE's rendering of the same control -- a line, not a box, so there is nothing for a stray
+   keystroke to land in -- and the two mouse-driven paths that have to agree with the keyboard
+   table in `keymap.ts` on what mode the panel is in. */
+describe("Composer's BROWSE/INPUT split", () => {
+  it("shows the hint line instead of a textarea in BROWSE", () => {
+    const { container } = renderComposer({ mode: "browse" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toContain("i");
+  });
+
+  it("reports focus on the hint line as entering INPUT", () => {
+    const onModeChange = vi.fn();
+    const { container } = renderComposer({ mode: "browse", onModeChange });
+    fireEvent.focus(container.querySelector(".composer-browse-hint")!);
+    expect(onModeChange).toHaveBeenCalledWith("input");
+  });
+
+  it("reports the textarea losing focus as leaving INPUT", () => {
+    const onModeChange = vi.fn();
+    const { textarea } = renderComposer({ mode: "input", onModeChange });
+    fireEvent.blur(textarea);
+    expect(onModeChange).toHaveBeenCalledWith("browse");
   });
 });

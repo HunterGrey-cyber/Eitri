@@ -82,7 +82,12 @@ describe("ModeSelector conversation picker", () => {
     );
     const row = choice(/claude 1857dcd5/);
     const when = new Date(1757700000000).toLocaleString();
-    expect(row.textContent).toBe(`claude 1857dcd5last opened ${when}`);
+    // Leading "↺": task 7 put this row on the sign-column grid, whose sign is `aria-hidden` (so it
+    // does not appear in `choice`'s accessible-name match above) but is still a real DOM text node,
+    // so it is still in `.textContent`. The thing this test actually guards -- no invented title,
+    // summary or first-prompt preview -- is unchanged; only the glyph every row on this grid carries
+    // was added in front of it.
+    expect(row.textContent).toBe(`↺claude 1857dcd5last opened ${when}`);
   });
 
   /** The provider name on a row is READ from the record, not written into the component.
@@ -292,6 +297,25 @@ describe("ModeSelector conversation picker", () => {
     const bypass = screen.getByText("Bypass").closest("button")!;
     expect(bypass.textContent).not.toMatch(/every tool call proceeds/i);
     expect(bypass.textContent).toMatch(/cannot edit files/i);
+  });
+
+  /** The start screen (panel-as-document task 7) is not a special case: it renders on the same
+   *  `.row` grid every conversation item does, via `.row-choice` buttons rather than the `.row`
+   *  divs a running conversation uses. `.toBeInTheDocument` is jest-dom; this project does not
+   *  install it (see the other assertions in this file), so this is plain `.toBeTruthy()`. */
+  it("renders the start screen as rows on the same grid the conversation uses", () => {
+    render(
+      <ModeSelector
+        hello={hello({ resumableSessions: [session("abc12345", "1737200000000")] })}
+        connecting={false}
+        onStart={() => {}}
+      />,
+    );
+    const rows = document.querySelectorAll(".row");
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/新会话|New session/)).toBeTruthy();
+    // The data cannot supply a title and the screen must say so rather than invent one.
+    expect(screen.getByTestId("no-title-note")).toBeTruthy();
   });
 
 });

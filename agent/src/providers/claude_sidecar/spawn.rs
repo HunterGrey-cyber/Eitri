@@ -767,19 +767,17 @@ mod tests {
                 .lines()
                 .filter(|l| l.contains("NEOVIBE_VERDANDI_CHECKOUT:-"))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                uses.len(),
-                1,
-                "{script} should name the default checkout exactly once, found {}:\n{}",
-                uses.len(),
-                uses.join("\n"),
-            );
-            assert!(
-                uses[0].contains(&expected),
-                "{script} defaults the Verdandi checkout somewhere this code does not:\n  \
-                 script: {}\n  expected to contain: {expected}",
-                uses[0].trim(),
-            );
+            // Require at least one default and check every occurrence. A script may need the default
+            // in more than one place; checking only `uses[0]` would miss a conflicting value elsewhere.
+            assert!(!uses.is_empty(), "{script} never names the default Verdandi checkout");
+            for line in &uses {
+                assert!(
+                    line.contains(&expected),
+                    "{script} defaults the Verdandi checkout somewhere this code does not:\n  \
+                     script: {}\n  expected to contain: {expected}",
+                    line.trim(),
+                );
+            }
         }
     }
 

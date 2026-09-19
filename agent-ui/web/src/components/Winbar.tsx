@@ -1,32 +1,38 @@
-import type { AgentUiState } from "../types";
+import type { AgentUiState, PermissionModeChoice } from "../types";
 
+// Moved verbatim from `SessionHeader.tsx` (panel-as-document task 6) -- do not rewrite this.
 function shortId(id: string | null): string {
   return id === null ? "—" : id.slice(0, 8);
 }
 
-export function SessionHeader({ state }: { state: AgentUiState }) {
+type Props = {
+  state: AgentUiState;
+  /** The mode this session was actually started with, or `null` when this page never started one
+   *  itself -- a panel reload's restored snapshot, say. `AgentUiState` carries no such field of its
+   *  own (`Hello.permissionModes` is only the pre-session menu, gone once a session exists, and
+   *  `Capabilities.bypassPermissionMode` is a capability flag, not the active mode), so `App.tsx`
+   *  remembers what it asked for and passes it down. See its own doc comment on
+   *  `startedPermissionMode` for why that remembered value is authoritative rather than a guess:
+   *  the provider REFUSES a mode it cannot honour instead of substituting one. Optional so every
+   *  existing caller/test that has no opinion about it does not have to name it. */
+  permissionMode?: PermissionModeChoice | null;
+};
+
+/** Identity and model, in a bar above the conversation -- the panel's `winbar`. Panel *state*
+ *  (mode, session status, position, Stop) is `StatusLine`'s job instead; see its own doc comment. */
+export function Winbar({ state, permissionMode = null }: Props) {
   const provider = state.provider;
   return (
-    <div className="session-header">
+    <div className="winbar">
       <span className="model">{state.model ?? "no model yet"}</span>
-      {/* A terminal status wins over activeTurnId. The reducer now also clears activeTurnId on
-          `session_unavailable`/`session_closed` -- the earlier note here argued the opposite, that
-          nothing should clear it because no provider event says "that turn is over", and that was
-          wrong in its consequence: it left a dead session reading "working" forever, in red, styled
-          by the very `.status-unavailable` rule written for the text it was hiding, and it kept
-          `App.tsx`'s composer spinner and the supervisor dashboard's Working dot stuck too.
-          Clearing it invents no completion; the terminal status is still the thing being shown. */}
-      <span
-        className={`status status-${state.status.kind}`}
-        title={
-          state.status.kind === "unavailable" || state.status.kind === "closed"
-            ? state.status.reason
-            : undefined
-        }
-      >
-        {state.status.kind === "running" && state.activeTurnId !== null ? "working" : state.status.kind}
+      <span className="backend" title={`backend: ${state.backend}`}>
+        {state.backend}
       </span>
-      <span className="backend" title={`backend: ${state.backend}`}>{state.backend}</span>
+      {permissionMode !== null && (
+        <span className="permission-mode" title={`permission mode: ${permissionMode}`}>
+          {permissionMode}
+        </span>
+      )}
       {/* Three identities where there really are three. The legacy backend's CLI never separated
           its own session id from Claude's, so `sessionId` and `providerSessionId` are the SAME
           value there -- printing both would invite a reader to conclude the two are distinct and
@@ -39,6 +45,7 @@ export function SessionHeader({ state }: { state: AgentUiState }) {
           nothing here has split into two processes. Say plainly that neither is assigned yet. */}
       <span
         className="identities"
+        data-testid="identities"
         title={[
           `conversation (neovibe): ${state.conversationId ?? "n/a"}`,
           `session (verdandi):     ${state.sessionId ?? "not yet assigned"}`,
@@ -57,8 +64,11 @@ export function SessionHeader({ state }: { state: AgentUiState }) {
         )}
       </span>
       {provider !== null && (
+        // `provider-warn` carries the Verdandi skew signal on a border, never on this text --
+        // `--nv-warn` is only guarded to 3:1 (see index.css's big comment near `.tool-result-error`
+        // for the measured numbers), which is not enough for 12px text.
         <span
-          className="provider"
+          className={`provider${provider.startupDiagnostics.length > 0 ? " provider-warn" : ""}`}
           title={[
             `sidecar ${provider.sidecarVersion} · protocol ${provider.protocol}`,
             `claude-agent-sdk ${provider.claudeAgentSdkVersion}`,

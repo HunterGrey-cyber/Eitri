@@ -61,6 +61,10 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
         let kind = match event {
             AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
             AgentDomainEvent::TurnStarted { .. } => "TurnStarted",
+            // This side's own event (see `AgentDomainEvent::UserPromptSubmitted`'s doc) -- never
+            // produced by `provider.pump()`, which is all this test drains. Matched anyway so this
+            // exhaustive `match` still compiles after adding the variant.
+            AgentDomainEvent::UserPromptSubmitted { .. } => "UserPromptSubmitted",
             AgentDomainEvent::ContentDelta { kind: ContentKind::Text, .. } => "ContentDelta(text)",
             AgentDomainEvent::ContentDelta { .. } => "ContentDelta(thinking)",
             AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",

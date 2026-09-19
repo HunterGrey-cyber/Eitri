@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyEvent, applySnapshot, initialState } from "./reducer";
+import { applyEvent, applySnapshot, initialState, resetToStartScreen } from "./reducer";
 import type { AgentDomainEvent, TurnOutcome } from "./types";
 
 describe("applyEvent", () => {
@@ -180,6 +180,17 @@ describe("applyEvent", () => {
       state = applyEvent(state, { type: "permission_resolved", permission_id: "r1", outcome });
       expect(state.pendingPermissions).toEqual([]);
     }
+  });
+
+  it("folds a user prompt as its own item and closes the open assistant message", () => {
+    let state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "text", text: "first" });
+    state = applyEvent(state, { type: "user_prompt_submitted", text: "and now this" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t2", kind: "text", text: "second" });
+
+    expect(state.userPrompts.map((p) => p.text)).toEqual(["and now this"]);
+    // Must match agent/src/projection.rs exactly: a snapshot from Rust and this reducer's own
+    // accumulation have to be indistinguishable.
+    expect(state.transcript.map((m) => m.text)).toEqual(["first", "second"]);
   });
 
   it("permission_resolved on an unknown permission id is a harmless no-op", () => {
@@ -435,5 +446,37 @@ describe("seq assignment", () => {
     // And no collision with anything the snapshot already held.
     const seqs = [...state.transcript.map((m) => m.seq), ...state.toolCalls.map((c) => c.seq)];
     expect(new Set(seqs).size).toBe(seqs.length);
+  });
+});
+
+describe("resetToStartScreen", () => {
+  /* `r` on an ended session must clear everything that belongs to the session that just ended, but
+     keep what came from `hello` and describes the bridge rather than the session -- there is no
+     fresh `hello` coming, so this is the only copy of it there is. */
+  it("keeps backend/capabilities/provider but clears the rest of the session", () => {
+    const providerInfo = {
+      sidecarVersion: "1.2.3", claudeAgentSdkVersion: "0.1.0", claudeCodeVersion: "2.1.272",
+      protocol: "v1", buildDescription: null, startupDiagnostics: [],
+    };
+    let state = applyEvent(initialState(), {
+      type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp",
+    });
+    state = {
+      ...state,
+      backend: "sidecar",
+      capabilities: { resume: true, fork: false, interrupt: true, bypassPermissionMode: false },
+      provider: providerInfo,
+    };
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "hello there" });
+    state = applyEvent(state, { type: "session_closed", reason: "provider exited" });
+
+    const reset = resetToStartScreen(state);
+
+    expect(reset.backend).toBe("sidecar");
+    expect(reset.capabilities).toEqual({ resume: true, fork: false, interrupt: true, bypassPermissionMode: false });
+    expect(reset.provider).toEqual(providerInfo);
+    expect(reset.transcript).toEqual([]);
+    expect(reset.status).toEqual({ kind: "starting" });
+    expect(reset.sessionId).toBeNull();
   });
 });

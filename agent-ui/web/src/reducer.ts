@@ -13,6 +13,7 @@ export function initialState(): AgentUiState {
     providerSessionId: null,
     model: null,
     cwd: null,
+    userPrompts: [],
     transcript: [],
     toolCalls: [],
     status: { kind: "starting" },
@@ -23,6 +24,17 @@ export function initialState(): AgentUiState {
     assistantMessageOpen: false,
     nextSeq: 0,
   };
+}
+
+/** `r` on an ended session (or any other in-panel "start over"): drops back to the start screen.
+ *
+ * `backend`, `capabilities` and `provider` are preserved rather than reset, because those came
+ * from `hello` and describe the bridge this WebView is attached to, not the session that just
+ * ended -- a fresh `hello` is not coming, so this is the only copy of them there is. Everything
+ * else (transcript, tool calls, pending permissions, status, `nextSeq`, ...) genuinely belongs to
+ * the session that ended, so it resets to exactly what a brand-new mount would show. */
+export function resetToStartScreen(state: AgentUiState): AgentUiState {
+  return { ...initialState(), backend: state.backend, capabilities: state.capabilities, provider: state.provider };
 }
 
 /**
@@ -63,6 +75,15 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       };
     case "turn_started":
       return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false };
+    case "user_prompt_submitted":
+      // `assistantMessageOpen: false` for the same reason `AgentSessionProjection::apply` does it:
+      // a prompt can only occur between assistant messages, and leaving the run open appends the
+      // next turn's reply to the last one.
+      return {
+        ...state,
+        userPrompts: [...state.userPrompts, { seq, text: event.text }],
+        assistantMessageOpen: false,
+      };
     case "content_delta": {
       if (event.kind !== "text") return state;
       // `transcript` holds assistant MESSAGES, not content events. Under partial streaming a single

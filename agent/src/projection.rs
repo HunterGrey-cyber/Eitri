@@ -99,6 +99,18 @@ pub enum ProjectionStatus {
 pub enum AgentDomainEvent {
     SessionOpened { session_id: String, provider_session_id: String, model: String, cwd: String },
     TurnStarted { turn_id: String },
+    /// What the user sent, as they typed it.
+    ///
+    /// **This side's event, not the provider's.** No backend reports the prompt back: the legacy
+    /// CLI's stream-json carries only what the model produced, and Verdandi's wire has no such
+    /// message either. So the panel could not show what was asked -- `TranscriptMessage` is
+    /// assistant text and nothing else -- and a conversation read as a monologue.
+    ///
+    /// `text` is the text the user typed, deliberately NOT the text that went on the wire. Wire 1
+    /// composes editor context into the outgoing turn above both backends
+    /// (`shell/src/agent_panel.rs`); rendering that would show a file path and a selection nobody
+    /// wrote.
+    UserPromptSubmitted { text: String },
     ContentDelta { turn_id: String, kind: ContentKind, text: String },
     ToolCallStarted { turn_id: String, tool_use_id: String, name: String, input: serde_json::Value },
     ToolCallCompleted { turn_id: String, tool_use_id: String, content: serde_json::Value, is_error: bool },
@@ -156,8 +168,8 @@ pub struct ToolCallResult {
 /// interleave. See `AgentSessionProjection::transcript` for why the order has to originate here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TranscriptMessage {
-    /// Ordering key, shared with `ToolCallRecord::seq` and `PermissionRequestRecord::seq`. See
-    /// `AgentSessionProjection::apply`.
+    /// Ordering key, shared with `UserPromptRecord::seq`, `ToolCallRecord::seq` and
+    /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
     ///
     /// The seq of the delta that OPENED this message, never updated as it grows -- a streaming
     /// message must not keep moving below the tool call that already interrupted it.
@@ -165,10 +177,24 @@ pub struct TranscriptMessage {
     pub text: String,
 }
 
+/// One prompt the user sent, with the position it occupies among everything else.
+///
+/// A fourth collection rather than a role on `TranscriptMessage`, because `transcript`'s
+/// coalescing (`assistant_message_open` plus `transcript.last_mut()`) is what keeps 400 streaming
+/// deltas one markdown-parsed message, and a user prompt must never be a thing that walk can land
+/// on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UserPromptRecord {
+    /// Ordering key, shared with `TranscriptMessage::seq`, `ToolCallRecord::seq` and
+    /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
+    pub seq: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallRecord {
-    /// Ordering key, shared with `TranscriptMessage::seq` and `PermissionRequestRecord::seq`. See
-    /// `AgentSessionProjection::apply`.
+    /// Ordering key, shared with `UserPromptRecord::seq`, `TranscriptMessage::seq` and
+    /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
     pub seq: u64,
     pub turn_id: String,
     pub tool_use_id: String,
@@ -183,8 +209,8 @@ pub struct ToolCallRecord {
 /// `agent::session`'s own bookkeeping, never in this provider-neutral type.
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionRequestRecord {
-    /// Ordering key, shared with `TranscriptMessage::seq` and `ToolCallRecord::seq`. See
-    /// `AgentSessionProjection::apply`.
+    /// Ordering key, shared with `UserPromptRecord::seq`, `TranscriptMessage::seq` and
+    /// `ToolCallRecord::seq`. See `AgentSessionProjection::apply`.
     ///
     /// Needed even though a request usually has `tool_use_id` to anchor it beside its tool call:
     /// that link is absent on the legacy backend (`None`) and can arrive as `""` from the sidecar's
@@ -266,10 +292,13 @@ pub struct AgentSessionProjection {
     /// `TurnCompleted` is folded. A session has at most one active turn, so the caller must
     /// reject a second `send_turn` while this is `Some` rather than queue it silently.
     pub active_turn_id: Option<String>,
+    /// Prompts the user sent, in order, each carrying the `seq` that orders it against the other
+    /// three collections.
+    pub user_prompts: Vec<UserPromptRecord>,
     /// Assistant messages in arrival order, each carrying the `seq` that orders it against
-    /// `tool_calls` and `pending_permissions`. The three collections stay separate so consumers
-    /// can read one kind of item without filtering a sum type. `seq` gives all three a total
-    /// order so readers can interleave them exactly, even after a snapshot replaces their state.
+    /// `user_prompts`, `tool_calls` and `pending_permissions`. The four collections stay separate
+    /// so consumers can read one kind of item without filtering a sum type. `seq` gives all four
+    /// a total order so readers can interleave them exactly, even after a snapshot replaces their state.
     /// The frontend cannot reconstruct arrival order from separate collections without it.
     pub transcript: Vec<TranscriptMessage>,
     pub tool_calls: Vec<ToolCallRecord>,
@@ -313,7 +342,7 @@ impl AgentSessionProjection {
     /// Ordering: an item created by this call takes `seq = self.last_revision` as read on entry --
     /// the value BEFORE the bump at the bottom. Two consequences the rest of the system relies on.
     /// (1) No two items ever share a `seq`, because no single event creates more than one item and
-    /// every call bumps the counter exactly once, so `seq` is a total order over all three
+    /// every call bumps the counter exactly once, so `seq` is a total order over all four
     /// collections. (2) Every `seq` is strictly less than `last_revision` afterwards, so a
     /// snapshot's `throughRevision` is a strict upper bound on the seqs inside it -- which is what
     /// lets the frontend seed its own counter from that number and never collide with an item the
@@ -338,6 +367,13 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::TurnStarted { turn_id } => {
                 self.active_turn_id = Some(turn_id.clone());
+                self.assistant_message_open = false;
+            }
+            AgentDomainEvent::UserPromptSubmitted { text } => {
+                self.user_prompts.push(UserPromptRecord { seq, text: text.clone() });
+                // Anything that can only occur BETWEEN assistant messages closes the run. A prompt
+                // is the clearest such thing: without this, the reply to the next turn is appended
+                // to the reply to the last one and they render as a single message.
                 self.assistant_message_open = false;
             }
             AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => {
