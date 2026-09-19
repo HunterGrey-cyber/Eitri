@@ -1,6 +1,8 @@
-//! `shell`'s client of the cross-window agent-status dashboard. Connects once at startup, spawning
-//! the supervisor if none is listening, registers this instance, and sends a status update whenever
-//! the derived status changes.
+//! `shell`'s client of the cross-window agent-status dashboard (`neovibe-supervisor`). Connects
+//! once at startup to a supervisor that is already listening, registers this instance, and sends
+//! a status update whenever the derived status changes. It does not start one: that needs
+//! `NEOVIBE_SUPERVISOR=1` (see `spawn_requested`), because a window appearing on screen is
+//! something the user asks for.
 
 use agent::{AgentSessionProjection, ProjectionStatus};
 use std::io::{BufRead, BufReader, Write};
@@ -73,6 +75,20 @@ fn retry_schedule() -> Vec<u64> {
     vec![25, 50, 100, 200, 400, 800, 1600, 1600, 1600, 1600]
 }
 
+/// Whether this window may start the supervisor when none is listening. Defaults to false so
+/// launching `shell` does not open an unsolicited dashboard window. Connecting to an already open
+/// supervisor remains unconditional, so it still receives this window's status.
+///
+/// Takes the raw variable instead of reading the environment, like `BackendKind::choose`, so tests
+/// can cover the input matrix without mutating process-global state shared by other tests.
+///
+/// Unrecognised values return false and leave the dashboard closed. `BackendKind::from_env`
+/// warns about typos because it still selects a backend; here a typo simply leaves a window closed,
+/// which the user can see and correct.
+fn spawn_requested(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "true" | "yes"))
+}
+
 impl SupervisorClient {
     /// Connects to the well-known socket, spawning `neovibe-supervisor` first if nothing is
     /// listening. Never blocks the caller for longer than one connect attempt: when a spawn is
@@ -92,6 +108,13 @@ impl SupervisorClient {
                 project_name,
                 project_dir,
             ));
+        }
+
+        // Nothing is listening, and that is where this used to spawn one. It no longer does by
+        // default -- see `spawn_requested`. Registering with a dashboard somebody opened and
+        // OPENING one are different acts, and only the first is this window's business.
+        if !spawn_requested(std::env::var("NEOVIBE_SUPERVISOR").ok().as_deref()) {
+            return PendingSupervisor::Ready(None);
         }
 
         match supervisor::locate_supervisor_binary() {
@@ -316,5 +339,26 @@ mod tests {
     fn idle_when_running_with_nothing_pending_and_no_turn_in_progress() {
         let state = base_state();
         assert_eq!(derive_status(Some(&state)), AgentStatus::Idle);
+    }
+
+    /// The default is the whole point of `spawn_requested`, so it gets its own assertion rather
+    /// than riding along in the matrix below: an unset variable is the case every normal launch
+    /// takes, and the regression this guards is a second GTK window appearing unasked.
+    #[test]
+    fn an_unset_variable_does_not_start_a_supervisor() {
+        assert!(!spawn_requested(None));
+    }
+
+    #[test]
+    fn only_an_explicit_affirmative_starts_a_supervisor() {
+        for yes in ["1", "true", "yes", " 1 ", "\ttrue\n"] {
+            assert!(spawn_requested(Some(yes)), "{yes:?} should ask for a supervisor");
+        }
+        // Empty and "0" are the two a caller is most likely to produce by accident -- an unset
+        // variable expanded by a shell (`NEOVIBE_SUPERVISOR=$UNSET`), and someone turning it off
+        // the obvious way. Neither may be read as consent.
+        for no in ["", "0", "false", "no", "yes please", "TRUE", "on"] {
+            assert!(!spawn_requested(Some(no)), "{no:?} should not start anything");
+        }
     }
 }
