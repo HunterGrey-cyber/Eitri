@@ -121,3 +121,75 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
   }
   return null;
 }
+
+/** A panel target of global `f` HINT: a conversation row, a code block inside a row, an enabled
+ *  control from `controlsOf`, or a marked composer. Code targets remember their row so landing
+ *  moves the row cursor. The list is frozen at `hint_collect`, and `shell` uses entry indices.
+ *  `rowIndex` is only the index at collection time. Landing reads it from the element again
+ *  because rows can be inserted above it while labels are displayed. */
+export type HintTarget =
+  | { kind: "row"; el: HTMLElement; rowIndex: number }
+  | { kind: "control"; el: HTMLElement }
+  | { kind: "code"; el: HTMLElement; rowIndex: number }
+  | { kind: "composer"; el: HTMLElement };
+
+/** Marks the composer as a HINT target. The composer is in no
+ *  `data-nav-stop` -- `j`/`k` never walk into it, `i` and `Ctrl+l` are its routes -- and in BROWSE it
+ *  is a plain `div`, which `CONTROL_SELECTOR` does not match, so without this marker HINT could never
+ *  reach it. `Composer` sets it only while INPUT can be entered. */
+export const HINT_COMPOSER_ATTR = "data-hint-composer";
+
+/** The elements known to scroll their own content (index.css): the conversation's list, and the
+ *  start screen's list of remembered sessions, capped at 40vh. Named here as well as read off the
+ *  computed style below, because jsdom loads no stylesheet and the tests must see these two. */
+const SCROLL_CONTAINERS = ".message-list, .session-choice";
+
+function clips(el: HTMLElement): boolean {
+  if (el.matches(SCROLL_CONTAINERS)) return true;
+  const style = getComputedStyle(el);
+  return [style.overflow, style.overflowX, style.overflowY].some((v) => v !== "" && v !== "visible");
+}
+
+function intersects(a: DOMRect, b: DOMRect): boolean {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+/** Whether `el` shows inside `root`: its non-zero box must intersect the root and every ancestor
+ *  that clips overflow. Checking every clipping ancestor prevents nested scrollers from exposing
+ *  targets that an outer scroller hides. */
+export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
+  const box = el.getBoundingClientRect();
+  if (box.width === 0 || box.height === 0) return false;
+  for (let a = el.parentElement; a !== null && a !== root; a = a.parentElement) {
+    if (clips(a) && !intersects(box, a.getBoundingClientRect())) return false;
+  }
+  return intersects(box, root.getBoundingClientRect());
+}
+
+/** Visible HINT targets under `root`, in document order: for each stop (row or other), the stop
+ *  itself (if it's a row), then its code blocks, then its controls; for a non-row stop, its
+ *  controls only. The composer, when marked (`HINT_COMPOSER_ATTR`), takes its place in document
+ *  order among the stops. "Visible" is `hintVisible` above. */
+export function hintTargets(root: HTMLElement): HintTarget[] {
+  const targets: HintTarget[] = [];
+  const composerEl = root.querySelector<HTMLElement>(`[${HINT_COMPOSER_ATTR}]`);
+  let composer = composerEl !== null && hintVisible(composerEl, root) ? composerEl : null;
+  for (const stop of stopsIn(root)) {
+    if (composer !== null && composer.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      targets.push({ kind: "composer", el: composer });
+      composer = null;
+    }
+    const rowIndex = stop.getAttribute(STOP_ATTR) === "row" ? rowIndexOf(root, stop) : null;
+    if (rowIndex !== null && hintVisible(stop, root)) targets.push({ kind: "row", el: stop, rowIndex });
+    if (rowIndex !== null) {
+      for (const block of stop.querySelectorAll<HTMLElement>("pre.code-block")) {
+        if (hintVisible(block, root)) targets.push({ kind: "code", el: block, rowIndex });
+      }
+    }
+    for (const control of controlsOf(stop)) {
+      if (hintVisible(control, root)) targets.push({ kind: "control", el: control });
+    }
+  }
+  if (composer !== null) targets.push({ kind: "composer", el: composer });
+  return targets;
+}

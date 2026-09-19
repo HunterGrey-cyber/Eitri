@@ -20,7 +20,11 @@ export type OutboundMessage =
    *  Carries nothing else: every input the rule needs is already canonical on the Rust side, and a
    *  session id sent from here would be a second, stale source for the one value that must not be
    *  wrong. The reply is a `handoff` envelope, deferred until the real close has finished. */
-  | { type: "handoff_to_terminal"; request_id: string };
+  | { type: "handoff_to_terminal"; request_id: string }
+  /** Global `f` HINT: panel has pressed `f` in BROWSE, asking shell to start a global HINT. */
+  | { type: "hint_request"; request_id: string }
+  /** Answer to hint_collect: the number of visible targets the panel froze for this sessionId. */
+  | { type: "hint_targets"; request_id: string; session_id: number; count: number };
 
 /** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
  *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send
@@ -71,6 +75,16 @@ type InboundHandler = (
      *  caret in it. Only the keyboard route sends this; a click on a row still lands in BROWSE on
      *  that row. See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "enter_input" }
+    /** Global `f` HINT: shell asking panel to report visible targets and freeze the list. */
+    | { kind: "hint_collect"; sessionId: number }
+    /** shell showing the frozen targets their labels, ready to start typing. */
+    | { kind: "hint_show"; sessionId: number; labels: string[] }
+    /** shell narrowing the label set as the user types. */
+    | { kind: "hint_prefix"; sessionId: number; typed: string }
+    /** shell landing on a target by index into the frozen list. */
+    | { kind: "hint_land"; sessionId: number; index: number }
+    /** shell ending a global HINT: clear the labels and return to normal. */
+    | { kind: "hint_end"; sessionId: number }
     | { kind: "error"; message: string },
 ) => void;
 
@@ -94,6 +108,11 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "theme" ||
         obj.kind === "pane_focus" ||
         obj.kind === "enter_input" ||
+        obj.kind === "hint_collect" ||
+        obj.kind === "hint_show" ||
+        obj.kind === "hint_prefix" ||
+        obj.kind === "hint_land" ||
+        obj.kind === "hint_end" ||
         obj.kind === "error"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);

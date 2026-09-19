@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PanelMode } from "../keymap";
+import { HINT_COMPOSER_ATTR } from "../nav";
 
 /** A draft the host is putting back into the box after a send was refused.
  *
@@ -41,6 +42,10 @@ type Props = {
    *  textarea that is already mounted is focused again; a fresh one takes focus through
    *  `autoFocus` as before. */
   focusRequest?: number;
+  /** Whether the global `f` HINT may label this box (`../nav`'s `HINT_COMPOSER_ATTR`). `App.tsx`
+   *  passes the negation of `disabled`: a landing on a textarea that cannot take focus would put the
+   *  panel in an INPUT with nothing to type into. */
+  hintTarget?: boolean;
   onSend: (text: string) => void;
 };
 
@@ -52,6 +57,7 @@ export function Composer({
   mode,
   onModeChange,
   focusRequest = 0,
+  hintTarget = false,
   onSend,
 }: Props) {
   const [text, setText] = useState("");
@@ -81,7 +87,7 @@ export function Composer({
   }
 
   return (
-    <div className="composer">
+    <div className="composer" {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}>
       {closing && (
         <p className="composer-closing" role="status">
           This conversation is being closed so it can continue in a terminal. Anything still in the
