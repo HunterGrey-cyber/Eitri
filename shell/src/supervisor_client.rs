@@ -1,6 +1,8 @@
 //! `shell`'s client of the cross-window agent-status dashboard (`neovibe-supervisor`). Connects
-//! once at startup (spawning the supervisor if nothing is listening yet), registers this
-//! instance, and pushes a status update whenever the derived status actually changes. See
+//! once at startup to a supervisor that is already listening, registers this instance, and pushes
+//! a status update whenever the derived status actually changes. It does NOT start one: since
+//! 2026-09-19 that needs `NEOVIBE_SUPERVISOR=1`, because a window appearing on screen is a thing
+//! the user asks for (see `spawn_requested`). See
 //! docs/superpowers/specs/2026-09-08-supervisor-cross-window-agent-status-design.md.
 
 use agent::{AgentSessionProjection, ProjectionStatus};
@@ -75,6 +77,30 @@ fn retry_schedule() -> Vec<u64> {
     vec![25, 50, 100, 200, 400, 800, 1600, 1600, 1600, 1600]
 }
 
+/// Whether this window may *start* `neovibe-supervisor` when none is listening.
+///
+/// **Default: no, changed 2026-09-19 at the owner's request** ("supervisor 的窗口能不能先隐藏").
+/// Until then, the first `shell` launch on a machine put a second, unasked-for GTK window on the
+/// screen -- a dashboard nobody had opened, belonging to a feature the user had not invoked.
+///
+/// Connecting is unaffected and is still unconditional: a supervisor the user *has* opened still
+/// gets this window's status, so the dashboard works exactly as before for anyone who wants it.
+/// What changed is only who decides it should exist. That distinction is the whole point -- the
+/// old behaviour conflated "use the dashboard if it is there" with "there should be a dashboard",
+/// and only the second one is a decision.
+///
+/// Takes the raw variable rather than reading the environment, the same reason
+/// `BackendKind::choose` does: the matrix is then testable without mutating a process-global that
+/// every other test in the binary shares.
+///
+/// Anything unrecognised is `false`. This is the safe direction and the opposite of the one
+/// `BackendKind::from_env` picks for its own typos, deliberately: a typo there silently selects a
+/// *backend*, so it warns; a typo here silently declines to open a window, which the user can see
+/// and correct by looking at the screen.
+fn spawn_requested(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "true" | "yes"))
+}
+
 impl SupervisorClient {
     /// Connects to the well-known socket, spawning `neovibe-supervisor` first if nothing is
     /// listening. Never blocks the caller for longer than one connect attempt: when a spawn is
@@ -94,6 +120,13 @@ impl SupervisorClient {
                 project_name,
                 project_dir,
             ));
+        }
+
+        // Nothing is listening, and that is where this used to spawn one. It no longer does by
+        // default -- see `spawn_requested`. Registering with a dashboard somebody opened and
+        // OPENING one are different acts, and only the first is this window's business.
+        if !spawn_requested(std::env::var("NEOVIBE_SUPERVISOR").ok().as_deref()) {
+            return PendingSupervisor::Ready(None);
         }
 
         match supervisor::locate_supervisor_binary() {
@@ -319,5 +352,26 @@ mod tests {
     fn idle_when_running_with_nothing_pending_and_no_turn_in_progress() {
         let state = base_state();
         assert_eq!(derive_status(Some(&state)), AgentStatus::Idle);
+    }
+
+    /// The default is the whole point of `spawn_requested`, so it gets its own assertion rather
+    /// than riding along in the matrix below: an unset variable is the case every normal launch
+    /// takes, and the regression this guards is a second GTK window appearing unasked.
+    #[test]
+    fn an_unset_variable_does_not_start_a_supervisor() {
+        assert!(!spawn_requested(None));
+    }
+
+    #[test]
+    fn only_an_explicit_affirmative_starts_a_supervisor() {
+        for yes in ["1", "true", "yes", " 1 ", "\ttrue\n"] {
+            assert!(spawn_requested(Some(yes)), "{yes:?} should ask for a supervisor");
+        }
+        // Empty and "0" are the two a caller is most likely to produce by accident -- an unset
+        // variable expanded by a shell (`NEOVIBE_SUPERVISOR=$UNSET`), and someone turning it off
+        // the obvious way. Neither may be read as consent.
+        for no in ["", "0", "false", "no", "yes please", "TRUE", "on"] {
+            assert!(!spawn_requested(Some(no)), "{no:?} should not start anything");
+        }
     }
 }

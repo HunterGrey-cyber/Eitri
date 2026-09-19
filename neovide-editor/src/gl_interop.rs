@@ -242,9 +242,69 @@ pub(crate) fn pixel_to_grid_pos(
 /// rect the next frame will actually draw into (as opposed to reaching into `SkiaState`'s own
 /// cached `fb_width`/`fb_height`, which is only ever updated from inside `connect_resize`/
 /// `connect_render` and would otherwise need its own borrow here for no benefit).
-pub(crate) fn current_content_region(gl_area: &GLArea) -> PixelRect<f32> {
+pub(crate) fn current_content_region(gl_area: &GLArea, grid_scale: GridScale) -> PixelRect<f32> {
     let scale_factor = gl_area.scale_factor();
-    compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor)
+    let region =
+        compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor);
+    snap_region_to_grid(&region, grid_scale)
+}
+
+/// `region` with the vertical sub-cell remainder moved from the BOTTOM edge to the TOP edge.
+///
+/// A pane is almost never an exact multiple of the font's cell height, and
+/// `grid_size_for_content_region` floors, so `height mod cell_height` pixels are always left over.
+/// They are painted -- `draw_frame` clip-clears the whole region to nvim's own `Normal` background
+/// -- so this is not an undrawn band. It is a band of the *editor's* background in a place where
+/// that colour is not what sits above it.
+///
+/// **Which edge it lands on is the entire difference, and it is not a matter of taste.** At the
+/// bottom, the row above the remainder is nvim's statusline (a global `laststatus=3` lualine, in
+/// the config this was reported against), whose background is deliberately a different colour; the
+/// leftover then reads as a stripe of a third colour between the statusline and the shell's own
+/// status bar. At the top, the row below it is ordinary buffer text on `Normal` -- the same colour
+/// as the remainder -- so it is indistinguishable from padding under the top bar. Reported
+/// 2026-09-19 as "最下面还是有空余" after the 44px dead-cmdline row (fork `20bee56`) was fixed and
+/// only this 14px remainder was left.
+///
+/// **Vertical only, deliberately.** The horizontal remainder sits at the right edge, where its
+/// neighbour is ordinary buffer background of the same colour, so it is already invisible; moving
+/// it to the left would put it between the window edge and the sign column, which is where it
+/// would start being visible. The asymmetry is in what the leftover is adjacent to, not in the
+/// arithmetic.
+///
+/// **The caller owes one thing for this to be an improvement rather than a swap:** once this
+/// returns anything but the full framebuffer, the pixels OUTSIDE the returned rect are no longer
+/// repainted by the renderer, so whatever the host clears the framebuffer to becomes visible for
+/// the first time. `lib.rs`'s `OUTSIDE_COLOR` doc predicted exactly this ("If `CONTENT_MARGIN`
+/// ever becomes non-zero again, this constant -- and a reason to bring back a host-settable
+/// override -- becomes reachable once more") and `NeovideEditorPane::set_clear_color` is that
+/// override, driven from the theme pipeline's `tokens.bg`.
+///
+/// Returns `region` unchanged when there is nothing to move or nothing to move it within: a cell
+/// height that is not yet a positive, finite number (nvim has not reported a font), no remainder,
+/// or a region too short for even one row -- in which case eating the remainder would leave a
+/// zero-height rect.
+pub(crate) fn snap_region_to_grid(
+    region: &PixelRect<f32>,
+    grid_scale: GridScale,
+) -> PixelRect<f32> {
+    let cell_height = grid_scale.height();
+    if !cell_height.is_finite() || cell_height <= 0.0 {
+        return *region;
+    }
+    let height = region.max.y - region.min.y;
+    let remainder = height - (height / cell_height).floor() * cell_height;
+    // Stated as one positive condition rather than as negated comparisons, so NaN -- which makes
+    // every comparison false and would silently pass a negated test -- lands on "leave it alone"
+    // by construction rather than by the reader noticing.
+    let worth_moving = remainder.is_finite() && remainder > 0.0 && remainder < height;
+    if !worth_moving {
+        return *region;
+    }
+    PixelRect::from_min_max(
+        (region.min.x, region.min.y + remainder),
+        (region.max.x, region.max.y),
+    )
 }
 
 pub(crate) fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f32>, color: Color4f) {
@@ -325,5 +385,93 @@ mod tests {
             pixel_to_grid_pos(9000.0, 9000.0, 1, &content_region, grid_scale, grid_size),
             (99, 32)
         );
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+
+    /// The exact geometry from the 2026-09-19 report, reproduced as arithmetic so the fix cannot
+    /// quietly stop applying: a 1598px-tall pane at a 44px cell is 36 rows plus **14px**, and that
+    /// 14 is what the owner saw as "最下面还是有空余". After the snap it is at the top, where the
+    /// pixel below it is buffer background of the same colour.
+    #[test]
+    fn the_reported_band_moves_from_the_bottom_edge_to_the_top() {
+        let grid_scale = GridScale::new(PixelSize::new(22.0, 44.0));
+        let pane = PixelRect::from_min_max((0.0, 0.0), (1400.0, 1598.0));
+
+        let snapped = snap_region_to_grid(&pane, grid_scale);
+
+        assert_eq!(snapped.min.y, 14.0, "the remainder should now be ABOVE the grid");
+        assert_eq!(snapped.max.y, 1598.0, "the bottom edge must be flush -- that is the fix");
+        let height = snapped.max.y - snapped.min.y;
+        assert_eq!(height % 44.0, 0.0, "a snapped region is whole cells");
+        assert_eq!(height / 44.0, 36.0, "and the same 36 rows as before, not one fewer");
+
+        // The horizontal remainder is deliberately NOT moved: its neighbour at the right edge is
+        // ordinary buffer background of the same colour, so it is already invisible, while moving
+        // it left would put it between the window edge and the sign column.
+        assert_eq!((snapped.min.x, snapped.max.x), (0.0, 1400.0));
+    }
+
+    /// The grid keeps the same number of rows either way. Worth pinning because it is the reason
+    /// the snap is purely cosmetic: if this were false the fix would be silently resizing nvim.
+    #[test]
+    fn snapping_never_changes_how_many_rows_fit() {
+        let grid_scale = GridScale::new(PixelSize::new(9.0, 18.0));
+        for height in [100.0_f32, 360.0, 361.0, 377.0, 1598.0, 1080.0] {
+            let raw = PixelRect::from_min_max((0.0, 0.0), (800.0, height));
+            let snapped = snap_region_to_grid(&raw, grid_scale);
+            let rows_raw = ((raw.max.y - raw.min.y) / 18.0).floor();
+            let rows_snapped = ((snapped.max.y - snapped.min.y) / 18.0).floor();
+            assert_eq!(rows_raw, rows_snapped, "height {height} changed its row count");
+        }
+    }
+
+    /// Every case where eating the remainder would be worse than leaving it. The cell height is
+    /// genuinely 0 before nvim has reported a font, and a pane can genuinely be shorter than one
+    /// row mid-drag -- returning a zero-height or inverted rect there would be a crash or a blank
+    /// pane, not a cosmetic issue.
+    #[test]
+    fn degenerate_inputs_are_left_exactly_alone() {
+        let pane = PixelRect::from_min_max((0.0, 0.0), (800.0, 100.0));
+        for bad_cell in [0.0_f32, -18.0, f32::NAN, f32::INFINITY] {
+            let snapped = snap_region_to_grid(&pane, GridScale::new(PixelSize::new(9.0, bad_cell)));
+            assert_eq!((snapped.min.y, snapped.max.y), (0.0, 100.0), "cell height {bad_cell}");
+        }
+
+        // Shorter than one row: the whole height is "remainder", and taking it would leave nothing.
+        let tiny = PixelRect::from_min_max((0.0, 0.0), (800.0, 10.0));
+        let snapped = snap_region_to_grid(&tiny, GridScale::new(PixelSize::new(9.0, 18.0)));
+        assert_eq!((snapped.min.y, snapped.max.y), (0.0, 10.0));
+
+        // An exact multiple has no remainder to move and must not drift by a float epsilon.
+        let exact = PixelRect::from_min_max((0.0, 0.0), (800.0, 360.0));
+        let snapped = snap_region_to_grid(&exact, GridScale::new(PixelSize::new(9.0, 18.0)));
+        assert_eq!((snapped.min.y, snapped.max.y), (0.0, 360.0));
+    }
+
+    /// A click must still land on the cell the user aimed at. This is the half of the change that
+    /// could break silently: `pixel_to_grid_pos` subtracts `content_region.min`, so a caller that
+    /// snapped for RENDERING but not for HIT-TESTING would be off by 14/44 of a row -- wrong only
+    /// near a row boundary, which is exactly where it would be blamed on the user's aim.
+    #[test]
+    fn hit_testing_through_the_snapped_region_lands_on_the_right_row() {
+        let grid_scale = GridScale::new(PixelSize::new(22.0, 44.0));
+        let grid_size = GridSize::new(63_u32, 36);
+        let snapped =
+            snap_region_to_grid(&PixelRect::from_min_max((0.0, 0.0), (1400.0, 1598.0)), grid_scale);
+
+        // The first painted pixel row of the grid is y=14, not y=0.
+        assert_eq!(pixel_to_grid_pos(0.0, 14.0, 1, &snapped, grid_scale, grid_size).1, 0);
+        // One pixel above it is still clamped into row 0 rather than going negative.
+        assert_eq!(pixel_to_grid_pos(0.0, 0.0, 1, &snapped, grid_scale, grid_size).1, 0);
+        // Row 1 starts 44px later, and 1px earlier is still row 0 -- the boundary the unsnapped
+        // rect would have put 14px too high.
+        assert_eq!(pixel_to_grid_pos(0.0, 57.0, 1, &snapped, grid_scale, grid_size).1, 0);
+        assert_eq!(pixel_to_grid_pos(0.0, 58.0, 1, &snapped, grid_scale, grid_size).1, 1);
+        // And the last pixel of the pane is the last row, with nothing past it.
+        assert_eq!(pixel_to_grid_pos(0.0, 1597.0, 1, &snapped, grid_scale, grid_size).1, 35);
     }
 }

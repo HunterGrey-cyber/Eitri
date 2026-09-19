@@ -38,6 +38,7 @@ use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::GridSize;
 
 use gl_interop::{
+    snap_region_to_grid,
     compute_content_region, fill_content_region, grid_size_for_content_region, make_gl_interface,
     SkiaState,
 };
@@ -85,6 +86,16 @@ const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 /// value also matches nothing any more: `#1a1b1f` was the background of the placeholder palette
 /// `shell`'s theme pipeline replaced. If `CONTENT_MARGIN` ever becomes non-zero again, this
 /// constant -- and a reason to bring back a host-settable override -- becomes reachable once more.
+///
+/// **2026-09-19: reachable again, exactly as the paragraph above predicted, and now only the
+/// STARTING value.** `snap_region_to_grid` moves the grid's sub-cell vertical remainder to the top
+/// edge so the bottom of the pane sits flush against the host's status bar, which means
+/// `content_region` no longer covers the whole framebuffer and these pixels are on screen -- a thin
+/// band under the top bar. A fixed near-black there would reinstate the near-black frame the margin
+/// removal fixed, so [`NeovideEditorPane::set_clear_color`] is back, and `shell` drives it from the
+/// same `tokens.bg` its theme pipeline already pushes at every colorscheme change. This value is
+/// what the band shows for the ~190ms before the first theme payload arrives, and until a host sets
+/// it at all.
 const OUTSIDE_COLOR: Color4f = Color4f::new(0.102, 0.106, 0.122, 1.0);
 /// Painted across the whole `content_region` while `LiveHarness` is being constructed (the one
 /// real, observed blocking call in this crate) -- distinct from both `OUTSIDE_COLOR` and anything
@@ -276,6 +287,8 @@ pub struct NeovideEditorPane {
     im_context: IMMulticontext,
     live_state: Rc<RefCell<LiveState>>,
     exited_callback: ExitedCallbackSlot,
+    /// Shared with the render callback. See [`NeovideEditorPane::set_clear_color`].
+    clear_color: Rc<Cell<Color4f>>,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -324,6 +337,29 @@ fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
 }
 
 impl NeovideEditorPane {
+    /// The colour painted where the editor's own grid does not reach -- today exactly one place:
+    /// the band at the TOP that `gl_interop::snap_region_to_grid` creates by moving the sub-cell
+    /// remainder off the bottom edge.
+    ///
+    /// **A host that does not call this gets `OUTSIDE_COLOR`, and on a light colorscheme that is
+    /// visibly wrong** -- a near-black line under the top bar. This is not an optional refinement;
+    /// it is the other half of the snap. `shell` calls it from the same theme listener that already
+    /// drives its GTK CSS and the agent panel, so the band is nvim's own `Normal` background and
+    /// therefore indistinguishable from the first text row below it.
+    ///
+    /// Takes straight RGB bytes rather than a `Color4f` so a host does not need `skia_safe` in its
+    /// own dependency graph to call it; alpha is always opaque, since a translucent band would let
+    /// through whatever GTK last painted there.
+    pub fn set_clear_color(&self, (r, g, b): (u8, u8, u8)) {
+        self.clear_color.set(Color4f::new(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            1.0,
+        ));
+        self.widget.queue_render();
+    }
+
     /// Builds the `GtkGLArea` and wires every resize/IME/keyboard/mouse/tick/render callback onto
     /// it and the shared `Rc<RefCell<LiveState>>` -- everything `poc/neovide_embed_live::build_ui`
     /// did except constructing an `Application`/`ApplicationWindow` and calling
@@ -350,6 +386,7 @@ impl NeovideEditorPane {
 
         let skia_state: Rc<RefCell<Option<SkiaState>>> = Rc::new(RefCell::new(None));
         let live_state: Rc<RefCell<LiveState>> = Rc::new(RefCell::new(LiveState::NotStarted));
+        let clear_color = Rc::new(Cell::new(OUTSIDE_COLOR));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
 
         // --- resize: GtkGLArea's FBO can be resized/recreated under us, so drop the cached
@@ -365,7 +402,10 @@ impl NeovideEditorPane {
                 let mut live = live_state.borrow_mut();
                 let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                     session.wants_frame.set(true);
-                    let content_region = compute_content_region(width, height);
+                    let content_region = snap_region_to_grid(
+                        &compute_content_region(width, height),
+                        session.harness.grid_scale(),
+                    );
                     let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
                     let resized_grid = if new_grid_size != session.last_grid_size.get() {
                         session.harness.resize_grid(new_grid_size);
@@ -473,6 +513,7 @@ impl NeovideEditorPane {
             // `child_env` and `cwd` are moved into this closure by the `move` below -- neither is
             // needed again in this function, and this closure is the only place `LiveHarness` is
             // ever constructed.
+            let clear_color = clear_color.clone();
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -516,7 +557,7 @@ impl NeovideEditorPane {
                 // nvim's own background, the placeholder arms fill it opaquely -- so nothing this
                 // clear writes survives the frame today; see `OUTSIDE_COLOR`'s own doc for the
                 // positive-control evidence.
-                canvas.clear(OUTSIDE_COLOR);
+                canvas.clear(clear_color.get());
 
                 let mut live = live_state.borrow_mut();
                 match &mut *live {
@@ -619,8 +660,16 @@ impl NeovideEditorPane {
                     }
                     LiveState::Ready(session) => {
                         let (dt, fps) = session.tick();
+                        // Snapped HERE rather than where `content_region` is computed above,
+                        // because the two users want different rects. The grid must sit on whole
+                        // cells (see `snap_region_to_grid`), while the placeholder arms below have
+                        // no grid at all and should cover every pixel they can -- a "starting
+                        // nvim..." screen with a band of clear colour along one edge would be a
+                        // regression, not a fix.
+                        let grid_region =
+                            snap_region_to_grid(&content_region, session.harness.grid_scale());
                         let animating =
-                            session.harness.render_frame(canvas, Some(&content_region), dt);
+                            session.harness.render_frame(canvas, Some(&grid_region), dt);
                         // Share this frame's "do we still need more frames" signals with the tick
                         // callback.
                         session.last_animating.set(animating);
@@ -728,7 +777,10 @@ impl NeovideEditorPane {
                         // staleness, instead of chasing that one root cause.
                         let width = widget.width() * widget.scale_factor();
                         let height = widget.height() * widget.scale_factor();
-                        let content_region = compute_content_region(width, height);
+                        let content_region = snap_region_to_grid(
+                            &compute_content_region(width, height),
+                            session.harness.grid_scale(),
+                        );
                         let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
                         let grid_resynced = if new_grid_size != session.last_grid_size.get() {
                             session.harness.resize_grid(new_grid_size);
@@ -794,7 +846,7 @@ impl NeovideEditorPane {
             });
         }
 
-        Self { widget: gl_area, im_context, live_state, exited_callback }
+        Self { widget: gl_area, im_context, live_state, exited_callback, clear_color }
     }
 
     /// The `GtkGLArea` this pane renders into. The host places this into its own window (e.g. as

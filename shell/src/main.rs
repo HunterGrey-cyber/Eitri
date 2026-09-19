@@ -212,10 +212,21 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // an inline block on purpose: `build_ui` is being edited by two other tracks of the same plan.
     agent_panel::install_reload_action(app, &agent_panel_handle);
     // The panel starts on the same fallback the chrome does, then both follow nvim together.
+    // So does the editor's own clear colour: `neovide-editor` snaps the grid's sub-cell remainder
+    // to the TOP edge so the bottom sits flush against the status bar, which puts a thin band
+    // outside the rect the renderer paints. Left at that crate's default it is a near-black line
+    // under the top bar -- the same defect the `CONTENT_MARGIN` removal fixed -- so it follows
+    // `bg`, and is then the same colour as the first text row below it.
+    let editor_clear = |tokens: &neovibe_core::theme::ThemeTokens| {
+        let bg = tokens.bg;
+        (bg.r, bg.g, bg.b)
+    };
     agent_panel_handle.set_theme(&neovibe_core::theme::ThemeTokens::fallback());
+    pane.set_clear_color(editor_clear(&neovibe_core::theme::ThemeTokens::fallback()));
     if let Some(feed) = theme_feed.as_mut() {
         let theme_css = theme_css.clone();
         let agent_panel_handle = agent_panel_handle.clone();
+        let pane_for_theme = pane.clone();
         theme::feed::listen(feed, move |payload| {
             let tokens = neovibe_core::theme::ThemeTokens::derive(&payload);
             println!(
@@ -224,6 +235,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             );
             theme_css.update(&tokens);
             agent_panel_handle.set_theme(&tokens);
+            pane_for_theme.set_clear_color(editor_clear(&tokens));
         });
     }
 
