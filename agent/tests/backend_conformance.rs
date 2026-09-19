@@ -339,3 +339,84 @@ fn drain_until_finished(session: &mut agent::AgentSession) -> String {
     }
     panic!("no TurnCompleted within 60s");
 }
+
+/// **The product's own MVP sentence, as far as this crate can carry it**: "I tell it to change the
+/// file I am looking at, I see a diff, I approve, the change lands."
+///
+/// This covers the first, third and fourth clauses. The diff is rendered by `agent-ui/web`, whose
+/// own tests cover it, and the buffer reload is `neovibe-core::buffer_reload`'s. What is asserted
+/// here is the part only a real CLI can settle: that with the product's own Auto-mode deny list the
+/// model may reach for `Edit` at all, that the gate stops it, that the request carries the fields a
+/// diff is drawn from, and that approving it really writes the file.
+///
+/// Before 2026-09-18 this test could not have been written. `Edit` was on the deny list in every
+/// mode, so the model never reached for it and no permission card for an edit could exist -- the
+/// MVP sentence failed at its first clause for a reason nothing in the UI explained.
+///
+/// Deliberately runs with the REAL `disallowed_tools_for(Auto)` rather than an empty list: an empty
+/// list would prove the CLI can edit, which was never in doubt, and not that the product's own
+/// policy permits it.
+#[test]
+#[ignore]
+fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_the_file() {
+    let dir = std::env::temp_dir().join(format!("agent-edit-mvp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("greeting.txt");
+    std::fs::write(&target, "hello world\n").unwrap();
+
+    let mut session =
+        AgentSession::start(&dir, PermissionMode::Auto, agent::disallowed_tools_for(PermissionMode::Auto)).unwrap();
+    session
+        .send_turn(&format!(
+            "Use the Edit tool to change the word 'world' to 'neovibe' in {}. Do not use a shell.",
+            target.display()
+        ))
+        .unwrap();
+
+    // Answer every request as it arrives, by its own id. One turn raises several on CLI 2.1.272:
+    // tools are deferred, so the model must `ToolSearch` for `Edit` first and each search is itself
+    // a gated call. A harness that answers one and waits stalls behind the second -- measured, and
+    // it cost a sibling project a fix before an event dump named it.
+    let mut edit_request: Option<serde_json::Value> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut answered = std::collections::HashSet::new();
+    let mut finished = false;
+    while std::time::Instant::now() < deadline && !finished {
+        for event in session.pump() {
+            match &event {
+                AgentDomainEvent::PermissionRequested { permission_id, tool_name, input, .. } => {
+                    if tool_name == "Edit" {
+                        edit_request = Some(input.clone());
+                    }
+                    if answered.insert(permission_id.clone()) {
+                        session.respond_permission(permission_id, PermissionDecision::Allow).unwrap();
+                    }
+                }
+                AgentDomainEvent::TurnCompleted { .. } => finished = true,
+                _ => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(finished, "the turn never completed after answering {} request(s)", answered.len());
+
+    // Clause 1 and 2's data: the model reached for `Edit`, and the gated request carries exactly the
+    // fields `agent-ui/web/src/diff.ts` draws a diff from. Asserted on the real wire value rather
+    // than on the projection, so a projection that dropped a field could not stand in for it.
+    let input = edit_request.expect(
+        "the model never reached for `Edit`; with it on the deny list this is what used to happen, \
+         and it is the failure the MVP sentence's first clause describes",
+    );
+    for field in ["file_path", "old_string", "new_string"] {
+        assert!(input.get(field).is_some(), "a reviewable Edit request must carry {field}: {input}");
+    }
+    assert_eq!(input["file_path"].as_str().unwrap(), target.display().to_string());
+
+    // Clause 4: approving really wrote it.
+    let after = std::fs::read_to_string(&target).unwrap();
+    assert!(after.contains("neovibe"), "the approved edit did not land; the file holds: {after:?}");
+    assert!(!after.contains("world"), "the old text survived: {after:?}");
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
