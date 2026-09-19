@@ -33,7 +33,18 @@ echo "project     $PROJECT"
 echo "backend     $BACKEND"
 if [[ "$BACKEND" == sidecar ]]; then
 	echo "sidecar     $VERDANDI @ $(git -C "$VERDANDI" rev-parse --short HEAD 2>/dev/null || echo '?')"
-	echo "            (agent pins 650782f; a different revision here is a diagnostic, not a refusal)"
+	echo "            (agent's baseline is agent::EXPECTED_VERDANDI_REVISION; a different revision"
+	echo "             here is a diagnostic printed at spawn, not a refusal)"
+	# Which of the two shapes will run, said here rather than discovered in the log. A checkout
+	# holding a built artifact runs THAT -- the same executable the package ships -- and a checkout
+	# without one runs `node dist/`, building it first if needed, which is the slow first start.
+	ARTIFACT="$(ls -t "$VERDANDI"/apps/claude-sidecar/dist-bin/verdandi-claude-sidecar-* 2>/dev/null | head -1 || true)"
+	if [[ -n "$ARTIFACT" ]]; then
+		echo "            runs $(basename "$ARTIFACT") (prebuilt; same shape the package ships)"
+	else
+		echo "            runs node dist/ -- nothing built in dist-bin/. First start may run npm."
+		echo "            \`npm run build:binary -w @verdandi/claude-sidecar\` there builds the artifact once."
+	fi
 fi
 if [[ -n "$ACCOUNT" ]]; then
 	echo "account     $ACCOUNT  (stated)"

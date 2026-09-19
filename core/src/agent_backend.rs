@@ -114,27 +114,36 @@ impl BackendKind {
             // default was never a preference: the sidecar needed a source checkout and Node, which
             // an installed copy does not have.
             //
-            // So the default follows what this installation can actually run, and asks a NARROW
-            // question -- is a shipped artifact here? A checkout deliberately does not count: see
-            // `agent::packaged_sidecar_available` for why treating one as availability would make
-            // the backend a property of what happens to be in someone's home directory and stall
-            // the first start on an `npm` build nothing explains.
+            // So the default follows what this installation can actually run, and the question is
+            // NARROW: is a sidecar artifact here that can be run **without building anything**?
+            // `agent::packaged_sidecar_available` answers it from three places -- a named binary,
+            // one beside this binary, or one already built in a Verdandi checkout -- and a checkout
+            // with nothing built still answers no, because a build is what must never happen behind
+            // a backend nobody chose. (That predicate said "a checkout never counts" until
+            // 2026-09-18; its own doc records why the object was wrong.)
+            //
+            // This says WHICH backend and WHY, in one word. It does not say which binary, because
+            // it cannot: a `bool` carries no path. `agent`'s own `agent: ...` line at session start
+            // names the exact program, which is the more precise answer to the same question.
             // An empty value is "not set", the way a wrapper script's `VAR=` means it.
             None | Some("") => {
                 if packaged_sidecar_available {
                     eprintln!(
-                        "[agent_backend] using the sidecar backend: a packaged sidecar artifact is \
-                         installed beside this binary"
+                        "[agent_backend] using the sidecar backend: a sidecar artifact is available \
+                         with nothing to build (the `agent:` line below names which one)"
                     );
                     BackendKind::Sidecar
                 } else {
-                    // Said every time, not once: on a source build this is the line that explains
-                    // why streaming and resume are missing, and a reader who does not see it will
-                    // look for the reason in the code.
+                    // Said every time, not once: this is the line that explains why streaming and
+                    // resume are missing, and a reader who does not see it will look for the reason
+                    // in the code. It names the way out, because on a development machine there is
+                    // one and it is a single command.
                     eprintln!(
-                        "[agent_backend] using the legacy backend: no packaged sidecar artifact \
-                         beside this binary. Set NEOVIBE_AGENT_BACKEND=sidecar with a Verdandi \
-                         checkout to use the sidecar from source"
+                        "[agent_backend] using the legacy backend: no sidecar artifact can be run \
+                         without building one -- NEOVIBE_SIDECAR_BINARY is unset, none sits beside \
+                         this binary, and no Verdandi checkout has one built. Build it once with \
+                         `npm run build:binary -w @verdandi/claude-sidecar` in the checkout, or set \
+                         NEOVIBE_AGENT_BACKEND=sidecar to build from source on first start"
                     );
                     BackendKind::Legacy
                 }
