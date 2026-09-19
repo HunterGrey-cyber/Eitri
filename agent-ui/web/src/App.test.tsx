@@ -932,6 +932,23 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(current(container)).toBe("c");
   });
 
+  it("a scroll step hands the keys back to the row when a control inside it had them", () => {
+    // After `l` onto a tall card's Approve, `j` scrolls the card. Left on Approve, the keys would
+    // follow a button that is scrolling off screen and still answers Enter.
+    const { container } = started();
+    events(
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    const list = fakeLayout(container, [100, 990]);
+    press("j");
+    press("l");
+    expect(document.activeElement?.textContent).toBe("Approve");
+    press("j");
+    expect(list.scrollTop).toBeGreaterThan(0);
+    expect(document.activeElement).toBe(root(container));
+  });
+
   it("j reads a tall LAST row to its end, then stops", () => {
     const { container } = started();
     prompts("a", "b");

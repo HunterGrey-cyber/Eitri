@@ -835,6 +835,13 @@ export default function App() {
       (scrollCursorRowBox(root, action.delta) || scrollCursorRow(root, action.delta))
     ) {
       event.preventDefault();
+      // `j`/`k` are row motions. If a control inside the row had the keys (after `l` onto a card's
+      // Approve), scrolling the row could carry that control off screen while it still answered
+      // Enter -- found by the scrolling change's own fix round and left open there. So a scroll
+      // step hands the keys back to the row first, the same place `j`/`k` leave them after a move.
+      if (root !== null && document.activeElement !== root && root.contains(document.activeElement)) {
+        root.focus({ preventScroll: true });
+      }
       return;
     }
     if (action.kind === "move" || action.kind === "control" || action.kind === "answer") {
