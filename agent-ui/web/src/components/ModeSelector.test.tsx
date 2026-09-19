@@ -278,4 +278,20 @@ describe("ModeSelector conversation picker", () => {
     expect(allChoices()).toHaveLength(0);
     expect(screen.getByText(/Starting the agent backend/)).toBeTruthy();
   });
+  /** The start screen's own text promises the permission choice cannot be changed afterwards, so a
+   *  mode description that overstates what the mode does is the worst place in the product to be
+   *  wrong. Bypass denies the editing tools -- `agent::disallowed_tools_for` -- because nothing
+   *  gates them there, and the copy said "Every tool call proceeds immediately" for a day after
+   *  that stopped being true.
+   *
+   *  This asserts the CLAIM, not the wording: the Rust list and this string are two statements of
+   *  one policy with nothing making the compiler compare them, so what is pinned here is that the
+   *  screen does not promise unconditional execution. */
+  it("does not promise Bypass runs every tool, because it does not", () => {
+    render(<ModeSelector hello={hello(["auto", "bypass"])} connecting={false} onStart={() => {}} />);
+    const bypass = screen.getByText("Bypass").closest("button")!;
+    expect(bypass.textContent).not.toMatch(/every tool call proceeds/i);
+    expect(bypass.textContent).toMatch(/cannot edit files/i);
+  });
+
 });
