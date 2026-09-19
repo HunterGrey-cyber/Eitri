@@ -200,6 +200,13 @@ pub fn serialize_pane_focus_for_js(focused: bool) -> String {
     json!({ "kind": "pane_focus", "focused": focused }).to_string()
 }
 
+/// `{"kind":"enter_input"}` opens the composer with a blinking caret when the user enters the
+/// panel by keyboard (`Ctrl+l` from the editor). A row click still lands in BROWSE on that row.
+/// This is a separate envelope because `pane_focus` cannot distinguish those arrival routes.
+pub fn serialize_enter_input_for_js() -> String {
+    json!({ "kind": "enter_input" }).to_string()
+}
+
 /// Serializes `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[...]}`.
 /// `AgentDomainEvent`'s `Serialize` implementation supplies each event's tagged JSON shape.
 /// The revisions are the projection's `last_revision` before and after folding the batch.
@@ -418,6 +425,12 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&serialize_pane_focus_for_js(focused)).unwrap();
             assert_eq!(value, serde_json::json!({ "kind": "pane_focus", "focused": focused }));
         }
+    }
+
+    #[test]
+    fn serializes_enter_input() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_enter_input_for_js()).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "enter_input" }));
     }
 
     #[test]

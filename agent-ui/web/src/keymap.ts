@@ -46,7 +46,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     case "i":
       // Refused on a dead session: the composer's textarea is `disabled` there, so INPUT has no box
       // to type into and resolves nothing but `Escape` -- entering it would drop `r`, the one key
-      // the ended/lost rows actually promise. `Composer` stops offering its `按 i 开始输入` hint at
+      // the ended/lost rows actually promise. `Composer` stops offering its focusable placeholder at
       // the same moment, so no on-screen text promises a key this table has stopped resolving.
       return ctx.sessionEnded ? null : { kind: "mode", to: "input" };
     case "j":

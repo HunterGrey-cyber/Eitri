@@ -32,7 +32,7 @@ describe("resolveKey", () => {
      focus and keys keep arriving at the panel root -- where the "input" branch resolves nothing but
      `Escape`, dropping `r`/`j`/`k`/`y` while the lost-session row kept printing "Press r to return
      to the start screen." Entering a mode that drops the key the screen promises is what this
-     refuses; `Composer` stops showing its `按 i 开始输入` hint on the same condition, so nothing on
+     refuses; `Composer` stops showing its focusable placeholder on the same condition, so nothing on
      screen promises `i` either. */
   it("refuses i on a session that ended, because INPUT there has no box and drops r", () => {
     expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input" });

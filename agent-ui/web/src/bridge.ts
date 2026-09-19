@@ -67,6 +67,10 @@ type InboundHandler = (
      *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
      *  status bar and the pane outline, so the three agree. */
     | { kind: "pane_focus"; focused: boolean }
+    /** The user moved into this panel with the keyboard (`Ctrl+l`), so open the composer with the
+     *  caret in it. Only the keyboard route sends this; a click on a row still lands in BROWSE on
+     *  that row. See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
+    | { kind: "enter_input" }
     | { kind: "error"; message: string },
 ) => void;
 
@@ -89,6 +93,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
         obj.kind === "pane_focus" ||
+        obj.kind === "enter_input" ||
         obj.kind === "error"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);

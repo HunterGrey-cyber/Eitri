@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PanelMode } from "../keymap";
 
 /** A draft the host is putting back into the box after a send was refused.
@@ -37,6 +37,10 @@ type Props = {
    *  and a keyboard-driven `i`/`Esc` agree on what mode the panel is in -- neither is the sole
    *  source of truth; both write to the same `mode` state in `App.tsx`. */
   onModeChange: (mode: PanelMode) => void;
+  /** Changes when `shell` asks for the caret (`Ctrl+l`, via `App.tsx`'s `inputRequest`). A
+   *  textarea that is already mounted is focused again; a fresh one takes focus through
+   *  `autoFocus` as before. */
+  focusRequest?: number;
   onSend: (text: string) => void;
 };
 
@@ -47,6 +51,7 @@ export function Composer({
   restoredDraft,
   mode,
   onModeChange,
+  focusRequest = 0,
   onSend,
 }: Props) {
   const [text, setText] = useState("");
@@ -54,6 +59,10 @@ export function Composer({
   /* The box is cleared optimistically on send, because a round trip's worth of latency in a text
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
      message is gone with no trace, which is the one outcome this must never produce. */
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (focusRequest > 0 && mode === "input") textareaRef.current?.focus();
+  }, [focusRequest, mode]);
   useEffect(() => {
     if (restoredDraft === null) return;
     setText(restoredDraft.text);
@@ -81,6 +90,7 @@ export function Composer({
       )}
       {mode === "input" ? (
         <textarea
+          ref={textareaRef}
           value={text}
           disabled={disabled}
           autoFocus
@@ -119,16 +129,15 @@ export function Composer({
         </div>
       ) : (
         // BROWSE's rendering of the same control: not a textarea at all, so there is nothing here
-        // for a stray keystroke to land in. `tabIndex` makes it a real focus target, so THREE
-        // things converge on the same `onModeChange("input")`: a click (which focuses it, like any
-        // focusable element), `i` (handled by the panel's own keydown table, which moves DOM focus
-        // here indirectly by mounting the textarea below with `autoFocus`), and Tab -- ordinary
-        // keyboard focus-navigation landing on this control the same way it would on a real
-        // textarea. That third one is deliberate, not an overlooked side door: a focusable control
-        // that does not become active when focus actually reaches it would be the surprising
-        // behaviour, not this.
+        // for a stray keystroke to land in. `tabIndex` makes it a real focus target, so three
+        // things converge on the same `onModeChange("input")`: a click (which focuses it), `i`
+        // (handled by the panel's own keydown table, which moves DOM focus here indirectly by
+        // mounting the textarea below with `autoFocus`), and Tab. Tab is deliberate: a focusable
+        // control that does not become active when focus reaches it would be the surprising
+        // behaviour. It reads like the empty box it stands in for, not like an instruction, since
+        // Ctrl+l opens the composer anyway.
         <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
-          按 i 开始输入
+          Ask the agent...
         </div>
       )}
       {/* No Send/Stop buttons here:
