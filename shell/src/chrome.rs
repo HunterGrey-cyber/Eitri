@@ -23,7 +23,11 @@ pub(crate) fn project_display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> gtk4::Widget {
+/// Builds the top bar and returns its keyboard-navigable items in left-to-right order.
+/// `Ctrl+k` reaches the bar from either pane because it is above both. `h` and `l` move
+/// between its items, currently only `↻`. Window controls cannot take focus, so an accidental
+/// `Enter` after `Ctrl+k` cannot close the window.
+pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> (gtk4::Widget, Vec<gtk4::Widget>) {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("topbar");
     bar.set_valign(gtk4::Align::Fill);
@@ -47,6 +51,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     reload_agent.set_valign(gtk4::Align::Center);
     reload_agent.set_tooltip_text(Some("Reload the agent panel (Ctrl+Shift+R) — the session keeps running"));
     reload_agent.set_action_name(Some("app.reload-agent-panel"));
+    reload_agent.add_css_class("topbar-item");
 
     bar.append(&app_name);
     bar.append(&project_name);
@@ -55,7 +60,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
 
     let handle = gtk4::WindowHandle::new();
     handle.set_child(Some(&bar));
-    handle.upcast()
+    (handle.upcast(), vec![reload_agent.upcast()])
 }
 
 /// Carried over from `shell_chrome::build_window_controls` unchanged.
@@ -92,6 +97,12 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
         close.connect_clicked(move |_| window.close());
     }
 
+    // Mouse only. A focusable close button is one `Enter` away from closing the window from the
+    // keyboard, and since `Ctrl+k` now brings keyboard focus into the top bar that is no longer a
+    // theoretical path. `focusable(false)` keeps them clickable.
+    for button in [&minimize, &maximize, &close] {
+        button.set_focusable(false);
+    }
     controls.append(&minimize);
     controls.append(&maximize);
     controls.append(&close);
