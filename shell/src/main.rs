@@ -127,6 +127,11 @@ fn build_ui(app: &Application, want_clean: bool, want_terminal: bool, project_ro
     nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
+    // wire 3. Unconditional and stateless -- no socket, no directory, nothing to fail at startup --
+    // because the only reload trigger a normal Neovim config installs is `FocusGained`, and nothing
+    // in this shell ever tells nvim it lost or gained focus. Without this a `git checkout`, a
+    // formatter, or an edit made anywhere else never reaches the buffer.
+    nvim_extra_args.extend(neovibe_core::buffer_reload::nvim_args());
 
     // `Rc` because two separate closures need it after this function returns: the agent panel's
     // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).

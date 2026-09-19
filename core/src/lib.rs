@@ -12,6 +12,7 @@
 
 pub mod agent_backend;
 pub mod agent_bridge;
+pub mod buffer_reload;
 pub mod editor_context;
 pub mod instance_dir;
 pub mod lua;
