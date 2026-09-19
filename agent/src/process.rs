@@ -63,6 +63,34 @@ const STDERR_TAIL_CAPACITY: usize = 20;
 /// instead; this is a suggested default, not hardcoded into `spawn`.
 pub const CONSERVATIVE_DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 
+/// The deny list for a session in `mode`, and the difference between the two is a security
+/// decision, not a convenience.
+///
+/// **Why they differ.** The real gate is the `PreToolUse` hook, and `Bypass` installs none -- see
+/// `spawn_with_binary`, which passes no `--settings` at all in that mode, and Verdandi's own proto
+/// comment saying the same of `BYPASS`. So in `Auto` an `Edit` is a permission card the user
+/// answers, and in `Bypass` it is a file rewritten under a live buffer with no diff, no decision
+/// and nothing in the transcript that had to be read. Those are not the same risk, so they do not
+/// get the same list.
+///
+/// `Auto` therefore drops the three editing tools -- the gate covers them -- and keeps `Bash`,
+/// whose blast radius is not a file but a machine. Un-denying `Bash` is a separate decision with
+/// its own evidence, not a rounding error in this one.
+///
+/// **`Bypass` keeps all four**, which is a narrower answer than removing the mode. The mode stays
+/// available and honest: it runs tools without asking, and the tools it may run are the ones whose
+/// worst case is bounded by what the model can already do through `Read`/`Grep`.
+///
+/// This is best-effort in both modes and was documented as such from the start -- no single
+/// permission flag reliably blocks all tool use. It is the second line; the hook is the first.
+pub fn disallowed_tools_for(mode: PermissionMode) -> &'static [&'static str] {
+    match mode {
+        // The hook gates every tool (matcher `*`), so an edit reaches the user as a card.
+        PermissionMode::Auto => &["Bash"],
+        PermissionMode::Bypass => CONSERVATIVE_DISALLOWED_TOOLS,
+    }
+}
+
 /// Which permission gate the CLI itself enforces for the whole conversation. `Auto` is the normal
 /// mode: the real, reliable `PreToolUse` hook (relayed by `agent-hook` over the per-conversation
 /// Unix socket) is the primary gate; `CanUseTool` control_requests are a secondary, unreliable
@@ -853,6 +881,28 @@ impl Drop for AgentProcess {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two modes must not get the same list, and the test says why rather than just that.
+    ///
+    /// `Bypass` installs no `PreToolUse` gate at all, so an `Edit` there is a file rewritten under a
+    /// live buffer with no card and no decision. Collapsing these two lists into one -- in either
+    /// direction -- is the change this asserts against: widening `Bypass` ships that hole, and
+    /// narrowing `Auto` back makes the permission card unreachable for the one thing the product's
+    /// own MVP sentence is about.
+    #[test]
+    fn auto_may_edit_because_the_gate_covers_it_and_bypass_may_not_because_nothing_does() {
+        let auto = disallowed_tools_for(PermissionMode::Auto);
+        let bypass = disallowed_tools_for(PermissionMode::Bypass);
+        for tool in ["Edit", "Write", "NotebookEdit"] {
+            assert!(!auto.contains(&tool), "Auto must permit {tool}: the hook gates it");
+            assert!(bypass.contains(&tool), "Bypass must deny {tool}: nothing gates it there");
+        }
+        // Bash stays denied in both. Its worst case is not a file, and un-denying it is a separate
+        // decision that owes its own evidence.
+        assert!(auto.contains(&"Bash"));
+        assert!(bypass.contains(&"Bash"));
+        assert_ne!(auto, bypass, "one list for both modes cannot be right for either");
+    }
 
     /// Pins the exact contents of `CONSERVATIVE_DISALLOWED_TOOLS`, because a typo in it is silent
     /// on BOTH sides of a repository boundary.

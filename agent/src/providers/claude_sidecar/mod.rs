@@ -588,7 +588,7 @@ fn build_create_request(
             // built-in tools at all", stated. Neovibe has no allowlist to express, so it says
             // nothing rather than saying the empty set.
             tool_policy: Some(ToolPolicy {
-                deny: crate::process::CONSERVATIVE_DISALLOWED_TOOLS
+                deny: crate::process::disallowed_tools_for(permission_mode)
                     .iter()
                     .map(|t| (*t).to_string())
                     .collect(),

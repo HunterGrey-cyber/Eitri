@@ -44,7 +44,7 @@ pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationE
 pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
 pub use persistence::{resumable_sessions, ResumableSession};
 pub use event::{AgentEvent, PermissionSource};
-pub use process::{AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
+pub use process::{disallowed_tools_for, AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 pub use session::AgentSession;
 pub use wire::translate_line;
 

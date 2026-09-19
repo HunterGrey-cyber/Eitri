@@ -487,3 +487,25 @@ body,
   flex: 1;
   user-select: text;
 }
+
+/* --- the permission card's diff (wire 2) -------------------------------------------------------
+   Signal colours live on the gutter and the left border, never on the text: --nv-ok/--nv-error are
+   guarded at 3:1 for non-text UI, and this file has already once drawn text in them at 2.05-3.84:1.
+   `indexCss.test.ts` keeps every `color:` on --nv-fg/--nv-muted. */
+.permission-card-edit { border: 1px solid var(--nv-border); border-radius: 4px; overflow: hidden; }
+.permission-card-edit-head {
+  display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+  padding: 6px 8px; background: var(--nv-surface); border-bottom: 1px solid var(--nv-border);
+}
+.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: 12px; color: var(--nv-fg); word-break: break-all; }
+.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: 12px; color: var(--nv-muted); white-space: nowrap; }
+.permission-card-edit-note {
+  padding: 6px 8px; font-size: 12px; color: var(--nv-muted);
+  border-bottom: 1px solid var(--nv-border); border-left: 3px solid var(--nv-warn);
+}
+.permission-card-diff { margin: 0; padding: 0; font-family: var(--nv-font-mono); font-size: 12px; overflow-x: auto; }
+.diff-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre; color: var(--nv-fg); }
+.diff-gutter { width: 1ch; flex: none; color: var(--nv-muted); }
+.diff-added { border-left: 3px solid var(--nv-ok); }
+.diff-removed { border-left: 3px solid var(--nv-error); }
+.diff-context { border-left: 3px solid transparent; }
