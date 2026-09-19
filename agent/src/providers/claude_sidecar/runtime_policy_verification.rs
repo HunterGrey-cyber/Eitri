@@ -1,9 +1,17 @@
 // agent/src/providers/claude_sidecar/runtime_policy_verification.rs
 //! **Every test in this file spends real Claude tokens and must be run against the TEST Claude
-//! profile, via the test-account wrapper** (`/home/user/.local/bin/a test-account wrapper`; see
-//! `docs/canonical/dated_record.md`'s 2026-09-19 entry for why this replaced billing work).
+//! profile, via a wrapper that runs it on a dedicated test account** (see `docs/canonical/dated_record.md`'s
+//! 2026-09-19 entry for why that replaced billing work).
+//!
+//! **Record the CLI build in the same breath, because nothing does it for you.** The test-account wrapper
+//! routes both doors a harness can use through the policy launcher, but it pins no version for the
+//! length of a run and echoes none; the tool it replaced did both. What these tests establish is a
+//! *runtime* boundary, and a runtime boundary whose build is unknown is precisely the defect
+//! 2026-09-18 spent a day finding -- it cost this exact A/B pair a re-run. So run the first line
+//! and keep its answer beside the result.
 //!
 //! ```text
+//! claude --version
 //! NEOVIBE_VERDANDI_CHECKOUT=$HOME/src/verdandi-old-checkout \
 //!   cargo test -p agent --lib runtime_policy -- --ignored --test-threads=1 --nocapture
 //! ```
