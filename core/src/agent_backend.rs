@@ -22,7 +22,6 @@ use agent::{
     ProjectionGuard, UiDelivery,
     ConversationError, PermissionDecision, PermissionMode, ProviderCapabilities, ProviderInfo,
     ResumableSession,
-    CONSERVATIVE_DISALLOWED_TOOLS,
 };
 use std::path::{Path, PathBuf};
 
@@ -174,7 +173,7 @@ impl AgentBackend {
                             .to_string(),
                     ));
                 }
-                AgentSession::start(project_dir, mode, CONSERVATIVE_DISALLOWED_TOOLS)
+                AgentSession::start(project_dir, mode, agent::disallowed_tools_for(mode))
                     .map(AgentBackend::Legacy)
                     .map_err(|e| BackendError::fatal(format!("failed to start the legacy Claude backend: {e}")))
             }

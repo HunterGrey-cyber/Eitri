@@ -314,7 +314,13 @@ fn tool_policy_deny_really_stops_a_bypass_session_from_running_bash() {
     );
 
     // ---- TEST: the real product path, carrying CONSERVATIVE_DISALLOWED_TOOLS.
-    let denied = crate::process::CONSERVATIVE_DISALLOWED_TOOLS;
+    // Through the same function the product calls, not the constant directly: this session is
+    // BYPASS, and since 2026-09-18 the deny list depends on the mode (Auto drops the editing tools
+    // because the PreToolUse gate covers them; Bypass keeps them because nothing does). The two are
+    // the same list for Bypass today, so this run's meaning is unchanged -- but a future change to
+    // either list should reach this verification rather than leave it testing a constant the
+    // product no longer sends.
+    let denied = crate::process::disallowed_tools_for(crate::PermissionMode::Bypass);
     assert!(
         denied.contains(&"Bash"),
         "this test measures the product's own list; if Bash left it, the test must change with it"
