@@ -6,6 +6,7 @@
 mod agent_panel;
 mod chrome;
 mod editor_context;
+mod hint;
 mod layout;
 mod pane_focus;
 mod pane_switch;
@@ -243,7 +244,41 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let (status_bar, focus_label) = chrome::build_status_bar();
     root.append(&status_bar);
 
-    window.set_child(Some(&root));
+    // The global `f` HINT draws its GTK labels (top bar, editor, bottom slot) as overlay children
+    // of this, positioned over whatever they label. Its only child is the whole window content, so
+    // the layout is exactly what it was without it; the labels never take a click.
+    let hint_overlay = gtk4::Overlay::new();
+    hint_overlay.set_child(Some(&root));
+    window.set_child(Some(&hint_overlay));
+
+    // The global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md). Three
+    // triggers reach the same toggle: `Ctrl+Shift+F` from anywhere (the `app.hint` accelerator,
+    // which GTK fires from the window's capture-phase `gtk-shortcut-manager-capture` controller,
+    // before the editor or the panel see the key -- not from `gtk-application-shortcuts`, which is
+    // GLOBAL-scoped and handles nothing itself; see `hint`'s module doc), `f` on the top bar
+    // (below), and `f` in the panel's BROWSE (the panel's `hint_request`).
+    let hint_coordinator = hint::HintCoordinator::new(hint::HintWidgets {
+        window: window.clone(),
+        overlay: hint_overlay.clone(),
+        top_items: top_items.clone(),
+        editor: pane.clone(),
+        main_widget: main_widget.clone(),
+        side_widget: side_widget.clone(),
+        agent_widget: agent_widget.clone(),
+        bottom: bottom_widget.clone(),
+        agent: agent_panel_handle.clone(),
+    });
+    {
+        let coordinator = hint_coordinator.clone();
+        agent_panel_handle.on_hint(move |message| coordinator.on_panel(message));
+    }
+    {
+        let action = gtk4::gio::SimpleAction::new("hint", None);
+        let coordinator = hint_coordinator.clone();
+        action.connect_activate(move |_, _| coordinator.toggle_from_chord());
+        app.add_action(&action);
+        app.set_accels_for_action("app.hint", &["<Control><Shift>f"]);
+    }
 
     // Which pane has the keys. One tracker drives the editor's cursor (solid, or not drawn,
     // via Neovide itself), the agent panel's cursor and mode block, and the status bar, so they cannot
@@ -383,6 +418,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let top_items = top_items.clone();
         let return_to_pane = return_to_pane.clone();
         let window = window.clone();
+        let hint_coordinator = hint_coordinator.clone();
         let controller = EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         controller.connect_key_pressed(move |_controller, key, _keycode, state| {
@@ -393,6 +429,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             }
             if ctrl {
                 return glib::Propagation::Proceed;
+            }
+            // `f` here starts the global HINT, as it does in the panel's BROWSE (spec §2.1).
+            if key == Key::f {
+                hint_coordinator.toggle();
+                return glib::Propagation::Stop;
             }
             let step: isize = match key {
                 Key::h | Key::Left => -1,

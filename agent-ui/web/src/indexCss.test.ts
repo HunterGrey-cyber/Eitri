@@ -26,6 +26,8 @@ const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
 /** The solid cursor block: the current row's sign cell, and a focused button with its children
  *  (every control is keyboard-reachable and the selected one is drawn as the cursor). Nothing else. */
 const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?)$/;
+/** The global `f` HINT's label, and nothing else (spec 2026-09-19-global-hint-design.md §2.3). */
+const HINT_BRANCH = /^\.hint-label$/;
 
 /**
  * The rule this file actually enforces, in one sentence: **a colour may be used as text only where
@@ -57,12 +59,17 @@ function unguardedTextColorDeclarations(source: string): string[] {
     const body = rule.slice(rule.indexOf("{") + 1, -1);
     const onCursorSurface =
       everyBranchIsOnSurface(selector, CURSOR_BRANCH) && /(?:^|;)\s*background: var\(--nv-fg\);/.test(body);
+    const onHintSurface =
+      everyBranchIsOnSurface(selector, HINT_BRANCH) && /(?:^|;)\s*background: var\(--nv-hint-bg\);/.test(body);
     for (const declaration of body.match(/(?<![a-z-])color:[^;]*;/g) ?? []) {
       if (onHljsSurface && /^color: var\(--nv-syn-[a-z]+\);$/.test(declaration)) continue;
       if (onChromeSurface && /^color: var\(--nv-chrome-(fg|muted)\);$/.test(declaration)) continue;
       // The panel's cursor: `--nv-bg` text on an `--nv-fg` fill, the body's own pair reversed.
       // Only where the SAME rule paints that fill, so the exemption cannot outlive the fill.
       if (onCursorSurface && /^color: var\(--nv-bg\);$/.test(declaration)) continue;
+      // A HINT label: `--nv-hint-fg` on the `--nv-hint-bg` fill it is guarded against in Rust
+      // (`tokens.rs`, 4.5:1). Again only where the same rule paints that fill.
+      if (onHintSurface && /^color: var\(--nv-hint-fg\);$/.test(declaration)) continue;
       declarations.push(declaration);
     }
   }
@@ -195,6 +202,36 @@ describe("index.css", () => {
     expect(
       unguardedTextColorDeclarations(".row-current .row-sign, .row-body { background: var(--nv-fg); color: var(--nv-bg); }"),
     ).toEqual(["color: var(--nv-bg);"]);
+  });
+
+  it("admits --nv-hint-fg as text only on a HINT label filled with --nv-hint-bg", () => {
+    // `tokens.rs` guards `hint_fg` for text against `hint_bg` (4.5:1) and against nothing else, so
+    // the pair is only sound where the SAME rule lays that fill under the text.
+    const filled = ".hint-label { background: var(--nv-hint-bg); color: var(--nv-hint-fg); }";
+    expect(unguardedTextColorDeclarations(filled)).toEqual([]);
+    // Negative controls: the colour without its fill, on any other selector, or in a group with
+    // only one branch on the label.
+    expect(unguardedTextColorDeclarations(".hint-label { color: var(--nv-hint-fg); }")).toEqual([
+      "color: var(--nv-hint-fg);",
+    ]);
+    expect(unguardedTextColorDeclarations(".row-sign { background: var(--nv-hint-bg); color: var(--nv-hint-fg); }")).toEqual([
+      "color: var(--nv-hint-fg);",
+    ]);
+    expect(
+      unguardedTextColorDeclarations(".hint-label, .row-body { background: var(--nv-hint-bg); color: var(--nv-hint-fg); }"),
+    ).toEqual(["color: var(--nv-hint-fg);"]);
+  });
+
+  it("paints the HINT label with the IncSearch pair, and gives its layer a containing block", () => {
+    const rules = withoutComments.match(/[^{}]*\{[^{}]*\}/g) ?? [];
+    const label = rules.find((r) => r.slice(0, r.indexOf("{")).trim() === ".hint-label");
+    expect(label).toBeDefined();
+    expect(label).toMatch(/background: var\(--nv-hint-bg\);/);
+    expect(label).toMatch(/(?<![a-z-])color: var\(--nv-hint-fg\);/);
+    // The layer is `position: absolute; inset: 0` over the panel root, and the labels are placed
+    // from rects measured against that root, so the root must be their containing block.
+    const root = rules.find((r) => r.slice(0, r.indexOf("{")).trim() === ".agent-ui-root");
+    expect(root).toMatch(/position: relative;/);
   });
 
   it("does not dim a conversation-picker row with opacity", () => {

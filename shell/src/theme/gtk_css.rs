@@ -20,6 +20,10 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     let border = tokens.border.hex();
     let hover = tokens.cursorline.hex();
     let error = tokens.error.hex();
+    // The global `f` HINT's label pair (nvim's IncSearch). `hint_fg` is guarded for text against
+    // `hint_bg` only (`neovibe_core::theme::tokens`), so it is used nowhere but on its own fill.
+    let hint_bg = tokens.hint_bg.hex();
+    let hint_fg = tokens.hint_fg.hex();
     let font = PROSE_FONT_STACK;
 
     format!(
@@ -130,6 +134,25 @@ paned.content-area > separator {{
 .topbar-item:focus {{
     background-color: {chrome_fg};
     color: {chrome};
+}}
+
+/* The global f HINT's GTK labels -- top bar items, the editor pane, a bottom plugin pane
+   (spec 2026-09-19-global-hint-design.md §3.5). The panel draws its own, in the same pair. They sit
+   in the window's hint overlay and never take a click (`can_target(false)`). The fill is in this
+   same rule because `hint_fg` is only guarded against `hint_bg`. */
+.hint-label {{
+    background-color: {hint_bg};
+    color: {hint_fg};
+    font-family: monospace;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 3px;
+}}
+
+/* A label the typed prefix can no longer reach recedes, as the panel's `.hint-off` does. */
+.hint-label.hint-off {{
+    opacity: 0.3;
 }}
 "#
     )
@@ -267,6 +290,53 @@ mod tests {
             assert!(item.contains(&format!("color: {};", t.chrome.hex())), "{item}");
             assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
             assert!(css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(), "hover must not win");
+        }
+    }
+
+    fn lunaperche() -> ThemeTokens {
+        ThemeTokens::derive(&NvimThemePayload {
+            v: PAYLOAD_VERSION,
+            groups: [
+                ("Normal".to_string(), HlAttrs { fg: Some(0xc6c6c6), bg: Some(0x000000), reverse: false }),
+                ("StatusLine".to_string(), HlAttrs { fg: None, bg: None, reverse: true }),
+                ("Comment".to_string(), HlAttrs { fg: Some(0x949494), bg: None, reverse: false }),
+            ]
+            .into(),
+            options: NvimOptions { background: "dark".into(), guifont: String::new(), colors_name: "lunaperche".into() },
+        })
+    }
+
+    /// rose-pine dawn with its real IncSearch (`#faf4ed` on `#d7827e`, 2.60:1 as written, and
+    /// neither of Normal's colours reaches 4.5:1 on that fill). The fixtures above carry no
+    /// IncSearch at all, so on them the pair is Normal's reversed and only re-checks Normal's own
+    /// contrast.
+    fn dawn_with_incsearch() -> ThemeTokens {
+        ThemeTokens::derive(&NvimThemePayload {
+            v: PAYLOAD_VERSION,
+            groups: [
+                ("Normal".to_string(), HlAttrs { fg: Some(0x575279), bg: Some(0xfaf4ed), reverse: false }),
+                ("IncSearch".to_string(), HlAttrs { fg: Some(0xfaf4ed), bg: Some(0xd7827e), reverse: false }),
+            ]
+            .into(),
+            options: NvimOptions { background: "light".into(), guifont: String::new(), colors_name: "rose-pine".into() },
+        })
+    }
+
+    /// The global `f` HINT's GTK labels (top bar, editor, bottom slot) are the IncSearch pair, the
+    /// same as the panel's. `hint_fg` is guarded for text against `hint_bg` only, so the rule must
+    /// lay its own `hint_bg` fill under the text and use no other text colour.
+    #[test]
+    fn a_hint_label_is_hint_fg_text_on_its_own_hint_bg_fill() {
+        let incsearch = dawn_with_incsearch();
+        assert_eq!(incsearch.hint_bg.hex(), "#d7827e", "the pair really comes from IncSearch here");
+        for t in [dawn(), ThemeTokens::fallback(), lunaperche(), incsearch] {
+            let css = gtk_css(&t);
+            let body = rule(&css, ".hint-label");
+            assert!(body.contains(&format!("\n    background-color: {};", t.hint_bg.hex())), "{body}");
+            let text_colours: Vec<&str> = body.lines().filter(|l| l.trim_start().starts_with("color:")).collect();
+            let expected = format!("    color: {};", t.hint_fg.hex());
+            assert_eq!(text_colours, vec![expected.as_str()], "{body}");
+            assert!(t.hint_fg.contrast(t.hint_bg) >= 4.5, "hint_fg is unreadable on hint_bg");
         }
     }
 

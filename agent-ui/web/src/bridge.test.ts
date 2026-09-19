@@ -108,4 +108,40 @@ describe("installDispatch", () => {
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
   });
+
+  it("demuxes hint_collect envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_collect", sessionId: 7 }));
+    expect(handler).toHaveBeenCalledWith({ kind: "hint_collect", sessionId: 7 });
+  });
+
+  it("demuxes hint_show envelope with labels", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const envelope = { kind: "hint_show", sessionId: 7, labels: ["a", "s", "d"] };
+    window.__neovibeDispatch!(JSON.stringify(envelope));
+    expect(handler).toHaveBeenCalledWith(envelope);
+  });
+
+  it("demuxes hint_prefix envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_prefix", sessionId: 7, typed: "a" }));
+    expect(handler).toHaveBeenCalledWith({ kind: "hint_prefix", sessionId: 7, typed: "a" });
+  });
+
+  it("demuxes hint_land envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_land", sessionId: 7, index: 2 }));
+    expect(handler).toHaveBeenCalledWith({ kind: "hint_land", sessionId: 7, index: 2 });
+  });
+
+  it("demuxes hint_end envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "hint_end", sessionId: 7 }));
+    expect(handler).toHaveBeenCalledWith({ kind: "hint_end", sessionId: 7 });
+  });
 });

@@ -6,8 +6,8 @@ import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
 import type { KeyLike, PanelMode } from "./keymap";
 import { buildTimeline } from "./timeline";
-import { controlsOf, currentStop, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
-import type { AnswerableItem } from "./nav";
+import { controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
+import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
 import { ModeSelector } from "./components/ModeSelector";
 import { Composer } from "./components/Composer";
@@ -17,6 +17,8 @@ import { Row } from "./components/Row";
 import { Winbar } from "./components/Winbar";
 import { StatusLine } from "./components/StatusLine";
 import { ContinueInTerminal, HandoffCommandCard } from "./components/TerminalHandoff";
+import { HintLayer } from "./components/HintLayer";
+import type { ShownHint } from "./components/HintLayer";
 import type { HandoffCommand, Hello, PermissionModeChoice } from "./types";
 import { applyTheme } from "./theme";
 
@@ -62,6 +64,13 @@ function isActivatableControl(el: EventTarget | null): el is HTMLElement {
  *  like the row-to-row step it stands in for rather than a full-page jump. Arbitrary and not
  *  verified on a screen -- see the dated record's entry for this change. */
 const TOOL_RESULT_SCROLL_STEP_PX = 40;
+
+/** The longest this panel swallows keys after `f` asked `shell` for a HINT, if that HINT never ends
+ *  here (see `hintPendingRef`). Long enough for a GTK main loop busy with a frame and the 33ms pump; short
+ *  enough that a `shell` which never answers (the HINT was refused, or this page is not hosted by
+ *  `shell` at all) costs a second of dead keys, not a stuck panel -- the same stance as `shell`'s own
+ *  300ms wait for this panel's answer (spec §3.3). */
+export const HINT_PENDING_TIMEOUT_MS = 1000;
 
 /** Whether a pending `j`/`k` cursor move should instead scroll the CURSOR ROW's own overflow box
  *  -- today, only a tool result opened past its 260px fold (`.tool-result-body` in index.css; see
@@ -350,6 +359,11 @@ export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (mode !== "browse") return;
+    const landed = landedControlRef.current;
+    if (landed !== null && landed.isConnected) {
+      landed.focus();
+      return;
+    }
     if (isEditableElement(document.activeElement)) return;
     containerRef.current?.focus();
   }, [mode, sessionStarted]);
@@ -461,6 +475,70 @@ export default function App() {
     if (!sessionStarted) startScreenRef.current?.focus();
   }, [sessionStarted]);
 
+  /* The panel's half of the global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md).
+     `shell` owns the session and every key typed during it -- the panel never sees those keys, so
+     there is no HINT key handling here at all. The panel only answers `shell`'s five envelopes:
+     report and freeze its visible targets, draw their labels, narrow them, land on one, clear.
+     Refs, because the dispatch handler is installed once and must never read stale render state. */
+  /** The HINT session this panel is part of, or null. Every envelope naming another one is ignored
+   *  (spec §4, invariant 5): a late `hint_show` from a session `shell` already gave up on must not
+   *  draw labels over a panel that has moved on. */
+  const hintSessionRef = useRef<number | null>(null);
+  /** The targets frozen at `hint_collect`, in the order `shell` addresses them by index. Frozen, not
+   *  re-read, so an index means the same element for the whole session even if the DOM changes. */
+  const frozenRef = useRef<HintTarget[]>([]);
+  const [hints, setHints] = useState<ShownHint[]>([]);
+  const [hintTyped, setHintTyped] = useState("");
+  /** A code block HINT landed on: the next `y` copies exactly that block's code rather than the
+   *  whole message (spec §2.4). Cleared by that copy and by any other key the table resolves. */
+  const copyCodeRef = useRef<HTMLElement | null>(null);
+  /** A control HINT landed on, for the `mode` effect above to leave focused: landing from INPUT
+   *  blurs the composer, which sets BROWSE, and that effect would otherwise take focus straight back
+   *  to the root. Consumed or dropped on the very next commit (the effect just below). */
+  const landedControlRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    landedControlRef.current = null;
+  });
+
+  /** Set from this panel posting `hint_request` until the HINT it asked for ends here (`endHint`,
+   *  which every `hint_end` and `hint_land` reaches), or the timer that gives up waiting fires.
+   *  Found in the whole-branch review: `shell` attaches the window key controller that swallows HINT keys only once it has handled the script message, so until then
+   *  a label typed right after `f` reached THIS panel's key table -- `a`/`d` pressed a permission
+   *  card's Approve/Deny (spec §4 invariants 1 and 6), `i` opened the composer, and a second `f`
+   *  asked for a second HINT that cancelled the first. While this is set, the capture-phase listener
+   *  below swallows every key before any handler in the panel sees it. Once `shell`'s controller
+   *  is attached the panel receives no keys anyway, so this outliving that moment costs nothing. Such a key is dropped, not
+   *  replayed: the labels are not drawn yet, so it cannot have been meant for one (spec §2.5). */
+  const hintPendingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function clearHintPending() {
+    if (hintPendingRef.current !== null) clearTimeout(hintPendingRef.current);
+    hintPendingRef.current = null;
+  }
+  /** `f`: ask `shell` for a HINT, once. A held `f`'s auto-repeat asks nothing (review: two requests
+   *  reaching `shell` toggled the HINT straight back off). */
+  function requestHint(repeat: boolean) {
+    if (repeat || hintPendingRef.current !== null) return;
+    postToRust({ type: "hint_request", request_id: nextRequestId() });
+    hintPendingRef.current = setTimeout(() => {
+      hintPendingRef.current = null;
+    }, HINT_PENDING_TIMEOUT_MS);
+  }
+  useEffect(() => {
+    function swallowWhilePending(event: globalThis.KeyboardEvent) {
+      if (hintPendingRef.current === null) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+    // Capture phase on the window: ahead of React's own listener, the document-level replay above,
+    // and the composer's and every control's own keydown -- including a focused button's native
+    // activation, which is the default action this prevents.
+    window.addEventListener("keydown", swallowWhilePending, true);
+    return () => {
+      window.removeEventListener("keydown", swallowWhilePending, true);
+      clearHintPending();
+    };
+  }, []);
+
   useEffect(() => {
     installDispatch((payload) => {
       if (payload.kind === "theme") {
@@ -473,6 +551,34 @@ export default function App() {
         setPaneFocused(payload.focused);
       } else if (payload.kind === "enter_input") {
         setInputRequest((n) => n + 1);
+      } else if (payload.kind === "hint_collect") {
+        const root = containerRef.current ?? startScreenRef.current;
+        frozenRef.current = root === null ? [] : hintTargets(root);
+        hintSessionRef.current = payload.sessionId;
+        // A newer session supersedes whatever an older one still had on screen.
+        setHints([]);
+        setHintTyped("");
+        postToRust({
+          type: "hint_targets",
+          request_id: nextRequestId(),
+          session_id: payload.sessionId,
+          count: frozenRef.current.length,
+        });
+      } else if (payload.kind === "hint_show") {
+        if (payload.sessionId !== hintSessionRef.current) return;
+        const frozen = frozenRef.current;
+        setHints(payload.labels.slice(0, frozen.length).map((label, i) => ({ target: frozen[i], label })));
+        setHintTyped("");
+      } else if (payload.kind === "hint_prefix") {
+        if (payload.sessionId !== hintSessionRef.current) return;
+        setHintTyped(payload.typed);
+      } else if (payload.kind === "hint_land") {
+        if (payload.sessionId !== hintSessionRef.current) return;
+        landOnHint(frozenRef.current[payload.index]);
+        endHint();
+      } else if (payload.kind === "hint_end") {
+        if (payload.sessionId !== hintSessionRef.current) return;
+        endHint();
       } else if (payload.kind === "hello") {
         setHello(payload);
       } else if (payload.kind === "snapshot") {
@@ -593,6 +699,56 @@ export default function App() {
     });
     requestHello();
   }, []);
+
+  /** Clears every trace of a HINT session: labels, prefix, the frozen list and the session itself,
+   *  so no later envelope for it does anything (spec §4, invariant 3). */
+  function endHint() {
+    clearHintPending();
+    frozenRef.current = [];
+    hintSessionRef.current = null;
+    setHints([]);
+    setHintTyped("");
+  }
+
+  /** Moves the keys to `target` and does nothing else -- HINT never acts (spec §4, invariant 1):
+   *  a button is focused, never clicked, and `Enter` is what presses it afterwards. A target whose
+   *  element has left the DOM since it was frozen lands nowhere rather than somewhere else. */
+  function landOnHint(target: HintTarget | undefined) {
+    copyCodeRef.current = null;
+    if (target === undefined || !target.el.isConnected) return;
+    const root = containerRef.current;
+    if (target.kind === "composer") {
+      // The same route `Ctrl+l` takes (`inputRequest`): INPUT, with the caret in the box. Entering a
+      // text box is what landing on one means (spec §2.4); nothing is typed or sent.
+      setInputRequest((n) => n + 1);
+      return;
+    }
+    if (target.kind === "control") {
+      // An input (a permission card's reason box) takes the keys by being focused; a button is
+      // selected by being focused, drawn as the solid cursor block.
+      // A control inside a conversation row (a card's Approve) also brings the row cursor to that
+      // row, the same place `l` would have reached it from: otherwise `h` from it would hand the
+      // keys back to some other row, and `a`/`d` would answer a different card.
+      const row = target.el.closest<HTMLElement>('[data-nav-stop="row"]');
+      const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
+      if (rowIndex !== null) setCursor(rowIndex);
+      landedControlRef.current = target.el;
+      setMode("browse");
+      target.el.focus();
+      return;
+    }
+    // A row or a code block: the row cursor goes there and the panel is back in BROWSE. The row's
+    // index is read now, from the element, never taken from `target.rowIndex`: rows can be added
+    // above it while the labels are up (a permission card is anchored right after its tool call),
+    // and the index frozen at `hint_collect` would then name a different row.
+    const row = target.kind === "row" ? target.el : target.el.closest<HTMLElement>('[data-nav-stop="row"]');
+    const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
+    if (rowIndex === null) return;
+    if (target.kind === "code") copyCodeRef.current = target.el;
+    setMode("browse");
+    setCursor(rowIndex);
+    root?.focus({ preventScroll: true });
+  }
 
   /** Posts `ready` and tracks it as in-flight. Rust replies with `hello` (and a snapshot, if a
    *  session exists). Called on mount and again whenever the start screen comes back. */
@@ -739,6 +895,11 @@ export default function App() {
       if (target instanceof HTMLElement) target.focus();
       return;
     }
+    if (event.key === "f") {
+      event.preventDefault();
+      requestHint(event.repeat);
+      return;
+    }
     if (handoff === null || event.key !== "y") return;
     event.preventDefault();
     void navigator.clipboard?.writeText(handoff.command);
@@ -773,6 +934,7 @@ export default function App() {
         {commandNoticeBanner}
         {handoff !== null && <HandoffCommandCard handoff={handoff} />}
         <ModeSelector hello={hello} connecting={startingRequestId !== null} onStart={startSession} />
+        <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />
       </div>
     );
   }
@@ -824,6 +986,9 @@ export default function App() {
     if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
     const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, { sessionEnded, pendingG });
     if (action === null) return;
+    // A code block HINT landed on is "the item" for exactly the next `y`; any other key moves on.
+    const landedCode = copyCodeRef.current;
+    copyCodeRef.current = null;
     // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move off it
     // -- the vim behaviour the owner expected; `scrollCursorRowBox`'s own doc says why this cannot
     // live in `resolveKey`. Failing that, they scroll the conversation through a current row that
@@ -887,6 +1052,14 @@ export default function App() {
         break;
       }
       case "copy": {
+        // After HINT landed on a code block: that block's code, not the whole message. Only while it
+        // is still in the DOM and still inside the row under the cursor -- anything else and the
+        // user is looking at something else now.
+        const cursorRow = root?.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[cursor];
+        if (landedCode !== null && landedCode.isConnected && cursorRow?.contains(landedCode)) {
+          void navigator.clipboard?.writeText(landedCode.querySelector("code")?.textContent ?? landedCode.textContent ?? "");
+          break;
+        }
         // No item at the cursor (an empty timeline) writes NOTHING, rather than clobbering
         // whatever the user already had on the clipboard with "" -- found in review.
         const item = timeline[cursor];
@@ -895,6 +1068,12 @@ export default function App() {
       }
       case "restart":
         returnToStartScreen();
+        break;
+      case "hint":
+        // `shell` owns the HINT session: it collects targets across the whole window and asks this
+        // panel for its own with `hint_collect`. Until the HINT ends, this panel's keys are swallowed
+        // (`hintPendingRef`); nothing else changes here.
+        requestHint(event.repeat);
         break;
       case "pending-g":
         // Claimed (so the `g` does nothing else) and remembered for exactly one key.
@@ -1017,6 +1196,8 @@ export default function App() {
         restoredDraft={restoredDraft}
         mode={mode}
         focusRequest={inputRequest}
+        // Only while the box can take a message: a landing on a disabled textarea could not focus it.
+        hintTarget={!(turnInProgress || sessionEnded || handingOff)}
         onModeChange={setMode}
         onSend={sendMessage}
       />
@@ -1033,6 +1214,7 @@ export default function App() {
         handingOff={handingOff}
         onHandoff={handoffToTerminal}
       />
+      <HintLayer root={containerRef.current} hints={hints} typed={hintTyped} />
     </div>
   );
 }

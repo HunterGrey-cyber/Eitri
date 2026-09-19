@@ -161,6 +161,20 @@ impl ThemeTokens {
         let hint_fg_raw = g.fg_of(&["IncSearch"]).unwrap_or(bg);
         // Toward whichever of Normal's two colours stands out more against the label background.
         let hint_toward = if hint_bg.contrast(bg) >= hint_bg.contrast(fg) { bg } else { fg };
+        // Normal's two colours cannot always carry text on a mid-luminance IncSearch: on rose-pine
+        // dawn's real `#d7827e`, the best either reaches is 2.60:1, and `ensure_contrast` would
+        // hand back that failing colour. Black or white always reaches 4.5:1 on one side of any
+        // background, so the guard falls through to whichever pole stands out more.
+        let hint_fg = {
+            let toward_normal = ensure_contrast(hint_fg_raw, hint_bg, hint_toward, TEXT_CONTRAST);
+            if toward_normal.contrast(hint_bg) >= TEXT_CONTRAST {
+                toward_normal
+            } else {
+                let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(0xff, 0xff, 0xff));
+                let pole = if hint_bg.contrast(black) >= hint_bg.contrast(white) { black } else { white };
+                ensure_contrast(hint_fg_raw, hint_bg, pole, TEXT_CONTRAST)
+            }
+        };
         let signal = |names: &[&str], fallback: Rgb| ensure_contrast(g.fg_of(names).unwrap_or(fallback), bg, fg, UI_CONTRAST);
         let comment = g.fg_of(&["Comment"]);
         let function = g.fg_of(&["Function"]);
@@ -194,7 +208,7 @@ impl ThemeTokens {
             muted: ensure_contrast(comment.unwrap_or_else(|| bg.mix(fg, 0.5)), bg, fg, TEXT_CONTRAST),
             cursorline,
             hint_bg,
-            hint_fg: ensure_contrast(hint_fg_raw, hint_bg, hint_toward, TEXT_CONTRAST),
+            hint_fg,
             search: g.bg_of(&["Search"]).unwrap_or(hint_bg),
             warn: signal(&["DiagnosticWarn", "WarningMsg"], FALLBACK_WARN),
             error: signal(&["DiagnosticError", "ErrorMsg"], FALLBACK_ERROR),
@@ -312,6 +326,9 @@ mod tests {
         assert_eq!(t.surface.hex(), "#fffaf3");
         assert_eq!(t.cursorline.hex(), "#dfdad9", "1.27:1 already clears the 1.15 cursorline guard");
         assert_eq!(t.hint_bg.hex(), "#d7827e");
+        // Neither of Normal's colours reaches 4.5:1 on this IncSearch (2.56 and 2.60): the label
+        // text must still read.
+        assert!(t.hint_fg.contrast(t.hint_bg) >= 4.5, "{}", t.hint_fg.hex());
         // Comment is 2.73:1 on this background: guarded toward the foreground, not replaced by it.
         assert!(t.muted.contrast(t.bg) >= 4.5);
         assert_ne!(t.muted, Rgb::from_u32(0x9893a5));

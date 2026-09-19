@@ -22,6 +22,9 @@ body,
   display: flex;
   flex-direction: column;
   height: 100vh;
+  /* The containing block for `.hint-layer`, whose labels are placed from rects measured against
+     this root (`components/HintLayer.tsx`). Nothing else here is positioned. */
+  position: relative;
 }
 
 /* winbar, the scrolling message list, the status line, the composer -- panel-as-document task 6
@@ -835,4 +838,37 @@ body,
   background: none;
   color: var(--nv-fg);
   box-shadow: inset 0 0 0 1.5px var(--nv-fg);
+}
+
+/* The global f HINT's labels (spec 2026-09-19-global-hint-design.md). The IncSearch pair, so a
+   label reads as a transient jump target and never as the solid cursor. `hint-fg` is guarded for
+   text against `hint-bg` only (`tokens.rs`), which is why the fill sits in the same rule and
+   `indexCss.test.ts` admits the text colour nowhere else. A row's label covers its sign cell,
+   displacing the glyph for as long as HINT lasts (UI spec §4.5); a control's sits at its top-left
+   corner and a code block's at its top-right. The dimming below is deliberate: an already-typed
+   prefix and a label that can no longer match are meant to recede. */
+.hint-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+.hint-label {
+  position: absolute;
+  background: var(--nv-hint-bg);
+  color: var(--nv-hint-fg);
+  font-family: var(--nv-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 3px 4px;
+  border-radius: 3px;
+  display: grid;
+  place-items: center;
+}
+.hint-typed {
+  opacity: 0.45;
+}
+.hint-off {
+  opacity: 0.3;
 }

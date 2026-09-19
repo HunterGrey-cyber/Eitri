@@ -14,6 +14,7 @@ pub mod agent_backend;
 pub mod agent_bridge;
 pub mod buffer_reload;
 pub mod editor_context;
+pub mod hint;
 pub mod instance_dir;
 pub mod lua;
 pub mod pane_switch;

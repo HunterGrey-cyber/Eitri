@@ -67,6 +67,10 @@ pub enum InboundMessage {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// `f` in the panel's BROWSE: ask `shell` to start a global HINT.
+    HintRequest { request_id: String },
+    /// The panel's answer to `hint_collect`: how many visible targets it froze for `session_id`.
+    HintTargets { request_id: String, session_id: u64, count: usize },
 }
 
 /// The decision half of a `permission_response`, as a closed set rather than a bool.
@@ -104,7 +108,9 @@ impl InboundMessage {
             | InboundMessage::Interrupt { request_id }
             | InboundMessage::TurnRendered { request_id, .. }
             | InboundMessage::HandoffToTerminal { request_id }
-            | InboundMessage::PermissionResponse { request_id, .. } => request_id,
+            | InboundMessage::PermissionResponse { request_id, .. }
+            | InboundMessage::HintRequest { request_id }
+            | InboundMessage::HintTargets { request_id, .. } => request_id,
         }
     }
 }
@@ -208,6 +214,24 @@ pub fn serialize_pane_focus_for_js(focused: bool) -> String {
 /// spec says, and `pane_focus` cannot tell the two apart.
 pub fn serialize_enter_input_for_js() -> String {
     json!({ "kind": "enter_input" }).to_string()
+}
+
+/// Global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md §3.3). `shell`
+/// owns the session; these five tell the panel to report, show, narrow, land and clear.
+pub fn serialize_hint_collect_for_js(session_id: u64) -> String {
+    json!({ "kind": "hint_collect", "sessionId": session_id }).to_string()
+}
+pub fn serialize_hint_show_for_js(session_id: u64, labels: &[String]) -> String {
+    json!({ "kind": "hint_show", "sessionId": session_id, "labels": labels }).to_string()
+}
+pub fn serialize_hint_prefix_for_js(session_id: u64, typed: &str) -> String {
+    json!({ "kind": "hint_prefix", "sessionId": session_id, "typed": typed }).to_string()
+}
+pub fn serialize_hint_land_for_js(session_id: u64, index: usize) -> String {
+    json!({ "kind": "hint_land", "sessionId": session_id, "index": index }).to_string()
+}
+pub fn serialize_hint_end_for_js(session_id: u64) -> String {
+    json!({ "kind": "hint_end", "sessionId": session_id }).to_string()
 }
 
 /// `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
@@ -447,6 +471,28 @@ mod tests {
     fn serializes_enter_input() {
         let value: serde_json::Value = serde_json::from_str(&serialize_enter_input_for_js()).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "enter_input" }));
+    }
+
+    #[test]
+    fn serializes_the_five_hint_envelopes() {
+        let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        assert_eq!(v(serialize_hint_collect_for_js(7)), serde_json::json!({ "kind": "hint_collect", "sessionId": 7 }));
+        assert_eq!(
+            v(serialize_hint_show_for_js(7, &["a".into(), "s".into()])),
+            serde_json::json!({ "kind": "hint_show", "sessionId": 7, "labels": ["a", "s"] })
+        );
+        assert_eq!(v(serialize_hint_prefix_for_js(7, "a")), serde_json::json!({ "kind": "hint_prefix", "sessionId": 7, "typed": "a" }));
+        assert_eq!(v(serialize_hint_land_for_js(7, 2)), serde_json::json!({ "kind": "hint_land", "sessionId": 7, "index": 2 }));
+        assert_eq!(v(serialize_hint_end_for_js(7)), serde_json::json!({ "kind": "hint_end", "sessionId": 7 }));
+    }
+
+    #[test]
+    fn parses_the_two_hint_messages() {
+        let m = parse_inbound_message(r#"{"type":"hint_request","request_id":"r1"}"#).unwrap();
+        assert_eq!(m.request_id(), "r1");
+        assert!(matches!(m, InboundMessage::HintRequest { .. }));
+        let m = parse_inbound_message(r#"{"type":"hint_targets","request_id":"r2","session_id":7,"count":3}"#).unwrap();
+        assert!(matches!(m, InboundMessage::HintTargets { session_id: 7, count: 3, .. }));
     }
 
     #[test]

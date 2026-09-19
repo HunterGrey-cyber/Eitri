@@ -103,4 +103,13 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("j"), { ...ctx, pendingG: true })).toEqual({ kind: "move", delta: 1 });
     expect(resolveKey("input", key("g"), { ...ctx, pendingG: true })).toBeNull();
   });
+
+  it("starts a global HINT on f in BROWSE, and does not in INPUT", () => {
+    expect(resolveKey("browse", key("f"), ctx)).toEqual({ kind: "hint" });
+    expect(resolveKey("input", key("f"), ctx)).toBeNull();
+    // Ctrl+Shift+F is shell's app-level accelerator (GTK takes it first); a Ctrl+f that does reach
+    // the page is not claimed here, and neither is a Shift+F.
+    expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("F", { shiftKey: true }), ctx)).toBeNull();
+  });
 });

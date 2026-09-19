@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import App from "./App";
+import App, { HINT_PENDING_TIMEOUT_MS } from "./App";
 import { initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
@@ -851,6 +851,407 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     expect(document.activeElement).toBe(modes[1]);
     press("k");
     expect(document.activeElement).toBe(modes[0]);
+  });
+});
+
+/* The panel's half of the global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md).
+   `shell` owns the session and every key typed during it; the panel answers five envelopes. jsdom lays
+   nothing out, so `layOut` gives every stop, control and code block a 10px box inside a 1000px list,
+   one below the other, and the list and root the whole height. Nothing here shows what WebKit draws. */
+describe("App global HINT: the panel's half", () => {
+  function started(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const press = (key: string) => fireEvent.keyDown(document.activeElement ?? document.body, { key });
+  const labels = (c: HTMLElement) => Array.from(c.querySelectorAll<HTMLElement>(".hint-label"));
+  const box = (el: Element, top: number, height = 10) => {
+    (el as HTMLElement).getBoundingClientRect = () =>
+      ({ top, bottom: top + height, left: 0, right: 100, width: 100, height, x: 0, y: top }) as DOMRect;
+  };
+  function layOut(container: HTMLElement) {
+    box(container.querySelector(".agent-ui-root")!, 0, 1000);
+    const list = container.querySelector(".message-list");
+    if (list !== null) box(list, 0, 1000);
+    let y = 0;
+    for (const el of container.querySelectorAll("[data-nav-stop], button, input, pre.code-block, .row-sign")) {
+      box(el, y);
+      y += 10;
+    }
+  }
+
+  /** A prompt, a reply carrying one fenced code block, and a tool call gated by a pending card (an
+   *  Approve, a Deny and a reason box), on a provider that can interrupt so Stop shows too. */
+  function conversation() {
+    const rendered = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
+    events(
+      { type: "user_prompt_submitted", text: "list it" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "Run this:\n\n```\nls -la\n```\n\nthen look." },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    layOut(rendered.container);
+    act(() => root(rendered.container).focus());
+    return rendered;
+  }
+
+  /** Runs `hint_collect` for `sessionId` and returns the count the panel reported. */
+  function collect(sessionId: number): number {
+    dispatch({ kind: "hint_collect", sessionId });
+    const reply = lastOfType("hint_targets");
+    expect(reply).toMatchObject({ session_id: sessionId });
+    expect(typeof reply!.request_id).toBe("string");
+    return reply!.count as number;
+  }
+  const LETTERS = ["a", "s", "d", "j", "k", "l", "g", "h", "w", "e", "r", "u", "i", "o"];
+  function show(sessionId: number, count: number) {
+    dispatch({ kind: "hint_show", sessionId, labels: LETTERS.slice(0, count) });
+  }
+  /** Where each target of `conversation()` sits in the frozen list, i.e. the index `shell` sends:
+   *  rows in document order, each followed by its code blocks and then its controls, the card's in
+   *  `data-nav-order` (Approve, Deny, reason), then the status line's Stop. */
+  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
+
+  it("f in BROWSE asks shell for a HINT, and f in INPUT is just a letter", () => {
+    const { container } = conversation();
+    press("f");
+    expect(lastOfType("hint_request")).toMatchObject({ type: "hint_request" });
+    expect(typeof lastOfType("hint_request")!.request_id).toBe("string");
+    // shell answers and the HINT ends; only then are the panel's keys its own again.
+    collect(1);
+    dispatch({ kind: "hint_end", sessionId: 1 });
+    posted = [];
+    fireEvent.keyDown(root(container), { key: "i" });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "f" });
+    expect(lastOfType("hint_request")).toBeUndefined();
+  });
+
+  /* Whole-branch review: between `f` posting `hint_request` and shell attaching its window key
+     controller (which happens only once it handles that script message), keys still reached this
+     panel's own table. */
+  describe("between f and shell's HINT taking the keys, no key acts in the panel", () => {
+    /** The conversation, with the row cursor on the pending permission card. */
+    function onTheCard() {
+      const rendered = conversation();
+      show(1, collect(1));
+      dispatch({ kind: "hint_land", sessionId: 1, index: AT.card });
+      expect(rendered.container.querySelector(".row-current")).toBe(rendered.container.querySelector(".row-permission"));
+      posted = [];
+      return rendered;
+    }
+
+    it("a label letter typed in the gap does not answer the card under the cursor", () => {
+      onTheCard();
+      // Control: without a HINT, `a` on this row approves.
+      press("f");
+      press("a");
+      press("d");
+      expect(lastOfType("permission_response")).toBeUndefined();
+    });
+
+    it("i does not open the composer, j does not move, a second f asks nothing", () => {
+      const { container } = onTheCard();
+      press("f");
+      press("i");
+      press("j");
+      press("f");
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
+      expect(posted.filter((m) => m.type === "hint_request")).toHaveLength(1);
+    });
+
+    it("once the HINT it asked for has ended, the keys are the panel's again", () => {
+      const { container } = onTheCard();
+      press("f");
+      collect(2);
+      dispatch({ kind: "hint_end", sessionId: 2 });
+      press("a");
+      expect(lastOfType("permission_response")).toBeDefined();
+      expect(container.querySelector(".row-permission")).not.toBeNull();
+    });
+
+    it("a shell that never answers costs a second of dead keys, not a stuck panel", () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = onTheCard();
+        press("f");
+        act(() => vi.advanceTimersByTime(HINT_PENDING_TIMEOUT_MS - 1));
+        press("i");
+        expect(container.querySelector("textarea")).toBeNull();
+        act(() => vi.advanceTimersByTime(1));
+        press("i");
+        expect(container.querySelector("textarea")).not.toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a held f's auto-repeat asks for nothing", () => {
+      onTheCard();
+      fireEvent.keyDown(document.activeElement!, { key: "f", repeat: true });
+      expect(lastOfType("hint_request")).toBeUndefined();
+    });
+  });
+
+  /** A prompt and nothing running: the composer can take a message. */
+  function idle() {
+    const rendered = started();
+    events({ type: "user_prompt_submitted", text: "hello" });
+    layOut(rendered.container);
+    box(rendered.container.querySelector(".composer")!, 900);
+    act(() => root(rendered.container).focus());
+    return rendered;
+  }
+
+  it("labels the composer and landing there enters INPUT with the caret in the box", () => {
+    const { container } = idle();
+    // The prompt row, then the composer.
+    expect(collect(1)).toBe(2);
+    show(1, 2);
+    expect(labels(container)[1].classList.contains("hint-composer")).toBe(true);
+    dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    expect(document.activeElement).toBe(textarea);
+    expect(lastOfType("send_message")).toBeUndefined();
+  });
+
+  it("offers no composer label while it cannot take a message: a turn running, or the session ended", () => {
+    // `conversation()` has a turn in progress: the box is disabled, and a landing could not focus it.
+    const running = conversation();
+    box(running.container.querySelector(".composer")!, 900);
+    expect(collect(1)).toBe(Object.keys(AT).length);
+    cleanup();
+    const { container } = idle();
+    expect(collect(2)).toBe(2);
+    events({ type: "session_closed", reason: "done" });
+    layOut(container);
+    box(container.querySelector(".composer")!, 900);
+    show(3, collect(3));
+    expect(container.querySelector(".hint-composer")).toBeNull();
+    expect(container.querySelector("[data-hint-composer]")).toBeNull();
+  });
+
+  it("drops the label of a target that has scrolled out of the list, and keeps its letter's place", () => {
+    const { container } = conversation();
+    const count = collect(1);
+    show(1, count);
+    expect(labels(container)).toHaveLength(count);
+    // The list follows a streamed reply to its end: the prompt row moves above the list's top edge.
+    const prompt = container.querySelector('[data-nav-stop="row"]')!;
+    box(prompt, -50);
+    box(prompt.querySelector(".row-sign")!, -50);
+    // Any commit re-measures; a prefix is one.
+    dispatch({ kind: "hint_prefix", sessionId: 1, typed: "d" });
+    const left = labels(container);
+    expect(left).toHaveLength(count - 1);
+    expect(left.map((l) => l.textContent)).toEqual(LETTERS.slice(1, count));
+  });
+
+  it("f on the start screen asks shell for a HINT too", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    press("f");
+    expect(lastOfType("hint_request")).toBeDefined();
+  });
+
+  it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
+    const { container } = conversation();
+    // 4 rows (prompt, reply, tool call, card) + the reply's code block + Approve + Deny + the
+    // reason box + Stop.
+    const count = collect(1);
+    expect(count).toBe(Object.keys(AT).length);
+    // Push the card row (and everything in it) below the list's viewport: it is no longer counted.
+    const card = container.querySelector(".row-permission")!;
+    box(card, 2000);
+    for (const el of card.querySelectorAll("button, input")) box(el, 2000);
+    expect(collect(2)).toBe(5);
+  });
+
+  it("hint_show draws one label per frozen target, a row's over its sign cell", () => {
+    const { container } = conversation();
+    const count = collect(1);
+    show(1, count);
+    expect(labels(container)).toHaveLength(count);
+    expect(labels(container).map((l) => l.textContent)).toEqual(LETTERS.slice(0, count));
+    const kinds = labels(container).map((l) => l.className.split(" ")[1]);
+    expect(kinds).toContain("hint-row");
+    expect(kinds).toContain("hint-code");
+    expect(kinds).toContain("hint-control");
+    // A row's label sits exactly on its sign cell, not at the row's own corner.
+    const firstSign = container.querySelector('[data-nav-stop="row"] .row-sign')!;
+    const firstRow = container.querySelector('[data-nav-stop="row"]')!;
+    expect(firstSign.getBoundingClientRect().top).not.toBe(firstRow.getBoundingClientRect().top);
+    expect(labels(container)[AT.prompt].style.top).toBe(`${firstSign.getBoundingClientRect().top}px`);
+  });
+
+  it("hint_prefix dims the typed part and greys every label it rules out", () => {
+    const { container } = conversation();
+    collect(1);
+    dispatch({ kind: "hint_show", sessionId: 1, labels: ["aa", "as", "sa", "ss", "da", "ds", "ja", "js", "ka"] });
+    dispatch({ kind: "hint_prefix", sessionId: 1, typed: "a" });
+    const [first, second, third] = labels(container);
+    expect(first.classList.contains("hint-off")).toBe(false);
+    expect(first.querySelector(".hint-typed")!.textContent).toBe("a");
+    expect(second.classList.contains("hint-off")).toBe(false);
+    expect(third.classList.contains("hint-off")).toBe(true);
+    expect(labels(container).filter((l) => l.classList.contains("hint-off"))).toHaveLength(7);
+  });
+
+  it("hint_land on a row moves the cursor there and back into BROWSE, and clears the labels", () => {
+    const { container } = conversation();
+    const count = collect(1);
+    show(1, count);
+    const toolRow = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'))[2];
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.tool });
+    expect(container.querySelector(".row-current")).toBe(toolRow);
+    expect(document.activeElement).toBe(root(container));
+    expect(labels(container)).toHaveLength(0);
+  });
+
+  it("hint_land on a button focuses it and never presses it", () => {
+    const { container } = conversation();
+    show(1, collect(1));
+    const approve = buttonLabelled(container, "Approve")!;
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.approve });
+    expect(document.activeElement).toBe(approve);
+    expect(lastOfType("permission_response")).toBeUndefined();
+    // The row cursor followed it onto the card, so h hands the keys back to THAT row.
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+  });
+
+  it("hint_land on a button from INPUT leaves the button focused, not the root", () => {
+    const { container } = conversation();
+    show(1, collect(1));
+    fireEvent.keyDown(root(container), { key: "i" });
+    act(() => container.querySelector("textarea")!.focus());
+    const stop = buttonLabelled(container, "Stop")!;
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.stop });
+    expect(document.activeElement).toBe(stop);
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("hint_land on the reason box gives it the keys", () => {
+    conversation();
+    show(1, collect(1));
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.reason });
+    expect((document.activeElement as HTMLElement).tagName).toBe("INPUT");
+    expect(document.activeElement!.closest(".row-permission")).not.toBeNull();
+  });
+
+  it("hint_land on a code block makes the next y copy only that block's code, once", () => {
+    const { container } = conversation();
+    const clipboard = stubClipboard();
+    show(1, collect(1));
+    expect(labels(container)[AT.code].classList.contains("hint-code")).toBe(true);
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
+    expect(container.querySelector(".row-current")!.classList.contains("row-assistant")).toBe(true);
+    press("y");
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("ls -la");
+    // Only the next y: the one after copies the whole message again.
+    press("y");
+    expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
+  });
+
+  it("any other key after landing on a code block forgets it", () => {
+    conversation();
+    const clipboard = stubClipboard();
+    show(1, collect(1));
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
+    press("j");
+    press("k");
+    press("y");
+    expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
+  });
+
+  it("hint_end leaves no label behind and moves nothing", () => {
+    const { container } = conversation();
+    show(1, collect(1));
+    const before = container.querySelector(".row-current");
+    dispatch({ kind: "hint_end", sessionId: 1 });
+    expect(labels(container)).toHaveLength(0);
+    expect(container.querySelector(".hint-layer")).toBeNull();
+    expect(container.querySelector(".row-current")).toBe(before);
+    // The session is over: a late land for it does nothing.
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.tool });
+    expect(container.querySelector(".row-current")).toBe(before);
+  });
+
+  it("ignores every envelope that names a session other than the current one", () => {
+    const { container } = conversation();
+    const count = collect(2);
+    const before = container.querySelector(".row-current");
+    show(1, count);
+    expect(labels(container)).toHaveLength(0);
+    show(2, count);
+    dispatch({ kind: "hint_prefix", sessionId: 1, typed: "a" });
+    expect(labels(container).some((l) => l.classList.contains("hint-off"))).toBe(false);
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.tool });
+    dispatch({ kind: "hint_end", sessionId: 1 });
+    expect(labels(container)).toHaveLength(count);
+    expect(container.querySelector(".row-current")).toBe(before);
+  });
+
+  it("hint_land on a row finds the row where it is NOW, not where it was when frozen", () => {
+    // Two tool calls running; B's row is frozen at hint_collect. A's permission card then arrives
+    // and is anchored straight after A (timeline.ts), pushing B one row down during HINT.
+    const rendered = started();
+    events(
+      { type: "user_prompt_submitted", text: "go" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_A", name: "Bash", input: { cmd: "a" } },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_B", name: "Bash", input: { cmd: "b" } },
+    );
+    const { container } = rendered;
+    layOut(container);
+    act(() => root(container).focus());
+    const rows = () => Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+    const b = rows()[2];
+    expect(b.textContent).toContain("b");
+    show(1, collect(1));
+    events({ type: "permission_requested", permission_id: "perm-A", tool_use_id: "toolu_A", tool_name: "Bash", input: {} });
+    expect(rows().indexOf(b)).toBe(3); // B moved, and is still the same element
+    dispatch({ kind: "hint_land", sessionId: 1, index: 2 }); // B's frozen index: prompt, A, B
+    expect(container.querySelector(".row-current")).toBe(b);
+  });
+
+  it("draws no label for a frozen target that has left the page since", () => {
+    // The card is answered while the labels are up: its row, Approve, Deny and reason box are gone.
+    // Their labels must go too, not be re-measured as all-zero rects at the panel's corner.
+    const { container } = conversation();
+    const count = collect(1);
+    show(1, count);
+    expect(labels(container)).toHaveLength(count);
+    events({ type: "permission_resolved", permission_id: "perm-1", outcome: "cancelled_by_session_close" });
+    expect(container.querySelector(".row-permission")).toBeNull();
+    const left = labels(container);
+    expect(left).toHaveLength(count - 4);
+    // Survivors keep their letters: shell addresses them by index, so none may shift up.
+    expect(left.map((l) => l.textContent)).toEqual(
+      LETTERS.slice(0, count).filter((_, i) => ![AT.card, AT.approve, AT.deny, AT.reason].includes(i)),
+    );
+  });
+
+  it("labels the start screen's buttons, where there is no conversation yet", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    layOut(container);
+    const count = collect(1);
+    expect(count).toBe(container.querySelectorAll('[data-nav-stop="mode"]').length + container.querySelectorAll('[data-nav-stop="choice"]').length);
+    show(1, count);
+    expect(labels(container)).toHaveLength(count);
+    const mode = container.querySelector<HTMLElement>('[data-nav-stop="mode"]')!;
+    const index = Array.from(container.querySelectorAll<HTMLElement>("[data-nav-stop]")).indexOf(mode);
+    dispatch({ kind: "hint_land", sessionId: 1, index });
+    expect(document.activeElement).toBe(mode);
+    expect(lastOfType("start_session")).toBeUndefined();
   });
 });
 

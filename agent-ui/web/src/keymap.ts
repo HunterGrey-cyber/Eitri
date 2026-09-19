@@ -26,6 +26,8 @@ export type PanelAction =
    *  `KeyContext.pendingG` with the next key, which is how `gg` is read without this table
    *  keeping any memory of its own. */
   | { kind: "pending-g" }
+  /** `f` in BROWSE: start a global HINT. */
+  | { kind: "hint" }
   | null;
 
 /** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
@@ -107,6 +109,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       // Only where the spec offers it: §3.2's disconnected/error row. Otherwise `r` is free for
       // sub-project 4 to claim.
       return ctx.sessionEnded ? { kind: "restart" } : null;
+    case "f":
+      return { kind: "hint" };
     case "Escape":
       return null;
     default:

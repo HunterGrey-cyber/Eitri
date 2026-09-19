@@ -51,6 +51,17 @@ const HANDOFF_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3
 const HANDOFF_CLOSE_FAILED_MESSAGE: &str =
     "the handoff could not finish closing this session; it is no longer running here";
 
+/// The panel's two HINT messages, demuxed out of `InboundMessage` for `shell::hint::HintCoordinator`
+/// -- it never sees the wire's `request_id`, only what the coordinator itself needs to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintInbound {
+    /// `f` in the panel's BROWSE: start a global HINT (or cancel one already active, same as the
+    /// window-level toggle).
+    Request,
+    /// The panel's answer to `hint_collect`: how many visible targets it froze for `session_id`.
+    Targets { session_id: u64, count: usize },
+}
+
 struct AgentPanelState {
     session: Option<AgentBackend>,
     backend_kind: BackendKind,
@@ -102,6 +113,11 @@ struct AgentPanelState {
     /// `Ctrl+Shift+R` reload) is told on `ready`. A document is otherwise told only when focus
     /// changes, and a reload does not change focus.
     pane_focused: bool,
+    /// Where the panel's two HINT messages (`hint_request`, `hint_targets`) go. `None` until
+    /// `shell::hint::HintCoordinator` installs one via `AgentPanelHandle::on_hint`. An `Rc<dyn Fn>`
+    /// rather than a plain closure field because the hook must be cloned out of the borrow before
+    /// being called -- see `handle_inbound_message`'s HintRequest/HintTargets arms for why.
+    hint_hook: Option<Rc<dyn Fn(HintInbound)>>,
 }
 
 /// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
@@ -276,37 +292,58 @@ impl AgentPanelHandle {
 }
 
 impl AgentPanelHandle {
+    /// Dispatches one already-serialized envelope to the live document, guarded so it is safe to
+    /// call before the page has loaded (in which case `ready`'s own batch re-sends whatever state
+    /// mattered, and this call is simply a no-op). `what` is a short label for the error log only.
+    fn dispatch(&self, payload: String, what: &'static str) {
+        let script = format!(
+            "window.__neovibeDispatch && window.__neovibeDispatch({});",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
+        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, move |result| {
+            if let Err(e) = result {
+                eprintln!("[agent_panel] {what} dispatch failed: {e}");
+            }
+        });
+    }
+
     /// Records whether this panel's pane has keyboard focus and tells the live document, which
     /// dims its mode block when it does not. Safe before the page has loaded for the same reason
     /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
     pub(crate) fn set_pane_focused(&self, focused: bool) {
         self.state.borrow_mut().pane_focused = focused;
-        let payload = neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused);
-        let script = format!(
-            "window.__neovibeDispatch && window.__neovibeDispatch({});",
-            serde_json::to_string(&payload).unwrap_or_default()
-        );
-        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
-            if let Err(e) = result {
-                eprintln!("[agent_panel] pane focus dispatch failed: {e}");
-            }
-        });
+        self.dispatch(neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused), "pane focus");
     }
 
     /// Asks the panel to open its composer with the caret in it. Sent after `Ctrl+l` has moved GTK
     /// focus into the panel; see `serialize_enter_input_for_js`. Safe before the page loads (the
     /// dispatch is guarded), in which case there is no composer yet and nothing happens.
     pub(crate) fn enter_input(&self) {
-        let payload = neovibe_core::agent_bridge::serialize_enter_input_for_js();
-        let script = format!(
-            "window.__neovibeDispatch && window.__neovibeDispatch({});",
-            serde_json::to_string(&payload).unwrap_or_default()
-        );
-        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
-            if let Err(e) = result {
-                eprintln!("[agent_panel] enter-input dispatch failed: {e}");
-            }
-        });
+        self.dispatch(neovibe_core::agent_bridge::serialize_enter_input_for_js(), "enter-input");
+    }
+
+    /// Global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md §3.3). Each
+    /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
+    /// drives the session, this handle only relays it to the WebView.
+    pub(crate) fn hint_collect(&self, session_id: u64) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_hint_collect_for_js(session_id), "hint collect");
+    }
+    pub(crate) fn hint_show(&self, session_id: u64, labels: &[String]) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_hint_show_for_js(session_id, labels), "hint show");
+    }
+    pub(crate) fn hint_prefix(&self, session_id: u64, typed: &str) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_hint_prefix_for_js(session_id, typed), "hint prefix");
+    }
+    pub(crate) fn hint_land(&self, session_id: u64, index: usize) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_hint_land_for_js(session_id, index), "hint land");
+    }
+    pub(crate) fn hint_end(&self, session_id: u64) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_hint_end_for_js(session_id), "hint end");
+    }
+
+    /// Where the panel's two HINT messages go. `shell::hint::HintCoordinator` installs this once.
+    pub(crate) fn on_hint(&self, hook: impl Fn(HintInbound) + 'static) {
+        self.state.borrow_mut().hint_hook = Some(Rc::new(hook));
     }
 }
 
@@ -391,6 +428,7 @@ pub(crate) fn build_agent_panel(
         turn_trace: None,
         theme: neovibe_core::theme::ThemeTokens::fallback(),
         pane_focused: false,
+        hint_hook: None,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -946,6 +984,21 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 }
             };
             apply_command_outcome(state, webview, &request_id, outcome);
+        }
+        InboundMessage::HintRequest { .. } => {
+            // Cloned out of the borrow before calling: the hook calls back into this handle,
+            // which borrows `state` again -- calling it while the borrow above is still held
+            // would panic with a double borrow (`HintCoordinator::toggle`/`on_panel` both do).
+            let hook = state.borrow().hint_hook.clone();
+            if let Some(hook) = hook {
+                hook(HintInbound::Request);
+            }
+        }
+        InboundMessage::HintTargets { session_id, count, .. } => {
+            let hook = state.borrow().hint_hook.clone();
+            if let Some(hook) = hook {
+                hook(HintInbound::Targets { session_id, count });
+            }
         }
         InboundMessage::TurnRendered { receive_to_frame_ms, .. } => {
             // Purely a diagnostic: no command_result, and nothing downstream reads it. A WebView

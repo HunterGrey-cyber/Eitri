@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { clampStep, controlsOf, currentStop, nextControl, nextStop, permissionTarget, rowIndexOf, stopsIn } from "./nav";
+import { clampStep, controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf, stopsIn } from "./nav";
 import type { AnswerableItem } from "./nav";
 
 afterEach(() => {
@@ -129,5 +129,138 @@ describe("permissionTarget", () => {
 
   it("does not link a tool call whose id is empty", () => {
     expect(permissionTarget([{ kind: "tool", toolUseId: "" }, { kind: "permission", toolUseId: "" }], 0)).toBeNull();
+  });
+});
+
+/* jsdom lays nothing out, so every rect is all zeros. `rect` gives one element a fake box; `hintDoc`
+   builds a panel whose list viewport is y 0..100, with every element laid out explicitly. Rects are
+   set per element rather than on `HTMLElement.prototype`, which would leak into every later test. */
+function rect(el: HTMLElement, top: number, height: number, left = 0, width = 100) {
+  el.getBoundingClientRect = () =>
+    ({ top, bottom: top + height, left, right: left + width, width, height, x: left, y: top }) as DOMRect;
+}
+
+function hintDoc(): HTMLElement {
+  document.body.innerHTML = `
+    <div id="root" tabindex="0">
+      <div class="message-list" id="list">
+        <div data-nav-stop="row" id="r0">prompt</div>
+        <div data-nav-stop="row" id="r1">
+          <pre class="code-block" id="code"><code>ls</code></pre>
+          <button id="approve" data-nav-order="1">Approve</button>
+          <button id="deny" data-nav-order="2" disabled>Deny</button>
+        </div>
+        <div data-nav-stop="row" id="r2">below the fold</div>
+      </div>
+      <div data-nav-stop="status" id="status"><button id="stop">Stop</button></div>
+    </div>`;
+  rect(byId("root"), 0, 200);
+  rect(byId("list"), 0, 100);
+  rect(byId("r0"), 0, 20);
+  rect(byId("r1"), 20, 60);
+  rect(byId("code"), 25, 20);
+  rect(byId("approve"), 50, 20);
+  rect(byId("deny"), 50, 20, 50, 40);
+  rect(byId("r2"), 150, 20); // entirely below the list's viewport
+  rect(byId("stop"), 180, 20);
+  return byId("root");
+}
+
+describe("hintTargets", () => {
+  it("takes a row inside the list's viewport and leaves out one entirely below it", () => {
+    const targets = hintTargets(hintDoc());
+    const rows = targets.filter((t) => t.kind === "row");
+    expect(rows).toEqual([
+      { kind: "row", el: byId("r0"), rowIndex: 0 },
+      { kind: "row", el: byId("r1"), rowIndex: 1 },
+    ]);
+  });
+
+  it("judges a row by the list's viewport, not the root's, which still contains it", () => {
+    // r2 (y 150..170) is inside the root (0..200) but below the list (0..100): only the list's
+    // own scrollport decides what is on screen for anything inside it.
+    const root = hintDoc();
+    expect(hintTargets(root).some((t) => t.el === byId("r2"))).toBe(false);
+    rect(byId("r2"), 90, 20); // partly inside: a sliver on screen still counts
+    expect(hintTargets(root).some((t) => t.el === byId("r2"))).toBe(true);
+  });
+
+  it("puts a row's code block and then its controls right after it, in that order", () => {
+    const targets = hintTargets(hintDoc());
+    expect(targets.map((t) => `${t.kind}:${t.el.id}`)).toEqual([
+      "row:r0",
+      "row:r1",
+      "code:code",
+      "control:approve",
+      "control:stop",
+    ]);
+    expect(targets[2]).toEqual({ kind: "code", el: byId("code"), rowIndex: 1 });
+  });
+
+  it("offers the status line's Stop button, which is not a row", () => {
+    const targets = hintTargets(hintDoc());
+    expect(targets).toContainEqual({ kind: "control", el: byId("stop") });
+  });
+
+  it("never offers a disabled button", () => {
+    const targets = hintTargets(hintDoc());
+    expect(targets.some((t) => t.el === byId("deny"))).toBe(false);
+  });
+
+  it("leaves out a zero-sized element, which is how a hidden one measures", () => {
+    const root = hintDoc();
+    rect(byId("stop"), 180, 0); // full width, no height: its box still "intersects" the root
+    expect(hintTargets(root).some((t) => t.el === byId("stop"))).toBe(false);
+  });
+
+  it("works on a start screen, which has no message list: its choice buttons are controls", () => {
+    document.body.innerHTML = `
+      <div id="root">
+        <button data-nav-stop="choice" id="c0">New session</button>
+        <button data-nav-stop="mode" id="m0">Auto</button>
+      </div>`;
+    rect(byId("root"), 0, 200);
+    rect(byId("c0"), 10, 20);
+    rect(byId("m0"), 40, 20);
+    expect(hintTargets(byId("root"))).toEqual([
+      { kind: "control", el: byId("c0") },
+      { kind: "control", el: byId("m0") },
+    ]);
+  });
+
+  it("judges a start-screen choice by its own scrolling list, not by the root", () => {
+    // `.session-choice` is capped at 40vh and scrolls (index.css): a choice scrolled out of it is
+    // still inside the root, and must not get a label drawn over the controls below the list.
+    document.body.innerHTML = `
+      <div id="root">
+        <div class="session-choice" id="list">
+          <button data-nav-stop="choice" id="c0">New session</button>
+          <button data-nav-stop="choice" id="c1">claude 1234</button>
+          <button data-nav-stop="choice" id="c2">claude 5678</button>
+        </div>
+        <button data-nav-stop="mode" id="m0">Auto</button>
+      </div>`;
+    rect(byId("root"), 0, 400);
+    rect(byId("list"), 0, 100);
+    rect(byId("c0"), 10, 20);
+    rect(byId("c1"), 50, 20);
+    rect(byId("c2"), 150, 20); // below the list's viewport, inside the root's
+    rect(byId("m0"), 300, 20);
+    expect(hintTargets(byId("root")).map((t) => t.el.id)).toEqual(["c0", "c1", "m0"]);
+  });
+
+  it("judges an element by any ancestor that clips its overflow, not only the known lists", () => {
+    document.body.innerHTML = `
+      <div id="root">
+        <div id="clip" style="overflow-y: auto">
+          <button data-nav-stop="mode" id="in">In</button>
+          <button data-nav-stop="mode" id="out">Out</button>
+        </div>
+      </div>`;
+    rect(byId("root"), 0, 400);
+    rect(byId("clip"), 0, 100);
+    rect(byId("in"), 10, 20);
+    rect(byId("out"), 150, 20);
+    expect(hintTargets(byId("root")).map((t) => t.el.id)).toEqual(["in"]);
   });
 });
