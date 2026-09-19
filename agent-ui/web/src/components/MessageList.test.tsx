@@ -420,6 +420,62 @@ describe("MessageList tool calls and permissions", () => {
   });
 });
 
+/* The other half of "j无法在长输出内部下滑": before this, a new message unconditionally scrolled
+   the view to the bottom, which fought the cursor the moment a user had used `j`/`k` to read
+   something further up -- every streamed delta snapped the viewport straight back down mid-read.
+   The guard reads `.message-list`'s own scroll position, not the cursor: see `MessageList.tsx`'s
+   doc comment on the effect for why gating on the cursor instead would have broken ordinary
+   mouse-only auto-follow for everyone who never touches `j`/`k`. jsdom implements no layout, so
+   `scrollHeight`/`scrollTop`/`clientHeight` all read 0 by default -- which the guard's arithmetic
+   reads as "already at the bottom", which is exactly what every OTHER test in this file relies on
+   for the follow-to-bottom effect to keep firing unconditionally. These two tests are the ones
+   that override those three to reach the other branch at all. */
+describe("MessageList auto-follow", () => {
+  it("still follows a new item to the bottom when the viewport was already near it", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { rerender } = render(
+      <MessageList state={state({ transcript: texts("first") })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={vi.fn()} />,
+    );
+    scrollIntoView.mockClear();
+
+    rerender(
+      <MessageList
+        state={state({ transcript: texts("first", "second") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={0}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("does not fight a user reading further up: skips the follow once the list has scrolled away from the bottom", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("first") })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={vi.fn()} />,
+    );
+    const list = container.querySelector(".message-list") as HTMLElement;
+    Object.defineProperty(list, "scrollHeight", { value: 2000, configurable: true });
+    Object.defineProperty(list, "clientHeight", { value: 400, configurable: true });
+    Object.defineProperty(list, "scrollTop", { value: 0, configurable: true, writable: true });
+    scrollIntoView.mockClear();
+
+    rerender(
+      <MessageList
+        state={state({ transcript: texts("first", "second") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={0}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+});
+
 describe("MessageList cursor highlight", () => {
   it("marks only the row at `cursor`, by position, with row-current and aria-current", () => {
     const { container } = render(

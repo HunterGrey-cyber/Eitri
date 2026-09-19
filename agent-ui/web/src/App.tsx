@@ -56,6 +56,43 @@ function isActivatableControl(el: EventTarget | null): el is HTMLElement {
   return el.closest("button, summary, a[href], [role=button]") !== null;
 }
 
+/** One `j`/`k` press's worth of scroll inside a tool result's own overflow box, chosen to read
+ *  like the row-to-row step it stands in for rather than a full-page jump. Arbitrary and not
+ *  verified on a screen -- see the dated record's entry for this change. */
+const TOOL_RESULT_SCROLL_STEP_PX = 40;
+
+/** Whether a pending `j`/`k` cursor move should instead scroll the CURSOR ROW's own overflow box
+ *  -- today, only a tool result opened past its 260px fold (`.tool-result-body` in index.css; see
+ *  `renderToolCall` in `../toolRegistry.tsx`). Before this, only a mouse wheel could reach that
+ *  box: the owner's "j无法在长输出内部下滑" is really two defects (see the dated record), and this
+ *  is the second one -- once such a box filled the viewport, `j` moved the cursor straight off the
+ *  row while most of its own content stayed unseen and unreachable from the keyboard.
+ *
+ *  This is a DOM measurement (`scrollTop`/`scrollHeight`/`clientHeight`), which is exactly what
+ *  `./keymap`'s pure table must never do -- see its own doc comment -- so it is checked here,
+ *  after `resolveKey` has already decided the key means "move the cursor," and BEFORE that
+ *  decision is applied.
+ *
+ *  Returns `false` -- let the cursor move, the ordinary case -- when the current row has no such
+ *  box, or the box is already at the end of travel in the pressed direction. That is the vim rule
+ *  this exists to reproduce: scroll the inner view to its own limit first, THEN move to the next
+ *  row. Mutates `scrollTop` directly rather than `scrollBy`/`scrollIntoView`, neither of which can
+ *  express "move by this many pixels, clamped at the box's own natural end" -- which is exactly
+ *  what is wanted here.
+ *
+ *  jsdom implements no layout, so `scrollHeight`/`clientHeight` both read 0 for every element and
+ *  this always returns `false` there unless a test overrides them -- `App.test.tsx`'s own tests
+ *  for this function do exactly that to reach the `true` branch at all. */
+function scrollCursorRowBox(container: HTMLDivElement | null, direction: 1 | -1): boolean {
+  const box = container?.querySelector<HTMLElement>(".row-current .tool-result-body") ?? null;
+  if (box === null) return false;
+  const atStart = box.scrollTop <= 0;
+  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
+  if (direction > 0 ? atEnd : atStart) return false;
+  box.scrollTop += direction * TOOL_RESULT_SCROLL_STEP_PX;
+  return true;
+}
+
 export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
@@ -173,6 +210,30 @@ export default function App() {
   useEffect(() => {
     setCursor((c) => Math.min(c, Math.max(timeline.length - 1, 0)));
   }, [timeline.length]);
+  /** Keeps the row the cursor sits on inside the viewport whenever the cursor moves. Before this,
+   *  `j`/`k` moved an invisible highlight once it passed the bottom of the message list -- which
+   *  reads exactly like the key doing nothing (the owner, on an installed build:
+   *  "j无法在长输出内部下滑"). `"nearest"` is the least-jarring `ScrollLogicalPosition`: a row
+   *  already fully on screen does not move at all, unlike `"start"`/`"center"`, which would shove
+   *  the viewport around on every single step even when nothing needed to move.
+   *
+   *  Reads through `containerRef` -- already queried above for focus -- rather than a second ref
+   *  into `MessageList`'s own DOM, since `.row-current` is always a descendant of it.
+   *
+   *  Kept from fighting `MessageList`'s own follow-the-newest-message effect (`MessageList.tsx`,
+   *  the `bottomRef` effect) by gating THAT effect on the message list's own scroll position
+   *  rather than on this cursor -- see its doc comment. This effect never needs to check anything
+   *  about that one: it only ever moves the viewport the minimum amount to reveal one row, so if
+   *  the other effect already put the tail in view, this is a no-op, and if the user is reading
+   *  further up, this is the only one of the two still allowed to move anything.
+   *
+   *  jsdom implements no layout and has no `scrollIntoView` on `Element` at all (this file's own
+   *  `beforeAll` stubs it for the same reason `MessageList.test.tsx`'s does), so a jsdom test can
+   *  only assert that this was CALLED on the right element -- never that the row actually ends up
+   *  on screen. That is a GUI check nobody has run yet. */
+  useEffect(() => {
+    containerRef.current?.querySelector<HTMLElement>(".row-current")?.scrollIntoView({ block: "nearest" });
+  }, [cursor]);
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
    *  effect under it is a hook and cannot live after a conditional return. */
   const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
@@ -528,6 +589,15 @@ export default function App() {
       sessionEnded,
     });
     if (action === null) return;
+    // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move the
+    // cursor off it -- the vim behaviour the owner expected, and the reason this check cannot live
+    // in `resolveKey` itself is spelled out on `scrollCursorRowBox`'s own doc comment. Only "cursor"
+    // actions come from `j`/`k` today, so `event.key` alone is enough to tell which direction was
+    // pressed; nothing else in `./keymap`'s table returns this action kind.
+    if (action.kind === "cursor" && scrollCursorRowBox(containerRef.current, event.key === "j" ? 1 : -1)) {
+      event.preventDefault();
+      return;
+    }
     event.preventDefault();
     switch (action.kind) {
       case "mode":

@@ -30,7 +30,14 @@ function toolSign(call: ToolCallRecord): string {
   return call.result.isError ? "✗" : "✓";
 }
 
+/** How close to the true bottom of `.message-list` still counts as "following the tail," for the
+ *  auto-follow guard below. Some slack rather than an exact `0`: a smooth scroll already in flight,
+ *  or ordinary sub-pixel rounding, can leave the true bottom a few pixels away even though the user
+ *  never scrolled up on purpose. Arbitrary and not tuned against a real screen. */
+const BOTTOM_FOLLOW_THRESHOLD_PX = 24;
+
 export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPermission }: Props) {
+  const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // `userPrompts` joined this list when prompts became a timeline item: without it, submitting a
@@ -38,8 +45,27 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   // changing, and a fresh prompt with no reply yet touches none of them). The brief that first
   // wrote this effect predates prompts being a row and said to keep it exactly as it was --
   // correct then, wrong once `userPrompts` became one more thing that can grow this list.
+  //
+  // **Guarded on the list's own scroll position, since 2026-09-19.** Unconditional, this fought
+  // `App.tsx`'s cursor-follow effect (`.row-current`'s own `scrollIntoView`) the moment a turn kept
+  // streaming while the user had used `j`/`k` to read something further up: every new delta snapped
+  // the viewport straight back down mid-read -- half of the owner's "j无法在长输出内部下滑" report,
+  // see the dated record. The guard reads `.message-list`'s actual scroll position rather than the
+  // cursor index on purpose: a great many people never touch `j`/`k` at all and still expect
+  // ordinary chat-style auto-follow while they only type and read, and gating on the cursor (which
+  // defaults to 0 and stays there for exactly those people) would have silently broken that for
+  // them instead of fixing anything. jsdom implements no layout, so `scrollHeight`/`scrollTop`/
+  // `clientHeight` all read 0 there, which this arithmetic reads as "already at the bottom" -- the
+  // guard is therefore a genuine no-op in every test below that does not override those three, and
+  // is why none of them needed to change for it; `MessageList.test.tsx`'s own "auto-follow" tests
+  // cover both branches by overriding them.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const list = listRef.current;
+    const nearBottom =
+      list === null || list.scrollHeight - list.scrollTop - list.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
+    if (nearBottom) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [state.userPrompts.length, state.transcript.length, state.toolCalls.length, state.pendingPermissions.length]);
 
   /* Which tool calls are blocked on a decision the user has not made yet. A turn can have several
@@ -81,7 +107,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, onAnswerPer
   const timeline = useMemo(() => buildTimeline(state), [state]);
 
   return (
-    <div className="message-list">
+    <div className="message-list" ref={listRef}>
       {timeline.map((item, index) => {
         const current = index === cursor;
         switch (item.kind) {
