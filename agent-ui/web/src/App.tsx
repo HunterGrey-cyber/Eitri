@@ -203,6 +203,12 @@ export default function App() {
    *  typed into the editor, and the panel rework (`9dd39f2`) had removed the composer caret that
    *  used to be the only sign of which pane was focused. */
   const [paneFocused, setPaneFocused] = useState(false);
+  /** Bumped by each `enter_input` envelope (`Ctrl+l` from the editor). A counter, not a flag, so
+   *  two arrivals in a row both act, and so the dispatch handler, installed once, need not read any
+   *  state: the effect below decides, against the current render, whether INPUT is possible. It
+   *  is also passed to `Composer` as `focusRequest`, which re-focuses a textarea that is already
+   *  mounted, since `setMode("input")` alone does nothing when the mode was already INPUT. */
+  const [inputRequest, setInputRequest] = useState(0);
   /** The index into `timeline` that `j`/`k` move and `Enter`/`y` act on. */
   const [cursor, setCursor] = useState(0);
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
@@ -276,6 +282,15 @@ export default function App() {
   useEffect(() => {
     if (sessionEnded) setMode("browse");
   }, [sessionEnded]);
+  /* `Ctrl+l` lands in INPUT with a blinking caret (owner, 2026-09-19: "control l 直接闪cursor"),
+     as it did before BROWSE became the landing mode. Refused under the same condition `i` is
+     (`resolveKey`): a dead session has no box to type into, and no session at all has no
+     composer. Keyed on the request alone, so a session change never opens the composer by itself. */
+  useEffect(() => {
+    if (inputRequest === 0 || !sessionStarted || sessionEnded) return;
+    setMode("input");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inputRequest]);
   /** The start screen's own focus target, for the same reason `containerRef` needs one: a keydown
    *  bubbles from whatever has real focus, and nothing here claims it by default. Only ever used to
    *  make `y` (copying a handoff command, see `handleStartScreenKeyDown`) reachable without an
@@ -291,6 +306,8 @@ export default function App() {
         applyTheme(payload.vars);
       } else if (payload.kind === "pane_focus") {
         setPaneFocused(payload.focused);
+      } else if (payload.kind === "enter_input") {
+        setInputRequest((n) => n + 1);
       } else if (payload.kind === "hello") {
         setHello(payload);
       } else if (payload.kind === "snapshot") {
@@ -718,6 +735,7 @@ export default function App() {
         closing={handingOff}
         restoredDraft={restoredDraft}
         mode={mode}
+        focusRequest={inputRequest}
         onModeChange={setMode}
         onSend={sendMessage}
       />

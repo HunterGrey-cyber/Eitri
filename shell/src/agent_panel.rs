@@ -292,6 +292,22 @@ impl AgentPanelHandle {
             }
         });
     }
+
+    /// Asks the panel to open its composer with the caret in it. Sent after `Ctrl+l` has moved GTK
+    /// focus into the panel; see `serialize_enter_input_for_js`. Safe before the page loads (the
+    /// dispatch is guarded), in which case there is no composer yet and nothing happens.
+    pub(crate) fn enter_input(&self) {
+        let payload = neovibe_core::agent_bridge::serialize_enter_input_for_js();
+        let script = format!(
+            "window.__neovibeDispatch && window.__neovibeDispatch({});",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
+        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
+            if let Err(e) = result {
+                eprintln!("[agent_panel] enter-input dispatch failed: {e}");
+            }
+        });
+    }
 }
 
 pub(crate) fn build_agent_panel(

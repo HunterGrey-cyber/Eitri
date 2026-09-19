@@ -200,6 +200,16 @@ pub fn serialize_pane_focus_for_js(focused: bool) -> String {
     json!({ "kind": "pane_focus", "focused": focused }).to_string()
 }
 
+/// `{"kind":"enter_input"}`: the user moved INTO the panel with the keyboard (`Ctrl+l` from the
+/// editor), so the panel should open its composer with a blinking caret, the way it did before the
+/// three-mode rework made BROWSE the landing mode. The owner asked for exactly that (2026-09-19):
+/// "control l 直接闪cursor". A separate envelope rather than a flag on `pane_focus`, because only
+/// the keyboard route should do it. A click on a row still lands in BROWSE on that row, as the UI
+/// spec says, and `pane_focus` cannot tell the two apart.
+pub fn serialize_enter_input_for_js() -> String {
+    json!({ "kind": "enter_input" }).to_string()
+}
+
 /// `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
 /// `AgentDomainEvent`'s own `#[derive(Serialize)]` produces the tagged shape directly for each
 /// element. `from_revision` is the projection's `last_revision` BEFORE this batch was folded;
@@ -431,6 +441,12 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&serialize_pane_focus_for_js(focused)).unwrap();
             assert_eq!(value, serde_json::json!({ "kind": "pane_focus", "focused": focused }));
         }
+    }
+
+    #[test]
+    fn serializes_enter_input() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_enter_input_for_js()).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "enter_input" }));
     }
 
     #[test]

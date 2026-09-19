@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PanelMode } from "../keymap";
 
 /** A draft the host is putting back into the box after a send was refused.
@@ -37,6 +37,10 @@ type Props = {
    *  and a keyboard-driven `i`/`Esc` agree on what mode the panel is in -- neither is the sole
    *  source of truth; both write to the same `mode` state in `App.tsx`. */
   onModeChange: (mode: PanelMode) => void;
+  /** Changes when `shell` asks for the caret (`Ctrl+l`, via `App.tsx`'s `inputRequest`). A
+   *  textarea that is already mounted is focused again; a fresh one takes focus through
+   *  `autoFocus` as before. */
+  focusRequest?: number;
   onSend: (text: string) => void;
 };
 
@@ -47,6 +51,7 @@ export function Composer({
   restoredDraft,
   mode,
   onModeChange,
+  focusRequest = 0,
   onSend,
 }: Props) {
   const [text, setText] = useState("");
@@ -54,6 +59,10 @@ export function Composer({
   /* The box is cleared optimistically on send, because a round trip's worth of latency in a text
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
      message is gone with no trace, which is the one outcome this must never produce. */
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (focusRequest > 0 && mode === "input") textareaRef.current?.focus();
+  }, [focusRequest, mode]);
   useEffect(() => {
     if (restoredDraft === null) return;
     setText(restoredDraft.text);
@@ -81,6 +90,7 @@ export function Composer({
       )}
       {mode === "input" ? (
         <textarea
+          ref={textareaRef}
           value={text}
           disabled={disabled}
           autoFocus
@@ -127,8 +137,11 @@ export function Composer({
         // textarea. That third one is deliberate, not an overlooked side door: a focusable control
         // that does not become active when focus actually reaches it would be the surprising
         // behaviour, not this.
+        // It reads like the empty box it stands in for, not like an instruction: the owner asked for
+        // the "按 i 开始输入" line to go (2026-09-19), since Ctrl+l now opens the composer anyway.
+        // `i`, a click and Tab still reach INPUT from here exactly as before.
         <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
-          按 i 开始输入
+          Ask the agent...
         </div>
       )}
       {/* No Send/Stop buttons here (spec §3.4, removed panel-as-document task 6 fix round 1):

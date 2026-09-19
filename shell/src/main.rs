@@ -159,7 +159,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source);
     lua_engine.register_builtin_panel(
         PanelSlot::Side,
-        PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget },
+        PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget.clone() },
     );
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
@@ -309,6 +309,9 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     if let Some(ps) = pane_switch.as_mut() {
         let side_widget = side_widget.clone();
         let focus_top_bar = focus_top_bar.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        // Only the built-in agent panel has a composer. A Lua panel in the side slot just gets focus.
+        let side_is_agent = side_widget == agent_widget;
         pane_switch::listen(ps, move |direction| match direction {
             'R' => {
                 // A `WebView` is an ordinary focusable GTK widget -- unlike a bare `GtkGLArea`,
@@ -317,6 +320,12 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // `shell/MANUAL_VERIFICATION.md`.
                 let grabbed = side_widget.grab_focus();
                 println!("[pane_switch] direction R -> focusing the side panel (grab_focus={grabbed})");
+                // Arriving by keyboard means "I want to type": open the composer with the caret in
+                // it (owner, 2026-09-19). A click on a row does not go through here and still lands
+                // in BROWSE on that row.
+                if grabbed && side_is_agent {
+                    agent_panel_handle.enter_input();
+                }
             }
             // Ctrl+k at nvim's topmost window: the top bar is above every pane.
             'U' => {

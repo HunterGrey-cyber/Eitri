@@ -149,10 +149,34 @@ describe("Composer restoring a refused draft", () => {
    keystroke to land in -- and the two mouse-driven paths that have to agree with the keyboard
    table in `keymap.ts` on what mode the panel is in. */
 describe("Composer's BROWSE/INPUT split", () => {
-  it("shows the hint line instead of a textarea in BROWSE", () => {
+  it("shows an empty-looking box instead of a textarea in BROWSE, with no instruction in it", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector("textarea")).toBeNull();
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toContain("i");
+    // The owner asked for "按 i 开始输入" to go (2026-09-19). The stand-in reads like the textarea's
+    // own placeholder, and `i`, a click and Tab still reach INPUT from it.
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...");
+  });
+
+  it("takes focus back when asked, even if it is already mounted", () => {
+    // The path `setMode("input")` cannot cover: already INPUT, focus somewhere else. `onModeChange`
+    // is a no-op here, so the blur cannot flip the mode out from under the test.
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    const props = {
+      disabled: false,
+      sessionEnded: false,
+      closing: false,
+      restoredDraft: null,
+      mode: "input" as const,
+      onModeChange: vi.fn(),
+      onSend: vi.fn(),
+    };
+    const { container, rerender } = render(<Composer {...props} focusRequest={0} />);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+    rerender(<Composer {...props} focusRequest={1} />);
+    expect(document.activeElement).toBe(container.querySelector("textarea"));
+    outside.remove();
   });
 
   it("reports focus on the hint line as entering INPUT", () => {

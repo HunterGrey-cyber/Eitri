@@ -109,6 +109,31 @@ describe("pane focus", () => {
     expect(modeBlock(container).textContent).toBe("BROWSE");
   });
 
+  it("opens the composer with the caret in it when shell says the user arrived by keyboard", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "enter_input" });
+    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(document.activeElement).toBe(container.querySelector("textarea"));
+    expect(container.textContent).not.toContain("按 i 开始输入");
+  });
+
+  it("does not open the composer on a session that has ended, the same as i", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatch({
+      kind: "events",
+      fromRevision: 1,
+      throughRevision: 2,
+      events: [{ type: "session_closed", reason: "provider exited" }],
+    });
+    dispatch({ kind: "enter_input" });
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+  });
+
   it("does not change the mode or what i does", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
