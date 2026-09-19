@@ -914,16 +914,18 @@ describe("App keyboard: scrolling through the conversation", () => {
 
     press("j");
     expect(current(container)).toBe("b");
-    expect(list.scrollTop).toBe(100); // the tall row's TOP at the top of the view
+    // The tall row's top was already on screen (at 100): landing moves NOTHING, so the tail of "a"
+    // just read stays in view (review: aligning it jumped the view by a quarter of it here).
+    expect(list.scrollTop).toBe(0);
 
-    // 590px of it is below the view: nine 60px steps, then a 50px one -- never past the edge.
+    // 690px of it is below the view: eleven 60px steps, then a 30px one -- never past the edge.
     const seen: number[] = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i++) {
       press("j");
       seen.push(list.scrollTop);
     }
     expect(current(container)).toBe("b");
-    expect(seen).toEqual([160, 220, 280, 340, 400, 460, 520, 580, 640, 690]);
+    expect(seen).toEqual([60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 690]);
     expect(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[1].getBoundingClientRect().bottom).toBe(400);
 
     press("j");
@@ -945,7 +947,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     const { container } = started();
     prompts("a", "b", "c");
     const list = fakeLayout(container, [100, 990, 100]);
-    for (let i = 0; i < 12; i++) press("j");
+    for (let i = 0; i < 14; i++) press("j");
     expect(current(container)).toBe("c");
     expect(list.scrollTop).toBe(690);
     // "c" fits, so landing on it used `scrollIntoView({ block: "nearest" })` -- a mock here. Do what
@@ -954,18 +956,34 @@ describe("App keyboard: scrolling through the conversation", () => {
 
     press("k");
     expect(current(container)).toBe("b");
-    expect(list.scrollTop).toBe(690); // the tall row's BOTTOM at the bottom of the view
+    expect(list.scrollTop).toBe(790); // its BOTTOM was already on screen (at 300): nothing moves
 
     const seen: number[] = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i++) {
       press("k");
       seen.push(list.scrollTop);
     }
-    expect(seen).toEqual([630, 570, 510, 450, 390, 330, 270, 210, 150, 100]);
+    expect(seen).toEqual([730, 670, 610, 550, 490, 430, 370, 310, 250, 190, 130, 100]);
     expect(current(container)).toBe("b");
 
     press("k");
     expect(current(container)).toBe("a");
+  });
+
+  it("j onto a tall row whose top is NOT on screen aligns that top with the view's top; k mirrors it", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    const list = fakeLayout(container, [400, 990, 400]);
+
+    press("j"); // "b" starts at 400, exactly where the 400px view ends
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(400);
+
+    press("G", { shiftKey: true }); // "c", view at the very end (1390)
+    expect(list.scrollTop).toBe(1390);
+    press("k"); // "b" ends at 1390, exactly where the view begins
+    expect(current(container)).toBe("b");
+    expect(list.scrollTop).toBe(990); // its bottom at the bottom of the view
   });
 
   it("from the Stop button, k moves back to the row rather than scrolling it", () => {
@@ -1012,6 +1030,40 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("u", { ctrlKey: true });
     expect(list.scrollTop).toBe(700);
     expect(current(container)).toBe("r3"); // the LAST row still on screen
+  });
+
+  it("Ctrl+d brings the cursor to the visible row NEAREST its own, not to the first one on screen", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7");
+    const list = fakeLayout(container, [100, 100, 100, 100, 100, 100, 100, 100], 250);
+    press("G", { shiftKey: true }); // cursor on r7, at the end
+    expect(current(container)).toBe("r7");
+    list.scrollTop = 0; // the wheel took the view back up: r0-r2 on screen, r7 far below
+
+    press("d", { ctrlKey: true }); // +125: r1-r3 on screen, r7 still below
+    expect(list.scrollTop).toBe(125);
+    expect(current(container)).toBe("r3"); // the last row on screen -- not r1, many rows UP
+  });
+
+  it("Ctrl+d that re-homes the cursor takes the keys back from a focused control", () => {
+    const { container } = started();
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    prompts("r1", "r2", "r3");
+    const list = fakeLayout(container, [300, 300, 300, 300]);
+    const rows = list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
+    expect(rows[0].querySelector('[data-nav-action="allow"]')).not.toBeNull();
+    press("l"); // Approve on the card (row 0) has the keys
+    expect((document.activeElement as HTMLElement).closest('[data-nav-stop="row"]')).toBe(rows[0]);
+
+    press("d", { ctrlKey: true });
+    press("d", { ctrlKey: true }); // the card has left the view: the cursor re-homes to r1
+    expect(current(container)).toBe("r1");
+    // The root, so Enter now acts on r1 rather than natively activating an Approve nobody can see
+    // (jsdom performs no native activation, so this focus is the observable; Enter is not pressed).
+    expect(document.activeElement).toBe(root(container));
   });
 
   it("Ctrl+d never answers a permission, whatever the plain d does", () => {
@@ -1068,6 +1120,22 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("j"); // and a key it does know cancels too
     press("g");
     expect(current(container)).toBe("c");
+  });
+
+  it("a pane switch cancels a pending g, though the WebView saw no key for it", () => {
+    const { container } = started();
+    prompts("a", "b", "c");
+    fakeLayout(container, [100, 100, 100]);
+    press("j");
+    press("j");
+    expect(current(container)).toBe("c");
+    press("g");
+    // Ctrl+h to the editor (GTK takes the chord), then back by a click, much later.
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => root(container).focus());
+    press("g");
+    expect(current(container)).toBe("c"); // not gg: the cursor did not jump to "a"
   });
 });
 

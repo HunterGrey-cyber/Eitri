@@ -139,6 +139,7 @@ function rowScrollStep(row: HTMLElement): number {
  *  the viewport shows the edge you are reading from: its top when you arrived with `j` (+1), its
  *  bottom when you arrived with `k` (-1) -- `"nearest"` on an element bigger than the scrollport
  *  aligns whichever edge happens to be closer, which for a long reply can be the middle of it.
+ *  When that edge is already on screen, nothing moves.
  *  `direction` 0 (the cursor moved for some other reason) always means `"nearest"`. */
 function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1 | 0) {
   if (list !== null && direction !== 0) {
@@ -146,7 +147,11 @@ function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1
     const l = list.getBoundingClientRect();
     const viewport = l.bottom - l.top;
     if (viewport > 0 && r.bottom - r.top > viewport) {
-      list.scrollTop += direction > 0 ? r.top - l.top : r.bottom - l.bottom;
+      // Already showing the edge you are reading from: move nothing, and let the next `j`/`k` step
+      // through the row (`scrollCursorRow`). Aligning it anyway jumped the view by up to a whole
+      // viewport in one press and pushed the tail of the row just read out of sight -- review.
+      const edgeShown = direction > 0 ? r.top >= l.top && r.top < l.bottom : r.bottom <= l.bottom && r.bottom > l.top;
+      if (!edgeShown) list.scrollTop += direction > 0 ? r.top - l.top : r.bottom - l.bottom;
       return;
     }
   }
@@ -312,7 +317,8 @@ export default function App() {
    *  unchanged cursor runs no effect, and a stale value would misplace some later, unrelated move. */
   const landingRef = useRef<1 | -1 | 0 | "keep">(0);
   /** A lone `g` was the last key in BROWSE (`resolveKey`'s `pending-g`). Cleared on EVERY key
-   *  `onKeyDown` sees, so anything but a second `g` cancels it; handed to `resolveKey` in its
+   *  `onKeyDown` sees, so anything but a second `g` cancels it, and on every `pane_focus` envelope,
+   *  so a pane switch the WebView never saw as a key cancels it too; handed to `resolveKey` in its
    *  context so the key table itself keeps no memory. */
   const pendingGRef = useRef(false);
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
@@ -460,6 +466,10 @@ export default function App() {
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
       } else if (payload.kind === "pane_focus") {
+        // A pending `g` is for the very next key; a pane switch in between (GTK takes `Ctrl+h`/
+        // `Ctrl+k` before the WebView sees a keydown) must not leave it armed for a `g` pressed
+        // much later, when it would jump to the top -- review.
+        pendingGRef.current = false;
         setPaneFocused(payload.focused);
       } else if (payload.kind === "enter_input") {
         setInputRequest((n) => n + 1);
@@ -884,13 +894,19 @@ export default function App() {
         pendingGRef.current = true;
         break;
       case "half-page": {
-        // Half the visible height, as in vim. Then, if the scroll carried the cursor's row entirely
-        // out of sight, the cursor comes to the nearest row still on screen -- the first one for
-        // `Ctrl+d`, the last one for `Ctrl+u` -- so the next `j`/`k` acts where the user is looking.
-        // The view stays exactly where the scroll put it ("keep"): re-revealing that row with
-        // `nearest` would pull the view back by up to a row.
+        // Half the visible height, as in vim. Then, if the cursor's row is not on screen, the
+        // cursor comes to the visible row NEAREST to it: the first one on screen when the row lies
+        // above the view, the last one when it lies below. (It used to pick by the key's direction
+        // alone, so `Ctrl+d` with the cursor's row already off screen BELOW the view pulled the
+        // cursor UP by many rows -- found in review.) The view stays exactly where the scroll put it
+        // ("keep"): re-revealing that row with `nearest` would pull the view back by up to a row.
+        //
+        // A re-home also takes DOM focus back to the root, as `move` and `jump` do. Found in
+        // review: without it, a control that had the keys (Approve after `l`, a banner's Dismiss,
+        // Stop) KEPT them while the cursor was drawn on another row, so `Enter` activated an
+        // Approve scrolled out of sight and `j`/`k` steered from the old stop.
         const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
-        if (list === null) break;
+        if (list === null || root === null) break;
         list.scrollTop += action.delta * Math.max(1, Math.floor(list.clientHeight / 2));
         const l = list.getBoundingClientRect();
         if (l.bottom - l.top <= 0) break;
@@ -898,11 +914,13 @@ export default function App() {
         const current = rows[cursor];
         const onScreen = visibleRows(list);
         if (current === undefined || onScreen.includes(current) || onScreen.length === 0) break;
-        const next = rows.indexOf(action.delta > 0 ? onScreen[0] : onScreen[onScreen.length - 1]);
+        const below = current.getBoundingClientRect().top >= l.bottom;
+        const next = rows.indexOf(below ? onScreen[onScreen.length - 1] : onScreen[0]);
         if (next !== -1 && next !== cursor) {
           landingRef.current = "keep";
           setCursor(next);
         }
+        root.focus({ preventScroll: true });
         break;
       }
       case "jump": {

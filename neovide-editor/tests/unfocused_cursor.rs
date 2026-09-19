@@ -62,8 +62,8 @@ fn cursor_pixels(harness: &LiveHarness, surface: &mut Surface) -> usize {
 }
 
 /// `(focused, unfocused)` cursor-pixel counts for one real nvim launched with `extra` after
-/// `--clean`, at `scale`.
-fn measure(scale: f64, insert: bool, extra: &[String]) -> (usize, usize) {
+/// `--clean`, at `scale`. `keys`, if not empty, is typed into nvim once it is ready (before `i`).
+fn measure(scale: f64, insert: bool, keys: &str, extra: &[String]) -> (usize, usize) {
     let mut surface = surfaces::raster_n32_premul(CANVAS).expect("raster surface");
     let region = PixelRect::from_min_max((0.0, 0.0), (CANVAS.0 as f32, CANVAS.1 as f32));
     let mut args = vec!["--clean".to_string()];
@@ -81,6 +81,9 @@ fn measure(scale: f64, insert: bool, extra: &[String]) -> (usize, usize) {
         assert!(Instant::now() < deadline && !harness.has_neovim_exited(), "nvim never became ready");
         render(&mut harness, &mut surface, &region);
         std::thread::sleep(Duration::from_millis(16));
+    }
+    if !keys.is_empty() {
+        harness.send_text_input(keys);
     }
     if insert {
         harness.send_text_input("i");
@@ -112,6 +115,11 @@ struct Case {
     name: &'static str,
     scale: f64,
     insert: bool,
+    /// Keys typed once nvim is ready, AFTER `ui_attach` -- the only way this test reaches Neovide's
+    /// `WatchGlobal`/`setting_changed` path, which is how a real `init.lua` (loaded at `ui_attach`)
+    /// or a runtime `:let` gets a value to the renderer. A `--cmd` does not: it is read by
+    /// `settings.read_initial_values`, before `ui_attach`.
+    keys: &'static str,
     extra: Vec<String>,
     /// Whether the unfocused frame must have cursor pixels (`true`) or none (`false`).
     unfocused_visible: bool,
@@ -120,7 +128,7 @@ struct Case {
 /// Runs one case in a child copy of this binary: winit allows one `EventLoop` per process, and
 /// only on the main thread, so every `LiveHarness` needs a fresh process.
 fn run_case(case: &Case) -> (usize, usize) {
-    let spec = format!("{}\n{}\n{}", case.scale, case.insert, case.extra.join("\n"));
+    let spec = format!("{}\n{}\n{}\n{}", case.scale, case.insert, case.keys, case.extra.join("\n"));
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .env(CASE_ENV, spec)
         .output()
@@ -142,6 +150,7 @@ fn cases() -> Vec<Case> {
             name: "pane default, block",
             scale,
             insert: false,
+            keys: "",
             extra: pane_default(),
             unfocused_visible: false,
         });
@@ -150,6 +159,7 @@ fn cases() -> Vec<Case> {
         name: "pane default, insert-mode bar",
         scale: 1.5,
         insert: true,
+        keys: "",
         extra: pane_default(),
         unfocused_visible: false,
     });
@@ -158,10 +168,21 @@ fn cases() -> Vec<Case> {
     let mut user_override = pane_default();
     user_override.extend(width_cmd("0.125"));
     v.push(Case {
-        name: "pane default + user override 0.125",
+        name: "pane default + user override 0.125 (--cmd, startup read)",
         scale: 1.5,
         insert: false,
+        keys: "",
         extra: user_override,
+        unfocused_visible: true,
+    });
+    // The same override delivered AFTER `ui_attach`, through the variable watcher -- the path a
+    // real `init.lua` and a runtime `:let` both take (the `--cmd` case above never reaches it).
+    v.push(Case {
+        name: "pane default + runtime :let 0.125 (watcher)",
+        scale: 1.5,
+        insert: false,
+        keys: ":let g:neovide_cursor_unfocused_outline_width = 0.125<CR>",
+        extra: pane_default(),
         unfocused_visible: true,
     });
     // Positive control: with nothing injected, stock Neovide's hollow block is really there, so a
@@ -170,6 +191,7 @@ fn cases() -> Vec<Case> {
         name: "no default (stock Neovide)",
         scale: 1.5,
         insert: false,
+        keys: "",
         extra: Vec::new(),
         unfocused_visible: true,
     });
@@ -181,8 +203,9 @@ fn main() {
         let mut lines = spec.split('\n');
         let scale: f64 = lines.next().unwrap().parse().unwrap();
         let insert: bool = lines.next().unwrap().parse().unwrap();
+        let keys = lines.next().unwrap().to_string();
         let extra: Vec<String> = lines.filter(|l| !l.is_empty()).map(String::from).collect();
-        let (f, u) = measure(scale, insert, &extra);
+        let (f, u) = measure(scale, insert, &keys, &extra);
         println!("RESULT {f} {u}");
         return;
     }

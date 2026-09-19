@@ -548,6 +548,92 @@ describe("MessageList follows a reply growing while it streams", () => {
   });
 });
 
+/* Review findings on the follow guard (2026-09-19). A list whose `scrollTop` clamps the way a
+   browser's does, so the snap lands where a real one would. */
+function clampedList(list: HTMLElement, clientHeight: number, start: { scrollHeight: number; scrollTop: number }) {
+  let height = start.scrollHeight;
+  let top = start.scrollTop;
+  Object.defineProperty(list, "clientHeight", { value: clientHeight, configurable: true });
+  Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => height });
+  Object.defineProperty(list, "scrollTop", {
+    configurable: true,
+    get: () => top,
+    set: (v: number) => {
+      top = Math.max(0, Math.min(height - clientHeight, v));
+    },
+  });
+  return {
+    grow(to: number) {
+      height = to;
+      top = Math.min(top, Math.max(0, height - clientHeight));
+    },
+  };
+}
+
+describe("MessageList follow guard: a scroll up always wins", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  it("a k step that ends inside the 24px threshold still stops following", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("par") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    list.scrollTop = 1590; // a 10px `k`: the rest of the row above was only 10px
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    rerender(<MessageList state={state({ transcript: texts("partial reply, longer now") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1590);
+  });
+
+  it("an update that moves nothing does not re-arm following near the bottom", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("par") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    list.scrollTop = 1590;
+    fireEvent.scroll(list);
+
+    // The state changes but the height does not (text replaced in place): the effect's own
+    // synchronous read finds the view 10px from the bottom and must not take that as "back".
+    rerender(<MessageList state={state({ transcript: texts("pat") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1590);
+  });
+
+  it("a k pressed right after a snap, before the snap's scroll event, is seen as a scroll up", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    dims.grow(2300);
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+    expect(list.scrollTop).toBe(1900); // snapped
+    list.scrollTop -= 60; // `k`, with no scroll event yet for either scroll
+    dims.grow(2400);
+
+    rerender(<MessageList state={state({ transcript: texts("par") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1840);
+  });
+
+  it("content shrinking under a user at the bottom (scrollTop clamped down) keeps following", () => {
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    dims.grow(1900); // a row went away: the browser clamps scrollTop to 1500 and fires scroll
+    fireEvent.scroll(list);
+    scrollIntoView.mockClear();
+
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
+
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+});
+
 describe("MessageList cursor highlight", () => {
   it("marks only the row at `cursor`, by position, with row-current and aria-current", () => {
     const { container } = render(

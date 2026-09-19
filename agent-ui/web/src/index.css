@@ -24,12 +24,24 @@ body,
   height: 100vh;
 }
 
-.agent-ui-conversation {
-  display: grid;
-  /* winbar, the scrolling message list, the status line, the composer -- panel-as-document task 6
-     split what used to be one `.session-header` row into a winbar (identity/model, above) and a
-     status line (mode/status/position/Stop, directly above the composer). */
-  grid-template-rows: auto 1fr auto auto;
+/* winbar, the scrolling message list, the status line, the composer -- panel-as-document task 6
+   split what used to be one `.session-header` row into a winbar (identity/model, above) and a
+   status line (mode/status/position/Stop, directly above the composer).
+
+   A flex column (inherited from `.agent-ui-root`), not the grid it used to be. The grid was
+   `grid-template-rows: auto 1fr auto auto`, which hands the `1fr` to whatever child happens to be
+   SECOND -- the message list normally, but the fatal-error banner whenever it is shown, because
+   `App.tsx` renders it between the winbar and the list. The list then sat in an `auto` track at its
+   full content height and never scrolled, so `j`/`k`'s stepping through a long reply did nothing in
+   exactly the state where someone reads back over a dead session (found in review). The list now
+   takes the free space by its own class, whatever else is on screen, and nothing else shrinks. */
+.agent-ui-conversation > * {
+  flex: 0 0 auto;
+}
+
+.agent-ui-conversation > .message-list {
+  flex: 1 1 0%;
+  min-height: 0;
 }
 
 .mode-selector {

@@ -339,8 +339,12 @@ pub struct NeovideEditorPaneOptions {
 ///
 /// It is a `--cmd`, so it runs before the user's own config: a user who wants the hollow block
 /// back sets the variable in their `init.lua` (e.g. `vim.g.neovide_cursor_unfocused_outline_width
-/// = 0.125`) and wins. Neovide watches the variable, so a change at runtime applies too. Proved on
-/// real frames by `tests/unfocused_cursor.rs`.
+/// = 0.125`) and wins. Neovide reads a `--cmd` value once, in `settings.read_initial_values`, BEFORE
+/// `ui_attach`; `init.lua` runs AT `ui_attach`, so its value, like a runtime `:let`, reaches the
+/// renderer by the other path -- the `WatchGlobal` dict watcher and `setting_changed`. Both paths are
+/// proved on real frames by `tests/unfocused_cursor.rs`: a later `--cmd`, and a `:let` typed after
+/// nvim is ready. A real `init.lua` itself was not loaded (the test runs `--clean`); the runtime
+/// `:let` stands in for it because it takes the same watcher path.
 pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outline_width = 0";
 
 /// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`

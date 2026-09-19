@@ -313,6 +313,33 @@ describe("index.css cascade (which rule actually wins)", () => {
   const MODE_BLOCK = `<div class="status-line"><span class="mode-block" data-mode="input">INPUT</span></div>`;
   const UNFOCUSED_INPUT_BLOCK = `<div class="status-line"><span class="mode-block" data-mode="input" data-focused="false">INPUT</span></div>`;
 
+  // Review (2026-09-19): the conversation used to be `grid-template-rows: auto 1fr auto auto`, which
+  // gives the `1fr` to the SECOND child -- the fatal-error banner when it is shown, not the list.
+  // The list then took its full content height and never scrolled, so `j`/`k` could not step
+  // through a long reply over a dead session. jsdom has no layout, so this pins the rule that
+  // decides it: the list grows by its own class, whatever sits between it and the winbar.
+  const CONVERSATION = (banner: string) =>
+    `<div class="agent-ui-root agent-ui-conversation"><div class="winbar">w</div>${banner}<div class="message-list">m</div><div class="status-line">s</div><div class="composer">c</div></div>`;
+
+  it("gives the free height to the message list, fatal banner or not", () => {
+    for (const banner of ["", `<div class="fatal-error">e</div>`]) {
+      const list = computed(CONVERSATION(banner), ".message-list");
+      expect(list.display).not.toBe("grid");
+      expect(list.flexGrow).toBe("1");
+      expect(list.minHeight).toBe("0px");
+      expect(list.overflowY).toBe("auto");
+      const root = computed(CONVERSATION(banner), ".agent-ui-conversation");
+      expect(root.display).toBe("flex");
+      expect(root.gridTemplateRows).toBe("none");
+      for (const other of [".winbar", ".status-line", ".composer", ...(banner ? [".fatal-error"] : [])]) {
+        expect(computed(CONVERSATION(banner), other).flexGrow).toBe("0");
+      }
+    }
+    // Negative control: the old grid put back, which is what hands the space to the banner.
+    const old = ".agent-ui-conversation { display: grid; grid-template-rows: auto 1fr auto auto; }";
+    expect(computed(CONVERSATION(`<div class="fatal-error">e</div>`), ".agent-ui-conversation", old).display).toBe("grid");
+  });
+
   it("paints a code block on --nv-surface even inside an assistant row", () => {
     expect(computed(CODE_BLOCK, "pre").background).toBe("var(--nv-surface)");
     // The negative control: the rule that was actually deleted, put back. Without it this
