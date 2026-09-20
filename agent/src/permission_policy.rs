@@ -122,7 +122,58 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookE
 /// that is stated in the docs and is *not* something this project has observed -- nothing here has
 /// confirmed that a subagent's inner calls reach this same `PreToolUse` gate. If that assumption is
 /// ever disproved, this entry is a hole and must be the first thing removed.
-pub const NEVER_ASK_TOOLS: &[&str] = &["TodoWrite", "Task"];
+///
+/// **`ToolSearch` is here on a measurement, and it is the row that made auto mode usable**
+/// (2026-09-19, later). On CLI 2.1.272 the tools are *deferred*: the model is given their names
+/// only, and has to call `ToolSearch` to load a schema before it can call anything at all. Every
+/// one of those searches reaches this gate -- `agent/tests/backend_conformance.rs` records the same
+/// thing from the product side -- so while `ToolSearch` was "not in the policy's table" the user got
+/// a card before nearly every action the agent took, which is what the owner reported as auto mode
+/// still being a wall of popups. Measured against the oracle the same way as everything else here:
+/// `claude --print` with no `--permission-mode`, which denies where it would have prompted, **ran**
+/// `ToolSearch {"query": "select:Read"}` and returned the schema. It loads a description; it opens
+/// no file, runs no command and reaches no network.
+pub const NEVER_ASK_TOOLS: &[&str] = &["TodoWrite", "Task", "ToolSearch"];
+
+/// The tools CLI 2.1.272 actually offers, read off its own `system/init` on 2026-09-19 (later).
+///
+/// It is here to keep one fact visible: **the two tables above were written against a tool set that
+/// is not this one.** `Grep`, `Glob`, `MultiEdit` and `TodoWrite` are named by the policy and do not
+/// exist on this build; eighteen tools that DO exist were unknown to it, and an unknown tool is a
+/// card. Most of those are rare enough that a card is the right answer and no worse than an
+/// annoyance -- and several (`SendMessage`, `PushNotification`, `RemoteTrigger`, `CronCreate`,
+/// `EnterWorktree`) reach outside this machine or change the tree, so they must stay cards. Only
+/// `ToolSearch` was frequent enough to matter, and only it has been measured. **Do not promote a
+/// name off this list without its own oracle run**; the list is a record of what exists, not a
+/// judgement about any of it.
+pub const TOOLS_OFFERED_BY_CLI_2_1_272: &[&str] = &[
+    "Task",
+    "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "Edit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ListAgents",
+    "LSP",
+    "Monitor",
+    "NotebookEdit",
+    "PushNotification",
+    "Read",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "TaskOutput",
+    "TaskStop",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
 
 /// The read-only `Bash` commands the CLI's own documentation names, verbatim and in its order.
 ///
@@ -556,6 +607,48 @@ mod tests {
                 "{tool} must not interrupt the user"
             );
         }
+    }
+
+    /// `ToolSearch` loads a tool's schema and does nothing else, and on this build the model must
+    /// call it before it can use any tool at all -- so a card here is a card before nearly every
+    /// action. Measured against the CLI (see `NEVER_ASK_TOOLS`), not reasoned about.
+    #[test]
+    fn a_tool_search_never_interrupts_the_user() {
+        let ws = Workspace::new();
+        assert_eq!(
+            verdict(
+                "ToolSearch",
+                json!({ "query": "select:Read", "max_results": 1 }),
+                ws.path()
+            ),
+            PermissionVerdict::AllowWithoutAsking
+        );
+    }
+
+    /// The other side of that change, and the reason it is one name rather than a category: every
+    /// remaining tool this CLI offers still reaches the user. Written as the real list off
+    /// `system/init` rather than an invented name, because the names that matter are the ones a real
+    /// session can actually produce -- five of these reach outside this machine or change the tree.
+    #[test]
+    fn every_other_tool_this_cli_offers_still_reaches_the_user() {
+        let ws = Workspace::new();
+        let decided_elsewhere = ["Task", "Bash", "Read", "ToolSearch"];
+        let mut carded = 0;
+        for tool in TOOLS_OFFERED_BY_CLI_2_1_272 {
+            if decided_elsewhere.contains(tool) {
+                continue;
+            }
+            assert_eq!(
+                verdict(tool, json!({ "file_path": "src/main.rs" }), ws.path()),
+                PermissionVerdict::AskTheUser,
+                "{tool} must still reach the user"
+            );
+            carded += 1;
+        }
+        assert_eq!(
+            carded, 22,
+            "the CLI's tool list changed; re-read its system/init before editing this"
+        );
     }
 
     #[test]

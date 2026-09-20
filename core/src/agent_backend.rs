@@ -587,6 +587,14 @@ impl AgentBackend {
             };
             let classification = agent::classify_permission_request(tool_name, input, project_root);
             if classification.needs_a_human() {
+                // The other half of the line below, added 2026-09-19 (later) because its absence
+                // cost a diagnosis: the owner reported auto mode still being a wall of popups, and
+                // nothing anywhere recorded WHY any particular card was drawn, so the cause --
+                // `ToolSearch` falling off the end of the policy's table, on a build whose tools are
+                // deferred so the model calls it before everything -- had to be reconstructed by
+                // reading the classifier against the CLI's own `system/init`. One line per card,
+                // with the policy's own fixed reason, never anything the model wrote.
+                eprintln!("[permission] asking the user: {tool_name} ({})", classification.reason);
                 kept.push(event);
                 continue;
             }

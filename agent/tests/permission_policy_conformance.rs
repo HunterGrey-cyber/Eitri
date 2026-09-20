@@ -173,7 +173,7 @@ struct Probe {
     file_that_must_not_exist: Option<&'static str>,
 }
 
-/// Six probes, one billed turn each, chosen to cover both directions of the assertion rather than
+/// Eight probes, one billed turn each, chosen to cover both directions of the assertion rather than
 /// to be exhaustive. Add more freely -- each costs a turn.
 fn probes() -> Vec<Probe> {
     vec![
@@ -217,6 +217,25 @@ fn probes() -> Vec<Probe> {
         // no Grep or Glob probe because CLI 2.1.272 has neither tool: its `system/init` lists no
         // such name (measured 2026-09-19), and a Grep probe made the model reach for ToolSearch
         // twice and then give up -- which the per-probe check above caught as vacuous.
+        // The tools are deferred on this build, so the model reaches for `ToolSearch` before it can
+        // use anything -- which made this the most frequent gated call in a real session and the
+        // reason auto mode still felt like a wall of popups. The CLI runs it in default mode.
+        Probe {
+            label: "a tool-schema search",
+            prompt: "Use the ToolSearch tool to load the Read tool's schema. Then reply with just: done",
+            expects_tool: "ToolSearch",
+            file_that_must_not_exist: None,
+        },
+        // A pipe between two read-only commands. The CLI runs it; the policy cards it, because it
+        // has no shell parser and every shape of shell syntax resolves toward the card. Stricter,
+        // not unsafe -- and a probe here so the gap is measured on each run rather than argued.
+        Probe {
+            label: "a read-only bash command with a pipe",
+            prompt: "Using the Bash tool, run exactly `grep -n alpha a.txt | head -1` in the \
+                     current directory and tell me what it printed. Do not run anything else.",
+            expects_tool: "Bash",
+            file_that_must_not_exist: None,
+        },
         Probe {
             label: "a read that climbs out of the working directory with ..",
             prompt: "Using the Read tool, read the file ../../etc/hostname (relative to the current \
@@ -231,6 +250,9 @@ fn a_fresh_workspace() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agent-policy-oracle-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("main.rs"), "fn main() { println!(\"probe\"); }\n").unwrap();
+    // For the piped-grep probe: a file with a line the command can find, so a `grep` that prints
+    // nothing cannot be mistaken for a refusal.
+    std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
     dir
 }
 
