@@ -218,6 +218,13 @@ pub fn serialize_enter_input_for_js() -> String {
     json!({ "kind": "enter_input" }).to_string()
 }
 
+/// `{"kind":"select_all"}`: `Ctrl+a Ctrl+a` from the shell prefix while the panel has focus.
+/// WebKitGTK cannot receive the key itself, so the panel selects all text in the focused
+/// field and does nothing if no field has focus.
+pub fn serialize_select_all_for_js() -> String {
+    json!({ "kind": "select_all" }).to_string()
+}
+
 /// Global `f` HINT. `shell`
 /// owns the session; these five tell the panel to report, show, narrow, land and clear.
 pub fn serialize_hint_collect_for_js(session_id: u64) -> String {
@@ -460,6 +467,12 @@ mod tests {
     fn serializes_enter_input() {
         let value: serde_json::Value = serde_json::from_str(&serialize_enter_input_for_js()).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "enter_input" }));
+    }
+
+    #[test]
+    fn serializes_select_all() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_select_all_for_js()).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "select_all" }));
     }
 
     #[test]

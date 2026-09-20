@@ -8,26 +8,19 @@
 //! when unfocused. The panel receives a `pane_focus` envelope through
 //! `AgentPanelHandle::set_pane_focused`. Its current row's sign cell is solid with focus and
 //! hollow without, so the panel still shows where focus will return.
+//! The cursors provide the focus indicators.
 //!
 //! Changes to `GtkWindow:focus-widget` update all indicators through one function so they agree.
 //! A pane has the keys only when it holds the focus widget and the window is active.
 //! `notify::is-active` runs the same function, so switching to another application clears that state.
-//! The status bar also names the focused pane. Its label ignores window activity and keeps
-//! naming the pane that will receive keys on return.
+//! The last focused pane is remembered even while the window is inactive. The top bar's
+//! `Ctrl+j` returns to it, and the `Ctrl+a` prefix zooms it.
 //! Visual behavior has not been checked on screen.
 
 use gtk4::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// One pane the tracker knows about.
-pub(crate) struct Pane {
-    /// Focus inside this widget, or on it, counts as this pane having focus.
-    pub(crate) content: gtk4::Widget,
-    /// What the status bar shows. It is the panel registry's own title, so a Lua plugin that
-    /// replaces a slot is named by its own title and not by the built-in one.
-    pub(crate) title: String,
-}
 
 /// The index of the first pane in `panes` whose element appears in `chain`, walking `chain` in
 /// order (the focus widget first, then each ancestor). `None` means focus is in none of them: the
@@ -37,13 +30,6 @@ pub(crate) struct Pane {
 /// chain.
 pub(crate) fn owning_pane<T: PartialEq>(chain: impl IntoIterator<Item = T>, panes: &[T]) -> Option<usize> {
     chain.into_iter().find_map(|w| panes.iter().position(|p| *p == w))
-}
-
-/// What the status bar says for `focused`. With no pane focused it says so ("—"). It does not
-/// keep the last pane's name up, which would be the same plausible-looking lie as the hardcoded
-/// `NORMAL` it replaced.
-pub(crate) fn status_text(focused: Option<&str>) -> String {
-    focused.unwrap_or("\u{2014}").to_string()
 }
 
 /// Which panes' "has the keys" answer changed, as `(index, now)`. `last` holds the previous
@@ -60,14 +46,14 @@ pub(crate) fn focus_changes(last: &[Option<bool>], focused: Option<usize>, activ
         .collect()
 }
 
-/// Wires the tracker to `window` and applies it once for the current focus.
+/// Wires the tracker to `window` and applies it once for the current focus. `panes` are the
+/// widgets whose subtree counts as that pane, in the order `on_pane_focus` reports indices.
 ///
 /// `on_pane_focus(index, has_keys)` is called when a pane's answer changes. Returns the index of
 /// the pane that most recently held focus, which the top bar's `Ctrl+j` uses to go back to it.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
-    panes: Vec<Pane>,
-    status_label: gtk4::Label,
+    panes: Vec<gtk4::Widget>,
     on_pane_focus: impl Fn(usize, bool) + 'static,
 ) -> Rc<Cell<usize>> {
     let last_pane = Rc::new(Cell::new(0));
@@ -75,12 +61,10 @@ pub(crate) fn install(
     let remembered = last_pane.clone();
     let apply = move |window: &gtk4::ApplicationWindow| {
         let chain = std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent());
-        let contents: Vec<gtk4::Widget> = panes.iter().map(|p| p.content.clone()).collect();
-        let focused = owning_pane(chain, &contents);
+        let focused = owning_pane(chain, &panes);
         if let Some(i) = focused {
             remembered.set(i);
         }
-        status_label.set_text(&status_text(focused.map(|i| panes[i].title.as_str())));
         let changes = focus_changes(&last.borrow(), focused, window.is_active());
         for (i, now) in changes {
             last.borrow_mut()[i] = Some(now);
@@ -93,6 +77,13 @@ pub(crate) fn install(
     window.connect_notify_local(Some("focus-widget"), move |window, _| apply(window));
     window.connect_notify_local(Some("is-active"), move |window, _| on_active(window));
     last_pane
+}
+
+/// The pane holding the window's focus widget, or `None` for the top bar or no focus widget.
+/// This is where a key typed now would go, rather than the last focused pane. `Ctrl+a Ctrl+a`
+/// forwards its `Ctrl+a` here.
+pub(crate) fn focused_pane(window: &gtk4::ApplicationWindow, panes: &[gtk4::Widget]) -> Option<usize> {
+    owning_pane(std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent()), panes)
 }
 
 #[cfg(test)]
@@ -135,11 +126,5 @@ mod tests {
         assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), false), vec![(0, false)]);
         // Focus on the top bar: neither pane has the keys.
         assert_eq!(focus_changes(&[Some(false), Some(true)], None, true), vec![(1, false)]);
-    }
-
-    #[test]
-    fn the_status_bar_says_nothing_is_focused_rather_than_keep_a_stale_name() {
-        assert_eq!(status_text(Some("Editor")), "Editor");
-        assert_eq!(status_text(None), "\u{2014}");
     }
 }

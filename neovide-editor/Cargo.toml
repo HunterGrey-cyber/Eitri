@@ -24,3 +24,7 @@ neovide = { path = "../neovide" }
 [[test]]
 name = "unfocused_cursor"
 harness = false
+
+[[test]]
+name = "fullscreen_setting"
+harness = false
