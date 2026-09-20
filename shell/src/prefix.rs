@@ -251,6 +251,12 @@ pub(crate) fn install(
                 (outcome, was_armed, p.is_armed())
             };
             if was_armed != is_armed {
+                // While the prefix is armed this same capture controller swallows every key that is
+                // not one of its own bindings -- by design, matching tmux -- so an arm that never
+                // disarms is indistinguishable from the window refusing input. Logged both ways
+                // since 2026-09-20, when a report of exactly that symptom could not be told apart
+                // from a stuck HINT or a stranded focus, because none of the three said anything.
+                println!("[prefix] armed={is_armed}");
                 on_armed(is_armed);
             }
             match outcome {

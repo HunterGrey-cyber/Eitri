@@ -324,6 +324,12 @@ impl HintCoordinator {
         self.stop_draining();
         let session_id = self.next_session.get() + 1;
         self.next_session.set(session_id);
+        // A HINT installs a window-level CAPTURE key controller, so while one is open every key in
+        // the window reaches nobody else. That is the design, and it is also indistinguishable from
+        // the window being broken -- so a session that fails to end looks exactly like "I cannot
+        // type any more". Until 2026-09-20 neither the start nor the end said anything, and one
+        // such report could not be explained from the log at all. One line each way now.
+        println!("[hint] session {session_id} started (held={held:?})");
 
         let order = order_targets(&self.layout());
         let panel_asked = order.ask_panel;
@@ -625,6 +631,11 @@ impl HintCoordinator {
         let Some(mut active) = self.active.borrow_mut().take() else {
             return;
         };
+        println!(
+            "[hint] session {} ended (restore_focus={restore}, labels={})",
+            active.session_id,
+            active.labels.len(),
+        );
         if let Some(source) = active.timeout.take() {
             source.remove();
         }

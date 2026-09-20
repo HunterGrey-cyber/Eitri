@@ -80,6 +80,22 @@ pub(crate) fn install(
         if let Some(i) = focused {
             remembered.set(i);
         }
+        // Said on every focus change, not only on a pane's own transition, because the two states
+        // that look identical from the per-pane callback are exactly the two a "I cannot type"
+        // report has to tell apart (2026-09-20, after one such report this log could not explain):
+        // the window went inactive -- ordinary, the keys are in another application -- or the
+        // window is STILL ACTIVE and focus is sitting on a widget that is neither pane, in which
+        // case the keys are going nowhere and that is a bug. `has_keys` is false either way.
+        // The widget's type name is what names the culprit: the top bar after `Ctrl+k`, HINT's
+        // overlay, or `None` after a control removed itself.
+        println!(
+            "[pane_focus] active={} focus={} owning_pane={:?}",
+            window.is_active(),
+            gtk4::prelude::GtkWindowExt::focus(window)
+                .map(|w| w.type_().name().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            focused,
+        );
         let changes = focus_changes(&last.borrow(), focused, window.is_active());
         for (i, now) in changes {
             last.borrow_mut()[i] = Some(now);
