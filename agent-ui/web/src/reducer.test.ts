@@ -322,6 +322,81 @@ describe("partial assistant streaming", () => {
   });
 });
 
+/* `turnThinking` is the ephemeral bit read by `turnPhase.ts` beyond the four collections. A
+   resync may clear it but must never invent it. `turnPhase.test.ts` checks the same degradation
+   in the phase derived from it. */
+describe("turnThinking", () => {
+  it("is set by a content_delta with kind thinking", () => {
+    const state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    expect(state.turnThinking).toBe(true);
+  });
+
+  it("a REPEATED thinking delta returns the exact same object -- the re-render guard", () => {
+    const first = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    const second = applyEvent(first, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "still going" });
+    // Use `toBe` to require the same object and avoid another render for repeated thinking deltas.
+    // `toEqual` would also accept a fresh object with equal values and miss that extra render.
+    expect(second).toBe(first);
+  });
+
+  it("a single (non-repeated) thinking delta still advances nextSeq like any other event", () => {
+    // Only a REPEAT is free. The first thinking delta from a fresh state creates no item but is
+    // still a real occurrence -- this is `reducer.test.ts`'s existing "seq assignment" invariant,
+    // restated here so the two guards cannot silently disagree about the boundary between them.
+    const before = initialState().nextSeq;
+    const state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    expect(state.nextSeq).toBe(before + 1);
+  });
+
+  it("a content_delta of an UNKNOWN kind is a no-op, not a transcript entry with no text", () => {
+    // An unknown delta such as `redacted_thinking` must not enter the text path and append
+    // `{seq: 1, text: undefined}`. `MessageList` passes that text to `renderMarkdown`, where
+    // `marked` throws. Without an error boundary, the whole panel unmounts.
+    // Rust currently emits only Text and Thinking, so the cast simulates future variant drift
+    // and verifies the runtime guard even though the TypeScript union excludes this input.
+    const drifted = { type: "content_delta", turn_id: "t1", kind: "redacted_thinking" } as unknown as AgentDomainEvent;
+    const state = applyEvent(initialState(), drifted);
+    expect(state.transcript).toEqual([]);
+    expect(state.assistantMessageOpen).toBe(false);
+    // It is still a real, ordered occurrence, so it consumes a revision exactly like any other
+    // event that creates nothing -- only a REPEATED thinking delta is free.
+    expect(state.nextSeq).toBe(initialState().nextSeq + 1);
+  });
+
+  it("is cleared by every OTHER event, by the absence of a special case rather than a maintained list", () => {
+    const opened: AgentDomainEvent = { type: "session_opened", session_id: "s", provider_session_id: "p", model: "m", cwd: "/tmp" };
+    const events: AgentDomainEvent[] = [
+      opened,
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_prompt_submitted", text: "go" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "ok" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} },
+      { type: "tool_call_completed", turn_id: "t1", tool_use_id: "tu1", content: "hi", is_error: false },
+      { type: "permission_requested", permission_id: "p1", tool_use_id: "tu1", tool_name: "Bash", input: {} },
+      { type: "permission_resolved", permission_id: "p1", outcome: "allowed" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "done", stop_reason: null, usage: null },
+      { type: "session_unavailable", reason: "provider crashed" },
+      { type: "session_closed", reason: "provider exited" },
+    ];
+    for (const event of events) {
+      const thinking = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+      expect(thinking.turnThinking).toBe(true);
+      const cleared = applyEvent(thinking, event);
+      expect(cleared.turnThinking).toBe(false);
+    }
+  });
+
+  it("applySnapshot clears it, even if the wire happened to carry a stale value", () => {
+    const thinking = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
+    // The real wire never carries this key at all (`AgentUiSnapshot` omits it) -- spreading it in
+    // anyway proves `applySnapshot` forces the reset itself rather than merely passing through
+    // whatever a snapshot happens not to override.
+    const wireWithStaleFlag = { ...thinking, turnThinking: true };
+    const restored = applySnapshot(thinking, wireWithStaleFlag, thinking.nextSeq);
+    expect(restored.turnThinking).toBe(false);
+  });
+});
+
 describe("resume outcome", () => {
   function outcome(over: Partial<Extract<AgentDomainEvent, { type: "resume_outcome" }>> = {}) {
     return {

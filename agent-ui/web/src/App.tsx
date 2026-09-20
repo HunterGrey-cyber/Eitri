@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { applyEvent, applySnapshot, initialState, resetToStartScreen } from "./reducer";
+import { applyEvent, applySnapshot, initialState, resetToStartScreen, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
@@ -22,7 +22,7 @@ import type { ShownHint } from "./components/HintLayer";
 import { WhichKey } from "./components/WhichKey";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { stripEntries } from "./whichKey";
-import type { HandoffCommand, Hello, PermissionModeChoice } from "./types";
+import type { HandoffCommand, Hello, PermissionModeChoice, TurnClock } from "./types";
 import { applyTheme } from "./theme";
 
 /** Whether `el` is an ordinary editable control -- an `<input>`, a `<textarea>`, or anything
@@ -255,6 +255,12 @@ export default function App() {
   /** Guards the render report to one per turn. Without it the effect below re-arms on every one of
    *  a reply's ~400 deltas. */
   const renderReportSent = useRef(false);
+  /** Elapsed time for the current turn, stored in state because it renders in `StatusLine`.
+   *  `exact: true` requires `turn_started` in an `events` envelope. A turn first seen in a snapshot
+   *  gets `exact: false` because its earlier duration is unknown.
+   *  Clear it on the events that clear `state.activeTurnId`. Read raw envelopes because folded state
+   *  does not retain whether the turn was first seen in events or a snapshot. */
+  const [turnClock, setTurnClock] = useState<TurnClock | null>(null);
   /** Which timeline rows show their full tool result rather than the folded placeholder, keyed by
    *  the timeline `key` -- never the cursor index, because a resolved permission removes a card and
    *  shifts every later index, which would silently move an expansion onto a different row.
@@ -592,11 +598,35 @@ export default function App() {
         // conversation nothing else remembers.
         setHandoff(null);
         setCommandNotice(null);
+        // A turn first seen in a snapshot gets `exact: false`, since the panel cannot know how
+        // long it was already running. Preserve the clock if the snapshot names the tracked
+        // turn so resync does not restart it. Clear the clock if there is no active turn.
+        setTurnClock((current) => {
+          const activeTurnId = payload.state.activeTurnId;
+          if (activeTurnId === null) return null;
+          if (current !== null && current.turnId === activeTurnId) return current;
+          return { turnId: activeTurnId, since: Date.now(), exact: false };
+        });
       } else if (payload.kind === "events") {
         // A new turn resets the render trace: each turn reports its own first text, once.
         if (payload.events.some((e) => e.type === "turn_started")) {
           firstTextReceivedAt.current = null;
           renderReportSent.current = false;
+        }
+        // The clock's only EXACT provenance: a real `turn_started` inside this batch. Everything
+        // that ends a turn clears it, mirroring exactly what already clears `state.activeTurnId` in
+        // the reducer (`turn_completed`, `session_unavailable`, `session_closed`, a non-attaching
+        // `resume_outcome`) -- read here off the raw events rather than off `state` afterwards,
+        // because `state` does not carry which envelope a turn id arrived in.
+        for (const event of payload.events) {
+          if (event.type === "turn_started") {
+            const turnId = event.turn_id;
+            setTurnClock((current) => (current?.turnId === turnId ? current : { turnId, since: Date.now(), exact: true }));
+          } else if (event.type === "turn_completed" || event.type === "session_unavailable" || event.type === "session_closed") {
+            setTurnClock(null);
+          } else if (event.type === "resume_outcome" && !resumeAttached(event)) {
+            setTurnClock(null);
+          }
         }
         // Stamped before the state update that will cause the render, so the span covers the work
         // being measured rather than starting after it.
@@ -658,6 +688,10 @@ export default function App() {
         setState(initialState());
         setStartedPermissionMode(null);
         setKeymapOpen(false);
+        // Clear the turn clock on a whole-state reset, as `returnToStartScreen` does. A later
+        // snapshot with the same `activeTurnId` would otherwise retain the old `since` and `exact: true`, showing an inflated elapsed time without `+`. Resetting avoids relying on turn ids
+        // being unique across sessions.
+        setTurnClock(null);
         setHandoff(payload);
         // Suppresses the resume offer for THIS client's already-delivered `hello`, which was
         // computed once at mount. That only ever matches when this session was itself resume-started
@@ -684,6 +718,8 @@ export default function App() {
         setState(initialState());
         setStartedPermissionMode(null);
         setKeymapOpen(false);
+        // The third of the three whole-state resets, now saying the same thing as the other two.
+        setTurnClock(null);
         setFatalError(payload.message);
         /* Re-ask for `hello`, because we are about to show the start screen again and the copy we
            captured at mount is a snapshot of the conversation records as they were then.
@@ -865,6 +901,10 @@ export default function App() {
     setState(resetToStartScreen);
     setStartedPermissionMode(null);
     setKeymapOpen(false);
+    // Belt and braces: only reachable on an ended session, which already cleared this via
+    // session_closed/session_unavailable above, but the start screen must never show a stale clock
+    // for the fresh session about to begin.
+    setTurnClock(null);
     requestHello();
   }
 
@@ -1231,6 +1271,7 @@ export default function App() {
         mode={mode}
         paneFocused={paneFocused}
         state={state}
+        turnClock={turnClock}
         position={{ index: cursor, total: timeline.length }}
         // Gate Stop on the interrupt capability. This status line is the only mouse Stop control; Enter
         // sends from the composer.

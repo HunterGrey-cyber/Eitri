@@ -1,5 +1,7 @@
-import type { AgentUiState } from "../types";
+import type { AgentUiState, TurnClock } from "../types";
 import type { PanelMode } from "../keymap";
+import { phaseOf } from "../turnPhase";
+import { TurnActivity } from "./TurnActivity";
 
 /* Data over the mode union, which is why `hint` has a label before `f` can reach it -- see
    `PanelMode`'s own doc comment in `../keymap` for why that mode is unreachable today. */
@@ -16,6 +18,11 @@ type Props = {
    *  dim block, which claims nothing. */
   paneFocused?: boolean;
   state: AgentUiState;
+  /** How long the current turn has been running, tracked in `App.tsx` (`TurnClock`) rather than in
+   *  `AgentUiState` -- see that type's own doc comment. `null` before any turn has started, and
+   *  optional/defaulted for callers (existing tests, mainly) that render no in-flight indicator at
+   *  all. Only read while a turn is actually working; see `TurnActivity`. */
+  turnClock?: TurnClock | null;
   /** The cursor's position in `buildTimeline(state)` and the current timeline length.
    *  This is not a durable item identity: `permission_resolved` removes a card and shifts later indices,
    *  so the same index can refer to a different row after an event. */
@@ -26,7 +33,7 @@ type Props = {
   onInterrupt: () => void;
 };
 
-export function StatusLine({ mode, paneFocused = false, state, position, canInterrupt, onInterrupt }: Props) {
+export function StatusLine({ mode, paneFocused = false, state, turnClock = null, position, canInterrupt, onInterrupt }: Props) {
   // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -58,6 +65,10 @@ export function StatusLine({ mode, paneFocused = false, state, position, canInte
       >
         {working ? "working" : state.status.kind}
       </span>
+      {/* The motion indicator represents per-turn state, so it lives in the status line.
+          It mounts only while `working`, using the same predicate as the status word and Stop
+          button so their indications of a running turn cannot drift apart. */}
+      {working && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
       {/* A timeline position: `permission_resolved` removes a card and shifts later indices.
           This label must not imply a durable item identity. */}
       <span className="position" data-testid="position">

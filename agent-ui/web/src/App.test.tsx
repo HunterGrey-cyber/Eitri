@@ -341,6 +341,113 @@ describe("App event folding", () => {
   });
 });
 
+/* `App.tsx` sees the raw envelope and can tell whether `turnClock` came from a real
+   `turn_started` event or a turn id first seen in a snapshot. Test the elapsed clock here,
+   where that distinction is available. */
+describe("the in-flight motion indicator's elapsed clock", () => {
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+  }
+
+  it("is exact when the turn id was learned from a real turn_started event", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    events({ type: "turn_started", turn_id: "t1" });
+    expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
+  });
+
+  it("is inexact when the turn id first arrives inside a snapshot -- a reload, or a resync mid-turn", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ activeTurnId: "t1" }) });
+    expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s+");
+  });
+
+  it("does not restart -- keyed on the turn id, so a resync that repeats it leaves `since` untouched", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ activeTurnId: "t1" }) });
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(container.querySelector(".turn-elapsed")?.textContent).toBe("5s+");
+      // The same turn id again, as a resync mid-turn resends it: the clock keeps counting from the
+      // original `since` rather than starting over from "now".
+      dispatch({ kind: "snapshot", throughRevision: 2, state: snapshotState({ activeTurnId: "t1" }) });
+      expect(container.querySelector(".turn-elapsed")?.textContent).toBe("5s+");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("is cleared by a terminal event, and a later turn starts its own clock from zero", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    events({ type: "turn_started", turn_id: "t1" });
+    events({
+      type: "turn_completed", turn_id: "t1", outcome: "completed",
+      result_text: "", stop_reason: null, usage: null,
+    });
+    expect(container.querySelector(".turn-activity")).toBeNull();
+    events({ type: "turn_started", turn_id: "t2" });
+    expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
+  });
+
+  /* A terminal handoff and a fatal error must clear `TurnClock`, just as `returnToStartScreen` does.
+     A later snapshot with the same `activeTurnId` would otherwise retain the old `since` and
+     `exact: true`, inflating elapsed time without a `+`. Both reset paths are tested with a repeated id. */
+  for (const reset of ["a fatal error", "a terminal handoff"] as const) {
+    it(`${reset} leaves no stale clock behind, even for a turn id that comes back`, () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = render(<App />);
+        dispatch({ kind: "hello", ...HELLO });
+        dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+        events({ type: "turn_started", turn_id: "t1" });
+        act(() => {
+          vi.advanceTimersByTime(60_000);
+        });
+        expect(container.querySelector(".turn-elapsed")?.textContent).toBe("60s");
+
+        if (reset === "a fatal error") {
+          dispatch({ kind: "error", message: "the session died" });
+        } else {
+          dispatch({
+            kind: "handoff",
+            command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+            cwd: "/home/user/project",
+            providerSessionId: "1857dcd5-973b-46a2",
+          });
+        }
+        expect(container.querySelector(".turn-activity")).toBeNull();
+
+        // A new session whose first snapshot happens to carry the SAME turn id. Nothing was
+        // observed starting it here, so the only honest reading is "at least 0 seconds" -- the
+        // stale record would have said 60s, exactly, with no `+`.
+        dispatch({ kind: "hello", ...HELLO });
+        dispatch({ kind: "snapshot", throughRevision: 9, state: snapshotState({ activeTurnId: "t1" }) });
+        expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s+");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it("a panel reload loses the clock, so it re-reads 0s+ and counts up from there -- less information, never a false statement", () => {
+    // A "reload" here is simply a fresh App mount receiving its first snapshot with a turn already
+    // active -- `turnClock` starts at `null` on every mount, same as `state` starts at
+    // `initialState()`, and there is no persisted copy of it to restore.
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 5, state: snapshotState({ activeTurnId: "already-running" }) });
+    expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s+");
+  });
+});
+
 /* The keyboard skeleton: BROWSE/INPUT and the seven keys, wired end to end through `App.tsx`'s
    `onKeyDown` rather than exercised in isolation the way `keymap.test.ts` exercises `resolveKey`
    itself. This is the layer that proves the wiring, not just the table. */
