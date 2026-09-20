@@ -19,6 +19,9 @@ import { StatusLine } from "./components/StatusLine";
 import { ContinueInTerminal, HandoffCommandCard } from "./components/TerminalHandoff";
 import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
+import { WhichKey } from "./components/WhichKey";
+import { KeymapOverlay } from "./components/KeymapOverlay";
+import { stripEntries } from "./whichKey";
 import type { HandoffCommand, Hello, PermissionModeChoice } from "./types";
 import { applyTheme } from "./theme";
 
@@ -71,6 +74,11 @@ const TOOL_RESULT_SCROLL_STEP_PX = 40;
  *  `shell` at all) costs a second of dead keys, not a stuck panel -- the same stance as `shell`'s own
  *  300ms wait for this panel's answer (spec §3.3). */
 export const HINT_PENDING_TIMEOUT_MS = 1000;
+
+/** How long a lone `g` in BROWSE has to wait before the which-key strip shows what it can start
+ *  (spec 2026-09-19-which-key-design.md §2.3: "按下前缀键之后 400ms 内没有下一个键"). Not a UI
+ *  guess -- the spec names this exact number, unlike `HINT_PENDING_TIMEOUT_MS` above. */
+export const WHICH_KEY_G_PREFIX_DELAY_MS = 400;
 
 /** Whether a pending `j`/`k` cursor move should instead scroll the CURSOR ROW's own overflow box
  *  -- today, only a tool result opened past its 260px fold (`.tool-result-body` in index.css; see
@@ -141,6 +149,15 @@ function rowScrollStep(row: HTMLElement): number {
     line = (Number.isFinite(font) && font > 0 ? font : 16) * 1.2;
   }
   return ROW_SCROLL_LINES * line;
+}
+
+/** `j`/`k` while the `?` keymap overlay is open (spec §3.1): scrolls the overlay itself, by the
+ *  same three-line step a tall row uses (`rowScrollStep`) rather than a fresh pixel constant --
+ *  the plan asks for exactly this reuse. `el.scrollTop` clamps itself at both ends, the same as
+ *  every other raw `scrollTop` write in this file, so there is nothing else here to bound. */
+function scrollKeymapOverlay(el: HTMLDivElement | null, direction: 1 | -1) {
+  if (el === null) return;
+  el.scrollTop += direction * rowScrollStep(el);
 }
 
 /** Brings `row` on screen in `list` after the cursor has landed on it. A row that fits is revealed
@@ -330,6 +347,32 @@ export default function App() {
    *  so a pane switch the WebView never saw as a key cancels it too; handed to `resolveKey` in its
    *  context so the key table itself keeps no memory. */
   const pendingGRef = useRef(false);
+  /** Whether the which-key strip is currently showing the `g` prefix's continuation (spec §2.3),
+   *  i.e. whether `WHICH_KEY_G_PREFIX_DELAY_MS` has elapsed since the last lone `g` with nothing
+   *  cancelling it since. A real state, not a ref like `pendingGRef`: this one drives what the
+   *  strip renders, so it must cause a re-render when it flips. */
+  const [gShown, setGShown] = useState(false);
+  /** The pending 400ms timer that would set `gShown` true, or `null` when none is running. Cleared
+   *  in every place `pendingGRef` itself is cleared (see that ref's own doc comment) -- a `g` that
+   *  gets cancelled before the delay elapses must never let a stale timer flip the strip on late. */
+  const gShownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function cancelGPrefixTimer() {
+    if (gShownTimerRef.current !== null) clearTimeout(gShownTimerRef.current);
+    gShownTimerRef.current = null;
+  }
+  function hideGPrefix() {
+    cancelGPrefixTimer();
+    setGShown(false);
+  }
+  useEffect(() => cancelGPrefixTimer, []);
+  /** Whether the `?` keymap overlay is open (spec §3). Toggled by `resolveKey`'s `{kind:"keymap"}`
+   *  (opening only -- see `onKeyDown`'s dedicated branch below for why closing never goes through
+   *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
+   *  the start screen coming back, and a HINT starting elsewhere in the window. */
+  const [keymapOpen, setKeymapOpen] = useState(false);
+  /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
+   *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
+  const keymapOverlayRef = useRef<HTMLDivElement>(null);
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
    *  `MessageList`'s own copy of this memo for why it is keyed on `state` as a whole. */
   const timeline = useMemo(() => buildTimeline(state), [state]);
@@ -457,6 +500,12 @@ export default function App() {
   useEffect(() => {
     if (sessionEnded) setMode("browse");
   }, [sessionEnded]);
+  // The `?` keymap belongs to a live conversation (spec §3, Task 4's docs); a session that just
+  // ended is not a reason to keep it up, and the ended/lost banners' own `r` must be reachable
+  // without an extra `?`/`Escape`/`q` first.
+  useEffect(() => {
+    if (sessionEnded) setKeymapOpen(false);
+  }, [sessionEnded]);
   /* `Ctrl+l` lands in INPUT with a blinking caret (owner, 2026-09-19: "control l 直接闪cursor"),
      as it did before BROWSE became the landing mode. Refused under the same condition `i` is
      (`resolveKey`): a dead session has no box to type into, and no session at all has no
@@ -548,8 +597,19 @@ export default function App() {
         // `Ctrl+k` before the WebView sees a keydown) must not leave it armed for a `g` pressed
         // much later, when it would jump to the top -- review.
         pendingGRef.current = false;
+        // The which-key strip's own memory of that `g` (spec §2.3) is cancelled the same way and
+        // for the same reason: a switch away and back must not leave its 400ms timer running for a
+        // press that has nothing to do with the `g` that started it.
+        hideGPrefix();
+        // A keymap for THIS panel has no reason to stay drawn while another pane has the keys, and
+        // leaving it up is how the review reproduced a dead keyboard: come back with `Ctrl+l`,
+        // land in INPUT, and every keystroke is swallowed by the overlay's own branch (review).
+        setKeymapOpen(false);
         setPaneFocused(payload.focused);
       } else if (payload.kind === "enter_input") {
+        // Same reason, the other half of that reproduction: this puts the caret in the composer, so
+        // the overlay must not be left covering it and eating what gets typed.
+        setKeymapOpen(false);
         setInputRequest((n) => n + 1);
       } else if (payload.kind === "select_all") {
         // `Ctrl+a Ctrl+a` (shell's prefix): what `Ctrl+a` does in a text field, since WebKitGTK
@@ -562,6 +622,14 @@ export default function App() {
           el.select();
         }
       } else if (payload.kind === "hint_collect") {
+        // A HINT started elsewhere in the window must not label rows hidden under this overlay
+        // (spec §3.1). It also frees the keys `hint_collect`'s own reply is about to swallow --
+        // this and HINT never actually contend for them, but closing here keeps that true by
+        // construction rather than by the two features happening not to overlap in practice.
+        setKeymapOpen(false);
+        // ...and the `g` the strip may still be waiting on, for the reason `pane_focus` does it.
+        pendingGRef.current = false;
+        hideGPrefix();
         const root = containerRef.current ?? startScreenRef.current;
         frozenRef.current = root === null ? [] : hintTargets(root);
         hintSessionRef.current = payload.sessionId;
@@ -665,6 +733,7 @@ export default function App() {
         setCommandNotice(null);
         setState(initialState());
         setStartedPermissionMode(null);
+        setKeymapOpen(false);
         setHandoff(payload);
         // Suppresses the resume offer for THIS client's already-delivered `hello`, which was
         // computed once at mount. That only ever matches when this session was itself resume-started
@@ -690,6 +759,7 @@ export default function App() {
         setHandoffRequestId(null);
         setState(initialState());
         setStartedPermissionMode(null);
+        setKeymapOpen(false);
         setFatalError(payload.message);
         /* Re-ask for `hello`, because we are about to show the start screen again and the copy we
            captured at mount is a snapshot of the conversation records as they were then.
@@ -874,6 +944,7 @@ export default function App() {
     setCommandNotice(null);
     setState(resetToStartScreen);
     setStartedPermissionMode(null);
+    setKeymapOpen(false);
     requestHello();
   }
 
@@ -980,6 +1051,27 @@ export default function App() {
     const root = containerRef.current;
     const pendingG = pendingGRef.current;
     pendingGRef.current = false;
+    // Every key seen here cancels whatever the PREVIOUS key armed, the which-key strip's `g`
+    // continuation included -- `pendingG` above already captured whether THIS key still gets to
+    // read it. Unconditional, ahead of every early return below, so a key that turns out to be
+    // claimed by a text box or a focused button still cancels a stale prefix line.
+    hideGPrefix();
+    // The `?` keymap overlay owns every key while it is open (spec §3.1), ahead of the editable-
+    // element and activatable-control checks below and ahead of `resolveKey` entirely -- not
+    // routed through the key table at all, because closing is not one of `resolveKey`'s actions
+    // (only OPENING is: its `{kind:"keymap"}` is reached below, and only ever with the overlay
+    // already closed, since this branch returns first whenever it is open). `preventDefault`
+    // unconditionally: `a`/`d` must not reach a permission card hidden underneath, and neither
+    // must anything else this table would otherwise claim.
+    if (keymapOpen) {
+      event.preventDefault();
+      if (event.key === "?" || event.key === "Escape" || event.key === "q") {
+        setKeymapOpen(false);
+      } else if (event.key === "j" || event.key === "k") {
+        scrollKeymapOverlay(keymapOverlayRef.current, event.key === "j" ? 1 : -1);
+      }
+      return;
+    }
     if (isEditableElement(event.target) && !(event.target as HTMLElement).closest(".composer")) {
       // A text box inside a row (a permission card's reason) takes every key as text, except Esc,
       // which hands the keys back to the row it sits in. Esc mid-composition still belongs to the
@@ -1079,6 +1171,12 @@ export default function App() {
       case "restart":
         returnToStartScreen();
         break;
+      case "keymap":
+        // Only ever reached with the overlay closed -- the `keymapOpen` branch above returns
+        // before `resolveKey` runs at all once it is open, `?`/`Escape`/`q` included, so this is
+        // opening only, never a toggle-closed here.
+        setKeymapOpen(true);
+        break;
       case "hint":
         // `shell` owns the HINT session: it collects targets across the whole window and asks this
         // panel for its own with `hint_collect`. Until the HINT ends, this panel's keys are swallowed
@@ -1088,6 +1186,14 @@ export default function App() {
       case "pending-g":
         // Claimed (so the `g` does nothing else) and remembered for exactly one key.
         pendingGRef.current = true;
+        // The strip shows what `g` can start once it has waited long enough that this is not just
+        // the first half of `gg` (spec §2.3): the timer this starts is the only thing that ever
+        // sets `gShown` true, and `hideGPrefix` at the top of this function on every later key --
+        // the second `g` of `gg` included -- is the only thing that cancels it before it fires.
+        gShownTimerRef.current = setTimeout(() => {
+          gShownTimerRef.current = null;
+          setGShown(true);
+        }, WHICH_KEY_G_PREFIX_DELAY_MS);
         break;
       case "half-page": {
         // Half the visible height, as in vim. Then, if the cursor's row is not on screen, the
@@ -1181,9 +1287,29 @@ export default function App() {
       {/* `sessionEnded` makes every pending card inert. The cards themselves are NOT removed: a
           permission that was still open when the session died is real history, and deleting it
           would read as a resolution nobody made. */}
-      <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused && !edgeFocused} onAnswerPermission={answerPermission} />
+      {/* The list and the `?` overlay share one positioned region, so the overlay covers the
+          conversation and nothing else -- the winbar and the status line are outside its box
+          rather than lifted back above it (review; see `.agent-ui-scroller` in index.css). */}
+      <div className="agent-ui-scroller">
+        <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused && !edgeFocused} onAnswerPermission={answerPermission} />
+        {keymapOpen && <KeymapOverlay ref={keymapOverlayRef} onClose={() => setKeymapOpen(false)} />}
+      </div>
       {sessionEndedBanner}
       {commandNoticeBanner}
+      {/* Only in BROWSE (spec §2.1: INPUT is typing, HINT's labels take over, the start screen has
+          its own text) and only once no HINT labels are on screen -- `hints.length === 0` is the
+          same predicate `HintLayer` itself uses to decide whether it is drawing anything at all, so
+          this and the labels can never both claim the same space. */}
+      {mode === "browse" && hints.length === 0 && (
+        <WhichKey
+          // `edgeFocused` too: `onKeyDown`'s answer arm is gated on it, so with the keys on a
+          // banner or the status line `a`/`d` resolve to nothing and the strip must not offer them
+          // (review). Same argument as the strip's own rule about a dead session.
+          entries={stripEntries(timeline, answerableItems, cursor, sessionEnded || edgeFocused)}
+          focused={paneFocused}
+          prefix={gShown ? "g" : null}
+        />
+      )}
       <StatusLine
         mode={mode}
         paneFocused={paneFocused}

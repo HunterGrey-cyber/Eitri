@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import App, { HINT_PENDING_TIMEOUT_MS } from "./App";
+import App, { HINT_PENDING_TIMEOUT_MS, WHICH_KEY_G_PREFIX_DELAY_MS } from "./App";
 import { initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
@@ -767,6 +767,97 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       // The key the banner promises actually resolves, from wherever focus ended up.
       fireEvent.keyDown(document.activeElement!, { key: "r" });
       expect(container.querySelector(".mode-selector")).not.toBeNull();
+    });
+  });
+});
+
+describe("App: the which-key strip (spec 2026-09-19-which-key-design.md)", () => {
+  function started(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const press = (key: string) => fireEvent.keyDown(document.activeElement ?? document.body, { key });
+  const strip = (c: HTMLElement) => c.querySelector<HTMLElement>(".which-key");
+  const keycaps = (el: HTMLElement) => Array.from(el.querySelectorAll(".keycap")).map((k) => k.textContent);
+
+  it("is present in BROWSE, and gone once i opens INPUT", () => {
+    const { container } = started();
+    act(() => root(container).focus());
+    expect(strip(container)).not.toBeNull();
+    press("i");
+    expect(strip(container)).toBeNull();
+  });
+
+  it("lists only ? keys for an ordinary row", () => {
+    const { container } = started();
+    events({ type: "user_prompt_submitted", text: "hi" });
+    act(() => root(container).focus());
+    expect(keycaps(strip(container)!)).toEqual(["?"]);
+  });
+
+  it("lists a allow / d deny / l buttons on the pending permission under the cursor", () => {
+    const { container } = started();
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: {} },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    act(() => root(container).focus());
+    // The cursor opens on the tool row (index 0), which the card right after it gates -- no `j`
+    // needed, and this is what proves it works from the GATING row, not only from the card itself.
+    const text = strip(container)!.textContent!;
+    expect(text).toContain("allow");
+    expect(text).toContain("deny");
+    expect(text).toContain("buttons");
+  });
+
+  it("lists r new session once the session has ended", () => {
+    const { container } = started();
+    events({ type: "session_closed", reason: "provider exited" });
+    act(() => root(container).focus());
+    const text = strip(container)!.textContent!;
+    expect(text).toContain("new session");
+  });
+
+  describe("the g prefix line (spec §2.3, 400ms)", () => {
+    it("shows nothing before the delay, `first row` once it elapses, and clears on the next key", () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = started();
+        events({ type: "user_prompt_submitted", text: "hi" });
+        act(() => root(container).focus());
+        press("g");
+        act(() => vi.advanceTimersByTime(WHICH_KEY_G_PREFIX_DELAY_MS - 1));
+        expect(strip(container)!.textContent).not.toContain("first row");
+        act(() => vi.advanceTimersByTime(1));
+        expect(strip(container)!.textContent).toContain("first row");
+        press("j");
+        expect(strip(container)!.textContent).not.toContain("first row");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("gg inside the delay never shows the prefix line", () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = started();
+        events({ type: "user_prompt_submitted", text: "hi" });
+        act(() => root(container).focus());
+        press("g");
+        act(() => vi.advanceTimersByTime(WHICH_KEY_G_PREFIX_DELAY_MS - 1));
+        press("g");
+        act(() => vi.advanceTimersByTime(WHICH_KEY_G_PREFIX_DELAY_MS));
+        expect(strip(container)!.textContent).not.toContain("first row");
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });
@@ -1888,5 +1979,81 @@ describe("App fatal errors", () => {
     fireEvent.click(buttonLabelled(container, "Dismiss")!);
     expect(container.querySelector(".fatal-error")).toBeNull();
     expect(container.querySelector(".mode-selector")).not.toBeNull();
+  });
+});
+
+/* The `?` keymap overlay (Task 3, spec 2026-09-19-which-key-design.md §3), wired end to end through
+   `App.tsx`'s `onKeyDown` rather than `KeymapOverlay` in isolation -- `KeymapOverlay.test.tsx`
+   already covers the tables/titles/backdrop-click, so what belongs here is the part only the wiring
+   can prove: that opening it comes from the real key table, and that once it is open it truly owns
+   every key ahead of `resolveKey` -- a pending permission and the row cursor included. */
+describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", () => {
+  function started(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    return rendered;
+  }
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const press = (key: string, over: Partial<{ shiftKey: boolean }> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
+  const overlay = (c: HTMLElement) => c.querySelector<HTMLElement>(".keymap-overlay");
+
+  it("opens on ? and shows all four groups, in the spec's order", () => {
+    const { container } = started();
+    act(() => root(container).focus());
+    expect(overlay(container)).toBeNull();
+    // `?` almost always arrives as Shift+/ -- the same reason `resolveKey`'s own test checks it
+    // both ways (`keymap.test.ts`).
+    press("?", { shiftKey: true });
+    const el = overlay(container);
+    expect(el).not.toBeNull();
+    const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles).toEqual(["This panel", "Typing", "Anywhere in the window", "After Ctrl+a"]);
+  });
+
+  it.each(["?", "Escape", "q"])("closes on %s", (key) => {
+    const { container } = started();
+    act(() => root(container).focus());
+    press("?", { shiftKey: true });
+    expect(overlay(container)).not.toBeNull();
+    press(key);
+    expect(overlay(container)).toBeNull();
+  });
+
+  it("swallows a and d while open -- a pending card underneath is not answered", () => {
+    const { container } = started();
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: {} },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+    );
+    act(() => root(container).focus());
+    press("?", { shiftKey: true });
+    press("a");
+    press("d");
+    expect(lastOfType("permission_response")).toBeUndefined();
+  });
+
+  it("swallows j -- the row cursor underneath does not move", () => {
+    const { container } = started();
+    events({ type: "user_prompt_submitted", text: "one" }, { type: "user_prompt_submitted", text: "two" });
+    act(() => root(container).focus());
+    const before = container.querySelector(".row-current")?.textContent;
+    press("?", { shiftKey: true });
+    press("j");
+    expect(container.querySelector(".row-current")?.textContent).toBe(before);
+  });
+
+  it("closes when a global HINT starts elsewhere in the window (hint_collect)", () => {
+    const { container } = started();
+    act(() => root(container).focus());
+    press("?", { shiftKey: true });
+    expect(overlay(container)).not.toBeNull();
+    dispatch({ kind: "hint_collect", sessionId: 1 });
+    expect(overlay(container)).toBeNull();
   });
 });

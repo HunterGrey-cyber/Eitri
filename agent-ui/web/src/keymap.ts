@@ -28,6 +28,8 @@ export type PanelAction =
   | { kind: "pending-g" }
   /** `f` in BROWSE: start a global HINT. */
   | { kind: "hint" }
+  /** `?` in BROWSE: open or close the full keymap (spec §3). */
+  | { kind: "keymap" }
   | null;
 
 /** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
@@ -64,6 +66,9 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
     }
     if (event.shiftKey && !event.ctrlKey && event.key === "G") return { kind: "jump", to: "last" };
+    // `?` arrives with Shift held on most layouts (Shift+/), so it must be named before the blanket
+    // modifier refusal below, the same reason `G` is; matched on `key`, never on the physical key.
+    if (event.key === "?" && !event.ctrlKey) return { kind: "keymap" };
   }
   // A key carrying a modifier this table does not name is not claimed. Apart from the three chords
   // just above, no row needs Ctrl or Shift, so any other chord holding either falls through
@@ -117,3 +122,51 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return null;
   }
 }
+
+/** One line of the `?` keymap: the key as a person types it, and what it does. */
+export type KeyHelp = { keys: string; what: string };
+
+/** BROWSE, i.e. everything `resolveKey` claims outside INPUT. Kept beside `resolveKey` and tied to
+ *  it both ways by `keymap.test.ts`, so this list can neither promise a key that does nothing nor
+ *  leave out one that does (spec §3.3). */
+export const BROWSE_KEYS: KeyHelp[] = [
+  { keys: "j / k", what: "Next / previous row; a long row scrolls first" },
+  { keys: "h / l", what: "Previous / next button in the row" },
+  { keys: "gg / G", what: "First / last row" },
+  { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
+  { keys: "a / d", what: "Allow / deny the permission under the cursor" },
+  { keys: "Enter", what: "Show or hide a tool's result" },
+  { keys: "y", what: "Copy the row (or the code block HINT landed on)" },
+  { keys: "i", what: "Start typing a message" },
+  { keys: "f", what: "HINT: jump anywhere in the window" },
+  { keys: "r", what: "New session, once this one has ended" },
+  { keys: "?", what: "This list (?, Esc or q closes it)" },
+];
+
+export const INPUT_KEYS: KeyHelp[] = [
+  { keys: "Enter", what: "Send" },
+  { keys: "Shift+Enter", what: "New line" },
+  { keys: "Esc", what: "Stop typing (back to browsing)" },
+];
+
+/** `shell`'s keys, not this page's: GTK takes them before the WebView sees them. Nothing here can
+ *  check them against the code that binds them; `shell/src/main.rs`'s test
+ *  `every_app_accelerator_is_in_the_panel_keymap` checks that each accelerator it registers is
+ *  spelled here, which catches a key removed without this list changing, not one added. Bound in
+ *  `shell/src/main.rs` (pane switch, top bar, HINT), `shell/src/window_mode.rs` (F11,
+ *  Ctrl+Shift+F11) and `shell/src/agent_panel.rs` (Ctrl+Shift+R). */
+export const WINDOW_KEYS: KeyHelp[] = [
+  { keys: "Ctrl+h / Ctrl+l", what: "Editor / this panel" },
+  { keys: "Ctrl+k", what: "Top bar (h / l move, Ctrl+j or Esc go back)" },
+  { keys: "Ctrl+Shift+F", what: "HINT from anywhere (f in this panel or the top bar)" },
+  { keys: "F11", what: "Fullscreen" },
+  { keys: "Ctrl+Shift+F11", what: "Immersive: fullscreen without the top bar" },
+  { keys: "Ctrl+Shift+R", what: "Reload this panel (the session keeps running)" },
+];
+
+/** `shell/src/prefix.rs`: tmux's own prefix, as the owner's tmux has it. */
+export const PREFIX_KEYS: KeyHelp[] = [
+  { keys: "Ctrl+a m / z", what: "Zoom this pane, or restore" },
+  { keys: "Ctrl+a h / j / k / l", what: "Move a divider 5 cells (repeat within 500 ms)" },
+  { keys: "Ctrl+a Ctrl+a", what: "Send Ctrl+a itself" },
+];

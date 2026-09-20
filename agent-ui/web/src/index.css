@@ -42,7 +42,18 @@ body,
   flex: 0 0 auto;
 }
 
-.agent-ui-conversation > .message-list {
+/* The list's own region, and the `?` overlay's containing block. A wrapper rather than the whole
+   conversation, so the overlay covers exactly what spec §3.1 says it covers ("盖住 ... 会话列表那块
+   区域，winbar 和状态行仍然看得见") with no JS measurement of the winbar's wrapping height. */
+.agent-ui-scroller {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-height: 0;
+  position: relative;
+}
+
+.agent-ui-scroller > .message-list {
   flex: 1 1 0%;
   min-height: 0;
 }
@@ -74,6 +85,11 @@ body,
    of the editor window rather than of the WebView document sitting inside it. `chrome-fg` is
    guarded to `TEXT_CONTRAST` (4.5:1) against `chrome`, not against `bg` -- a reversed StatusLine
    makes `chrome` Normal's `fg`, so guarding against `bg` would measure the wrong pair. */
+/* No `z-index` here any more (review of the which-key branch): the `?` overlay used to cover this
+   whole container and these two bars had to be lifted back above it, which put the overlay's scroll
+   box under the winbar -- its first heading was unreadable AND unreachable, since `scrollTop` is
+   already 0 there. The overlay is now positioned against `.agent-ui-scroller`, the list's own
+   region, so it cannot reach these bars and nothing has to out-paint it. */
 .winbar,
 .status-line {
   display: flex;
@@ -477,6 +493,104 @@ body,
   border-radius: 50%;
   background: var(--nv-error);
   vertical-align: middle;
+}
+
+/* The which-key strip (2026-09-19, spec 2026-09-19-which-key-design.md §2): the row directly above
+   the status line, same font and one-line layout, listing the keys the row under the cursor answers
+   to. Only ever in BROWSE (`App.tsx` gates the whole component on that), so it carries the body's
+   `--nv-fg`/`--nv-muted` pair rather than the winbar/status-line's `--nv-chrome-*` one -- it sits on
+   the plain body surface, not on chrome, whatever it visually neighbours. Text is `--nv-muted`
+   throughout: the keys change with the cursor, but they are still a secondary hint, never the main
+   thing on screen. */
+.which-key {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 12px;
+  min-height: 22px;
+  font-family: var(--nv-font-mono);
+  font-size: 12px;
+  color: var(--nv-muted);
+}
+.which-key-help {
+  margin-left: auto;
+  /* Recedes by TOKEN, never by `opacity` (review): this file has already recorded that defect once
+     ("fg at 0.7 is 3.34:1 on rose-pine dawn", the picker rows) and `indexCss.test.ts` now bans
+     opacity here too. `? keys` is the one entry that never changes, so it keeps the body's dimmer
+     guarded token while the row's own keycaps carry the brighter `--nv-fg`. */
+}
+/* The pane does not have the keys, so the strip dims -- the same claim `.mode-block` makes about
+   `paneFocused`, and the same reason (spec §2.1: it says what these keys will do when focus comes
+   back, so it must stay legible rather than vanish).
+   Adapted, not copied, from `.status-line .mode-block[data-focused="false"]`: that rule steps its
+   text from the brighter `--nv-chrome-fg` down to `--nv-chrome-muted`, deliberately never
+   `opacity` (see its own comment -- opacity multiplies a guarded pair's contrast down with it). This
+   strip's body text is `--nv-muted` already, the dimmer of the body's own two guarded tokens, so
+   there is no third rung to step down to for the label text; what CAN still step down is each
+   keycap's glyph, which is the brighter `--nv-fg` while focused. */
+.which-key[data-focused="false"] .keycap {
+  /* The fill goes with the brightness: `--nv-muted` is guarded to 4.5:1 against `bg`, NOT against
+     `cursorline`, so dimming the glyph while keeping the fill would measure a pair nothing checks
+     (review). Unfocused, the keycap is plain dim text on the panel's own background. */
+  background: transparent;
+  color: var(--nv-muted);
+}
+/* No `font-family` of its own: `font-family` inherits by default, and every place a `.keycap` sits
+   (`.which-key`, and the keymap overlay's tables, Task 3) already names `--nv-font-mono` on itself
+   -- `font-family: inherit;` here was tried and is redundant with that, and `indexCss.test.ts`'s
+   font guard reads it as a THIRD, unaccounted-for font declaration and refuses it (Task 2 finding:
+   the plan's own snippet named this line, written from a reading rather than a run). */
+.keycap {
+  background: var(--nv-cursorline);
+  color: var(--nv-fg);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+/* The `?` keymap overlay (Task 3, spec 2026-09-19-which-key-design.md §3): opened by `?` in
+   BROWSE, closed by `?`/Escape/q or a click on its own backdrop (`App.tsx`, `KeymapOverlay.tsx`).
+   `position: absolute; inset: 0;` against `.agent-ui-scroller`, the message list's own region --
+   which IS spec §3.1's "会话列表那块区域", and leaves the winbar and the status line outside the
+   overlay's box entirely rather than under it. The first version covered the whole conversation and
+   lifted those two bars back by z-index; that put this scroll box's top under the winbar, where its
+   first heading was both unreadable and unreachable (`scrollTop` is already 0 there) -- found in
+   the whole-branch review. No JS measurement of the winbar's wrapping height is needed either way.
+   A HINT starting while this is open closes it first (`App.tsx`'s `hint_collect` handler), so the
+   two are never both on screen. Body text is the plain surface's own `--nv-fg`/`--nv-muted` pair (this is
+   not chrome), same as `.which-key` above -- `indexCss.test.ts`'s guard admits both with no
+   exemption, per the plan's own note that the spec's colours need none. */
+.keymap-overlay {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: 12px;
+}
+.keymap-overlay h2 {
+  margin: 16px 0 6px;
+  font-size: 13px;
+}
+.keymap-overlay section:first-child h2 {
+  margin-top: 0;
+}
+.keymap-overlay table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.keymap-overlay td {
+  padding: 2px 8px 2px 0;
+  vertical-align: top;
+}
+.keymap-overlay td:first-child {
+  white-space: nowrap;
+}
+/* The description column only -- the keys column keeps the inherited `--nv-fg`, same as the
+   keycap's own label text everywhere else on this page. */
+.keymap-overlay td:last-child {
+  color: var(--nv-muted);
 }
 
 /* Replaces window.alert: copyable, non-blocking, and able to show the sidecar's own multi-line

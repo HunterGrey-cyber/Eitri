@@ -637,4 +637,113 @@ mod tests {
         let app = build_application();
         assert!(app.flags().contains(gtk4::gio::ApplicationFlags::NON_UNIQUE));
     }
+
+    /// The panel's `?` keymap lists the window's keys by hand (`agent-ui/web/src/keymap.ts`,
+    /// `WINDOW_KEYS`), since nothing on the web side can read what GTK binds. This test reads the
+    /// registrations rather than restating them: it walks this crate's own sources for
+    /// accelerator-shaped string literals and asserts each one has a row in that list.
+    ///
+    /// It looks for the literals rather than for `set_accels_for_action` calls because
+    /// `window_mode.rs` passes its two through a `format!` over a table, so a scan of the call
+    /// sites alone would miss `F11` and `<Control><Shift>F11` entirely. In `shell/src` an
+    /// accelerator-shaped literal is always an accelerator; a new one that is something else fails
+    /// loudly here, which is the safe direction.
+    ///
+    /// Reading the sources is also what gives this **both** directions. The hand-written list this
+    /// replaced could only catch a registration whose row was deleted; a key added in a new file
+    /// and never documented now fails too.
+    ///
+    /// The containment check is row-shaped, not substring-shaped: an accelerator must equal a whole
+    /// `keys:` value, or one `/`-separated alternative inside one. `keymap.ts.contains("Ctrl+Shift+F")`
+    /// was satisfied by the `Ctrl+Shift+F11` row, so deleting HINT's own row left the old test green.
+    #[test]
+    fn every_app_accelerator_is_in_the_panel_keymap() {
+        /// Every spelling a `keys:` row offers, each `/`-separated alternative on its own.
+        fn documented_keys(keymap: &str) -> std::collections::HashSet<String> {
+            let mut rows = std::collections::HashSet::new();
+            for after in keymap.split("keys: \"").skip(1) {
+                let Some(value) = after.split('"').next() else { continue };
+                rows.insert(value.to_string());
+                for alternative in value.split(" / ") {
+                    rows.insert(alternative.to_string());
+                }
+            }
+            rows
+        }
+
+        /// A GTK accelerator (`<Control><Shift>f`) as `keymap.ts` spells it (`Ctrl+Shift+F`).
+        fn spell(accel: &str) -> String {
+            let mut parts: Vec<String> = Vec::new();
+            let mut rest = accel;
+            while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
+                parts.push(match &rest[1..end + 1] {
+                    "Control" | "Primary" => "Ctrl".to_string(),
+                    other => other.to_string(),
+                });
+                rest = &rest[end + 2..];
+            }
+            parts.push(if rest.chars().count() == 1 { rest.to_uppercase() } else { rest.to_string() });
+            parts.join("+")
+        }
+
+        /// `<Mod>…Key`, with at least one modifier or a function key. The shape the sources are
+        /// scanned for; anything else in a string literal is not an accelerator.
+        fn is_accel(literal: &str) -> bool {
+            let mut rest = literal;
+            let mut modifiers = 0;
+            while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
+                if !rest[1..end + 1].chars().all(|c| c.is_ascii_alphabetic()) {
+                    return false;
+                }
+                modifiers += 1;
+                rest = &rest[end + 2..];
+            }
+            let function_key =
+                rest.starts_with('F') && rest.len() > 1 && rest[1..].chars().all(|c| c.is_ascii_digit());
+            !rest.is_empty()
+                && rest.chars().all(|c| c.is_ascii_alphanumeric())
+                && (modifiers > 0 || function_key)
+        }
+
+        /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module and its line comments cut
+        /// off -- so this test's own copies of the accelerators cannot satisfy it.
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("shell/src is readable") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("a readable source file");
+                    let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    let code: String =
+                        code.lines().map(|line| line.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+                    out.push((path.display().to_string(), code));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (name, code) in &files {
+            for (index, chunk) in code.split('"').enumerate() {
+                if index % 2 == 1 && is_accel(chunk) {
+                    found.push((name.clone(), chunk.to_string()));
+                }
+            }
+        }
+
+        // A floor, not a list: it catches a walk that silently stopped finding anything, without
+        // restating what the sources say.
+        assert!(found.len() >= 4, "only {} accelerators found -- the source walk is broken", found.len());
+
+        let documented = documented_keys(include_str!("../../agent-ui/web/src/keymap.ts"));
+        for (file, accel) in found {
+            let spelled = spell(&accel);
+            assert!(
+                documented.contains(&spelled),
+                "{file} binds {accel}, but no keymap.ts row says `keys: \"{spelled}\"`"
+            );
+        }
+    }
 }

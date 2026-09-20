@@ -1,9 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { resolveKey } from "./keymap";
+import { BROWSE_KEYS, INPUT_KEYS, PREFIX_KEYS, WINDOW_KEYS, resolveKey } from "./keymap";
+import type { KeyContext, KeyLike } from "./keymap";
 
 const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; isComposing: boolean }> = {}) =>
   ({ key: k, ctrlKey: false, shiftKey: false, isComposing: false, ...over });
 const ctx = { sessionEnded: false };
+
+/** Turns one `BROWSE_KEYS[i].keys` TOKEN (after splitting on " / ") into what a person actually
+ *  pressed, per spec §3.3: `Ctrl+x` -> Ctrl held with `x`; `G`/`?` -> Shift held (that is how both
+ *  arrive on a real keyboard); `gg` -> a lone `g` with the caller's `pendingG` already true (the
+ *  second half of the chord); anything else is the key on its own. Shared by both directions of the
+ *  table <-> `resolveKey` correspondence below, so the two can never silently parse a token two
+ *  different ways. */
+function parseKeyToken(token: string): { ev: KeyLike; pendingG?: boolean } {
+  if (token === "gg") return { ev: key("g"), pendingG: true };
+  if (token.startsWith("Ctrl+")) return { ev: key(token.slice("Ctrl+".length), { ctrlKey: true }) };
+  if (token === "G" || token === "?") return { ev: key(token, { shiftKey: true }) };
+  return { ev: key(token) };
+}
 
 describe("resolveKey", () => {
   it("enters INPUT on i and leaves it on Esc", () => {
@@ -111,5 +125,65 @@ describe("resolveKey", () => {
     // the page is not claimed here, and neither is a Shift+F.
     expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("F", { shiftKey: true }), ctx)).toBeNull();
+  });
+
+  /* `?` almost always arrives as Shift+/ (spec §3.1), so it has to be named ahead of the blanket
+     modifier refusal the same way `G` is -- checked with Shift both ways so a regression that moved
+     it below that refusal, or that started requiring Shift, is caught either direction. */
+  it("opens the ? keymap in BROWSE with or without Shift, and never in INPUT", () => {
+    expect(resolveKey("browse", key("?", { shiftKey: true }), ctx)).toEqual({ kind: "keymap" });
+    expect(resolveKey("browse", key("?", { shiftKey: false }), ctx)).toEqual({ kind: "keymap" });
+    expect(resolveKey("input", key("?", { shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("input", key("?", { shiftKey: false }), ctx)).toBeNull();
+  });
+});
+
+/* The two-way check spec §3.3 asks for: `BROWSE_KEYS` may neither promise a key `resolveKey` does
+   nothing with, nor leave out a key that does something. Each half is its own `it` so a failure
+   names which direction broke. */
+describe("BROWSE_KEYS <-> resolveKey", () => {
+  it("every key BROWSE_KEYS lists actually does something in resolveKey", () => {
+    for (const { keys } of BROWSE_KEYS) {
+      for (const token of keys.split(" / ")) {
+        const { ev, pendingG } = parseKeyToken(token);
+        const localCtx: KeyContext = { sessionEnded: token === "r", pendingG };
+        expect(resolveKey("browse", ev, localCtx), `"${token}" (from "${keys}")`).not.toBeNull();
+      }
+    }
+  });
+
+  /* Every candidate a person could plausibly press, checked under both endings of a session (some
+     rows, like `a`/`d`/`i`, only resolve on one side of that flag). `pending-g` is excluded on
+     purpose: it is the first half of `gg`, which the table already lists as `gg`, not as a bare `g`
+     -- see the comment on `PanelAction`'s `pending-g` case. Deleting the `y` row (spec's own red
+     check for this test) makes "y" resolve to `{kind:"copy"}` here with no row to match it against. */
+  it("every key that does something in resolveKey is listed somewhere in BROWSE_KEYS", () => {
+    const known = new Set(BROWSE_KEYS.flatMap((row) => row.keys.split(" / ")));
+    const candidates: { token: string; ev: KeyLike; pendingG?: boolean }[] = [
+      ...("abcdefghijklmnopqrstuvwxyz".split("").map((letter) => ({ token: letter, ev: key(letter) }))),
+      { token: "Enter", ev: key("Enter") },
+      { token: "Escape", ev: key("Escape") },
+      { token: "?", ev: key("?", { shiftKey: true }) },
+      { token: "G", ev: key("G", { shiftKey: true }) },
+      { token: "Ctrl+d", ev: key("d", { ctrlKey: true }) },
+      { token: "Ctrl+u", ev: key("u", { ctrlKey: true }) },
+      { token: "gg", ev: key("g"), pendingG: true },
+    ];
+    for (const sessionEnded of [false, true]) {
+      for (const { token, ev, pendingG } of candidates) {
+        const result = resolveKey("browse", ev, { sessionEnded, pendingG });
+        if (result === null || result.kind === "pending-g") continue;
+        expect(known.has(token), `"${token}" (sessionEnded=${sessionEnded}) resolves to ${JSON.stringify(result)} but no BROWSE_KEYS row spells it`).toBe(true);
+      }
+    }
+  });
+});
+
+describe("the ? keymap tables", () => {
+  it("are each non-empty and free of duplicate keys", () => {
+    for (const table of [BROWSE_KEYS, INPUT_KEYS, WINDOW_KEYS, PREFIX_KEYS]) {
+      expect(table.length).toBeGreaterThan(0);
+      expect(new Set(table.map((row) => row.keys)).size).toBe(table.length);
+    }
   });
 });

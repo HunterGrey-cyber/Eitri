@@ -356,7 +356,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   // through a long reply over a dead session. jsdom has no layout, so this pins the rule that
   // decides it: the list grows by its own class, whatever sits between it and the winbar.
   const CONVERSATION = (banner: string) =>
-    `<div class="agent-ui-root agent-ui-conversation"><div class="winbar">w</div>${banner}<div class="message-list">m</div><div class="status-line">s</div><div class="composer">c</div></div>`;
+    `<div class="agent-ui-root agent-ui-conversation"><div class="winbar">w</div>${banner}<div class="agent-ui-scroller"><div class="message-list">m</div></div><div class="status-line">s</div><div class="composer">c</div></div>`;
 
   it("gives the free height to the message list, fatal banner or not", () => {
     for (const banner of ["", `<div class="fatal-error">e</div>`]) {
@@ -365,6 +365,11 @@ describe("index.css cascade (which rule actually wins)", () => {
       expect(list.flexGrow).toBe("1");
       expect(list.minHeight).toBe("0px");
       expect(list.overflowY).toBe("auto");
+      // The chain, not just its last link: the free height reaches the list through the scroller
+      // the `?` overlay is positioned against, so both have to grow and neither may keep a floor.
+      const scroller = computed(CONVERSATION(banner), ".agent-ui-scroller");
+      expect(scroller.flexGrow).toBe("1");
+      expect(scroller.minHeight).toBe("0px");
       const root = computed(CONVERSATION(banner), ".agent-ui-conversation");
       expect(root.display).toBe("flex");
       expect(root.gridTemplateRows).toBe("none");
@@ -375,6 +380,34 @@ describe("index.css cascade (which rule actually wins)", () => {
     // Negative control: the old grid put back, which is what hands the space to the banner.
     const old = ".agent-ui-conversation { display: grid; grid-template-rows: auto 1fr auto auto; }";
     expect(computed(CONVERSATION(`<div class="fatal-error">e</div>`), ".agent-ui-conversation", old).display).toBe("grid");
+  });
+
+  /// The `?` overlay covers the conversation and nothing else. Its box comes from its containing
+  /// block, so the pair that decides it -- the scroller being positioned, the overlay being
+  /// absolute -- is the invariant, not the overlay's own rule alone. The first version covered the
+  /// whole panel and put its own first heading under the winbar, unreadable and unreachable.
+  it("keeps the ? overlay inside the list's own region, not over the two bars", () => {
+    const markup =
+      `<div class="agent-ui-root agent-ui-conversation"><div class="winbar">w</div>` +
+      `<div class="agent-ui-scroller"><div class="message-list">m</div>` +
+      `<div class="keymap-overlay"><section><h2>This panel</h2></section></div></div>` +
+      `<div class="status-line">s</div></div>`;
+    expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
+    expect(computed(markup, ".keymap-overlay").position).toBe("absolute");
+    // And the bars are back to taking part in normal painting: nothing has to out-stack the overlay.
+    for (const bar of [".winbar", ".status-line"]) {
+      expect(computed(markup, bar).zIndex).toBe("auto");
+    }
+  });
+
+  it("does not dim the which-key strip with opacity", () => {
+    // The third instance of the same defect this file has now recorded twice (picker rows, winbar):
+    // opacity multiplies a guarded pair's contrast down with it. `? keys` recedes by token instead.
+    const rules = withoutComments.match(/\.which-key[^{}]*\{[^}]*\}/g) ?? [];
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) {
+      expect(rule).not.toMatch(/opacity/);
+    }
   });
 
   it("paints a code block on --nv-surface even inside an assistant row", () => {
