@@ -7,7 +7,46 @@ import css from "./index.css?raw";
 // why the allowed names are derived from this source rather than written down here.
 import tokensRs from "../../../core/src/theme/tokens.rs?raw";
 
-const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+/** Strip CSS comments, but never a `/*` that is inside a string.
+ *
+ *  The eighth bypass, found by the round-2 re-review, and it sat UPSTREAM of every scan in this
+ *  file rather than inside any one guard: with a plain regex, a `content` string holding an
+ *  opening comment marker and a later one holding a closing marker delete everything between
+ *  them -- real rules included -- before a guard ever sees the text, and the braces stay balanced
+ *  so `splitRules`' own throw does not fire. `splitRules` was already rewritten to treat a brace
+ *  inside a string as literal text; this is that same awareness one step earlier, where the input
+ *  to all of it is produced. */
+function stripComments(sheet: string): string {
+  let out = "";
+  let quote: string | null = null;
+  for (let i = 0; i < sheet.length; i += 1) {
+    const c = sheet[i];
+    if (quote !== null) {
+      out += c;
+      if (c === "\\") {
+        i += 1;
+        if (i < sheet.length) out += sheet[i];
+      } else if (c === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      out += c;
+      continue;
+    }
+    if (c === "/" && sheet[i + 1] === "*") {
+      const end = sheet.indexOf("*/", i + 2);
+      i = end === -1 ? sheet.length : end + 1;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+const withoutComments = stripComments(css);
 
 /** Whether EVERY selector in a comma-separated list matches `branch` -- not just one of them. A
  *  grouped selector like `.session-lost, .hljs-keyword` must not smuggle a colour past a surface's
@@ -223,15 +262,17 @@ describe("index.css", () => {
   });
 
   it("paints the HINT label with the IncSearch pair, and gives its layer a containing block", () => {
-    const rules = withoutComments.match(/[^{}]*\{[^{}]*\}/g) ?? [];
-    const label = rules.find((r) => r.slice(0, r.indexOf("{")).trim() === ".hint-label");
+    // `splitRules` (defined with the motion guards below) rather than a regex splitter: it is the
+    // one in this file that cannot mistake a nested block's `{` for its parent's.
+    const rules = splitRules(withoutComments);
+    const label = rules.find((r) => r.selector === ".hint-label");
     expect(label).toBeDefined();
-    expect(label).toMatch(/background: var\(--nv-hint-bg\);/);
-    expect(label).toMatch(/(?<![a-z-])color: var\(--nv-hint-fg\);/);
+    expect(label?.declarations).toMatch(/background: var\(--nv-hint-bg\);/);
+    expect(label?.declarations).toMatch(/(?<![a-z-])color: var\(--nv-hint-fg\);/);
     // The layer is `position: absolute; inset: 0` over the panel root, and the labels are placed
     // from rects measured against that root, so the root must be their containing block.
-    const root = rules.find((r) => r.slice(0, r.indexOf("{")).trim() === ".agent-ui-root");
-    expect(root).toMatch(/position: relative;/);
+    const root = rules.find((r) => r.selector === ".agent-ui-root");
+    expect(root?.declarations).toMatch(/position: relative;/);
   });
 
   it("does not dim a conversation-picker row with opacity", () => {
@@ -257,6 +298,308 @@ describe("index.css", () => {
     for (const rule of rules) {
       expect(rule).not.toMatch(/opacity/);
     }
+  });
+
+  /* In-flight motion (2026-09-20-in-flight-motion-design.md) §5.3's two structural assertions: "the
+     element is absent" <=> "no animation is running" has to be a property of the FILE, not of this
+     document, so a second animated selector or a second @keyframes reusing the idea would be a
+     silent second motion nobody argued for (design §11: "no second animation for a second
+     purpose").
+
+     **Rewritten by the whole-branch review of 2026-09-20, which demonstrated three passing bypasses
+     against the real file, and again by its re-review the same day, which demonstrated three more
+     against the rewrite.** All six are kept below as negative controls, fed to the same splitter
+     the real assertions use -- as STRINGS rather than as real CSS, so a future author who reopens
+     one of them fails a test here instead of shipping an unargued motion:
+
+       (a) `animation-name` / `animation-duration` longhands on a second selector. The detector was
+           `/(?<![a-z-])animation:/`, the SHORTHAND only, so the longhand spelling of the same thing
+           was invisible.
+       (b) `transition: background-color 300ms` on any selector. The word `transition` appeared
+           nowhere in this file, and animating a COLOUR is exactly what §7.1 forbids -- and the
+           single most ordinary thing to reach for on a hover state.
+       (c) a keyframe's LAST declaration written with no trailing `;` (`to { transform: scaleX(1);
+           opacity: 1 }`). The declaration regex was `[a-z-]+:[^;]*;`, which needs a later `;` to
+           terminate the match, so the one declaration that most often lacks one was never checked.
+       (d) a NESTED block hiding its parent's motion: `.tool-card { transition: ...; &:hover { ... } }`.
+           The rule splitter was `/[^{}]*\{[^{}]*\}/g`, whose `[^{}]*` cannot span a nested block, so
+           the only match it produced began inside the parent -- and the old `declarationsOf` then
+           sliced after that match's first `{`, which is the CHILD's, classifying the parent's
+           `transition:` as selector text. Closing (b)'s false positive on a class NAMED `.transition`
+           is what opened this, and it was a REGRESSION: the guard before (b), which searched whole
+           rule text, did catch this one.
+       (e) the same nesting one level down, inside `@media`.
+       (f) `content: "}"` followed by `animation:` in one rule -- a brace inside a string, which
+           splits the rule in the wrong place for any scanner that does not know about quotes.
+
+     The repair is the splitter itself: `splitRules` walks the sheet tracking brace depth AND quote
+     state, so (d), (e) and (f) are all parsed the way a browser parses them. Its companion is the
+     "contains no nested blocks today" assertion below, which is what keeps the several NARROWER
+     regex scans elsewhere in this file (`.winbar[^{}]*\{[^}]*\}` and friends) sound too: they all
+     assume a rule body has no `{` in it, and that assumption now fails loudly rather than silently
+     the day someone nests something. */
+
+  /** One CSS block: its prelude, its OWN declarations (a nested block's text belongs to that block,
+   *  not to this one), and the selector of the block it sits inside (`null` at the top level). */
+  type CssRule = { selector: string; declarations: string; parent: string | null };
+
+  /** Split a stylesheet into blocks, brace-depth and quote aware.
+   *
+   *  Two things this does that a regex cannot. A nested block is emitted as its OWN rule and its
+   *  text is removed from its parent's declarations, so neither can hide the other -- the parent's
+   *  own declarations end at the last `;` before the child's prelude, which is where CSS itself
+   *  requires them to end. And a `{`, `}` or `;` inside a quoted string is literal text, not
+   *  structure. **Throws on unbalanced braces**, so a malformed file fails every test that reads it
+   *  rather than quietly yielding truncated blocks. */
+  function splitRules(sheet: string): CssRule[] {
+    const rules: CssRule[] = [];
+    const open: { selector: string; parent: string | null; own: string }[] = [];
+    let buffer = "";
+    let quote: string | null = null;
+    for (let i = 0; i < sheet.length; i++) {
+      const ch = sheet[i];
+      if (quote !== null) {
+        buffer += ch;
+        if (ch === "\\") buffer += sheet[++i] ?? "";
+        else if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        buffer += ch;
+        continue;
+      }
+      if (ch === "{") {
+        // A nested rule's prelude can only begin after its parent's previous declaration was
+        // terminated, so the last `;` is the boundary between the two.
+        const cut = buffer.lastIndexOf(";");
+        const parent = open[open.length - 1];
+        if (parent !== undefined && cut !== -1) parent.own += buffer.slice(0, cut + 1);
+        open.push({
+          selector: (cut === -1 ? buffer : buffer.slice(cut + 1)).trim(),
+          parent: parent === undefined ? null : parent.selector,
+          own: "",
+        });
+        buffer = "";
+        continue;
+      }
+      if (ch === "}") {
+        const block = open.pop();
+        if (block === undefined) throw new Error("unbalanced CSS: a `}` closed no block");
+        rules.push({ selector: block.selector, declarations: block.own + buffer, parent: block.parent });
+        buffer = "";
+        continue;
+      }
+      buffer += ch;
+    }
+    if (open.length > 0) throw new Error(`unbalanced CSS: ${open.length} block(s) never closed`);
+    return rules;
+  }
+
+  /** Anything that MOVES: the `animation` and `transition` shorthands, every longhand of either,
+   *  and a vendor-prefixed spelling of any of them. The leading lookbehind is what keeps
+   *  `foo-animation:` (not a property) out while letting `-webkit-animation:` in through the
+   *  prefix alternative. Matched against a rule's DECLARATIONS only: run over whole rule text it
+   *  could be satisfied by a selector (a class literally named `.transition`, or a pseudo-class on
+   *  one), which would make the guard pass for the wrong reason.
+   *
+   *  The `i` flag and the widened lookbehind close the seventh bypass, found by the round-2
+   *  re-review: CSS property names are ASCII case-insensitive (CSS Syntax L3), so `TRANSITION:`
+   *  is live CSS that a case-sensitive matcher reads as nothing at all. Nobody writes it by
+   *  hand -- it is closed because this guard's whole claim is a property of the FILE, and a
+   *  property with a spelling that escapes it is not established. An ESCAPED ident is still
+   *  NOT matched: decoding those needs a real tokenizer, and that limit is recorded in the
+   *  control below rather than left for a ninth review to rediscover. */
+  const MOTION_PROPERTY = /(?<![a-zA-Z-])(?:-webkit-|-moz-|-ms-|-o-)?(?:animation|transition)(?:-[a-z-]+)?\s*:/i;
+  function movesSomething(rule: CssRule): boolean {
+    return MOTION_PROPERTY.test(rule.declarations);
+  }
+
+  /** The selectors in a sheet that move something -- the whole guard in one call, so the negative
+   *  controls exercise the real splitter rather than a hand-sliced approximation of it. */
+  function movingSelectorsIn(sheet: string): string[] {
+    // Strips comments HERE rather than taking already-stripped text, so the controls below exercise
+    // the whole path a real scan takes -- including the stripper. The eighth bypass lived in that
+    // step, and a control that called the stripper itself would have passed with the broken one.
+    return splitRules(stripComments(sheet))
+      .filter(movesSomething)
+      .map((rule) => rule.selector);
+  }
+
+  /** Every declaration inside a `@keyframes` body, INCLUDING one written last with no trailing
+   *  `;`. Split rather than matched, so a declaration is terminated by `;` or by the end of its
+   *  own block -- which is what closes bypass (c). */
+  function keyframeDeclarations(body: string): string[] {
+    const out: string[] = [];
+    for (const block of body.match(/\{[^{}]*\}/g) ?? []) {
+      for (const declaration of block.slice(1, -1).split(";")) {
+        const trimmed = declaration.trim();
+        if (trimmed !== "") out.push(trimmed);
+      }
+    }
+    return out;
+  }
+
+  it("contains no nested blocks today, which is what keeps every rule scan in this file sound", () => {
+    // Every guard here -- this splitter's callers and the narrower `X[^{}]*\{[^}]*\}` scans alike --
+    // assumes a rule body contains no `{`. CSS nesting is supported by the WebKitGTK this ships on
+    // and is the ordinary way to write a hover state, so the day someone nests something that
+    // assumption has to fail here rather than silently somewhere else. An at-rule (`@media`,
+    // `@keyframes`) is a container, not a nested rule, so its children are the allowed case.
+    const nested = splitRules(withoutComments).filter((r) => r.parent !== null && !r.parent.startsWith("@"));
+    expect(nested.map((r) => `${r.parent} > ${r.selector}`)).toEqual([]);
+
+    // ...and the splitter really can see one, so the assertion above is not vacuous.
+    const probe = splitRules(".tool-card { color: red; &:hover { color: blue; } }");
+    expect(probe.filter((r) => r.parent !== null && !r.parent.startsWith("@")).map((r) => r.selector)).toEqual([
+      "&:hover",
+    ]);
+    // A block inside `@media` is NOT reported, or the assertion above could never hold.
+    const inMedia = splitRules("@media (min-width: 1px) { .a { color: red; } }");
+    expect(inMedia.filter((r) => r.parent !== null && !r.parent.startsWith("@"))).toEqual([]);
+
+    // Unbalanced braces throw rather than yielding truncated blocks -- the failure the depth-aware
+    // walk would otherwise hide, since a regex splitter simply matches less.
+    expect(() => splitRules(".a { color: red; ")).toThrow(/never closed/);
+    expect(() => splitRules(".a { color: red; } }")).toThrow(/closed no block/);
+  });
+
+  it("puts every animation OR transition declaration on .turn-activity .meter-fill, with exactly one @keyframes", () => {
+    const moving = movingSelectorsIn(css);
+    expect(moving.length).toBeGreaterThan(0);
+    for (const selector of moving) {
+      expect(selector).toBe(".turn-activity .meter-fill");
+    }
+    const keyframeBlocks = withoutComments.match(/@keyframes\s+[\w-]+\s*\{/g) ?? [];
+    expect(keyframeBlocks).toHaveLength(1);
+    expect(keyframeBlocks[0]).toContain("turn-meter");
+
+    // Negative control 1 (as first written): a second animated selector and a second @keyframes.
+    const twoAnimations =
+      ".turn-activity .meter-fill { animation: turn-meter 1s; } .row-current { animation: pulse 1s; } " +
+      "@keyframes turn-meter { from { transform: scaleX(0.25); } to { transform: scaleX(1); } } " +
+      "@keyframes pulse { from { opacity: 0; } to { opacity: 1; } }";
+    expect(movingSelectorsIn(twoAnimations)).toContain(".row-current");
+    expect((twoAnimations.match(/@keyframes\s+[\w-]+\s*\{/g) ?? []).length).toBeGreaterThan(1);
+
+    // Negative control (a), a REPRODUCED bypass: the longhands. A second element reusing the one
+    // permitted @keyframes adds no second @keyframes and writes no `animation:` shorthand, so the
+    // original guard passed on it 36/36.
+    const longhands = ".row-current .row-sign { animation-name: turn-meter; animation-duration: 2s; }";
+    expect(movingSelectorsIn(longhands)).toEqual([".row-current .row-sign"]);
+    expect(/(?<![a-z-])animation:/.test(longhands)).toBe(false);
+
+    // Negative control (b), a REPRODUCED bypass: a colour transition. `transition` was not
+    // mentioned by any guard in this file, and a 300ms colour fade spends most of its period below
+    // the contrast floor `tokens.rs` guarantees only at full strength (§7.1).
+    expect(movingSelectorsIn(".tool-card { transition: background-color 300ms linear; }")).toEqual([".tool-card"]);
+    expect(movingSelectorsIn(".tool-card:hover { -webkit-transition: color 1s; }")).toEqual([".tool-card:hover"]);
+    // ...and it is a DECLARATION guard, not a text search: a class whose NAME contains the word is
+    // not a motion, and must not be reported as one.
+    expect(movingSelectorsIn(".transition-demo:hover { color: var(--nv-fg); }")).toEqual([]);
+
+    // Negative control (d), a REPRODUCED bypass and a REGRESSION against the guard before (b): a
+    // nested block whose own `{` came before the parent's declarations were read. The parent is
+    // what moves; the child does not, and neither is lost.
+    expect(movingSelectorsIn(".tool-card { transition: background-color 300ms linear; &:hover { color: var(--nv-fg); } }")).toEqual([
+      ".tool-card",
+    ]);
+    // Negative control (e), the same shape one level down, inside an @media.
+    expect(
+      movingSelectorsIn("@media (min-width: 1px) { .tool-card { transition: opacity 300ms; &:hover { color: var(--nv-fg); } } }"),
+    ).toEqual([".tool-card"]);
+    // Negative control (f), a REPRODUCED bypass: a brace inside a string. `content: "}"` ends no
+    // block, so the `animation:` after it is still this rule's declaration.
+    expect(movingSelectorsIn('.row-sign::before { content: "}"; animation: turn-meter 2s; }')).toEqual([
+      ".row-sign::before",
+    ]);
+    // Negative control (g), a REPRODUCED bypass from the round-2 re-review: property names are
+    // ASCII case-insensitive per CSS Syntax L3, so this is live CSS that the case-sensitive
+    // matcher read as nothing at all. Injected into the real stylesheet it left the suite green.
+    expect(movingSelectorsIn(".tool-card { TRANSITION: background-color 300ms linear; }")).toEqual([
+      ".tool-card",
+    ]);
+    // And the limit, stated rather than left for a ninth review to find: an ESCAPED ident is live
+    // CSS too (`animati\\6fn` decodes to `animation`) and this guard does NOT catch it, because
+    // decoding idents needs a real tokenizer. Asserted as it behaves, so the day someone adds one
+    // this line is what tells them the guard was never claiming to.
+    expect(movingSelectorsIn(".row-current { animati\\6fn: turn-meter 2s; }")).toEqual([]);
+  });
+
+  /// The eighth bypass, and the only one that was upstream of every guard rather than inside one.
+  /// A comment stripper that does not know about strings lets two `content` values act as a comment
+  /// pair and delete every rule between them -- with the braces still balanced, so `splitRules`'
+  /// own throw stays silent. Injected into the real stylesheet, the animated rule in the middle
+  /// vanished before any guard ran and the suite stayed green.
+  it("does not let a string act as a comment marker", () => {
+    const sheet =
+      '.a::before { content: "/*"; }\n' +
+      ".moving { animation: turn-meter 2s linear infinite; }\n" +
+      '.a::after { content: "*/"; }';
+    // The rule in the middle survives stripping, so the guard can see it. Fed RAW, through the same
+    // entry point every real scan uses -- feeding it pre-stripped would test the stripper and not
+    // the path, and would pass with the broken stripper still installed.
+    expect(movingSelectorsIn(sheet)).toEqual([".moving"]);
+    // ...and a REAL comment is still removed, or this would be a stripper that does nothing.
+    expect(stripComments(".x { /* animation: nope; */ color: red; }")).not.toMatch(/animation/);
+  });
+
+  it("rests the meter at ONE cell of four under reduced motion, and steps to exactly four cells otherwise", () => {
+    // Two arithmetic defects the whole-branch review settled (2026-09-20), kept together because
+    // they are the same number seen from two sides.
+    //
+    // (1) The easing. `steps(4, start)` is `jump-start`, whose progress outputs are
+    // {0.25, 0.5, 0.75, 1}; against a `from` of 0.25 that is a scale of 0.25 + 0.75p =
+    // {0.4375, 0.625, 0.8125, 1}, i.e. 1.75ch, 2.5ch, 3.25ch, 4ch of a 4ch meter -- never a cell
+    // boundary, never fewer than ~1.75 cells, and never the `from` value at all, which made that
+    // value's stated purpose ("never empty, so it cannot read as a blink") unreachable.
+    // `jump-none` emits {0, 1/3, 2/3, 1}, so the scale is exactly {0.25, 0.5, 0.75, 1}.
+    const fill = withoutComments.match(/\.turn-activity \.meter-fill \{[^}]*\}/);
+    expect(fill).not.toBeNull();
+    expect(fill![0]).toMatch(/animation: turn-meter 1200ms steps\(4, jump-none\) infinite;/);
+
+    // (2) Reduced motion. `animation: none` alone left the computed transform at the initial
+    // `none` -- the identity -- so `width: 100%` of the 4ch meter painted a FULL bar, which is the
+    // one reading design §4 forbids (a full bar reads as a completed percentage). The static
+    // transform is what makes §6's "one cell of four" true, and it must be the keyframes' own
+    // `from` value rather than an independently written number, which is why this test DERIVES it
+    // instead of spelling it twice.
+    const from = withoutComments.match(/@keyframes turn-meter \{\s*from \{ transform: (scaleX\([\d.]+\)); \}/);
+    expect(from).not.toBeNull();
+    const reduced = withoutComments.match(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\n\}/);
+    expect(reduced).not.toBeNull();
+    expect(reduced![0]).toContain("animation: none;");
+    expect(reduced![0]).toContain(`transform: ${from![1]};`);
+    // One quarter, said as arithmetic rather than as a string: one cell of the meter's four.
+    expect(Number(from![1].replace(/[^\d.]/g, ""))).toBeCloseTo(1 / 4, 10);
+
+    // Negative control: `animation: none` on its own -- the state this replaced -- carries no
+    // transform, so the same extraction finds nothing to rest at.
+    const bare = "@media (prefers-reduced-motion: reduce) {\n  .turn-activity .meter-fill {\n    animation: none;\n  }\n}";
+    expect(bare).not.toContain("transform:");
+  });
+
+  it("keeps the meter's keyframes to transform only -- geometry cannot break the contrast guarantee, colour and alpha can (design §7.1)", () => {
+    const match = withoutComments.match(/@keyframes turn-meter \{([\s\S]*?)\n\}/);
+    expect(match).not.toBeNull();
+    const declarations = keyframeDeclarations(match![1]);
+    expect(declarations.length).toBeGreaterThan(0);
+    for (const declaration of declarations) {
+      expect(declaration).toMatch(/^transform\s*:/);
+    }
+
+    // Negative control (as first written): an opacity fade, both declarations `;`-terminated.
+    const fade = "\n  from { transform: scaleX(0.25); opacity: 0.4; }\n  to { transform: scaleX(1); opacity: 1; }\n";
+    expect(keyframeDeclarations(fade).some((d) => !d.startsWith("transform:"))).toBe(true);
+
+    // Negative control (c), the REPRODUCED bypass, in the reviewer's own exact shape: a final
+    // declaration with no trailing `;`, which is how a last declaration is most often written.
+    // The second `expect` is the point of this control -- it runs the OLD pattern over the same
+    // string and shows it finds nothing wrong, so this is a hole that was really open rather than
+    // one this test merely asserts about.
+    const unterminated = "\n  from { transform: scaleX(0.25); }\n  to { transform: scaleX(1); opacity: 1 }\n";
+    expect(keyframeDeclarations(unterminated).filter((d) => !d.startsWith("transform:"))).toEqual(["opacity: 1"]);
+    expect((unterminated.match(/[a-z-]+:[^;]*;/g) ?? []).filter((d) => !d.startsWith("transform:"))).toEqual([]);
   });
 });
 
@@ -417,6 +760,278 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(computed(CODE_BLOCK, "pre", ".row-assistant pre { background: var(--nv-bg); }").background).toBe(
       "var(--nv-bg)",
     );
+  });
+
+  /* --- Task 1 (2026-09-20): wide content escapes the 62ch prose measure -----------------------
+     The owner's report: fullscreen leaves a big empty strip down the right of the chat panel,
+     because a fenced code block, the permission card's diff and a tool result all wrapped at the
+     same 62ch the `.row` grid caps PROSE at (`index.css:136`'s `minmax(0, 62ch)`).
+
+     jsdom runs no real Grid layout (see the big comment atop this describe block), so none of
+     these tests can see an actual resolved pixel width -- what they CAN see, and what the fix
+     actually is, is a `cqw`-based `width` declaration reaching a specific element and not others.
+     A `cqw` unit is relative to `.row`'s own `container-type: inline-size` (also new), which is
+     what lets it reach `.tool-result-body`/`.permission-card-edit` through several PLAIN wrapper
+     elements (`.tool-call`, `[data-awaiting-permission]`, `.permission-card`) that a subgrid
+     alternative could not reach without giving up their own box (background/border/padding). */
+  it("lets a fenced code block ignore the 62ch measure, unlike a paragraph in the very same row", () => {
+    // Real defect reproduced: before this task, `.code-block` had no `width` rule at all, so it
+    // was exactly as capped by `.row-body`'s grid track as the paragraph beside it.
+    const html =
+      `<div class="message-list"><div class="row row-assistant"><div class="row-body">` +
+      `<p>prose</p><pre class="code-block"><code>x</code></pre></div></div></div>`;
+    const prose = computed(html, "p");
+    const code = computed(html, "pre.code-block");
+    expect(code.width).toMatch(/cqw/);
+    expect(prose.width).not.toMatch(/cqw/);
+    // Negative control: without the rule this task adds, a code block is exactly as capped as the
+    // paragraph next to it -- there is nothing else in this file that would widen it.
+    expect(computed(html, "pre.code-block", ".code-block { width: auto; }").width).not.toMatch(/cqw/);
+  });
+
+  it("lets a tool result ignore the 62ch measure through two plain, unstyled wrapper elements", () => {
+    // `.tool-result-body` sits inside `[data-awaiting-permission]` > `.tool-call` >
+    // `.tool-result` -- MessageList.tsx and toolRegistry.tsx's real nesting -- and NONE of those
+    // three carries a rule in this file. A fix that (wrongly) targeted `.row-body` itself, rather
+    // than the leaf, would not be exercised by a fixture this shallow; this one is exactly as deep
+    // as the real DOM to make sure the `cqw` unit really does reach through, not just past a
+    // fixture shortcut.
+    const html =
+      `<div class="message-list"><div class="row row-tool"><div class="row-body">` +
+      `<div data-awaiting-permission><div class="tool-call"><div class="tool-result">` +
+      `<pre class="tool-result-body">out</pre></div></div></div></div></div></div>`;
+    expect(computed(html, "pre.tool-result-body").width).toMatch(/cqw/);
+    expect(computed(html, "pre.tool-result-body", ".tool-result-body { width: auto; }").width).not.toMatch(/cqw/);
+  });
+
+  it("widens the permission-card diff's own bordered box, not just the text inside it", () => {
+    // `.permission-card-edit` sets `overflow: hidden` -- widening `.permission-card-diff`/
+    // `.diff-line` INSIDE it without widening this box would just be clipped at its edge, so this
+    // is the element the fix actually has to touch, and the one the sign-column-x-position test
+    // below does not otherwise cover.
+    const html =
+      `<div class="permission-card"><div class="permission-card-edit"><div class="permission-card-edit-head">h</div>` +
+      `<pre class="permission-card-diff"><div class="diff-line diff-added"><span class="diff-gutter">+</span></div></pre></div></div>`;
+    const edit = computed(html, ".permission-card-edit");
+    expect(edit.width).toMatch(/cqw/);
+    // It also has to climb back out of `.permission-card`'s own box first, or the widened box
+    // would start further right than a code block or a tool result does. **-11px, not -10px**
+    // (whole-branch review, 2026-09-20): with the global `box-sizing: border-box` the card's
+    // content box begins `border-left` + `padding-left` inside, and this test used to pin the
+    // padding alone. The padding half is read back below; the 1px border is NOT readable here --
+    // `border: 1px solid var(--nv-border)` is a shorthand containing `var()`, which this engine
+    // drops entirely (see the big comment atop this describe block) -- so the number is checked
+    // against the one half jsdom can see plus this sentence, rather than being pinned blind.
+    expect(computed(html, ".permission-card").paddingLeft).toBe("10px");
+    expect(edit.marginLeft).toBe("-11px");
+    expect(computed(html, ".permission-card-edit", ".permission-card-edit { width: auto; margin-left: 0; }").width).not.toMatch(
+      /cqw/,
+    );
+  });
+
+  /* Whole-branch review (2026-09-20): the raw-JSON `<pre>` is the FIFTH element under the 62ch cap
+     and the one the product draws most, since `editPreview` returns null for `Bash`/`WebFetch`/an
+     unknown tool -- which per CLAUDE.md's permission-policy row is nearly every card. It is the
+     same class of miss the review already caught once for `.tool-card-generic`. */
+  it("lets a permission card's raw-JSON input ignore the 62ch measure, with the card's own inset backed out", () => {
+    const html =
+      `<div class="message-list"><div class="row row-permission"><div class="row-body">` +
+      `<div class="permission-card"><pre class="permission-card-input">{"command":"..."}</pre></div>` +
+      `</div></div></div>`;
+    const input = computed(html, ".permission-card-input");
+    expect(input.width).toMatch(/cqw/);
+    // The same -11px as the diff box above, and for the same reason: both sit inside
+    // `.permission-card`'s border + padding, so both have to climb back out by the same amount or
+    // the two would not line up with each other, let alone with a code block.
+    expect(input.marginLeft).toBe("-11px");
+    expect(input.marginLeft).toBe(computed(html, ".permission-card-input").marginLeft);
+    // Negative control: without this rule it is exactly as capped as it was.
+    expect(computed(html, ".permission-card-input", ".permission-card-input { width: auto; margin-left: 0; }").width).not.toMatch(
+      /cqw/,
+    );
+  });
+
+  /* Whole-branch review (2026-09-20): `calc(100cqw - 30px)` assumes `.tool-result-body`'s parent is
+     flush with `.row-body`. On the FAILED-tool path it is not -- `.tool-result-error` puts a 2px
+     border and 6px of padding on that exact parent -- so the body overhung `.row`'s right edge by
+     8px. The original fixture used a plain `.tool-result`, so neither the prose nor the suite
+     covered the one state where the rule was untrue. */
+  it("narrows a tool result by its error gutter, so a FAILED tool lands on the same right edge as a passing one", () => {
+    const row = (errorClass: string) =>
+      `<div class="message-list"><div class="row row-tool"><div class="row-body">` +
+      `<div class="tool-call"><div class="tool-result${errorClass}">` +
+      `<pre class="tool-result-body">out</pre></div></div></div></div></div>`;
+    // jsdom normalises a `calc()` into `calc(<length> + <length>)` order, so these read the
+    // subtrahend rather than the literal text this file spells.
+    expect(computed(row(""), "pre.tool-result-body").width).toBe("calc(-30px + 100cqw)");
+    // 2px border-left + 6px padding-left = 8px, so 38px, and the two right edges coincide.
+    expect(computed(row(" tool-result-error"), "pre.tool-result-body").width).toBe("calc(-38px + 100cqw)");
+    // Negative control: this is a real specificity win, not an accident of the fixture. Deleting
+    // the narrower rule (simulated by re-declaring the base one after it, at higher specificity)
+    // puts the overhanging width back.
+    expect(
+      computed(row(" tool-result-error"), "pre.tool-result-body", ".tool-result-error .tool-result-body { width: calc(100cqw - 30px); }")
+        .width,
+    ).toBe("calc(-30px + 100cqw)");
+  });
+
+  /* --- the in-flight indicator's own layout (whole-branch review, 2026-09-20) ------------------
+     Two findings, one bar. jsdom runs no flex layout, so both tests read the DECLARATIONS that
+     decide the outcome -- which is the same thing every other test in this block does, and is
+     exactly why the defects were invisible until someone did the flexbox arithmetic by hand. */
+
+  it("keeps the meter from being the first thing squeezed off a narrow status line", () => {
+    // `.meter`'s only child is an EMPTY span, so its min-content size is 0 and flexbox's automatic
+    // minimum (§4.5) is min(4ch, 0) = 0. As an ordinary flex item it shrank to nothing -- the one
+    // animated element in the product silently gone on the narrow panel where it matters most.
+    const html = `<div class="status-line"><span class="turn-activity" data-phase="thinking"><span class="meter"><span class="meter-fill"></span></span><span class="turn-state">thinking</span></span></div>`;
+    const meter = computed(html, ".meter");
+    expect(meter.flexShrink).toBe("0");
+    expect(meter.flexGrow).toBe("0");
+    // `4ch` is pinned through this engine's own resolution of it rather than as text: it computes
+    // `ch` at 0.5em, and `.status-line` sets `font-size: 12px`, so four of them is 24px. Any other
+    // width fails here. (That is a jsdom metric, not a real font's -- the number a real WebKitGTK
+    // resolves is a screen question, and design §12 asks a human whether 4ch is visible at all.)
+    expect(meter.width).toBe("24px");
+    // The same idiom, on the element this file already used it on -- so the fix is the file's own
+    // answer rather than a new one.
+    const gutter = computed(`<div class="diff-line"><span class="diff-gutter">+</span></div>`, ".diff-gutter");
+    expect(gutter.flexShrink).toBe("0");
+    // Negative control: the default `flex-shrink: 1` put back is the defect, and it is reachable
+    // from any later rule that touches `flex` on this element.
+    expect(computed(html, ".meter", ".turn-activity .meter { flex: 1 1 auto; }").flexShrink).toBe("1");
+  });
+
+  it("spends the phase word before the Stop button as the status line narrows", () => {
+    // The priority order index.css states in prose, asserted as the TWO independent flex
+    // distributions it really is: the indicator's box gives before the status word and the
+    // position counter (its siblings in `.status-line`), and inside that box the phase word is the
+    // only thing that can give. The meter, the clock, the mode block and Stop are never spent by
+    // either. The Stop button is the one that matters -- App.tsx's own comment says it is the ONLY
+    // Stop control for mouse users, so it going off the right edge is the interrupt affordance
+    // leaving the screen.
+    const html =
+      `<div class="status-line">` +
+      `<span class="mode-block" data-mode="browse">BROWSE</span>` +
+      `<span class="status status-running">working</span>` +
+      `<span class="turn-activity" data-phase="tool"><span class="meter"><span class="meter-fill"></span></span>` +
+      `<span class="turn-state">running NotebookEdit</span><span class="turn-elapsed">123s+</span></span>` +
+      `<span class="position">12/34</span>` +
+      `<button type="button" class="stop">Stop</button></div>`;
+    const shrink = (selector: string) => Number(computed(html, selector).flexShrink);
+
+    // **The re-review of 2026-09-20 found the assertion that used to stand here unable to fail.**
+    // It compared `.turn-state` against `.status` -- items in DIFFERENT flex containers, which
+    // never compete in one distribution, so no arrangement of those two numbers could have
+    // implemented or broken the order the comment claimed. The structure is asserted first now, so
+    // that reading is impossible to make again by eye.
+    const dom = new DOMParser().parseFromString(html, "text/html");
+    expect(dom.querySelector(".turn-state")?.parentElement?.className).toBe("turn-activity");
+    expect(dom.querySelector(".status")?.parentElement?.className).toBe("status-line");
+    expect(dom.querySelector(".position")?.parentElement?.className).toBe("status-line");
+
+    // Decision 1, among the children of `.status-line` that can give at all: the INDICATOR'S BOX
+    // first, by a wide margin -- shrinking is distributed by factor x base size, so these numbers
+    // are an order and not a ratio -- then the status word, then the position counter.
+    expect(shrink(".turn-activity")).toBeGreaterThan(shrink(".status"));
+    expect(shrink(".status")).toBeGreaterThan(shrink(".position"));
+    expect(shrink(".position")).toBeGreaterThan(0);
+
+    // Decision 2, inside `.turn-activity`: the phase word is the ONLY item there that can give, so
+    // decision 1 spending that box IS the phase word truncating. This is the step that turns the
+    // outer order into the documented one, and it holds because of what is zero here, not because
+    // of how large `.turn-state`'s own factor is -- which is why that factor is now the plain
+    // default rather than a number implying a rank it cannot express.
+    expect(shrink(".meter")).toBe(0);
+    expect(shrink(".turn-elapsed")).toBe(0);
+    expect(shrink(".turn-state")).toBeGreaterThan(0);
+
+    // ...and what `flex: none` on the meter and the clock actually buys: the DISTRIBUTION never
+    // spends them. It does not mean they can never be clipped -- once the word is gone there is
+    // nothing left inside the box to give -- so `.turn-activity` clips its own overflow rather
+    // than letting the meter and the clock run out over `.position`.
+    expect(computed(html, ".turn-activity").overflow).toBe("hidden");
+
+    // Never spent by either distribution: the two fixed parts of the indicator, the mode block,
+    // and the control that stops the turn.
+    for (const fixed of [".meter", ".turn-elapsed", ".mode-block", ".stop"]) {
+      expect(shrink(fixed)).toBe(0);
+    }
+    // A word that shrinks has to be ABLE to: its automatic minimum is its min-content size (the
+    // whole word) unless `min-width: 0` says otherwise, and `text-overflow` never engages without
+    // an `overflow` that is not `visible`.
+    for (const shrinkable of [".turn-state", ".status", ".position"]) {
+      expect(computed(html, shrinkable).minWidth).toBe("0px");
+      expect(computed(html, shrinkable).overflow).toBe("hidden");
+      expect(computed(html, shrinkable).textOverflow).toBe("ellipsis");
+    }
+    // `.turn-activity` is itself a flex ITEM: its child cannot shrink unless it can.
+    expect(shrink(".turn-activity")).toBeGreaterThan(0);
+    expect(computed(html, ".turn-activity").minWidth).toBe("0px");
+    // And the bar never becomes two lines. `.winbar` wraps for this, deliberately not copied here:
+    // line breaking happens on base sizes BEFORE shrinking, so a wrapping status line would jump
+    // between one and two rows every time the phase word changed width.
+    expect(computed(html, ".status-line").flexWrap).not.toBe("wrap");
+    expect(computed(html, ".status-line").whiteSpace).toBe("nowrap");
+    expect(computed(`<div class="winbar">w</div>`, ".winbar").flexWrap).toBe("wrap");
+    // Negative control: the state this replaced -- nothing shrinking, nothing clipping -- is what
+    // pushed Stop off the edge, and it is one later `flex` declaration away.
+    expect(computed(html, ".turn-state", ".status-line .turn-activity .turn-state { flex: none; }").flexShrink).toBe("0");
+  });
+
+  /* Review of Task 1: an unrecognized tool's raw JSON dump is a fourth `<pre>` under the same
+     62ch-capped `.row-body` and had been missed the first time this list was written. Widens the
+     SAME element the fenced-code-block test above does (the outer box, not the bare `<pre>` inside
+     it) -- `.tool-card-generic` needs no compensating `margin-left`, unlike `.permission-card-edit`
+     above, because nothing between it and `.row-body` (`.tool-call`, `[data-awaiting-permission]`)
+     carries a rule in this file either. */
+  it("lets an unrecognized tool's raw JSON dump ignore the 62ch measure too", () => {
+    const html =
+      `<div class="message-list"><div class="row row-tool"><div class="row-body">` +
+      `<div data-awaiting-permission><div class="tool-call">` +
+      `<details class="tool-card tool-card-generic"><summary>s</summary><pre>{}</pre></details>` +
+      `</div></div></div></div></div>`;
+    const card = computed(html, ".tool-card-generic");
+    expect(card.width).toMatch(/cqw/);
+    expect(card.marginLeft).not.toBe("-10px");
+    // Negative control: without the rule this fix adds, it is exactly as capped as everything else
+    // in `.row-body`.
+    expect(computed(html, ".tool-card-generic", ".tool-card-generic { width: auto; }").width).not.toMatch(/cqw/);
+  });
+
+  it("keeps the sign column on the same track whether the row's body is prose or a wide code block", () => {
+    // The entire reason the grid exists (`index.css:136-150`'s comment): the sign column must sit
+    // at the same x position down the whole page. Widening the BODY column must never be able to
+    // move it, so this compares `.row`'s own `grid-template-columns` -- the declaration that
+    // decides column 1's width -- across a plain-prose row and a row whose body is a wide code
+    // block, and pins it to the literal value so a future change to column 1 fails here too.
+    const proseRow =
+      `<div class="message-list"><div class="row row-assistant">` +
+      `<span class="row-sign">›</span><div class="row-body"><p>prose</p></div></div></div>`;
+    const codeRow =
+      `<div class="message-list"><div class="row row-assistant">` +
+      `<span class="row-sign">›</span><div class="row-body"><pre class="code-block"><code>x</code></pre></div></div></div>`;
+    const proseColumns = computed(proseRow, ".row").gridTemplateColumns;
+    expect(proseColumns).toBe("22px minmax(0, 62ch)");
+    expect(computed(codeRow, ".row").gridTemplateColumns).toBe(proseColumns);
+    // Negative control: proves the assertion above can actually fail. A rule that changed column 1
+    // wins the SAME assertion path used above, at the same specificity as `.row`'s own base rule
+    // (`.row-assistant`, 0,1,0), placed after it -- reproducing the shape a careless edit to this
+    // grid, or to a class every row already carries, would take.
+    expect(computed(codeRow, ".row", ".row-assistant { grid-template-columns: 24px minmax(0, 62ch); }").gridTemplateColumns).not.toBe(
+      proseColumns,
+    );
+  });
+
+  it("gives `.row` a size query container without disturbing its own grid tracks", () => {
+    // The mechanism the four tests above all rely on: `container-type: inline-size` has to be on
+    // by the time any of them run, or every `cqw`-based width above would be checking a unit that
+    // resolves against nothing. Pinned on its own so a regression here explains itself instead of
+    // surfacing as four unrelated-looking failures above.
+    const row = computed(CODE_BLOCK, ".row");
+    expect(row.getPropertyValue("container-type")).toBe("inline-size");
+    expect(row.display).toBe("grid");
+    expect(row.gridTemplateColumns).toBe("22px minmax(0, 62ch)");
   });
 
   it("leaves a choice row on the sign-column grid, not on the boxed-button padding", () => {

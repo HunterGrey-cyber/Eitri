@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { applyEvent, applySnapshot, initialState, resetToStartScreen } from "./reducer";
+import { applyEvent, applySnapshot, initialState, resetToStartScreen, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
@@ -22,7 +22,7 @@ import type { ShownHint } from "./components/HintLayer";
 import { WhichKey } from "./components/WhichKey";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { stripEntries } from "./whichKey";
-import type { HandoffCommand, Hello, PermissionModeChoice } from "./types";
+import type { HandoffCommand, Hello, PermissionModeChoice, TurnClock } from "./types";
 import { applyTheme } from "./theme";
 
 /** Whether `el` is an ordinary editable control -- an `<input>`, a `<textarea>`, or anything
@@ -306,6 +306,16 @@ export default function App() {
   /** Guards the render report to one per turn. Without it the effect below re-arms on every one of
    *  a reply's ~400 deltas. */
   const renderReportSent = useRef(false);
+  /** How long the current turn has been running -- design doc §8.4. Real `useState`, not a ref: it
+   *  feeds `StatusLine`'s render (the elapsed clock), unlike the trace-only refs above. Set with
+   *  `exact: true` only from a real `turn_started` inside an `events` envelope; a turn id first
+   *  observed inside a `snapshot` (a page reload, or a resync mid-turn) gets `exact: false`, because
+   *  this panel cannot know how long the turn had already been running before it first saw it.
+   *  Cleared whenever a `turn_completed`/`session_unavailable`/`session_closed`/non-attaching
+   *  `resume_outcome` arrives -- the same events that clear `state.activeTurnId` in the reducer,
+   *  kept in step here rather than re-derived from `state` because only the raw event batch (not
+   *  the folded state) carries the provenance (`events` vs `snapshot`) this needs. */
+  const [turnClock, setTurnClock] = useState<TurnClock | null>(null);
   /** Which timeline rows show their full tool result rather than the folded placeholder, keyed by
    *  the timeline `key` -- never the cursor index, because a resolved permission removes a card and
    *  shifts every later index, which would silently move an expansion onto a different row.
@@ -668,11 +678,36 @@ export default function App() {
         // conversation nothing else remembers.
         setHandoff(null);
         setCommandNotice(null);
+        // A turn id first seen inside a SNAPSHOT (a page reload, or a resync mid-turn) gets
+        // `exact: false` -- this panel cannot know how long it had already been running (design doc
+        // §8.4). Untouched if the snapshot names the SAME turn already tracked (a resync must not
+        // restart the clock); cleared if the snapshot carries no active turn at all.
+        setTurnClock((current) => {
+          const activeTurnId = payload.state.activeTurnId;
+          if (activeTurnId === null) return null;
+          if (current !== null && current.turnId === activeTurnId) return current;
+          return { turnId: activeTurnId, since: Date.now(), exact: false };
+        });
       } else if (payload.kind === "events") {
         // A new turn resets the render trace: each turn reports its own first text, once.
         if (payload.events.some((e) => e.type === "turn_started")) {
           firstTextReceivedAt.current = null;
           renderReportSent.current = false;
+        }
+        // The clock's only EXACT provenance: a real `turn_started` inside this batch. Everything
+        // that ends a turn clears it, mirroring exactly what already clears `state.activeTurnId` in
+        // the reducer (`turn_completed`, `session_unavailable`, `session_closed`, a non-attaching
+        // `resume_outcome`) -- read here off the raw events rather than off `state` afterwards,
+        // because `state` does not carry which envelope a turn id arrived in.
+        for (const event of payload.events) {
+          if (event.type === "turn_started") {
+            const turnId = event.turn_id;
+            setTurnClock((current) => (current?.turnId === turnId ? current : { turnId, since: Date.now(), exact: true }));
+          } else if (event.type === "turn_completed" || event.type === "session_unavailable" || event.type === "session_closed") {
+            setTurnClock(null);
+          } else if (event.type === "resume_outcome" && !resumeAttached(event)) {
+            setTurnClock(null);
+          }
         }
         // Stamped before the state update that will cause the render, so the span covers the work
         // being measured rather than starting after it.
@@ -734,6 +769,15 @@ export default function App() {
         setState(initialState());
         setStartedPermissionMode(null);
         setKeymapOpen(false);
+        // Same reason `returnToStartScreen` below clears it: a whole-state reset must leave no
+        // record of a turn behind. The next snapshot's `activeTurnId === null` branch usually
+        // clears it incidentally, which is why this was missed -- but a snapshot arriving with an
+        // `activeTurnId` EQUAL to the stale one would keep both the old `since` and the old
+        // `exact: true`, rendering an inflated elapsed time with no `+` (design §8.4: "it never
+        // shows a number it cannot stand behind"). Whether a turn id can repeat across sessions is
+        // a question about ids this repo does not own -- legacy mints uuid v4, the sidecar's come
+        // from Verdandi over the wire -- so this clears it rather than answering it.
+        setTurnClock(null);
         setHandoff(payload);
         // Suppresses the resume offer for THIS client's already-delivered `hello`, which was
         // computed once at mount. That only ever matches when this session was itself resume-started
@@ -760,6 +804,8 @@ export default function App() {
         setState(initialState());
         setStartedPermissionMode(null);
         setKeymapOpen(false);
+        // The third of the three whole-state resets, now saying the same thing as the other two.
+        setTurnClock(null);
         setFatalError(payload.message);
         /* Re-ask for `hello`, because we are about to show the start screen again and the copy we
            captured at mount is a snapshot of the conversation records as they were then.
@@ -945,6 +991,10 @@ export default function App() {
     setState(resetToStartScreen);
     setStartedPermissionMode(null);
     setKeymapOpen(false);
+    // Belt and braces: only reachable on an ended session, which already cleared this via
+    // session_closed/session_unavailable above, but the start screen must never show a stale clock
+    // for the fresh session about to begin.
+    setTurnClock(null);
     requestHello();
   }
 
@@ -1314,6 +1364,7 @@ export default function App() {
         mode={mode}
         paneFocused={paneFocused}
         state={state}
+        turnClock={turnClock}
         position={{ index: cursor, total: timeline.length }}
         // Stop is gated on the capability, never on the backend's name. Spec §3.4's Send/Stop pair
         // leaving the composer is done in the same change as this StatusLine addition (see

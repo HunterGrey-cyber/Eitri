@@ -1,5 +1,7 @@
-import type { AgentUiState } from "../types";
+import type { AgentUiState, TurnClock } from "../types";
 import type { PanelMode } from "../keymap";
+import { phaseOf } from "../turnPhase";
+import { TurnActivity } from "./TurnActivity";
 
 /* Data over the mode union, which is why `hint` has a label before `f` can reach it -- see
    `PanelMode`'s own doc comment in `../keymap` for why that mode is unreachable today. */
@@ -16,6 +18,11 @@ type Props = {
    *  dim block, which claims nothing. */
   paneFocused?: boolean;
   state: AgentUiState;
+  /** How long the current turn has been running, tracked in `App.tsx` (`TurnClock`) rather than in
+   *  `AgentUiState` -- see that type's own doc comment. `null` before any turn has started, and
+   *  optional/defaulted for callers (existing tests, mainly) that render no in-flight indicator at
+   *  all. Only read while a turn is actually working; see `TurnActivity`. */
+  turnClock?: TurnClock | null;
   /** Where the cursor is in `buildTimeline(state)`, and how long that timeline currently is. A
    *  POSITION, never an identity: `permission_resolved` removes a card and every later index
    *  shifts, so the same number names a different row from one event to the next. Spec §9 keeps
@@ -28,7 +35,7 @@ type Props = {
   onInterrupt: () => void;
 };
 
-export function StatusLine({ mode, paneFocused = false, state, position, canInterrupt, onInterrupt }: Props) {
+export function StatusLine({ mode, paneFocused = false, state, turnClock = null, position, canInterrupt, onInterrupt }: Props) {
   // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -60,6 +67,13 @@ export function StatusLine({ mode, paneFocused = false, state, position, canInte
       >
         {working ? "working" : state.status.kind}
       </span>
+      {/* The in-flight motion indicator (2026-09-20-in-flight-motion-design.md §3): per-turn state,
+          so it lives here rather than in the sign column (per-item state) or anywhere else -- see
+          that design's §3.1 for the places it deliberately does not live. Mounted iff `working`,
+          reusing the SAME predicate the status word and the Stop button already gate on rather than
+          a second one that could drift from it (§5.1) -- this is also what makes "the element is
+          gone" and "no turn is in flight" the same fact. */}
+      {working && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
       {/* A POSITION, never an identity: `permission_resolved` removes a card and every later index
           shifts. Spec §9 keeps the stable-numbering fix deferred, and this label must not read as a
           durable name for an item. */}

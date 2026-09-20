@@ -23,6 +23,7 @@ export function initialState(): AgentUiState {
     provider: null,
     assistantMessageOpen: false,
     nextSeq: 0,
+    turnThinking: false,
   };
 }
 
@@ -46,6 +47,13 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
  * means a locally-folded item gets the number Rust would have given it, so the live path and a
  * later snapshot describe the same order rather than two schemes that merely happen to agree.
  *
+ * **There is exactly one exception, and it is the first thing this function does** (2026-09-20): a
+ * REPEATED thinking delta returns `incoming` itself, advancing nothing, so that a turn that merely
+ * keeps thinking costs no re-render. The two counters therefore drift apart by one per such delta.
+ * The paragraph above is the rule and this is the whole of its exception -- see the early return's
+ * own comment for why it is safe, and `types.ts`'s `nextSeq` doc for what was checked rather than
+ * assumed. Nothing else in this function may take a second exception without the same check.
+ *
  * The events in one `{kind:"events"}` batch arrive in fold order -- `UiDelivery::Events` is
  * documented as "apply these events, in order", and `ConversationIngest` queues one entry per event
  * it folds -- so arrival order here IS the authoritative order, not a guess at it. The one case
@@ -53,10 +61,24 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
  * this counter rather than continuing it.
  */
 export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState {
+  // A REPEATED thinking delta sets a bit that is already set, so it has nothing left to change --
+  // returning `incoming` itself (not even a new object with `nextSeq` bumped) is what lets
+  // `App.tsx` skip a render on the 33ms pump while a turn merely keeps thinking (design doc §5.4,
+  // §8.2's "one re-render per transition, not per delta"). This is the one call that does NOT
+  // advance `nextSeq` -- safe only because it also creates no ITEM, so nothing downstream ever
+  // needs a `seq` for a delta that produced nothing. A single (non-repeated) thinking delta still
+  // falls through below and advances `nextSeq` exactly like any other event.
+  if (event.type === "content_delta" && event.kind === "thinking" && incoming.turnThinking) {
+    return incoming;
+  }
   const seq = incoming.nextSeq;
   // Advanced once, here, so every `return state` below carries it -- including the arms that change
   // nothing else. An event with no visible effect is still a real, ordered occurrence.
-  const state: AgentUiState = { ...incoming, nextSeq: seq + 1 };
+  //
+  // `turnThinking` defaults to false here too, for every event: it is cleared by the ABSENCE of a
+  // special case rather than by a maintained list of event types that ought to clear it (§8.2).
+  // Only the `content_delta`/`"thinking"` arm below sets it back to true.
+  const state: AgentUiState = { ...incoming, nextSeq: seq + 1, turnThinking: false };
   switch (event.type) {
     case "session_opened":
       // Arrives once PER TURN on the sidecar backend, not once per session: the Agent SDK emits a
@@ -85,7 +107,20 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         assistantMessageOpen: false,
       };
     case "content_delta": {
-      if (event.kind !== "text") return state;
+      if (event.kind === "thinking") return { ...state, turnThinking: true };
+      // A RUNTIME defence against TS/Rust drift, not a type-level branch -- which is exactly why
+      // it needs the cast. `ContentKind` is `{Text, Thinking}` today, so TS has already narrowed
+      // `event.kind` to "text" by this line and the comparison is dead by the types. It is not
+      // dead at runtime: a third variant added on the Rust side without a matching case here would
+      // otherwise fall through into the text path below and append a transcript entry whose `text`
+      // is `undefined`, which `MessageList` hands to `renderMarkdown`, which throws inside
+      // `marked` -- and this app has no error boundary, so the whole panel unmounts. This arm used
+      // to read `if (event.kind !== "text") return state;` and the in-flight motion change turned
+      // it into `if (event.kind === "thinking")`, dropping the guard; the whole-branch review of
+      // 2026-09-20 reproduced the unmount. Same shape, and same reason, as the `default:` arm at
+      // the bottom of this switch.
+      if ((event.kind as string) !== "text") return state;
+      // `event.kind` is narrowed to "text" here, the only other member of the union.
       // `transcript` holds assistant MESSAGES, not content events. Under partial streaming a single
       // 600-word reply arrives as 400+ deltas; pushing each as its own entry renders 400 separate
       // bubbles, each markdown-parsed in isolation -- and a fragment like "`neovibe_" or "**bold"
@@ -160,10 +195,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // looks continued while carrying none of its history is the one outcome the resume protocol
       // exists to prevent. `forked` is consulted rather than ignored because forking legitimately
       // returns a different id.
-      const attached =
-        event.status === "attached" &&
-        (event.forked || event.attached_provider_session_id === event.requested_provider_session_id);
-      if (attached) return state;
+      if (resumeAttached(event)) return state;
       return {
         ...state,
         activeTurnId: null,
@@ -205,15 +237,27 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
-  // The snapshot carries neither `assistantMessageOpen` nor `nextSeq` -- both are reducer-internal
-  // on both sides and deliberately not on the wire, which is why the parameter is typed
-  // `AgentUiSnapshot` (the `Omit` of exactly those two) rather than a full `AgentUiState` that would
-  // claim Rust sent them. Supplying them here is the only reason this function exists.
+  // The snapshot carries neither `assistantMessageOpen`, `nextSeq` nor `turnThinking` -- all three
+  // are reducer-internal on both sides and deliberately not on the wire, which is why the parameter
+  // is typed `AgentUiSnapshot` (the `Omit` of exactly those three) rather than a full `AgentUiState`
+  // that would claim Rust sent them. Supplying them here is the only reason this function exists.
   //
   // Resetting `assistantMessageOpen` is the safe direction: the next content event starts a new
   // transcript entry rather than appending to a message that may have been closed before the
-  // snapshot was taken.
-  return { ...snapshot, assistantMessageOpen: false, nextSeq: throughRevision };
+  // snapshot was taken. Resetting `turnThinking` is the same direction for the same reason -- a
+  // thinking delta folded before the snapshot was taken must not still read as "thinking now"; the
+  // in-flight-motion design's invariant (§8.2) is that this bit can only ever be LOST, and a
+  // resync/reload is one more way to lose it, degrading `thinking` to `sent` (design §8.4).
+  return { ...snapshot, assistantMessageOpen: false, nextSeq: throughRevision, turnThinking: false };
+}
+
+/** Whether a `resume_outcome` confirms the session that was actually asked for -- the same
+ * predicate `applyEvent`'s own `resume_outcome` arm used to compute inline. Exported so `App.tsx`
+ * can decide whether a resume outcome ends the in-flight-motion clock (`turnClock`, design doc
+ * §8.4) without re-deriving this rule a second time; a forked attach is not a substitution because
+ * forking legitimately returns a different id. */
+export function resumeAttached(event: Extract<AgentDomainEvent, { type: "resume_outcome" }>): boolean {
+  return event.status === "attached" && (event.forked || event.attached_provider_session_id === event.requested_provider_session_id);
 }
 
 /** The user-facing reason a resume did not continue the session that was asked for.

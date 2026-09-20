@@ -145,6 +145,13 @@ body,
      column (this rule's whole reason to exist) was on two different x positions down the page.
      Only the colour differs below; the width must not, or this same misalignment comes back. */
   border-left: 2px solid transparent;
+  /* A size query container for the "escape the 62ch measure" rules far below (fenced code, the
+     permission-card diff, tool output). Purely additive: it does not change how the two tracks
+     above are sized, so the sign column's x position is exactly as unaffected by it as by
+     everything else in this rule -- see the comment on those rules for why a query container,
+     rather than a third grid track or subgrid, is what lets a `cqw` length reach a `<pre>` sitting
+     several plain (non-grid) wrapper elements below `.row-body`. */
+  container-type: inline-size;
 }
 /* The cursor `j`/`k` move and `Enter`/`y` act on (panel-as-document task 5, review round 1):
    `--nv-cursorline` is a BACKGROUND (nvim's own `Visual` highlight token, the same one
@@ -245,6 +252,63 @@ body,
   font-size: 12.5px;
   margin-top: 4px;
 }
+/* --- wide content escapes the 62ch prose measure (Task 1, 2026-09-20) -------------------------
+   `.row`'s body track is `minmax(0, 62ch)` -- a readable prose measure, and the owner's call to
+   keep it that way for prose is unchanged. Fenced code (`.code-block`) and tool output
+   (`.tool-result-body`) are not prose, sit several PLAIN wrapper elements below `.row-body`
+   (`renderMarkdown`'s own unstyled wrapper div for the former, `[data-awaiting-permission]` >
+   `.tool-call` > `.tool-result` for the latter -- none of which carries a class this file styles),
+   and should use whatever width the panel actually has instead of wrapping at 62 characters.
+
+   `.row-body` itself cannot simply stop being capped: it is ONE grid cell holding a mix of prose
+   and wide content for `.row-assistant` (a markdown reply can have both), so the cap has to come
+   off the wide elements individually, not off their container. Subgrid was the other candidate
+   and does not reach through those plain wrappers -- subgrid placement only promotes a grid
+   container's DIRECT children, and every wrapper between here and `.row-body` would have to
+   become `display: contents` (removing its own box) to relay it further, which `.tool-card` and
+   `.permission-card` cannot afford: their background/border/padding IS their box.
+
+   `.row`'s own `container-type: inline-size` (above) is what a `cqw` unit below is relative to,
+   and a container query reaches through any number of plain elements in between by definition --
+   the property subgrid does not have. `100cqw` is `.row`'s own full content-box width, the same
+   box its grid tracks are laid out inside, so `calc(100cqw - 30px)` -- 22px sign column + 8px
+   column gap, the same two numbers the grid above already uses -- lands exactly on `.row`'s own
+   right edge: as far right as a full-width prose line would reach if the body track had no cap at
+   all. On a panel narrower than 62ch this is IDENTICAL to `.row-body`'s own width (the track's
+   `minmax(0, ...)` has already given it all of `100cqw - 30px` at that point), so nothing here
+   overflows a narrow panel -- see indexCss.test.ts's cascade test for both directions.
+
+   `.tool-card-generic` joined this list in review, alongside `.code-block`/`.tool-result-body`
+   rather than the way `.permission-card-edit` does further down: its own left edge already sits
+   flush with `.row-body`'s (it is a direct-enough descendant, through `.tool-call` and
+   `[data-awaiting-permission]` -- neither carries a rule here either), so no compensating
+   `margin-left` is needed, same as the first two. An unrecognized tool's raw JSON dump is a fourth
+   `<pre>` under this same 62ch cap and had been missed the first time this list was written. */
+.code-block,
+.tool-result-body,
+.tool-card-generic {
+  width: calc(100cqw - 30px);
+}
+/* The one state where the `- 30px` above is wrong, found in the whole-branch review (2026-09-20).
+   `.tool-result-error` below adds `border-left: 2px` + `padding-left: 6px` to `.tool-result`, the
+   DIRECT parent of `.tool-result-body` (`toolRegistry.tsx`: `<div className={"tool-result" +
+   (result.isError ? " tool-result-error" : "")}>`). The rule above assumes that parent is flush
+   with `.row-body`, which on the error path it is not: the child's content box starts 8px in and,
+   at a width equal to the full body track, ended 8px past `.row`'s right edge -- eating into
+   `.message-list`'s 12px right padding, so no scrollbar and nothing visibly broken, but it is the
+   alignment the whole rule exists to get right. `.tool-result-error .tool-result-body` is (0,2,0)
+   against (0,1,0) and sits later in the file, so it wins twice over. */
+.tool-result-error .tool-result-body {
+  width: calc(100cqw - 38px);
+}
+/* The JSON dump itself: an ordinary block `<pre>` with no width of its own, so it already fills
+   whatever width `.tool-card-generic` above gives its box. `overflow-x: auto` is what keeps ONE
+   unusually long line (a long string value, say) from bleeding past that box's own border/
+   background rather than scrolling inside it -- the same role `.code-block`'s own `overflow-x`
+   plays for a fenced code block. */
+.tool-card-generic pre {
+  overflow-x: auto;
+}
 .tool-result-folded {
   color: var(--nv-muted);
   font-size: 12.5px;
@@ -328,11 +392,23 @@ body,
   font-size: 11px;
   margin-bottom: 4px;
 }
+/* The raw-JSON `<pre>` a permission card renders for every NON-Edit tool -- and per CLAUDE.md's
+   permission-policy row, the cards this product actually produces are overwhelmingly `Bash`,
+   `WebFetch` and unknown tools, all of which take this branch (`ToolInput` in PermissionCard.tsx
+   falls back here whenever `editPreview` returns null). It is the FIFTH `<pre>` under the 62ch cap
+   and the most common one, and the first pass at "wide content escapes the measure" missed it, so
+   a long Bash command still scrolled sideways inside a ~62ch box with empty panel to its right --
+   the owner's original report, unfixed on the card he sees most (whole-branch review, 2026-09-20).
+   `margin-left: -11px` for the same reason `.permission-card-edit` further down carries it, and
+   with the same arithmetic: `.permission-card` is `border: 1px` + `padding: 10px`, so its content
+   box begins 11px inside `.row-body`'s own left edge. */
 .permission-card-input {
   background: var(--nv-bg);
   padding: 6px;
   border-radius: 4px;
   overflow-x: auto;
+  width: calc(100cqw - 30px);
+  margin-left: -11px;
 }
 .permission-card-buttons button {
   margin-right: 8px;
@@ -478,9 +554,182 @@ body,
   font-weight: 400;
   border-left-color: var(--nv-chrome-muted);
 }
+/* In-flight motion (2026-09-20-in-flight-motion-design.md). Per-turn state, so it lives in the
+   status line rather than the sign column (per-item state) or anywhere else -- design §3. Sits
+   between the status word above and `.position` below in DOM order; `.position`'s own
+   `margin-left: auto` still pushes IT and `Stop` to the right, so this grows into the gap between
+   without moving either, and the meter -- leftmost inside it -- never moves as the word's width
+   changes (`running NotebookEdit` is the longest, design §3.2). */
+.turn-activity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.turn-activity .meter {
+  /* `4ch` in the inherited `--nv-font-mono` (`.status-line`, above): exactly four status-line
+     characters wide, matching the four discrete steps below (design §4). */
+  width: 4ch;
+  /* `flex: none`, the same idiom `.diff-gutter` below already uses, and for the same reason. Its
+     only child is an EMPTY span, so this box's min-content size is 0 and flexbox's automatic
+     minimum (§4.5) is min(4ch, 0) = 0 -- as a plain flex item with the default `flex-shrink: 1` it
+     was the first thing on a squeezed status line to vanish, and it vanished completely. The one
+     animated element in the product disappearing on exactly the narrow panel where the
+     reassurance matters most, with no error and nothing jsdom can see (whole-branch review,
+     2026-09-20). */
+  flex: none;
+  height: 3px;
+  overflow: hidden;
+}
+/* The one animated element in the whole stylesheet, and the only rule in the file with an
+   `animation:` declaration (`indexCss.test.ts` asserts both halves of that, and that there is
+   exactly one `@keyframes`). `transform` only -- never colour or alpha: `--nv-chrome-accent` clears
+   its 3:1 guard only at full strength, so a fade would spend most of its period below that
+   guarantee, a defect no static check could catch once it existed (design §7.1). The keyframes
+   body is asserted to contain only `transform:` declarations for the same reason. */
+.turn-activity .meter-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--nv-chrome-accent);
+  transform-origin: left center;
+  /* `jump-none`, not `start` (whole-branch review, 2026-09-20; design §4's easing row corrected
+     with it). `steps(4, start)` is `jump-start`, which emits progress {0.25, 0.5, 0.75, 1} -- so
+     against a `from` of 0.25 the scale ran {0.4375, 0.625, 0.8125, 1}, i.e. 1.75ch, 2.5ch, 3.25ch
+     and 4ch of a 4ch meter. It never landed on a cell boundary, never showed fewer than ~1.75 of
+     its four cells, and never displayed the `from` value at all -- which made that value's stated
+     purpose ("never empty, so it cannot read as a blink") unreachable. `jump-none` emits {0, 1/3,
+     2/3, 1}, so the scale is exactly {0.25, 0.5, 0.75, 1}: one, two, three, four cells, starting
+     on the `from` value, which is the behaviour design §4 describes and §6 relies on. */
+  animation: turn-meter 1200ms steps(4, jump-none) infinite;
+}
+@keyframes turn-meter {
+  from { transform: scaleX(0.25); }
+  to { transform: scaleX(1); }
+}
+/* Nothing is lost: the word already carries all five phases and does not move. What reduced motion
+   costs is the LIVENESS channel, and the elapsed clock (`.turn-elapsed`) replaces it -- a number
+   that increments once a second is a content update, not motion (design §6). */
+@media (prefers-reduced-motion: reduce) {
+  .turn-activity .meter-fill {
+    animation: none;
+    /* `animation: none` ALONE rendered a full 4ch bar, not "one cell of four" (whole-branch
+       review, 2026-09-20). The rule above declares `transform-origin` but no static `transform`,
+       so with the animation removed the computed transform is the initial `none` -- the identity
+       -- and `width: 100%` painted the whole meter. Design §4 explicitly rules out ever resting at
+       full, because a full bar reads as a completed percentage; so reduced motion was shipping the
+       one reading the design forbids. Stating the `from` value here is what makes §6's claim true,
+       and it is what keeps the reduced-motion variant saying WHICH phase it is in: the word and
+       the clock beside it are unchanged, and the meter is a static mark that a turn is in flight
+       rather than a bar reporting progress. */
+    transform: scaleX(0.25);
+  }
+}
+/* Secondary chrome text, the same pair `.position` uses just below -- selectors begin `.status-line
+   ` so the guard in `indexCss.test.ts` recognises this as the already-sanctioned chrome exemption
+   rather than needing a fifth one. */
+.status-line .turn-activity .turn-state,
+.status-line .turn-activity .turn-elapsed {
+  color: var(--nv-chrome-muted);
+}
 .status-line .position {
   margin-left: auto;
   color: var(--nv-chrome-muted);
+}
+/* --- what the status line sacrifices first as the panel narrows (whole-branch review, 2026-09-20)
+   `.status-line` is a nowrap flex row that could not shrink and never clipped, and the in-flight
+   indicator roughly DOUBLES its minimum content width: 4ch of meter plus `running NotebookEdit`
+   (design §3.2's own named worst case, 20ch) plus `123s+` plus two more 10px gaps, on a bar that
+   needed about 250px before it. So under pressure the phase word wrapped to a second line --
+   breaking the `min-height: 28px` that design §3.2 calls costless -- and past that `.position` and
+   the Stop button were pushed off the right edge. `App.tsx`'s own comment beside that button says
+   it is the ONLY Stop control for mouse users, so that was the interrupt affordance leaving the
+   screen, which must never happen.
+
+   **The priority order implemented here, first to give:**
+     1. the PHASE WORD truncates with an ellipsis (`running NotebookEdit` -> `running Note…`);
+     2. then the STATUS word, the same way;
+     3. then the POSITION counter.
+   **Never:** the meter, the elapsed clock, the mode block, and the Stop button. Those are
+   `flex: none`, so a narrow panel spends words and never spends the control that stops a turn.
+
+   **Correction (2026-09-20, re-review).** The order above is what the declarations produce only
+   after the change described in this paragraph; as first written they could not produce it at all,
+   and the test that claimed to guard it could not fail. `flex-shrink: 100` sat on `.turn-state`
+   and `flex-shrink: 10` on `.status` -- items in DIFFERENT flex containers (`.turn-activity` and
+   `.status-line`), which never compete in one distribution, so comparing the two numbers meant
+   nothing. What actually competed with `.status` was `.turn-activity` at the default 1, and by
+   Flexbox 9.7's `shrink x base size` the status word took ~68% of any deficit: at 12px monospace
+   `.status` = 10 x ~50px = 500 against `.turn-activity` = 1 x ~206px = 206. The STATUS word was
+   the first thing to go, not the phase word -- about 75px of squeeze erased it while the phase
+   word had lost ~21px, 3 of 20 characters. The large factor now sits on `.turn-activity`, the
+   item that really is `.status`'s sibling. There are two independent decisions here, and the
+   comment above is the OUTER one:
+
+   1. **Between the three children of `.status-line` that can give at all** (`.turn-activity`,
+      `.status`, `.position`, at 100 / 10 / 1): the indicator's whole box gives first, then the
+      status word, then the position counter.
+   2. **Inside `.turn-activity`** (`.meter`, `.turn-state`, `.turn-elapsed`): `.turn-state` is the
+      ONLY item there with a non-zero shrink factor, so decision 1 spending the indicator's box is
+      the same event as the phase word truncating -- which is what makes the outer order deliver
+      the documented one. Its own factor is therefore inert today, and is written as the plain
+      default rather than a large number that claims a priority it cannot express; it becomes a
+      real order only if a second shrinkable child is ever added there.
+
+   What `flex: none` buys the meter and the clock is that the DISTRIBUTION never spends them -- not
+   that they can never be clipped. Once the phase word is gone there is nothing left inside
+   `.turn-activity` to give, so a deeper squeeze takes the box below its own fixed content;
+   `overflow: hidden` on it is what makes that clip (rightmost first: the clock, then the meter)
+   instead of overflowing onto `.position`, which neither box clipped before. The panel width at
+   which any of this begins is a screen question, and design §12 asks a human for it.
+
+   Two mechanics worth knowing before editing this:
+   - Shrinking is distributed by `flex-shrink x base-size`, so the factors below are an ORDER
+     rather than a ratio -- the indicator's box absorbs ~97% of a deficit before the status word
+     gives anything, and only once an item has reached its own `min-width: 0` does the remainder
+     move on to the next. The `min-width: 0` on each is required: a flex item's automatic minimum
+     is its min-content size, which for a word is the whole word, and `text-overflow` would never
+     engage without it.
+   - `.winbar` answers the same problem with `flex-wrap: wrap`, and that is deliberately NOT copied
+     here. Line breaking is decided on base sizes BEFORE any shrinking, so a wrapping status line
+     would jump between one and two rows every time the phase word changed width -- the jitter
+     §3.2 promises there is none of, arriving by the other door. `white-space: nowrap` on the bar
+     is the other half of that: it is what stops a word wrapping inside its own box. */
+.status-line {
+  white-space: nowrap;
+}
+.status-line > * {
+  flex: 0 0 auto;
+}
+/* Decision 1, first rank: the indicator's whole box is what competes with the status word, so this
+   is where the large factor has to be. `overflow: hidden` is the floor -- see the correction above. */
+.status-line .turn-activity {
+  flex-shrink: 100;
+  min-width: 0;
+  overflow: hidden;
+}
+.status-line .turn-activity .turn-elapsed {
+  flex: none;
+}
+/* Decision 2: the only shrinkable child of `.turn-activity`, which is what turns rank 1 into "the
+   phase word truncates". The plain default, stated rather than inherited so that the day a second
+   shrinkable child appears here, this is a number someone has to choose rather than one nobody
+   noticed. */
+.status-line .turn-activity .turn-state {
+  flex-shrink: 1;
+}
+/* Decision 1, second rank. */
+.status-line .status {
+  flex-shrink: 10;
+}
+.status-line .position {
+  flex-shrink: 1;
+}
+.status-line .turn-activity .turn-state,
+.status-line .status,
+.status-line .position {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* The status word stays `--nv-chrome-fg`; the error colour is a dot in front of it. */
 .status-line .status-unavailable::before,
@@ -844,7 +1093,29 @@ body,
    Signal colours live on the gutter and the left border, never on the text: --nv-ok/--nv-error are
    guarded at 3:1 for non-text UI, and this file has already once drawn text in them at 2.05-3.84:1.
    `indexCss.test.ts` keeps every `color:` on --nv-fg/--nv-muted. */
-.permission-card-edit { border: 1px solid var(--nv-border); border-radius: 4px; overflow: hidden; }
+/* Widened the same way `.code-block`/`.tool-result-body` are (see the big comment above them):
+   `calc(100cqw - 30px)` against `.row`'s own query container. The difference here is that this
+   box, unlike those two, does not already sit flush against `.row-body`'s own left edge -- it is
+   inside `.permission-card`'s 10px padding AND its 1px border -- so `margin-left: -11px` pulls it
+   back out to that edge first (matching where the diff's own text and a plain paragraph both
+   start), and only then does the width reach `.row`'s right edge. **It was -10px until the
+   whole-branch review of 2026-09-20**, which is the padding alone: with the global `box-sizing:
+   border-box`, `.permission-card`'s content box begins 1 + 10 = 11px in, so pulling back only 10
+   left this box 1px right of where a code block starts and put its own right edge 1px past `.row`
+   -- painting over the card's `--nv-warn` right border, which is the cue that a permission is
+   pending. `overflow: hidden` on THIS box is what makes widening
+   it, rather than `.permission-card-diff`/`.diff-line` further down, the right target: anything
+   grown inside an `overflow: hidden` ancestor without also growing that ancestor is invisible,
+   clipped at its edge. Everything this box contains -- the head bar and the diff -- is a plain
+   block-level child with no width of its own, so it fills whatever width this rule gives the box;
+   nothing further down needs its own copy of this rule. */
+.permission-card-edit {
+  border: 1px solid var(--nv-border);
+  border-radius: 4px;
+  overflow: hidden;
+  width: calc(100cqw - 30px);
+  margin-left: -11px;
+}
 .permission-card-edit-head {
   display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
   padding: 6px 8px; background: var(--nv-surface); border-bottom: 1px solid var(--nv-border);

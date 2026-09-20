@@ -146,20 +146,50 @@ export type AgentUiState = {
    * every `seq` inside that snapshot -- so an item folded after a snapshot sorts after everything
    * the snapshot carried, and cannot collide with one of them. Incremented once per `applyEvent`
    * call, exactly as `AgentSessionProjection::apply` bumps `last_revision`, so on the healthy path
-   * the numbers are the same numbers Rust would have assigned rather than a parallel scheme. */
+   * the numbers are the same numbers Rust would have assigned rather than a parallel scheme.
+   *
+   * **One exception, since the in-flight motion change (2026-09-20):** a REPEATED thinking delta
+   * returns the incoming state untouched and advances nothing, so this counter and Rust's
+   * `last_revision` drift apart by one for each such delta. That is safe and is checked rather
+   * than assumed -- the skipped number is assigned to no item, locally folded `seq`s stay strictly
+   * increasing, every item in a snapshot sits below its `throughRevision`, and `applySnapshot`
+   * re-seeds this field from that number, so no collision and no reordering is reachable. Nothing
+   * in this frontend ever compares a `seq` here against a Rust-assigned one. See `applyEvent`'s
+   * own early return for why that delta must not allocate a render, let alone a number. */
   nextSeq: Seq;
+  /** Reducer-internal, never on the wire: true from a `content_delta` with `kind: "thinking"` until
+   * the next event of any other kind. The one ephemeral bit `turnPhase.ts`'s `phaseOf` reads that is
+   * not already sitting in the four collections above -- see `2026-09-20-in-flight-motion-design.md`
+   * §8.2. **Invariant: can only ever be LOST, never invented.** Every way of losing it (a resync, a
+   * reload, any other event) degrades the phase it feeds toward `sent`/`replying`/`tool` -- less
+   * specific, never wrong -- because it is cleared by the ABSENCE of a special case in `applyEvent`
+   * rather than by a maintained list of event types that ought to clear it. Nothing may set it to
+   * `true` anywhere but that one arm. */
+  turnThinking: boolean;
 };
 
 /** A snapshot as it ACTUALLY arrives from Rust, which is not an `AgentUiState`.
  *
- * `serialize_snapshot_for_js` emits neither of the two reducer-internal fields above -- they are
- * marked "never on the wire" for a reason and Rust has no key for either. Typing the inbound
- * envelope as a full `AgentUiState` asserted both were present and `number`/`boolean` when both are
- * `undefined` at runtime; `applySnapshot` overrides them immediately so nothing broke, but anything
- * that read `payload.state.nextSeq` before that -- a resync-diffing path, say, which is exactly the
- * kind of thing this area attracts -- would have got `undefined` with the compiler insisting on a
- * number. Subtracting them is the honest shape: what is missing is now missing in the type too. */
-export type AgentUiSnapshot = Omit<AgentUiState, "assistantMessageOpen" | "nextSeq">;
+ * `serialize_snapshot_for_js` emits neither of the three reducer-internal fields above -- they are
+ * marked "never on the wire" for a reason and Rust has no key for any of them. Typing the inbound
+ * envelope as a full `AgentUiState` asserted all three were present and `number`/`boolean` when all
+ * three are `undefined` at runtime; `applySnapshot` overrides them immediately so nothing broke, but
+ * anything that read `payload.state.nextSeq` before that -- a resync-diffing path, say, which is
+ * exactly the kind of thing this area attracts -- would have got `undefined` with the compiler
+ * insisting on a number. Subtracting them is the honest shape: what is missing is now missing in the
+ * type too. */
+export type AgentUiSnapshot = Omit<AgentUiState, "assistantMessageOpen" | "nextSeq" | "turnThinking">;
+
+/** How long a turn has been running, tracked in `App.tsx` alongside `AgentUiState` rather than
+ * inside it: it is a UI-local clock, not part of the projection Rust serializes, and it does not
+ * survive a page reload the way `AgentUiState` (rebuilt from a snapshot) does.
+ *
+ * `exact` is `true` only when this record was minted from a real `turn_started` event; a turn id
+ * first observed inside a `snapshot` envelope (a page reload, or a resync mid-turn) gets
+ * `exact: false`, because this panel cannot know how long the turn had already been running before
+ * it first saw it. Rendered `12s` when exact, `12s+` -- "at least this long" -- when not. See
+ * `2026-09-20-in-flight-motion-design.md` §8.4. */
+export type TurnClock = { turnId: string; since: number; exact: boolean };
 
 /** The handshake reply, before any session exists: which backend is behind the bridge and what it
  * genuinely offers. The start screen renders from this rather than hardcoding either backend's
