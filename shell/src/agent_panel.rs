@@ -322,6 +322,11 @@ impl AgentPanelHandle {
         self.dispatch(neovibe_core::agent_bridge::serialize_enter_input_for_js(), "enter-input");
     }
 
+    /// `Ctrl+a Ctrl+a` with the panel focused; see `serialize_select_all_for_js`.
+    pub(crate) fn select_all(&self) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_select_all_for_js(), "select-all");
+    }
+
     /// Global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md §3.3). Each
     /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
     /// drives the session, this handle only relays it to the WebView.

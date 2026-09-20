@@ -1,5 +1,9 @@
-//! Window chrome: top bar, window controls (minimize/maximize/close), status bar. Styling itself
-//! lives in `theme::gtk_css`.
+//! Window chrome: top bar and window controls (minimize/maximize/close). Styling itself lives in
+//! `theme::gtk_css`.
+//!
+//! **There is no bottom status bar** (deleted 2026-09-19, the owner's choice; UI spec §2 had already
+//! called for it). Its last job was naming the focused pane, which the cursors do on their own
+//! (`pane_focus`).
 
 use std::path::Path;
 
@@ -23,14 +27,27 @@ pub(crate) fn project_display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// Builds the top bar. Returns the bar and its keyboard-navigable items, in left-to-right order.
+/// The top bar and the parts of it other modules act on.
+pub(crate) struct TopBar {
+    /// The whole bar (the `WindowHandle` around it). Hidden in immersive mode (`window_mode`).
+    pub(crate) widget: gtk4::Widget,
+    /// Its keyboard-navigable items, left to right; see `build_top_bar`'s doc.
+    pub(crate) items: Vec<gtk4::Widget>,
+    /// Minimize/maximize/close. Hidden whenever the window is fullscreen (`window_mode`).
+    pub(crate) controls: gtk4::Widget,
+    /// The `neovibe` label, drawn as a solid block while the `Ctrl+a` prefix waits (`prefix`).
+    #[allow(dead_code)] // read by the `prefix` module (plan Task 3, spec §3.1); not consumed by Task 1
+    pub(crate) app_name: gtk4::Label,
+}
+
+/// Builds the top bar. Returns the bar and the parts of it other modules act on (`TopBar`).
 ///
 /// `Ctrl+k` reaches the top bar from either pane (2026-09-19): it is spatially above both, the
 /// same way `Ctrl+l` reaches the panel. The items are what `h`/`l` move between once there. Today
 /// that is only `↻`; the project switcher the UI spec puts at the left (§2.1) joins it when it
 /// lands. **The window controls are deliberately not items and cannot take focus at all** (see
 /// `build_window_controls`): a stray `Enter` after `Ctrl+k` must never be able to close the window.
-pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> (gtk4::Widget, Vec<gtk4::Widget>) {
+pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> TopBar {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("topbar");
     bar.set_valign(gtk4::Align::Fill);
@@ -60,14 +77,21 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     reload_agent.set_action_name(Some("app.reload-agent-panel"));
     reload_agent.add_css_class("topbar-item");
 
+    let controls = build_window_controls(window);
+
     bar.append(&app_name);
     bar.append(&project_name);
     bar.append(&reload_agent);
-    bar.append(&build_window_controls(window));
+    bar.append(&controls);
 
     let handle = gtk4::WindowHandle::new();
     handle.set_child(Some(&bar));
-    (handle.upcast(), vec![reload_agent.upcast()])
+    TopBar {
+        widget: handle.upcast(),
+        items: vec![reload_agent.upcast()],
+        controls,
+        app_name,
+    }
 }
 
 /// Carried over from `shell_chrome::build_window_controls` unchanged.
@@ -114,35 +138,6 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
     controls.append(&maximize);
     controls.append(&close);
     controls.upcast()
-}
-
-/// Bottom status bar strip. Returns the bar and the label that names the focused pane, which
-/// `pane_focus::install` keeps current.
-///
-/// **It used to say `NORMAL  —  Ln 1, Col 1`, hardcoded, and those strings never changed.** Nothing
-/// here reads nvim's mode or cursor. They were placeholders carried over from
-/// `poc/shell_chrome`, and a placeholder that looks like live data is a lie
-/// (`shell/MANUAL_VERIFICATION.md` recorded it reading `NORMAL` while nvim was in another mode).
-/// Both were removed and not replaced with a guess. nvim already draws its own mode and position in
-/// its own statusline, so a second copy here would only be worth having if it were live. Making it
-/// live means an RPC subscription this crate does not have. The one thing this bar can say
-/// truthfully is which pane has keyboard focus, so that is what it says now.
-pub(crate) fn build_status_bar() -> (gtk4::Widget, gtk4::Label) {
-    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    bar.add_css_class("statusbar");
-    bar.set_tooltip_text(Some("The pane with keyboard focus. Ctrl+l / Ctrl+h switch panes."));
-
-    let caption = gtk4::Label::new(Some("focus"));
-    caption.add_css_class("statusbar-caption");
-
-    // Empty until `pane_focus::install` applies the real focus, which it does at once.
-    let focused = gtk4::Label::new(None);
-    focused.add_css_class("statusbar-focus");
-
-    bar.append(&caption);
-    bar.append(&focused);
-
-    (bar.upcast(), focused)
 }
 
 #[cfg(test)]

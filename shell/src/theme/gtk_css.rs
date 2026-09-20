@@ -16,7 +16,6 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     // bg-guarded `muted` and the unguarded `mode_browse` are never used on chrome: a reversed
     // StatusLine makes `chrome` the colour they were pushed toward.
     let chrome_muted = tokens.chrome_muted.hex();
-    let chrome_accent = tokens.chrome_accent.hex();
     let border = tokens.border.hex();
     let hover = tokens.cursorline.hex();
     let error = tokens.error.hex();
@@ -51,6 +50,8 @@ window {{
     font-weight: 700;
     font-size: 13px;
     margin-right: 8px;
+    padding: 0 4px;
+    border-radius: 3px;
 }}
 
 .topbar-project-name {{
@@ -101,30 +102,6 @@ paned.content-area > separator {{
     background-color: {bg};
 }}
 
-.statusbar {{
-    background-color: {chrome};
-    border-top: 1px solid {border};
-    padding: 0 8px;
-    min-height: 24px;
-    color: {chrome_muted};
-    font-size: 11px;
-}}
-
-.statusbar-caption {{
-    color: {chrome_muted};
-    margin-right: 6px;
-}}
-
-/* The focused pane's name. It is text on chrome, so it is `chrome_fg` (guarded at 4.5:1 against
-   chrome). The accent goes on the rule beside it, never on the glyphs: `chrome_accent` is guarded
-   only at 3:1. */
-.statusbar-focus {{
-    color: {chrome_fg};
-    font-weight: 700;
-    border-left: 3px solid {chrome_accent};
-    padding-left: 5px;
-}}
-
 /* The top bar's keyboard cursor. `Ctrl+k` brings focus here, and the focused item is drawn the
    way every other cursor in this window is: a solid block with the glyph knocked out. The editor's
    block is Neovide's own, the panel's is its current row's sign cell. That is the whole focus
@@ -132,6 +109,14 @@ paned.content-area > separator {{
    reverse of the bar's guarded `chrome_fg`-on-`chrome` text pair, so it has the same 4.5:1.
    Placed after `.win-btn:hover` so a hovered AND focused button still shows the cursor. */
 .topbar-item:focus {{
+    background-color: {chrome_fg};
+    color: {chrome};
+}}
+
+/* The `Ctrl+a` prefix is waiting for its next key (shell::prefix). The same solid block as the top
+   bar's own cursor -- the pair is chrome_fg behind chrome text, guarded at 4.5:1 -- as the owner's
+   tmux theme highlights its session name while the prefix is down. */
+.topbar-app-name.prefix-armed {{
     background-color: {chrome_fg};
     color: {chrome};
 }}
@@ -226,7 +211,7 @@ mod tests {
         assert_eq!(css.matches('{').count(), css.matches('}').count());
     }
 
-    /// The body of the rule whose selector is exactly `selector` (`.statusbar`, not `.statusbar-accent`).
+    /// The body of the rule whose selector is exactly `selector` (`.win-btn`, not `.win-btn:hover`).
     fn rule<'a>(css: &'a str, selector: &str) -> &'a str {
         let start = css.find(&format!("\n{selector} {{")).unwrap_or_else(|| panic!("no rule {selector}"));
         let body = &css[start..];
@@ -235,8 +220,8 @@ mod tests {
 
     #[test]
     fn text_on_chrome_is_paired_with_chrome_not_with_the_window_background() {
-        // lunaperche: reversed StatusLine, no Function. With bg-guarded tokens the status bar's
-        // "NORMAL" came out at 1.00:1 on chrome.
+        // lunaperche: reversed StatusLine, no Function. With bg-guarded tokens the (since deleted)
+        // status bar's "NORMAL" came out at 1.00:1 on chrome; the top bar's text is the same pair.
         let t = ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: [
@@ -252,27 +237,11 @@ mod tests {
             (".topbar-app-name", t.chrome_fg, 4.5),
             (".topbar-project-name", t.chrome_muted, 4.5),
             (".win-btn", t.chrome_muted, 4.5),
-            (".statusbar", t.chrome_muted, 4.5),
-            (".statusbar-caption", t.chrome_muted, 4.5),
-            (".statusbar-focus", t.chrome_fg, 4.5),
         ] {
             let body = rule(&css, selector);
             assert!(body.contains(&format!("\n    color: {};", colour.hex())), "{selector}: {body}");
             assert!(colour.contrast(t.chrome) >= min, "{selector} is unreadable on chrome");
         }
-    }
-
-    /// The focused pane's name is text, so it gets a text-guarded colour. `chrome_accent` (3:1)
-    /// is allowed only on the rule beside it.
-    #[test]
-    fn the_focus_label_puts_the_accent_on_a_rule_never_on_its_text() {
-        let t = ThemeTokens::fallback();
-        let css = gtk_css(&t);
-        let body = rule(&css, ".statusbar-focus");
-        assert!(body.contains(&format!("\n    border-left: 3px solid {};", t.chrome_accent.hex())), "{body}");
-        let text_colours: Vec<&str> = body.lines().filter(|l| l.trim_start().starts_with("color:")).collect();
-        let expected = format!("    color: {};", t.chrome_fg.hex());
-        assert_eq!(text_colours, vec![expected.as_str()], "{body}");
     }
 
     /// Focus is shown by cursors, never by chrome around the panes (2026-09-19). The owner found a
@@ -290,6 +259,23 @@ mod tests {
             assert!(item.contains(&format!("color: {};", t.chrome.hex())), "{item}");
             assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
             assert!(css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(), "hover must not win");
+        }
+    }
+
+    /// The `Ctrl+a` prefix's indicator (`shell::prefix`, spec §3.1): the app-name label goes solid
+    /// while it waits, the same pair as the top bar's own focus cursor. Placed after the base
+    /// `.topbar-app-name` rule so it wins the cascade (equal specificity, later wins).
+    #[test]
+    fn the_prefix_indicator_reuses_the_cursor_pair_and_wins_the_cascade() {
+        for t in [dawn(), ThemeTokens::fallback()] {
+            let css = gtk_css(&t);
+            let armed = rule(&css, ".topbar-app-name.prefix-armed");
+            assert!(armed.contains(&format!("background-color: {};", t.chrome_fg.hex())), "{armed}");
+            assert!(armed.contains(&format!("color: {};", t.chrome.hex())), "{armed}");
+            assert!(
+                css.find("\n.topbar-app-name {").unwrap() < css.find("\n.topbar-app-name.prefix-armed {").unwrap(),
+                "the armed rule must come after the base rule"
+            );
         }
     }
 

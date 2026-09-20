@@ -75,6 +75,11 @@ type InboundHandler = (
      *  caret in it. Only the keyboard route sends this; a click on a row still lands in BROWSE on
      *  that row. See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "enter_input" }
+    /** `Ctrl+a Ctrl+a` (shell's `Ctrl+a` prefix) with this panel focused: WebKitGTK has no way to be
+     *  handed the key itself, so this is what `Ctrl+a` does in a text field -- select all of
+     *  whichever one has focus, nothing when none does. See `serialize_select_all_for_js` in
+     *  `core/src/agent_bridge.rs`. */
+    | { kind: "select_all" }
     /** Global `f` HINT: shell asking panel to report visible targets and freeze the list. */
     | { kind: "hint_collect"; sessionId: number }
     /** shell showing the frozen targets their labels, ready to start typing. */
@@ -108,6 +113,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "theme" ||
         obj.kind === "pane_focus" ||
         obj.kind === "enter_input" ||
+        obj.kind === "select_all" ||
         obj.kind === "hint_collect" ||
         obj.kind === "hint_show" ||
         obj.kind === "hint_prefix" ||

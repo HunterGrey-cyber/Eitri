@@ -178,6 +178,10 @@ pub struct LiveSession {
     /// position at all, so a scroll event's target grid cell has to come from here -- the last
     /// place the pointer was actually seen.
     pub(crate) last_pointer_pos: Cell<(f64, f64)>,
+    /// `LiveHarness::fullscreen_setting()` as the tick callback last read it, so the host's
+    /// `on_fullscreen_setting` callback fires on a change and not on every tick. Starts at
+    /// Neovide's own default (`false`), so a value `init.lua` set is reported on the first tick.
+    last_fullscreen_setting: Cell<bool>,
 }
 
 impl LiveSession {
@@ -197,6 +201,7 @@ impl LiveSession {
             active_drag: Cell::new(None),
             scroll_position: Cell::new((0.0, 0.0)),
             last_pointer_pos: Cell::new((0.0, 0.0)),
+            last_fullscreen_setting: Cell::new(false),
         }
     }
 
@@ -270,6 +275,7 @@ impl TickStats {
 /// in `NeovideEditorPane::new()`. Factored into a named alias purely to satisfy
 /// `clippy::type_complexity` -- no behavior difference from writing the nested type out inline.
 type ExitedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+type FullscreenCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
 
 /// The embeddable Neovide/Skia editor surface. Wraps a single `GtkGLArea` driving a real
 /// `nvim --embed` connection (`neovide::live_harness::LiveHarness`), with resize/IME/keyboard/
@@ -293,6 +299,11 @@ pub struct NeovideEditorPane {
     /// arrives before nvim has started is applied the moment the harness exists. See
     /// [`NeovideEditorPane::set_focused`].
     focused: Rc<Cell<Option<bool>>>,
+    /// See [`NeovideEditorPane::on_fullscreen_setting`].
+    fullscreen_callback: FullscreenCallbackSlot,
+    /// A [`NeovideEditorPane::set_fullscreen_setting`] made before nvim existed, handed over the
+    /// moment it does -- the same shape as `focused`. Only the last one matters.
+    pending_fullscreen: Rc<Cell<Option<bool>>>,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -414,6 +425,8 @@ impl NeovideEditorPane {
         let clear_color = Rc::new(Cell::new(OUTSIDE_COLOR));
         let focused: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
+        let fullscreen_callback: FullscreenCallbackSlot = Rc::new(RefCell::new(None));
+        let pending_fullscreen: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
 
         // --- resize: GtkGLArea's FBO can be resized/recreated under us, so drop the cached
         // Surface and let the next render() rebuild it against the new framebuffer dimensions
@@ -541,6 +554,7 @@ impl NeovideEditorPane {
             // ever constructed.
             let clear_color = clear_color.clone();
             let focused = focused.clone();
+            let pending_fullscreen = pending_fullscreen.clone();
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -679,6 +693,10 @@ impl NeovideEditorPane {
                                 if let Some(state) = focused.get() {
                                     harness.set_focused(state);
                                 }
+                                // Same for a fullscreen write the host made before nvim existed.
+                                if let Some(fullscreen) = pending_fullscreen.take() {
+                                    harness.set_fullscreen_setting(fullscreen);
+                                }
                                 *live = LiveState::Ready(Box::new(LiveSession::new(harness, grid_size)));
                             }
                             Err(err) => {
@@ -770,6 +788,9 @@ impl NeovideEditorPane {
             // that reentrant borrow would hit a `RefCell` `BorrowMutError` panic. See
             // `should_fire_exited_callback` below for how that's kept safe.
             let exited_callback_for_tick = exited_callback.clone();
+            // Fired after `live` is dropped, for the same reentrancy reason as the exited callback:
+            // the host's handler calls straight back into `set_fullscreen_setting`.
+            let fullscreen_callback_for_tick = fullscreen_callback.clone();
             let tick_stats = Rc::new(TickStats::new());
             gl_area.add_tick_callback(move |widget, _clock| {
                 let mut live = live_state.borrow_mut();
@@ -777,11 +798,16 @@ impl NeovideEditorPane {
                 // dropped -- see the comment on `exited_callback_for_tick` above for why the
                 // ordering matters.
                 let mut should_fire_exited_callback = false;
+                let mut fullscreen_changed: Option<bool> = None;
                 let issued = match &mut *live {
                     LiveState::Ready(session) => {
                         // Cheap, non-blocking drain of any nvim redraw traffic that arrived since
                         // the last tick.
                         session.harness.pump(Duration::ZERO);
+                        let fullscreen = session.harness.fullscreen_setting();
+                        if session.last_fullscreen_setting.replace(fullscreen) != fullscreen {
+                            fullscreen_changed = Some(fullscreen);
+                        }
                         let batches_now = session.harness.redraw_batches_seen();
                         let new_content = batches_now != session.last_seen_batches.get();
                         if new_content {
@@ -859,6 +885,13 @@ impl NeovideEditorPane {
                 };
                 drop(live);
 
+                if let Some(fullscreen) = fullscreen_changed {
+                    println!("[live] g:neovide_fullscreen is now {fullscreen}");
+                    if let Some(cb) = fullscreen_callback_for_tick.borrow().as_ref() {
+                        cb(fullscreen);
+                    }
+                }
+
                 if should_fire_exited_callback {
                     println!(
                         "[live] nvim exited on its own (not via a caller-initiated shutdown) -- \
@@ -879,7 +912,16 @@ impl NeovideEditorPane {
             });
         }
 
-        Self { widget: gl_area, im_context, live_state, exited_callback, clear_color, focused }
+        Self {
+            widget: gl_area,
+            im_context,
+            live_state,
+            exited_callback,
+            clear_color,
+            focused,
+            fullscreen_callback,
+            pending_fullscreen,
+        }
     }
 
     /// The `GtkGLArea` this pane renders into. The host places this into its own window (e.g. as
@@ -915,6 +957,51 @@ impl NeovideEditorPane {
     pub fn grab_focus(&self) {
         self.widget.grab_focus();
         self.im_context.focus_in();
+    }
+
+    /// Registers `callback`, called with the new value each time `g:neovide_fullscreen` changes in
+    /// nvim -- a `:let`, a mapping, or a value `init.lua` set (reported on the first tick after
+    /// nvim is ready). This pane owns no window, so it acts on nothing itself: the host owns the
+    /// real window and follows the variable. Read from the tick callback, so while this pane's
+    /// widget is hidden a change waits until it is shown again. Replaces any earlier callback.
+    pub fn on_fullscreen_setting(&self, callback: impl Fn(bool) + 'static) {
+        *self.fullscreen_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Writes `g:neovide_fullscreen` in nvim, for a host whose window changed fullscreen state for
+    /// a reason nvim did not see (its own key, the compositor), so the variable keeps matching the
+    /// window. The write goes through nvim's own watcher like a `:let`, so the host's
+    /// [`on_fullscreen_setting`](Self::on_fullscreen_setting) callback sees it come back; a host
+    /// that already matches the value it is told does nothing and so cannot ping-pong. Before nvim
+    /// is ready the value is held and written the moment it is.
+    pub fn set_fullscreen_setting(&self, fullscreen: bool) {
+        if let LiveState::Ready(session) = &*self.live_state.borrow() {
+            session.harness.set_fullscreen_setting(fullscreen);
+        } else {
+            self.pending_fullscreen.set(Some(fullscreen));
+        }
+    }
+
+    /// Sends `keys`, in nvim's own key notation (`"<C-a>"`), exactly as a typed key would arrive:
+    /// through `nvim_input`. For a host that took a key before this pane saw it and now hands it
+    /// on -- `shell`'s `Ctrl+a Ctrl+a`. Dropped, with a log line, before nvim is ready.
+    pub fn send_keys(&self, keys: &str) {
+        if let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() {
+            session.harness.send_text_input(keys);
+            session.wants_frame.set(true);
+        } else {
+            println!("[live] send_keys({keys:?}) before nvim is ready -- dropped");
+        }
+        self.widget.queue_render();
+    }
+
+    /// One grid cell's size in logical pixels (the unit GTK sizes and positions widgets in), or
+    /// `None` before nvim is ready. For a host that moves a divider by whole cells.
+    pub fn cell_size(&self) -> Option<(f64, f64)> {
+        let LiveState::Ready(session) = &*self.live_state.borrow() else { return None };
+        let scale = session.harness.grid_scale();
+        let factor = f64::from(self.widget.scale_factor().max(1));
+        Some((f64::from(scale.width()) / factor, f64::from(scale.height()) / factor))
     }
 
     /// Registers a callback fired (at most once) when the tick callback observes that nvim

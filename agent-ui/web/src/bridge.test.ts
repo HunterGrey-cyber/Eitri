@@ -75,6 +75,13 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith({ kind: "enter_input" });
   });
 
+  it("demuxes a select_all envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "select_all" }));
+    expect(handler).toHaveBeenCalledWith({ kind: "select_all" });
+  });
+
   it("demuxes a pane_focus envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);

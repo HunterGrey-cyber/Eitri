@@ -147,6 +147,30 @@ describe("pane focus", () => {
   });
 });
 
+describe("select_all (Ctrl+a Ctrl+a from shell's prefix)", () => {
+  it("selects all of the composer textarea's text while it has focus", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "pane_focus", focused: true });
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "hello world" } });
+    dispatch({ kind: "select_all" });
+    expect(textarea.selectionStart).toBe(0);
+    expect(textarea.selectionEnd).toBe(textarea.value.length);
+  });
+
+  it("does nothing in BROWSE, where no text field has focus", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    const before = document.activeElement;
+    expect(() => dispatch({ kind: "select_all" })).not.toThrow();
+    expect(document.activeElement).toBe(before);
+  });
+});
+
 describe("App handshake", () => {
   it("announces itself with a `ready` carrying a request id, before anything else", () => {
     render(<App />);

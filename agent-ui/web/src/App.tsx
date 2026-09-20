@@ -551,6 +551,16 @@ export default function App() {
         setPaneFocused(payload.focused);
       } else if (payload.kind === "enter_input") {
         setInputRequest((n) => n + 1);
+      } else if (payload.kind === "select_all") {
+        // `Ctrl+a Ctrl+a` (shell's prefix): what `Ctrl+a` does in a text field, since WebKitGTK
+        // cannot be handed the key itself. Nothing when no text field has focus.
+        // Deliberately NOT `isEditableElement`: that one answers "can a key be typed into this",
+        // which is true of a contentEditable div and of a checkbox, neither of which has `select()`.
+        // This needs "does this have a text selection", which is exactly these two types.
+        const el = document.activeElement;
+        if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
+          el.select();
+        }
       } else if (payload.kind === "hint_collect") {
         const root = containerRef.current ?? startScreenRef.current;
         frozenRef.current = root === null ? [] : hintTargets(root);
