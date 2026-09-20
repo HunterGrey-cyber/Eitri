@@ -14,9 +14,18 @@ use std::path::Path;
 const NEVER_BOUND: &[(&str, &str)] = &[
     // Parser inputs and file-name arguments: strings that name a socket file, not paths to one.
     // Every path actually built from them goes through `in_dir` at its own construction site.
-    ("src/instance_dir.rs", "stale_instance_dir_pid(\"neovibe-supervisor.sock\""),
-    ("src/instance_dir.rs", "sweep_stale_instance_dirs(&root, PREFIX, \"switch.sock\""),
-    ("src/instance_dir.rs", "sweep_stale_instance_dirs(&root, BIND_PREFIX, \"s.sock\""),
+    (
+        "src/instance_dir.rs",
+        "stale_instance_dir_pid(\"neovibe-supervisor.sock\"",
+    ),
+    (
+        "src/instance_dir.rs",
+        "sweep_stale_instance_dirs(&root, PREFIX, \"switch.sock\"",
+    ),
+    (
+        "src/instance_dir.rs",
+        "sweep_stale_instance_dirs(&root, BIND_PREFIX, \"s.sock\"",
+    ),
     // Deliberately a plain file, not a socket: the fixture for "this directory's socket answers
     // nothing", which is the case the sweep must reclaim.
     ("src/instance_dir.rs", "std::fs::write(silent.join(\"s.sock\")"),
@@ -45,10 +54,11 @@ fn every_sock_path_in_this_crate_is_built_through_agent_socket_path() {
             return;
         }
         let text = std::fs::read_to_string(file).unwrap();
-        for (n, line) in text.lines().enumerate() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
             let code = line.trim_start();
-            // A path handed straight to `in_dir` on the same line is checked.
-            if code.starts_with("//") || !mentions_a_sock_file(code) || code.contains("socket_path::in_dir(") {
+            // A name that reaches `in_dir` is checked by it, however rustfmt broke the call up.
+            if code.starts_with("//") || !mentions_a_sock_file(code) || routed_through_in_dir(&lines, n) {
                 continue;
             }
             if NEVER_BOUND.iter().any(|(f, s)| *f == rel && code.contains(s)) {
@@ -71,14 +81,41 @@ fn no_allowlist_entry_is_stale() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, needle) in NEVER_BOUND {
         let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
-        assert!(text.lines().any(|l| l.contains(needle)), "{file} no longer contains {needle:?}");
+        assert!(
+            text.lines().any(|l| l.contains(needle)),
+            "{file} no longer contains {needle:?}"
+        );
     }
+}
+
+/// Whether the `.sock` name on line `n` is an argument of a `socket_path::in_dir(` call.
+///
+/// The check used to be "the same line mentions `in_dir(`", which was true of every call site until
+/// `rustfmt.toml` landed (2026-09-19) and rustfmt wrapped the longer ones onto their own argument
+/// lines -- in `agent`, whose twin of this scanner had the same check, six correctly routed sites
+/// became offenders at once. The invariant was never about one line: it is that the name reaches
+/// `in_dir`, which owns the length cap. So walk back over the open argument list instead, stopping
+/// at the statement boundary a `;` or a blank line marks, and never further than a short window.
+fn routed_through_in_dir(lines: &[&str], n: usize) -> bool {
+    for line in lines[n.saturating_sub(4)..=n].iter().rev() {
+        let code = line.trim();
+        if code.contains("socket_path::in_dir(") || code.contains("in_dir(") && code.contains("socket_path") {
+            return true;
+        }
+        if code.is_empty() || code.ends_with(';') {
+            return false;
+        }
+    }
+    false
 }
 
 /// `.sock` as a file extension, not as the start of an identifier like `.socket_path`.
 fn mentions_a_sock_file(code: &str) -> bool {
     code.match_indices(".sock").any(|(i, m)| {
-        !code[i + m.len()..].chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        !code[i + m.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
     })
 }
 

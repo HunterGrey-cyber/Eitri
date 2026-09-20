@@ -97,7 +97,10 @@ mod tests {
         let too_long = "a".repeat(MAX_SOCKET_PATH_BYTES);
         let err = in_dir(dir, &too_long).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("104 bytes"), "the error should name the length: {err}");
+        assert!(
+            err.to_string().contains("104 bytes"),
+            "the error should name the length: {err}"
+        );
     }
 
     /// The limit is the real one, not a number copied from a comment: a path of exactly
@@ -119,7 +122,10 @@ mod tests {
         {
             let one_more = dir.join(format!("{name}y"));
             assert_eq!(one_more.as_os_str().len(), MAX_SOCKET_PATH_BYTES + 1);
-            assert!(std::os::unix::net::UnixListener::bind(&one_more).is_err(), "104 bytes must not bind on macOS");
+            assert!(
+                std::os::unix::net::UnixListener::bind(&one_more).is_err(),
+                "104 bytes must not bind on macOS"
+            );
             let _ = std::fs::remove_file(&one_more);
         }
     }
@@ -141,12 +147,15 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let path = sidecar_socket(Path::new("/t"), &id.to_string()).unwrap();
         assert_eq!(path, Path::new(&format!("/t/neovibe-sc-{}.sock", id.simple())));
-        assert_eq!(sidecar_socket(Path::new("/t"), "abc").unwrap(), Path::new("/t/neovibe-sc-abc.sock"));
+        assert_eq!(
+            sidecar_socket(Path::new("/t"), "abc").unwrap(),
+            Path::new("/t/neovibe-sc-abc.sock")
+        );
     }
 
     /// The assertion over every construction site. Any line in `agent/src` or `agent/tests` that
-    /// mentions `.sock` outside a comment has to be in this file, passed to `in_dir` on that same
-    /// line, or on the list below, and
+    /// mentions `.sock` outside a comment has to be in this file, passed to `in_dir` (on that line or
+    /// as an argument of the call a line or two above it), or on the list below, and
     /// every entry on the list says why that path is never bound. A new socket path built anywhere
     /// else fails here, on Linux, before it fails `bind` on a Mac.
     ///
@@ -175,10 +184,11 @@ mod tests {
                     return;
                 }
                 let text = std::fs::read_to_string(file).unwrap();
-                for (n, line) in text.lines().enumerate() {
+                let lines: Vec<&str> = text.lines().collect();
+                for (n, line) in lines.iter().enumerate() {
                     let code = line.trim_start();
-                    // A path handed straight to `in_dir` on the same line is checked.
-                    if code.starts_with("//") || !mentions_a_sock_file(code) || code.contains("socket_path::in_dir(") {
+                    // A name that reaches `in_dir` is checked by it, however rustfmt broke the call up.
+                    if code.starts_with("//") || !mentions_a_sock_file(code) || routed_through_in_dir(&lines, n) {
                         continue;
                     }
                     if NEVER_BOUND.iter().any(|(f, s)| *f == rel && code.contains(s)) {
@@ -196,9 +206,33 @@ mod tests {
     }
 
     /// `.sock` as a file extension, not as the start of an identifier like `.socket_path`.
+    /// Whether the `.sock` name on line `n` is an argument of a `socket_path::in_dir(` call.
+    ///
+    /// The check used to be "the same line mentions `in_dir(`", which was true of every call site
+    /// until `rustfmt.toml` landed (2026-09-19) and rustfmt wrapped the longer ones onto their own
+    /// argument lines -- six real, correctly routed sites became offenders at once. The invariant
+    /// was never about one line: it is that the name reaches `in_dir`, which owns the length cap.
+    /// So walk back over the open argument list instead, stopping at the statement boundary a `;`
+    /// or a blank line marks, and never further than a short window.
+    fn routed_through_in_dir(lines: &[&str], n: usize) -> bool {
+        for line in lines[n.saturating_sub(4)..=n].iter().rev() {
+            let code = line.trim();
+            if code.contains("socket_path::in_dir(") || code.contains("in_dir(") && code.contains("socket_path") {
+                return true;
+            }
+            if code.is_empty() || code.ends_with(';') {
+                return false;
+            }
+        }
+        false
+    }
+
     fn mentions_a_sock_file(code: &str) -> bool {
         code.match_indices(".sock").any(|(i, m)| {
-            !code[i + m.len()..].chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            !code[i + m.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         })
     }
 
