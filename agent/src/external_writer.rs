@@ -35,7 +35,12 @@ impl ExternalWriterWatch {
     pub fn start(cwd: &str, provider_session_id: &str, poll_interval: Duration) -> std::io::Result<Self> {
         let path = transcript_path(cwd, provider_session_id)?;
         let last_seen_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        Ok(Self { path, last_seen_mtime, last_checked: Instant::now(), poll_interval })
+        Ok(Self {
+            path,
+            last_seen_mtime,
+            last_checked: Instant::now(),
+            poll_interval,
+        })
     }
 
     /// Never blocks. Returns `Unchanged` if `poll_interval` hasn't elapsed since the last real

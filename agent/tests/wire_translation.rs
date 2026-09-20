@@ -23,7 +23,12 @@ fn init_line_becomes_session_started() {
 fn assistant_text_block_becomes_assistant_text() {
     let events = translate_line(fixture("assistant_text.json").trim());
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0], AgentEvent::AssistantText { text: "pong".to_string() });
+    assert_eq!(
+        events[0],
+        AgentEvent::AssistantText {
+            text: "pong".to_string()
+        }
+    );
 }
 
 #[test]
@@ -59,7 +64,12 @@ fn result_line_becomes_turn_finished() {
     let events = translate_line(fixture("result_success.json").trim());
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::TurnFinished { result_text, is_error, num_turns, .. } => {
+        AgentEvent::TurnFinished {
+            result_text,
+            is_error,
+            num_turns,
+            ..
+        } => {
             assert_eq!(result_text, "pong");
             assert!(!is_error);
             assert_eq!(*num_turns, 1);
@@ -118,9 +128,7 @@ fn unrecognized_content_block_kind_preserves_its_raw_json() {
 #[test]
 fn a_line_with_a_hook_subtype_this_crate_does_not_model_becomes_unknown() {
     // Real observed shape this crate deliberately does not special-case in v1.
-    let events = translate_line(
-        r#"{"type": "system", "subtype": "hook_started", "hook_id": "x", "session_id": "y"}"#,
-    );
+    let events = translate_line(r#"{"type": "system", "subtype": "hook_started", "hook_id": "x", "session_id": "y"}"#);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Unknown { kind, subtype, .. } => {
@@ -136,7 +144,9 @@ fn control_response_becomes_control_response_event() {
     let events = translate_line(fixture("v2_control_response_interrupt.json").trim());
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ControlResponse { request_id, subtype, .. } => {
+        AgentEvent::ControlResponse {
+            request_id, subtype, ..
+        } => {
             assert_eq!(request_id, "int-1");
             assert_eq!(subtype, "success");
         }
@@ -159,7 +169,12 @@ fn can_use_tool_control_request_becomes_permission_request_with_can_use_tool_sou
     let events = translate_line(fixture("v2_control_request_can_use_tool.json").trim());
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::PermissionRequest { request_id, tool_name, source, .. } => {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_name,
+            source,
+            ..
+        } => {
             assert_eq!(request_id, "ctu-1");
             assert_eq!(tool_name, "Bash");
             assert_eq!(*source, PermissionSource::CanUseTool);
@@ -186,7 +201,11 @@ fn can_use_tool_control_request_becomes_permission_request_with_can_use_tool_sou
 fn can_use_tool_never_passes_its_envelope_request_id_off_as_a_tool_use_id() {
     let events = translate_line(fixture("v2_control_request_can_use_tool.json").trim());
     match &events[0] {
-        AgentEvent::PermissionRequest { request_id, tool_use_id, .. } => {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_use_id,
+            ..
+        } => {
             assert_eq!(request_id, "ctu-1");
             assert_eq!(
                 tool_use_id.as_deref(),
@@ -211,9 +230,19 @@ fn can_use_tool_never_passes_its_envelope_request_id_off_as_a_tool_use_id() {
 fn a_can_use_tool_request_without_the_declared_tool_use_id_is_unlinked_rather_than_unparseable() {
     let line = r#"{"type":"control_request","request_id":"ctu-9","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi"}}}"#;
     let events = translate_line(line);
-    assert_eq!(events.len(), 1, "an absent optional field must not turn this into an Unknown");
+    assert_eq!(
+        events.len(),
+        1,
+        "an absent optional field must not turn this into an Unknown"
+    );
     match &events[0] {
-        AgentEvent::PermissionRequest { request_id, tool_use_id, tool_name, source, .. } => {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_use_id,
+            tool_name,
+            source,
+            ..
+        } => {
             assert_eq!(request_id, "ctu-9");
             assert_eq!(*tool_use_id, None);
             assert_eq!(tool_name, "Bash");

@@ -95,7 +95,10 @@ impl PaneSwitchChannel {
         // there is nothing to clear -- and an unconditional recursive delete of a `TMPDIR`-derived
         // path this process has not yet created is worth not having at all.
         if let Err(e) = std::fs::create_dir_all(&bin_dir) {
-            eprintln!("[pane_switch] could not create {}: {e} -- Ctrl+h/Ctrl+l pane switching disabled", bin_dir.display());
+            eprintln!(
+                "[pane_switch] could not create {}: {e} -- Ctrl+h/Ctrl+l pane switching disabled",
+                bin_dir.display()
+            );
             return None;
         }
         let fail = |what: String| {
@@ -105,7 +108,11 @@ impl PaneSwitchChannel {
 
         let fake_tmux = bin_dir.join("tmux");
         if let Err(e) = std::os::unix::fs::symlink(shim, &fake_tmux) {
-            fail(format!("could not link {} -> {}: {e}", fake_tmux.display(), shim.display()));
+            fail(format!(
+                "could not link {} -> {}: {e}",
+                fake_tmux.display(),
+                shim.display()
+            ));
             return None;
         }
 
@@ -131,8 +138,16 @@ impl PaneSwitchChannel {
             return None;
         }
 
-        println!("[pane_switch] fake tmux at {}, socket at {}", fake_tmux.display(), socket_path.display());
-        Some(Self { dir, socket_path, listener: Some(listener) })
+        println!(
+            "[pane_switch] fake tmux at {}, socket at {}",
+            fake_tmux.display(),
+            socket_path.display()
+        );
+        Some(Self {
+            dir,
+            socket_path,
+            listener: Some(listener),
+        })
     }
 
     /// The `(name, value)` pairs to hand to the embedded nvim child. **These must never be applied
@@ -150,10 +165,16 @@ impl PaneSwitchChannel {
             Err(_) => bin_dir.display().to_string(),
         };
         vec![
-            ("TMUX".to_string(), format!("{},{},0", self.socket_path.display(), std::process::id())),
+            (
+                "TMUX".to_string(),
+                format!("{},{},0", self.socket_path.display(), std::process::id()),
+            ),
             ("TMUX_PANE".to_string(), "%0".to_string()),
             ("PATH".to_string(), path),
-            ("NEOVIBE_PANE_SWITCH_SOCKET".to_string(), self.socket_path.display().to_string()),
+            (
+                "NEOVIBE_PANE_SWITCH_SOCKET".to_string(),
+                self.socket_path.display().to_string(),
+            ),
         ]
     }
 
@@ -306,7 +327,11 @@ mod tests {
         let prefix = format!("{DIR_PREFIX}{}-", std::process::id());
         for dir in [&a, &b] {
             assert!(dir.starts_with(&tmp), "not under TMPDIR: {}", dir.display());
-            let name = dir.file_name().expect("a named directory").to_string_lossy().into_owned();
+            let name = dir
+                .file_name()
+                .expect("a named directory")
+                .to_string_lossy()
+                .into_owned();
             assert!(name.starts_with(&prefix), "pid missing from {name}");
             // A 32-hex simple uuid, not an empty tail -- a `format!` that lost its uuid argument
             // would still satisfy the `starts_with` above while reintroducing the collision.
@@ -332,8 +357,14 @@ mod tests {
         assert!(!env["TMUX"].is_empty());
         assert!(!env["TMUX"].contains("tmate"));
         // The socket is the first comma-separated field, which is what `s:TmuxSocket()` reads.
-        assert_eq!(env["TMUX"].split(',').next().unwrap(), channel.socket_path.display().to_string());
-        assert_eq!(env["NEOVIBE_PANE_SWITCH_SOCKET"], channel.socket_path.display().to_string());
+        assert_eq!(
+            env["TMUX"].split(',').next().unwrap(),
+            channel.socket_path.display().to_string()
+        );
+        assert_eq!(
+            env["NEOVIBE_PANE_SWITCH_SOCKET"],
+            channel.socket_path.display().to_string()
+        );
 
         // PATH is *prepended to*, not replaced -- the child still needs to find `nvim`'s own
         // helpers, language servers, and everything else the user's config shells out to.
@@ -479,6 +510,9 @@ mod tests {
         // And on whatever `TMPDIR` this host actually has, with its real pid.
         let here = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
         let path = agent::socket_path::in_dir(&here, SOCKET_NAME).expect("must fit");
-        assert!(path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES, "{path:?}");
+        assert!(
+            path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES,
+            "{path:?}"
+        );
     }
 }

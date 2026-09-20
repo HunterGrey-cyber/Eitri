@@ -4,17 +4,28 @@
 //! permission/interrupt/close-fail-close scenarios; this file is scoped to the plain-text happy
 //! path only.
 
-use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode, TurnOutcome};
+use agent::{
+    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode, TurnOutcome,
+};
 
 #[test]
 #[ignore]
 fn a_real_turn_s_reply_arrives_via_pump() {
     let provider = ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string()).unwrap();
     let session_id = provider
-        .create_session(CreateSessionRequest { cwd: std::env::temp_dir().to_string_lossy().to_string(), permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial })
+        .create_session(CreateSessionRequest {
+            cwd: std::env::temp_dir().to_string_lossy().to_string(),
+            permission_mode: PermissionMode::Auto,
+            streaming: agent::StreamingPreference::Partial,
+        })
         .unwrap();
 
-    provider.send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "reply with exactly the word: pong".into() }).unwrap();
+    provider
+        .send_turn(agent::SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "reply with exactly the word: pong".into(),
+        })
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut full_text = String::new();
@@ -35,5 +46,7 @@ fn a_real_turn_s_reply_arrives_via_pump() {
     assert!(completed, "turn did not complete within 30s");
     assert!(full_text.to_lowercase().contains("pong"), "got: {full_text}");
 
-    provider.close_session(agent::CloseSessionRequest { session_id }).unwrap();
+    provider
+        .close_session(agent::CloseSessionRequest { session_id })
+        .unwrap();
 }

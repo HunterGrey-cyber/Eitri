@@ -92,7 +92,9 @@ fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(
 }
 
 fn turn_finished(events: &[AgentDomainEvent]) -> bool {
-    events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
 }
 
 fn text_of(events: &[AgentDomainEvent]) -> String {
@@ -122,7 +124,11 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
     eprintln!("---- {label}: {} events ----", events.len());
     for event in events {
         match event {
-            AgentDomainEvent::SessionOpened { provider_session_id, model, .. } => {
+            AgentDomainEvent::SessionOpened {
+                provider_session_id,
+                model,
+                ..
+            } => {
                 eprintln!("  SessionOpened   provider_session_id={provider_session_id} model={model}")
             }
             AgentDomainEvent::ContentDelta { text, .. } => {
@@ -131,7 +137,9 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::ToolCallStarted { name, tool_use_id, .. } => {
                 eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}")
             }
-            AgentDomainEvent::ToolCallCompleted { tool_use_id, is_error, .. } => {
+            AgentDomainEvent::ToolCallCompleted {
+                tool_use_id, is_error, ..
+            } => {
                 eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}")
             }
             AgentDomainEvent::TurnCompleted { outcome, .. } => eprintln!("  TurnCompleted   {outcome:?}"),
@@ -194,7 +202,10 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
     // "opus[1m]" in settings comes back as "claude-opus-5[1m]" on the wire: the CLI resolves the
     // alias. Compare on the family token, which survives that resolution.
     let family = declared_model.split('[').next().unwrap().to_string();
-    eprintln!("user tier: {} declares model {declared_model:?} (family {family:?})", config_dir.display());
+    eprintln!(
+        "user tier: {} declares model {declared_model:?} (family {family:?})",
+        config_dir.display()
+    );
 
     // ---- CONTROL: setting_sources ABSENT. Under ConfigurationProfile::NATIVE that means all three
     // tiers, so the user tier loads. Without this arm the test arm proves nothing: a tier that never
@@ -210,7 +221,10 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
     control
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: "Reply with exactly: ok".into() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "Reply with exactly: ok".into(),
+        })
         .expect("control turn");
     let control_events = drain_until(&control, 120, turn_finished);
     trace("control (setting_sources absent)", &control_events);
@@ -236,7 +250,10 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
         })
         .expect("test session");
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: "Reply with exactly: ok".into() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "Reply with exactly: ok".into(),
+        })
         .expect("test turn");
     let events = drain_until(&provider, 120, turn_finished);
     trace("test (setting_sources = [PROJECT, LOCAL])", &events);
@@ -299,11 +316,16 @@ fn tool_policy_deny_really_stops_a_bypass_session_from_running_bash() {
         None,
         false,
     );
-    request.policy.as_mut().unwrap().tool_policy =
-        Some(ToolPolicy { deny: vec!["NotebookEdit".to_string()], allow: None });
+    request.policy.as_mut().unwrap().tool_policy = Some(ToolPolicy {
+        deny: vec!["NotebookEdit".to_string()],
+        allow: None,
+    });
     let session_id = control.open_session(request).expect("control session");
     control
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: prompt.clone() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: prompt.clone(),
+        })
         .expect("control turn");
     let control_events = drain_until(&control, 150, turn_finished);
     trace("control (deny = [NotebookEdit])", &control_events);
@@ -344,7 +366,10 @@ fn tool_policy_deny_really_stops_a_bypass_session_from_running_bash() {
         })
         .expect("test session");
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: prompt })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: prompt,
+        })
         .expect("test turn");
     let events = drain_until(&provider, 150, turn_finished);
     trace("test (deny = CONSERVATIVE_DISALLOWED_TOOLS)", &events);

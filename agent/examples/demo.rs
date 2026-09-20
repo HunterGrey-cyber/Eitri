@@ -26,7 +26,10 @@ fn main() {
 
     println!("== agent v2 demo ==\n");
 
-    send_and_wait(&mut session, "Read the file agent/Cargo.toml and tell me, in one short sentence, what dependencies it declares.");
+    send_and_wait(
+        &mut session,
+        "Read the file agent/Cargo.toml and tell me, in one short sentence, what dependencies it declares.",
+    );
     send_and_wait(&mut session, "What was the first dependency you mentioned?");
 
     session.shutdown();
@@ -53,7 +56,10 @@ fn send_and_wait(session: &mut AgentSession, prompt: &str) {
             println!(
                 "[auto-approving] {tool_name} -- this demo has no interactive UI, see real_pretooluse_hook_allow_end_to_end/real_pretooluse_hook_deny_end_to_end for full round-trip examples"
             );
-            for event in session.respond_permission(&permission_id, agent::PermissionDecision::Allow).expect("respond_permission") {
+            for event in session
+                .respond_permission(&permission_id, agent::PermissionDecision::Allow)
+                .expect("respond_permission")
+            {
                 print_event(&event);
             }
         }
@@ -66,13 +72,27 @@ fn send_and_wait(session: &mut AgentSession, prompt: &str) {
 
 fn print_event(event: &AgentDomainEvent) {
     match event {
-        AgentDomainEvent::SessionOpened { session_id, provider_session_id, model, cwd } => {
-            println!("[session opened] id={session_id} provider_session_id={provider_session_id} model={model} cwd={cwd}");
+        AgentDomainEvent::SessionOpened {
+            session_id,
+            provider_session_id,
+            model,
+            cwd,
+        } => {
+            println!(
+                "[session opened] id={session_id} provider_session_id={provider_session_id} model={model} cwd={cwd}"
+            );
         }
         AgentDomainEvent::TurnStarted { turn_id } => println!("[turn started] {turn_id}"),
         AgentDomainEvent::UserPromptSubmitted { text } => println!("[user] {text}"),
-        AgentDomainEvent::ContentDelta { kind: agent::ContentKind::Text, text, .. } => println!("[assistant] {text}"),
-        AgentDomainEvent::ContentDelta { kind: agent::ContentKind::Thinking, .. } => println!("[thinking...]"),
+        AgentDomainEvent::ContentDelta {
+            kind: agent::ContentKind::Text,
+            text,
+            ..
+        } => println!("[assistant] {text}"),
+        AgentDomainEvent::ContentDelta {
+            kind: agent::ContentKind::Thinking,
+            ..
+        } => println!("[thinking...]"),
         AgentDomainEvent::ToolCallStarted { name, input, .. } => println!("[tool call] {name}({input})"),
         AgentDomainEvent::ToolCallCompleted { content, is_error, .. } => {
             println!("[tool result] error={is_error} content={content}");
@@ -83,7 +103,12 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
             println!("[permission resolved] id={permission_id} outcome={outcome:?}");
         }
-        AgentDomainEvent::TurnCompleted { result_text, outcome, usage, .. } => {
+        AgentDomainEvent::TurnCompleted {
+            result_text,
+            outcome,
+            usage,
+            ..
+        } => {
             // "unknown", not "$0.0000": a backend that reports no usage (the sidecar provider, whose
             // wire has no usage fields) must not print a figure it was never given.
             let cost = match usage {
@@ -92,7 +117,13 @@ fn print_event(event: &AgentDomainEvent) {
             };
             println!("\n[turn completed] outcome={outcome:?} cost={cost}\nresult: {result_text}\n");
         }
-        AgentDomainEvent::ResumeOutcome { requested_provider_session_id, status, attached_provider_session_id, forked, detail } => {
+        AgentDomainEvent::ResumeOutcome {
+            requested_provider_session_id,
+            status,
+            attached_provider_session_id,
+            forked,
+            detail,
+        } => {
             println!(
                 "[resume {status:?}] requested={requested_provider_session_id} attached={} forked={forked} detail={}",
                 attached_provider_session_id.as_deref().unwrap_or("-"),

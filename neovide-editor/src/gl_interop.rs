@@ -136,10 +136,7 @@ pub(crate) fn make_gl_interface() -> GlInterface {
 }
 
 /// Carried over verbatim from `neovide_embed::resolve_gl_proc`.
-unsafe fn resolve_gl_proc(
-    lib: &libloading::os::unix::Library,
-    name: &str,
-) -> *const std::ffi::c_void {
+unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
     unsafe {
         if let Ok(epoxy_name) = std::ffi::CString::new(format!("epoxy_{name}")) {
             if let Ok(sym) = lib.get::<*const std::ffi::c_void>(epoxy_name.as_bytes_with_nul()) {
@@ -196,7 +193,10 @@ pub(crate) fn grid_size_for_content_region(harness: &LiveHarness, content_region
         content_region.max.y - content_region.min.y,
     );
     let grid_size = pixel_size / harness.grid_scale();
-    GridSize::new(grid_size.width.floor().max(1.0) as u32, grid_size.height.floor().max(1.0) as u32)
+    GridSize::new(
+        grid_size.width.floor().max(1.0) as u32,
+        grid_size.height.floor().max(1.0) as u32,
+    )
 }
 
 /// Converts a widget-local *logical*-pixel position -- exactly what GTK4's `GestureClick`/
@@ -232,7 +232,10 @@ pub(crate) fn pixel_to_grid_pos(
     let grid_x = (pixel_x / grid_scale.width()).floor().max(0.0) as u32;
     let grid_y = (pixel_y / grid_scale.height()).floor().max(0.0) as u32;
 
-    (grid_x.min(grid_size.width.max(1) - 1), grid_y.min(grid_size.height.max(1) - 1))
+    (
+        grid_x.min(grid_size.width.max(1) - 1),
+        grid_y.min(grid_size.height.max(1) - 1),
+    )
 }
 
 /// `content_region` computed from `gl_area`'s own *current* framebuffer size -- the same
@@ -244,8 +247,7 @@ pub(crate) fn pixel_to_grid_pos(
 /// `connect_render` and would otherwise need its own borrow here for no benefit).
 pub(crate) fn current_content_region(gl_area: &GLArea, grid_scale: GridScale) -> PixelRect<f32> {
     let scale_factor = gl_area.scale_factor();
-    let region =
-        compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor);
+    let region = compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor);
     snap_region_to_grid(&region, grid_scale)
 }
 
@@ -284,10 +286,7 @@ pub(crate) fn current_content_region(gl_area: &GLArea, grid_scale: GridScale) ->
 /// height that is not yet a positive, finite number (nvim has not reported a font), no remainder,
 /// or a region too short for even one row -- in which case eating the remainder would leave a
 /// zero-height rect.
-pub(crate) fn snap_region_to_grid(
-    region: &PixelRect<f32>,
-    grid_scale: GridScale,
-) -> PixelRect<f32> {
+pub(crate) fn snap_region_to_grid(region: &PixelRect<f32>, grid_scale: GridScale) -> PixelRect<f32> {
     let cell_height = grid_scale.height();
     if !cell_height.is_finite() || cell_height <= 0.0 {
         return *region;
@@ -301,10 +300,7 @@ pub(crate) fn snap_region_to_grid(
     if !worth_moving {
         return *region;
     }
-    PixelRect::from_min_max(
-        (region.min.x, region.min.y + remainder),
-        (region.max.x, region.max.y),
-    )
+    PixelRect::from_min_max((region.min.x, region.min.y + remainder), (region.max.x, region.max.y))
 }
 
 pub(crate) fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f32>, color: Color4f) {
@@ -367,17 +363,29 @@ mod tests {
         // Right at content_region's own top-left corner -> grid cell (0, 0), not wherever (0, 0)
         // of the raw framebuffer would map to -- this is the whole point of subtracting
         // content_region.min before dividing by grid_scale.
-        assert_eq!(pixel_to_grid_pos(40.0, 40.0, 1, &content_region, grid_scale, grid_size), (0, 0));
+        assert_eq!(
+            pixel_to_grid_pos(40.0, 40.0, 1, &content_region, grid_scale, grid_size),
+            (0, 0)
+        );
 
         // One cell right/down of that (scale_factor=1, so logical == device pixels here).
-        assert_eq!(pixel_to_grid_pos(49.0, 58.0, 1, &content_region, grid_scale, grid_size), (1, 1));
+        assert_eq!(
+            pixel_to_grid_pos(49.0, 58.0, 1, &content_region, grid_scale, grid_size),
+            (1, 1)
+        );
 
         // scale_factor=2 (HiDPI): logical (20, 20) is device pixel (40, 40) -- same as the first
         // case above once converted, so still grid cell (0, 0).
-        assert_eq!(pixel_to_grid_pos(20.0, 20.0, 2, &content_region, grid_scale, grid_size), (0, 0));
+        assert_eq!(
+            pixel_to_grid_pos(20.0, 20.0, 2, &content_region, grid_scale, grid_size),
+            (0, 0)
+        );
 
         // Anything left of/above content_region clamps to 0 rather than underflowing.
-        assert_eq!(pixel_to_grid_pos(0.0, 0.0, 1, &content_region, grid_scale, grid_size), (0, 0));
+        assert_eq!(
+            pixel_to_grid_pos(0.0, 0.0, 1, &content_region, grid_scale, grid_size),
+            (0, 0)
+        );
 
         // Anything past the grid's own reported size clamps to grid_size - 1, matching
         // `MouseManager::get_relative_position_at`'s own clamp.
@@ -404,7 +412,10 @@ mod snap_tests {
         let snapped = snap_region_to_grid(&pane, grid_scale);
 
         assert_eq!(snapped.min.y, 14.0, "the remainder should now be ABOVE the grid");
-        assert_eq!(snapped.max.y, 1598.0, "the bottom edge must be flush -- that is the fix");
+        assert_eq!(
+            snapped.max.y, 1598.0,
+            "the bottom edge must be flush -- that is the fix"
+        );
         let height = snapped.max.y - snapped.min.y;
         assert_eq!(height % 44.0, 0.0, "a snapped region is whole cells");
         assert_eq!(height / 44.0, 36.0, "and the same 36 rows as before, not one fewer");
@@ -460,8 +471,7 @@ mod snap_tests {
     fn hit_testing_through_the_snapped_region_lands_on_the_right_row() {
         let grid_scale = GridScale::new(PixelSize::new(22.0, 44.0));
         let grid_size = GridSize::new(63_u32, 36);
-        let snapped =
-            snap_region_to_grid(&PixelRect::from_min_max((0.0, 0.0), (1400.0, 1598.0)), grid_scale);
+        let snapped = snap_region_to_grid(&PixelRect::from_min_max((0.0, 0.0), (1400.0, 1598.0)), grid_scale);
 
         // The first painted pixel row of the grid is y=14, not y=0.
         assert_eq!(pixel_to_grid_pos(0.0, 14.0, 1, &snapped, grid_scale, grid_size).1, 0);

@@ -181,9 +181,5 @@ fn apply_css(css: &str) {
     provider.load_from_string(css);
 
     let display = gtk4::gdk::Display::default().expect("no default GDK display");
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    gtk4::style_context_add_provider_for_display(&display, &provider, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 }

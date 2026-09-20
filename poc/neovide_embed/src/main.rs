@@ -142,10 +142,7 @@ fn make_gl_interface() -> GlInterface {
     }
 }
 
-unsafe fn resolve_gl_proc(
-    lib: &libloading::os::unix::Library,
-    name: &str,
-) -> *const std::ffi::c_void {
+unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
     unsafe {
         // Preferred: libepoxy's `epoxy_<name>` dispatch-pointer *variable*. See
         // gl_skia_test::resolve_gl_proc's doc comment for the full nm -D-verified explanation of

@@ -40,7 +40,9 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             model: ready.model,
             cwd: ready.cwd,
         }),
-        ProtoEvent::TurnStarted(started) => Some(AgentDomainEvent::TurnStarted { turn_id: started.turn_id }),
+        ProtoEvent::TurnStarted(started) => Some(AgentDomainEvent::TurnStarted {
+            turn_id: started.turn_id,
+        }),
         ProtoEvent::TextDelta(delta) => Some(AgentDomainEvent::ContentDelta {
             turn_id: delta.turn_id,
             kind: ContentKind::Text,
@@ -51,18 +53,20 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             kind: ContentKind::Thinking,
             text: delta.text,
         }),
-        ProtoEvent::ToolCallStarted(started) => match serde_json::from_str(&started.input_json) {
-            Ok(input) => Some(AgentDomainEvent::ToolCallStarted {
-                turn_id: started.turn_id,
-                tool_use_id: started.tool_use_id,
-                name: started.name,
-                input,
-            }),
-            Err(e) => {
-                eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallStarted.input_json, dropping this event: {e}");
-                None
+        ProtoEvent::ToolCallStarted(started) => {
+            match serde_json::from_str(&started.input_json) {
+                Ok(input) => Some(AgentDomainEvent::ToolCallStarted {
+                    turn_id: started.turn_id,
+                    tool_use_id: started.tool_use_id,
+                    name: started.name,
+                    input,
+                }),
+                Err(e) => {
+                    eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallStarted.input_json, dropping this event: {e}");
+                    None
+                }
             }
-        },
+        }
         ProtoEvent::ToolCallCompleted(completed) => match serde_json::from_str(&completed.content_json) {
             Ok(content) => Some(AgentDomainEvent::ToolCallCompleted {
                 turn_id: completed.turn_id,
@@ -104,7 +108,7 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 permission_id: resolved.permission_id,
                 outcome,
             })
-        },
+        }
         ProtoEvent::TurnCompleted(completed) => {
             let outcome = translate_turn_outcome(completed.outcome());
             Some(AgentDomainEvent::TurnCompleted {
@@ -123,7 +127,7 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 // put in it.
                 usage: None,
             })
-        },
+        }
         ProtoEvent::SessionClosed(closed) => Some(AgentDomainEvent::SessionClosed {
             reason: translate_close_reason(closed.reason()),
         }),
@@ -135,8 +139,7 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 // The wire uses an empty string for "not set" on a plain string field. An empty id
                 // is not an id, so it becomes None rather than travelling inward as `Some("")` and
                 // failing an equality check for the wrong reason.
-                attached_provider_session_id: Some(outcome.attached_provider_session_id)
-                    .filter(|id| !id.is_empty()),
+                attached_provider_session_id: Some(outcome.attached_provider_session_id).filter(|id| !id.is_empty()),
                 forked: outcome.forked,
                 detail: Some(outcome.detail).filter(|d| !d.trim().is_empty()),
             })
@@ -145,7 +148,9 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             // Diagnostics only, per design doc §3.2/§5.2 -- never surfaced as a domain event.
             eprintln!(
                 "agent: ClaudeSidecarProvider: ProviderNotice kind={} subtype={:?} (turn {})",
-                notice.kind, notice.subtype, envelope_turn_id.unwrap_or_default()
+                notice.kind,
+                notice.subtype,
+                envelope_turn_id.unwrap_or_default()
             );
             None
         }
@@ -178,7 +183,9 @@ fn translate_permission_outcome(outcome: ProtoPermissionOutcome) -> PermissionOu
         ProtoPermissionOutcome::ProviderFailed => PermissionOutcome::ProviderFailed,
         ProtoPermissionOutcome::Expired => PermissionOutcome::Expired,
         ProtoPermissionOutcome::Unspecified => {
-            eprintln!("agent: ClaudeSidecarProvider: PermissionOutcome::Unspecified from the wire, treating as Expired");
+            eprintln!(
+                "agent: ClaudeSidecarProvider: PermissionOutcome::Unspecified from the wire, treating as Expired"
+            );
             PermissionOutcome::Expired
         }
     }
@@ -214,12 +221,18 @@ mod tests {
     use super::*;
     use claude_runtime_protocol::v1::{
         PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved, ProviderNotice,
-        SessionClosed, SessionCloseReason, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted,
-        ToolCallStarted, TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
+        SessionCloseReason, SessionClosed, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted, ToolCallStarted,
+        TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
     };
 
     fn wrap(event: ProtoEvent) -> ProtoSessionEvent {
-        ProtoSessionEvent { session_id: "sess-1".into(), sequence: 1, occurred_at: 0, turn_id: None, event: Some(event) }
+        ProtoSessionEvent {
+            session_id: "sess-1".into(),
+            sequence: 1,
+            occurred_at: 0,
+            turn_id: None,
+            event: Some(event),
+        }
     }
 
     #[test]
@@ -247,36 +260,75 @@ mod tests {
 
     #[test]
     fn turn_started_translates() {
-        let event = wrap(ProtoEvent::TurnStarted(TurnStarted { turn_id: "turn-1".into() }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() }));
+        let event = wrap(ProtoEvent::TurnStarted(TurnStarted {
+            turn_id: "turn-1".into(),
+        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::TurnStarted {
+                turn_id: "turn-1".into()
+            })
+        );
     }
 
     #[test]
     fn text_delta_translates_with_text_kind() {
-        let event = wrap(ProtoEvent::TextDelta(TextDelta { turn_id: "turn-1".into(), text: "hi".into() }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "hi".into() }));
+        let event = wrap(ProtoEvent::TextDelta(TextDelta {
+            turn_id: "turn-1".into(),
+            text: "hi".into(),
+        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::ContentDelta {
+                turn_id: "turn-1".into(),
+                kind: ContentKind::Text,
+                text: "hi".into()
+            })
+        );
     }
 
     #[test]
     fn thinking_delta_translates_with_thinking_kind() {
-        let event = wrap(ProtoEvent::ThinkingDelta(ThinkingDelta { turn_id: "turn-1".into(), text: "hmm".into() }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Thinking, text: "hmm".into() }));
+        let event = wrap(ProtoEvent::ThinkingDelta(ThinkingDelta {
+            turn_id: "turn-1".into(),
+            text: "hmm".into(),
+        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::ContentDelta {
+                turn_id: "turn-1".into(),
+                kind: ContentKind::Thinking,
+                text: "hmm".into()
+            })
+        );
     }
 
     #[test]
     fn tool_call_started_parses_input_json() {
         let event = wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
-            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), name: "Bash".into(), input_json: r#"{"command":"echo hi"}"#.into(),
+            turn_id: "turn-1".into(),
+            tool_use_id: "tu-1".into(),
+            name: "Bash".into(),
+            input_json: r#"{"command":"echo hi"}"#.into(),
         }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::ToolCallStarted {
-            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), name: "Bash".into(), input: serde_json::json!({"command": "echo hi"}),
-        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::ToolCallStarted {
+                turn_id: "turn-1".into(),
+                tool_use_id: "tu-1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "echo hi"}),
+            })
+        );
     }
 
     #[test]
     fn tool_call_started_drops_the_event_on_unparseable_input_json() {
         let event = wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
-            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), name: "Bash".into(), input_json: "not json".into(),
+            turn_id: "turn-1".into(),
+            tool_use_id: "tu-1".into(),
+            name: "Bash".into(),
+            input_json: "not json".into(),
         }));
         assert_eq!(translate(event), None);
     }
@@ -284,7 +336,10 @@ mod tests {
     #[test]
     fn tool_call_completed_drops_the_event_on_unparseable_content_json() {
         let event = wrap(ProtoEvent::ToolCallCompleted(ToolCallCompleted {
-            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), content_json: "not json".into(), is_error: false,
+            turn_id: "turn-1".into(),
+            tool_use_id: "tu-1".into(),
+            content_json: "not json".into(),
+            is_error: false,
         }));
         assert_eq!(translate(event), None);
     }
@@ -292,21 +347,39 @@ mod tests {
     #[test]
     fn tool_call_completed_parses_content_json() {
         let event = wrap(ProtoEvent::ToolCallCompleted(ToolCallCompleted {
-            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), content_json: r#""hi""#.into(), is_error: false,
+            turn_id: "turn-1".into(),
+            tool_use_id: "tu-1".into(),
+            content_json: r#""hi""#.into(),
+            is_error: false,
         }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::ToolCallCompleted {
-            turn_id: "turn-1".into(), tool_use_id: "tu-1".into(), content: serde_json::json!("hi"), is_error: false,
-        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::ToolCallCompleted {
+                turn_id: "turn-1".into(),
+                tool_use_id: "tu-1".into(),
+                content: serde_json::json!("hi"),
+                is_error: false,
+            })
+        );
     }
 
     #[test]
     fn permission_requested_carries_tool_use_id_and_parses_input_json() {
         let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
-            permission_id: "perm-1".into(), tool_use_id: "tu-1".into(), tool_name: "Write".into(), input_json: "{}".into(),
+            permission_id: "perm-1".into(),
+            tool_use_id: "tu-1".into(),
+            tool_name: "Write".into(),
+            input_json: "{}".into(),
         }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::PermissionRequested {
-            permission_id: "perm-1".into(), tool_use_id: Some("tu-1".into()), tool_name: "Write".into(), input: serde_json::json!({}),
-        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::PermissionRequested {
+                permission_id: "perm-1".into(),
+                tool_use_id: Some("tu-1".into()),
+                tool_name: "Write".into(),
+                input: serde_json::json!({}),
+            })
+        );
     }
 
     /// proto3 has no absent string, so a `tool_use_id` the provider never set arrives here as
@@ -318,11 +391,20 @@ mod tests {
     #[test]
     fn an_unset_proto3_tool_use_id_arrives_as_an_empty_string_and_is_not_treated_as_a_link() {
         let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
-            permission_id: "perm-1".into(), tool_use_id: String::new(), tool_name: "Write".into(), input_json: "{}".into(),
+            permission_id: "perm-1".into(),
+            tool_use_id: String::new(),
+            tool_name: "Write".into(),
+            input_json: "{}".into(),
         }));
-        assert_eq!(translate(event), Some(AgentDomainEvent::PermissionRequested {
-            permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Write".into(), input: serde_json::json!({}),
-        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::PermissionRequested {
+                permission_id: "perm-1".into(),
+                tool_use_id: None,
+                tool_name: "Write".into(),
+                input: serde_json::json!({}),
+            })
+        );
     }
 
     #[test]
@@ -330,14 +412,29 @@ mod tests {
         let cases = [
             (ProtoPermOutcome::Allowed, PermissionOutcome::Allowed),
             (ProtoPermOutcome::Denied, PermissionOutcome::Denied),
-            (ProtoPermOutcome::CancelledByInterrupt, PermissionOutcome::CancelledByInterrupt),
-            (ProtoPermOutcome::CancelledBySessionClose, PermissionOutcome::CancelledBySessionClose),
+            (
+                ProtoPermOutcome::CancelledByInterrupt,
+                PermissionOutcome::CancelledByInterrupt,
+            ),
+            (
+                ProtoPermOutcome::CancelledBySessionClose,
+                PermissionOutcome::CancelledBySessionClose,
+            ),
             (ProtoPermOutcome::ProviderFailed, PermissionOutcome::ProviderFailed),
             (ProtoPermOutcome::Expired, PermissionOutcome::Expired),
         ];
         for (proto_outcome, expected) in cases {
-            let event = wrap(ProtoEvent::PermissionResolved(PermissionResolved { permission_id: "perm-1".into(), outcome: proto_outcome as i32 }));
-            assert_eq!(translate(event), Some(AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: expected }));
+            let event = wrap(ProtoEvent::PermissionResolved(PermissionResolved {
+                permission_id: "perm-1".into(),
+                outcome: proto_outcome as i32,
+            }));
+            assert_eq!(
+                translate(event),
+                Some(AgentDomainEvent::PermissionResolved {
+                    permission_id: "perm-1".into(),
+                    outcome: expected
+                })
+            );
         }
     }
 
@@ -355,11 +452,22 @@ mod tests {
         ];
         for (proto_outcome, expected) in cases {
             let event = wrap(ProtoEvent::TurnCompleted(TurnCompleted {
-                turn_id: "turn-1".into(), outcome: proto_outcome as i32, result_text: "done".into(), is_error: false, stop_reason: Some("end_turn".into()),
+                turn_id: "turn-1".into(),
+                outcome: proto_outcome as i32,
+                result_text: "done".into(),
+                is_error: false,
+                stop_reason: Some("end_turn".into()),
             }));
-            assert_eq!(translate(event), Some(AgentDomainEvent::TurnCompleted {
-                turn_id: "turn-1".into(), outcome: expected, result_text: "done".into(), stop_reason: Some("end_turn".into()), usage: None,
-            }));
+            assert_eq!(
+                translate(event),
+                Some(AgentDomainEvent::TurnCompleted {
+                    turn_id: "turn-1".into(),
+                    outcome: expected,
+                    result_text: "done".into(),
+                    stop_reason: Some("end_turn".into()),
+                    usage: None,
+                })
+            );
         }
     }
 
@@ -371,14 +479,24 @@ mod tests {
             (SessionCloseReason::ProviderFailed, "provider_failed"),
         ];
         for (proto_reason, expected) in cases {
-            let event = wrap(ProtoEvent::SessionClosed(SessionClosed { reason: proto_reason as i32 }));
-            assert_eq!(translate(event), Some(AgentDomainEvent::SessionClosed { reason: expected.to_string() }));
+            let event = wrap(ProtoEvent::SessionClosed(SessionClosed {
+                reason: proto_reason as i32,
+            }));
+            assert_eq!(
+                translate(event),
+                Some(AgentDomainEvent::SessionClosed {
+                    reason: expected.to_string()
+                })
+            );
         }
     }
 
     #[test]
     fn provider_notice_never_becomes_a_domain_event() {
-        let event = wrap(ProtoEvent::ProviderNotice(ProviderNotice { kind: "diagnostic".into(), subtype: None }));
+        let event = wrap(ProtoEvent::ProviderNotice(ProviderNotice {
+            kind: "diagnostic".into(),
+            subtype: None,
+        }));
         assert_eq!(translate(event), None);
     }
 }

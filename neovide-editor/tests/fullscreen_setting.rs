@@ -22,7 +22,7 @@ use neovide::{
     live_harness::{LiveHarness, LiveHarnessOptions},
     units::{GridSize, PixelRect},
 };
-use skia_safe::{Surface, surfaces};
+use skia_safe::{surfaces, Surface};
 
 /// Readiness is decided by the renderer as it handles draw commands, so the harness is driven the
 /// way a host drives it: one frame at a time, into a CPU raster surface (no GPU, no window).
@@ -34,7 +34,10 @@ struct Frames {
 impl Frames {
     fn new() -> Self {
         let surface = surfaces::raster_n32_premul((320, 160)).expect("raster surface");
-        Self { surface, region: PixelRect::from_min_max((0.0, 0.0), (320.0, 160.0)) }
+        Self {
+            surface,
+            region: PixelRect::from_min_max((0.0, 0.0), (320.0, 160.0)),
+        }
     }
 
     fn step(&mut self, harness: &mut LiveHarness) {
@@ -47,7 +50,10 @@ impl Frames {
 fn wait_for(harness: &mut LiveHarness, frames: &mut Frames, want: bool, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while harness.fullscreen_setting() != want {
-        assert!(Instant::now() < deadline, "{what}: fullscreen_setting() never became {want}");
+        assert!(
+            Instant::now() < deadline,
+            "{what}: fullscreen_setting() never became {want}"
+        );
         frames.step(harness);
     }
 }
@@ -85,7 +91,10 @@ fn main() {
     let mut frames = Frames::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !harness.is_ready() {
-        assert!(Instant::now() < deadline && !harness.has_neovim_exited(), "nvim never became ready");
+        assert!(
+            Instant::now() < deadline && !harness.has_neovim_exited(),
+            "nvim never became ready"
+        );
         frames.step(&mut harness);
     }
 

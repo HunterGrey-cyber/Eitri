@@ -111,9 +111,11 @@ impl TurnTrace {
                         self.turn_id = Some(turn_id.clone());
                     }
                 }
-                AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. }
-                    if self.first_presentation_delta.is_none() && !text.is_empty() =>
-                {
+                AgentDomainEvent::ContentDelta {
+                    kind: ContentKind::Text,
+                    text,
+                    ..
+                } if self.first_presentation_delta.is_none() && !text.is_empty() => {
                     self.first_presentation_delta = Some(self.since_submit());
                     carried_first_text = true;
                 }
@@ -159,8 +161,7 @@ impl TurnTrace {
     /// (an interrupt before any text, a session that died first) is finished without it, so this
     /// also reports true when there is nothing left to wait for.
     pub fn is_complete(&self) -> bool {
-        self.is_finished()
-            && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none())
+        self.is_finished() && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none())
     }
 
     /// Prints the line. Idempotent: the caller emits on completion and again on a deadline, and only
@@ -207,7 +208,11 @@ mod tests {
     }
 
     fn text(s: &str) -> AgentDomainEvent {
-        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: s.into() }
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: s.into(),
+        }
     }
 
     #[test]
@@ -217,14 +222,21 @@ mod tests {
         // presentation delta would make the pipeline look faster than a reader could possibly see.
         let carried = trace.observe(&[
             AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
-            AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() },
+            AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: ContentKind::Thinking,
+                text: "hmm".into(),
+            },
         ]);
         assert!(!carried);
         assert!(trace.first_provider_event.is_some());
         assert!(trace.first_presentation_delta.is_none());
         assert_eq!(trace.turn_id.as_deref(), Some("t1"));
 
-        assert!(trace.observe(&[text("hello")]), "the batch carrying the first text must say so");
+        assert!(
+            trace.observe(&[text("hello")]),
+            "the batch carrying the first text must say so"
+        );
         assert!(trace.first_presentation_delta.is_some());
     }
 
@@ -252,7 +264,10 @@ mod tests {
         let dispatched = trace.first_text_dispatched.unwrap();
         trace.mark_painted(40.0);
         let painted = trace.first_paint_frame.unwrap();
-        assert!(painted >= dispatched + Duration::from_millis(39), "{painted:?} vs {dispatched:?}");
+        assert!(
+            painted >= dispatched + Duration::from_millis(39),
+            "{painted:?} vs {dispatched:?}"
+        );
         // A second report is ignored -- the mark is "first", and a later frame is not it.
         trace.mark_painted(500.0);
         assert_eq!(trace.first_paint_frame, Some(painted));
@@ -281,11 +296,17 @@ mod tests {
     fn a_turn_that_produced_no_text_is_complete_without_a_paint() {
         let mut trace = trace();
         trace.observe(&[AgentDomainEvent::TurnCompleted {
-            turn_id: "t1".into(), outcome: TurnOutcome::Interrupted, result_text: String::new(),
-            stop_reason: None, usage: None,
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Interrupted,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
         }]);
         assert!(trace.is_finished());
-        assert!(trace.is_complete(), "nothing is still coming, so waiting for a paint would hang the line");
+        assert!(
+            trace.is_complete(),
+            "nothing is still coming, so waiting for a paint would hang the line"
+        );
     }
 
     /// The slow and broken turns are the ones worth tracing, so a session that dies mid-turn still

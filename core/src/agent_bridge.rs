@@ -5,9 +5,9 @@
 //! command, and pushes a revisioned `events`/`snapshot` envelope independently of any specific
 //! command. See agent-ui/web/src/types.ts for the exact TS-side shapes these must match.
 
-use agent::{AgentDomainEvent, PermissionMode};
 #[cfg(test)]
 use agent::AgentSessionProjection;
+use agent::{AgentDomainEvent, PermissionMode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -30,7 +30,9 @@ impl From<SessionModeChoice> for PermissionMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
-    Ready { request_id: String },
+    Ready {
+        request_id: String,
+    },
     /// `resume` carries the Claude provider session id to continue. Absent for a fresh session.
     /// One message rather than two so there is exactly one path into backend construction -- a
     /// second entry point is how a "resume" would eventually acquire its own subtly different
@@ -41,22 +43,32 @@ pub enum InboundMessage {
         #[serde(default)]
         resume: Option<String>,
     },
-    SendMessage { request_id: String, text: String },
-    Interrupt { request_id: String },
+    SendMessage {
+        request_id: String,
+        text: String,
+    },
+    Interrupt {
+        request_id: String,
+    },
     /// The WebView reporting how long it took to draw the first assistant text of a turn, measured
     /// from its own receipt of the payload to the animation frame that rendered it.
     ///
     /// A SPAN, not an instant: JS `performance.now()` and Rust `Instant` have unrelated epochs, so a
     /// timestamp crossing this boundary would be a confident, meaningless number. Diagnostic only --
     /// nothing branches on it, and it gets no `command_result`.
-    TurnRendered { request_id: String, receive_to_frame_ms: f64 },
+    TurnRendered {
+        request_id: String,
+        receive_to_frame_ms: f64,
+    },
     /// "Continue this conversation in a real terminal." Carries nothing of its own: every input the
     /// rule needs already lives in canonical state on the Rust side, and a session id sent from the
     /// frontend would be a second, stale source for the one value that must not be wrong.
     ///
     /// Closes the session before the command is produced -- see `crate::terminal_handoff` for what
     /// this path does and does not claim, and `agent_panel`'s `PendingHandoff` for the ordering.
-    HandoffToTerminal { request_id: String },
+    HandoffToTerminal {
+        request_id: String,
+    },
     PermissionResponse {
         request_id: String,
         permission_id: String,
@@ -68,9 +80,15 @@ pub enum InboundMessage {
         reason: Option<String>,
     },
     /// `f` in the panel's BROWSE: ask `shell` to start a global HINT.
-    HintRequest { request_id: String },
+    HintRequest {
+        request_id: String,
+    },
     /// The panel's answer to `hint_collect`: how many visible targets it froze for `session_id`.
-    HintTargets { request_id: String, session_id: u64, count: usize },
+    HintTargets {
+        request_id: String,
+        session_id: u64,
+        count: usize,
+    },
 }
 
 /// The decision half of a `permission_response`, as a closed set rather than a bool.
@@ -136,7 +154,9 @@ pub fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
 pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str>) -> String {
     match result {
         Ok(()) => json!({ "kind": "command_result", "requestId": request_id, "ok": true }).to_string(),
-        Err(error) => json!({ "kind": "command_result", "requestId": request_id, "ok": false, "error": error }).to_string(),
+        Err(error) => {
+            json!({ "kind": "command_result", "requestId": request_id, "ok": false, "error": error }).to_string()
+        }
     }
 }
 
@@ -197,8 +217,11 @@ pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) 
 /// complete, so the frontend's CSS never needs a fallback value of its own. Kept out of `hello`
 /// on purpose: `hello` describes the backend, and a theme change must not resend it.
 pub fn serialize_theme_for_js(tokens: &crate::theme::ThemeTokens) -> String {
-    let vars: serde_json::Map<String, serde_json::Value> =
-        tokens.css_vars().into_iter().map(|(name, value)| (name, serde_json::Value::String(value))).collect();
+    let vars: serde_json::Map<String, serde_json::Value> = tokens
+        .css_vars()
+        .into_iter()
+        .map(|(name, value)| (name, serde_json::Value::String(value)))
+        .collect();
     json!({ "kind": "theme", "vars": vars }).to_string()
 }
 
@@ -258,7 +281,8 @@ pub fn serialize_hint_end_for_js(session_id: u64) -> String {
 /// `snapshot`, not by asking for events from a prior revision -- a real revisioned resync
 /// consumer, if one is ever built, is future work, not something already wired up here.
 pub fn serialize_events_for_js(from_revision: u64, through_revision: u64, events: &[AgentDomainEvent]) -> String {
-    json!({ "kind": "events", "fromRevision": from_revision, "throughRevision": through_revision, "events": events }).to_string()
+    json!({ "kind": "events", "fromRevision": from_revision, "throughRevision": through_revision, "events": events })
+        .to_string()
 }
 
 /// Everything one snapshot needs, gathered from wherever it actually lives.
@@ -495,14 +519,26 @@ mod tests {
     #[test]
     fn serializes_the_five_hint_envelopes() {
         let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
-        assert_eq!(v(serialize_hint_collect_for_js(7)), serde_json::json!({ "kind": "hint_collect", "sessionId": 7 }));
+        assert_eq!(
+            v(serialize_hint_collect_for_js(7)),
+            serde_json::json!({ "kind": "hint_collect", "sessionId": 7 })
+        );
         assert_eq!(
             v(serialize_hint_show_for_js(7, &["a".into(), "s".into()])),
             serde_json::json!({ "kind": "hint_show", "sessionId": 7, "labels": ["a", "s"] })
         );
-        assert_eq!(v(serialize_hint_prefix_for_js(7, "a")), serde_json::json!({ "kind": "hint_prefix", "sessionId": 7, "typed": "a" }));
-        assert_eq!(v(serialize_hint_land_for_js(7, 2)), serde_json::json!({ "kind": "hint_land", "sessionId": 7, "index": 2 }));
-        assert_eq!(v(serialize_hint_end_for_js(7)), serde_json::json!({ "kind": "hint_end", "sessionId": 7 }));
+        assert_eq!(
+            v(serialize_hint_prefix_for_js(7, "a")),
+            serde_json::json!({ "kind": "hint_prefix", "sessionId": 7, "typed": "a" })
+        );
+        assert_eq!(
+            v(serialize_hint_land_for_js(7, 2)),
+            serde_json::json!({ "kind": "hint_land", "sessionId": 7, "index": 2 })
+        );
+        assert_eq!(
+            v(serialize_hint_end_for_js(7)),
+            serde_json::json!({ "kind": "hint_end", "sessionId": 7 })
+        );
     }
 
     #[test]
@@ -511,7 +547,14 @@ mod tests {
         assert_eq!(m.request_id(), "r1");
         assert!(matches!(m, InboundMessage::HintRequest { .. }));
         let m = parse_inbound_message(r#"{"type":"hint_targets","request_id":"r2","session_id":7,"count":3}"#).unwrap();
-        assert!(matches!(m, InboundMessage::HintTargets { session_id: 7, count: 3, .. }));
+        assert!(matches!(
+            m,
+            InboundMessage::HintTargets {
+                session_id: 7,
+                count: 3,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -527,7 +570,13 @@ mod tests {
     #[test]
     fn parses_start_session_with_auto_mode() {
         let msg = parse_inbound_message(r#"{"type":"start_session","request_id":"r2","mode":"auto"}"#).unwrap();
-        assert!(matches!(msg, InboundMessage::StartSession { mode: SessionModeChoice::Auto, .. }));
+        assert!(matches!(
+            msg,
+            InboundMessage::StartSession {
+                mode: SessionModeChoice::Auto,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -547,9 +596,17 @@ mod tests {
 
     #[test]
     fn parses_an_approval_which_carries_no_reason() {
-        let msg = parse_inbound_message(r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","decision":"allow"}"#).unwrap();
+        let msg = parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","decision":"allow"}"#,
+        )
+        .unwrap();
         match msg {
-            InboundMessage::PermissionResponse { permission_id, decision, reason, .. } => {
+            InboundMessage::PermissionResponse {
+                permission_id,
+                decision,
+                reason,
+                ..
+            } => {
                 assert_eq!(permission_id, "p1");
                 assert_eq!(decision, DecisionChoice::Allow);
                 assert_eq!(decision.into_decision(reason), agent::PermissionDecision::Allow);
@@ -568,7 +625,9 @@ mod tests {
             InboundMessage::PermissionResponse { decision, reason, .. } => {
                 assert_eq!(
                     decision.into_decision(reason),
-                    agent::PermissionDecision::Deny { reason: Some("not in this repo".into()) }
+                    agent::PermissionDecision::Deny {
+                        reason: Some("not in this repo".into())
+                    }
                 );
             }
             other => panic!("expected PermissionResponse, got {other:?}"),
@@ -585,7 +644,10 @@ mod tests {
         .unwrap();
         match msg {
             InboundMessage::PermissionResponse { decision, reason, .. } => {
-                assert_eq!(decision.into_decision(reason), agent::PermissionDecision::Deny { reason: None });
+                assert_eq!(
+                    decision.into_decision(reason),
+                    agent::PermissionDecision::Deny { reason: None }
+                );
             }
             other => panic!("expected PermissionResponse, got {other:?}"),
         }
@@ -602,7 +664,10 @@ mod tests {
         )
         .is_none());
         assert!(
-            parse_inbound_message(r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","allow":true}"#).is_none(),
+            parse_inbound_message(
+                r#"{"type":"permission_response","request_id":"r5","permission_id":"p1","allow":true}"#
+            )
+            .is_none(),
             "the old bool shape must not still be accepted"
         );
     }
@@ -641,7 +706,10 @@ mod tests {
 
     #[test]
     fn serialize_events_for_js_carries_revision_range_and_tagged_events() {
-        let events = vec![AgentDomainEvent::PermissionResolved { permission_id: "p1".into(), outcome: PermissionOutcome::Allowed }];
+        let events = vec![AgentDomainEvent::PermissionResolved {
+            permission_id: "p1".into(),
+            outcome: PermissionOutcome::Allowed,
+        }];
         let json_str = serialize_events_for_js(3, 4, &events);
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["kind"], "events");
@@ -662,11 +730,28 @@ mod tests {
     #[test]
     fn serialize_snapshot_for_js_produces_camel_case_matching_the_ts_shape() {
         let mut projection = AgentSessionProjection::default();
-        projection.apply(&AgentDomainEvent::SessionOpened { session_id: "verdandi-1".into(), provider_session_id: "claude-1".into(), model: "claude-sonnet-5".into(), cwd: "/tmp".into() });
+        projection.apply(&AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-1".into(),
+            provider_session_id: "claude-1".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/tmp".into(),
+        });
         projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-        projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({"command": "echo hi"}) });
-        projection.apply(&AgentDomainEvent::ToolCallCompleted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), content: json!("boom"), is_error: true });
-        projection.apply(&AgentDomainEvent::SessionUnavailable { reason: "provider process exited unexpectedly".into() });
+        projection.apply(&AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+        });
+        projection.apply(&AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            content: json!("boom"),
+            is_error: true,
+        });
+        projection.apply(&AgentDomainEvent::SessionUnavailable {
+            reason: "provider process exited unexpectedly".into(),
+        });
 
         let provider = agent::ProviderInfo {
             sidecar_version: "0.1.0".into(),
@@ -685,7 +770,13 @@ mod tests {
             conversation_id: Some("conv-hash"),
             session_id: Some("verdandi-1"),
             provider_session_id: Some("claude-1".to_string()),
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
@@ -697,7 +788,10 @@ mod tests {
         assert_eq!(parsed["state"]["backend"], "sidecar");
         assert_eq!(parsed["state"]["pendingPermissions"], json!([]));
         assert_eq!(parsed["state"]["status"]["kind"], "unavailable");
-        assert_eq!(parsed["state"]["status"]["reason"], "provider process exited unexpectedly");
+        assert_eq!(
+            parsed["state"]["status"]["reason"],
+            "provider process exited unexpectedly"
+        );
         assert_eq!(parsed["state"]["toolCalls"][0]["toolUseId"], "toolu_1");
         assert_eq!(parsed["state"]["toolCalls"][0]["result"]["isError"], true);
 
@@ -709,12 +803,21 @@ mod tests {
         assert_eq!(parsed["state"]["providerSessionId"], "claude-1");
 
         assert_eq!(parsed["state"]["capabilities"]["interrupt"], true);
-        assert_eq!(parsed["state"]["capabilities"]["resume"], false, "resume must not be advertised in this milestone");
+        assert_eq!(
+            parsed["state"]["capabilities"]["resume"], false,
+            "resume must not be advertised in this milestone"
+        );
         assert_eq!(parsed["state"]["provider"]["claudeCodeVersion"], "2.1.269");
         assert_eq!(parsed["state"]["provider"]["protocol"], "2.0");
-        assert!(parsed["state"]["provider"]["buildDescription"].as_str().unwrap().contains("eb70aa3"));
+        assert!(parsed["state"]["provider"]["buildDescription"]
+            .as_str()
+            .unwrap()
+            .contains("eb70aa3"));
         // Warnings only -- a list that is never empty cannot drive a "something is wrong" glyph.
-        assert!(parsed["state"]["provider"]["startupDiagnostics"][0].as_str().unwrap().contains("untested"));
+        assert!(parsed["state"]["provider"]["startupDiagnostics"][0]
+            .as_str()
+            .unwrap()
+            .contains("untested"));
     }
 
     /// The link from a permission card back to the tool call it gates.
@@ -737,7 +840,13 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
@@ -767,7 +876,13 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
@@ -801,7 +916,13 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
@@ -822,12 +943,33 @@ mod tests {
     #[test]
     fn a_snapshot_carries_the_order_of_the_three_collections_against_each_other() {
         let mut projection = AgentSessionProjection::default();
-        projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: agent::ContentKind::Text, text: "I'll check.".into() });
-        projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) });
-        projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: agent::ContentKind::Text, text: "And now this.".into() });
-        projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_2".into(), name: "Read".into(), input: json!({}) });
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: "I'll check.".into(),
+        });
+        projection.apply(&AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: json!({}),
+        });
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: "And now this.".into(),
+        });
+        projection.apply(&AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_2".into(),
+            name: "Read".into(),
+            input: json!({}),
+        });
         projection.apply(&AgentDomainEvent::PermissionRequested {
-            permission_id: "perm-1".into(), tool_use_id: Some("toolu_2".into()), tool_name: "Read".into(), input: json!({}),
+            permission_id: "perm-1".into(),
+            tool_use_id: Some("toolu_2".into()),
+            tool_name: "Read".into(),
+            input: json!({}),
         });
 
         let view = SnapshotView {
@@ -835,7 +977,13 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
@@ -844,19 +992,34 @@ mod tests {
 
         let mut merged: Vec<(u64, String)> = Vec::new();
         for m in state["transcript"].as_array().unwrap() {
-            merged.push((m["seq"].as_u64().unwrap(), format!("text:{}", m["text"].as_str().unwrap())));
+            merged.push((
+                m["seq"].as_u64().unwrap(),
+                format!("text:{}", m["text"].as_str().unwrap()),
+            ));
         }
         for c in state["toolCalls"].as_array().unwrap() {
-            merged.push((c["seq"].as_u64().unwrap(), format!("tool:{}", c["toolUseId"].as_str().unwrap())));
+            merged.push((
+                c["seq"].as_u64().unwrap(),
+                format!("tool:{}", c["toolUseId"].as_str().unwrap()),
+            ));
         }
         for p in state["pendingPermissions"].as_array().unwrap() {
-            merged.push((p["seq"].as_u64().unwrap(), format!("perm:{}", p["permissionId"].as_str().unwrap())));
+            merged.push((
+                p["seq"].as_u64().unwrap(),
+                format!("perm:{}", p["permissionId"].as_str().unwrap()),
+            ));
         }
         merged.sort_by_key(|(seq, _)| *seq);
 
         assert_eq!(
             merged.into_iter().map(|(_, label)| label).collect::<Vec<_>>(),
-            vec!["text:I'll check.", "tool:toolu_1", "text:And now this.", "tool:toolu_2", "perm:perm-1"],
+            vec![
+                "text:I'll check.",
+                "tool:toolu_1",
+                "text:And now this.",
+                "tool:toolu_2",
+                "perm:perm-1"
+            ],
         );
         // Every seq is below the revision the same envelope reports, so the frontend can seed its
         // own counter from `throughRevision` and never collide with an item this snapshot carried.
@@ -893,7 +1056,10 @@ mod tests {
             let mut projection = AgentSessionProjection::default();
             for id in &expected {
                 projection.apply(&AgentDomainEvent::PermissionRequested {
-                    permission_id: id.clone(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+                    permission_id: id.clone(),
+                    tool_use_id: None,
+                    tool_name: "Bash".into(),
+                    input: json!({}),
                 });
             }
             let view = SnapshotView {
@@ -901,7 +1067,13 @@ mod tests {
                 conversation_id: None,
                 session_id: None,
                 provider_session_id: None,
-                capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+                capabilities: agent::ProviderCapabilities {
+                    resume: false,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
             };
@@ -909,12 +1081,18 @@ mod tests {
             let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
 
             let ids: Vec<&str> = cards.iter().map(|p| p["permissionId"].as_str().unwrap()).collect();
-            assert_eq!(ids, expected, "projection {attempt} emitted its cards out of request order");
+            assert_eq!(
+                ids, expected,
+                "projection {attempt} emitted its cards out of request order"
+            );
 
             // The request order IS seq order; asserted separately so a future change that kept the
             // ids lined up while emitting some other key's order still fails here.
             let seqs: Vec<u64> = cards.iter().map(|p| p["seq"].as_u64().unwrap()).collect();
-            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "projection {attempt} emitted seqs {seqs:?}");
+            assert!(
+                seqs.windows(2).all(|w| w[0] < w[1]),
+                "projection {attempt} emitted seqs {seqs:?}"
+            );
         }
     }
 
@@ -932,7 +1110,13 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
@@ -963,16 +1147,22 @@ mod tests {
     /// have unrelated epochs.
     #[test]
     fn parses_turn_rendered_as_a_float_span() {
-        let msg = parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r7","receive_to_frame_ms":18.5}"#).unwrap();
+        let msg =
+            parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r7","receive_to_frame_ms":18.5}"#).unwrap();
         assert_eq!(msg.request_id(), "r7");
         match msg {
-            InboundMessage::TurnRendered { receive_to_frame_ms, .. } => assert_eq!(receive_to_frame_ms, 18.5),
+            InboundMessage::TurnRendered {
+                receive_to_frame_ms, ..
+            } => assert_eq!(receive_to_frame_ms, 18.5),
             other => panic!("expected TurnRendered, got {other:?}"),
         }
         // An integer on the wire is still a valid span -- JSON has one number type and a whole
         // number of milliseconds is an ordinary measurement, not a different shape.
-        let whole = parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r8","receive_to_frame_ms":20}"#).unwrap();
-        assert!(matches!(whole, InboundMessage::TurnRendered { receive_to_frame_ms, .. } if receive_to_frame_ms == 20.0));
+        let whole =
+            parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r8","receive_to_frame_ms":20}"#).unwrap();
+        assert!(
+            matches!(whole, InboundMessage::TurnRendered { receive_to_frame_ms, .. } if receive_to_frame_ms == 20.0)
+        );
         // Missing the measurement is a parse failure, not a defaulted zero: a zero-millisecond
         // render would be reported into a trace as a real, impossibly good number.
         assert!(parse_inbound_message(r#"{"type":"turn_rendered","request_id":"r9"}"#).is_none());
@@ -986,13 +1176,22 @@ mod tests {
             conversation_id: None,
             session_id: None,
             provider_session_id: None,
-            capabilities: agent::ProviderCapabilities { resume: false, fork: false, interrupt: true, bypass_permission_mode: true, interactive_permission_mode: true },
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
         assert_eq!(parsed["state"]["backend"], "legacy");
-        assert!(parsed["state"]["conversationId"].is_null(), "the legacy backend has no conversation identity");
+        assert!(
+            parsed["state"]["conversationId"].is_null(),
+            "the legacy backend has no conversation identity"
+        );
         assert!(parsed["state"]["provider"].is_null());
     }
 
@@ -1015,9 +1214,7 @@ mod tests {
     }
 
     /// A greeting with the given sessions, for the hello-envelope tests below.
-    fn greeting_with(
-        resumable: Vec<agent::ResumableSession>,
-    ) -> crate::agent_backend::BackendGreeting {
+    fn greeting_with(resumable: Vec<agent::ResumableSession>) -> crate::agent_backend::BackendGreeting {
         crate::agent_backend::BackendGreeting {
             kind: crate::agent_backend::BackendKind::Sidecar,
             project_dir: std::path::PathBuf::from("/tmp/project"),
@@ -1125,7 +1322,10 @@ mod tests {
             agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2").unwrap();
         let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(&command)).unwrap();
         assert_eq!(parsed["kind"], "handoff");
-        assert_eq!(parsed["command"], "cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
+        assert_eq!(
+            parsed["command"],
+            "cd /home/user/project && claude --resume 1857dcd5-973b-46a2"
+        );
         assert_eq!(parsed["cwd"], "/home/user/project");
         assert_eq!(parsed["providerSessionId"], "1857dcd5-973b-46a2");
     }
@@ -1138,7 +1338,10 @@ mod tests {
         let command = agent::handoff::ClaudeResumeCommand::for_session("/tmp/p", " padded-id ").unwrap();
         let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(&command)).unwrap();
         assert_eq!(parsed["providerSessionId"], "padded-id");
-        assert!(parsed["command"].as_str().unwrap().ends_with("claude --resume padded-id"));
+        assert!(parsed["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("claude --resume padded-id"));
     }
 
     #[test]

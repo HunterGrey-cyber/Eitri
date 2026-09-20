@@ -8,13 +8,13 @@ mod chrome;
 mod editor_context;
 mod hint;
 mod layout;
+mod lua;
 mod pane_focus;
 mod pane_switch;
 mod prefix;
 mod supervisor_client;
 mod terminal_handoff;
 mod theme;
-mod lua;
 mod window_mode;
 
 use std::path::{Path, PathBuf};
@@ -139,9 +139,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     }));
 
     let config_dir = config_dir();
-    let lua_engine = Rc::new(
-        LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"),
-    );
+    let lua_engine = Rc::new(LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"));
 
     // Register built-in panels FIRST, through the exact same `PanelRegistry::register` that a
     // Lua plugin's `neovibe.panel.register` call goes through -- then load init.lua, which may
@@ -150,7 +148,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let editor_widget: gtk4::Widget = pane.widget().clone().upcast();
     lua_engine.register_builtin_panel(
         PanelSlot::Main,
-        PanelEntry { id: "editor".into(), title: "Editor".into(), widget: editor_widget },
+        PanelEntry {
+            id: "editor".into(),
+            title: "Editor".into(),
+            widget: editor_widget,
+        },
     );
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
@@ -162,7 +164,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source);
     lua_engine.register_builtin_panel(
         PanelSlot::Side,
-        PanelEntry { id: "agent".into(), title: "Agent".into(), widget: agent_widget.clone() },
+        PanelEntry {
+            id: "agent".into(),
+            title: "Agent".into(),
+            widget: agent_widget.clone(),
+        },
     );
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
@@ -178,10 +184,18 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // window is built with no vertical split at all.
     let (main_widget, side_widget, bottom_widget) = {
         let panels = lua_engine.panels.borrow();
-        let main = panels.get(PanelSlot::Main).expect("main slot must be populated by this point");
-        let side = panels.get(PanelSlot::Side).expect("side slot must be populated by this point");
+        let main = panels
+            .get(PanelSlot::Main)
+            .expect("main slot must be populated by this point");
+        let side = panels
+            .get(PanelSlot::Side)
+            .expect("side slot must be populated by this point");
         let bottom = panels.get(PanelSlot::Bottom);
-        (main.widget.clone(), side.widget.clone(), bottom.map(|e| e.widget.clone()))
+        (
+            main.widget.clone(),
+            side.widget.clone(),
+            bottom.map(|e| e.widget.clone()),
+        )
     };
 
     // A Lua plugin can take the main slot, in which case the editor is not pane 0 and must not
@@ -497,7 +511,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 _ => return glib::Propagation::Proceed,
             };
             let focus = gtk4::prelude::GtkWindowExt::focus(&window);
-            let current = top_items.iter().position(|item| Some(item) == focus.as_ref()).unwrap_or(0);
+            let current = top_items
+                .iter()
+                .position(|item| Some(item) == focus.as_ref())
+                .unwrap_or(0);
             let next = (current as isize + step).clamp(0, top_items.len() as isize - 1) as usize;
             top_items[next].grab_focus();
             glib::Propagation::Stop
@@ -682,7 +699,11 @@ mod tests {
                 });
                 rest = &rest[end + 2..];
             }
-            parts.push(if rest.chars().count() == 1 { rest.to_uppercase() } else { rest.to_string() });
+            parts.push(if rest.chars().count() == 1 {
+                rest.to_uppercase()
+            } else {
+                rest.to_string()
+            });
             parts.join("+")
         }
 
@@ -698,11 +719,8 @@ mod tests {
                 modifiers += 1;
                 rest = &rest[end + 2..];
             }
-            let function_key =
-                rest.starts_with('F') && rest.len() > 1 && rest[1..].chars().all(|c| c.is_ascii_digit());
-            !rest.is_empty()
-                && rest.chars().all(|c| c.is_ascii_alphanumeric())
-                && (modifiers > 0 || function_key)
+            let function_key = rest.starts_with('F') && rest.len() > 1 && rest[1..].chars().all(|c| c.is_ascii_digit());
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) && (modifiers > 0 || function_key)
         }
 
         /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module and its line comments cut
@@ -715,15 +733,21 @@ mod tests {
                 } else if path.extension().is_some_and(|e| e == "rs") {
                     let text = std::fs::read_to_string(&path).expect("a readable source file");
                     let code = text.split("#[cfg(test)]").next().unwrap_or_default();
-                    let code: String =
-                        code.lines().map(|line| line.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+                    let code: String = code
+                        .lines()
+                        .map(|line| line.split("//").next().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     out.push((path.display().to_string(), code));
                 }
             }
         }
 
         let mut files = Vec::new();
-        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
         let mut found: Vec<(String, String)> = Vec::new();
         for (name, code) in &files {
             for (index, chunk) in code.split('"').enumerate() {
@@ -735,7 +759,11 @@ mod tests {
 
         // A floor, not a list: it catches a walk that silently stopped finding anything, without
         // restating what the sources say.
-        assert!(found.len() >= 4, "only {} accelerators found -- the source walk is broken", found.len());
+        assert!(
+            found.len() >= 4,
+            "only {} accelerators found -- the source walk is broken",
+            found.len()
+        );
 
         let documented = documented_keys(include_str!("../../agent-ui/web/src/keymap.ts"));
         for (file, accel) in found {

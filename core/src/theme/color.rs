@@ -15,7 +15,11 @@ impl Rgb {
     }
 
     pub(crate) const fn from_u32(value: u32) -> Self {
-        Rgb { r: ((value >> 16) & 0xff) as u8, g: ((value >> 8) & 0xff) as u8, b: (value & 0xff) as u8 }
+        Rgb {
+            r: ((value >> 16) & 0xff) as u8,
+            g: ((value >> 8) & 0xff) as u8,
+            b: (value & 0xff) as u8,
+        }
     }
 
     /// `pub`, not `pub(crate)`: `shell/src/theme/gtk_css.rs` and `agent_panel.rs` call this
@@ -29,14 +33,22 @@ impl Rgb {
     pub(crate) fn mix(self, other: Rgb, t: f64) -> Rgb {
         let t = t.clamp(0.0, 1.0);
         let lerp = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u8;
-        Rgb { r: lerp(self.r, other.r), g: lerp(self.g, other.g), b: lerp(self.b, other.b) }
+        Rgb {
+            r: lerp(self.r, other.r),
+            g: lerp(self.g, other.g),
+            b: lerp(self.b, other.b),
+        }
     }
 
     /// WCAG 2.x relative luminance.
     fn relative_luminance(self) -> f64 {
         let channel = |c: u8| {
             let c = f64::from(c) / 255.0;
-            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
         };
         0.2126 * channel(self.r) + 0.7152 * channel(self.g) + 0.0722 * channel(self.b)
     }
@@ -109,12 +121,21 @@ mod tests {
         let pale = Rgb::new(0xf0, 0xf0, 0xf0);
         let fixed = ensure_contrast(pale, WHITE, BLACK, 4.5);
         assert!(fixed.contrast(WHITE) >= 4.5);
-        assert_ne!(fixed, BLACK, "it must stop at the first step that passes, not jump to the end");
-        assert!(fixed.r == fixed.g && fixed.g == fixed.b, "it must stay on the line toward BLACK");
+        assert_ne!(
+            fixed, BLACK,
+            "it must stop at the first step that passes, not jump to the end"
+        );
+        assert!(
+            fixed.r == fixed.g && fixed.g == fixed.b,
+            "it must stay on the line toward BLACK"
+        );
     }
 
     #[test]
     fn ensure_contrast_returns_the_target_when_nothing_reaches_the_minimum() {
-        assert_eq!(ensure_contrast(WHITE, WHITE, Rgb::new(200, 200, 200), 30.0), Rgb::new(200, 200, 200));
+        assert_eq!(
+            ensure_contrast(WHITE, WHITE, Rgb::new(200, 200, 200), 30.0),
+            Rgb::new(200, 200, 200)
+        );
     }
 }

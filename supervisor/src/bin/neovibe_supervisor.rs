@@ -166,14 +166,23 @@ fn poll_once(listener: &UnixListener, state: &Rc<RefCell<AppState>>) {
                         continue;
                     }
                     match serde_json::from_str::<ShellMessage>(trimmed) {
-                        Ok(ShellMessage::Register { instance_id, project_name, project_dir, pid }) => {
-                            state_ref.registry.handle_register(id, instance_id, project_name, project_dir, pid);
+                        Ok(ShellMessage::Register {
+                            instance_id,
+                            project_name,
+                            project_dir,
+                            pid,
+                        }) => {
+                            state_ref
+                                .registry
+                                .handle_register(id, instance_id, project_name, project_dir, pid);
                         }
                         Ok(ShellMessage::Status { instance_id, status }) => {
                             state_ref.registry.handle_status(id, &instance_id, status);
                         }
                         Err(e) => {
-                            eprintln!("neovibe-supervisor: unparseable message on connection {id}: {e} -- raw: {trimmed}");
+                            eprintln!(
+                                "neovibe-supervisor: unparseable message on connection {id}: {e} -- raw: {trimmed}"
+                            );
                         }
                     }
                     // Keep draining -- a burst of buffered lines shouldn't wait for the next poll tick.
@@ -225,9 +234,9 @@ fn rebuild_list(list_box: &ListBox, rows: &[Row]) {
 
 fn status_dot(status: AgentStatus) -> &'static str {
     match status {
-        AgentStatus::Blocked => "\u{1F534}",   // red circle
-        AgentStatus::Working => "\u{1F7E1}",   // yellow circle
-        AgentStatus::Done => "\u{1F7E2}",      // green circle
+        AgentStatus::Blocked => "\u{1F534}",                      // red circle
+        AgentStatus::Working => "\u{1F7E1}",                      // yellow circle
+        AgentStatus::Done => "\u{1F7E2}",                         // green circle
         AgentStatus::Idle | AgentStatus::NoSession => "\u{26AA}", // white circle
     }
 }

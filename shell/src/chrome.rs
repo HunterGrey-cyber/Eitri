@@ -7,10 +7,7 @@
 
 use std::path::Path;
 
-use gtk4::{
-    prelude::*,
-    ApplicationWindow,
-};
+use gtk4::{prelude::*, ApplicationWindow};
 
 /// The top bar's project label shows the directory's own last path component, never the whole
 /// resolved path -- which would run long and, for a project under the user's home directory,
@@ -73,7 +70,9 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     let reload_agent = gtk4::Button::with_label("\u{21BB}");
     reload_agent.add_css_class("win-btn");
     reload_agent.set_valign(gtk4::Align::Center);
-    reload_agent.set_tooltip_text(Some("Reload the agent panel (Ctrl+Shift+R) — the session keeps running"));
+    reload_agent.set_tooltip_text(Some(
+        "Reload the agent panel (Ctrl+Shift+R) — the session keeps running",
+    ));
     reload_agent.set_action_name(Some("app.reload-agent-panel"));
     reload_agent.add_css_class("topbar-item");
 
@@ -147,12 +146,18 @@ mod tests {
 
     #[test]
     fn a_normal_path_shows_its_last_component() {
-        assert_eq!(project_display_name(Path::new("/home/user/src/neovibe")), "neovibe");
+        assert_eq!(
+            project_display_name(Path::new("/home/user/src/neovibe")),
+            "neovibe"
+        );
     }
 
     #[test]
     fn a_trailing_slash_does_not_change_the_answer() {
-        assert_eq!(project_display_name(Path::new("/home/user/src/neovibe/")), "neovibe");
+        assert_eq!(
+            project_display_name(Path::new("/home/user/src/neovibe/")),
+            "neovibe"
+        );
     }
 
     #[test]

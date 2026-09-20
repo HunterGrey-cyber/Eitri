@@ -18,10 +18,9 @@
 //! path clears its acceptance criteria.
 
 use agent::{
-    AgentConversation, AgentSession, AgentDomainEvent, AgentSessionProjection, ClaudeSidecarProvider,
-    ProjectionGuard, UiDelivery,
-    ConversationError, PermissionDecision, PermissionMode, ProviderCapabilities, ProviderInfo,
-    ResumableSession,
+    AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
+    ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
+    ResumableSession, UiDelivery,
 };
 use std::path::{Path, PathBuf};
 
@@ -47,8 +46,14 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
 // that implements the path behind it -- see `CLIENT_IMPLEMENTS_RESUME` in the agent crate for the
 // sidecar side of the same rule.
 const _: () = {
-    assert!(!LEGACY_CAPABILITIES.resume, "resume must not be advertised before it works end to end");
-    assert!(!LEGACY_CAPABILITIES.fork, "fork must not be advertised before it works end to end");
+    assert!(
+        !LEGACY_CAPABILITIES.resume,
+        "resume must not be advertised before it works end to end"
+    );
+    assert!(
+        !LEGACY_CAPABILITIES.fork,
+        "fork must not be advertised before it works end to end"
+    );
 };
 
 /// A borrow of whichever projection this backend owns.
@@ -190,7 +195,11 @@ pub struct BackendError {
 
 impl BackendError {
     fn fatal(message: String) -> Self {
-        Self { message, benign: false, folded_events: Vec::new() }
+        Self {
+            message,
+            benign: false,
+            folded_events: Vec::new(),
+        }
     }
 
     /// Attaches events the projection has already taken, so the caller can deliver them even though
@@ -203,7 +212,11 @@ impl BackendError {
 
 impl From<ConversationError> for BackendError {
     fn from(error: ConversationError) -> Self {
-        Self { benign: error.is_benign(), message: error.to_string(), folded_events: Vec::new() }
+        Self {
+            benign: error.is_benign(),
+            message: error.to_string(),
+            folded_events: Vec::new(),
+        }
     }
 }
 
@@ -216,14 +229,20 @@ impl From<std::io::Error> for BackendError {
             error.kind(),
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
         );
-        Self { benign, message: error.to_string(), folded_events: Vec::new() }
+        Self {
+            benign,
+            message: error.to_string(),
+            folded_events: Vec::new(),
+        }
     }
 }
 
 /// The event a submitted prompt becomes. Free function so `send_turn` and its test build it the
 /// same way.
 fn user_prompt_event(as_typed: &str) -> AgentDomainEvent {
-    AgentDomainEvent::UserPromptSubmitted { text: as_typed.to_string() }
+    AgentDomainEvent::UserPromptSubmitted {
+        text: as_typed.to_string(),
+    }
 }
 
 /// `AgentSession` is ~576 bytes while `AgentConversation` is boxed, so clippy flags the size
@@ -556,7 +575,12 @@ impl AgentBackend {
     ) -> Vec<AgentDomainEvent> {
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
-            let AgentDomainEvent::PermissionRequested { permission_id, tool_name, input, .. } = &event
+            let AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_name,
+                input,
+                ..
+            } = &event
             else {
                 kept.push(event);
                 continue;
@@ -758,13 +782,19 @@ mod tests {
     #[test]
     fn the_sidecar_greeting_names_its_verdandi_baseline() {
         let greeting = BackendGreeting::for_kind(BackendKind::Sidecar, PathBuf::from("/tmp"));
-        assert_eq!(greeting.expected_verdandi_revision, Some(agent::EXPECTED_VERDANDI_REVISION));
+        assert_eq!(
+            greeting.expected_verdandi_revision,
+            Some(agent::EXPECTED_VERDANDI_REVISION)
+        );
     }
 
     #[test]
     fn the_legacy_greeting_has_no_verdandi_baseline_to_name() {
         let greeting = BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/tmp"));
-        assert_eq!(greeting.expected_verdandi_revision, None, "the legacy backend has no Verdandi dependency");
+        assert_eq!(
+            greeting.expected_verdandi_revision, None,
+            "the legacy backend has no Verdandi dependency"
+        );
     }
 
     /// The permission offer is a statement about what this CLIENT implements, so it does not vary by
@@ -848,7 +878,10 @@ mod tests {
         assert!(unknown_permission.benign);
 
         let broken_pipe: BackendError = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone").into();
-        assert!(!broken_pipe.benign, "a dead process must never be treated as a benign ordering complaint");
+        assert!(
+            !broken_pipe.benign,
+            "a dead process must never be treated as a benign ordering complaint"
+        );
     }
 
     #[test]
@@ -944,8 +977,15 @@ mod tests {
         )
         .err()
         .expect("the legacy backend must refuse a resume");
-        assert!(!error.benign, "a refused resume ends the attempt; it is not an ordering complaint");
-        assert!(error.message.contains("cannot continue a previous session"), "got: {}", error.message);
+        assert!(
+            !error.benign,
+            "a refused resume ends the attempt; it is not an ordering complaint"
+        );
+        assert!(
+            error.message.contains("cannot continue a previous session"),
+            "got: {}",
+            error.message
+        );
     }
 
     /// The turn that goes on the wire and the turn the panel shows are different strings, and the
@@ -979,13 +1019,22 @@ mod tests {
             typed,
             Some(&EditorContext {
                 file: "/p/src/main.rs".into(),
-                selection: Some(Selection { start_line: 3, end_line: 4, text: "fn main() {}".into() }),
+                selection: Some(Selection {
+                    start_line: 3,
+                    end_line: 4,
+                    text: "fn main() {}".into(),
+                }),
             }),
         );
-        assert!(wire.contains("/p/src/main.rs"), "the fixture must actually differ: {wire}");
+        assert!(
+            wire.contains("/p/src/main.rs"),
+            "the fixture must actually differ: {wire}"
+        );
 
         let event = user_prompt_event(typed);
-        let AgentDomainEvent::UserPromptSubmitted { text } = event else { panic!("wrong variant") };
+        let AgentDomainEvent::UserPromptSubmitted { text } = event else {
+            panic!("wrong variant")
+        };
         assert_eq!(text, typed);
         assert!(!text.contains("/p/src/main.rs"));
     }
@@ -1065,7 +1114,12 @@ mod tests {
 
         let error = result.expect_err("RejectingProvider's send_turn always fails");
         assert_eq!(
-            backend.projection().user_prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            backend
+                .projection()
+                .user_prompts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["what does this do?"],
             "the prompt was folded BEFORE the rejected send, so it survives the rejection"
         );
@@ -1089,9 +1143,15 @@ mod tests {
         let provider = std::sync::Arc::new(RecordingProvider::default());
         let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Bypass).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
-        let conversation_id = backend.conversation_id().expect("a sidecar backend has one").to_string();
+        let conversation_id = backend
+            .conversation_id()
+            .expect("a sidecar backend has one")
+            .to_string();
 
-        let sent = backend.send_turn("Editor context: /p/src/main.rs, line 3\n\nfix the picker", "fix the picker");
+        let sent = backend.send_turn(
+            "Editor context: /p/src/main.rs, line 3\n\nfix the picker",
+            "fix the picker",
+        );
         assert!(sent.is_ok(), "RecordingProvider accepts every turn");
         provider.queue(AgentDomainEvent::SessionOpened {
             session_id: "fake-session".into(),
@@ -1151,7 +1211,10 @@ mod tests {
             Ok(())
         }
         fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
-            self.resolved.lock().unwrap().push((request.permission_id, request.decision.allows()));
+            self.resolved
+                .lock()
+                .unwrap()
+                .push((request.permission_id, request.decision.allows()));
             Ok(())
         }
         fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
@@ -1192,8 +1255,7 @@ mod tests {
     fn a_read_inside_the_project_is_answered_here_and_never_becomes_a_card() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation =
-            AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -1213,11 +1275,15 @@ mod tests {
 
         let delivered = pump_until_delivery(&mut backend, &dir);
         assert!(
-            !delivered.iter().any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+            !delivered
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
             "a read inside the project must not reach the UI as a card: {delivered:?}"
         );
         assert!(
-            delivered.iter().any(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. })),
+            delivered
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. })),
             "the tool call itself is still owed to the transcript: {delivered:?}"
         );
         assert_eq!(
@@ -1234,8 +1300,7 @@ mod tests {
     fn a_write_still_reaches_the_user_and_is_answered_by_nobody_else() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation =
-            AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -1253,7 +1318,10 @@ mod tests {
             )),
             "a write must reach the user: {delivered:?}"
         );
-        assert!(provider.resolutions().is_empty(), "nothing may answer a write for the user");
+        assert!(
+            provider.resolutions().is_empty(),
+            "nothing may answer a write for the user"
+        );
         backend.shutdown();
     }
 
@@ -1266,8 +1334,7 @@ mod tests {
     fn a_read_outside_the_project_still_reaches_the_user() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation =
-            AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -1279,7 +1346,9 @@ mod tests {
 
         let delivered = pump_until_delivery(&mut backend, &dir);
         assert!(
-            delivered.iter().any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+            delivered
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
             "a read outside the project must reach the user: {delivered:?}"
         );
         assert!(provider.resolutions().is_empty());
@@ -1299,14 +1368,19 @@ mod tests {
     fn attaching_folded_events_does_not_change_how_an_error_is_classified() {
         let folded = || vec![user_prompt_event("what does this do?")];
 
-        let benign: BackendError =
-            BackendError::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, "a turn is already in progress"))
-                .with_folded_events(folded());
-        assert!(benign.benign, "a refused turn must stay benign once it carries the prompt");
+        let benign: BackendError = BackendError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a turn is already in progress",
+        ))
+        .with_folded_events(folded());
+        assert!(
+            benign.benign,
+            "a refused turn must stay benign once it carries the prompt"
+        );
         assert_eq!(benign.folded_events.len(), 1);
 
-        let fatal: BackendError =
-            BackendError::from(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone")).with_folded_events(folded());
+        let fatal: BackendError = BackendError::from(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+            .with_folded_events(folded());
         assert!(!fatal.benign, "a dead process is still fatal, events or no events");
         assert_eq!(fatal.folded_events.len(), 1);
     }

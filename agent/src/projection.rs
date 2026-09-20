@@ -70,12 +70,7 @@ impl ResumeStatus {
     ///
     /// `forked` is consulted rather than ignored because forking legitimately returns a different
     /// id. Without it, the day fork is enabled every successful fork reads as a substitution.
-    pub fn attached_to_the_requested_session(
-        self,
-        requested: &str,
-        attached: Option<&str>,
-        forked: bool,
-    ) -> bool {
+    pub fn attached_to_the_requested_session(self, requested: &str, attached: Option<&str>, forked: bool) -> bool {
         match self {
             ResumeStatus::Attached => forked || attached == Some(requested),
             ResumeStatus::Rejected | ResumeStatus::InitializationFailed => false,
@@ -89,8 +84,12 @@ pub enum ProjectionStatus {
     #[default]
     Starting,
     Running,
-    Unavailable { reason: String },
-    Closed { reason: String },
+    Unavailable {
+        reason: String,
+    },
+    Closed {
+        reason: String,
+    },
 }
 
 /// Provider-neutral (per the design doc's own naming) but Claude-only in practice this phase --
@@ -98,8 +97,15 @@ pub enum ProjectionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentDomainEvent {
-    SessionOpened { session_id: String, provider_session_id: String, model: String, cwd: String },
-    TurnStarted { turn_id: String },
+    SessionOpened {
+        session_id: String,
+        provider_session_id: String,
+        model: String,
+        cwd: String,
+    },
+    TurnStarted {
+        turn_id: String,
+    },
     /// What the user sent, as they typed it.
     ///
     /// **This side's event, not the provider's.** No backend reports the prompt back: the legacy
@@ -111,12 +117,36 @@ pub enum AgentDomainEvent {
     /// composes editor context into the outgoing turn above both backends
     /// (`shell/src/agent_panel.rs`); rendering that would show a file path and a selection nobody
     /// wrote.
-    UserPromptSubmitted { text: String },
-    ContentDelta { turn_id: String, kind: ContentKind, text: String },
-    ToolCallStarted { turn_id: String, tool_use_id: String, name: String, input: serde_json::Value },
-    ToolCallCompleted { turn_id: String, tool_use_id: String, content: serde_json::Value, is_error: bool },
-    PermissionRequested { permission_id: String, tool_use_id: Option<String>, tool_name: String, input: serde_json::Value },
-    PermissionResolved { permission_id: String, outcome: PermissionOutcome },
+    UserPromptSubmitted {
+        text: String,
+    },
+    ContentDelta {
+        turn_id: String,
+        kind: ContentKind,
+        text: String,
+    },
+    ToolCallStarted {
+        turn_id: String,
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolCallCompleted {
+        turn_id: String,
+        tool_use_id: String,
+        content: serde_json::Value,
+        is_error: bool,
+    },
+    PermissionRequested {
+        permission_id: String,
+        tool_use_id: Option<String>,
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    PermissionResolved {
+        permission_id: String,
+        outcome: PermissionOutcome,
+    },
     TurnCompleted {
         turn_id: String,
         outcome: TurnOutcome,
@@ -136,7 +166,9 @@ pub enum AgentDomainEvent {
     /// distinct from `SessionClosed`, which is an orderly end. No hook-relay/gRPC-crash producer
     /// exists yet in this phase; the only current producer is `agent::session`'s translation of a
     /// crashed/non-zero-exit `AgentEvent::ProcessExited`.
-    SessionUnavailable { reason: String },
+    SessionUnavailable {
+        reason: String,
+    },
     /// The provider's verdict on a resume, reported exactly once for a session that asked for one.
     ///
     /// Replaces an inference the client could not make safely: `CreateSession` returns before the
@@ -152,7 +184,9 @@ pub enum AgentDomainEvent {
         forked: bool,
         detail: Option<String>,
     },
-    SessionClosed { reason: String },
+    SessionClosed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -364,7 +398,12 @@ impl AgentSessionProjection {
     pub fn apply(&mut self, event: &AgentDomainEvent) {
         let seq = self.last_revision;
         match event {
-            AgentDomainEvent::SessionOpened { session_id, provider_session_id, model, cwd } => {
+            AgentDomainEvent::SessionOpened {
+                session_id,
+                provider_session_id,
+                model,
+                cwd,
+            } => {
                 self.session_id = Some(session_id.clone());
                 self.provider_session_id = Some(provider_session_id.clone());
                 self.model = Some(model.clone());
@@ -376,27 +415,45 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
             }
             AgentDomainEvent::UserPromptSubmitted { text } => {
-                self.user_prompts.push(UserPromptRecord { seq, text: text.clone() });
+                self.user_prompts.push(UserPromptRecord {
+                    seq,
+                    text: text.clone(),
+                });
                 // Anything that can only occur BETWEEN assistant messages closes the run. A prompt
                 // is the clearest such thing: without this, the reply to the next turn is appended
                 // to the reply to the last one and they render as a single message.
                 self.assistant_message_open = false;
             }
-            AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => {
+            AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => {
                 match self.transcript.last_mut() {
                     // Appending leaves `seq` alone: a message is ordered by where it started.
                     Some(open) if self.assistant_message_open => open.text.push_str(text),
                     _ => {
-                        self.transcript.push(TranscriptMessage { seq, text: text.clone() });
+                        self.transcript.push(TranscriptMessage {
+                            seq,
+                            text: text.clone(),
+                        });
                         self.assistant_message_open = true;
                     }
                 }
             }
-            AgentDomainEvent::ContentDelta { kind: ContentKind::Thinking, .. } => {
+            AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Thinking,
+                ..
+            } => {
                 // No projection effect -- mirrors the pre-Phase-1 AgentSessionState::apply's
                 // identical treatment of `Thinking`. Still bumps last_revision (see fn doc).
             }
-            AgentDomainEvent::ToolCallStarted { turn_id, tool_use_id, name, input } => {
+            AgentDomainEvent::ToolCallStarted {
+                turn_id,
+                tool_use_id,
+                name,
+                input,
+            } => {
                 // A tool call can only happen between assistant messages, so whatever text was
                 // streaming has ended; the text after it is a new message.
                 self.assistant_message_open = false;
@@ -409,12 +466,25 @@ impl AgentSessionProjection {
                     result: None,
                 });
             }
-            AgentDomainEvent::ToolCallCompleted { tool_use_id, content, is_error, .. } => {
+            AgentDomainEvent::ToolCallCompleted {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
                 if let Some(call) = self.tool_calls.iter_mut().find(|c| &c.tool_use_id == tool_use_id) {
-                    call.result = Some(ToolCallResult { content: content.clone(), is_error: *is_error });
+                    call.result = Some(ToolCallResult {
+                        content: content.clone(),
+                        is_error: *is_error,
+                    });
                 }
             }
-            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, input } => {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                tool_name,
+                input,
+            } => {
                 self.assistant_message_open = false;
                 self.pending_permissions.insert(
                     permission_id.clone(),

@@ -58,8 +58,7 @@ impl GlApp {
     }
 
     fn draw(&mut self) {
-        let (Some(gl_context), Some(gl_surface), Some(window)) =
-            (&self.gl_context, &self.gl_surface, &self.window)
+        let (Some(gl_context), Some(gl_surface), Some(window)) = (&self.gl_context, &self.gl_surface, &self.window)
         else {
             return;
         };
@@ -97,9 +96,7 @@ impl GlApp {
             }
         }
 
-        gl_surface
-            .swap_buffers(gl_context)
-            .expect("failed to swap GL buffers");
+        gl_surface.swap_buffers(gl_context).expect("failed to swap GL buffers");
 
         self.frame_count += 1;
         if self.last_fps_report.elapsed() >= Duration::from_secs(1) {
@@ -188,9 +185,7 @@ impl ApplicationHandler for GlApp {
         // timer instead removed the stall entirely and produced smooth,
         // independent 500ms/16ms cadences on both sides. This is the load-
         // bearing lesson of this spike, not a stylistic choice.
-        gl_surface
-            .set_swap_interval(&gl_context, SwapInterval::DontWait)
-            .ok();
+        gl_surface.set_swap_interval(&gl_context, SwapInterval::DontWait).ok();
 
         gl::load_with(|symbol| {
             let symbol = std::ffi::CString::new(symbol).unwrap();

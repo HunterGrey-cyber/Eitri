@@ -243,7 +243,11 @@ impl ConversationIngest {
             record_written,
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let context = AdoptionContext { conversation_id, canonical_cwd, provider_advertises_resume };
+        let context = AdoptionContext {
+            conversation_id,
+            canonical_cwd,
+            provider_advertises_resume,
+        };
 
         let thread = {
             let state = Arc::clone(&state);
@@ -254,7 +258,11 @@ impl ConversationIngest {
                 .expect("spawning the agent ingestion thread")
         };
 
-        Self { state, stop, thread: Some(thread) }
+        Self {
+            state,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     /// Holds the state lock for as long as the returned guard lives.
@@ -351,7 +359,10 @@ fn ingest_loop(
         {
             let mut guard = state.lock().unwrap();
             for event in events {
-                if let AgentDomainEvent::SessionOpened { provider_session_id, .. } = &event {
+                if let AgentDomainEvent::SessionOpened {
+                    provider_session_id, ..
+                } = &event
+                {
                     // Only the FIRST one. `SessionOpened` repeats -- the Agent SDK emits a
                     // system/init at the start of every turn, not once per session -- so adopting
                     // unconditionally would re-take a lease this conversation already holds, on
@@ -386,8 +397,12 @@ fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
         if !guard.record_written {
             return;
         }
-        let Some(title) = guard.pending_title.take() else { return };
-        let Some(id) = guard.provider_session_id.clone() else { return };
+        let Some(title) = guard.pending_title.take() else {
+            return;
+        };
+        let Some(id) = guard.provider_session_id.clone() else {
+            return;
+        };
         (title, id)
     };
     if let Err(e) = crate::persistence::set_title_if_missing(&context.conversation_id, &provider_session_id, &title) {
@@ -454,7 +469,11 @@ mod tests {
     }
 
     fn text(t: &str) -> AgentDomainEvent {
-        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: t.into() }
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: t.into(),
+        }
     }
 
     #[test]
@@ -487,7 +506,10 @@ mod tests {
             state.pending_ui.len()
         );
         assert!(state.resync_pending, "the UI must be told it needs to resynchronise");
-        assert_eq!(state.stats.events_ingested, 10_001, "every event must still have been folded");
+        assert_eq!(
+            state.stats.events_ingested, 10_001,
+            "every event must still have been folded"
+        );
 
         // And the meaning survived in full: 10,000 partial updates coalesced into one assistant
         // message, which is the whole point -- memory follows the conversation, not the event count.
@@ -527,7 +549,9 @@ mod tests {
             tool_name: "Bash".into(),
             input: serde_json::json!({}),
         });
-        state.fold(AgentDomainEvent::SessionUnavailable { reason: "the stream died".into() });
+        state.fold(AgentDomainEvent::SessionUnavailable {
+            reason: "the stream died".into(),
+        });
 
         assert!(matches!(state.take_delivery(), UiDelivery::Resync));
         assert!(state.projection.pending_permissions.contains_key("p1"));

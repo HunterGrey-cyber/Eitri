@@ -43,7 +43,12 @@ impl LuaEngine {
 
         lua.globals().set("neovibe", neovibe)?;
 
-        Ok(Self { lua, panels, commands, events })
+        Ok(Self {
+            lua,
+            panels,
+            commands,
+            events,
+        })
     }
 
     pub(crate) fn emit(&self, event_name: &str) {
@@ -62,7 +67,9 @@ impl LuaEngine {
             let Some(entry) = commands.get(id) else { return };
             entry.action.clone()
         };
-        let Ok(f) = self.lua.registry_value::<mlua::Function>(&action) else { return };
+        let Ok(f) = self.lua.registry_value::<mlua::Function>(&action) else {
+            return;
+        };
         if let Err(err) = f.call::<()>(()) {
             eprintln!("[lua] command '{id}' handler error: {err}");
         }
@@ -83,7 +90,10 @@ impl LuaEngine {
     /// registered by the caller *before* this is called -- see `main.rs`'s `build_ui` ordering).
     pub(crate) fn load_init_file(&self, path: &std::path::Path) {
         if !path.exists() {
-            println!("[lua] no init.lua at {} -- continuing with built-ins only", path.display());
+            println!(
+                "[lua] no init.lua at {} -- continuing with built-ins only",
+                path.display()
+            );
             return;
         }
         match std::fs::read_to_string(path) {

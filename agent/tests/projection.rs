@@ -1,6 +1,5 @@
 use agent::{
-    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
-    TurnOutcome, UsageInfo,
+    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus, TurnOutcome, UsageInfo,
 };
 use serde_json::json;
 
@@ -35,7 +34,9 @@ fn session_opened_populates_identity_and_sets_running() {
 #[test]
 fn turn_started_sets_active_turn_id() {
     let mut projection = AgentSessionProjection::default();
-    projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    projection.apply(&AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
     assert_eq!(projection.active_turn_id, Some("turn-1".into()));
 }
 
@@ -46,15 +47,27 @@ fn content_delta_text_accumulates_into_one_message_in_order() {
     // StreamingPreference::Partial they are two fragments of one sentence, and one entry each would
     // render 400 separate bubbles for a single reply.
     let mut projection = AgentSessionProjection::default();
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "hello".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: "world".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "turn-1".into(),
+        kind: ContentKind::Text,
+        text: "hello".into(),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "turn-1".into(),
+        kind: ContentKind::Text,
+        text: "world".into(),
+    });
     assert_eq!(texts(&projection), vec!["helloworld"]);
 }
 
 #[test]
 fn content_delta_thinking_has_no_transcript_effect_but_still_bumps_revision() {
     let mut projection = AgentSessionProjection::default();
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Thinking, text: "hmm".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "turn-1".into(),
+        kind: ContentKind::Thinking,
+        text: "hmm".into(),
+    });
     assert!(projection.transcript.is_empty());
     assert_eq!(projection.last_revision, 1);
 }
@@ -63,10 +76,16 @@ fn content_delta_thinking_has_no_transcript_effect_but_still_bumps_revision() {
 fn tool_call_started_then_completed_links_by_tool_use_id() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::ToolCallStarted {
-        turn_id: "turn-1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({"command": "echo hi"}),
+        turn_id: "turn-1".into(),
+        tool_use_id: "toolu_1".into(),
+        name: "Bash".into(),
+        input: json!({"command": "echo hi"}),
     });
     projection.apply(&AgentDomainEvent::ToolCallCompleted {
-        turn_id: "turn-1".into(), tool_use_id: "toolu_1".into(), content: json!("hi\n"), is_error: false,
+        turn_id: "turn-1".into(),
+        tool_use_id: "toolu_1".into(),
+        content: json!("hi\n"),
+        is_error: false,
     });
     assert_eq!(projection.tool_calls.len(), 1);
     let call = &projection.tool_calls[0];
@@ -80,7 +99,10 @@ fn tool_call_started_then_completed_links_by_tool_use_id() {
 fn tool_call_completed_for_unknown_tool_use_id_is_a_harmless_no_op() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::ToolCallCompleted {
-        turn_id: "turn-1".into(), tool_use_id: "does-not-exist".into(), content: json!("x"), is_error: false,
+        turn_id: "turn-1".into(),
+        tool_use_id: "does-not-exist".into(),
+        content: json!("x"),
+        is_error: false,
     });
     assert!(projection.tool_calls.is_empty());
 }
@@ -89,11 +111,17 @@ fn tool_call_completed_for_unknown_tool_use_id_is_a_harmless_no_op() {
 fn permission_requested_populates_pending_permissions_map() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_use_id: Some("tu-1".into()), tool_name: "Bash".into(), input: json!({}),
+        permission_id: "perm-1".into(),
+        tool_use_id: Some("tu-1".into()),
+        tool_name: "Bash".into(),
+        input: json!({}),
     });
     assert!(projection.pending_permissions.contains_key("perm-1"));
     assert_eq!(projection.pending_permissions["perm-1"].tool_name, "Bash");
-    assert_eq!(projection.pending_permissions["perm-1"].tool_use_id, Some("tu-1".into()));
+    assert_eq!(
+        projection.pending_permissions["perm-1"].tool_use_id,
+        Some("tu-1".into())
+    );
 }
 
 /// The link itself, at the level that matters to a reader of the projection: the id a pending
@@ -105,10 +133,16 @@ fn permission_requested_populates_pending_permissions_map() {
 fn a_pending_permission_names_one_specific_tool_call_among_several_of_the_same_tool() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::ToolCallStarted {
-        turn_id: "turn-1".into(), tool_use_id: "toolu_first".into(), name: "Bash".into(), input: json!({"command": "echo one"}),
+        turn_id: "turn-1".into(),
+        tool_use_id: "toolu_first".into(),
+        name: "Bash".into(),
+        input: json!({"command": "echo one"}),
     });
     projection.apply(&AgentDomainEvent::ToolCallStarted {
-        turn_id: "turn-1".into(), tool_use_id: "toolu_second".into(), name: "Bash".into(), input: json!({"command": "rm -rf /"}),
+        turn_id: "turn-1".into(),
+        tool_use_id: "toolu_second".into(),
+        name: "Bash".into(),
+        input: json!({"command": "rm -rf /"}),
     });
     projection.apply(&AgentDomainEvent::PermissionRequested {
         permission_id: "toolu_second".into(),
@@ -124,7 +158,11 @@ fn a_pending_permission_names_one_specific_tool_call_among_several_of_the_same_t
         .filter(|c| Some(&c.tool_use_id) == request.tool_use_id.as_ref())
         .map(|c| c.tool_use_id.as_str())
         .collect();
-    assert_eq!(gated, vec!["toolu_second"], "exactly one call is gated, and it is the second one");
+    assert_eq!(
+        gated,
+        vec!["toolu_second"],
+        "exactly one call is gated, and it is the second one"
+    );
 }
 
 /// The legacy hook-relay shape specifically: its `permission_id` and its `tool_use_id` are the
@@ -152,40 +190,77 @@ fn the_legacy_hook_relay_shape_where_both_ids_are_one_string_is_stored_intact() 
 fn two_concurrent_permission_requests_are_both_retained_and_independently_resolvable_in_either_order() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+        permission_id: "perm-1".into(),
+        tool_use_id: None,
+        tool_name: "Bash".into(),
+        input: json!({}),
     });
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-2".into(), tool_use_id: None, tool_name: "Write".into(), input: json!({}),
+        permission_id: "perm-2".into(),
+        tool_use_id: None,
+        tool_name: "Write".into(),
+        input: json!({}),
     });
     assert_eq!(projection.pending_permissions.len(), 2);
 
     // Resolve the SECOND request first -- proves order-independence, not just that two can coexist.
-    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-2".into(), outcome: PermissionOutcome::Allowed });
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-2".into(),
+        outcome: PermissionOutcome::Allowed,
+    });
     assert!(!projection.pending_permissions.contains_key("perm-2"));
     assert!(projection.pending_permissions.contains_key("perm-1"));
 
-    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: PermissionOutcome::Denied });
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-1".into(),
+        outcome: PermissionOutcome::Denied,
+    });
     assert!(projection.pending_permissions.is_empty());
 }
 
 #[test]
 fn permission_resolved_for_unknown_id_is_a_harmless_no_op() {
     let mut projection = AgentSessionProjection::default();
-    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "does-not-exist".into(), outcome: PermissionOutcome::Allowed });
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "does-not-exist".into(),
+        outcome: PermissionOutcome::Allowed,
+    });
     assert!(projection.pending_permissions.is_empty());
 }
 
 #[test]
 fn turn_completed_clears_active_turn_id_and_updates_usage_for_every_outcome() {
-    for outcome in [TurnOutcome::Completed, TurnOutcome::Interrupted, TurnOutcome::Failed, TurnOutcome::LimitReached] {
+    for outcome in [
+        TurnOutcome::Completed,
+        TurnOutcome::Interrupted,
+        TurnOutcome::Failed,
+        TurnOutcome::LimitReached,
+    ] {
         let mut projection = AgentSessionProjection::default();
-        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
-        projection.apply(&AgentDomainEvent::TurnCompleted {
-            turn_id: "turn-1".into(), outcome, result_text: "done".into(), stop_reason: None,
-            usage: Some(UsageInfo { total_cost_usd: 0.01, num_turns: 1 }),
+        projection.apply(&AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
         });
-        assert_eq!(projection.active_turn_id, None, "outcome {outcome:?} must clear active_turn_id");
-        assert_eq!(projection.usage, Some(UsageInfo { total_cost_usd: 0.01, num_turns: 1 }));
+        projection.apply(&AgentDomainEvent::TurnCompleted {
+            turn_id: "turn-1".into(),
+            outcome,
+            result_text: "done".into(),
+            stop_reason: None,
+            usage: Some(UsageInfo {
+                total_cost_usd: 0.01,
+                num_turns: 1,
+            }),
+        });
+        assert_eq!(
+            projection.active_turn_id, None,
+            "outcome {outcome:?} must clear active_turn_id"
+        );
+        assert_eq!(
+            projection.usage,
+            Some(UsageInfo {
+                total_cost_usd: 0.01,
+                num_turns: 1
+            })
+        );
     }
 }
 
@@ -203,22 +278,40 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
     assert_eq!(projection.usage, None, "nothing has been reported yet");
 
     projection.apply(&AgentDomainEvent::TurnCompleted {
-        turn_id: "turn-1".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
-        stop_reason: None, usage: None,
+        turn_id: "turn-1".into(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: None,
     });
-    assert_eq!(projection.usage, None, "absence must stay absence, never become a measured zero");
+    assert_eq!(
+        projection.usage, None,
+        "absence must stay absence, never become a measured zero"
+    );
 
     projection.apply(&AgentDomainEvent::TurnCompleted {
-        turn_id: "turn-2".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
-        stop_reason: None, usage: Some(UsageInfo { total_cost_usd: 0.25, num_turns: 2 }),
+        turn_id: "turn-2".into(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: Some(UsageInfo {
+            total_cost_usd: 0.25,
+            num_turns: 2,
+        }),
     });
     projection.apply(&AgentDomainEvent::TurnCompleted {
-        turn_id: "turn-3".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
-        stop_reason: None, usage: None,
+        turn_id: "turn-3".into(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: None,
     });
     assert_eq!(
         projection.usage,
-        Some(UsageInfo { total_cost_usd: 0.25, num_turns: 2 }),
+        Some(UsageInfo {
+            total_cost_usd: 0.25,
+            num_turns: 2
+        }),
         "a silent turn must not zero out what an earlier turn actually reported"
     );
 }
@@ -226,21 +319,44 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
 #[test]
 fn session_unavailable_and_session_closed_set_distinct_statuses() {
     let mut unavailable = AgentSessionProjection::default();
-    unavailable.apply(&AgentDomainEvent::SessionUnavailable { reason: "crashed".into() });
-    assert_eq!(unavailable.status, ProjectionStatus::Unavailable { reason: "crashed".into() });
+    unavailable.apply(&AgentDomainEvent::SessionUnavailable {
+        reason: "crashed".into(),
+    });
+    assert_eq!(
+        unavailable.status,
+        ProjectionStatus::Unavailable {
+            reason: "crashed".into()
+        }
+    );
 
     let mut closed = AgentSessionProjection::default();
-    closed.apply(&AgentDomainEvent::SessionClosed { reason: "closed_by_host".into() });
-    assert_eq!(closed.status, ProjectionStatus::Closed { reason: "closed_by_host".into() });
+    closed.apply(&AgentDomainEvent::SessionClosed {
+        reason: "closed_by_host".into(),
+    });
+    assert_eq!(
+        closed.status,
+        ProjectionStatus::Closed {
+            reason: "closed_by_host".into()
+        }
+    );
 }
 
 #[test]
 fn every_apply_call_bumps_last_revision_by_exactly_one() {
     let mut projection = AgentSessionProjection::default();
     let events = vec![
-        AgentDomainEvent::SessionOpened { session_id: "s".into(), provider_session_id: "p".into(), model: "m".into(), cwd: "/".into() },
+        AgentDomainEvent::SessionOpened {
+            session_id: "s".into(),
+            provider_session_id: "p".into(),
+            model: "m".into(),
+            cwd: "/".into(),
+        },
         AgentDomainEvent::TurnStarted { turn_id: "t".into() },
-        AgentDomainEvent::ContentDelta { turn_id: "t".into(), kind: ContentKind::Thinking, text: "".into() },
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t".into(),
+            kind: ContentKind::Thinking,
+            text: "".into(),
+        },
     ];
     for (i, event) in events.iter().enumerate() {
         projection.apply(event);
@@ -252,15 +368,27 @@ fn every_apply_call_bumps_last_revision_by_exactly_one() {
 fn permission_resolved_accepts_provider_failed_and_expired_outcomes() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+        permission_id: "perm-1".into(),
+        tool_use_id: None,
+        tool_name: "Bash".into(),
+        input: json!({}),
     });
-    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: PermissionOutcome::ProviderFailed });
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-1".into(),
+        outcome: PermissionOutcome::ProviderFailed,
+    });
     assert!(!projection.pending_permissions.contains_key("perm-1"));
 
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-2".into(), tool_use_id: None, tool_name: "Write".into(), input: json!({}),
+        permission_id: "perm-2".into(),
+        tool_use_id: None,
+        tool_name: "Write".into(),
+        input: json!({}),
     });
-    projection.apply(&AgentDomainEvent::PermissionResolved { permission_id: "perm-2".into(), outcome: PermissionOutcome::Expired });
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-2".into(),
+        outcome: PermissionOutcome::Expired,
+    });
     assert!(!projection.pending_permissions.contains_key("perm-2"));
 }
 
@@ -288,19 +416,37 @@ fn streamed_text_accumulates_into_one_transcript_entry() {
 fn a_tool_call_or_a_turn_boundary_starts_a_new_transcript_entry() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() });
-    projection.apply(&AgentDomainEvent::ToolCallStarted {
-        turn_id: "t1".into(), tool_use_id: "tu1".into(), name: "Bash".into(), input: serde_json::json!({}),
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "I'll check.".into(),
     });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "It printed hi.".into() });
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "tu1".into(),
+        name: "Bash".into(),
+        input: serde_json::json!({}),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "It printed hi.".into(),
+    });
     assert_eq!(texts(&projection), vec!["I'll check.", "It printed hi."]);
 
     projection.apply(&AgentDomainEvent::TurnCompleted {
-        turn_id: "t1".into(), outcome: TurnOutcome::Completed, result_text: String::new(),
-        stop_reason: None, usage: None,
+        turn_id: "t1".into(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: None,
     });
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t2".into(), kind: ContentKind::Text, text: "next turn".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t2".into(),
+        kind: ContentKind::Text,
+        text: "next turn".into(),
+    });
     assert_eq!(projection.transcript.len(), 3);
 }
 
@@ -308,9 +454,21 @@ fn a_tool_call_or_a_turn_boundary_starts_a_new_transcript_entry() {
 fn a_thinking_delta_does_not_split_the_text_around_it() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "before ".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "after".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "before ".into(),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Thinking,
+        text: "hmm".into(),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "after".into(),
+    });
     assert_eq!(texts(&projection), vec!["before after"]);
 }
 
@@ -325,12 +483,16 @@ fn a_thinking_delta_does_not_split_the_text_around_it() {
 fn a_lost_session_stops_looking_like_a_turn_in_progress() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::SessionOpened {
-        session_id: "sess-1".into(), provider_session_id: "prov-1".into(),
-        model: "claude-sonnet-5".into(), cwd: "/tmp/project".into(),
+        session_id: "sess-1".into(),
+        provider_session_id: "prov-1".into(),
+        model: "claude-sonnet-5".into(),
+        cwd: "/tmp/project".into(),
     });
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
     projection.apply(&AgentDomainEvent::ContentDelta {
-        turn_id: "t1".into(), kind: ContentKind::Text, text: "half an ans".into(),
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "half an ans".into(),
     });
     assert_eq!(projection.active_turn_id, Some("t1".into()));
 
@@ -338,7 +500,10 @@ fn a_lost_session_stops_looking_like_a_turn_in_progress() {
         reason: "57 event(s) from the provider (sequence 41-97) were never delivered".into(),
     });
 
-    assert_eq!(projection.active_turn_id, None, "a session that cannot report a turn is not running one");
+    assert_eq!(
+        projection.active_turn_id, None,
+        "a session that cannot report a turn is not running one"
+    );
     assert!(matches!(projection.status, ProjectionStatus::Unavailable { .. }));
     // What DID arrive stays. Clearing the turn must not double as deleting the partial reply: the
     // reason string is what tells the reader it may be incomplete, not its absence.
@@ -353,48 +518,90 @@ fn a_lost_session_stops_looking_like_a_turn_in_progress() {
 fn a_session_closed_mid_turn_also_stops_looking_like_a_turn_in_progress() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-    projection.apply(&AgentDomainEvent::SessionClosed { reason: "closed_by_host".into() });
+    projection.apply(&AgentDomainEvent::SessionClosed {
+        reason: "closed_by_host".into(),
+    });
     assert_eq!(projection.active_turn_id, None);
     assert!(matches!(projection.status, ProjectionStatus::Closed { .. }));
 }
 
 /* ------------------------------------------------------------------------------------------------
-   Interleaved ordering (2026-09-15).
+Interleaved ordering (2026-09-15).
 
-   The defect: `agent-ui`'s MessageList rendered `transcript`, then `toolCalls`, then
-   `pendingPermissions` as three sequential lists, so every tool card appeared below every assistant
-   message whatever the turn actually did.
+The defect: `agent-ui`'s MessageList rendered `transcript`, then `toolCalls`, then
+`pendingPermissions` as three sequential lists, so every tool card appeared below every assistant
+message whatever the turn actually did.
 
-   Why the order is produced HERE rather than in the frontend: a snapshot is a complete replacement
-   of frontend state, and `serialize_snapshot_for_js` emits the three collections separately.
-   Nothing in that payload said how they interleave -- no per-item index, and no turn id (the
-   serializer does not even emit `ToolCallRecord::turn_id`, and a turn id could not order items
-   WITHIN a turn anyway). So a frontend that rebuilt the order from live event arrival alone would
-   lose it on every WebView reload and on every `UiDelivery::Resync`.
+Why the order is produced HERE rather than in the frontend: a snapshot is a complete replacement
+of frontend state, and `serialize_snapshot_for_js` emits the three collections separately.
+Nothing in that payload said how they interleave -- no per-item index, and no turn id (the
+serializer does not even emit `ToolCallRecord::turn_id`, and a turn id could not order items
+WITHIN a turn anyway). So a frontend that rebuilt the order from live event arrival alone would
+lose it on every WebView reload and on every `UiDelivery::Resync`.
 
-   `seq` is read from the same counter as `last_revision`, before `apply` bumps it, so a snapshot's
-   `throughRevision` is strictly greater than every `seq` in that snapshot.
-   ------------------------------------------------------------------------------------------------ */
+`seq` is read from the same counter as `last_revision`, before `apply` bumps it, so a snapshot's
+`throughRevision` is strictly greater than every `seq` in that snapshot.
+------------------------------------------------------------------------------------------------ */
 
 /// The whole point, at the projection level: three collections, one order.
 #[test]
 fn every_item_carries_a_sequence_number_ordering_it_against_the_other_two_collections() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() });
-    projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "Now the other one.".into() });
-    projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_2".into(), name: "Read".into(), input: json!({}) });
-    projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_use_id: Some("toolu_2".into()), tool_name: "Read".into(), input: json!({}),
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "I'll check.".into(),
     });
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "Done.".into() });
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_1".into(),
+        name: "Bash".into(),
+        input: json!({}),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "Now the other one.".into(),
+    });
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_2".into(),
+        name: "Read".into(),
+        input: json!({}),
+    });
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-1".into(),
+        tool_use_id: Some("toolu_2".into()),
+        tool_name: "Read".into(),
+        input: json!({}),
+    });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "Done.".into(),
+    });
 
     // Merge all three by `seq` and check the result is the real turn, not messages-then-tools.
     let mut merged: Vec<(u64, String)> = Vec::new();
-    merged.extend(projection.transcript.iter().map(|m| (m.seq, format!("text:{}", m.text))));
-    merged.extend(projection.tool_calls.iter().map(|c| (c.seq, format!("tool:{}", c.tool_use_id))));
-    merged.extend(projection.pending_permissions.values().map(|p| (p.seq, format!("perm:{}", p.permission_id))));
+    merged.extend(
+        projection
+            .transcript
+            .iter()
+            .map(|m| (m.seq, format!("text:{}", m.text))),
+    );
+    merged.extend(
+        projection
+            .tool_calls
+            .iter()
+            .map(|c| (c.seq, format!("tool:{}", c.tool_use_id))),
+    );
+    merged.extend(
+        projection
+            .pending_permissions
+            .values()
+            .map(|p| (p.seq, format!("perm:{}", p.permission_id))),
+    );
     merged.sort_by_key(|(seq, _)| *seq);
 
     assert_eq!(
@@ -416,10 +623,18 @@ fn every_item_carries_a_sequence_number_ordering_it_against_the_other_two_collec
 #[test]
 fn a_streamed_message_keeps_the_seq_of_its_first_delta() {
     let mut projection = AgentSessionProjection::default();
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "The ".into() });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "The ".into(),
+    });
     let first = projection.transcript[0].seq;
     for chunk in ["quick ", "brown ", "fox"] {
-        projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: chunk.into() });
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: chunk.into(),
+        });
     }
     assert_eq!(projection.transcript.len(), 1);
     assert_eq!(projection.transcript[0].seq, first);
@@ -432,14 +647,28 @@ fn a_streamed_message_keeps_the_seq_of_its_first_delta() {
 #[test]
 fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
     let mut projection = AgentSessionProjection::default();
-    projection.apply(&AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "hi".into() });
-    projection.apply(&AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) });
+    projection.apply(&AgentDomainEvent::ContentDelta {
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "hi".into(),
+    });
+    projection.apply(&AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "toolu_1".into(),
+        name: "Bash".into(),
+        input: json!({}),
+    });
     projection.apply(&AgentDomainEvent::PermissionRequested {
-        permission_id: "perm-1".into(), tool_use_id: None, tool_name: "Bash".into(), input: json!({}),
+        permission_id: "perm-1".into(),
+        tool_use_id: None,
+        tool_name: "Bash".into(),
+        input: json!({}),
     });
 
     let highest = projection
-        .transcript.iter().map(|m| m.seq)
+        .transcript
+        .iter()
+        .map(|m| m.seq)
         .chain(projection.tool_calls.iter().map(|c| c.seq))
         .chain(projection.pending_permissions.values().map(|p| p.seq))
         .max()
@@ -472,7 +701,9 @@ fn no_single_event_ever_creates_more_than_one_item() {
         projection.apply(&event);
 
         let mut seqs: Vec<u64> = projection
-            .user_prompts.iter().map(|p| p.seq)
+            .user_prompts
+            .iter()
+            .map(|p| p.seq)
             .chain(projection.transcript.iter().map(|m| m.seq))
             .chain(projection.tool_calls.iter().map(|c| c.seq))
             .chain(projection.pending_permissions.values().map(|p| p.seq))
@@ -481,7 +712,8 @@ fn no_single_event_ever_creates_more_than_one_item() {
         seqs.sort_unstable();
         seqs.dedup();
         assert_eq!(
-            seqs.len(), before_dedup,
+            seqs.len(),
+            before_dedup,
             "two items share a seq after applying {}; `seq` is assigned once per apply call, so \
              this means one event created more than one item",
             label(&event),
@@ -506,11 +738,17 @@ fn no_single_event_ever_creates_more_than_one_item() {
 fn a_user_prompt_is_an_item_of_its_own_and_closes_an_open_assistant_message() {
     let mut projection = AgentSessionProjection::default();
     projection.apply(&AgentDomainEvent::ContentDelta {
-        turn_id: "t1".into(), kind: ContentKind::Text, text: "first".into(),
+        turn_id: "t1".into(),
+        kind: ContentKind::Text,
+        text: "first".into(),
     });
-    projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "and now this".into() });
+    projection.apply(&AgentDomainEvent::UserPromptSubmitted {
+        text: "and now this".into(),
+    });
     projection.apply(&AgentDomainEvent::ContentDelta {
-        turn_id: "t2".into(), kind: ContentKind::Text, text: "second".into(),
+        turn_id: "t2".into(),
+        kind: ContentKind::Text,
+        text: "second".into(),
     });
 
     assert_eq!(projection.user_prompts.len(), 1);
@@ -528,30 +766,75 @@ fn a_user_prompt_is_an_item_of_its_own_and_closes_an_open_assistant_message() {
 fn every_event_variant() -> Vec<AgentDomainEvent> {
     vec![
         AgentDomainEvent::SessionOpened {
-            session_id: "sess-1".into(), provider_session_id: "prov-1".into(),
-            model: "claude-sonnet-5".into(), cwd: "/tmp/project".into(),
+            session_id: "sess-1".into(),
+            provider_session_id: "prov-1".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/tmp/project".into(),
         },
         AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
-        AgentDomainEvent::UserPromptSubmitted { text: "what does this do?".into() },
-        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "I'll check.".into() },
-        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Thinking, text: "hmm".into() },
-        AgentDomainEvent::ToolCallStarted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), name: "Bash".into(), input: json!({}) },
-        AgentDomainEvent::ToolCallCompleted { turn_id: "t1".into(), tool_use_id: "toolu_1".into(), content: json!("ok"), is_error: false },
-        AgentDomainEvent::PermissionRequested {
-            permission_id: "perm-1".into(), tool_use_id: Some("toolu_1".into()), tool_name: "Bash".into(), input: json!({}),
+        AgentDomainEvent::UserPromptSubmitted {
+            text: "what does this do?".into(),
         },
-        AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "Done.".into() },
-        AgentDomainEvent::PermissionResolved { permission_id: "perm-1".into(), outcome: PermissionOutcome::Allowed },
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: "I'll check.".into(),
+        },
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Thinking,
+            text: "hmm".into(),
+        },
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: json!({}),
+        },
+        AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            content: json!("ok"),
+            is_error: false,
+        },
+        AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: Some("toolu_1".into()),
+            tool_name: "Bash".into(),
+            input: json!({}),
+        },
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: "Done.".into(),
+        },
+        AgentDomainEvent::PermissionResolved {
+            permission_id: "perm-1".into(),
+            outcome: PermissionOutcome::Allowed,
+        },
         AgentDomainEvent::TurnCompleted {
-            turn_id: "t1".into(), outcome: TurnOutcome::Completed, result_text: "Done.".into(),
-            stop_reason: None, usage: Some(UsageInfo { total_cost_usd: 0.01, num_turns: 1 }),
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: "Done.".into(),
+            stop_reason: None,
+            usage: Some(UsageInfo {
+                total_cost_usd: 0.01,
+                num_turns: 1,
+            }),
         },
         AgentDomainEvent::ResumeOutcome {
-            requested_provider_session_id: "prov-1".into(), status: agent::ResumeStatus::Attached,
-            attached_provider_session_id: Some("prov-1".into()), forked: false, detail: None,
+            requested_provider_session_id: "prov-1".into(),
+            status: agent::ResumeStatus::Attached,
+            attached_provider_session_id: Some("prov-1".into()),
+            forked: false,
+            detail: None,
         },
-        AgentDomainEvent::SessionUnavailable { reason: "provider exited".into() },
-        AgentDomainEvent::SessionClosed { reason: "closed_by_host".into() },
+        AgentDomainEvent::SessionUnavailable {
+            reason: "provider exited".into(),
+        },
+        AgentDomainEvent::SessionClosed {
+            reason: "closed_by_host".into(),
+        },
     ]
 }
 
@@ -564,8 +847,14 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
         AgentDomainEvent::TurnStarted { .. } => "TurnStarted",
         AgentDomainEvent::UserPromptSubmitted { .. } => "UserPromptSubmitted",
-        AgentDomainEvent::ContentDelta { kind: ContentKind::Text, .. } => "ContentDelta(Text)",
-        AgentDomainEvent::ContentDelta { kind: ContentKind::Thinking, .. } => "ContentDelta(Thinking)",
+        AgentDomainEvent::ContentDelta {
+            kind: ContentKind::Text,
+            ..
+        } => "ContentDelta(Text)",
+        AgentDomainEvent::ContentDelta {
+            kind: ContentKind::Thinking,
+            ..
+        } => "ContentDelta(Thinking)",
         AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",
         AgentDomainEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
         AgentDomainEvent::PermissionRequested { .. } => "PermissionRequested",

@@ -25,7 +25,11 @@ use std::path::{Path, PathBuf};
 /// so directories a pre-L2-T5 build left behind are still recognised -- and each caller sweeps its
 /// own pre-L2-T5 *prefix* alongside its current one, which is the part a shorter uuid does not cover.
 pub(crate) fn instance_dir_path(tmp: &Path, prefix: &str) -> PathBuf {
-    tmp.join(format!("{prefix}{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()))
+    tmp.join(format!(
+        "{prefix}{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ))
 }
 
 /// Deletes directories under `tmp` named `<prefix><pid>-<uuid>` (or the legacy `<prefix><pid>`)
@@ -52,7 +56,9 @@ pub(crate) fn sweep_stale_instance_dirs(tmp: &Path, prefix: &str, socket_name: &
     let Ok(entries) = std::fs::read_dir(tmp) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|n| stale_instance_dir_pid(n, prefix)) else { continue };
+        let Some(pid) = name.to_str().and_then(|n| stale_instance_dir_pid(n, prefix)) else {
+            continue;
+        };
         let path = entry.path();
         if pid_is_running(pid) || socket_has_a_listener(&path.join(socket_name)) {
             continue;
@@ -61,7 +67,10 @@ pub(crate) fn sweep_stale_instance_dirs(tmp: &Path, prefix: &str, socket_name: &
         // `TMPDIR` is writable by anyone, and this is the one call here that deletes.
         let is_real_directory = matches!(path.symlink_metadata(), Ok(meta) if meta.is_dir());
         if is_real_directory && std::fs::remove_dir_all(&path).is_ok() {
-            println!("[{log_tag}] reclaimed stale {} (pid {pid} is gone and its socket is dead)", path.display());
+            println!(
+                "[{log_tag}] reclaimed stale {} (pid {pid} is gone and its socket is dead)",
+                path.display()
+            );
         }
     }
 }
@@ -121,16 +130,25 @@ mod tests {
     #[test]
     fn only_this_prefixes_own_directory_names_are_sweep_candidates() {
         let uuid = uuid::Uuid::new_v4();
-        assert_eq!(stale_instance_dir_pid(&format!("neovibe-pane-switch-4321-{uuid}"), PREFIX), Some(4321));
+        assert_eq!(
+            stale_instance_dir_pid(&format!("neovibe-pane-switch-4321-{uuid}"), PREFIX),
+            Some(4321)
+        );
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch-4321", PREFIX), Some(4321));
         assert_eq!(stale_instance_dir_pid("neovibe-supervisor.sock", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("systemd-private-abcdef", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch-4321-scratch", PREFIX), None);
-        assert_eq!(stale_instance_dir_pid(&format!("neovibe-pane-switch-notapid-{uuid}"), PREFIX), None);
+        assert_eq!(
+            stale_instance_dir_pid(&format!("neovibe-pane-switch-notapid-{uuid}"), PREFIX),
+            None
+        );
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch--1", PREFIX), None);
         // Two modules sharing `TMPDIR` must never sweep each other's directories.
-        assert_eq!(stale_instance_dir_pid(&format!("neovibe-theme-4321-{uuid}"), PREFIX), None);
+        assert_eq!(
+            stale_instance_dir_pid(&format!("neovibe-theme-4321-{uuid}"), PREFIX),
+            None
+        );
     }
 
     #[test]
@@ -143,7 +161,11 @@ mod tests {
         assert_eq!(stale_instance_dir_pid(name, PREFIX), Some(std::process::id()));
         // The 32-hex `simple` form, not the 36-byte hyphenated one: those four bytes are what put
         // `shell`'s two sockets back under macOS's 103-byte cap (L2 T5).
-        assert_eq!(name.len() - PREFIX.len() - std::process::id().to_string().len() - 1, 32, "{name}");
+        assert_eq!(
+            name.len() - PREFIX.len() - std::process::id().to_string().len() - 1,
+            32,
+            "{name}"
+        );
     }
 
     /// The sweep still recognises what a pre-L2-T5 build wrote. Without this, every directory an
@@ -156,7 +178,10 @@ mod tests {
         assert_eq!(uuid.to_string().len(), 36);
         assert_eq!(uuid.simple().to_string().len(), 32);
         for tail in [uuid.to_string(), uuid.simple().to_string()] {
-            assert_eq!(stale_instance_dir_pid(&format!("{PREFIX}4321-{tail}"), PREFIX), Some(4321));
+            assert_eq!(
+                stale_instance_dir_pid(&format!("{PREFIX}4321-{tail}"), PREFIX),
+                Some(4321)
+            );
         }
     }
 
@@ -169,7 +194,11 @@ mod tests {
         // returns it, so it is always a safe "definitely dead" pid to plant a fixture at.
         let dead = root.join(format!("neovibe-pane-switch-0-{}", uuid::Uuid::new_v4()));
         let dead_old_shape = root.join("neovibe-pane-switch-0");
-        let live = root.join(format!("neovibe-pane-switch-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let live = root.join(format!(
+            "neovibe-pane-switch-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let stranger = root.join("neovibe-pane-switch-0-definitely-not-a-uuid");
         let unrelated = root.join("some-other-tools-directory");
         for dir in [&dead, &dead_old_shape, &live, &stranger, &unrelated] {
@@ -181,7 +210,10 @@ mod tests {
         assert!(!dead.exists(), "a dead pid's directory must be reclaimed");
         assert!(!dead_old_shape.exists(), "a pre-uuid directory must be reclaimed too");
         assert!(live.exists(), "a live pid's directory must be left strictly alone");
-        assert!(stranger.exists(), "a name that is not this prefix's shape must be left alone");
+        assert!(
+            stranger.exists(),
+            "a name that is not this prefix's shape must be left alone"
+        );
         assert!(unrelated.exists(), "an unrelated entry must be left alone");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -207,13 +239,20 @@ mod tests {
         std::fs::create_dir_all(&silent).expect("build the fixture");
         // Through `in_dir` like every other bind in this workspace, so an over-cap fixture is
         // refused naming its own length rather than failing inside `bind` with std's message.
-        let listener = UnixListener::bind(agent::socket_path::in_dir(&listening, "s.sock").expect("under the cap")).expect("bind");
+        let listener =
+            UnixListener::bind(agent::socket_path::in_dir(&listening, "s.sock").expect("under the cap")).expect("bind");
         std::fs::write(silent.join("s.sock"), b"").expect("write a dead socket file");
 
         sweep_stale_instance_dirs(&root, BIND_PREFIX, "s.sock", "test");
 
-        assert!(listening.exists(), "a directory with a live listener must never be reclaimed");
-        assert!(!silent.exists(), "a directory whose socket answers nothing must be reclaimed");
+        assert!(
+            listening.exists(),
+            "a directory with a live listener must never be reclaimed"
+        );
+        assert!(
+            !silent.exists(),
+            "a directory whose socket answers nothing must be reclaimed"
+        );
         drop(listener);
         let _ = std::fs::remove_dir_all(&root);
     }

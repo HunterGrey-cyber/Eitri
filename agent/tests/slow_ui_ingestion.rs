@@ -18,10 +18,9 @@
 //! Measured then, over a 20s stall: 253 raw events held, with transport lag flat at 1-3ms.
 
 use agent::{
-    AgentConversation, AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind,
-    CreateSessionRequest, InterruptTurnRequest, PermissionMode, ProjectionStatus, ProviderCapabilities,
-    ProviderError, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
-    TurnOutcome, UiDelivery, UI_EVENT_QUEUE_CAPACITY,
+    AgentConversation, AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
+    InterruptTurnRequest, PermissionMode, ProjectionStatus, ProviderCapabilities, ProviderError, ProviderInfo,
+    ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, TurnOutcome, UiDelivery, UI_EVENT_QUEUE_CAPACITY,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,7 +39,10 @@ struct ScriptedProvider {
 
 impl ScriptedProvider {
     fn new() -> Self {
-        Self { queued: Mutex::new(std::collections::VecDeque::new()), handed_out: AtomicU64::new(0) }
+        Self {
+            queued: Mutex::new(std::collections::VecDeque::new()),
+            handed_out: AtomicU64::new(0),
+        }
     }
 
     fn emit(&self, event: AgentDomainEvent) {
@@ -112,7 +114,11 @@ fn conversation(provider: Arc<ScriptedProvider>) -> AgentConversation {
 }
 
 fn text(text: &str) -> AgentDomainEvent {
-    AgentDomainEvent::ContentDelta { turn_id: "turn-1".into(), kind: ContentKind::Text, text: text.into() }
+    AgentDomainEvent::ContentDelta {
+        turn_id: "turn-1".into(),
+        kind: ContentKind::Text,
+        text: text.into(),
+    }
 }
 
 /// Waits until ingestion has folded everything handed out so far.
@@ -155,7 +161,9 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
         model: "claude-sonnet-5".into(),
         cwd: "/tmp".into(),
     });
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
 
     let rss_before = rss_kib();
     const EVENTS: usize = 20_000;
@@ -175,12 +183,20 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
     eprintln!("---- {EVENTS} events, UI never pumped ----");
     eprintln!("  events ingested         : {}", stats.events_ingested);
     eprintln!("  UI backlog now          : {}", stats.ui_backlog);
-    eprintln!("  deepest UI backlog      : {} (cap {UI_EVENT_QUEUE_CAPACITY})", stats.max_ui_backlog);
+    eprintln!(
+        "  deepest UI backlog      : {} (cap {UI_EVENT_QUEUE_CAPACITY})",
+        stats.max_ui_backlog
+    );
     eprintln!("  resyncs owed to the UI  : {}", stats.resyncs);
     eprintln!("  still queued in provider: {}", provider.still_queued());
-    eprintln!("  transcript messages     : {}", conversation.projection().transcript.len());
+    eprintln!(
+        "  transcript messages     : {}",
+        conversation.projection().transcript.len()
+    );
     match (rss_before, rss_after) {
-        (Some(before), Some(after)) => eprintln!("  RSS {before}KiB -> {after}KiB (+{}KiB)", after.saturating_sub(before)),
+        (Some(before), Some(after)) => {
+            eprintln!("  RSS {before}KiB -> {after}KiB (+{}KiB)", after.saturating_sub(before))
+        }
         // Linux and macOS always read it (`process_probe`'s own tests insist); only another
         // platform reaches this, and it says so rather than printing a number.
         _ => eprintln!("  RSS unreadable on this platform -- not measured"),
@@ -195,12 +211,23 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
         "the UI queue reached {}, past its {UI_EVENT_QUEUE_CAPACITY} cap",
         stats.max_ui_backlog
     );
-    assert_eq!(provider.still_queued(), 0, "events piled up in the provider instead of the UI queue");
-    assert!(stats.resyncs > 0, "with 20k events and no UI, the queue must have overflowed at least once");
+    assert_eq!(
+        provider.still_queued(),
+        0,
+        "events piled up in the provider instead of the UI queue"
+    );
+    assert!(
+        stats.resyncs > 0,
+        "with 20k events and no UI, the queue must have overflowed at least once"
+    );
 
     // And memory follows the CONVERSATION: 20,000 partial updates are one assistant message.
     let projection = conversation.projection();
-    assert_eq!(projection.transcript.len(), 1, "partial updates must coalesce into one message");
+    assert_eq!(
+        projection.transcript.len(),
+        1,
+        "partial updates must coalesce into one message"
+    );
     assert!(projection.transcript[0].text.starts_with("0 1 2 "));
     assert!(projection.transcript[0].text.ends_with("19999 "));
     assert_eq!(projection.active_turn_id.as_deref(), Some("turn-1"));
@@ -211,7 +238,9 @@ fn twenty_thousand_events_against_a_stalled_ui_do_not_accumulate_as_raw_events()
 fn a_ui_that_returns_after_a_stall_resynchronises_instead_of_replaying_everything() {
     let provider = Arc::new(ScriptedProvider::new());
     let conversation = conversation(Arc::clone(&provider));
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
     for i in 0..5_000 {
         provider.emit(text(&format!("{i} ")));
     }
@@ -241,7 +270,9 @@ fn a_ui_that_returns_after_a_stall_resynchronises_instead_of_replaying_everythin
 fn an_interrupt_during_a_stall_terminates_the_turn_exactly_once() {
     let provider = Arc::new(ScriptedProvider::new());
     let conversation = conversation(Arc::clone(&provider));
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
     for i in 0..2_000 {
         provider.emit(text(&format!("{i} ")));
     }
@@ -256,14 +287,22 @@ fn an_interrupt_during_a_stall_terminates_the_turn_exactly_once() {
 
     // The UI has still seen nothing at this point.
     let projection = conversation.projection();
-    assert_eq!(projection.active_turn_id, None, "an interrupted turn must not still read as working");
+    assert_eq!(
+        projection.active_turn_id, None,
+        "an interrupted turn must not still read as working"
+    );
     assert!(!matches!(projection.status, ProjectionStatus::Unavailable { .. }));
     assert_eq!(projection.transcript.len(), 1);
-    assert!(projection.transcript[0].text.starts_with("0 1 2 "), "text received before the interrupt must survive");
+    assert!(
+        projection.transcript[0].text.starts_with("0 1 2 "),
+        "text received before the interrupt must survive"
+    );
     drop(projection);
 
     // The session is reusable: a second turn folds normally on top.
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-2".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-2".into(),
+    });
     provider.emit(AgentDomainEvent::ContentDelta {
         turn_id: "turn-2".into(),
         kind: ContentKind::Text,
@@ -282,7 +321,9 @@ fn an_interrupt_during_a_stall_terminates_the_turn_exactly_once() {
 fn a_permission_requested_during_a_stall_is_still_pending_when_the_ui_returns() {
     let provider = Arc::new(ScriptedProvider::new());
     let conversation = conversation(Arc::clone(&provider));
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
     for i in 0..1_000 {
         provider.emit(text(&format!("{i} ")));
     }
@@ -322,7 +363,9 @@ fn a_permission_requested_during_a_stall_is_still_pending_when_the_ui_returns() 
 fn a_session_that_dies_during_a_stall_is_unavailable_when_the_ui_returns() {
     let provider = Arc::new(ScriptedProvider::new());
     let conversation = conversation(Arc::clone(&provider));
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
     for i in 0..1_000 {
         provider.emit(text(&format!("{i} ")));
     }
@@ -337,8 +380,15 @@ fn a_session_that_dies_during_a_stall_is_unavailable_when_the_ui_returns() {
         "got {:?}",
         projection.status
     );
-    assert_eq!(projection.active_turn_id, None, "availability must outrank a stale turn id");
-    assert_eq!(projection.transcript.len(), 1, "the truncated reply is kept, and the banner says it may be");
+    assert_eq!(
+        projection.active_turn_id, None,
+        "availability must outrank a stale turn id"
+    );
+    assert_eq!(
+        projection.transcript.len(),
+        1,
+        "the truncated reply is kept, and the banner says it may be"
+    );
 }
 
 /// Ingestion keeps folding while the UI is away -- which is the whole architecture in one assertion.
@@ -354,7 +404,9 @@ fn the_projection_advances_while_the_ui_is_asleep() {
     let provider = Arc::new(ScriptedProvider::new());
     let conversation = conversation(Arc::clone(&provider));
 
-    provider.emit(AgentDomainEvent::TurnStarted { turn_id: "turn-1".into() });
+    provider.emit(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
     settle(&provider, &conversation);
     let early = conversation.projection().last_revision;
 

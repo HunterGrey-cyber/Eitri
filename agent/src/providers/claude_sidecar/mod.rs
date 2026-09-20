@@ -19,21 +19,19 @@ pub use spawn::{packaged_sidecar_available, EXPECTED_VERDANDI_REVISION};
 
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
-    ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest,
-    SendTurnRequest, StreamingPreference,
+    ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
+    StreamingPreference,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::{AgentDomainEvent, PermissionMode};
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
     ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
-    SettingSource, SettingSourceSelection, ToolPolicy,
-    CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ExecutableSource,
-    ErrorDetail, StreamingMode,
+    CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ErrorDetail, ExecutableSource,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
-    PermissionMode as ProtoPermissionMode, PersistenceMode,
-    ReplayStart, ResolvePermissionRequest as ProtoResolvePermissionRequest,
-    SendTurnRequest as ProtoSendTurnRequest, WatchSessionEventsRequest,
+    PermissionMode as ProtoPermissionMode, PersistenceMode, ReplayStart,
+    ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest, SettingSource,
+    SettingSourceSelection, StreamingMode, ToolPolicy, WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
@@ -89,7 +87,10 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
         fork: CLIENT_IMPLEMENTS_FORK && has(CAP_FORK_SESSION),
         interrupt: has(CAP_INTERRUPT_TURN),
         bypass_permission_mode: response.permission_modes.iter().any(|m| m == PERMISSION_MODE_BYPASS),
-        interactive_permission_mode: response.permission_modes.iter().any(|m| m == PERMISSION_MODE_INTERACTIVE),
+        interactive_permission_mode: response
+            .permission_modes
+            .iter()
+            .any(|m| m == PERMISSION_MODE_INTERACTIVE),
     }
 }
 
@@ -198,7 +199,11 @@ impl ClaudeSidecarProvider {
                 {
                     let mut client = client.clone();
                     async move {
-                        client.handshake(HandshakeRequest { client_protocol_major: CLIENT_PROTOCOL_MAJOR }).await
+                        client
+                            .handshake(HandshakeRequest {
+                                client_protocol_major: CLIENT_PROTOCOL_MAJOR,
+                            })
+                            .await
                     }
                 },
                 UNARY_RPC_TIMEOUT,
@@ -288,7 +293,10 @@ impl ClaudeSidecarProvider {
         F: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>> + Send + 'static,
         T: Send + 'static,
     {
-        let result = self.runtime.block_on(future, UNARY_RPC_TIMEOUT).map_err(|_| ProviderError::Timeout)?;
+        let result = self
+            .runtime
+            .block_on(future, UNARY_RPC_TIMEOUT)
+            .map_err(|_| ProviderError::Timeout)?;
         match result {
             Ok(response) => Ok(response.into_inner()),
             Err(status) => Err(self.map_status(status)),
@@ -355,7 +363,10 @@ impl ClaudeSidecarProvider {
             // one genuinely normal ending: a session that closed on its own terms.
             let report = |reason: String| {
                 eprintln!("agent: ClaudeSidecarProvider: event stream lost: {reason}");
-                events.lock().unwrap().push(AgentDomainEvent::SessionUnavailable { reason });
+                events
+                    .lock()
+                    .unwrap()
+                    .push(AgentDomainEvent::SessionUnavailable { reason });
             };
 
             loop {
@@ -618,7 +629,13 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
         self.require_permission_mode(request.permission_mode)?;
-        self.open_session(build_create_request(request.cwd, request.permission_mode, request.streaming, None, false))
+        self.open_session(build_create_request(
+            request.cwd,
+            request.permission_mode,
+            request.streaming,
+            None,
+            false,
+        ))
     }
 
     /// Continues an existing Claude session. Goes through the same `CreateSession` RPC as a fresh
@@ -667,7 +684,10 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError> {
         let mut client = self.client.clone();
-        let proto_request = ProtoInterruptTurnRequest { session_id: request.session_id, command_id: uuid::Uuid::new_v4().to_string() };
+        let proto_request = ProtoInterruptTurnRequest {
+            session_id: request.session_id,
+            command_id: uuid::Uuid::new_v4().to_string(),
+        };
         self.run_unary(async move { client.interrupt_turn(proto_request).await })?;
         Ok(())
     }
@@ -690,7 +710,10 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError> {
         let mut client = self.client.clone();
-        let proto_request = ProtoCloseSessionRequest { session_id: request.session_id, command_id: uuid::Uuid::new_v4().to_string() };
+        let proto_request = ProtoCloseSessionRequest {
+            session_id: request.session_id,
+            command_id: uuid::Uuid::new_v4().to_string(),
+        };
         self.run_unary(async move { client.close_session(proto_request).await })?;
         Ok(())
     }
@@ -800,9 +823,18 @@ mod tests {
     #[test]
     fn todays_real_sidecar_advertises_interrupt_bypass_and_resume_but_this_client_withholds_fork() {
         let capabilities = capabilities_from_handshake(&real_handshake_today());
-        assert!(capabilities.interrupt, "interrupt_turn is advertised and works (proven by the conformance suite)");
-        assert!(capabilities.bypass_permission_mode, "bypass is advertised, and is this milestone's only permission policy");
-        assert!(capabilities.resume, "resume_session is advertised AND CLIENT_IMPLEMENTS_RESUME is true");
+        assert!(
+            capabilities.interrupt,
+            "interrupt_turn is advertised and works (proven by the conformance suite)"
+        );
+        assert!(
+            capabilities.bypass_permission_mode,
+            "bypass is advertised, and is this milestone's only permission policy"
+        );
+        assert!(
+            capabilities.resume,
+            "resume_session is advertised AND CLIENT_IMPLEMENTS_RESUME is true"
+        );
         assert!(
             !capabilities.fork,
             "fork_session IS advertised on the wire -- this reports false because CLIENT_IMPLEMENTS_FORK is still false"
@@ -847,7 +879,11 @@ mod tests {
 
     #[test]
     fn info_carries_the_advertised_lists_verbatim_for_diagnostics() {
-        let info = info_from_handshake(&real_handshake_today(), Some("checkout @ abc1234".into()), vec!["diag".into()]);
+        let info = info_from_handshake(
+            &real_handshake_today(),
+            Some("checkout @ abc1234".into()),
+            vec!["diag".into()],
+        );
         assert_eq!(info.actual_claude_code_version, "2.1.269");
         assert_eq!(info.protocol_major, 3);
         assert_eq!(info.sidecar_version, "0.1.0");

@@ -42,25 +42,25 @@ pub mod state_dirs;
 pub mod transcript;
 
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
+pub use event::{AgentEvent, PermissionSource};
 pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
 pub use permission_policy::{classify_permission_request, Classification, PermissionVerdict};
 pub use persistence::{resumable_sessions, ResumableSession};
-pub use event::{AgentEvent, PermissionSource};
 pub use process::{disallowed_tools_for, AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 pub use session::AgentSession;
 pub use wire::translate_line;
 
 pub use projection::{
-    AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, ProjectionStatus,
-    ToolCallRecord, ToolCallResult, PermissionRequestRecord, TranscriptMessage, UsageInfo,
-    TurnOutcome, ResumeStatus, describe_failed_resume, UserPromptRecord,
+    describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome,
+    PermissionRequestRecord, ProjectionStatus, ResumeStatus, ToolCallRecord, ToolCallResult, TranscriptMessage,
+    TurnOutcome, UsageInfo, UserPromptRecord,
 };
 pub use provider::{
-    AgentProvider, CreateSessionRequest, ResumeSessionRequest, SendTurnRequest,
-    InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, CloseSessionRequest, ProviderCapabilities,
-    ProviderError, ProviderErrorCode, ProviderInfo, StreamingPreference,
+    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
+    ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
+    ResumeSessionRequest, SendTurnRequest, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
-    packaged_sidecar_available, BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR,
-    EXPECTED_VERDANDI_REVISION,
+    packaged_sidecar_available, BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME,
+    CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION,
 };

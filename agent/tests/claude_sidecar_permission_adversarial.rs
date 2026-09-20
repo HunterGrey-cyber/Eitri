@@ -13,8 +13,8 @@
 //! themselves processes named `claude`.
 
 use agent::{
-    AgentConversation, AgentDomainEvent, ClaudeSidecarProvider, PermissionDecision, PermissionMode,
-    PermissionOutcome, ProjectionStatus,
+    AgentConversation, AgentDomainEvent, ClaudeSidecarProvider, PermissionDecision, PermissionMode, PermissionOutcome,
+    ProjectionStatus,
 };
 use std::time::{Duration, Instant};
 
@@ -81,7 +81,9 @@ fn saw_a_turn_end(events: &[AgentDomainEvent]) -> bool {
 }
 
 fn wait_for_a_pending_permission(conversation: &AgentConversation) -> String {
-    drain_until(conversation, Duration::from_secs(60), |c, _| !c.projection().pending_permissions.is_empty());
+    drain_until(conversation, Duration::from_secs(60), |c, _| {
+        !c.projection().pending_permissions.is_empty()
+    });
     conversation
         .projection()
         .pending_permissions
@@ -111,7 +113,10 @@ fn a_decision_that_takes_a_minute_is_still_honored() {
     }
     // Still pending after a full minute: nothing timed it out behind the user's back.
     assert!(
-        conversation.projection().pending_permissions.contains_key(&permission_id),
+        conversation
+            .projection()
+            .pending_permissions
+            .contains_key(&permission_id),
         "the request was resolved by something other than the user during the wait"
     );
     assert!(
@@ -119,20 +124,28 @@ fn a_decision_that_takes_a_minute_is_still_honored() {
         "the session did not survive an idle minute"
     );
 
-    conversation.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
+    conversation
+        .respond_permission(&permission_id, PermissionDecision::Allow)
+        .unwrap();
 
     let events = drain_until(&conversation, Duration::from_secs(60), |c, seen| {
         saw_a_turn_end(seen) && c.projection().pending_permissions.is_empty()
     });
     let outcome = events.iter().find_map(|e| match e {
-        AgentDomainEvent::PermissionResolved { permission_id: id, outcome } if *id == permission_id => Some(*outcome),
+        AgentDomainEvent::PermissionResolved {
+            permission_id: id,
+            outcome,
+        } if *id == permission_id => Some(*outcome),
         _ => None,
     });
     assert_eq!(outcome, Some(PermissionOutcome::Allowed), "got: {outcome:?}");
 
     let text: String = events
         .iter()
-        .filter_map(|e| match e { AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()), _ => None })
+        .filter_map(|e| match e {
+            AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
         .collect();
     assert!(
         text.contains("neovibe_permission_probe"),
@@ -153,7 +166,9 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
     conversation.send_turn(TOOL_PROMPT).unwrap();
     let permission_id = wait_for_a_pending_permission(&conversation);
 
-    conversation.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
+    conversation
+        .respond_permission(&permission_id, PermissionDecision::Allow)
+        .unwrap();
 
     // Immediately, before PermissionResolved can possibly have arrived: the projection still lists
     // it as pending, so this is the double-click case and not the already-cleared one.
@@ -174,11 +189,18 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
     let outcomes: Vec<PermissionOutcome> = events
         .iter()
         .filter_map(|e| match e {
-            AgentDomainEvent::PermissionResolved { permission_id: id, outcome } if *id == permission_id => Some(*outcome),
+            AgentDomainEvent::PermissionResolved {
+                permission_id: id,
+                outcome,
+            } if *id == permission_id => Some(*outcome),
             _ => None,
         })
         .collect();
-    assert_eq!(outcomes, vec![PermissionOutcome::Allowed], "exactly one resolution, and it is the first one");
+    assert_eq!(
+        outcomes,
+        vec![PermissionOutcome::Allowed],
+        "exactly one resolution, and it is the first one"
+    );
     assert!(
         !matches!(conversation.projection().status, ProjectionStatus::Unavailable { .. }),
         "a double decision must not end the session"
@@ -191,7 +213,10 @@ fn deciding_twice_is_refused_without_killing_the_conversation() {
     let events = drain_until(&conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     let text: String = events
         .iter()
-        .filter_map(|e| match e { AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()), _ => None })
+        .filter_map(|e| match e {
+            AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
         .collect();
     assert!(text.contains("still-here"), "got: {text}");
     conversation.shutdown();
@@ -208,10 +233,15 @@ fn an_unknown_permission_id_never_reaches_the_provider() {
     let error = conversation
         .respond_permission("not-a-real-permission-id", PermissionDecision::Allow)
         .expect_err("an unknown id must be refused");
-    assert!(error.is_benign(), "an unknown id is a stale click, not a broken session: {error}");
+    assert!(
+        error.is_benign(),
+        "an unknown id is a stale click, not a broken session: {error}"
+    );
 
     // The real one still works afterwards -- the refusal did not disturb the pending request.
-    conversation.respond_permission(&real_id, PermissionDecision::Allow).unwrap();
+    conversation
+        .respond_permission(&real_id, PermissionDecision::Allow)
+        .unwrap();
     drain_until(&conversation, Duration::from_secs(60), |_, seen| saw_a_turn_end(seen));
     conversation.shutdown();
 }
@@ -248,10 +278,17 @@ fn a_session_that_dies_with_a_decision_outstanding_reports_it_and_keeps_the_reco
     assert!(!reason.trim().is_empty());
 
     assert!(
-        conversation.projection().pending_permissions.contains_key(&permission_id),
+        conversation
+            .projection()
+            .pending_permissions
+            .contains_key(&permission_id),
         "the unanswered request was silently dropped -- that reads as a resolution nobody made"
     );
-    assert_eq!(conversation.projection().active_turn_id, None, "the turn cannot still be in progress");
+    assert_eq!(
+        conversation.projection().active_turn_id,
+        None,
+        "the turn cannot still be in progress"
+    );
 
     // And answering it now fails instead of appearing to work.
     let error = conversation

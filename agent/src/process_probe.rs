@@ -107,7 +107,13 @@ fn task_info(pid: u32) -> Option<libc::proc_taskinfo> {
     // size passed; `proc_pidinfo` writes at most that many bytes and returns how many it wrote.
     let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let written = unsafe {
-        libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&mut info as *mut libc::proc_taskinfo).cast(), size)
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
     };
     (written == size).then_some(info)
 }

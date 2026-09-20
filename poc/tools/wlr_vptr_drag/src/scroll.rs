@@ -20,8 +20,7 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle,
 };
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
-    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
-    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
 struct AppState;
@@ -133,9 +132,7 @@ fn main() -> ExitCode {
         let _ = queue.roundtrip(state);
     };
 
-    eprintln!(
-        "scroll: {notches} notch(es) axis={axis:?} value={value} source={source:?}"
-    );
+    eprintln!("scroll: {notches} notch(es) axis={axis:?} value={value} source={source:?}");
     for _ in 0..notches {
         pointer.axis_source(source);
         pointer.axis(now_ms(start), axis, value);

@@ -14,12 +14,12 @@
 
 use gtk4::prelude::*;
 use mlua::{Lua, Table};
-use webkit6::prelude::*;
 use neovibe_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use webkit6::prelude::*;
 
 pub(crate) struct PanelEntry {
     pub(crate) id: String,
@@ -64,7 +64,11 @@ pub(crate) fn install(
         webview.set_vexpand(true);
         registry.borrow_mut().register(
             parsed.slot,
-            PanelEntry { id: parsed.id, title: parsed.title, widget: webview.upcast() },
+            PanelEntry {
+                id: parsed.id,
+                title: parsed.title,
+                widget: webview.upcast(),
+            },
         );
         Ok(())
     })?;

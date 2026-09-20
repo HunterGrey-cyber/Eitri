@@ -38,7 +38,9 @@ pub fn claude_projects_dir() -> std::io::Result<PathBuf> {
 /// since this iterates `.chars()` -- Unicode scalars, not bytes) are both replaced by the real
 /// CLI but were left untouched by the old rule.
 pub fn sanitize_cwd_for_claude_projects(cwd: &str) -> String {
-    cwd.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect()
 }
 
 pub fn transcript_path(cwd: &str, provider_session_id: &str) -> std::io::Result<PathBuf> {
@@ -77,7 +79,10 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_every_slash_and_dot() {
-        assert_eq!(sanitize_cwd_for_claude_projects("/home/user/src/neovibe"), "-home-user-src-neovibe");
+        assert_eq!(
+            sanitize_cwd_for_claude_projects("/home/user/src/neovibe"),
+            "-home-user-src-neovibe"
+        );
     }
 
     #[test]
@@ -106,7 +111,10 @@ mod tests {
         let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/fake-claude-config") };
         let path = transcript_path("/tmp/project", "prov-1").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/fake-claude-config/projects/-tmp-project/prov-1.jsonl"));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/fake-claude-config/projects/-tmp-project/prov-1.jsonl")
+        );
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
 
@@ -139,7 +147,10 @@ mod tests {
 
     #[test]
     fn is_transcript_stable_errors_on_a_missing_file() {
-        let result = is_transcript_stable(Path::new("/tmp/definitely-does-not-exist-12345.jsonl"), Duration::from_millis(10));
+        let result = is_transcript_stable(
+            Path::new("/tmp/definitely-does-not-exist-12345.jsonl"),
+            Duration::from_millis(10),
+        );
         assert!(result.is_err());
     }
 }

@@ -4,8 +4,11 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn agent_hook_relays_stdin_to_socket_and_prints_the_response() {
-    let socket_path = agent::socket_path::in_dir(&std::env::temp_dir(), &format!("agent-hook-test-{}.sock", std::process::id()))
-        .expect("the test socket path must fit the macOS socket-path limit");
+    let socket_path = agent::socket_path::in_dir(
+        &std::env::temp_dir(),
+        &format!("agent-hook-test-{}.sock", std::process::id()),
+    )
+    .expect("the test socket path must fit the macOS socket-path limit");
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
 
@@ -31,7 +34,9 @@ fn agent_hook_relays_stdin_to_socket_and_prints_the_response() {
     assert_eq!(received_json["tool_name"], "Bash");
     assert_eq!(received_json["tool_use_id"], "toolu_1");
 
-    stream.write_all(b"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\"}}\n").unwrap();
+    stream
+        .write_all(b"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\"}}\n")
+        .unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
@@ -57,10 +62,19 @@ fn spawn_hook(socket: Option<&std::path::Path>, payload: &str) -> std::process::
     let binary = env!("CARGO_BIN_EXE_agent-hook");
     let mut command = Command::new(binary);
     match socket {
-        Some(path) => { command.env("NEOVIBE_AGENT_HOOK_SOCKET", path); }
-        None => { command.env_remove("NEOVIBE_AGENT_HOOK_SOCKET"); }
+        Some(path) => {
+            command.env("NEOVIBE_AGENT_HOOK_SOCKET", path);
+        }
+        None => {
+            command.env_remove("NEOVIBE_AGENT_HOOK_SOCKET");
+        }
     }
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
     child.wait_with_output().unwrap()
 }
@@ -86,7 +100,11 @@ fn an_unset_socket_variable_blocks_rather_than_letting_the_tool_run() {
 
 #[test]
 fn a_socket_that_is_not_there_blocks() {
-    let missing = agent::socket_path::in_dir(&std::env::temp_dir(), &format!("ah-gone-{}.sock", uuid::Uuid::new_v4().simple())).unwrap();
+    let missing = agent::socket_path::in_dir(
+        &std::env::temp_dir(),
+        &format!("ah-gone-{}.sock", uuid::Uuid::new_v4().simple()),
+    )
+    .unwrap();
     let output = spawn_hook(Some(&missing), "{}");
     assert_blocked(&output, "could not connect");
 }
@@ -97,7 +115,11 @@ fn a_socket_that_is_not_there_blocks() {
 /// comment; this makes the binary agree with it.
 #[test]
 fn a_host_that_closes_without_answering_blocks_instead_of_exiting_zero() {
-    let socket_path = agent::socket_path::in_dir(&std::env::temp_dir(), &format!("ah-drop-{}.sock", uuid::Uuid::new_v4().simple())).expect("the test socket path must fit the macOS socket-path limit");
+    let socket_path = agent::socket_path::in_dir(
+        &std::env::temp_dir(),
+        &format!("ah-drop-{}.sock", uuid::Uuid::new_v4().simple()),
+    )
+    .expect("the test socket path must fit the macOS socket-path limit");
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
     let accepting = std::thread::spawn(move || {
@@ -120,7 +142,11 @@ fn a_host_that_closes_without_answering_blocks_instead_of_exiting_zero() {
 /// read, empty decision, and the old binary would have printed nothing and exited 0.
 #[test]
 fn an_empty_decision_blocks() {
-    let socket_path = agent::socket_path::in_dir(&std::env::temp_dir(), &format!("ah-blank-{}.sock", uuid::Uuid::new_v4().simple())).expect("the test socket path must fit the macOS socket-path limit");
+    let socket_path = agent::socket_path::in_dir(
+        &std::env::temp_dir(),
+        &format!("ah-blank-{}.sock", uuid::Uuid::new_v4().simple()),
+    )
+    .expect("the test socket path must fit the macOS socket-path limit");
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
     let accepting = std::thread::spawn(move || {

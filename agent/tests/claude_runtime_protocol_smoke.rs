@@ -41,9 +41,16 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
     let policy = request.policy.unwrap();
     let tool_policy = policy.tool_policy.clone().expect("a stated tool policy must survive");
     assert_eq!(tool_policy.deny, vec!["Bash".to_string()]);
-    assert!(tool_policy.allow.is_none(), "absent is not the same as an empty allow list");
+    assert!(
+        tool_policy.allow.is_none(),
+        "absent is not the same as an empty allow list"
+    );
     assert_eq!(
-        policy.setting_sources.clone().expect("a stated tier set must survive").sources,
+        policy
+            .setting_sources
+            .clone()
+            .expect("a stated tier set must survive")
+            .sources,
         vec![
             claude_runtime_protocol::v1::SettingSource::Project as i32,
             claude_runtime_protocol::v1::SettingSource::Local as i32,

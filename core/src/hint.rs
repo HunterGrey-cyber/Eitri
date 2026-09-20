@@ -51,7 +51,10 @@ pub struct HintSession {
 
 impl HintSession {
     pub fn new(labels: Vec<String>) -> Self {
-        Self { labels, typed: String::new() }
+        Self {
+            labels,
+            typed: String::new(),
+        }
     }
 
     pub fn labels(&self) -> &[String] {
@@ -65,7 +68,11 @@ impl HintSession {
     pub fn key(&mut self, ch: char) -> HintStep {
         let mut next = self.typed.clone();
         next.push(ch);
-        let mut matching = self.labels.iter().enumerate().filter(|(_, l)| l.starts_with(next.as_str()));
+        let mut matching = self
+            .labels
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with(next.as_str()));
         let Some((first, label)) = matching.next() else {
             return HintStep::Ignored;
         };
@@ -106,7 +113,11 @@ pub fn plan_labels(before: usize, panel: usize, after: usize) -> LabelPlan {
     let mut all = assign_labels(before + panel + after);
     let after_labels = all.split_off(before + panel);
     let panel_labels = all.split_off(before);
-    LabelPlan { before: all, panel: panel_labels, after: after_labels }
+    LabelPlan {
+        before: all,
+        panel: panel_labels,
+        after: after_labels,
+    }
 }
 
 impl LabelPlan {
@@ -125,7 +136,12 @@ impl LabelPlan {
 
     /// Every label, in the global order `HintSession` indexes.
     pub fn all(&self) -> Vec<String> {
-        self.before.iter().chain(&self.panel).chain(&self.after).cloned().collect()
+        self.before
+            .iter()
+            .chain(&self.panel)
+            .chain(&self.after)
+            .cloned()
+            .collect()
     }
 }
 
@@ -182,17 +198,34 @@ pub struct TargetOrder {
 }
 
 pub fn order_targets(layout: &WindowLayout) -> TargetOrder {
-    let mut before: Vec<Slot> =
-        layout.top_visible.iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| Slot::Top(i)).collect();
+    let mut before: Vec<Slot> = layout
+        .top_visible
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v)
+        .map(|(i, _)| Slot::Top(i))
+        .collect();
     if layout.main_visible {
-        before.push(if layout.main_is_editor { Slot::Editor } else { Slot::Main });
+        before.push(if layout.main_is_editor {
+            Slot::Editor
+        } else {
+            Slot::Main
+        });
     }
     let ask_panel = layout.side_is_agent_panel && layout.side_visible;
     if !layout.side_is_agent_panel && layout.side_visible {
         before.push(Slot::Side);
     }
-    let after = if layout.bottom_visible { vec![Slot::Bottom] } else { Vec::new() };
-    TargetOrder { before, ask_panel, after }
+    let after = if layout.bottom_visible {
+        vec![Slot::Bottom]
+    } else {
+        Vec::new()
+    };
+    TargetOrder {
+        before,
+        ask_panel,
+        after,
+    }
 }
 
 impl TargetOrder {
@@ -326,7 +359,11 @@ mod tests {
     /// panel's place in the order: after the main slot, never before it.
     #[test]
     fn a_lua_plugin_in_a_slot_is_one_target_in_that_slots_place() {
-        let order = order_targets(&WindowLayout { main_is_editor: false, side_is_agent_panel: false, ..layout() });
+        let order = order_targets(&WindowLayout {
+            main_is_editor: false,
+            side_is_agent_panel: false,
+            ..layout()
+        });
         assert_eq!(order.before, vec![Slot::Top(0), Slot::Top(2), Slot::Main, Slot::Side]);
         assert!(!order.ask_panel, "a replaced agent panel is never asked");
     }
@@ -342,15 +379,29 @@ mod tests {
             bottom_visible: false,
             ..layout()
         });
-        assert_eq!(order, TargetOrder { before: vec![], ask_panel: false, after: vec![] });
-        let order = order_targets(&WindowLayout { side_visible: false, side_is_agent_panel: false, ..layout() });
+        assert_eq!(
+            order,
+            TargetOrder {
+                before: vec![],
+                ask_panel: false,
+                after: vec![]
+            }
+        );
+        let order = order_targets(&WindowLayout {
+            side_visible: false,
+            side_is_agent_panel: false,
+            ..layout()
+        });
         assert!(!order.before.contains(&Slot::Side));
     }
 
     /// A count from a panel that was never asked labels nothing in it.
     #[test]
     fn an_unasked_panels_answer_is_ignored() {
-        let order = order_targets(&WindowLayout { side_is_agent_panel: false, ..layout() });
+        let order = order_targets(&WindowLayout {
+            side_is_agent_panel: false,
+            ..layout()
+        });
         let plan = order.plan(5);
         assert!(plan.panel.is_empty());
         assert_eq!(plan.all().len(), order.before.len() + order.after.len());

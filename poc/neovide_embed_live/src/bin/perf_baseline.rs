@@ -113,8 +113,9 @@ const BARRIER_DELAY_MS: u64 = 30;
 const TYPED_TEXT: &str = "fn p11_workload_probe(seed: u64) -> u64 {\n    let mut acc: u64 = seed;\n    for i in 0..2000u64 {\n        acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);\n        if acc % 101 == 0 {\n            acc ^= i;\n        }\n    }\n    acc\n}\n\n";
 
 fn scroll_keys() -> Vec<&'static str> {
-    let unit: [&'static str; 12] =
-        ["gg", "<C-d>", "<C-d>", "<C-d>", "<C-d>", "<C-d>", "<C-f>", "<C-f>", "<C-f>", "<C-u>", "<C-u>", "<C-b>"];
+    let unit: [&'static str; 12] = [
+        "gg", "<C-d>", "<C-d>", "<C-d>", "<C-d>", "<C-d>", "<C-f>", "<C-f>", "<C-f>", "<C-u>", "<C-u>", "<C-b>",
+    ];
     let mut v = Vec::with_capacity(12 * 15 + 4);
     for _ in 0..15 {
         v.extend_from_slice(&unit);
@@ -145,7 +146,11 @@ impl SkiaState {
             return;
         }
         let fboid = current_bound_framebuffer();
-        let fb_info = FramebufferInfo { fboid: fboid as u32, format: GlFormat::RGBA8.into(), ..Default::default() };
+        let fb_info = FramebufferInfo {
+            fboid: fboid as u32,
+            format: GlFormat::RGBA8.into(),
+            ..Default::default()
+        };
         let render_target = backend_render_targets::make_gl((self.fb_width, self.fb_height), 0, 8, fb_info);
         let surface = surfaces::wrap_backend_render_target(
             &mut self.gr_context,
@@ -214,7 +219,10 @@ const FAILED_COLOR: Color4f = Color4f::new(0.5, 0.05, 0.05, 1.0);
 fn compute_content_region(fb_width: i32, fb_height: i32) -> PixelRect<f32> {
     let (w, h) = (fb_width as f32, fb_height as f32);
     if w > CONTENT_MARGIN * 2.0 + 20.0 && h > CONTENT_MARGIN * 2.0 + 20.0 {
-        PixelRect::from_min_max((CONTENT_MARGIN, CONTENT_MARGIN), (w - CONTENT_MARGIN, h - CONTENT_MARGIN))
+        PixelRect::from_min_max(
+            (CONTENT_MARGIN, CONTENT_MARGIN),
+            (w - CONTENT_MARGIN, h - CONTENT_MARGIN),
+        )
     } else {
         PixelRect::from_min_max((0.0, 0.0), (w.max(1.0), h.max(1.0)))
     }
@@ -224,7 +232,12 @@ fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f32>, color: 
     let mut paint = Paint::default();
     paint.set_color4f(color, None);
     canvas.draw_rect(
-        Rect::from_ltrb(content_region.min.x, content_region.min.y, content_region.max.x, content_region.max.y),
+        Rect::from_ltrb(
+            content_region.min.x,
+            content_region.min.y,
+            content_region.max.x,
+            content_region.max.y,
+        ),
         &paint,
     );
 }
@@ -474,9 +487,7 @@ fn run_workload_script(
 
     // ---- sanity: ask nvim itself to write final buffer/cursor state to a file we can read after
     // shutdown (avoids needing a direct nvim-rs async call cross-runtime -- see phase report) ----
-    let sanity_cmd = format!(
-        ":call writefile([string(line('$')), string(line('.'))], '{sanity_path}')<CR>"
-    );
+    let sanity_cmd = format!(":call writefile([string(line('$')), string(line('.'))], '{sanity_path}')<CR>");
     send_and_wait(&tx, &sanity_cmd, 200, &nvim_exited);
     phase_marker("SANITY_DONE");
 
@@ -490,16 +501,33 @@ fn main() -> glib::ExitCode {
     let workload_path = std::env::var("NEOVIBE_WORKLOAD_FILE").unwrap_or_else(|_| {
         "/tmp/neovibe_p11_scratch/workload.rs".to_string()
     });
-    let sanity_path = std::env::var("NEOVIBE_SANITY_FILE").unwrap_or_else(|_| "/tmp/neovibe_p11_sanity.txt".to_string());
-    let results_path = std::env::var("NEOVIBE_RESULTS_JSON").unwrap_or_else(|_| "/tmp/neovibe_p11_results.json".to_string());
+    let sanity_path =
+        std::env::var("NEOVIBE_SANITY_FILE").unwrap_or_else(|_| "/tmp/neovibe_p11_sanity.txt".to_string());
+    let results_path =
+        std::env::var("NEOVIBE_RESULTS_JSON").unwrap_or_else(|_| "/tmp/neovibe_p11_results.json".to_string());
 
-    println!("NEOVIBE_TIMING:main_entry t={:.4}", t_process_start.elapsed().as_secs_f64());
+    println!(
+        "NEOVIBE_TIMING:main_entry t={:.4}",
+        t_process_start.elapsed().as_secs_f64()
+    );
     let app = Application::builder().application_id(APP_ID).build();
-    println!("NEOVIBE_TIMING:app_built t={:.4}", t_process_start.elapsed().as_secs_f64());
+    println!(
+        "NEOVIBE_TIMING:app_built t={:.4}",
+        t_process_start.elapsed().as_secs_f64()
+    );
     app.connect_activate(move |app| {
-        println!("NEOVIBE_TIMING:activated t={:.4}", t_process_start.elapsed().as_secs_f64());
+        println!(
+            "NEOVIBE_TIMING:activated t={:.4}",
+            t_process_start.elapsed().as_secs_f64()
+        );
         let _ = std::io::stdout().flush();
-        build_ui(app, t_process_start, workload_path.clone(), sanity_path.clone(), results_path.clone())
+        build_ui(
+            app,
+            t_process_start,
+            workload_path.clone(),
+            sanity_path.clone(),
+            results_path.clone(),
+        )
     });
     let _ = std::io::stdout().flush();
     app.run_with_args::<&str>(&[])
@@ -568,11 +596,16 @@ fn build_ui(
             let mut state_slot = skia_state.borrow_mut();
             if state_slot.is_none() {
                 let interface = make_gl_interface();
-                let gr_context = direct_contexts::make_gl(interface, None)
-                    .expect("failed to create Skia GL DirectContext");
+                let gr_context =
+                    direct_contexts::make_gl(interface, None).expect("failed to create Skia GL DirectContext");
                 let width = widget.width() * widget.scale_factor();
                 let height = widget.height() * widget.scale_factor();
-                *state_slot = Some(SkiaState { gr_context, surface: None, fb_width: width, fb_height: height });
+                *state_slot = Some(SkiaState {
+                    gr_context,
+                    surface: None,
+                    fb_width: width,
+                    fb_height: height,
+                });
             }
             let state = state_slot.as_mut().unwrap();
             state.ensure_surface();
@@ -588,7 +621,10 @@ fn build_ui(
             let mut live = live_state.borrow_mut();
             match &mut *live {
                 LiveState::NotStarted => {
-                    println!("NEOVIBE_TIMING:first_render_callback t={:.4}", t_process_start.elapsed().as_secs_f64());
+                    println!(
+                        "NEOVIBE_TIMING:first_render_callback t={:.4}",
+                        t_process_start.elapsed().as_secs_f64()
+                    );
                     let _ = std::io::stdout().flush();
                     fill_content_region(canvas, &content_region, STARTING_COLOR);
                     *live = LiveState::Starting;
@@ -598,16 +634,25 @@ fn build_ui(
                     let os_scale_factor = widget.scale_factor() as f64;
                     let options = LiveHarnessOptions {
                         os_scale_factor,
-                        grid_size: Some(GridSize { width: GRID_WIDTH, height: GRID_HEIGHT }),
+                        grid_size: Some(GridSize {
+                            width: GRID_WIDTH,
+                            height: GRID_HEIGHT,
+                        }),
                         extra_nvim_args: vec!["--clean".to_string()],
                         ..Default::default()
                     };
-                    println!("NEOVIBE_TIMING:before_with_options t={:.4}", t_process_start.elapsed().as_secs_f64());
+                    println!(
+                        "NEOVIBE_TIMING:before_with_options t={:.4}",
+                        t_process_start.elapsed().as_secs_f64()
+                    );
                     let _ = std::io::stdout().flush();
                     match LiveHarness::with_options(options) {
                         Ok(harness) => {
                             let now = Instant::now();
-                            println!("NEOVIBE_TIMING:after_with_options t={:.4}", t_process_start.elapsed().as_secs_f64());
+                            println!(
+                                "NEOVIBE_TIMING:after_with_options t={:.4}",
+                                t_process_start.elapsed().as_secs_f64()
+                            );
                             let _ = std::io::stdout().flush();
                             *live = LiveState::Ready(Box::new(LiveSession {
                                 harness,
@@ -660,13 +705,7 @@ fn build_ui(
                             let workload_path2 = workload_path.clone();
                             let sanity_path2 = sanity_path.clone();
                             thread::spawn(move || {
-                                run_workload_script(
-                                    tx2,
-                                    nvim_exited2,
-                                    workload_path2,
-                                    sanity_path2,
-                                    t_process_start,
-                                );
+                                run_workload_script(tx2, nvim_exited2, workload_path2, sanity_path2, t_process_start);
                             });
                         }
                     }
@@ -808,8 +847,14 @@ fn build_ui(
         });
     }
 
-    println!("NEOVIBE_TIMING:before_present t={:.4}", t_process_start.elapsed().as_secs_f64());
+    println!(
+        "NEOVIBE_TIMING:before_present t={:.4}",
+        t_process_start.elapsed().as_secs_f64()
+    );
     window.present();
-    println!("NEOVIBE_TIMING:after_present t={:.4}", t_process_start.elapsed().as_secs_f64());
+    println!(
+        "NEOVIBE_TIMING:after_present t={:.4}",
+        t_process_start.elapsed().as_secs_f64()
+    );
     let _ = std::io::stdout().flush();
 }

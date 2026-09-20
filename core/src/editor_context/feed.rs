@@ -67,7 +67,10 @@ impl EditorContextFeed {
         let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
         // 0700: whatever can connect to this socket can tell the agent what the user is looking at.
         if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            eprintln!("[editor-context] could not create {}: {e} -- turns will carry no editor context", dir.display());
+            eprintln!(
+                "[editor-context] could not create {}: {e} -- turns will carry no editor context",
+                dir.display()
+            );
             return None;
         }
         let fail = |what: String| {
@@ -99,13 +102,21 @@ impl EditorContextFeed {
             return None;
         }
         println!("[editor-context] feed at {}", socket_path.display());
-        Some(EditorContextFeed { dir, socket_path, lua_path, listener: Some(listener) })
+        Some(EditorContextFeed {
+            dir,
+            socket_path,
+            lua_path,
+            listener: Some(listener),
+        })
     }
 
     /// Set on the nvim child only.
     pub fn child_env(&self) -> Vec<(String, String)> {
         vec![
-            ("NEOVIBE_EDITOR_SOCKET".to_string(), self.socket_path.display().to_string()),
+            (
+                "NEOVIBE_EDITOR_SOCKET".to_string(),
+                self.socket_path.display().to_string(),
+            ),
             ("NEOVIBE_EDITOR_LUA".to_string(), self.lua_path.display().to_string()),
         ]
     }
@@ -188,13 +199,16 @@ pub fn latest_context(lines: Vec<String>) -> Option<EditorContext> {
 }
 
 fn parse(line: &str) -> Result<EditorContext, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(line.trim()).map_err(|e| format!("not JSON: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("not JSON: {e}"))?;
     let version = value.get("v").and_then(serde_json::Value::as_u64);
     if version != Some(1) {
         return Err(format!("unknown payload version {version:?}; this client speaks 1"));
     }
-    let file = value.get("file").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+    let file = value
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let selection = match value.get("selection") {
         Some(serde_json::Value::Null) | None => None,
         Some(selection) => {
@@ -223,12 +237,17 @@ mod tests {
 
     #[test]
     fn a_real_snippet_line_parses_into_a_selection() {
-        let line = r#"{"v":1,"file":"/p/a.rs","line":13,"selection":{"start_line":12,"end_line":14,"text":"fn a() {}"}}"#;
+        let line =
+            r#"{"v":1,"file":"/p/a.rs","line":13,"selection":{"start_line":12,"end_line":14,"text":"fn a() {}"}}"#;
         let context = parse(line).unwrap();
         assert_eq!(context.file, "/p/a.rs");
         assert_eq!(
             context.selection,
-            Some(Selection { start_line: 12, end_line: 14, text: "fn a() {}".into() })
+            Some(Selection {
+                start_line: 12,
+                end_line: 14,
+                text: "fn a() {}".into()
+            })
         );
     }
 
@@ -290,13 +309,22 @@ mod tests {
     #[test]
     fn the_snippet_writes_the_fields_this_parser_reads() {
         for needle in ["v = 1", "file =", "selection =", "start_line =", "end_line =", "text ="] {
-            assert!(NVIM_EDITOR_CONTEXT_LUA.contains(needle), "the snippet no longer writes {needle:?}");
+            assert!(
+                NVIM_EDITOR_CONTEXT_LUA.contains(needle),
+                "the snippet no longer writes {needle:?}"
+            );
         }
         for needle in ["NEOVIBE_EDITOR_SOCKET", "getregion", "getpos"] {
-            assert!(NVIM_EDITOR_CONTEXT_LUA.contains(needle), "the snippet no longer uses {needle:?}");
+            assert!(
+                NVIM_EDITOR_CONTEXT_LUA.contains(needle),
+                "the snippet no longer uses {needle:?}"
+            );
         }
         // The marks are the thing this wire must never read; see `selection()` in the snippet.
-        assert!(!NVIM_EDITOR_CONTEXT_LUA.contains("getpos(\"'<\")"), "the snippet must never read the visual marks");
+        assert!(
+            !NVIM_EDITOR_CONTEXT_LUA.contains("getpos(\"'<\")"),
+            "the snippet must never read the visual marks"
+        );
     }
 
     /// The socket path at macOS's own worst case, asserted **exactly** rather than against the cap.
@@ -316,18 +344,27 @@ mod tests {
         let dir = macos_tmp.join(format!("{DIR_PREFIX}99999-{}", uuid::Uuid::new_v4().simple()));
         let path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("must fit");
         assert_eq!(path.as_os_str().len(), 100, "{path:?}");
-        assert!(path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES, "{path:?}");
+        assert!(
+            path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES,
+            "{path:?}"
+        );
     }
 
     #[test]
     fn a_real_feed_binds_and_round_trips_one_line() {
-        let Some(mut feed) = EditorContextFeed::new() else { return };
+        let Some(mut feed) = EditorContextFeed::new() else {
+            return;
+        };
         let socket = feed.socket_path().to_path_buf();
         let listener = feed.take_listener().unwrap();
         {
             use std::io::Write;
             let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-            writeln!(client, r#"{{"v":1,"file":"/p/b.rs","selection":{{"start_line":3,"end_line":3,"text":"x"}}}}"#).unwrap();
+            writeln!(
+                client,
+                r#"{{"v":1,"file":"/p/b.rs","selection":{{"start_line":3,"end_line":3,"text":"x"}}}}"#
+            )
+            .unwrap();
         }
         let context = latest_context(accept_pending_lines(&listener)).expect("the line must arrive");
         assert_eq!(context.file, "/p/b.rs");

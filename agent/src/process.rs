@@ -249,7 +249,10 @@ fn spawn_hook_listener(
             continue;
         };
         let request_id = parsed.tool_use_id.clone();
-        pending.lock().unwrap().insert(request_id.clone(), PendingHookConnection { stream });
+        pending
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), PendingHookConnection { stream });
         let event = AgentEvent::PermissionRequest {
             request_id,
             // The same string as `request_id` above, filled in separately and on purpose. This
@@ -299,11 +302,7 @@ fn spawn_hook_listener(
 /// the underlying `io::Error` unchanged -- `spawn_with_binary`'s real `cmd.spawn()` a few lines
 /// down would fail on it identically, so this just surfaces the same failure slightly earlier and
 /// before anything else (a socket, a listener thread) has been created.
-fn preflight_gate_flag_is_accepted(
-    binary: &str,
-    settings_json: &str,
-    project_dir: &Path,
-) -> std::io::Result<()> {
+fn preflight_gate_flag_is_accepted(binary: &str, settings_json: &str, project_dir: &Path) -> std::io::Result<()> {
     let output = Command::new(binary)
         // The same working directory the real spawn sets, and this is load-bearing rather than
         // tidiness: a wrapper standing in for `claude` may decide whether to run FROM THE CWD --
@@ -330,7 +329,10 @@ fn preflight_gate_flag_is_accepted(
     } else if !stdout.is_empty() {
         stdout
     } else {
-        format!("exited with {:?} and produced no output on stdout or stderr", output.status)
+        format!(
+            "exited with {:?} and produced no output on stdout or stderr",
+            output.status
+        )
     };
     Err(std::io::Error::other(format!(
         "the resolved `{binary}` binary refused the --settings flag this permission gate needs \
@@ -379,8 +381,7 @@ fn resolve_binary_absolute_path(binary: &str) -> Option<std::path::PathBuf> {
 /// best-effort and infallible from the caller's point of view: if the peer has already gone away
 /// there is no one left to tell, and the connection is being dropped either way.
 fn write_fail_closed_deny(stream: &UnixStream, reason: &str) {
-    let decision =
-        crate::hook_protocol::format_decision(false, Some(&format!("agent-hook relay failed: {reason}")));
+    let decision = crate::hook_protocol::format_decision(false, Some(&format!("agent-hook relay failed: {reason}")));
     let mut sink = stream;
     let _ = writeln!(sink, "{decision}");
 }
@@ -401,9 +402,7 @@ fn write_fail_closed_deny(stream: &UnixStream, reason: &str) {
 /// hazard `spawn_hook_listener`'s doc describes. Split out as a free function taking `pending`
 /// directly so this behavior can be tested against a real, genuinely-blocked peer without a live
 /// `AgentProcess`.
-fn release_pending_hook_connections(
-    pending: &Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
-) {
+fn release_pending_hook_connections(pending: &Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>) {
     let mut pending = pending.lock().unwrap();
     for (_request_id, conn) in pending.drain() {
         write_fail_closed_deny(&conn.stream, "the conversation shut down before this was answered");
@@ -572,8 +571,9 @@ impl AgentProcess {
         let resolved_path = resolve_binary_absolute_path(binary)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| format!("<could not resolve {binary:?} on PATH>"));
-        let argv: Vec<String> =
-            std::iter::once(binary.to_string()).chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned())).collect();
+        let argv: Vec<String> = std::iter::once(binary.to_string())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
         eprintln!("[agent] spawning resolved binary {resolved_path} -- argv: {argv:?}");
 
         let mut child = match cmd.spawn() {
@@ -624,7 +624,9 @@ impl AgentProcess {
         });
 
         let stderr_tx = tx;
-        let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(STDERR_TAIL_CAPACITY)));
+        let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+            STDERR_TAIL_CAPACITY,
+        )));
         let stderr_tail_writer = stderr_tail.clone();
         let stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
@@ -678,7 +680,10 @@ impl AgentProcess {
                 // stderr thread may have already exited too (having hit EOF right alongside the
                 // child), so the tail must travel with the event itself.
                 let stderr_tail: Vec<String> = self.stderr_tail.lock().unwrap().iter().cloned().collect();
-                events.push(AgentEvent::ProcessExited { success: status.success(), stderr_tail });
+                events.push(AgentEvent::ProcessExited {
+                    success: status.success(),
+                    stderr_tail,
+                });
             }
         }
         events
@@ -693,10 +698,12 @@ impl AgentProcess {
             "message": { "role": "user", "content": text },
             "parent_tool_use_id": serde_json::Value::Null,
         });
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)"))?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdin already closed (process shut down)",
+            )
+        })?;
         writeln!(stdin, "{payload}")?;
         stdin.flush()
     }
@@ -724,7 +731,10 @@ impl AgentProcess {
         });
         let write_result = (|| -> std::io::Result<()> {
             let stdin = self.stdin.as_mut().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)")
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdin already closed (process shut down)",
+                )
             })?;
             writeln!(stdin, "{payload}")?;
             stdin.flush()
@@ -754,11 +764,16 @@ impl AgentProcess {
         reason: Option<&str>,
     ) -> std::io::Result<()> {
         match source {
-            PermissionSource::HookRelay => write_hook_decision(&self.pending_hook_connections, request_id, allow, reason),
+            PermissionSource::HookRelay => {
+                write_hook_decision(&self.pending_hook_connections, request_id, allow, reason)
+            }
             PermissionSource::CanUseTool => {
                 let payload = build_can_use_tool_response_payload(request_id, allow, reason);
                 let stdin = self.stdin.as_mut().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin already closed (process shut down)")
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "stdin already closed (process shut down)",
+                    )
                 })?;
                 writeln!(stdin, "{payload}")?;
                 stdin.flush()
@@ -856,7 +871,11 @@ impl AgentProcess {
     fn send_signal(&self, sig: i32) -> std::io::Result<()> {
         let pid = self.child.id() as i32;
         let ret = unsafe { libc_kill(pid, sig) };
-        if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 
@@ -895,7 +914,10 @@ mod tests {
         let bypass = disallowed_tools_for(PermissionMode::Bypass);
         for tool in ["Edit", "Write", "NotebookEdit"] {
             assert!(!auto.contains(&tool), "Auto must permit {tool}: the hook gates it");
-            assert!(bypass.contains(&tool), "Bypass must deny {tool}: nothing gates it there");
+            assert!(
+                bypass.contains(&tool),
+                "Bypass must deny {tool}: nothing gates it there"
+            );
         }
         // Bash stays denied in both. Its worst case is not a file, and un-denying it is a separate
         // decision that owes its own evidence.
@@ -956,7 +978,10 @@ mod tests {
 
         process.send_turn("what word did you just say?").unwrap();
         let result2 = drain_until_turn_finished(&mut process);
-        assert!(result2.to_lowercase().contains("pong"), "same process must recall turn 1 with no --resume: {result2}");
+        assert!(
+            result2.to_lowercase().contains("pong"),
+            "same process must recall turn 1 with no --resume: {result2}"
+        );
 
         // Neither turn above ever triggers a real tool call (CONSERVATIVE_DISALLOWED_TOOLS blocks
         // the tool-using tools, and both prompts are plain text anyway), so the hook socket never
@@ -986,7 +1011,9 @@ mod tests {
         let mut process = AgentProcess::spawn(&dir, PermissionMode::Auto, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
         let pid = process.pid();
 
-        process.send_turn("write a very long story, at least 2000 words, about a journey").unwrap();
+        process
+            .send_turn("write a very long story, at least 2000 words, about a journey")
+            .unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         process.interrupt().unwrap();
         std::thread::sleep(Duration::from_millis(1500));
@@ -998,7 +1025,10 @@ mod tests {
             "shutdown() must return in bounded time, took {:?}",
             shutdown_started.elapsed()
         );
-        assert!(!crate::process_probe::pid_is_alive(pid), "pid {pid} outlived shutdown()");
+        assert!(
+            !crate::process_probe::pid_is_alive(pid),
+            "pid {pid} outlived shutdown()"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1016,8 +1046,11 @@ mod tests {
     }
 
     fn temp_socket_path() -> std::path::PathBuf {
-        crate::socket_path::in_dir(&std::env::temp_dir(), &format!("nv-listener-{}.sock", uuid::Uuid::new_v4().simple()))
-            .expect("the listener tests' socket path must fit the macOS limit")
+        crate::socket_path::in_dir(
+            &std::env::temp_dir(),
+            &format!("nv-listener-{}.sock", uuid::Uuid::new_v4().simple()),
+        )
+        .expect("the listener tests' socket path must fit the macOS limit")
     }
 
     /// The regression test for the real deadlock this task found: no real `claude` process
@@ -1044,7 +1077,10 @@ mod tests {
         while !handle.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(handle.is_finished(), "hook-listener thread did not stop within 2s of the stop flag being set");
+        assert!(
+            handle.is_finished(),
+            "hook-listener thread did not stop within 2s of the stop flag being set"
+        );
         handle.join().unwrap();
         assert!(
             stop_requested.elapsed() < Duration::from_secs(2),
@@ -1154,7 +1190,10 @@ mod tests {
                 panic!("no PermissionRequest within 2s; the listener answered {reply:?}");
             }
         }
-        write.join().unwrap().expect("the whole payload should have been written");
+        write
+            .join()
+            .unwrap()
+            .expect("the whole payload should have been written");
         assert!(pending.lock().unwrap().contains_key("toolu_01CtdezhmhUCrBaswxW5HYmC"));
 
         stop.store(true, Ordering::Relaxed);
@@ -1200,9 +1239,17 @@ mod tests {
         let mut client = UnixStream::connect(&socket_path).unwrap();
         writeln!(client, "{}", fixture.trim()).unwrap();
 
-        let event = rx.recv_timeout(Duration::from_secs(2)).expect("no PermissionRequest event within 2s");
+        let event = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no PermissionRequest event within 2s");
         match &event {
-            AgentEvent::PermissionRequest { request_id, tool_use_id, tool_name, source, .. } => {
+            AgentEvent::PermissionRequest {
+                request_id,
+                tool_use_id,
+                tool_name,
+                source,
+                ..
+            } => {
                 assert_eq!(request_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
                 assert_eq!(
                     tool_use_id.as_deref(),
@@ -1221,15 +1268,14 @@ mod tests {
         // it. This is the join the two halves of this feature used to be tested either side of.
         let mut interrupt_requested = false;
         let mut sources = std::collections::HashMap::new();
-        let domain = crate::session::translate_wire_event(
-            event,
-            None,
-            &mut interrupt_requested,
-            &mut sources,
-        );
+        let domain = crate::session::translate_wire_event(event, None, &mut interrupt_requested, &mut sources);
         assert_eq!(domain.len(), 1);
         match &domain[0] {
-            crate::projection::AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+            crate::projection::AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(
                     tool_use_id.as_deref(),
                     Some("toolu_01CtdezhmhUCrBaswxW5HYmC"),
@@ -1267,7 +1313,10 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         assert_eq!(line.trim(), crate::hook_protocol::format_decision(true, None));
-        assert!(!pending.lock().unwrap().contains_key("toolu_1"), "answered request must be removed from pending");
+        assert!(
+            !pending.lock().unwrap().contains_key("toolu_1"),
+            "answered request must be removed from pending"
+        );
     }
 
     /// I2's transport half: two concurrent `agent-hook` connections are live at once (a real
@@ -1280,17 +1329,29 @@ mod tests {
         let (agent_side_a, hook_side_a) = UnixStream::pair().unwrap();
         let (agent_side_b, hook_side_b) = UnixStream::pair().unwrap();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        pending.lock().unwrap().insert("toolu_a".to_string(), PendingHookConnection { stream: agent_side_a });
-        pending.lock().unwrap().insert("toolu_b".to_string(), PendingHookConnection { stream: agent_side_b });
+        pending
+            .lock()
+            .unwrap()
+            .insert("toolu_a".to_string(), PendingHookConnection { stream: agent_side_a });
+        pending
+            .lock()
+            .unwrap()
+            .insert("toolu_b".to_string(), PendingHookConnection { stream: agent_side_b });
 
         write_hook_decision(&pending, "toolu_b", false, Some("denied b")).unwrap();
-        assert!(pending.lock().unwrap().contains_key("toolu_a"), "answering b must leave a pending");
+        assert!(
+            pending.lock().unwrap().contains_key("toolu_a"),
+            "answering b must leave a pending"
+        );
 
         // b's peer got b's decision...
         let mut reader_b = BufReader::new(hook_side_b);
         let mut line_b = String::new();
         reader_b.read_line(&mut line_b).unwrap();
-        assert_eq!(line_b.trim(), crate::hook_protocol::format_decision(false, Some("denied b")));
+        assert_eq!(
+            line_b.trim(),
+            crate::hook_protocol::format_decision(false, Some("denied b"))
+        );
 
         // ...and a's peer, still unanswered, gets its own (different) decision when answered.
         write_hook_decision(&pending, "toolu_a", true, None).unwrap();
@@ -1329,7 +1390,8 @@ mod tests {
         // A real client playing `agent-hook`: relay the request, then block waiting for a decision.
         let mut client = UnixStream::connect(&socket_path).unwrap();
         writeln!(client, "{}", fixture.trim()).unwrap();
-        rx.recv_timeout(Duration::from_secs(2)).expect("no PermissionRequest event within 2s");
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("no PermissionRequest event within 2s");
         assert!(pending.lock().unwrap().contains_key("toolu_01CtdezhmhUCrBaswxW5HYmC"));
 
         let peer = std::thread::spawn(move || {
@@ -1344,7 +1406,10 @@ mod tests {
 
         // It must genuinely be blocked -- otherwise this test would prove nothing about stranding.
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!peer.is_finished(), "the peer should still be blocked waiting for a decision");
+        assert!(
+            !peer.is_finished(),
+            "the peer should still be blocked waiting for a decision"
+        );
 
         // Exactly what `shutdown()` now does.
         release_pending_hook_connections(&pending);
@@ -1353,7 +1418,10 @@ mod tests {
         while !peer.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(peer.is_finished(), "the stranded peer was not released by draining pending_hook_connections");
+        assert!(
+            peer.is_finished(),
+            "the stranded peer was not released by draining pending_hook_connections"
+        );
         let (decision, bytes_after) = peer.join().unwrap();
         let decision: serde_json::Value =
             serde_json::from_str(decision.trim()).expect("the released peer must receive a real decision");
@@ -1361,7 +1429,10 @@ mod tests {
             decision["hookSpecificOutput"]["permissionDecision"], "deny",
             "a request released by shutdown must fail closed, not be answered with silence"
         );
-        assert_eq!(bytes_after, 0, "the connection must then close, giving agent-hook a real EOF to exit on");
+        assert_eq!(
+            bytes_after, 0,
+            "the connection must then close, giving agent-hook a real EOF to exit on"
+        );
         assert!(pending.lock().unwrap().is_empty());
 
         stop.store(true, Ordering::Relaxed);
@@ -1390,9 +1461,17 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         let decision: serde_json::Value = serde_json::from_str(line.trim()).expect("a decision must come back at all");
         assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
-        let reason = decision["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
-        assert!(reason.contains("agent-hook relay failed"), "the deny must say why: {reason}");
-        assert!(pending.lock().unwrap().is_empty(), "an unparseable request is never left pending");
+        let reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reason.contains("agent-hook relay failed"),
+            "the deny must say why: {reason}"
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "an unparseable request is never left pending"
+        );
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1476,9 +1555,14 @@ mod tests {
         // No leftover socket file from any of the five attempts (compared as a set difference
         // against a before-snapshot, so unrelated leftovers from other runs can't mask or fake
         // this).
-        let new_sockets: Vec<_> =
-            temp_hook_socket_names().into_iter().filter(|name| !sockets_before.contains(name)).collect();
-        assert!(new_sockets.is_empty(), "a failed spawn must not leave its socket file behind: {new_sockets:?}");
+        let new_sockets: Vec<_> = temp_hook_socket_names()
+            .into_iter()
+            .filter(|name| !sockets_before.contains(name))
+            .collect();
+        assert!(
+            new_sockets.is_empty(),
+            "a failed spawn must not leave its socket file behind: {new_sockets:?}"
+        );
 
         // A leaked listener thread never exits, so five leaks would be five permanently-extra
         // threads. Threads that other tests in this same binary hold are, by contrast, transient
@@ -1589,7 +1673,10 @@ mod tests {
         );
 
         let from_allowed = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &allowed);
-        assert!(from_allowed.is_ok(), "the project directory is the one probed: {from_allowed:?}");
+        assert!(
+            from_allowed.is_ok(),
+            "the project directory is the one probed: {from_allowed:?}"
+        );
 
         let from_refused = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &refused);
         let err = from_refused.expect_err("a project directory the binary refuses must fail the preflight");
@@ -1631,7 +1718,8 @@ exit 0"#,
         let result = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &std::env::temp_dir());
         let err = result.expect_err("a binary that refuses --settings must fail the preflight");
         assert!(
-            err.to_string().contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
+            err.to_string()
+                .contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
             "the real launcher's own refusal message must reach the caller verbatim, got: {err}"
         );
         let _ = std::fs::remove_file(&script);
@@ -1660,14 +1748,19 @@ exit 0"#,
 
         let sockets_before = temp_hook_socket_names();
         let outcome = AgentProcess::spawn_with_binary(&dir, PermissionMode::Auto, &[], script.to_str().unwrap());
-        let err = outcome.err().expect("spawn must fail when the resolved binary refuses the gate flag");
+        let err = outcome
+            .err()
+            .expect("spawn must fail when the resolved binary refuses the gate flag");
         assert!(
-            err.to_string().contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
+            err.to_string()
+                .contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
             "spawn_with_binary's error must carry the launcher's own refusal, got: {err}"
         );
 
-        let new_sockets: Vec<_> =
-            temp_hook_socket_names().into_iter().filter(|name| !sockets_before.contains(name)).collect();
+        let new_sockets: Vec<_> = temp_hook_socket_names()
+            .into_iter()
+            .filter(|name| !sockets_before.contains(name))
+            .collect();
         assert!(
             new_sockets.is_empty(),
             "a preflight failure must happen before the hook socket is ever bound, found: {new_sockets:?}"
@@ -1711,8 +1804,14 @@ exit 0"#,
     fn resolve_binary_absolute_path_finds_a_path_relative_name() {
         let resolved = resolve_binary_absolute_path("sh");
         let resolved = resolved.expect("sh must be found on PATH in any environment that can run a shell test");
-        assert!(resolved.is_absolute(), "resolved path must be absolute, got {resolved:?}");
-        assert!(resolved.is_file(), "resolved path must actually exist, got {resolved:?}");
+        assert!(
+            resolved.is_absolute(),
+            "resolved path must be absolute, got {resolved:?}"
+        );
+        assert!(
+            resolved.is_file(),
+            "resolved path must actually exist, got {resolved:?}"
+        );
     }
 
     /// A name that exists on no `PATH` entry resolves to `None`, not a fabricated guess -- the
@@ -1720,6 +1819,9 @@ exit 0"#,
     #[test]
     fn resolve_binary_absolute_path_returns_none_for_a_name_on_no_path_entry() {
         let resolved = resolve_binary_absolute_path("definitely-not-a-real-binary-name-2026-09-18");
-        assert!(resolved.is_none(), "a nonexistent name must resolve to None, got {resolved:?}");
+        assert!(
+            resolved.is_none(),
+            "a nonexistent name must resolve to None, got {resolved:?}"
+        );
     }
 }

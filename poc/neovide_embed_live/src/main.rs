@@ -61,8 +61,8 @@ use gtk4::gdk::{Key, ModifierType, ScrollUnit};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, EventControllerKey, EventControllerMotion,
-    EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext,
+    Application, ApplicationWindow, EventControllerKey, EventControllerMotion, EventControllerScroll,
+    EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext,
 };
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
@@ -179,10 +179,7 @@ fn make_gl_interface() -> GlInterface {
 }
 
 /// Carried over verbatim from `neovide_embed::resolve_gl_proc`.
-unsafe fn resolve_gl_proc(
-    lib: &libloading::os::unix::Library,
-    name: &str,
-) -> *const std::ffi::c_void {
+unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
     unsafe {
         if let Ok(epoxy_name) = std::ffi::CString::new(format!("epoxy_{name}")) {
             if let Ok(sym) = lib.get::<*const std::ffi::c_void>(epoxy_name.as_bytes_with_nul()) {
@@ -233,7 +230,10 @@ fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRec
         content_region.max.y - content_region.min.y,
     );
     let grid_size = pixel_size / harness.grid_scale();
-    GridSize::new(grid_size.width.floor().max(1.0) as u32, grid_size.height.floor().max(1.0) as u32)
+    GridSize::new(
+        grid_size.width.floor().max(1.0) as u32,
+        grid_size.height.floor().max(1.0) as u32,
+    )
 }
 
 /// nvim's own button-text notation for a GDK button number, mirroring the reference
@@ -313,7 +313,10 @@ fn pixel_to_grid_pos(
     let grid_x = (pixel_x / grid_scale.width()).floor().max(0.0) as u32;
     let grid_y = (pixel_y / grid_scale.height()).floor().max(0.0) as u32;
 
-    (grid_x.min(grid_size.width.max(1) - 1), grid_y.min(grid_size.height.max(1) - 1))
+    (
+        grid_x.min(grid_size.width.max(1) - 1),
+        grid_y.min(grid_size.height.max(1) - 1),
+    )
 }
 
 /// `content_region` computed from `gl_area`'s own *current* framebuffer size -- the same
@@ -577,8 +580,17 @@ fn handle_mouse_button(
         position_from_event
     };
 
-    session.harness.send_mouse_button(button, pressed, grid_pos, &modifier_string);
-    session.active_drag.set(if pressed { Some(DragState { button, last_grid_pos: grid_pos }) } else { None });
+    session
+        .harness
+        .send_mouse_button(button, pressed, grid_pos, &modifier_string);
+    session.active_drag.set(if pressed {
+        Some(DragState {
+            button,
+            last_grid_pos: grid_pos,
+        })
+    } else {
+        None
+    });
     session.wants_frame.set(true);
 }
 
@@ -627,7 +639,10 @@ fn handle_mouse_motion(
 
     let modifier_string = format_modifier_string(controller.current_event_state());
     session.harness.send_mouse_drag(drag.button, grid_pos, &modifier_string);
-    session.active_drag.set(Some(DragState { button: drag.button, last_grid_pos: grid_pos }));
+    session.active_drag.set(Some(DragState {
+        button: drag.button,
+        last_grid_pos: grid_pos,
+    }));
     session.wants_frame.set(true);
 }
 
@@ -890,9 +905,7 @@ fn build_ui(app: &Application, want_clean: bool) {
         let key_controller = EventControllerKey::new();
         key_controller.set_im_context(Some(&im_context));
         key_controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-            if state.intersects(
-                ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
-            ) {
+            if state.intersects(ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK) {
                 return glib::Propagation::Proceed;
             }
 
@@ -1020,8 +1033,8 @@ fn build_ui(app: &Application, want_clean: bool) {
 
             if state_slot.is_none() {
                 let interface = make_gl_interface();
-                let gr_context = direct_contexts::make_gl(interface, None)
-                    .expect("failed to create Skia GL DirectContext");
+                let gr_context =
+                    direct_contexts::make_gl(interface, None).expect("failed to create Skia GL DirectContext");
                 let width = widget.width() * widget.scale_factor();
                 let height = widget.height() * widget.scale_factor();
                 println!(
@@ -1030,7 +1043,12 @@ fn build_ui(app: &Application, want_clean: bool) {
                     height,
                     widget.scale_factor()
                 );
-                *state_slot = Some(SkiaState { gr_context, surface: None, fb_width: width, fb_height: height });
+                *state_slot = Some(SkiaState {
+                    gr_context,
+                    surface: None,
+                    fb_width: width,
+                    fb_height: height,
+                });
             }
 
             let state = state_slot.as_mut().unwrap();
@@ -1114,17 +1132,14 @@ fn build_ui(app: &Application, want_clean: bool) {
                         Err(err) => {
                             let elapsed = t0.elapsed();
                             let message = format!("{err:#}");
-                            println!(
-                                "[live] LiveHarness::with_options failed after {elapsed:?}: {message}"
-                            );
+                            println!("[live] LiveHarness::with_options failed after {elapsed:?}: {message}");
                             *live = LiveState::Failed(message);
                         }
                     }
                 }
                 LiveState::Ready(session) => {
                     let (dt, fps) = session.tick();
-                    let animating =
-                        session.harness.render_frame(canvas, Some(&content_region), dt);
+                    let animating = session.harness.render_frame(canvas, Some(&content_region), dt);
                     // Share this frame's "do we still need more frames" signals with the tick
                     // callback -- the fix this crate exists to validate (see PHASE_REPORT.md).
                     session.last_animating.set(animating);
@@ -1251,8 +1266,7 @@ fn build_ui(app: &Application, want_clean: bool) {
                     // `close_requested.replace(true)` is the one-shot guard documented on
                     // `LiveSession::close_requested`; only the tick that flips it false->true
                     // actually asks the window to close.
-                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true)
-                    {
+                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true) {
                         should_close_window = true;
                     }
 
@@ -1380,17 +1394,29 @@ mod tests {
         // Right at content_region's own top-left corner -> grid cell (0, 0), not wherever (0, 0)
         // of the raw framebuffer would map to -- this is the whole point of subtracting
         // content_region.min before dividing by grid_scale.
-        assert_eq!(pixel_to_grid_pos(40.0, 40.0, 1, &content_region, grid_scale, grid_size), (0, 0));
+        assert_eq!(
+            pixel_to_grid_pos(40.0, 40.0, 1, &content_region, grid_scale, grid_size),
+            (0, 0)
+        );
 
         // One cell right/down of that (scale_factor=1, so logical == device pixels here).
-        assert_eq!(pixel_to_grid_pos(49.0, 58.0, 1, &content_region, grid_scale, grid_size), (1, 1));
+        assert_eq!(
+            pixel_to_grid_pos(49.0, 58.0, 1, &content_region, grid_scale, grid_size),
+            (1, 1)
+        );
 
         // scale_factor=2 (HiDPI): logical (20, 20) is device pixel (40, 40) -- same as the first
         // case above once converted, so still grid cell (0, 0).
-        assert_eq!(pixel_to_grid_pos(20.0, 20.0, 2, &content_region, grid_scale, grid_size), (0, 0));
+        assert_eq!(
+            pixel_to_grid_pos(20.0, 20.0, 2, &content_region, grid_scale, grid_size),
+            (0, 0)
+        );
 
         // Anything left of/above content_region clamps to 0 rather than underflowing.
-        assert_eq!(pixel_to_grid_pos(0.0, 0.0, 1, &content_region, grid_scale, grid_size), (0, 0));
+        assert_eq!(
+            pixel_to_grid_pos(0.0, 0.0, 1, &content_region, grid_scale, grid_size),
+            (0, 0)
+        );
 
         // Anything past the grid's own reported size clamps to grid_size - 1, matching
         // `MouseManager::get_relative_position_at`'s own clamp.

@@ -17,7 +17,7 @@ use neovide::{
     live_harness::{LiveHarness, LiveHarnessOptions},
     units::{GridSize, PixelRect},
 };
-use skia_safe::{Color, Surface, surfaces};
+use skia_safe::{surfaces, Color, Surface};
 
 const CANVAS: (i32, i32) = (640, 320);
 const FRAME_DT: f32 = 1.0 / 60.0;
@@ -78,7 +78,10 @@ fn measure(scale: f64, insert: bool, keys: &str, extra: &[String]) -> (usize, us
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while !harness.is_ready() {
-        assert!(Instant::now() < deadline && !harness.has_neovim_exited(), "nvim never became ready");
+        assert!(
+            Instant::now() < deadline && !harness.has_neovim_exited(),
+            "nvim never became ready"
+        );
         render(&mut harness, &mut surface, &region);
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -100,12 +103,18 @@ fn measure(scale: f64, insert: bool, keys: &str, extra: &[String]) -> (usize, us
 }
 
 fn width_cmd(width: &str) -> Vec<String> {
-    vec!["--cmd".to_string(), format!("let g:neovide_cursor_unfocused_outline_width = {width}")]
+    vec![
+        "--cmd".to_string(),
+        format!("let g:neovide_cursor_unfocused_outline_width = {width}"),
+    ]
 }
 
 /// What neovibe's editor pane passes: its own default, exactly as `NeovideEditorPane` builds it.
 fn pane_default() -> Vec<String> {
-    vec!["--cmd".to_string(), neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD.to_string()]
+    vec![
+        "--cmd".to_string(),
+        neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD.to_string(),
+    ]
 }
 
 const CASE_ENV: &str = "NEOVIBE_UNFOCUSED_CURSOR_CASE";
@@ -128,15 +137,28 @@ struct Case {
 /// Runs one case in a child copy of this binary: winit allows one `EventLoop` per process, and
 /// only on the main thread, so every `LiveHarness` needs a fresh process.
 fn run_case(case: &Case) -> (usize, usize) {
-    let spec = format!("{}\n{}\n{}\n{}", case.scale, case.insert, case.keys, case.extra.join("\n"));
+    let spec = format!(
+        "{}\n{}\n{}\n{}",
+        case.scale,
+        case.insert,
+        case.keys,
+        case.extra.join("\n")
+    );
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .env(CASE_ENV, spec)
         .output()
         .expect("re-exec of the test binary failed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().find_map(|l| l.strip_prefix("RESULT ")).unwrap_or_else(|| {
-        panic!("case produced no result: {}\n{}", stdout, String::from_utf8_lossy(&out.stderr))
-    });
+    let line = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("RESULT "))
+        .unwrap_or_else(|| {
+            panic!(
+                "case produced no result: {}\n{}",
+                stdout,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
     let mut it = line.split(' ').map(|n| n.parse().unwrap());
     (it.next().unwrap(), it.next().unwrap())
 }

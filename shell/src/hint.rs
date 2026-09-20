@@ -45,7 +45,7 @@ use gtk4::glib;
 use gtk4::graphene;
 use gtk4::prelude::*;
 
-use neovibe_core::hint::{order_targets, HintSession, HintStep, Landing, LabelPlan, Slot, TargetOrder, WindowLayout};
+use neovibe_core::hint::{order_targets, HintSession, HintStep, LabelPlan, Landing, Slot, TargetOrder, WindowLayout};
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::{AgentPanelHandle, HintInbound};
@@ -111,7 +111,13 @@ pub(crate) fn classify_key(key: Key, state: ModifierType, same_key: &[Key]) -> H
 fn same_key_in_every_layout(widget: Option<gtk4::Widget>, keycode: u32) -> Vec<Key> {
     widget
         .and_then(|w| w.display().map_keycode(keycode))
-        .map(|entries| entries.into_iter().filter(|(k, _)| k.level() == 0).map(|(_, key)| key).collect())
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|(k, _)| k.level() == 0)
+                .map(|(_, key)| key)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -329,7 +335,9 @@ impl HintCoordinator {
         let weak = Rc::downgrade(self);
         let held_on_press = held.clone();
         keys.connect_key_pressed(move |keys, key, keycode, state| {
-            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(this) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             let mut h = held_on_press.get();
             let repeat = h.press(keycode, key);
             held_on_press.set(h);
@@ -346,7 +354,11 @@ impl HintCoordinator {
                 detach_later(&this.window, keys.clone());
                 return glib::Propagation::Proceed;
             }
-            this.on_key(classify_key(key, state, &same_key_in_every_layout(keys.widget(), keycode)));
+            this.on_key(classify_key(
+                key,
+                state,
+                &same_key_in_every_layout(keys.widget(), keycode),
+            ));
             glib::Propagation::Stop
         });
         let weak = Rc::downgrade(self);
@@ -474,8 +486,15 @@ impl HintCoordinator {
             self.agent.hint_show(session_id, &plan.panel);
         }
         let mut labels = Vec::new();
-        for (slot, label) in order.before.iter().zip(&plan.before).chain(order.after.iter().zip(&plan.after)) {
-            let Some(widget) = self.slot_widget(*slot) else { continue };
+        for (slot, label) in order
+            .before
+            .iter()
+            .zip(&plan.before)
+            .chain(order.after.iter().zip(&plan.after))
+        {
+            let Some(widget) = self.slot_widget(*slot) else {
+                continue;
+            };
             let Some(point) = widget.compute_point(&self.overlay, &graphene::Point::new(0.0, 0.0)) else {
                 // Not in the overlay's tree after all; the label can still be typed, just not seen.
                 eprintln!("[hint] no position for a target; its label {label} is not drawn");
@@ -513,7 +532,9 @@ impl HintCoordinator {
             HintKey::Backspace => {
                 let typed = {
                     let mut guard = self.active.borrow_mut();
-                    let Some(session) = guard.as_mut().and_then(|a| a.session.as_mut()) else { return };
+                    let Some(session) = guard.as_mut().and_then(|a| a.session.as_mut()) else {
+                        return;
+                    };
                     session.backspace().to_string()
                 };
                 self.show_prefix(&typed);
@@ -522,7 +543,9 @@ impl HintCoordinator {
                 let step = {
                     let mut guard = self.active.borrow_mut();
                     // Before the plan exists every key is swallowed and ignored.
-                    let Some(session) = guard.as_mut().and_then(|a| a.session.as_mut()) else { return };
+                    let Some(session) = guard.as_mut().and_then(|a| a.session.as_mut()) else {
+                        return;
+                    };
                     session.key(ch)
                 };
                 match step {
@@ -556,7 +579,9 @@ impl HintCoordinator {
         let (session_id, landing, panel_asked) = {
             let guard = self.active.borrow();
             let Some(active) = guard.as_ref() else { return };
-            let Some(landing) = active.plan.as_ref().and_then(|p| active.order.landing(p, index)) else { return };
+            let Some(landing) = active.plan.as_ref().and_then(|p| active.order.landing(p, index)) else {
+                return;
+            };
             (active.session_id, landing, active.order.ask_panel)
         };
         match landing {
@@ -584,8 +609,7 @@ impl HintCoordinator {
 
     /// Every cancel path (spec §2.5): labels gone, focus back where it was.
     fn cancel(&self) {
-        let Some((session_id, panel_asked)) =
-            self.active.borrow().as_ref().map(|a| (a.session_id, a.order.ask_panel))
+        let Some((session_id, panel_asked)) = self.active.borrow().as_ref().map(|a| (a.session_id, a.order.ask_panel))
         else {
             return;
         };
@@ -598,7 +622,9 @@ impl HintCoordinator {
     fn end(&self, restore: bool) {
         // Taken out first, so nothing below runs with `active` borrowed and a re-entrant callback
         // (a focus change, an `is-active` notify) sees no session rather than a borrow panic.
-        let Some(mut active) = self.active.borrow_mut().take() else { return };
+        let Some(mut active) = self.active.borrow_mut().take() else {
+            return;
+        };
         if let Some(source) = active.timeout.take() {
             source.remove();
         }
@@ -666,7 +692,10 @@ mod tests {
     #[test]
     fn capslock_and_shift_still_type_the_label() {
         assert_eq!(classify_key(Key::A, ModifierType::LOCK_MASK, &[]), HintKey::Letter('a'));
-        assert_eq!(classify_key(Key::A, ModifierType::SHIFT_MASK, &[]), HintKey::Letter('a'));
+        assert_eq!(
+            classify_key(Key::A, ModifierType::SHIFT_MASK, &[]),
+            HintKey::Letter('a')
+        );
     }
 
     /// On a Cyrillic layout the key where `a` sits types `ф`: its Latin letter is found in the
@@ -676,8 +705,14 @@ mod tests {
     fn a_non_latin_layout_types_the_latin_letter_on_the_same_key() {
         let same_key = [Key::Cyrillic_ef, Key::a];
         assert_eq!(classify_key(Key::Cyrillic_ef, NONE, &same_key), HintKey::Letter('a'));
-        assert_eq!(classify_key(Key::Cyrillic_EF, ModifierType::LOCK_MASK, &same_key), HintKey::Letter('a'));
-        assert_eq!(classify_key(Key::Cyrillic_ef, NONE, &[Key::Cyrillic_ef]), HintKey::Letter('ф'));
+        assert_eq!(
+            classify_key(Key::Cyrillic_EF, ModifierType::LOCK_MASK, &same_key),
+            HintKey::Letter('a')
+        );
+        assert_eq!(
+            classify_key(Key::Cyrillic_ef, NONE, &[Key::Cyrillic_ef]),
+            HintKey::Letter('ф')
+        );
     }
 
     /// A non-label key does nothing: not a cancel, not a letter (spec §2.5).
@@ -695,7 +730,10 @@ mod tests {
     #[test]
     fn a_label_dims_its_typed_prefix_and_an_unreachable_one_is_off() {
         assert_eq!(label_markup("as", ""), ("as".to_string(), true));
-        assert_eq!(label_markup("as", "a"), ("<span alpha=\"45%\">a</span>s".to_string(), true));
+        assert_eq!(
+            label_markup("as", "a"),
+            ("<span alpha=\"45%\">a</span>s".to_string(), true)
+        );
         assert_eq!(label_markup("ds", "a"), ("ds".to_string(), false));
     }
 

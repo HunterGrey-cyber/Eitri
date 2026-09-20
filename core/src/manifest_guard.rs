@@ -43,9 +43,14 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
         // name is everything before the first `=`, trimmed. A `[dependencies.name]` sub-table
         // header (already excluded above, since it starts with `[`) is the only other shape a
         // Cargo.toml dependency can take, so this covers every real declaration.
-        let Some(name) = trimmed.split('=').next() else { continue };
+        let Some(name) = trimmed.split('=').next() else {
+            continue;
+        };
         let name = name.trim();
-        if FORBIDDEN.iter().any(|forbidden| name == *forbidden || name.starts_with(&format!("{forbidden}-"))) {
+        if FORBIDDEN
+            .iter()
+            .any(|forbidden| name == *forbidden || name.starts_with(&format!("{forbidden}-")))
+        {
             offenders.push(format!("core/Cargo.toml:{}: {trimmed}", n + 1));
         }
     }

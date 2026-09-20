@@ -122,8 +122,7 @@ impl HandoffRefusal {
                     .to_string()
             }
             HandoffRefusal::TurnInProgress => {
-                "A turn is still running. Let it finish, or press Stop, before continuing in a terminal."
-                    .to_string()
+                "A turn is still running. Let it finish, or press Stop, before continuing in a terminal.".to_string()
             }
             HandoffRefusal::Unusable(e) => e.to_string(),
         }
@@ -140,7 +139,9 @@ pub(crate) fn prepare_handoff(
     project_dir: &Path,
     facts: Option<HandoffFacts<'_>>,
 ) -> Result<ClaudeResumeCommand, HandoffRefusal> {
-    let Some(facts) = facts else { return Err(HandoffRefusal::NoSession) };
+    let Some(facts) = facts else {
+        return Err(HandoffRefusal::NoSession);
+    };
     let Some(provider_session_id) = facts.provider_session_id.filter(|id| !id.trim().is_empty()) else {
         return Err(HandoffRefusal::NoProviderSessionId);
     };
@@ -156,7 +157,9 @@ pub(crate) fn prepare_handoff(
     // The provider's own cwd wins: it is where Claude actually stored the session, which is what
     // `--resume` resolves against. `project_dir` is only what the shell asked for, and is the
     // fallback for the window where a session id exists but no `SessionOpened` has been folded yet.
-    let cwd = facts.reported_cwd.unwrap_or_else(|| project_dir.to_str().unwrap_or_default());
+    let cwd = facts
+        .reported_cwd
+        .unwrap_or_else(|| project_dir.to_str().unwrap_or_default());
     ClaudeResumeCommand::for_session(cwd, provider_session_id).map_err(HandoffRefusal::Unusable)
 }
 
@@ -180,7 +183,10 @@ mod tests {
 
     #[test]
     fn there_is_nothing_to_continue_before_a_session_exists() {
-        assert_eq!(prepare_handoff(&project(), None).unwrap_err(), HandoffRefusal::NoSession);
+        assert_eq!(
+            prepare_handoff(&project(), None).unwrap_err(),
+            HandoffRefusal::NoSession
+        );
     }
 
     /// The precondition this whole action is gated on. `provider_session_id` is the real Claude
@@ -215,7 +221,10 @@ mod tests {
     fn a_turn_in_flight_blocks_the_handoff_rather_than_cutting_it_short() {
         let refusal = prepare_handoff(
             &project(),
-            Some(HandoffFacts { active_turn_id: Some("t1"), ..ready() }),
+            Some(HandoffFacts {
+                active_turn_id: Some("t1"),
+                ..ready()
+            }),
         )
         .unwrap_err();
         assert_eq!(refusal, HandoffRefusal::TurnInProgress);
@@ -227,18 +236,31 @@ mod tests {
     fn the_command_runs_where_the_provider_says_the_session_lives() {
         let command = prepare_handoff(
             &PathBuf::from("/home/user/somewhere-else"),
-            Some(HandoffFacts { reported_cwd: Some("/home/user/project"), ..ready() }),
+            Some(HandoffFacts {
+                reported_cwd: Some("/home/user/project"),
+                ..ready()
+            }),
         )
         .unwrap();
         assert_eq!(command.cwd(), "/home/user/project");
-        assert_eq!(command.shell_command_line(), "cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
+        assert_eq!(
+            command.shell_command_line(),
+            "cd /home/user/project && claude --resume 1857dcd5-973b-46a2"
+        );
     }
 
     /// A session can carry a provider session id before the projection has folded a `SessionOpened`
     /// with a cwd in it, so the shell's own project directory is the fallback -- not an error.
     #[test]
     fn the_project_directory_is_the_fallback_when_the_provider_reported_none() {
-        let command = prepare_handoff(&project(), Some(HandoffFacts { reported_cwd: None, ..ready() })).unwrap();
+        let command = prepare_handoff(
+            &project(),
+            Some(HandoffFacts {
+                reported_cwd: None,
+                ..ready()
+            }),
+        )
+        .unwrap();
         assert_eq!(command.cwd(), "/home/user/project");
     }
 
@@ -250,10 +272,18 @@ mod tests {
     /// arm to `prepare_handoff` fails this test and nothing else.
     #[test]
     fn a_session_that_has_already_ended_can_still_be_handed_off() {
-        let command =
-            prepare_handoff(&project(), Some(HandoffFacts { liveness: ConversationLiveness::Ended, ..ready() }))
-                .expect("a conversation that ended is exactly the one a terminal helps most with");
-        assert_eq!(command.shell_command_line(), "cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
+        let command = prepare_handoff(
+            &project(),
+            Some(HandoffFacts {
+                liveness: ConversationLiveness::Ended,
+                ..ready()
+            }),
+        )
+        .expect("a conversation that ended is exactly the one a terminal helps most with");
+        assert_eq!(
+            command.shell_command_line(),
+            "cd /home/user/project && claude --resume 1857dcd5-973b-46a2"
+        );
     }
 
     /// The mapping from the projection's own status, so the panel cannot restate it differently.
@@ -262,8 +292,14 @@ mod tests {
     /// liveness one.
     #[test]
     fn liveness_is_read_off_the_projections_own_status() {
-        assert_eq!(ConversationLiveness::of(&agent::ProjectionStatus::Starting), ConversationLiveness::Live);
-        assert_eq!(ConversationLiveness::of(&agent::ProjectionStatus::Running), ConversationLiveness::Live);
+        assert_eq!(
+            ConversationLiveness::of(&agent::ProjectionStatus::Starting),
+            ConversationLiveness::Live
+        );
+        assert_eq!(
+            ConversationLiveness::of(&agent::ProjectionStatus::Running),
+            ConversationLiveness::Live
+        );
         assert_eq!(
             ConversationLiveness::of(&agent::ProjectionStatus::Closed { reason: "done".into() }),
             ConversationLiveness::Ended
@@ -296,9 +332,15 @@ mod tests {
     fn a_malformed_session_id_is_reported_as_the_agent_crate_states_it() {
         let refusal = prepare_handoff(
             &project(),
-            Some(HandoffFacts { provider_session_id: Some("--resume"), ..ready() }),
+            Some(HandoffFacts {
+                provider_session_id: Some("--resume"),
+                ..ready()
+            }),
         )
         .unwrap_err();
-        assert_eq!(refusal, HandoffRefusal::Unusable(ResumeCommandError::SessionIdLooksLikeAFlag));
+        assert_eq!(
+            refusal,
+            HandoffRefusal::Unusable(ResumeCommandError::SessionIdLooksLikeAFlag)
+        );
     }
 }

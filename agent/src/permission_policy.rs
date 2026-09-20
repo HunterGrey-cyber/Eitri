@@ -95,19 +95,24 @@ impl Classification {
 }
 
 fn allow(reason: &'static str) -> Classification {
-    Classification { verdict: PermissionVerdict::AllowWithoutAsking, reason }
+    Classification {
+        verdict: PermissionVerdict::AllowWithoutAsking,
+        reason,
+    }
 }
 
 fn ask(reason: &'static str) -> Classification {
-    Classification { verdict: PermissionVerdict::AskTheUser, reason }
+    Classification {
+        verdict: PermissionVerdict::AskTheUser,
+        reason,
+    }
 }
 
 /// Tools the CLI asks about every time in `default` mode, decidable from the name alone.
 ///
 /// `WebFetch` is here for a different reason from the rest -- see the module doc's rule (d): the
 /// CLI does exempt some documentation domains, and this version refuses to guess which.
-pub const ALWAYS_ASK_TOOLS: &[&str] =
-    &["Write", "Edit", "MultiEdit", "NotebookEdit", "WebSearch", "WebFetch"];
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit", "WebSearch", "WebFetch"];
 
 /// Tools that change no file, run no command and reach no network -- the CLI does not ask about
 /// these and neither does this.
@@ -125,16 +130,24 @@ pub const NEVER_ASK_TOOLS: &[&str] = &["TodoWrite", "Task"];
 /// `classify_bash` below and the module doc. `echo` is on this list and `echo hi >
 /// c.txt` was measured DENIED.
 pub const READ_ONLY_BASH_COMMANDS: &[&str] = &[
-    "ls", "cat", "echo", "pwd", "head", "tail", "grep", "find", "wc", "which", "diff", "stat", "du",
-    "cd",
+    "ls", "cat", "echo", "pwd", "head", "tail", "grep", "find", "wc", "which", "diff", "stat", "du", "cd",
 ];
 
 /// `git` subcommands that only read. Deliberately narrower than "read-only git forms" in the docs:
 /// `branch`, `tag`, `config` and `stash` all have writing forms distinguished only by their
 /// arguments, and distinguishing them is exactly the kind of partial parse this module refuses to
 /// do. `git commit` was measured denied; nothing here would have allowed it anyway.
-pub const READ_ONLY_GIT_SUBCOMMANDS: &[&str] =
-    &["status", "log", "diff", "show", "blame", "rev-parse", "ls-files", "shortlog", "describe"];
+pub const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "rev-parse",
+    "ls-files",
+    "shortlog",
+    "describe",
+];
 
 /// The docs name 10,000 characters as a length past which the CLI re-prompts even for an otherwise
 /// read-only command. Reproduced rather than reasoned about.
@@ -148,8 +161,8 @@ pub const MAX_BASH_COMMAND_LEN: usize = 10_000;
 /// quoting (`" '`), escapes (`\`), home expansion (`~`), history (`!`), comments (`#`) and embedded
 /// newlines all qualify.
 const BASH_CHARS_THAT_FORCE_A_CARD: &[char] = &[
-    '|', '&', ';', '<', '>', '$', '`', '(', ')', '{', '}', '[', ']', '*', '?', '~', '!', '#', '\\',
-    '"', '\'', '\n', '\r',
+    '|', '&', ';', '<', '>', '$', '`', '(', ')', '{', '}', '[', ']', '*', '?', '~', '!', '#', '\\', '"', '\'', '\n',
+    '\r',
 ];
 
 /// `find` actions that write or execute. `find` is on the CLI's read-only list, and `find . -delete`
@@ -192,12 +205,7 @@ pub fn classify_permission_request(tool_name: &str, input: &Value, project_root:
 /// [`classify_permission_request`] with the home directory passed in rather than read from the
 /// environment, so the "the root is not a boundary" branch is testable without mutating `HOME` for
 /// the whole test process.
-fn classify_with_home(
-    tool_name: &str,
-    input: &Value,
-    project_root: &Path,
-    home: Option<&Path>,
-) -> Classification {
+fn classify_with_home(tool_name: &str, input: &Value, project_root: &Path, home: Option<&Path>) -> Classification {
     // Before anything else: a call whose input is not even an object is not a call this module can
     // read. Both backends deliver `input` as whatever JSON arrived, so this is reachable.
     if !input.is_object() {
@@ -265,7 +273,9 @@ fn boundary(project_root: &Path, home: Option<&Path>) -> Result<PathBuf, Classif
     }
     if let Some(home) = home.and_then(|h| h.canonicalize().ok()) {
         if home.starts_with(&root) {
-            return Err(ask("the project root is the home directory or above it, which is no boundary"));
+            return Err(ask(
+                "the project root is the home directory or above it, which is no boundary",
+            ));
         }
     }
     Ok(root)
@@ -290,12 +300,7 @@ enum PathField {
 ///
 /// Resolving BEFORE comparing is the whole design. A textual check would be defeated by
 /// `src/../../etc/passwd` and by any symlink; `canonicalize` is a real syscall that follows both.
-fn classify_path(
-    input: &Value,
-    field: &str,
-    requirement: PathField,
-    root: &Path,
-) -> Classification {
+fn classify_path(input: &Value, field: &str, requirement: PathField, root: &Path) -> Classification {
     let raw = match input.get(field) {
         None | Some(Value::Null) => match requirement {
             // No path means the working directory, which is the root.
@@ -405,9 +410,7 @@ fn classify_bash(input: &Value, root: &Path) -> Classification {
             {
                 ask("this git call carries an option that writes a file")
             }
-            Some(sub) if READ_ONLY_GIT_SUBCOMMANDS.contains(sub) => {
-                allow("a read-only git subcommand")
-            }
+            Some(sub) if READ_ONLY_GIT_SUBCOMMANDS.contains(sub) => allow("a read-only git subcommand"),
             _ => ask("this git subcommand is not one of the read-only forms"),
         },
         "find"
@@ -492,8 +495,7 @@ mod tests {
 
     impl Workspace {
         fn new() -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("agent-permission-policy-{}", uuid::Uuid::new_v4()));
+            let root = std::env::temp_dir().join(format!("agent-permission-policy-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(root.join("src")).unwrap();
             std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
             Self { root }
@@ -579,7 +581,10 @@ mod tests {
                 "{tool} with a non-object input"
             );
             assert_eq!(verdict(tool, json!(null), ws.path()), PermissionVerdict::AskTheUser);
-            assert_eq!(verdict(tool, json!([1, 2, 3]), ws.path()), PermissionVerdict::AskTheUser);
+            assert_eq!(
+                verdict(tool, json!([1, 2, 3]), ws.path()),
+                PermissionVerdict::AskTheUser
+            );
         }
     }
 
@@ -641,7 +646,11 @@ mod tests {
     fn dot_dot_traversal_does_not_escape_the_root() {
         let ws = Workspace::new();
         assert_eq!(
-            verdict("Read", json!({ "file_path": "src/../../../../etc/hostname" }), ws.path()),
+            verdict(
+                "Read",
+                json!({ "file_path": "src/../../../../etc/hostname" }),
+                ws.path()
+            ),
             PermissionVerdict::AskTheUser
         );
         // And a `..` that stays inside is still fine -- this is a containment test, not a ban on
@@ -757,19 +766,19 @@ mod tests {
     fn every_shape_of_shell_syntax_gets_a_card() {
         let ws = Workspace::new();
         for command in [
-            "echo hi > c.txt",         // redirect
-            "echo hi >> c.txt",        // appending redirect
-            "cat < a.txt",             // input redirect
-            "ls | tee out.txt",        // pipeline
-            "ls && rm -rf .",          // chain
-            "ls; rm -rf .",            // sequence
-            "echo $(rm -rf .)",        // command substitution
-            "echo `rm -rf .`",         // backtick substitution
-            "ls *.rs",                 // unquoted glob
-            "cat 'a b.txt'",           // quoting
-            "ls ~",                    // home expansion
-            "ls \\\n -l",              // escape and newline
-            "ls & ",                   // background
+            "echo hi > c.txt",  // redirect
+            "echo hi >> c.txt", // appending redirect
+            "cat < a.txt",      // input redirect
+            "ls | tee out.txt", // pipeline
+            "ls && rm -rf .",   // chain
+            "ls; rm -rf .",     // sequence
+            "echo $(rm -rf .)", // command substitution
+            "echo `rm -rf .`",  // backtick substitution
+            "ls *.rs",          // unquoted glob
+            "cat 'a b.txt'",    // quoting
+            "ls ~",             // home expansion
+            "ls \\\n -l",       // escape and newline
+            "ls & ",            // background
         ] {
             assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
         }
@@ -790,7 +799,13 @@ mod tests {
     #[test]
     fn a_command_that_is_not_on_the_read_only_list_gets_a_card() {
         let ws = Workspace::new();
-        for command in ["rm b.txt", "mv a b", "curl http://example.com", "python script.py", "npm ci"] {
+        for command in [
+            "rm b.txt",
+            "mv a b",
+            "curl http://example.com",
+            "python script.py",
+            "npm ci",
+        ] {
             assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
         }
     }
@@ -814,7 +829,9 @@ mod tests {
             );
         }
         // Writing forms, and the ambiguous ones this module deliberately refuses to split.
-        for sub in ["commit", "push", "checkout", "branch", "tag", "config", "stash", "reset"] {
+        for sub in [
+            "commit", "push", "checkout", "branch", "tag", "config", "stash", "reset",
+        ] {
             assert_eq!(
                 bash(&format!("git {sub}"), ws.path()),
                 PermissionVerdict::AskTheUser,
@@ -830,7 +847,10 @@ mod tests {
     #[test]
     fn a_find_that_writes_or_executes_gets_a_card() {
         let ws = Workspace::new();
-        assert_eq!(bash("find . -name main.rs", ws.path()), PermissionVerdict::AllowWithoutAsking);
+        assert_eq!(
+            bash("find . -name main.rs", ws.path()),
+            PermissionVerdict::AllowWithoutAsking
+        );
         for command in ["find . -delete", "find . -exec rm -rf . +", "find . -fprint out.txt"] {
             assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
         }
@@ -851,7 +871,11 @@ mod tests {
         }
         // And the ordinary read-only forms are untouched.
         for command in ["git log -5", "git log --oneline", "git show HEAD", "git diff --stat"] {
-            assert_eq!(bash(command, ws.path()), PermissionVerdict::AllowWithoutAsking, "`{command}`");
+            assert_eq!(
+                bash(command, ws.path()),
+                PermissionVerdict::AllowWithoutAsking,
+                "`{command}`"
+            );
         }
     }
 
@@ -903,7 +927,10 @@ mod tests {
         }
         // A path through a link that stays inside is still fine.
         std::os::unix::fs::symlink(ws.path().join("src"), ws.path().join("inner")).unwrap();
-        assert_eq!(bash("cat inner/main.rs", ws.path()), PermissionVerdict::AllowWithoutAsking);
+        assert_eq!(
+            bash("cat inner/main.rs", ws.path()),
+            PermissionVerdict::AllowWithoutAsking
+        );
         let _ = std::fs::remove_dir_all(&outside);
     }
 
@@ -927,8 +954,18 @@ mod tests {
             assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
         }
         // The forms that do not follow links found mid-walk are unchanged.
-        for command in ["grep -r token .", "grep -rn token src", "find . -name main.rs", "ls -R", "du -a ."] {
-            assert_eq!(bash(command, ws.path()), PermissionVerdict::AllowWithoutAsking, "`{command}`");
+        for command in [
+            "grep -r token .",
+            "grep -rn token src",
+            "find . -name main.rs",
+            "ls -R",
+            "du -a .",
+        ] {
+            assert_eq!(
+                bash(command, ws.path()),
+                PermissionVerdict::AllowWithoutAsking,
+                "`{command}`"
+            );
         }
     }
 
@@ -950,7 +987,11 @@ mod tests {
                 "{pattern}"
             );
         }
-        assert_eq!(verdict("Glob", json!({}), ws.path()), PermissionVerdict::AskTheUser, "no pattern");
+        assert_eq!(
+            verdict("Glob", json!({}), ws.path()),
+            PermissionVerdict::AskTheUser,
+            "no pattern"
+        );
         assert_eq!(
             verdict("Glob", json!({ "pattern": "**/*.rs" }), ws.path()),
             PermissionVerdict::AllowWithoutAsking
@@ -970,7 +1011,10 @@ mod tests {
             classify("Read", json!({ "file_path": "src/main.rs" }), ws.path(), ws.path()),
             PermissionVerdict::AskTheUser
         );
-        assert_eq!(classify("Bash", json!({ "command": "ls" }), ws.path(), ws.path()), PermissionVerdict::AskTheUser);
+        assert_eq!(
+            classify("Bash", json!({ "command": "ls" }), ws.path(), ws.path()),
+            PermissionVerdict::AskTheUser
+        );
         // The root is an ancestor of home.
         let home = ws.path().join("src");
         assert_eq!(

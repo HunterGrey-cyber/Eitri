@@ -43,9 +43,8 @@ use gtk4::gdk::{Key, ModifierType, ScrollUnit};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, DrawingArea, EventControllerKey, EventControllerMotion,
-    EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext,
-    Overlay, Paned,
+    Application, ApplicationWindow, DrawingArea, EventControllerKey, EventControllerMotion, EventControllerScroll,
+    EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext, Overlay, Paned,
 };
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
@@ -339,12 +338,7 @@ impl SkiaState {
             ..Default::default()
         };
 
-        let render_target = backend_render_targets::make_gl(
-            (self.fb_width, self.fb_height),
-            0,
-            8,
-            fb_info,
-        );
+        let render_target = backend_render_targets::make_gl((self.fb_width, self.fb_height), 0, 8, fb_info);
 
         let surface = surfaces::wrap_backend_render_target(
             &mut self.gr_context,
@@ -388,10 +382,7 @@ fn make_gl_interface() -> GlInterface {
 }
 
 /// Carried over verbatim from `neovide_embed_live::resolve_gl_proc`.
-unsafe fn resolve_gl_proc(
-    lib: &libloading::os::unix::Library,
-    name: &str,
-) -> *const std::ffi::c_void {
+unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
     unsafe {
         if let Ok(epoxy_name) = std::ffi::CString::new(format!("epoxy_{name}")) {
             if let Ok(sym) = lib.get::<*const std::ffi::c_void>(epoxy_name.as_bytes_with_nul()) {
@@ -438,7 +429,10 @@ fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRec
         content_region.max.y - content_region.min.y,
     );
     let grid_size = pixel_size / harness.grid_scale();
-    GridSize::new(grid_size.width.floor().max(1.0) as u32, grid_size.height.floor().max(1.0) as u32)
+    GridSize::new(
+        grid_size.width.floor().max(1.0) as u32,
+        grid_size.height.floor().max(1.0) as u32,
+    )
 }
 
 /// Identical to `neovide_embed_live::gdk_button_to_button_text` -- see that crate's own copy for
@@ -494,7 +488,10 @@ fn pixel_to_grid_pos(
     let grid_x = (pixel_x / grid_scale.width()).floor().max(0.0) as u32;
     let grid_y = (pixel_y / grid_scale.height()).floor().max(0.0) as u32;
 
-    (grid_x.min(grid_size.width.max(1) - 1), grid_y.min(grid_size.height.max(1) - 1))
+    (
+        grid_x.min(grid_size.width.max(1) - 1),
+        grid_y.min(grid_size.height.max(1) - 1),
+    )
 }
 
 /// Identical to `neovide_embed_live::current_content_region` -- `content_region` computed from
@@ -735,8 +732,17 @@ fn handle_mouse_button(
         position_from_event
     };
 
-    session.harness.send_mouse_button(button, pressed, grid_pos, &modifier_string);
-    session.active_drag.set(if pressed { Some(DragState { button, last_grid_pos: grid_pos }) } else { None });
+    session
+        .harness
+        .send_mouse_button(button, pressed, grid_pos, &modifier_string);
+    session.active_drag.set(if pressed {
+        Some(DragState {
+            button,
+            last_grid_pos: grid_pos,
+        })
+    } else {
+        None
+    });
     session.wants_frame.set(true);
 }
 
@@ -777,7 +783,10 @@ fn handle_mouse_motion(
 
     let modifier_string = format_modifier_string(controller.current_event_state());
     session.harness.send_mouse_drag(drag.button, grid_pos, &modifier_string);
-    session.active_drag.set(Some(DragState { button: drag.button, last_grid_pos: grid_pos }));
+    session.active_drag.set(Some(DragState {
+        button: drag.button,
+        last_grid_pos: grid_pos,
+    }));
     session.wants_frame.set(true);
 }
 
@@ -1190,7 +1199,12 @@ fn build_editor_pane(
                     } else {
                         None
                     };
-                    (Some(session.last_frame.elapsed()), Some(session.frame_count), true, resized_grid)
+                    (
+                        Some(session.last_frame.elapsed()),
+                        Some(session.frame_count),
+                        true,
+                        resized_grid,
+                    )
                 }
                 _ => (None, None, false, None),
             };
@@ -1263,9 +1277,7 @@ fn build_editor_pane(
         let key_controller = EventControllerKey::new();
         key_controller.set_im_context(Some(&im_context));
         key_controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-            if state.intersects(
-                ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
-            ) {
+            if state.intersects(ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK) {
                 return glib::Propagation::Proceed;
             }
 
@@ -1373,8 +1385,8 @@ fn build_editor_pane(
 
             if state_slot.is_none() {
                 let interface = make_gl_interface();
-                let gr_context = direct_contexts::make_gl(interface, None)
-                    .expect("failed to create Skia GL DirectContext");
+                let gr_context =
+                    direct_contexts::make_gl(interface, None).expect("failed to create Skia GL DirectContext");
                 let width = widget.width() * widget.scale_factor();
                 let height = widget.height() * widget.scale_factor();
                 println!(
@@ -1383,7 +1395,12 @@ fn build_editor_pane(
                     height,
                     widget.scale_factor()
                 );
-                *state_slot = Some(SkiaState { gr_context, surface: None, fb_width: width, fb_height: height });
+                *state_slot = Some(SkiaState {
+                    gr_context,
+                    surface: None,
+                    fb_width: width,
+                    fb_height: height,
+                });
             }
 
             let state = state_slot.as_mut().unwrap();
@@ -1459,17 +1476,14 @@ fn build_editor_pane(
                         Err(err) => {
                             let elapsed = t0.elapsed();
                             let message = format!("{err:#}");
-                            println!(
-                                "[live] LiveHarness::with_options failed after {elapsed:?}: {message}"
-                            );
+                            println!("[live] LiveHarness::with_options failed after {elapsed:?}: {message}");
                             *live = LiveState::Failed(message);
                         }
                     }
                 }
                 LiveState::Ready(session) => {
                     let (dt, fps) = session.tick();
-                    let animating =
-                        session.harness.render_frame(canvas, Some(&content_region), dt);
+                    let animating = session.harness.render_frame(canvas, Some(&content_region), dt);
                     // Share this frame's "do we still need more frames" signals with the tick
                     // callback -- the fix this crate exists to validate (see PHASE_REPORT.md).
                     session.last_animating.set(animating);
@@ -1583,8 +1597,7 @@ fn build_editor_pane(
                     // ported verbatim (this crate shares that crate's `LiveHarness`/tick-callback
                     // plumbing exactly, so it shared the bug too). See that crate's own comment on
                     // this same check for the full rationale.
-                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true)
-                    {
+                    if session.harness.has_neovim_exited() && !session.close_requested.replace(true) {
                         should_close_window = true;
                     }
 
@@ -1756,9 +1769,7 @@ fn install_auto_resize_sweep(paned: &Paned) {
         let n = tick_count.get() + 1;
         tick_count.set(n);
         if n.is_multiple_of(30) {
-            println!(
-                "[resize-sweep] tick {n}: paned.position()={pos} bounds=[{min_pos},{max_pos}] width={width}"
-            );
+            println!("[resize-sweep] tick {n}: paned.position()={pos} bounds=[{min_pos},{max_pos}] width={width}");
         }
 
         glib::ControlFlow::Continue
@@ -1861,9 +1872,5 @@ fn apply_css(css: &str) {
     provider.load_from_string(css);
 
     let display = gtk4::gdk::Display::default().expect("no default GDK display");
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    gtk4::style_context_add_provider_for_display(&display, &provider, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 }

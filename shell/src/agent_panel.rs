@@ -15,14 +15,14 @@
 //! panel's idea of "a turn is running" ahead of the server's, which is the exact shadow state the
 //! runtime design forbids.
 
-use neovibe_core::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
 use agent::UiDelivery;
+use gtk4::prelude::*;
+use gtk4::Application;
+use neovibe_core::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
     serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
 };
-use gtk4::prelude::*;
-use gtk4::Application;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -218,10 +218,15 @@ impl AgentPanelHandle {
             // already failed; three seconds is well past a warm connect and well short of a hang.
             match pending.result_rx.recv_timeout(std::time::Duration::from_secs(3)) {
                 Ok(Ok(mut backend)) => {
-                    eprintln!("[agent_panel] window closed mid-connect; shutting down the backend that finished anyway");
+                    eprintln!(
+                        "[agent_panel] window closed mid-connect; shutting down the backend that finished anyway"
+                    );
                     backend.shutdown();
                 }
-                Ok(Err(e)) => eprintln!("[agent_panel] window closed mid-connect; the backend had already failed: {}", e.message),
+                Ok(Err(e)) => eprintln!(
+                    "[agent_panel] window closed mid-connect; the backend had already failed: {}",
+                    e.message
+                ),
                 Err(_) => eprintln!(
                     "[agent_panel] window closed mid-connect and the worker did not report within 3s; \
                      any backend it produces will be dropped with its channel"
@@ -283,11 +288,12 @@ impl AgentPanelHandle {
             "window.__neovibeDispatch && window.__neovibeDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
         );
-        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
-            if let Err(e) = result {
-                eprintln!("[agent_panel] theme dispatch failed: {e}");
-            }
-        });
+        self.webview
+            .evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
+                if let Err(e) = result {
+                    eprintln!("[agent_panel] theme dispatch failed: {e}");
+                }
+            });
     }
 }
 
@@ -300,11 +306,12 @@ impl AgentPanelHandle {
             "window.__neovibeDispatch && window.__neovibeDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
         );
-        self.webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, move |result| {
-            if let Err(e) = result {
-                eprintln!("[agent_panel] {what} dispatch failed: {e}");
-            }
-        });
+        self.webview
+            .evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, move |result| {
+                if let Err(e) = result {
+                    eprintln!("[agent_panel] {what} dispatch failed: {e}");
+                }
+            });
     }
 
     /// Records whether this panel's pane has keyboard focus and tells the live document, which
@@ -312,14 +319,20 @@ impl AgentPanelHandle {
     /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
     pub(crate) fn set_pane_focused(&self, focused: bool) {
         self.state.borrow_mut().pane_focused = focused;
-        self.dispatch(neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused), "pane focus");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused),
+            "pane focus",
+        );
     }
 
     /// Asks the panel to open its composer with the caret in it. Sent after `Ctrl+l` has moved GTK
     /// focus into the panel; see `serialize_enter_input_for_js`. Safe before the page loads (the
     /// dispatch is guarded), in which case there is no composer yet and nothing happens.
     pub(crate) fn enter_input(&self) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_enter_input_for_js(), "enter-input");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_enter_input_for_js(),
+            "enter-input",
+        );
     }
 
     /// `Ctrl+a Ctrl+a` with the panel focused; see `serialize_select_all_for_js`.
@@ -331,19 +344,34 @@ impl AgentPanelHandle {
     /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
     /// drives the session, this handle only relays it to the WebView.
     pub(crate) fn hint_collect(&self, session_id: u64) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_hint_collect_for_js(session_id), "hint collect");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_hint_collect_for_js(session_id),
+            "hint collect",
+        );
     }
     pub(crate) fn hint_show(&self, session_id: u64, labels: &[String]) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_hint_show_for_js(session_id, labels), "hint show");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_hint_show_for_js(session_id, labels),
+            "hint show",
+        );
     }
     pub(crate) fn hint_prefix(&self, session_id: u64, typed: &str) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_hint_prefix_for_js(session_id, typed), "hint prefix");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_hint_prefix_for_js(session_id, typed),
+            "hint prefix",
+        );
     }
     pub(crate) fn hint_land(&self, session_id: u64, index: usize) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_hint_land_for_js(session_id, index), "hint land");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_hint_land_for_js(session_id, index),
+            "hint land",
+        );
     }
     pub(crate) fn hint_end(&self, session_id: u64) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_hint_end_for_js(session_id), "hint end");
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_hint_end_for_js(session_id),
+            "hint end",
+        );
     }
 
     /// Where the panel's two HINT messages go. `shell::hint::HintCoordinator` installs this once.
@@ -379,7 +407,11 @@ pub(crate) fn build_agent_panel(
                             // UserContentManager/neovibeAgent bridge); hand it to the system
                             // browser instead.
                             if let Some(uri) = action.request().and_then(|r| r.uri()) {
-                                gtk4::UriLauncher::new(&uri).launch(None::<&gtk4::Window>, None::<&gtk4::gio::Cancellable>, |_| {});
+                                gtk4::UriLauncher::new(&uri).launch(
+                                    None::<&gtk4::Window>,
+                                    None::<&gtk4::gio::Cancellable>,
+                                    |_| {},
+                                );
                             }
                             nav_decision.ignore();
                             return true;
@@ -409,11 +441,7 @@ pub(crate) fn build_agent_panel(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
     let (supervisor, supervisor_pending) =
-        match crate::supervisor_client::SupervisorClient::connect_or_spawn(
-            instance_id,
-            project_name,
-            &project_dir,
-        ) {
+        match crate::supervisor_client::SupervisorClient::connect_or_spawn(instance_id, project_name, &project_dir) {
             crate::supervisor_client::PendingSupervisor::Ready(client) => (client, None),
             crate::supervisor_client::PendingSupervisor::Connecting(rx) => (None, Some(rx)),
         };
@@ -458,7 +486,10 @@ pub(crate) fn build_agent_panel(
     // state -- every later event would then be dispatched twice.
     start_pump_timer(state.clone(), webview.clone());
 
-    let handle = AgentPanelHandle { state: state.clone(), webview: webview.clone() };
+    let handle = AgentPanelHandle {
+        state: state.clone(),
+        webview: webview.clone(),
+    };
     (webview.upcast(), handle)
 }
 
@@ -487,8 +518,14 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
 
         let (payload, first_text_in_this_batch) = {
             let mut state_ref = state.borrow_mut();
-            let AgentPanelState { session, turn_trace, supervisor, supervisor_pending, project_dir, .. } =
-                &mut *state_ref;
+            let AgentPanelState {
+                session,
+                turn_trace,
+                supervisor,
+                supervisor_pending,
+                project_dir,
+                ..
+            } = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
             // during `build_ui`, where waiting for it would have delayed the window appearing.
             if supervisor.is_none() {
@@ -614,7 +651,9 @@ fn report_a_session_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webv
 fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let finished = {
         let mut state_ref = state.borrow_mut();
-        let Some(pending) = state_ref.pending_start.as_ref() else { return };
+        let Some(pending) = state_ref.pending_start.as_ref() else {
+            return;
+        };
         match pending.result_rx.try_recv() {
             Ok(result) => {
                 let request_id = pending.request_id.clone();
@@ -665,7 +704,10 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
         }
         Err(error) => {
             eprintln!("[agent_panel] backend failed to start: {}", error.message);
-            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&error.message)));
+            evaluate_js_dispatch(
+                webview,
+                &serialize_command_result_for_js(&request_id, Err(&error.message)),
+            );
             evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
         }
     }
@@ -679,7 +721,9 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
 fn collect_pending_handoff(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let finished = {
         let mut state_ref = state.borrow_mut();
-        let Some(pending) = state_ref.pending_handoff.as_ref() else { return };
+        let Some(pending) = state_ref.pending_handoff.as_ref() else {
+            return;
+        };
         let outcome = classify_close_signal(&pending.closed_rx);
         if outcome == HandoffCloseOutcome::StillClosing {
             return;
@@ -781,7 +825,9 @@ fn ready_payloads(
     // It removes exactly that one row. Clearing the whole offer would hide every other session the
     // workspace remembers, which is a different and worse bug than the one this prevents.
     if let Some(command) = last_handoff {
-        greeting.resumable.retain(|r| r.provider_session_id != command.provider_session_id());
+        greeting
+            .resumable
+            .retain(|r| r.provider_session_id != command.provider_session_id());
     }
 
     let mut payloads = vec![serialize_hello_for_js(&greeting)];
@@ -845,18 +891,31 @@ fn apply_command_outcome(
         // own wire protocol cannot provide. The sidecar backend returns an empty vec and its state
         // arrives through the pump, from the server.
         let state_ref = state.borrow();
-        let through_revision = state_ref.session.as_ref().map(|s| s.projection().last_revision).unwrap_or(0);
+        let through_revision = state_ref
+            .session
+            .as_ref()
+            .map(|s| s.projection().last_revision)
+            .unwrap_or(0);
         let from_revision = through_revision.saturating_sub(events.len() as u64);
         drop(state_ref);
-        evaluate_js_dispatch(webview, &serialize_events_for_js(from_revision, through_revision, events));
+        evaluate_js_dispatch(
+            webview,
+            &serialize_events_for_js(from_revision, through_revision, events),
+        );
     }
     match outcome {
         Ok(_) => {
             evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Ok(())));
         }
         Err(error) if error.benign => {
-            eprintln!("[agent_panel] command rejected (session stays alive): {}", error.message);
-            evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Err(&error.message)));
+            eprintln!(
+                "[agent_panel] command rejected (session stays alive): {}",
+                error.message
+            );
+            evaluate_js_dispatch(
+                webview,
+                &serialize_command_result_for_js(request_id, Err(&error.message)),
+            );
         }
         Err(error) => {
             eprintln!("[agent_panel] command failed fatally: {}", error.message);
@@ -877,7 +936,10 @@ fn apply_command_outcome(
             if let Some(mut backend) = dead {
                 std::thread::spawn(move || backend.shutdown());
             }
-            evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Err(&error.message)));
+            evaluate_js_dispatch(
+                webview,
+                &serialize_command_result_for_js(request_id, Err(&error.message)),
+            );
             evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
         }
     }
@@ -899,11 +961,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let payloads = {
                 let state_ref = state.borrow();
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
-                let snapshot = state_ref.session.as_ref().map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
+                let snapshot = state_ref
+                    .session
+                    .as_ref()
+                    .map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
                 let mut payloads = ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref(), Some(&theme));
                 // Last, so nothing the document draws from the payloads above can reset it.
-                payloads.push(neovibe_core::agent_bridge::serialize_pane_focus_for_js(state_ref.pane_focused));
+                payloads.push(neovibe_core::agent_bridge::serialize_pane_focus_for_js(
+                    state_ref.pane_focused,
+                ));
                 payloads
             };
             for payload in payloads {
@@ -915,7 +982,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let mut state_ref = state.borrow_mut();
             if state_ref.session.is_some() {
                 drop(state_ref);
-                evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("a session already exists")));
+                evaluate_js_dispatch(
+                    webview,
+                    &serialize_command_result_for_js(&request_id, Err("a session already exists")),
+                );
                 return;
             }
             if state_ref.pending_start.is_some() {
@@ -923,7 +993,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // would spawn a second sidecar process whose result would overwrite the first,
                 // leaking it.
                 drop(state_ref);
-                evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err("a session is already starting")));
+                evaluate_js_dispatch(
+                    webview,
+                    &serialize_command_result_for_js(&request_id, Err("a session is already starting")),
+                );
                 return;
             }
             if state_ref.pending_handoff.is_some() {
@@ -933,7 +1006,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 drop(state_ref);
                 evaluate_js_dispatch(
                     webview,
-                    &serialize_command_result_for_js(&request_id, Err("the previous session is still being handed off to a terminal")),
+                    &serialize_command_result_for_js(
+                        &request_id,
+                        Err("the previous session is still being handed off to a terminal"),
+                    ),
                 );
                 return;
             }
@@ -964,10 +1040,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // gives legacy the feature for free and changes no wire format. The context is read
                 // NOW rather than remembered, and a `None` means the turn goes out exactly as the
                 // user typed it.
-                let composed = neovibe_core::editor_context::compose_turn_text(
-                    &text,
-                    (state_ref.editor_context)().as_ref(),
-                );
+                let composed =
+                    neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
                 // Stamped before the call, so the trace's zero is the user's action rather than the
                 // moment the backend got around to accepting it.
                 state_ref.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
@@ -1005,7 +1079,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 hook(HintInbound::Targets { session_id, count });
             }
         }
-        InboundMessage::TurnRendered { receive_to_frame_ms, .. } => {
+        InboundMessage::TurnRendered {
+            receive_to_frame_ms, ..
+        } => {
             // Purely a diagnostic: no command_result, and nothing downstream reads it. A WebView
             // that never sends one costs only a missing column in a trace line.
             let mut state_ref = state.borrow_mut();
@@ -1042,7 +1118,11 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         crate::terminal_handoff::ConversationLiveness::of(&projection.status),
                     )
                 });
-                (state_ref.project_dir.clone(), facts, state_ref.pending_handoff.is_some())
+                (
+                    state_ref.project_dir.clone(),
+                    facts,
+                    state_ref.pending_handoff.is_some(),
+                )
             };
             if already_handing_off {
                 evaluate_js_dispatch(
@@ -1053,14 +1133,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
             let prepared = crate::terminal_handoff::prepare_handoff(
                 &project_dir,
-                session_facts.as_ref().map(|(provider_session_id, active_turn_id, reported_cwd, liveness)| {
-                    crate::terminal_handoff::HandoffFacts {
-                        provider_session_id: provider_session_id.as_deref(),
-                        active_turn_id: active_turn_id.as_deref(),
-                        reported_cwd: reported_cwd.as_deref(),
-                        liveness: *liveness,
-                    }
-                }),
+                session_facts
+                    .as_ref()
+                    .map(|(provider_session_id, active_turn_id, reported_cwd, liveness)| {
+                        crate::terminal_handoff::HandoffFacts {
+                            provider_session_id: provider_session_id.as_deref(),
+                            active_turn_id: active_turn_id.as_deref(),
+                            reported_cwd: reported_cwd.as_deref(),
+                            liveness: *liveness,
+                        }
+                    }),
             );
             let command = match prepared {
                 Ok(command) => command,
@@ -1089,7 +1171,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // the GTK main loop, so nothing can. Reported rather than unwrapped anyway.
                 evaluate_js_dispatch(
                     webview,
-                    &serialize_command_result_for_js(&request_id, Err("the conversation ended before it could be handed off")),
+                    &serialize_command_result_for_js(
+                        &request_id,
+                        Err("the conversation ended before it could be handed off"),
+                    ),
                 );
                 return;
             };
@@ -1101,10 +1186,19 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 // instead, which `collect_pending_handoff` reads as a failed close.
                 let _ = closed_tx.send(());
             });
-            state.borrow_mut().pending_handoff = Some(PendingHandoff { request_id, command, closed_rx });
+            state.borrow_mut().pending_handoff = Some(PendingHandoff {
+                request_id,
+                command,
+                closed_rx,
+            });
             // No command_result yet -- `collect_pending_handoff` owes it once the close finishes.
         }
-        InboundMessage::PermissionResponse { permission_id, decision, reason, .. } => {
+        InboundMessage::PermissionResponse {
+            permission_id,
+            decision,
+            reason,
+            ..
+        } => {
             let decision = decision.into_decision(reason);
             let outcome = {
                 let mut state_ref = state.borrow_mut();
@@ -1166,7 +1260,10 @@ fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::The
 }
 
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
-    let script = format!("window.__neovibeDispatch({});", serde_json::to_string(json_payload).unwrap_or_default());
+    let script = format!(
+        "window.__neovibeDispatch({});",
+        serde_json::to_string(json_payload).unwrap_or_default()
+    );
     webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
         if let Err(e) = result {
             eprintln!("[agent_panel] evaluate_javascript failed: {e}");
@@ -1237,14 +1334,19 @@ mod tests {
     /// broken.
     #[test]
     fn a_failed_command_still_owes_the_events_its_backend_already_folded() {
-        let folded = vec![agent::AgentDomainEvent::UserPromptSubmitted { text: "what does this do?".into() }];
-        let refused: Result<Vec<agent::AgentDomainEvent>, _> =
-            Err(neovibe_core::agent_backend::BackendError {
-                message: "a turn is already in progress".into(),
-                benign: true,
-                folded_events: folded.clone(),
-            });
-        assert_eq!(events_owed(&refused), folded.as_slice(), "a refusal must not swallow a folded prompt");
+        let folded = vec![agent::AgentDomainEvent::UserPromptSubmitted {
+            text: "what does this do?".into(),
+        }];
+        let refused: Result<Vec<agent::AgentDomainEvent>, _> = Err(neovibe_core::agent_backend::BackendError {
+            message: "a turn is already in progress".into(),
+            benign: true,
+            folded_events: folded.clone(),
+        });
+        assert_eq!(
+            events_owed(&refused),
+            folded.as_slice(),
+            "a refusal must not swallow a folded prompt"
+        );
 
         // The other two shapes, so this is a rule rather than one case: a success delivers its own
         // events, and a failure that folded nothing delivers nothing.
@@ -1281,9 +1383,14 @@ mod tests {
     fn the_panel_document_carries_its_theme_before_its_script() {
         let tokens = neovibe_core::theme::ThemeTokens::fallback();
         let html = themed_document(&tokens.css_vars());
-        let style_at = html.find("<style id=\"nv-theme\">").expect("the theme block is inserted");
+        let style_at = html
+            .find("<style id=\"nv-theme\">")
+            .expect("the theme block is inserted");
         let script_at = html.find("<script").expect("the single-file build inlines its script");
-        assert!(style_at < script_at, "the theme must be parsed before the script that renders");
+        assert!(
+            style_at < script_at,
+            "the theme must be parsed before the script that renders"
+        );
         assert_eq!(html.matches("<style id=\"nv-theme\">").count(), 1);
         assert!(html.contains(&format!("--nv-bg:{};", tokens.bg.hex())));
         let end = style_at + html[style_at..].find("</style>").unwrap() + "</style>".len();
@@ -1302,7 +1409,10 @@ mod tests {
         payloads
             .iter()
             .map(|p| {
-                serde_json::from_str::<serde_json::Value>(p).unwrap()["kind"].as_str().unwrap().to_string()
+                serde_json::from_str::<serde_json::Value>(p).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
             })
             .collect()
     }
@@ -1319,25 +1429,37 @@ mod tests {
         let command = a_command();
         let payloads = ready_payloads(legacy_greeting(), None, Some(&command), None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
-        assert!(hello["resumableSession"].is_null(), "legacy has no other record of this session");
+        assert!(
+            hello["resumableSession"].is_null(),
+            "legacy has no other record of this session"
+        );
 
         assert_eq!(kinds(&payloads), vec!["hello", "handoff"]);
         let handoff: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
-        assert_eq!(handoff["command"], "cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
+        assert_eq!(
+            handoff["command"],
+            "cd /home/user/project && claude --resume 1857dcd5-973b-46a2"
+        );
         assert_eq!(handoff["providerSessionId"], "1857dcd5-973b-46a2");
     }
 
     /// The ordinary case is unchanged: a panel that never handed anything off sends `hello` alone.
     #[test]
     fn a_panel_that_handed_nothing_off_sends_only_the_greeting() {
-        assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None, None)), vec!["hello"]);
+        assert_eq!(
+            kinds(&ready_payloads(legacy_greeting(), None, None, None)),
+            vec!["hello"]
+        );
     }
 
     /// A reloaded document must get its colours back before anything it would draw with them.
     #[test]
     fn the_theme_follows_the_greeting_and_precedes_everything_else() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        assert_eq!(kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme))), vec!["hello", "theme"]);
+        assert_eq!(
+            kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme))),
+            vec!["hello", "theme"]
+        );
         let payloads = ready_payloads(
             legacy_greeting(),
             Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),

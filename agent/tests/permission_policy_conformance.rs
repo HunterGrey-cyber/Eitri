@@ -257,9 +257,13 @@ fn run_one_probe(workspace: &Path, prompt: &str) -> Vec<ObservedCall> {
 fn parse_calls(stream_json: &str) -> Vec<ObservedCall> {
     let mut calls: Vec<ObservedCall> = Vec::new();
     for line in stream_json.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
-        let Some(content) =
-            value.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array())
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(content) = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
         else {
             continue;
         };
@@ -285,7 +289,9 @@ fn parse_calls(stream_json: &str) -> Vec<ObservedCall> {
                     });
                 }
                 Some("tool_result") => {
-                    let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else { continue };
+                    let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
+                        continue;
+                    };
                     if !block.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
                         continue;
                     }

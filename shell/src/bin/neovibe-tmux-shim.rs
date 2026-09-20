@@ -138,7 +138,10 @@ mod tests {
             direction_from_args(&args(&["-S", "/s", "display-message", "-p", "#{window_zoomed_flag}"])),
             None
         );
-        assert_eq!(direction_from_args(&args(&["-S", "/s", "run-shell", "ps -o state="])), None);
+        assert_eq!(
+            direction_from_args(&args(&["-S", "/s", "run-shell", "ps -o state="])),
+            None
+        );
         assert_eq!(direction_from_args(&args(&["-S", "/s", "load-buffer", "-"])), None);
         assert_eq!(direction_from_args(&[]), None);
     }

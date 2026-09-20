@@ -22,8 +22,16 @@ pub enum AgentStatus {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShellMessage {
-    Register { instance_id: String, project_name: String, project_dir: String, pid: u32 },
-    Status { instance_id: String, status: AgentStatus },
+    Register {
+        instance_id: String,
+        project_name: String,
+        project_dir: String,
+        pid: u32,
+    },
+    Status {
+        instance_id: String,
+        status: AgentStatus,
+    },
 }
 
 /// A message `neovibe-supervisor` sends back to `shell` over that same connection (spec §3).
@@ -60,14 +68,17 @@ pub fn socket_path() -> PathBuf {
 /// `cargo run --example` builds).
 pub fn locate_supervisor_binary() -> std::io::Result<PathBuf> {
     let current = std::env::current_exe()?;
-    let dir = current.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory")
-    })?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory"))?;
     let candidate = dir.join("neovibe-supervisor");
     if candidate.exists() {
         return Ok(candidate);
     }
-    let one_dir_deeper = matches!(dir.file_name().and_then(|n| n.to_str()), Some("deps") | Some("examples"));
+    let one_dir_deeper = matches!(
+        dir.file_name().and_then(|n| n.to_str()),
+        Some("deps") | Some("examples")
+    );
     if one_dir_deeper {
         if let Some(parent) = dir.parent() {
             let fallback = parent.join("neovibe-supervisor");
@@ -97,14 +108,20 @@ mod tests {
             pid: 4242,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"register","instance_id":"abc-123","project_name":"neovibe","project_dir":"/home/user/src/neovibe","pid":4242}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"register","instance_id":"abc-123","project_name":"neovibe","project_dir":"/home/user/src/neovibe","pid":4242}"#
+        );
         let parsed: ShellMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg);
     }
 
     #[test]
     fn status_message_round_trips_with_snake_case_status_value() {
-        let msg = ShellMessage::Status { instance_id: "abc-123".into(), status: AgentStatus::Blocked };
+        let msg = ShellMessage::Status {
+            instance_id: "abc-123".into(),
+            status: AgentStatus::Blocked,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(json, r#"{"type":"status","instance_id":"abc-123","status":"blocked"}"#);
         let parsed: ShellMessage = serde_json::from_str(&json).unwrap();
@@ -140,7 +157,10 @@ mod tests {
         // in this crate can interleave with these mutations on a separate thread -- cargo's default
         // multi-threaded test runner made that a real risk when this was two separate tests.
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
-        assert_eq!(socket_path(), std::path::PathBuf::from("/run/user/1000/neovibe-supervisor.sock"));
+        assert_eq!(
+            socket_path(),
+            std::path::PathBuf::from("/run/user/1000/neovibe-supervisor.sock")
+        );
 
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");

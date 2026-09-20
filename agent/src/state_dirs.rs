@@ -44,9 +44,8 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(state_home).join("neovibe/conversations"));
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set")
-    })?;
+    let home = std::env::var("HOME")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
     Ok(PathBuf::from(home).join(".local/state/neovibe/conversations"))
 }
 
@@ -121,7 +120,10 @@ fn account_home_dir() -> std::io::Result<PathBuf> {
             return Err(std::io::Error::from_raw_os_error(rc));
         }
         if result.is_null() || pwd.pw_dir.is_null() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "this user has no entry in the user database"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "this user has no entry in the user database",
+            ));
         }
         let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
         let dir = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
@@ -209,7 +211,10 @@ mod tests {
         let root = redirect_state_to_a_test_root();
         assert!(conversations_dir().unwrap().starts_with(&root));
         assert!(leases_dir().unwrap().starts_with(&root));
-        assert!(root.starts_with(std::env::temp_dir()), "the test root must live under TMPDIR: {root:?}");
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "the test root must live under TMPDIR: {root:?}"
+        );
     }
 
     /// The redirect is one-way and single-valued: a second call cannot move an already-redirected
@@ -223,9 +228,18 @@ mod tests {
         let home = account_home_dir().expect("this user must have a home directory");
         let dir = platform_leases_dir().unwrap();
         assert_eq!(dir, macos_leases_dir_under(&home));
-        assert!(dir.ends_with("Library/Application Support/neovibe/session-leases"), "{dir:?}");
-        assert!(!dir.starts_with(std::env::temp_dir()), "{dir:?} must not be under TMPDIR");
-        assert!(!dir.starts_with("/var/folders") && !dir.starts_with("/private/var/folders"), "{dir:?}");
+        assert!(
+            dir.ends_with("Library/Application Support/neovibe/session-leases"),
+            "{dir:?}"
+        );
+        assert!(
+            !dir.starts_with(std::env::temp_dir()),
+            "{dir:?} must not be under TMPDIR"
+        );
+        assert!(
+            !dir.starts_with("/var/folders") && !dir.starts_with("/private/var/folders"),
+            "{dir:?}"
+        );
     }
 
     /// The home comes from the user database, so it cannot drift with the environment. Compared
@@ -240,7 +254,11 @@ mod tests {
             .output()
             .unwrap();
         let out = String::from_utf8(out.stdout).unwrap();
-        let expected = out.trim().strip_prefix("NFSHomeDirectory:").expect("dscl output").trim();
+        let expected = out
+            .trim()
+            .strip_prefix("NFSHomeDirectory:")
+            .expect("dscl output")
+            .trim();
         assert_eq!(account_home_dir().unwrap(), Path::new(expected));
     }
 
@@ -276,7 +294,10 @@ mod tests {
         prune_dead_roots(&parent);
 
         assert!(!dead.exists(), "a root whose process is gone must be pruned");
-        assert!(!pid_zero.exists(), "pid 0 is never a live test process and must be pruned");
+        assert!(
+            !pid_zero.exists(),
+            "pid 0 is never a live test process and must be pruned"
+        );
         assert!(live.exists(), "a root whose process is alive must be left alone");
         assert!(not_a_pid.exists(), "a directory that is not a pid must be left alone");
         let _ = std::fs::remove_dir_all(&parent);

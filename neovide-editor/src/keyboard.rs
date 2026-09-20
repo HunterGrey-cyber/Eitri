@@ -104,8 +104,8 @@ fn is_ascii_alphabetic_char(text: &str) -> bool {
 /// special key, and is its text an ASCII letter) simply don't exist for a mouse button.
 pub(crate) fn format_modifier_string(text: &str, is_special: bool, state: ModifierType) -> String {
     let control = state.contains(ModifierType::CONTROL_MASK);
-    let include_shift = state.contains(ModifierType::SHIFT_MASK)
-        && (is_special || (control && is_ascii_alphabetic_char(text)));
+    let include_shift =
+        state.contains(ModifierType::SHIFT_MASK) && (is_special || (control && is_ascii_alphabetic_char(text)));
 
     let mut modifiers = String::new();
     if include_shift {
@@ -142,7 +142,11 @@ pub(crate) fn format_key_text(text: &str, is_special: bool, state: ModifierType)
     };
 
     let modifiers = format_modifier_string(&text, is_special, state);
-    let (text, is_special) = if text == "<" { ("lt".to_string(), true) } else { (text, is_special) };
+    let (text, is_special) = if text == "<" {
+        ("lt".to_string(), true)
+    } else {
+        (text, is_special)
+    };
 
     if modifiers.is_empty() {
         if is_special {
@@ -248,11 +252,7 @@ pub(crate) fn im_cursor_rect_for_editor(
 /// A no-op unless the session is `Ready` and nvim is alive -- there is no meaningful cursor to
 /// point at otherwise, and leaving the previously published location in place is strictly better
 /// than publishing a `(0, 0)` one.
-fn publish_cursor_location(
-    im_context: &IMMulticontext,
-    gl_area: &GLArea,
-    live_state: &Rc<RefCell<LiveState>>,
-) {
+fn publish_cursor_location(im_context: &IMMulticontext, gl_area: &GLArea, live_state: &Rc<RefCell<LiveState>>) {
     let live = live_state.borrow();
     let LiveState::Ready(session) = &*live else {
         return;
@@ -284,10 +284,7 @@ fn publish_cursor_location(
 /// later call `im_context.focus_in()` from `grab_focus()` once the host's window is actually shown
 /// -- mirroring the reference's own `gl_area.grab_focus(); im_context.focus_in();` pairing, which
 /// only makes sense once the widget is realized, not at construction time.
-pub(crate) fn attach_keyboard_input(
-    gl_area: &GLArea,
-    live_state: &Rc<RefCell<LiveState>>,
-) -> IMMulticontext {
+pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<LiveState>>) -> IMMulticontext {
     // --- IME: a GtkIMMulticontext attached to the key controller via `set_im_context`, which
     // makes GTK itself run `gtk_im_context_filter_keypress` on every key event before ever
     // emitting ::key-pressed -- a key an input method consumes (composition in progress) never
@@ -446,20 +443,38 @@ mod tests {
     fn named_keys_are_bracketed_and_beat_their_own_unicode_value() {
         // Escape/Return/Tab/Space all have a Unicode value; the special table must win, or
         // Escape would be sent as a raw U+001B and `<C-Space>` would be inexpressible.
-        assert_eq!(format_key_event(Key::Escape, ModifierType::empty()).as_deref(), Some("<Esc>"));
+        assert_eq!(
+            format_key_event(Key::Escape, ModifierType::empty()).as_deref(),
+            Some("<Esc>")
+        );
         assert_eq!(
             format_key_event(Key::Return, ModifierType::empty()).as_deref(),
             Some("<Enter>")
         );
-        assert_eq!(format_key_event(Key::Tab, ModifierType::empty()).as_deref(), Some("<Tab>"));
-        assert_eq!(format_key_event(Key::space, ModifierType::empty()).as_deref(), Some("<Space>"));
+        assert_eq!(
+            format_key_event(Key::Tab, ModifierType::empty()).as_deref(),
+            Some("<Tab>")
+        );
+        assert_eq!(
+            format_key_event(Key::space, ModifierType::empty()).as_deref(),
+            Some("<Space>")
+        );
         assert_eq!(
             format_key_event(Key::BackSpace, ModifierType::empty()).as_deref(),
             Some("<BS>")
         );
-        assert_eq!(format_key_event(Key::Up, ModifierType::empty()).as_deref(), Some("<Up>"));
-        assert_eq!(format_key_event(Key::F5, ModifierType::empty()).as_deref(), Some("<F5>"));
-        assert_eq!(format_key_event(Key::F12, ModifierType::empty()).as_deref(), Some("<F12>"));
+        assert_eq!(
+            format_key_event(Key::Up, ModifierType::empty()).as_deref(),
+            Some("<Up>")
+        );
+        assert_eq!(
+            format_key_event(Key::F5, ModifierType::empty()).as_deref(),
+            Some("<F5>")
+        );
+        assert_eq!(
+            format_key_event(Key::F12, ModifierType::empty()).as_deref(),
+            Some("<F12>")
+        );
         assert_eq!(
             format_key_event(Key::Page_Down, ModifierType::empty()).as_deref(),
             Some("<PageDown>")

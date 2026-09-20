@@ -16,16 +16,14 @@
 //! the same accumulation.
 
 use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind,
-    CreateSessionRequest, InterruptTurnRequest, PermissionMode, SendTurnRequest, StreamingPreference,
-    TurnOutcome,
+    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
+    InterruptTurnRequest, PermissionMode, SendTurnRequest, StreamingPreference, TurnOutcome,
 };
 use std::time::{Duration, Instant};
 
 /// A long-but-bounded prompt. Long enough that streaming has something to stream (the
 /// complete-mode measurement is meaningless on a two-word reply), bounded so the bill stays sane.
-const LONG_PROMPT: &str =
-    "Write about 600 words on why text editors converged on modal and non-modal designs. \
+const LONG_PROMPT: &str = "Write about 600 words on why text editors converged on modal and non-modal designs. \
      Continuous prose, no headings, no bullet points.";
 
 struct Timeline {
@@ -83,17 +81,30 @@ fn open(provider: &ClaudeSidecarProvider, streaming: StreamingPreference) -> Str
 fn run_timed_turn(provider: &ClaudeSidecarProvider, session_id: &str, prompt: &str, deadline_secs: u64) -> Timeline {
     let submitted = Instant::now();
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.to_string(), text: prompt.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.to_string(),
+            text: prompt.to_string(),
+        })
         .expect("send_turn should be accepted");
 
-    let mut timeline =
-        Timeline { submitted, first_visible: None, last_visible: None, completed: None, chunks: Vec::new(), events: Vec::new() };
+    let mut timeline = Timeline {
+        submitted,
+        first_visible: None,
+        last_visible: None,
+        completed: None,
+        chunks: Vec::new(),
+        events: Vec::new(),
+    };
     let deadline = submitted + Duration::from_secs(deadline_secs);
     while Instant::now() < deadline && timeline.completed.is_none() {
         for event in provider.pump() {
             let now = Instant::now();
             match &event {
-                AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => {
+                AgentDomainEvent::ContentDelta {
+                    kind: ContentKind::Text,
+                    text,
+                    ..
+                } => {
                     if timeline.first_visible.is_none() {
                         timeline.first_visible = Some(now);
                     }
@@ -131,7 +142,11 @@ fn partial_streaming_shows_content_sooner_and_loses_or_duplicates_nothing() {
     let complete_session = open(&provider, StreamingPreference::Complete);
     let complete = run_timed_turn(&provider, &complete_session, LONG_PROMPT, 180);
     complete.report("STREAMING_MODE_COMPLETE (baseline)");
-    provider.close_session(CloseSessionRequest { session_id: complete_session }).unwrap();
+    provider
+        .close_session(CloseSessionRequest {
+            session_id: complete_session,
+        })
+        .unwrap();
 
     assert!(complete.completed.is_some(), "the baseline turn did not finish");
     let complete_final = result_text(&complete.events).expect("a completed turn reports its result text");
@@ -160,7 +175,11 @@ fn partial_streaming_shows_content_sooner_and_loses_or_duplicates_nothing() {
         partial.chunks.len(),
         complete.chunks.len()
     );
-    assert!(partial.chunks.len() > 5, "expected many partial updates, got {}", partial.chunks.len());
+    assert!(
+        partial.chunks.len() > 5,
+        "expected many partial updates, got {}",
+        partial.chunks.len()
+    );
 
     // 2. NO DUPLICATE TEXT and NO LOST TEXT, in one assertion, against the turn's own authoritative
     //    final text rather than a second copy of the same accumulation. Both failure directions are
@@ -209,12 +228,19 @@ fn partial_streaming_shows_content_sooner_and_loses_or_duplicates_nothing() {
 
     // 5. TurnCompleted reconciles: it arrives after the last visible text, and its outcome is clean.
     assert_eq!(
-        partial.events.iter().filter(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })).count(),
+        partial
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+            .count(),
         1,
         "exactly one terminal event per turn"
     );
     let completed_at = partial.completed.unwrap();
-    assert!(completed_at >= partial.last_visible.unwrap(), "TurnCompleted preceded the last content it completes");
+    assert!(
+        completed_at >= partial.last_visible.unwrap(),
+        "TurnCompleted preceded the last content it completes"
+    );
     assert!(matches!(
         partial.events.iter().find_map(|e| match e {
             AgentDomainEvent::TurnCompleted { outcome, .. } => Some(*outcome),
@@ -226,14 +252,22 @@ fn partial_streaming_shows_content_sooner_and_loses_or_duplicates_nothing() {
     // 6. The session survives a partial-stream turn: a second turn runs on it normally.
     let second = run_timed_turn(&provider, &partial_session, "Reply with exactly the word: pong", 60);
     second.report("second turn after a partial-stream turn");
-    assert!(second.accumulated().to_lowercase().contains("pong"), "got: {:?}", second.accumulated());
+    assert!(
+        second.accumulated().to_lowercase().contains("pong"),
+        "got: {:?}",
+        second.accumulated()
+    );
     assert_eq!(
         result_text(&second.events).as_deref().map(str::trim),
         Some(second.accumulated().trim()),
         "the second turn's stream and final text disagree"
     );
 
-    provider.close_session(CloseSessionRequest { session_id: partial_session }).unwrap();
+    provider
+        .close_session(CloseSessionRequest {
+            session_id: partial_session,
+        })
+        .unwrap();
 }
 
 /// Interrupting mid-stream must terminate the turn cleanly and leave the accumulated text coherent.
@@ -249,7 +283,10 @@ fn interrupting_a_partial_stream_terminates_cleanly_and_leaves_a_coherent_prefix
 
     let submitted = Instant::now();
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: LONG_PROMPT.to_string(),
+        })
         .unwrap();
 
     // Interrupt only once real content has arrived -- otherwise this tests an interrupt of nothing,
@@ -258,7 +295,12 @@ fn interrupting_a_partial_stream_terminates_cleanly_and_leaves_a_coherent_prefix
     let deadline = submitted + Duration::from_secs(60);
     while Instant::now() < deadline && before_interrupt.len() < 200 {
         for event in provider.pump() {
-            if let AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } = event {
+            if let AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } = event
+            {
                 before_interrupt.push_str(&text);
             }
         }
@@ -270,7 +312,11 @@ fn interrupting_a_partial_stream_terminates_cleanly_and_leaves_a_coherent_prefix
     );
     eprintln!("interrupting after {} streamed chars", before_interrupt.len());
 
-    provider.interrupt_turn(InterruptTurnRequest { session_id: session_id.clone() }).unwrap();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: session_id.clone(),
+        })
+        .unwrap();
 
     let mut after = before_interrupt.clone();
     let mut outcome = None;
@@ -278,7 +324,11 @@ fn interrupting_a_partial_stream_terminates_cleanly_and_leaves_a_coherent_prefix
     while Instant::now() < deadline && outcome.is_none() {
         for event in provider.pump() {
             match event {
-                AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => after.push_str(&text),
+                AgentDomainEvent::ContentDelta {
+                    kind: ContentKind::Text,
+                    text,
+                    ..
+                } => after.push_str(&text),
                 AgentDomainEvent::TurnCompleted { outcome: o, .. } => outcome = Some(o),
                 _ => {}
             }
@@ -286,15 +336,26 @@ fn interrupting_a_partial_stream_terminates_cleanly_and_leaves_a_coherent_prefix
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    assert_eq!(outcome, Some(TurnOutcome::Interrupted), "an interrupted partial stream must terminate as Interrupted");
+    assert_eq!(
+        outcome,
+        Some(TurnOutcome::Interrupted),
+        "an interrupted partial stream must terminate as Interrupted"
+    );
     // What was already on screen stays on screen: the pre-interrupt text is still a prefix of
     // everything received. A stream that rewrote or dropped already-shown text would break a UI
     // that has appended it.
-    assert!(after.starts_with(&before_interrupt), "text already shown was not a prefix of the final stream");
+    assert!(
+        after.starts_with(&before_interrupt),
+        "text already shown was not a prefix of the final stream"
+    );
 
     // And the session is still usable.
     let second = run_timed_turn(&provider, &session_id, "Reply with exactly the word: pong", 60);
-    assert!(second.accumulated().to_lowercase().contains("pong"), "got: {:?}", second.accumulated());
+    assert!(
+        second.accumulated().to_lowercase().contains("pong"),
+        "got: {:?}",
+        second.accumulated()
+    );
 
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
 }
@@ -316,10 +377,16 @@ fn tool_activity_interleaves_with_partial_assistant_updates() {
     );
     timeline.report("tool + partial assistant updates");
 
-    let tool_started = timeline.events.iter().position(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. }));
+    let tool_started = timeline
+        .events
+        .iter()
+        .position(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. }));
     let tool_started = tool_started.expect("no tool call ran; this turn does not test interleaving");
     assert!(
-        timeline.events.iter().any(|e| matches!(e, AgentDomainEvent::ToolCallCompleted { is_error: false, .. })),
+        timeline
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::ToolCallCompleted { is_error: false, .. })),
         "the tool call never completed successfully"
     );
 
@@ -329,7 +396,15 @@ fn tool_activity_interleaves_with_partial_assistant_updates() {
         .events
         .iter()
         .enumerate()
-        .filter(|(_, e)| matches!(e, AgentDomainEvent::ContentDelta { kind: ContentKind::Text, .. }))
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                AgentDomainEvent::ContentDelta {
+                    kind: ContentKind::Text,
+                    ..
+                }
+            )
+        })
         .map(|(i, _)| i)
         .collect();
     assert!(

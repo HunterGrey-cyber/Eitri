@@ -184,8 +184,20 @@ mod tests {
     fn dawn() -> ThemeTokens {
         ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
-            groups: [("Normal".to_string(), HlAttrs { fg: Some(0x575279), bg: Some(0xfaf4ed), reverse: false })].into(),
-            options: NvimOptions { background: "light".into(), guifont: String::new(), colors_name: "rose-pine".into() },
+            groups: [(
+                "Normal".to_string(),
+                HlAttrs {
+                    fg: Some(0x575279),
+                    bg: Some(0xfaf4ed),
+                    reverse: false,
+                },
+            )]
+            .into(),
+            options: NvimOptions {
+                background: "light".into(),
+                guifont: String::new(),
+                colors_name: "rose-pine".into(),
+            },
         })
     }
 
@@ -213,7 +225,9 @@ mod tests {
 
     /// The body of the rule whose selector is exactly `selector` (`.win-btn`, not `.win-btn:hover`).
     fn rule<'a>(css: &'a str, selector: &str) -> &'a str {
-        let start = css.find(&format!("\n{selector} {{")).unwrap_or_else(|| panic!("no rule {selector}"));
+        let start = css
+            .find(&format!("\n{selector} {{"))
+            .unwrap_or_else(|| panic!("no rule {selector}"));
         let body = &css[start..];
         &body[..body.find('}').unwrap()]
     }
@@ -225,12 +239,37 @@ mod tests {
         let t = ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: [
-                ("Normal".to_string(), HlAttrs { fg: Some(0xc6c6c6), bg: Some(0x000000), reverse: false }),
-                ("StatusLine".to_string(), HlAttrs { fg: None, bg: None, reverse: true }),
-                ("Comment".to_string(), HlAttrs { fg: Some(0x949494), bg: None, reverse: false }),
+                (
+                    "Normal".to_string(),
+                    HlAttrs {
+                        fg: Some(0xc6c6c6),
+                        bg: Some(0x000000),
+                        reverse: false,
+                    },
+                ),
+                (
+                    "StatusLine".to_string(),
+                    HlAttrs {
+                        fg: None,
+                        bg: None,
+                        reverse: true,
+                    },
+                ),
+                (
+                    "Comment".to_string(),
+                    HlAttrs {
+                        fg: Some(0x949494),
+                        bg: None,
+                        reverse: false,
+                    },
+                ),
             ]
             .into(),
-            options: NvimOptions { background: "dark".into(), guifont: String::new(), colors_name: "lunaperche".into() },
+            options: NvimOptions {
+                background: "dark".into(),
+                guifont: String::new(),
+                colors_name: "lunaperche".into(),
+            },
         });
         let css = gtk_css(&t);
         for (selector, colour, min) in [
@@ -239,7 +278,10 @@ mod tests {
             (".win-btn", t.chrome_muted, 4.5),
         ] {
             let body = rule(&css, selector);
-            assert!(body.contains(&format!("\n    color: {};", colour.hex())), "{selector}: {body}");
+            assert!(
+                body.contains(&format!("\n    color: {};", colour.hex())),
+                "{selector}: {body}"
+            );
             assert!(colour.contrast(t.chrome) >= min, "{selector} is unreadable on chrome");
         }
     }
@@ -252,13 +294,22 @@ mod tests {
     fn focus_is_a_cursor_not_a_frame() {
         for t in [dawn(), ThemeTokens::fallback()] {
             let css = gtk_css(&t);
-            assert!(!css.contains("\n.pane {") && !css.contains("pane-focused"), "no pane focus chrome");
+            assert!(
+                !css.contains("\n.pane {") && !css.contains("pane-focused"),
+                "no pane focus chrome"
+            );
             assert!(!css.contains("outline:"), "no outline");
             let item = rule(&css, ".topbar-item:focus");
-            assert!(item.contains(&format!("background-color: {};", t.chrome_fg.hex())), "{item}");
+            assert!(
+                item.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+                "{item}"
+            );
             assert!(item.contains(&format!("color: {};", t.chrome.hex())), "{item}");
             assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
-            assert!(css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(), "hover must not win");
+            assert!(
+                css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(),
+                "hover must not win"
+            );
         }
     }
 
@@ -270,7 +321,10 @@ mod tests {
         for t in [dawn(), ThemeTokens::fallback()] {
             let css = gtk_css(&t);
             let armed = rule(&css, ".topbar-app-name.prefix-armed");
-            assert!(armed.contains(&format!("background-color: {};", t.chrome_fg.hex())), "{armed}");
+            assert!(
+                armed.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+                "{armed}"
+            );
             assert!(armed.contains(&format!("color: {};", t.chrome.hex())), "{armed}");
             assert!(
                 css.find("\n.topbar-app-name {").unwrap() < css.find("\n.topbar-app-name.prefix-armed {").unwrap(),
@@ -283,12 +337,37 @@ mod tests {
         ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: [
-                ("Normal".to_string(), HlAttrs { fg: Some(0xc6c6c6), bg: Some(0x000000), reverse: false }),
-                ("StatusLine".to_string(), HlAttrs { fg: None, bg: None, reverse: true }),
-                ("Comment".to_string(), HlAttrs { fg: Some(0x949494), bg: None, reverse: false }),
+                (
+                    "Normal".to_string(),
+                    HlAttrs {
+                        fg: Some(0xc6c6c6),
+                        bg: Some(0x000000),
+                        reverse: false,
+                    },
+                ),
+                (
+                    "StatusLine".to_string(),
+                    HlAttrs {
+                        fg: None,
+                        bg: None,
+                        reverse: true,
+                    },
+                ),
+                (
+                    "Comment".to_string(),
+                    HlAttrs {
+                        fg: Some(0x949494),
+                        bg: None,
+                        reverse: false,
+                    },
+                ),
             ]
             .into(),
-            options: NvimOptions { background: "dark".into(), guifont: String::new(), colors_name: "lunaperche".into() },
+            options: NvimOptions {
+                background: "dark".into(),
+                guifont: String::new(),
+                colors_name: "lunaperche".into(),
+            },
         })
     }
 
@@ -300,11 +379,29 @@ mod tests {
         ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: [
-                ("Normal".to_string(), HlAttrs { fg: Some(0x575279), bg: Some(0xfaf4ed), reverse: false }),
-                ("IncSearch".to_string(), HlAttrs { fg: Some(0xfaf4ed), bg: Some(0xd7827e), reverse: false }),
+                (
+                    "Normal".to_string(),
+                    HlAttrs {
+                        fg: Some(0x575279),
+                        bg: Some(0xfaf4ed),
+                        reverse: false,
+                    },
+                ),
+                (
+                    "IncSearch".to_string(),
+                    HlAttrs {
+                        fg: Some(0xfaf4ed),
+                        bg: Some(0xd7827e),
+                        reverse: false,
+                    },
+                ),
             ]
             .into(),
-            options: NvimOptions { background: "light".into(), guifont: String::new(), colors_name: "rose-pine".into() },
+            options: NvimOptions {
+                background: "light".into(),
+                guifont: String::new(),
+                colors_name: "rose-pine".into(),
+            },
         })
     }
 
@@ -314,11 +411,18 @@ mod tests {
     #[test]
     fn a_hint_label_is_hint_fg_text_on_its_own_hint_bg_fill() {
         let incsearch = dawn_with_incsearch();
-        assert_eq!(incsearch.hint_bg.hex(), "#d7827e", "the pair really comes from IncSearch here");
+        assert_eq!(
+            incsearch.hint_bg.hex(),
+            "#d7827e",
+            "the pair really comes from IncSearch here"
+        );
         for t in [dawn(), ThemeTokens::fallback(), lunaperche(), incsearch] {
             let css = gtk_css(&t);
             let body = rule(&css, ".hint-label");
-            assert!(body.contains(&format!("\n    background-color: {};", t.hint_bg.hex())), "{body}");
+            assert!(
+                body.contains(&format!("\n    background-color: {};", t.hint_bg.hex())),
+                "{body}"
+            );
             let text_colours: Vec<&str> = body.lines().filter(|l| l.trim_start().starts_with("color:")).collect();
             let expected = format!("    color: {};", t.hint_fg.hex());
             assert_eq!(text_colours, vec![expected.as_str()], "{body}");

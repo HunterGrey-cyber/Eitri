@@ -70,9 +70,20 @@ pub(crate) struct Hidden {
 /// `None` for a pane index that does not exist.
 pub(crate) fn hidden_for_zoom(pane: usize, has_bottom: bool) -> Option<Hidden> {
     match pane {
-        0 => Some(Hidden { side: true, bottom: has_bottom, ..Hidden::default() }),
-        1 => Some(Hidden { main: true, bottom: has_bottom, ..Hidden::default() }),
-        2 if has_bottom => Some(Hidden { top_row: true, ..Hidden::default() }),
+        0 => Some(Hidden {
+            side: true,
+            bottom: has_bottom,
+            ..Hidden::default()
+        }),
+        1 => Some(Hidden {
+            main: true,
+            bottom: has_bottom,
+            ..Hidden::default()
+        }),
+        2 if has_bottom => Some(Hidden {
+            top_row: true,
+            ..Hidden::default()
+        }),
         _ => None,
     }
 }
@@ -110,7 +121,12 @@ pub(crate) struct PaneLayout {
 
 impl PaneLayout {
     pub(crate) fn new(across: Paned, down: Option<Paned>) -> Rc<Self> {
-        Rc::new(PaneLayout { across, down, zoomed: Cell::new(None), saved: Cell::new((0, None)) })
+        Rc::new(PaneLayout {
+            across,
+            down,
+            zoomed: Cell::new(None),
+            saved: Cell::new((0, None)),
+        })
     }
 
     fn set_hidden(&self, hidden: Hidden) {
@@ -132,8 +148,11 @@ impl PaneLayout {
         if self.unzoom() {
             return;
         }
-        let Some(hidden) = hidden_for_zoom(pane, self.down.is_some()) else { return };
-        self.saved.set((self.across.position(), self.down.as_ref().map(|d| d.position())));
+        let Some(hidden) = hidden_for_zoom(pane, self.down.is_some()) else {
+            return;
+        };
+        self.saved
+            .set((self.across.position(), self.down.as_ref().map(|d| d.position())));
         self.set_hidden(hidden);
         self.zoomed.set(Some(pane));
         println!("[layout] zoomed pane {pane}");
@@ -161,7 +180,9 @@ impl PaneLayout {
         // Decided BEFORE unzooming: a direction with no divider on that side is a no-op, and a
         // no-op must not silently undo a zoom. tmux's `resize-pane` unzooms because it resizes;
         // at the edge of its own grid it does nothing at all.
-        let Some((split, sign)) = resize_target(direction, focused_pane, self.down.is_some()) else { return };
+        let Some((split, sign)) = resize_target(direction, focused_pane, self.down.is_some()) else {
+            return;
+        };
         self.unzoom();
         let (paned, px) = match split {
             Split::Across => (&self.across, cell.0),
@@ -311,11 +332,43 @@ mod tests {
 
     #[test]
     fn zooming_a_pane_hides_every_other_one() {
-        assert_eq!(hidden_for_zoom(0, false), Some(Hidden { side: true, ..Hidden::default() }));
-        assert_eq!(hidden_for_zoom(1, false), Some(Hidden { main: true, ..Hidden::default() }));
-        assert_eq!(hidden_for_zoom(0, true), Some(Hidden { side: true, bottom: true, ..Hidden::default() }));
-        assert_eq!(hidden_for_zoom(1, true), Some(Hidden { main: true, bottom: true, ..Hidden::default() }));
-        assert_eq!(hidden_for_zoom(2, true), Some(Hidden { top_row: true, ..Hidden::default() }));
+        assert_eq!(
+            hidden_for_zoom(0, false),
+            Some(Hidden {
+                side: true,
+                ..Hidden::default()
+            })
+        );
+        assert_eq!(
+            hidden_for_zoom(1, false),
+            Some(Hidden {
+                main: true,
+                ..Hidden::default()
+            })
+        );
+        assert_eq!(
+            hidden_for_zoom(0, true),
+            Some(Hidden {
+                side: true,
+                bottom: true,
+                ..Hidden::default()
+            })
+        );
+        assert_eq!(
+            hidden_for_zoom(1, true),
+            Some(Hidden {
+                main: true,
+                bottom: true,
+                ..Hidden::default()
+            })
+        );
+        assert_eq!(
+            hidden_for_zoom(2, true),
+            Some(Hidden {
+                top_row: true,
+                ..Hidden::default()
+            })
+        );
     }
 
     #[test]

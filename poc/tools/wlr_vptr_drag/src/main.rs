@@ -14,8 +14,7 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle,
 };
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
-    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
-    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
 struct AppState;
@@ -119,9 +118,7 @@ fn parse_args() -> Args {
             "--hold-ms" => hold_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--steps" => steps = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--clicks" => clicks = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
-            "--click-gap-ms" => {
-                click_gap_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())
-            }
+            "--click-gap-ms" => click_gap_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--screen-w" => screen_w = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--screen-h" => screen_h = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
@@ -217,7 +214,16 @@ fn main() -> ExitCode {
 
     eprintln!(
         "drag: ({}, {}) -> ({}, {}) button=0x{:x} steps={} hold_ms={} clicks={} screen={}x{}",
-        args.x1, args.y1, args.x2, args.y2, args.button, args.steps, args.hold_ms, args.clicks, args.screen_w, args.screen_h
+        args.x1,
+        args.y1,
+        args.x2,
+        args.y2,
+        args.button,
+        args.steps,
+        args.hold_ms,
+        args.clicks,
+        args.screen_w,
+        args.screen_h
     );
 
     // 1. Move to the start position and settle there before pressing --

@@ -11,7 +11,11 @@ use agent::handoff::prepare_neovibe_to_cli_handoff;
 use agent::lease::{LeaseError, SessionLease};
 use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode};
 
-fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(provider: &ClaudeSidecarProvider, deadline_secs: u64, done: F) -> Vec<AgentDomainEvent> {
+fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(
+    provider: &ClaudeSidecarProvider,
+    deadline_secs: u64,
+    done: F,
+) -> Vec<AgentDomainEvent> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
     let mut all_events = Vec::new();
     while std::time::Instant::now() < deadline {
@@ -49,7 +53,11 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     // the kind of real bug this plan's own "Verified facts" point 1 exists to prevent; do not
     // "simplify" this test by using one value for both.
     let session_id = provider
-        .create_session(CreateSessionRequest { cwd: cwd.clone(), permission_mode: PermissionMode::Auto, streaming: agent::StreamingPreference::Partial })
+        .create_session(CreateSessionRequest {
+            cwd: cwd.clone(),
+            permission_mode: PermissionMode::Auto,
+            streaming: agent::StreamingPreference::Partial,
+        })
         .unwrap();
 
     // `SessionOpened` carries the real Claude session UUID, and it is NOT emitted at
@@ -59,20 +67,38 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     // first version of this test waited for it before send_turn and timed out for exactly this
     // reason.) So: send the turn first, then read the id out of the events collected along the way.
     provider
-        .send_turn(agent::SendTurnRequest { session_id: session_id.clone(), text: "reply with exactly the word: pong".into() })
+        .send_turn(agent::SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "reply with exactly the word: pong".into(),
+        })
         .unwrap();
-    let events = drain_until(&provider, 30, |events| events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })));
-    assert!(events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })), "turn did not complete");
+    let events = drain_until(&provider, 30, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })),
+        "turn did not complete"
+    );
 
     let provider_session_id = events
         .iter()
         .find_map(|e| match e {
-            AgentDomainEvent::SessionOpened { provider_session_id, .. } => Some(provider_session_id.clone()),
+            AgentDomainEvent::SessionOpened {
+                provider_session_id, ..
+            } => Some(provider_session_id.clone()),
             _ => None,
         })
         .expect("expected a real SessionOpened event carrying a provider_session_id");
 
-    provider.close_session(agent::CloseSessionRequest { session_id: session_id.clone() }).unwrap();
+    provider
+        .close_session(agent::CloseSessionRequest {
+            session_id: session_id.clone(),
+        })
+        .unwrap();
 
     // The handoff itself: acquire the lease, spawn neovibe-claude-handoff, confirm it's really
     // running the real claude binary and really holding the lease.
@@ -103,19 +129,29 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(comm.trim(), "claude", "expected the handoff's real spawned process to have exec'd into claude");
+    assert_eq!(
+        comm.trim(),
+        "claude",
+        "expected the handoff's real spawned process to have exec'd into claude"
+    );
 
     // Confirm a second acquire attempt of the SAME lease key genuinely fails now that the process
     // is confirmed to genuinely be `claude` -- this is the real, load-bearing assertion: the lease
     // is really held by the exec'd `claude`, not just "a process was spawned" (see the ordering
     // comment above for why this must run second).
     let second_attempt = SessionLease::try_acquire("claude", &cwd, &provider_session_id);
-    assert!(matches!(second_attempt, Err(LeaseError::AlreadyHeld)), "expected AlreadyHeld while the handoff process is running, got: {second_attempt:?}");
+    assert!(
+        matches!(second_attempt, Err(LeaseError::AlreadyHeld)),
+        "expected AlreadyHeld while the handoff process is running, got: {second_attempt:?}"
+    );
 
     // Clean up: kill the real spawned claude --resume process (this test never actually interacts
     // with its own terminal session -- it exists only to prove the handoff mechanism, not to be a
     // real interactive session left running after the test).
-    let _ = std::process::Command::new("kill").arg("-9").arg(outcome.child_pid.to_string()).status();
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(outcome.child_pid.to_string())
+        .status();
     let _ = std::fs::remove_dir_all(&project_dir);
 
     // After killing it, the lease must become acquirable again -- proving flock's own
@@ -131,5 +167,8 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(released, "expected the lease to become acquirable again after killing the handoff process");
+    assert!(
+        released,
+        "expected the lease to become acquirable again after killing the handoff process"
+    );
 }

@@ -130,10 +130,7 @@ fn make_gl_interface() -> GlInterface {
     }
 }
 
-unsafe fn resolve_gl_proc(
-    lib: &libloading::os::unix::Library,
-    name: &str,
-) -> *const std::ffi::c_void {
+unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
     unsafe {
         // Preferred: libepoxy's `epoxy_<name>` dispatch-pointer *variable*.
         //
@@ -286,8 +283,8 @@ fn build_ui(app: &Application) {
 
             if state_slot.is_none() {
                 let interface = make_gl_interface();
-                let gr_context = direct_contexts::make_gl(interface, None)
-                    .expect("failed to create Skia GL DirectContext");
+                let gr_context =
+                    direct_contexts::make_gl(interface, None).expect("failed to create Skia GL DirectContext");
                 let width = widget.width() * widget.scale_factor();
                 let height = widget.height() * widget.scale_factor();
                 println!(

@@ -19,8 +19,8 @@
 //! never evicts, and never gapping looks exactly like correct behaviour.
 
 use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, ContentKind, CreateSessionRequest,
-    PermissionMode, ProjectionStatus, SendTurnRequest, StreamingPreference,
+    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, ContentKind, CreateSessionRequest, PermissionMode,
+    ProjectionStatus, SendTurnRequest, StreamingPreference,
 };
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,11 @@ fn text_of(events: &[AgentDomainEvent]) -> String {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => Some(text.as_str()),
+            AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -110,7 +114,10 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: STREAMING_PROMPT.into() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: STREAMING_PROMPT.into(),
+        })
         .unwrap();
 
     let all = drain_until(&provider, Duration::from_secs(180), turn_ended);
@@ -126,7 +133,9 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     );
     eprintln!("watch reconnects during this turn: {reconnects}");
 
-    let broke = all.iter().any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }));
+    let broke = all
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }));
     assert!(
         !broke,
         "the client gave up instead of recovering: {:?}",
@@ -153,7 +162,10 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     // No loss and no duplication, judged against the provider's own final text. `result_text` is the
     // LAST assistant message of the turn, so on a multi-message turn it is a suffix rather than the
     // whole thing -- hence `ends_with` rather than equality.
-    assert!(!final_text.is_empty(), "the turn produced no final text to reconcile against");
+    assert!(
+        !final_text.is_empty(),
+        "the turn produced no final text to reconcile against"
+    );
     assert!(
         accumulated.ends_with(&final_text),
         "what this client accumulated across the break does not end in what the provider says it \
@@ -165,7 +177,10 @@ fn a_broken_watch_stream_recovers_without_loss_or_duplication() {
     // And the session is still usable afterwards -- a recovery that leaves a one-turn conversation
     // is not a recovery.
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: "reply with exactly: still-here".into() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: "reply with exactly: still-here".into(),
+        })
         .unwrap();
     let second = drain_until(&provider, Duration::from_secs(120), turn_ended);
     assert!(
@@ -208,11 +223,16 @@ fn a_gap_too_large_to_replay_ends_the_session_visibly() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest { session_id, text: STREAMING_PROMPT.into() })
+        .send_turn(SendTurnRequest {
+            session_id,
+            text: STREAMING_PROMPT.into(),
+        })
         .unwrap();
 
     let all = drain_until(&provider, Duration::from_secs(180), |events| {
-        events.iter().any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
     });
 
     let reason = all
@@ -239,7 +259,10 @@ fn a_gap_too_large_to_replay_ends_the_session_visibly() {
         projection.apply(event);
     }
     assert!(matches!(projection.status, ProjectionStatus::Unavailable { .. }));
-    assert_eq!(projection.active_turn_id, None, "a session that lost events is not still working");
+    assert_eq!(
+        projection.active_turn_id, None,
+        "a session that lost events is not still working"
+    );
 }
 
 /// **The same stall, but through a real `AgentConversation`.**
@@ -263,7 +286,9 @@ fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
     let mut conversation = agent::AgentConversation::create(provider.clone(), &cwd, PermissionMode::Bypass)
         .expect("creating a conversation should succeed");
 
-    conversation.send_turn(STREAMING_PROMPT).expect("send_turn should succeed");
+    conversation
+        .send_turn(STREAMING_PROMPT)
+        .expect("send_turn should succeed");
 
     // The UI never looks. Not once, for the whole turn.
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -286,12 +311,23 @@ fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
     eprintln!("  provider events received : {}", wire.events_received);
     eprintln!("  events folded            : {}", ingest.events_ingested);
     eprintln!("  worst provider-side queue: {worst_provider_queue}");
-    eprintln!("  deepest UI backlog       : {} (cap {})", ingest.max_ui_backlog, agent::UI_EVENT_QUEUE_CAPACITY);
+    eprintln!(
+        "  deepest UI backlog       : {} (cap {})",
+        ingest.max_ui_backlog,
+        agent::UI_EVENT_QUEUE_CAPACITY
+    );
     eprintln!("  resyncs owed to the UI   : {}", ingest.resyncs);
-    eprintln!("  transcript messages      : {}", conversation.projection().transcript.len());
+    eprintln!(
+        "  transcript messages      : {}",
+        conversation.projection().transcript.len()
+    );
 
     // The premise: a real streamed turn actually happened.
-    assert!(ingest.events_ingested > 50, "only {} events -- no real stream to stall against", ingest.events_ingested);
+    assert!(
+        ingest.events_ingested > 50,
+        "only {} events -- no real stream to stall against",
+        ingest.events_ingested
+    );
 
     // Ingestion kept up even though nothing rendered: the provider's own queue never became the
     // place the backlog lives.
@@ -309,7 +345,10 @@ fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
     // And the conversation is complete despite never having been rendered: partial updates coalesced
     // into real messages rather than being held as raw events waiting for a repaint.
     let projection = conversation.projection();
-    assert!(!projection.transcript.is_empty(), "the turn produced no assistant message");
+    assert!(
+        !projection.transcript.is_empty(),
+        "the turn produced no assistant message"
+    );
     assert_eq!(projection.active_turn_id, None, "the turn should have completed");
     assert!(!matches!(projection.status, ProjectionStatus::Unavailable { .. }));
 }
@@ -331,7 +370,10 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
     assert_eq!(before.pending_events, 0);
 
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: STREAMING_PROMPT.into() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: STREAMING_PROMPT.into(),
+        })
         .unwrap();
 
     // Deliberately do not pump. Everything produced in this window has to be held somewhere.
@@ -340,7 +382,11 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
     for _ in 0..20 {
         std::thread::sleep(Duration::from_secs(1));
         let stats = provider.backpressure_stats();
-        samples.push((stats.pending_events, stats.max_delivery_lag_ms, sidecar_rss_kib(sidecar_pid)));
+        samples.push((
+            stats.pending_events,
+            stats.max_delivery_lag_ms,
+            sidecar_rss_kib(sidecar_pid),
+        ));
     }
 
     let stalled = provider.backpressure_stats();
@@ -356,7 +402,8 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
             i + 1,
             pending,
             lag,
-            rss.map(|kib| format!("{kib}KiB")).unwrap_or_else(|| "unreadable".into()),
+            rss.map(|kib| format!("{kib}KiB"))
+                .unwrap_or_else(|| "unreadable".into()),
         );
     }
     eprintln!("  peak client-side queue depth : {}", stalled.pending_events);
@@ -367,7 +414,8 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
 
     // The correctness property, unchanged: a stall costs memory, not content.
     assert!(
-        !all.iter().any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+        !all.iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
         "a stalled consumer must not be reported as a loss"
     );
     let final_text = all
@@ -377,11 +425,18 @@ fn a_stalled_consumer_is_lossless_and_its_cost_is_measured() {
             _ => None,
         })
         .expect("the turn never completed");
-    assert!(text_of(&all).ends_with(&final_text), "text was lost or duplicated across the stall");
+    assert!(
+        text_of(&all).ends_with(&final_text),
+        "text was lost or duplicated across the stall"
+    );
 
     // The premise: the stall actually built a backlog. Without this the numbers above could all be
     // zero and the test would still pass.
-    assert!(stalled.pending_events > 50, "no real backlog accumulated: {}", stalled.pending_events);
+    assert!(
+        stalled.pending_events > 50,
+        "no real backlog accumulated: {}",
+        stalled.pending_events
+    );
 
     // THE SHAPE OF THE ANSWER, and it is not what a first guess suggests. The queue grows while
     // delivery lag stays flat at a millisecond or two -- so nothing in the transport is holding

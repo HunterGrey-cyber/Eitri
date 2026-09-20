@@ -22,7 +22,11 @@ pub enum PermissionSource {
 pub enum AgentEvent {
     /// The CLI's own `system`/`init` line -- fired once, first, at the start of every
     /// invocation (fresh session or `--resume`).
-    SessionStarted { session_id: String, model: String, cwd: String },
+    SessionStarted {
+        session_id: String,
+        model: String,
+        cwd: String,
+    },
     /// One `{"type": "text", "text": ...}` content block from an `assistant` message.
     AssistantText { text: String },
     /// One `{"type": "thinking", "thinking": ...}` content block. Real captured output showed
@@ -72,15 +76,29 @@ pub enum AgentEvent {
     ///   `can_use_tool` control_request on a real wire at all** (`agent/CAPTURE_NOTES.md` step 6),
     ///   so nothing here is evidence about what that message really carries -- only about how
     ///   `wire.rs` treats the declared shape.
-    PermissionRequest { request_id: String, tool_use_id: Option<String>, tool_name: String, input: Value, source: PermissionSource },
+    PermissionRequest {
+        request_id: String,
+        tool_use_id: Option<String>,
+        tool_name: String,
+        input: Value,
+        source: PermissionSource,
+    },
     /// Any `control_response` line -- acknowledges `initialize`, `interrupt`, or a caller's own
     /// `can_use_tool` answer. `agent` does not correlate these internally; see `process.rs`.
-    ControlResponse { request_id: String, subtype: String, raw: Value },
+    ControlResponse {
+        request_id: String,
+        subtype: String,
+        raw: Value,
+    },
     /// Deliberately permissive catch-all -- see this plan's Global Constraint on never letting
     /// an unrecognized event stop the stream. `kind` is the wire `type` field, `subtype` its
     /// `subtype` field if present (many `system` events use this to distinguish e.g.
     /// `hook_started`/`hook_response`/`init`/`thinking_tokens`).
-    Unknown { kind: String, subtype: Option<String>, raw: Value },
+    Unknown {
+        kind: String,
+        subtype: Option<String>,
+        raw: Value,
+    },
     /// One line of the child's stderr, verbatim. Diagnostic only -- v1 has no state effect for
     /// this (see `AgentSessionProjection::apply`), it exists purely so stderr is observable (and
     /// actually drained, so the child can never block on a full stderr pipe buffer) instead of

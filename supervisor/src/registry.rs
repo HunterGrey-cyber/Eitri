@@ -32,12 +32,24 @@ impl Registry {
         Self::default()
     }
 
-    pub fn handle_register(&mut self, connection_id: u64, instance_id: String, project_name: String, _project_dir: String, _pid: u32) {
+    pub fn handle_register(
+        &mut self,
+        connection_id: u64,
+        instance_id: String,
+        project_name: String,
+        _project_dir: String,
+        _pid: u32,
+    ) {
         // A re-register on the same connection_id (shouldn't happen in practice -- `shell` only
         // ever sends one Register per connection -- but never trust the wire) replaces the entry
         // rather than duplicating it.
         self.entries.retain(|e| e.connection_id != connection_id);
-        self.entries.push(Entry { connection_id, instance_id, project_name, status: AgentStatus::NoSession });
+        self.entries.push(Entry {
+            connection_id,
+            instance_id,
+            project_name,
+            status: AgentStatus::NoSession,
+        });
     }
 
     /// `connection_id` must match the connection that originally registered `instance_id` --
@@ -46,7 +58,11 @@ impl Registry {
     /// message itself carries no other identity). Not a real threat model on a single-user local
     /// socket, but free to close.
     pub fn handle_status(&mut self, connection_id: u64, instance_id: &str, status: AgentStatus) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.connection_id == connection_id && e.instance_id == instance_id) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.connection_id == connection_id && e.instance_id == instance_id)
+        {
             entry.status = status;
         }
         // A status for a (connection_id, instance_id) pair that doesn't match any registered
@@ -64,11 +80,21 @@ impl Registry {
     /// could click a row in the same poll tick its connection drops) -- a harmless no-op case,
     /// not an error.
     pub fn connection_id_for(&self, instance_id: &str) -> Option<u64> {
-        self.entries.iter().find(|e| e.instance_id == instance_id).map(|e| e.connection_id)
+        self.entries
+            .iter()
+            .find(|e| e.instance_id == instance_id)
+            .map(|e| e.connection_id)
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        self.entries.iter().map(|e| Row { instance_id: e.instance_id.clone(), project_name: e.project_name.clone(), status: e.status }).collect()
+        self.entries
+            .iter()
+            .map(|e| Row {
+                instance_id: e.instance_id.clone(),
+                project_name: e.project_name.clone(),
+                status: e.status,
+            })
+            .collect()
     }
 }
 
@@ -80,7 +106,14 @@ mod tests {
     fn a_freshly_registered_instance_starts_as_no_session() {
         let mut reg = Registry::new();
         reg.handle_register(1, "abc".into(), "neovibe".into(), "/tmp/neovibe".into(), 100);
-        assert_eq!(reg.rows(), vec![Row { instance_id: "abc".into(), project_name: "neovibe".into(), status: AgentStatus::NoSession }]);
+        assert_eq!(
+            reg.rows(),
+            vec![Row {
+                instance_id: "abc".into(),
+                project_name: "neovibe".into(),
+                status: AgentStatus::NoSession
+            }]
+        );
     }
 
     #[test]

@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, GLArea,
-    GestureClick, IMMulticontext,
+    EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick, IMMulticontext,
 };
 
 use skia_safe::gpu::direct_contexts;
@@ -38,8 +37,7 @@ use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::GridSize;
 
 use gl_interop::{
-    snap_region_to_grid,
-    compute_content_region, fill_content_region, grid_size_for_content_region, make_gl_interface,
+    compute_content_region, fill_content_region, grid_size_for_content_region, make_gl_interface, snap_region_to_grid,
     SkiaState,
 };
 use mouse::DragState;
@@ -404,13 +402,21 @@ impl NeovideEditorPane {
     /// deterministic manual-verification runs; everything else takes its default. Use
     /// [`NeovideEditorPane::with_options`] to set anything more.
     pub fn new(clean: bool) -> Self {
-        Self::with_options(NeovideEditorPaneOptions { clean, ..Default::default() })
+        Self::with_options(NeovideEditorPaneOptions {
+            clean,
+            ..Default::default()
+        })
     }
 
     /// Same as [`NeovideEditorPane::new`], with every construction-time knob this pane forwards to
     /// `LiveHarnessOptions` spelled out. See [`NeovideEditorPaneOptions`] for what each one means.
     pub fn with_options(options: NeovideEditorPaneOptions) -> Self {
-        let NeovideEditorPaneOptions { clean, child_env, cwd, extra_nvim_args } = options;
+        let NeovideEditorPaneOptions {
+            clean,
+            child_env,
+            cwd,
+            extra_nvim_args,
+        } = options;
         let gl_area = GLArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -441,10 +447,8 @@ impl NeovideEditorPane {
                 let mut live = live_state.borrow_mut();
                 let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                     session.wants_frame.set(true);
-                    let content_region = snap_region_to_grid(
-                        &compute_content_region(width, height),
-                        session.harness.grid_scale(),
-                    );
+                    let content_region =
+                        snap_region_to_grid(&compute_content_region(width, height), session.harness.grid_scale());
                     let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
                     let resized_grid = if new_grid_size != session.last_grid_size.get() {
                         session.harness.resize_grid(new_grid_size);
@@ -560,8 +564,8 @@ impl NeovideEditorPane {
 
                 if state_slot.is_none() {
                     let interface = make_gl_interface();
-                    let gr_context = direct_contexts::make_gl(interface, None)
-                        .expect("failed to create Skia GL DirectContext");
+                    let gr_context =
+                        direct_contexts::make_gl(interface, None).expect("failed to create Skia GL DirectContext");
                     let width = widget.width() * widget.scale_factor();
                     let height = widget.height() * widget.scale_factor();
                     println!(
@@ -570,7 +574,12 @@ impl NeovideEditorPane {
                         height,
                         widget.scale_factor()
                     );
-                    *state_slot = Some(SkiaState { gr_context, surface: None, fb_width: width, fb_height: height });
+                    *state_slot = Some(SkiaState {
+                        gr_context,
+                        surface: None,
+                        fb_width: width,
+                        fb_height: height,
+                    });
                 }
 
                 let state = state_slot.as_mut().unwrap();
@@ -702,9 +711,7 @@ impl NeovideEditorPane {
                             Err(err) => {
                                 let elapsed = t0.elapsed();
                                 let message = format!("{err:#}");
-                                println!(
-                                    "[live] LiveHarness::with_options failed after {elapsed:?}: {message}"
-                                );
+                                println!("[live] LiveHarness::with_options failed after {elapsed:?}: {message}");
                                 *live = LiveState::Failed(message);
                             }
                         }
@@ -717,10 +724,8 @@ impl NeovideEditorPane {
                         // no grid at all and should cover every pixel they can -- a "starting
                         // nvim..." screen with a band of clear colour along one edge would be a
                         // regression, not a fix.
-                        let grid_region =
-                            snap_region_to_grid(&content_region, session.harness.grid_scale());
-                        let animating =
-                            session.harness.render_frame(canvas, Some(&grid_region), dt);
+                        let grid_region = snap_region_to_grid(&content_region, session.harness.grid_scale());
+                        let animating = session.harness.render_frame(canvas, Some(&grid_region), dt);
                         // Share this frame's "do we still need more frames" signals with the tick
                         // callback.
                         session.last_animating.set(animating);
@@ -836,10 +841,8 @@ impl NeovideEditorPane {
                         // staleness, instead of chasing that one root cause.
                         let width = widget.width() * widget.scale_factor();
                         let height = widget.height() * widget.scale_factor();
-                        let content_region = snap_region_to_grid(
-                            &compute_content_region(width, height),
-                            session.harness.grid_scale(),
-                        );
+                        let content_region =
+                            snap_region_to_grid(&compute_content_region(width, height), session.harness.grid_scale());
                         let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
                         let grid_resynced = if new_grid_size != session.last_grid_size.get() {
                             session.harness.resize_grid(new_grid_size);
@@ -868,8 +871,7 @@ impl NeovideEditorPane {
                         // did. `close_requested.replace(true)` is the one-shot guard documented on
                         // `LiveSession::close_requested`; only the tick that flips it false->true
                         // actually fires the callback.
-                        if session.harness.has_neovim_exited() && !session.close_requested.replace(true)
-                        {
+                        if session.harness.has_neovim_exited() && !session.close_requested.replace(true) {
                             should_fire_exited_callback = true;
                         }
 
@@ -998,7 +1000,9 @@ impl NeovideEditorPane {
     /// One grid cell's size in logical pixels (the unit GTK sizes and positions widgets in), or
     /// `None` before nvim is ready. For a host that moves a divider by whole cells.
     pub fn cell_size(&self) -> Option<(f64, f64)> {
-        let LiveState::Ready(session) = &*self.live_state.borrow() else { return None };
+        let LiveState::Ready(session) = &*self.live_state.borrow() else {
+            return None;
+        };
         let scale = session.harness.grid_scale();
         let factor = f64::from(self.widget.scale_factor().max(1));
         Some((f64::from(scale.width()) / factor, f64::from(scale.height()) / factor))

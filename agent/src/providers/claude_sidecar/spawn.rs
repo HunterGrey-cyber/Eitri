@@ -251,7 +251,12 @@ fn locate_verdandi_checkout(explicit: Option<&str>) -> std::io::Result<VerdandiC
 
     let revision = git_short_revision(&path);
     let prebuilt = prebuilt_artifact_in(&path);
-    Ok(VerdandiCheckout { path, revision, from_override, prebuilt })
+    Ok(VerdandiCheckout {
+        path,
+        revision,
+        from_override,
+        prebuilt,
+    })
 }
 
 /// Best-effort `git rev-parse --short HEAD`. Any failure (not a repo, no `git`, detached weirdness)
@@ -284,14 +289,20 @@ fn git_short_revision(checkout: &Path) -> Option<String> {
 /// diagnostics" as "something is wrong" lit up permanently for every healthy session. A warning
 /// that is always on is not a warning.
 fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
-    let source = if checkout.from_override { "NEOVIBE_VERDANDI_CHECKOUT" } else { "default path" };
+    let source = if checkout.from_override {
+        "NEOVIBE_VERDANDI_CHECKOUT"
+    } else {
+        "default path"
+    };
     let revision = checkout.revision.as_deref().unwrap_or("unknown revision");
     let shape = match &checkout.prebuilt {
         Some(artifact) => format!(", running its prebuilt artifact {}", artifact.display()),
         None => String::new(),
     };
-    let description =
-        format!("Verdandi checkout: {} @ {revision} (via {source}){shape}", checkout.path.display());
+    let description = format!(
+        "Verdandi checkout: {} @ {revision} (via {source}){shape}",
+        checkout.path.display()
+    );
 
     let mut warnings = Vec::new();
     // `starts_with` rather than equality: `git rev-parse --short` picks its own abbreviation length,
@@ -472,7 +483,10 @@ fn resolve_sidecar_program(
 pub fn packaged_sidecar_available() -> bool {
     sidecar_artifact_available(
         std::env::var("NEOVIBE_SIDECAR_BINARY").ok().as_deref(),
-        std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)).as_deref(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .as_deref(),
         checkout_path_for(std::env::var("NEOVIBE_VERDANDI_CHECKOUT").ok().as_deref()).as_deref(),
     )
 }
@@ -487,15 +501,14 @@ pub fn packaged_sidecar_available() -> bool {
 /// alongside an installed artifact answers `true` here and still resolves to the checkout there, so
 /// that start does run `npm`. That is the operator's own override doing what it says, not a default
 /// chosen for them.
-fn sidecar_artifact_available(
-    named_binary: Option<&str>,
-    exe_dir: Option<&Path>,
-    checkout: Option<&Path>,
-) -> bool {
+fn sidecar_artifact_available(named_binary: Option<&str>, exe_dir: Option<&Path>, checkout: Option<&Path>) -> bool {
     if named_binary.map(str::trim).is_some_and(|b| !b.is_empty()) {
         return true;
     }
-    if exe_dir.map(|dir| dir.join(PACKAGED_SIDECAR_BINARY)).is_some_and(|path| path.is_file()) {
+    if exe_dir
+        .map(|dir| dir.join(PACKAGED_SIDECAR_BINARY))
+        .is_some_and(|path| path.is_file())
+    {
         return true;
     }
     checkout.is_some_and(|path| prebuilt_artifact_in(path).is_some())
@@ -508,7 +521,9 @@ fn checkout_path_for(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
 }
 
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
@@ -516,7 +531,9 @@ fn checkout_path_for(explicit: Option<&str>) -> Option<PathBuf> {
 /// per-conversation UUID socket and keeps both under macOS's 103-byte socket-path limit) so
 /// multiple concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
     let program = resolve_sidecar_program(
         std::env::var("NEOVIBE_SIDECAR_BINARY").ok().as_deref(),
         std::env::var("NEOVIBE_VERDANDI_CHECKOUT").ok().as_deref(),
@@ -581,7 +598,14 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     const RETRY_DELAY: Duration = Duration::from_millis(50);
     for _ in 0..RETRY_ATTEMPTS {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            return Ok(SpawnedSidecar { socket_path, build_description, build_warnings, stdin_keepalive, child, stderr_tail });
+            return Ok(SpawnedSidecar {
+                socket_path,
+                build_description,
+                build_warnings,
+                stdin_keepalive,
+                child,
+                stderr_tail,
+            });
         }
         // Check for a dead child BEFORE sleeping again. The sidecar fails closed on a policy
         // violation (an incompatible Claude CLI, a socket already in use) by throwing before it
@@ -694,13 +718,12 @@ mod tests {
     fn an_explicit_binary_beats_an_explicit_checkout() {
         let artifact = std::env::temp_dir().join(format!("nv-sidecar-{}", uuid::Uuid::new_v4()));
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
-        let resolved = resolve_sidecar_program(
-            artifact.to_str(),
-            Some("/definitely/not/a/checkout"),
-            None,
-        )
-        .expect("an existing artifact resolves");
-        assert!(matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact), "{resolved:?}");
+        let resolved = resolve_sidecar_program(artifact.to_str(), Some("/definitely/not/a/checkout"), None)
+            .expect("an existing artifact resolves");
+        assert!(
+            matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact),
+            "{resolved:?}"
+        );
         let _ = std::fs::remove_file(&artifact);
     }
 
@@ -724,7 +747,10 @@ mod tests {
         let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
         let resolved = resolve_sidecar_program(None, None, Some(&dir)).expect("the sibling resolves");
-        assert!(matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact), "{resolved:?}");
+        assert!(
+            matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact),
+            "{resolved:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -759,7 +785,10 @@ mod tests {
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
         let resolved = resolve_sidecar_program(Some("   "), Some(""), Some(&dir))
             .expect("blank overrides fall through to the sibling");
-        assert!(matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact), "{resolved:?}");
+        assert!(
+            matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact),
+            "{resolved:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     use super::*;
@@ -801,13 +830,19 @@ mod tests {
     /// right on a machine where neither directory exists.
     #[test]
     fn packaging_scripts_default_to_the_same_checkout_this_code_does() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("agent/ has a parent");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("agent/ has a parent");
         let expected = format!("${{NEOVIBE_VERDANDI_CHECKOUT:-$HOME/{DEFAULT_CHECKOUT_UNDER_HOME}}}");
 
-        for script in ["packaging/neovibe.launcher.sh", "install.sh", "try-neovibe.sh", "publish.sh"] {
+        for script in [
+            "packaging/neovibe.launcher.sh",
+            "install.sh",
+            "try-neovibe.sh",
+            // publish.sh (the private deploy script) does not ship publicly.
+        ] {
             let path = repo_root.join(script);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
             let uses = text
                 .lines()
                 .filter(|l| l.contains("NEOVIBE_VERDANDI_CHECKOUT:-"))
@@ -885,7 +920,10 @@ mod tests {
     /// message naming neither the platform nor this decision.
     #[test]
     fn an_artifact_built_for_another_platform_is_neither_picked_nor_counted() {
-        let root = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{}", foreign_platform_suffix())]);
+        let root = fake_checkout(&[&format!(
+            "{PACKAGED_SIDECAR_BINARY}-0.1.0-{}",
+            foreign_platform_suffix()
+        )]);
         assert_eq!(prebuilt_artifact_in(&root), None);
         assert!(!sidecar_artifact_available(None, None, Some(&root)));
         std::fs::remove_dir_all(&root).unwrap();
@@ -926,7 +964,10 @@ mod tests {
         let SidecarProgram::Checkout(checkout) = resolved else {
             panic!("an explicit checkout must resolve to the checkout shape: {resolved:?}");
         };
-        assert_eq!(checkout.prebuilt, Some(root.join(CHECKOUT_ARTIFACT_DIR).join(&artifact_name)));
+        assert_eq!(
+            checkout.prebuilt,
+            Some(root.join(CHECKOUT_ARTIFACT_DIR).join(&artifact_name))
+        );
         // And it says so, because "which of the two shapes ran" is not otherwise visible.
         let (description, _) = describe_checkout(&checkout);
         assert!(description.contains("prebuilt artifact"), "{description}");
@@ -939,7 +980,9 @@ mod tests {
     fn a_checkout_with_nothing_built_still_describes_the_node_shape() {
         let root = fake_checkout(&[]);
         let resolved = resolve_sidecar_program(None, root.to_str(), None).expect("the checkout resolves");
-        let SidecarProgram::Checkout(checkout) = resolved else { panic!("{resolved:?}") };
+        let SidecarProgram::Checkout(checkout) = resolved else {
+            panic!("{resolved:?}")
+        };
         assert_eq!(checkout.prebuilt, None);
         let (description, _) = describe_checkout(&checkout);
         assert!(!description.contains("prebuilt"), "{description}");

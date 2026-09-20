@@ -45,17 +45,17 @@
 //! takes no lease and is not stopped, and Claude's own documentation records that two clients
 //! resuming one session interleave a single transcript.
 
+use crate::ingestion::ConversationIngest;
 use crate::lease::{LeaseError, SessionLease};
 use crate::persistence::{save_conversation_record, ConversationRecord};
+use crate::projection::{AgentDomainEvent, PermissionOutcome};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
 };
-use crate::ingestion::ConversationIngest;
-use crate::projection::{AgentDomainEvent, PermissionOutcome};
-use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum ConversationError {
@@ -74,7 +74,10 @@ pub enum ConversationError {
     /// is a provider session id that no longer exists. Reported as a failed resume, never as a
     /// session: handing back a dead conversation is the silent-substitution failure this whole
     /// phase exists to prevent.
-    ResumeRejected { provider_session_id: String, reason: String },
+    ResumeRejected {
+        provider_session_id: String,
+        reason: String,
+    },
     /// The provider opened a session with a DIFFERENT provider session id than the one asked for.
     ///
     /// This is the silent substitution itself, caught in the act. A resume that comes back as some
@@ -221,10 +224,7 @@ enum ResumeVerdict {
 /// A missing transcript is NOT a refusal: a session that ran under an ephemeral persistence policy
 /// legitimately has none, and treating "no file" as "unsafe" would make those sessions permanently
 /// unresumable. Only an observably-moving file blocks.
-fn ensure_transcript_is_not_being_written(
-    cwd: &str,
-    provider_session_id: &str,
-) -> Result<(), ConversationError> {
+fn ensure_transcript_is_not_being_written(cwd: &str, provider_session_id: &str) -> Result<(), ConversationError> {
     const PROBE: std::time::Duration = std::time::Duration::from_millis(250);
     let Ok(path) = crate::transcript::transcript_path(cwd, provider_session_id) else {
         return Ok(());
@@ -265,7 +265,10 @@ pub(crate) fn persist_record(
     // pre-2026-09-15 flat file restamped it to the moment of the resume, and the de-duplication in
     // `resumable_sessions` then discarded the flat record still holding the real value.
     let existing = crate::persistence::existing_record(conversation_id, provider_session_id);
-    let created_at = existing.as_ref().map(|r| r.created_at.clone()).unwrap_or_else(|| now.clone());
+    let created_at = existing
+        .as_ref()
+        .map(|r| r.created_at.clone())
+        .unwrap_or_else(|| now.clone());
     let title = existing.and_then(|r| r.title).or_else(|| title.map(str::to_string));
     let record = ConversationRecord {
         conversation_id: conversation_id.to_string(),
@@ -412,7 +415,9 @@ impl AgentConversation {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
         if !capabilities.resume {
-            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability("resume")));
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "resume",
+            )));
         }
         let info = provider.info();
         let cwd_string = canonical_cwd.to_string_lossy().to_string();
@@ -485,7 +490,13 @@ impl AgentConversation {
             }
         }
 
-        persist_record(conversation.conversation_id(), &cwd_string, provider_session_id, capabilities.resume, None);
+        persist_record(
+            conversation.conversation_id(),
+            &cwd_string,
+            provider_session_id,
+            capabilities.resume,
+            None,
+        );
         Ok(conversation)
     }
 
@@ -546,11 +557,7 @@ impl AgentConversation {
                                 ),
                             };
                         }
-                        return if status.attached_to_the_requested_session(
-                            &requested,
-                            attached.as_deref(),
-                            forked,
-                        ) {
+                        return if status.attached_to_the_requested_session(&requested, attached.as_deref(), forked) {
                             ResumeVerdict::Attached
                         } else {
                             ResumeVerdict::Failed {
@@ -637,11 +644,15 @@ impl AgentConversation {
         }
         let session_id = self.require_session()?;
         self.provider
-            .send_turn(SendTurnRequest { session_id, text: text.to_string() })
+            .send_turn(SendTurnRequest {
+                session_id,
+                text: text.to_string(),
+            })
             .map_err(|e| match e {
-                ProviderError::Provider { code: crate::ProviderErrorCode::TurnAlreadyActive, .. } => {
-                    ConversationError::TurnAlreadyActive
-                }
+                ProviderError::Provider {
+                    code: crate::ProviderErrorCode::TurnAlreadyActive,
+                    ..
+                } => ConversationError::TurnAlreadyActive,
                 other => ConversationError::Provider(other),
             })
     }
@@ -670,7 +681,9 @@ impl AgentConversation {
         if self.title_noted {
             return;
         }
-        let Some(title) = crate::persistence::title_from_prompt(as_typed) else { return };
+        let Some(title) = crate::persistence::title_from_prompt(as_typed) else {
+            return;
+        };
         self.title_noted = true;
         self.ingest.note_title(title);
     }
@@ -685,7 +698,9 @@ impl AgentConversation {
     /// real outcome. `AgentSession::interrupt` synthesizes because its backend cannot.
     pub fn interrupt(&mut self) -> Result<(), ConversationError> {
         if !self.capabilities.interrupt {
-            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability("interrupt")));
+            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "interrupt",
+            )));
         }
         let session_id = self.require_session()?;
         self.provider.interrupt_turn(InterruptTurnRequest { session_id })?;
@@ -761,7 +776,9 @@ impl AgentConversation {
         }
         let already_closed = matches!(self.projection().status, crate::ProjectionStatus::Closed { .. });
         if !already_closed {
-            self.fold_locally(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
+            self.fold_locally(AgentDomainEvent::SessionClosed {
+                reason: "closed_by_host".to_string(),
+            });
         }
         // Released last: the lease must outlive the provider's own session teardown, so no other
         // client can acquire it while this one is still closing.
@@ -839,10 +856,17 @@ mod tests {
             self.capabilities
         }
         fn info(&self) -> ProviderInfo {
-            ProviderInfo { sidecar_version: "fake".into(), protocol_major: 1, ..Default::default() }
+            ProviderInfo {
+                sidecar_version: "fake".into(),
+                protocol_major: 1,
+                ..Default::default()
+            }
         }
         fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
-            self.calls.lock().unwrap().push(format!("create_session(cwd={})", request.cwd));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create_session(cwd={})", request.cwd));
             Ok("verdandi-session-1".into())
         }
         fn resume_session(&self, _r: ResumeSessionRequest) -> Result<String, ProviderError> {
@@ -860,7 +884,11 @@ mod tests {
             Ok(())
         }
         fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
-            self.calls.lock().unwrap().push(format!("resolve_permission({}, allow={})", request.permission_id, request.decision.allows()));
+            self.calls.lock().unwrap().push(format!(
+                "resolve_permission({}, allow={})",
+                request.permission_id,
+                request.decision.allows()
+            ));
             Ok(())
         }
         fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
@@ -896,15 +924,33 @@ mod tests {
     fn conversation_in(fake: Arc<FakeProvider>, dir: &Path) -> Result<AgentConversation, ConversationError> {
         struct Shared(Arc<FakeProvider>);
         impl AgentProvider for Shared {
-            fn capabilities(&self) -> ProviderCapabilities { self.0.capabilities() }
-            fn info(&self) -> ProviderInfo { self.0.info() }
-            fn create_session(&self, r: CreateSessionRequest) -> Result<String, ProviderError> { self.0.create_session(r) }
-            fn resume_session(&self, r: ResumeSessionRequest) -> Result<String, ProviderError> { self.0.resume_session(r) }
-            fn send_turn(&self, r: SendTurnRequest) -> Result<String, ProviderError> { self.0.send_turn(r) }
-            fn interrupt_turn(&self, r: InterruptTurnRequest) -> Result<(), ProviderError> { self.0.interrupt_turn(r) }
-            fn resolve_permission(&self, r: ResolvePermissionRequest) -> Result<(), ProviderError> { self.0.resolve_permission(r) }
-            fn close_session(&self, r: CloseSessionRequest) -> Result<(), ProviderError> { self.0.close_session(r) }
-            fn pump(&self) -> Vec<AgentDomainEvent> { self.0.pump() }
+            fn capabilities(&self) -> ProviderCapabilities {
+                self.0.capabilities()
+            }
+            fn info(&self) -> ProviderInfo {
+                self.0.info()
+            }
+            fn create_session(&self, r: CreateSessionRequest) -> Result<String, ProviderError> {
+                self.0.create_session(r)
+            }
+            fn resume_session(&self, r: ResumeSessionRequest) -> Result<String, ProviderError> {
+                self.0.resume_session(r)
+            }
+            fn send_turn(&self, r: SendTurnRequest) -> Result<String, ProviderError> {
+                self.0.send_turn(r)
+            }
+            fn interrupt_turn(&self, r: InterruptTurnRequest) -> Result<(), ProviderError> {
+                self.0.interrupt_turn(r)
+            }
+            fn resolve_permission(&self, r: ResolvePermissionRequest) -> Result<(), ProviderError> {
+                self.0.resolve_permission(r)
+            }
+            fn close_session(&self, r: CloseSessionRequest) -> Result<(), ProviderError> {
+                self.0.close_session(r)
+            }
+            fn pump(&self) -> Vec<AgentDomainEvent> {
+                self.0.pump()
+            }
         }
         AgentConversation::create(Arc::new(Shared(fake)), dir, PermissionMode::Bypass)
     }
@@ -998,7 +1044,9 @@ mod tests {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(Arc::clone(&fake));
         fake.queue(session_opened());
-        wait_for(&conversation, "the session id visible", |c| c.provider_session_id().is_some());
+        wait_for(&conversation, "the session id visible", |c| {
+            c.provider_session_id().is_some()
+        });
         conversation.note_title("said in the gap");
         assert_eq!(titled_record(&conversation).as_deref(), Some("said in the gap"));
     }
@@ -1054,8 +1102,7 @@ mod tests {
             Some("some-other-session"),
             false,
         ));
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
         match verdict {
             ResumeVerdict::Failed { reason } => {
                 assert!(reason.contains("some-other-session"), "{reason}");
@@ -1075,8 +1122,7 @@ mod tests {
             Some("claude-uuid-abc"),
             false,
         ));
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
         assert_eq!(verdict, ResumeVerdict::Attached);
     }
 
@@ -1092,8 +1138,7 @@ mod tests {
             Some("a-brand-new-forked-id"),
             true,
         ));
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
         assert_eq!(verdict, ResumeVerdict::Attached);
     }
 
@@ -1101,9 +1146,13 @@ mod tests {
     fn a_refused_resume_is_reported_in_terms_of_the_session_that_is_gone() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
-        fake.queue(resume_outcome("claude-uuid-abc", crate::ResumeStatus::Rejected, None, false));
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        fake.queue(resume_outcome(
+            "claude-uuid-abc",
+            crate::ResumeStatus::Rejected,
+            None,
+            false,
+        ));
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
         match verdict {
             ResumeVerdict::Failed { reason } => {
                 assert!(reason.contains("claude-uuid-abc"), "{reason}");
@@ -1128,8 +1177,7 @@ mod tests {
             None,
             false,
         ));
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
         match verdict {
             ResumeVerdict::Failed { reason } => {
                 assert!(reason.contains("provider problem"), "{reason}");
@@ -1143,10 +1191,16 @@ mod tests {
     fn a_session_that_dies_before_any_verdict_is_still_a_failed_resume() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
-        fake.queue(AgentDomainEvent::SessionUnavailable { reason: "stream ended early".into() });
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
-        assert_eq!(verdict, ResumeVerdict::Failed { reason: "stream ended early".into() });
+        fake.queue(AgentDomainEvent::SessionUnavailable {
+            reason: "stream ended early".into(),
+        });
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(500));
+        assert_eq!(
+            verdict,
+            ResumeVerdict::Failed {
+                reason: "stream ended early".into()
+            }
+        );
     }
 
     /// **Silence is no longer success.** The old code returned "held up" here, which is what made a
@@ -1157,12 +1211,14 @@ mod tests {
     fn an_expired_wait_means_not_yet_known_rather_than_success() {
         let fake = Arc::new(FakeProvider::new());
         let mut conversation = conversation_with(fake.clone());
-        let verdict = conversation
-            .watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(150));
+        let verdict = conversation.watch_resume_take_hold("claude-uuid-abc", std::time::Duration::from_millis(150));
         assert_eq!(verdict, ResumeVerdict::NotYetKnown);
-        assert_ne!(verdict, ResumeVerdict::Attached, "an unanswered resume must not read as a confirmed one");
+        assert_ne!(
+            verdict,
+            ResumeVerdict::Attached,
+            "an unanswered resume must not read as a confirmed one"
+        );
     }
-
 
     #[test]
     fn conversation_id_is_stable_for_a_directory_and_differs_between_directories() {
@@ -1188,7 +1244,10 @@ mod tests {
         let canonical = dir.canonicalize().unwrap();
         assert_eq!(conversation.canonical_cwd(), canonical.as_path());
         assert_eq!(conversation.conversation_id(), conversation_id_for_cwd(&canonical));
-        assert_eq!(fake.calls(), vec![format!("create_session(cwd={})", canonical.to_string_lossy())]);
+        assert_eq!(
+            fake.calls(),
+            vec![format!("create_session(cwd={})", canonical.to_string_lossy())]
+        );
     }
 
     /// **The withdrawn A3, pinned so it cannot come back by accident.**
@@ -1214,7 +1273,10 @@ mod tests {
         );
         assert_eq!(
             second.calls(),
-            vec![format!("create_session(cwd={})", dir.canonicalize().unwrap().to_string_lossy())],
+            vec![format!(
+                "create_session(cwd={})",
+                dir.canonicalize().unwrap().to_string_lossy()
+            )],
             "the second window must really have asked the provider for its own session"
         );
     }
@@ -1223,17 +1285,33 @@ mod tests {
     fn create_fails_cleanly_on_a_cwd_that_does_not_exist() {
         struct Never;
         impl AgentProvider for Never {
-            fn capabilities(&self) -> ProviderCapabilities { ProviderCapabilities::default() }
-            fn info(&self) -> ProviderInfo { ProviderInfo::default() }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            fn info(&self) -> ProviderInfo {
+                ProviderInfo::default()
+            }
             fn create_session(&self, _r: CreateSessionRequest) -> Result<String, ProviderError> {
                 panic!("create_session must not be reached when cwd cannot be resolved")
             }
-            fn resume_session(&self, _r: ResumeSessionRequest) -> Result<String, ProviderError> { unreachable!() }
-            fn send_turn(&self, _r: SendTurnRequest) -> Result<String, ProviderError> { unreachable!() }
-            fn interrupt_turn(&self, _r: InterruptTurnRequest) -> Result<(), ProviderError> { unreachable!() }
-            fn resolve_permission(&self, _r: ResolvePermissionRequest) -> Result<(), ProviderError> { unreachable!() }
-            fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> { unreachable!() }
-            fn pump(&self) -> Vec<AgentDomainEvent> { vec![] }
+            fn resume_session(&self, _r: ResumeSessionRequest) -> Result<String, ProviderError> {
+                unreachable!()
+            }
+            fn send_turn(&self, _r: SendTurnRequest) -> Result<String, ProviderError> {
+                unreachable!()
+            }
+            fn interrupt_turn(&self, _r: InterruptTurnRequest) -> Result<(), ProviderError> {
+                unreachable!()
+            }
+            fn resolve_permission(&self, _r: ResolvePermissionRequest) -> Result<(), ProviderError> {
+                unreachable!()
+            }
+            fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
+                unreachable!()
+            }
+            fn pump(&self) -> Vec<AgentDomainEvent> {
+                vec![]
+            }
         }
         let result = AgentConversation::create(
             Arc::new(Never),
@@ -1256,7 +1334,11 @@ mod tests {
 
         // Before any event: Verdandi's id is known, Claude's is not.
         assert_eq!(conversation.session_id(), Some("verdandi-session-1"));
-        assert_eq!(conversation.provider_session_id(), None, "a created-but-never-opened session has no Claude identity");
+        assert_eq!(
+            conversation.provider_session_id(),
+            None,
+            "a created-but-never-opened session has no Claude identity"
+        );
 
         fake.queue(session_opened());
         settle(&fake, &conversation);
@@ -1268,12 +1350,16 @@ mod tests {
     }
 
     #[test]
-    fn ingestion_folds_the_projection_without_the_ui_asking()  {
+    fn ingestion_folds_the_projection_without_the_ui_asking() {
         let fake = Arc::new(FakeProvider::new());
         let conversation = conversation_with(fake.clone());
         fake.queue(session_opened());
         fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
-        fake.queue(AgentDomainEvent::ContentDelta { turn_id: "t1".into(), kind: ContentKind::Text, text: "hi".into() });
+        fake.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: ContentKind::Text,
+            text: "hi".into(),
+        });
 
         // Nothing calls a pump. The projection advances anyway, which is the property: the reducer's
         // progress is no longer a function of the UI's.
@@ -1281,7 +1367,12 @@ mod tests {
 
         assert_eq!(conversation.projection().last_revision, 3);
         assert_eq!(
-            conversation.projection().transcript.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            conversation
+                .projection()
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["hi"],
         );
         assert_eq!(conversation.projection().active_turn_id.as_deref(), Some("t1"));
@@ -1311,9 +1402,21 @@ mod tests {
         let turn_id = conversation.send_turn("hello").unwrap();
 
         assert_eq!(turn_id, "turn-1");
-        assert_eq!(conversation.projection().last_revision, revision_before, "send_turn must fold nothing");
-        assert_eq!(conversation.projection().active_turn_id, None, "state comes from the provider's own event");
-        assert_eq!(conversation.ingest_stats().events_ingested, 1, "only the SessionOpened folded earlier");
+        assert_eq!(
+            conversation.projection().last_revision,
+            revision_before,
+            "send_turn must fold nothing"
+        );
+        assert_eq!(
+            conversation.projection().active_turn_id,
+            None,
+            "state comes from the provider's own event"
+        );
+        assert_eq!(
+            conversation.ingest_stats().events_ingested,
+            1,
+            "only the SessionOpened folded earlier"
+        );
     }
 
     #[test]
@@ -1325,9 +1428,19 @@ mod tests {
         settle(&fake, &conversation);
 
         let result = conversation.send_turn("second");
-        assert!(matches!(result, Err(ConversationError::TurnAlreadyActive)), "got: {result:?}");
-        assert!(result.unwrap_err().is_benign(), "an early second send must not tear the session down");
-        assert!(!fake.calls().iter().any(|c| c.starts_with("send_turn")), "got: {:?}", fake.calls());
+        assert!(
+            matches!(result, Err(ConversationError::TurnAlreadyActive)),
+            "got: {result:?}"
+        );
+        assert!(
+            result.unwrap_err().is_benign(),
+            "an early second send must not tear the session down"
+        );
+        assert!(
+            !fake.calls().iter().any(|c| c.starts_with("send_turn")),
+            "got: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -1345,7 +1458,10 @@ mod tests {
         settle(&fake, &conversation);
 
         let result = conversation.send_turn("racing");
-        assert!(matches!(result, Err(ConversationError::TurnAlreadyActive)), "got: {result:?}");
+        assert!(
+            matches!(result, Err(ConversationError::TurnAlreadyActive)),
+            "got: {result:?}"
+        );
     }
 
     #[test]
@@ -1366,16 +1482,28 @@ mod tests {
     #[test]
     fn interrupt_is_refused_when_the_provider_does_not_advertise_it() {
         let fake = Arc::new(FakeProvider {
-            capabilities: ProviderCapabilities { interrupt: false, ..ProviderCapabilities::default() },
+            capabilities: ProviderCapabilities {
+                interrupt: false,
+                ..ProviderCapabilities::default()
+            },
             ..Default::default()
         });
         let mut conversation = conversation_with(fake.clone());
         let result = conversation.interrupt();
         assert!(
-            matches!(result, Err(ConversationError::Provider(ProviderError::UnsupportedCapability("interrupt")))),
+            matches!(
+                result,
+                Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                    "interrupt"
+                )))
+            ),
             "got: {result:?}"
         );
-        assert!(!fake.calls().iter().any(|c| c == "interrupt_turn"), "got: {:?}", fake.calls());
+        assert!(
+            !fake.calls().iter().any(|c| c == "interrupt_turn"),
+            "got: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -1416,8 +1544,15 @@ mod tests {
 
         let result = conversation.respond_permission("never-existed", PermissionDecision::Allow);
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_benign(), "an already-answered or unknown id is a logged no-op, not fatal");
-        assert!(!fake.calls().iter().any(|c| c.starts_with("resolve_permission")), "got: {:?}", fake.calls());
+        assert!(
+            result.unwrap_err().is_benign(),
+            "an already-answered or unknown id is a logged no-op, not fatal"
+        );
+        assert!(
+            !fake.calls().iter().any(|c| c.starts_with("resolve_permission")),
+            "got: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -1433,8 +1568,14 @@ mod tests {
         });
         settle(&fake, &conversation);
 
-        conversation.respond_permission("p1", PermissionDecision::Allow).unwrap();
-        assert!(fake.calls().iter().any(|c| c == "resolve_permission(p1, allow=true)"), "got: {:?}", fake.calls());
+        conversation
+            .respond_permission("p1", PermissionDecision::Allow)
+            .unwrap();
+        assert!(
+            fake.calls().iter().any(|c| c == "resolve_permission(p1, allow=true)"),
+            "got: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -1453,13 +1594,27 @@ mod tests {
 
         conversation.shutdown();
 
-        assert!(conversation.projection().pending_permissions.is_empty(), "a closing session can never answer them");
-        assert!(matches!(conversation.projection().status, crate::ProjectionStatus::Closed { .. }));
+        assert!(
+            conversation.projection().pending_permissions.is_empty(),
+            "a closing session can never answer them"
+        );
+        assert!(matches!(
+            conversation.projection().status,
+            crate::ProjectionStatus::Closed { .. }
+        ));
         assert_eq!(fake.calls().iter().filter(|c| *c == "close_session").count(), 1);
 
         let revision_after_first = conversation.projection().last_revision;
         conversation.shutdown();
-        assert_eq!(fake.calls().iter().filter(|c| *c == "close_session").count(), 1, "close_session must not repeat");
-        assert_eq!(conversation.projection().last_revision, revision_after_first, "a repeat shutdown folds nothing");
+        assert_eq!(
+            fake.calls().iter().filter(|c| *c == "close_session").count(),
+            1,
+            "close_session must not repeat"
+        );
+        assert_eq!(
+            conversation.projection().last_revision,
+            revision_after_first,
+            "a repeat shutdown folds nothing"
+        );
     }
 }

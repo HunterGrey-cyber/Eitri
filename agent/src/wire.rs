@@ -120,13 +120,21 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
     let raw: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => {
-            return vec![AgentEvent::Unknown { kind: "parse_error".into(), subtype: None, raw: Value::String(line.to_string()) }];
+            return vec![AgentEvent::Unknown {
+                kind: "parse_error".into(),
+                subtype: None,
+                raw: Value::String(line.to_string()),
+            }];
         }
     };
     let envelope: Envelope = match serde_json::from_value(raw.clone()) {
         Ok(e) => e,
         Err(_) => {
-            return vec![AgentEvent::Unknown { kind: "no_type_field".into(), subtype: None, raw }];
+            return vec![AgentEvent::Unknown {
+                kind: "no_type_field".into(),
+                subtype: None,
+                raw,
+            }];
         }
     };
 
@@ -138,7 +146,11 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                     model: init.model,
                     cwd: init.cwd,
                 }],
-                Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+                Err(_) => vec![AgentEvent::Unknown {
+                    kind: envelope.kind,
+                    subtype: envelope.subtype,
+                    raw,
+                }],
             }
         }
         "assistant" => {
@@ -160,8 +172,12 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                     .into_iter()
                     .zip(raw_blocks.into_iter().map(Some).chain(std::iter::repeat(None)))
                     .map(|(block, raw_block)| match block.kind.as_str() {
-                        "text" => AgentEvent::AssistantText { text: block.text.unwrap_or_default() },
-                        "thinking" => AgentEvent::Thinking { text: block.thinking.unwrap_or_default() },
+                        "text" => AgentEvent::AssistantText {
+                            text: block.text.unwrap_or_default(),
+                        },
+                        "thinking" => AgentEvent::Thinking {
+                            text: block.thinking.unwrap_or_default(),
+                        },
                         "tool_use" => AgentEvent::ToolStarted {
                             id: block.id.unwrap_or_default(),
                             name: block.name.unwrap_or_default(),
@@ -174,7 +190,11 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                         },
                     })
                     .collect(),
-                Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+                Err(_) => vec![AgentEvent::Unknown {
+                    kind: envelope.kind,
+                    subtype: envelope.subtype,
+                    raw,
+                }],
             }
         }
         "user" => match serde_json::from_value::<UserLine>(raw.clone()) {
@@ -188,7 +208,11 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                     is_error: block.is_error,
                 })
                 .collect(),
-            Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+            Err(_) => vec![AgentEvent::Unknown {
+                kind: envelope.kind,
+                subtype: envelope.subtype,
+                raw,
+            }],
         },
         "result" => match serde_json::from_value::<ResultLine>(raw.clone()) {
             Ok(r) => vec![AgentEvent::TurnFinished {
@@ -198,7 +222,11 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                 total_cost_usd: r.total_cost_usd,
                 num_turns: r.num_turns,
             }],
-            Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+            Err(_) => vec![AgentEvent::Unknown {
+                kind: envelope.kind,
+                subtype: envelope.subtype,
+                raw,
+            }],
         },
         "rate_limit_event" => vec![AgentEvent::RateLimit { raw }],
         "control_request" => match serde_json::from_value::<ControlRequestLine>(raw.clone()) {
@@ -231,7 +259,11 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                 subtype: Some(cr.request.subtype),
                 raw,
             }],
-            Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+            Err(_) => vec![AgentEvent::Unknown {
+                kind: envelope.kind,
+                subtype: envelope.subtype,
+                raw,
+            }],
         },
         "control_response" => match serde_json::from_value::<ControlResponseLine>(raw.clone()) {
             Ok(cr) => vec![AgentEvent::ControlResponse {
@@ -239,8 +271,16 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                 subtype: cr.response.subtype,
                 raw,
             }],
-            Err(_) => vec![AgentEvent::Unknown { kind: envelope.kind, subtype: envelope.subtype, raw }],
+            Err(_) => vec![AgentEvent::Unknown {
+                kind: envelope.kind,
+                subtype: envelope.subtype,
+                raw,
+            }],
         },
-        other => vec![AgentEvent::Unknown { kind: other.to_string(), subtype: envelope.subtype, raw }],
+        other => vec![AgentEvent::Unknown {
+            kind: other.to_string(),
+            subtype: envelope.subtype,
+            raw,
+        }],
     }
 }

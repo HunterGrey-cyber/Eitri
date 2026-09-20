@@ -52,7 +52,9 @@ pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 /// buffer with no file. A turn that carries a context block saying nothing is worse than one
 /// carrying none: it spends the model's attention and teaches the reader to ignore the block.
 pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> String {
-    let Some(context) = context else { return user_text.to_string() };
+    let Some(context) = context else {
+        return user_text.to_string();
+    };
     if context.file.trim().is_empty() {
         return user_text.to_string();
     }
@@ -95,14 +97,24 @@ mod tests {
     use super::*;
 
     fn ctx(file: &str, selection: Option<Selection>) -> EditorContext {
-        EditorContext { file: file.to_string(), selection }
+        EditorContext {
+            file: file.to_string(),
+            selection,
+        }
     }
 
     #[test]
     fn a_selection_carries_its_lines_and_their_real_text() {
         let out = compose_turn_text(
             "why is this slow?",
-            Some(&ctx("/p/src/main.rs", Some(Selection { start_line: 12, end_line: 14, text: "fn a() {}".into() }))),
+            Some(&ctx(
+                "/p/src/main.rs",
+                Some(Selection {
+                    start_line: 12,
+                    end_line: 14,
+                    text: "fn a() {}".into(),
+                }),
+            )),
         );
         assert_eq!(
             out,
@@ -126,7 +138,17 @@ mod tests {
     #[test]
     fn both_templates_carry_the_hedge_sentence() {
         const HEDGE: &str = "This may or may not be related to the current task.";
-        let with = compose_turn_text("q", Some(&ctx("/f", Some(Selection { start_line: 1, end_line: 1, text: "x".into() }))));
+        let with = compose_turn_text(
+            "q",
+            Some(&ctx(
+                "/f",
+                Some(Selection {
+                    start_line: 1,
+                    end_line: 1,
+                    text: "x".into(),
+                }),
+            )),
+        );
         let without = compose_turn_text("q", Some(&ctx("/f", None)));
         assert!(with.ends_with(HEDGE), "{with}");
         assert!(without.ends_with(HEDGE), "{without}");
@@ -142,7 +164,20 @@ mod tests {
     #[test]
     fn a_buffer_with_no_file_contributes_nothing() {
         assert_eq!(compose_turn_text("q", Some(&ctx("", None))), "q");
-        assert_eq!(compose_turn_text("q", Some(&ctx("   ", Some(Selection { start_line: 1, end_line: 2, text: "x".into() })))), "q");
+        assert_eq!(
+            compose_turn_text(
+                "q",
+                Some(&ctx(
+                    "   ",
+                    Some(Selection {
+                        start_line: 1,
+                        end_line: 2,
+                        text: "x".into()
+                    })
+                ))
+            ),
+            "q"
+        );
     }
 
     #[test]
@@ -151,8 +186,22 @@ mod tests {
         // counts the frame as well as the content. The first draft of this test did exactly that
         // and failed against correct code.
         let long = "Z".repeat(CONTENT_LIMIT + 50);
-        let out = compose_turn_text("q", Some(&ctx("/f", Some(Selection { start_line: 1, end_line: 9, text: long }))));
-        assert!(out.contains(TRUNCATION_MARKER), "the marker must be present: {}", &out[..120]);
+        let out = compose_turn_text(
+            "q",
+            Some(&ctx(
+                "/f",
+                Some(Selection {
+                    start_line: 1,
+                    end_line: 9,
+                    text: long,
+                }),
+            )),
+        );
+        assert!(
+            out.contains(TRUNCATION_MARKER),
+            "the marker must be present: {}",
+            &out[..120]
+        );
         assert_eq!(out.matches('Z').count(), CONTENT_LIMIT);
     }
 
@@ -161,7 +210,17 @@ mod tests {
     #[test]
     fn truncation_counts_characters_not_bytes_so_multibyte_text_cannot_panic() {
         let long = "字".repeat(CONTENT_LIMIT + 10);
-        let out = compose_turn_text("q", Some(&ctx("/f", Some(Selection { start_line: 1, end_line: 2, text: long }))));
+        let out = compose_turn_text(
+            "q",
+            Some(&ctx(
+                "/f",
+                Some(Selection {
+                    start_line: 1,
+                    end_line: 2,
+                    text: long,
+                }),
+            )),
+        );
         assert_eq!(out.matches('字').count(), CONTENT_LIMIT);
         assert!(out.contains(TRUNCATION_MARKER));
     }
@@ -171,7 +230,17 @@ mod tests {
     #[test]
     fn content_exactly_at_the_limit_is_not_marked_truncated() {
         let exact = "Z".repeat(CONTENT_LIMIT);
-        let out = compose_turn_text("q", Some(&ctx("/f", Some(Selection { start_line: 1, end_line: 2, text: exact }))));
+        let out = compose_turn_text(
+            "q",
+            Some(&ctx(
+                "/f",
+                Some(Selection {
+                    start_line: 1,
+                    end_line: 2,
+                    text: exact,
+                }),
+            )),
+        );
         assert!(!out.contains(TRUNCATION_MARKER), "{out}");
     }
 

@@ -222,7 +222,10 @@ pub fn resumable_sessions(conversation_id: &str) -> Vec<ResumableSession> {
 /// and the answer genuinely reproducible. Which of two same-millisecond sessions wins is arbitrary;
 /// that it is the same one every time is the property being bought.
 fn updated_at_rank(record: &ConversationRecord) -> (Option<u128>, &str) {
-    (record.updated_at.parse::<u128>().ok(), record.provider_session_id.as_str())
+    (
+        record.updated_at.parse::<u128>().ok(),
+        record.provider_session_id.as_str(),
+    )
 }
 
 /// Every record stored for one conversation, skipping anything that will not parse.
@@ -235,7 +238,9 @@ fn updated_at_rank(record: &ConversationRecord) -> (Option<u128>, &str) {
 /// the single pre-2026-09-15 `<conversation_id>.json` beside it. See this module's header for why
 /// the legacy file is read but never written or removed.
 fn read_conversation_records(conversation_id: &str) -> Vec<ConversationRecord> {
-    let Ok(dir) = conversation_dir(conversation_id) else { return Vec::new() };
+    let Ok(dir) = conversation_dir(conversation_id) else {
+        return Vec::new();
+    };
     let mut records: Vec<ConversationRecord> = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
@@ -320,7 +325,10 @@ fn record_path(conversation_id: &str, provider_session_id: &str) -> std::io::Res
 pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<()> {
     let path = record_path(&record.conversation_id, &record.provider_session_id)?;
     // `record_path` always joins onto a directory, so the parent is never `None`.
-    let dir = path.parent().expect("a record path always has a parent directory").to_path_buf();
+    let dir = path
+        .parent()
+        .expect("a record path always has a parent directory")
+        .to_path_buf();
     std::fs::create_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(record).map_err(std::io::Error::other)?;
     write_record(&path, json.as_bytes())?;
@@ -393,7 +401,11 @@ fn prune(dir: &Path, keep: &Path) {
                 let orphaned = entry
                     .metadata()
                     .and_then(|m| m.modified())
-                    .and_then(|m| std::time::SystemTime::now().duration_since(m).map_err(std::io::Error::other))
+                    .and_then(|m| {
+                        std::time::SystemTime::now()
+                            .duration_since(m)
+                            .map_err(std::io::Error::other)
+                    })
                     .map(|age| age > STALE_TEMP_AGE)
                     .unwrap_or(false);
                 if orphaned {
@@ -401,7 +413,9 @@ fn prune(dir: &Path, keep: &Path) {
                 }
             }
             Some("json") if path != keep => {
-                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
                 let Ok(record) = serde_json::from_str::<ConversationRecord>(&text) else {
                     // Unparseable files are left alone rather than deleted: this is the only copy
                     // of whatever is in them, and `read_conversation_records` already skips them.
@@ -514,7 +528,10 @@ mod tests {
         }"#;
         let record: ConversationRecord = serde_json::from_str(json).expect("an older record must still load");
         assert_eq!(record.provider_session_id, "prov-old");
-        assert!(!record.provider_advertised_resume, "unknown resumability must read as not-resumable");
+        assert!(
+            !record.provider_advertised_resume,
+            "unknown resumability must read as not-resumable"
+        );
     }
 
     #[test]
@@ -694,7 +711,11 @@ mod tests {
     fn one_unreadable_record_does_not_hide_the_rest() {
         let conv = unique_conversation_id("corrupt");
         save_conversation_record(&record(&conv, "prov-good", "2000")).unwrap();
-        std::fs::write(conversations_dir().unwrap().join(&conv).join("prov-corrupt.json"), "{ this is not json").unwrap();
+        std::fs::write(
+            conversations_dir().unwrap().join(&conv).join("prov-corrupt.json"),
+            "{ this is not json",
+        )
+        .unwrap();
         let offered = most_recent_offer(&conv).expect("one unreadable record must not hide the rest");
         assert_eq!(offered.provider_session_id, "prov-good");
     }
@@ -708,7 +729,11 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-legacy", "2000");
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
 
         let offered = most_recent_offer(&conv).expect("an old-layout record must still be offered");
         assert_eq!(offered.provider_session_id, "prov-legacy");
@@ -727,14 +752,22 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-legacy", "2000");
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
         save_conversation_record(&record(&conv, "prov-new", "3000")).unwrap();
         assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, "prov-new");
 
         let older = unique_conversation_id("new-vs-legacy");
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&older, "prov-legacy", "3000");
-        std::fs::write(dir.join(format!("{older}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{older}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
         save_conversation_record(&record(&older, "prov-new", "2000")).unwrap();
         assert_eq!(
             most_recent_offer(&older).unwrap().provider_session_id,
@@ -758,8 +791,14 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(kept.len(), MAX_RECORDS_PER_CONVERSATION, "got: {kept:?}");
-        assert!(kept.contains(&"prov-020.json".to_string()), "the newest must survive: {kept:?}");
-        assert!(!kept.contains(&"prov-000.json".to_string()), "the oldest must be dropped: {kept:?}");
+        assert!(
+            kept.contains(&"prov-020.json".to_string()),
+            "the newest must survive: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"prov-000.json".to_string()),
+            "the oldest must be dropped: {kept:?}"
+        );
         // And the offer is still the newest of what is left.
         assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, "prov-020");
     }
@@ -782,7 +821,10 @@ mod tests {
         save_conversation_record(&record(&conv, "prov-2", "2000")).unwrap();
 
         assert!(!stale.exists(), "an orphaned temp file must be swept");
-        assert!(fresh.exists(), "a temp file a concurrent writer may still hold must be left alone");
+        assert!(
+            fresh.exists(),
+            "a temp file a concurrent writer may still hold must be left alone"
+        );
     }
 
     // ---- The list, not just the head ----------------------------------------------------------
@@ -800,8 +842,10 @@ mod tests {
         save_conversation_record(&record(&conv, "prov-new", "3000")).unwrap();
         save_conversation_record(&record(&conv, "prov-old", "1000")).unwrap();
 
-        let ids: Vec<String> =
-            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+        let ids: Vec<String> = resumable_sessions(&conv)
+            .into_iter()
+            .map(|s| s.provider_session_id)
+            .collect();
         assert_eq!(ids, vec!["prov-new", "prov-mid", "prov-old"]);
     }
 
@@ -815,9 +859,15 @@ mod tests {
         no.provider_advertised_resume = false;
         save_conversation_record(&no).unwrap();
 
-        let ids: Vec<String> =
-            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
-        assert_eq!(ids, vec!["prov-yes"], "the newest record is not offerable and must not be listed");
+        let ids: Vec<String> = resumable_sessions(&conv)
+            .into_iter()
+            .map(|s| s.provider_session_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["prov-yes"],
+            "the newest record is not offerable and must not be listed"
+        );
     }
 
     /// The pre-2026-09-15 single file is a row like any other, ranked by its own stamp.
@@ -833,12 +883,22 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-legacy", "9000");
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
         save_conversation_record(&record(&conv, "prov-new", "1000")).unwrap();
 
-        let ids: Vec<String> =
-            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
-        assert_eq!(ids, vec!["prov-legacy", "prov-new"], "the greater stamp leads, whichever layout wrote it");
+        let ids: Vec<String> = resumable_sessions(&conv)
+            .into_iter()
+            .map(|s| s.provider_session_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["prov-legacy", "prov-new"],
+            "the greater stamp leads, whichever layout wrote it"
+        );
     }
 
     /// One Claude session is one row, even when it is recorded in BOTH layouts.
@@ -858,7 +918,11 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-same", "4000");
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
         save_conversation_record(&record(&conv, "prov-same", "5000")).unwrap();
 
         let listed = resumable_sessions(&conv);
@@ -874,11 +938,15 @@ mod tests {
         let conv = unique_conversation_id("list-tie");
         save_conversation_record(&record(&conv, "prov-aaa", "2000")).unwrap();
         save_conversation_record(&record(&conv, "prov-zzz", "2000")).unwrap();
-        let first: Vec<String> =
-            resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+        let first: Vec<String> = resumable_sessions(&conv)
+            .into_iter()
+            .map(|s| s.provider_session_id)
+            .collect();
         for _ in 0..5 {
-            let again: Vec<String> =
-                resumable_sessions(&conv).into_iter().map(|s| s.provider_session_id).collect();
+            let again: Vec<String> = resumable_sessions(&conv)
+                .into_iter()
+                .map(|s| s.provider_session_id)
+                .collect();
             assert_eq!(again, first);
         }
         // Which comes first is arbitrary; that it is decided by the id rather than by directory
@@ -902,9 +970,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut legacy = record(&conv, "prov-same", "2000");
         legacy.created_at = "1234".into();
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
 
-        assert_eq!(existing_record(&conv, "prov-same").map(|r| r.created_at).as_deref(), Some("1234"));
+        assert_eq!(
+            existing_record(&conv, "prov-same").map(|r| r.created_at).as_deref(),
+            Some("1234")
+        );
     }
 
     /// ...but only for the SAME session. The flat file is keyed by conversation alone, so a
@@ -917,7 +992,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut legacy = record(&conv, "prov-other", "2000");
         legacy.created_at = "1234".into();
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(existing_record(&conv, "prov-same").map(|r| r.created_at), None);
     }
@@ -930,11 +1009,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut legacy = record(&conv, "prov-same", "2000");
         legacy.created_at = "1234".into();
-        std::fs::write(dir.join(format!("{conv}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{conv}.json")),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
         // `record()` writes created_at "1000".
         save_conversation_record(&record(&conv, "prov-same", "5000")).unwrap();
 
-        assert_eq!(existing_record(&conv, "prov-same").map(|r| r.created_at).as_deref(), Some("1000"));
+        assert_eq!(
+            existing_record(&conv, "prov-same").map(|r| r.created_at).as_deref(),
+            Some("1000")
+        );
         assert_eq!(existing_record(&conv, "prov-never-seen").map(|r| r.created_at), None);
     }
 
@@ -970,11 +1056,20 @@ mod tests {
     /// The title is the prompt's first line with visible text, as typed, whitespace collapsed.
     #[test]
     fn a_title_is_the_first_line_with_text_in_it() {
-        assert_eq!(title_from_prompt("fix the resume picker").as_deref(), Some("fix the resume picker"));
-        assert_eq!(title_from_prompt("\n  \n  两个  空格\t和制表符\nsecond line").as_deref(), Some("两个 空格 和制表符"));
+        assert_eq!(
+            title_from_prompt("fix the resume picker").as_deref(),
+            Some("fix the resume picker")
+        );
+        assert_eq!(
+            title_from_prompt("\n  \n  两个  空格\t和制表符\nsecond line").as_deref(),
+            Some("两个 空格 和制表符")
+        );
         assert_eq!(title_from_prompt(""), None);
         assert_eq!(title_from_prompt(" \n\t\n"), None);
-        assert_eq!(title_from_prompt("\u{200B}\u{FEFF}\nthe real line").as_deref(), Some("the real line"));
+        assert_eq!(
+            title_from_prompt("\u{200B}\u{FEFF}\nthe real line").as_deref(),
+            Some("the real line")
+        );
         assert_eq!(title_from_prompt("line one\r\nline two").as_deref(), Some("line one"));
     }
 
@@ -983,7 +1078,11 @@ mod tests {
     #[test]
     fn a_long_title_is_cut_by_characters_and_says_so() {
         let exact: String = "字".repeat(TITLE_MAX_CHARS);
-        assert_eq!(title_from_prompt(&exact).as_deref(), Some(exact.as_str()), "at the limit nothing is cut");
+        assert_eq!(
+            title_from_prompt(&exact).as_deref(),
+            Some(exact.as_str()),
+            "at the limit nothing is cut"
+        );
         let long: String = "字".repeat(TITLE_MAX_CHARS + 20);
         let title = title_from_prompt(&long).unwrap();
         assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
@@ -1004,7 +1103,10 @@ mod tests {
     #[test]
     fn set_title_if_missing_sets_it_once_and_leaves_updated_at_alone() {
         let conv = unique_conversation_id("title-once");
-        assert!(!set_title_if_missing(&conv, "prov-1", "nothing to title").unwrap(), "no record, nothing written");
+        assert!(
+            !set_title_if_missing(&conv, "prov-1", "nothing to title").unwrap(),
+            "no record, nothing written"
+        );
         save_conversation_record(&record(&conv, "prov-1", "5000")).unwrap();
 
         assert!(set_title_if_missing(&conv, "prov-1", "first").unwrap());

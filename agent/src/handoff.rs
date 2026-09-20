@@ -47,7 +47,10 @@ impl std::fmt::Display for ResumeCommandError {
                 "this conversation has no Claude session id yet -- one is issued when its first turn starts"
             ),
             ResumeCommandError::SessionIdLooksLikeAFlag => {
-                write!(f, "the provider session id begins with '-', which `claude --resume` would read as an option")
+                write!(
+                    f,
+                    "the provider session id begins with '-', which `claude --resume` would read as an option"
+                )
             }
             ResumeCommandError::MissingCwd => write!(f, "no project directory to run `claude --resume` in"),
         }
@@ -107,7 +110,10 @@ impl ClaudeResumeCommand {
         if canonical_cwd.trim().is_empty() {
             return Err(ResumeCommandError::MissingCwd);
         }
-        Ok(Self { cwd: canonical_cwd.to_string(), argv: claude_resume_argv(provider_session_id)? })
+        Ok(Self {
+            cwd: canonical_cwd.to_string(),
+            argv: claude_resume_argv(provider_session_id)?,
+        })
     }
 
     pub fn cwd(&self) -> &str {
@@ -197,14 +203,17 @@ pub struct HandoffOutcome {
 /// it needs to change in every one of them, not just here.
 fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
     let current = std::env::current_exe()?;
-    let dir = current.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory")
-    })?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory"))?;
     let candidate = dir.join("neovibe-claude-handoff");
     if candidate.exists() {
         return Ok(candidate);
     }
-    let one_dir_deeper = matches!(dir.file_name().and_then(|n| n.to_str()), Some("deps") | Some("examples"));
+    let one_dir_deeper = matches!(
+        dir.file_name().and_then(|n| n.to_str()),
+        Some("deps") | Some("examples")
+    );
     if one_dir_deeper {
         if let Some(parent) = dir.parent() {
             let fallback = parent.join("neovibe-claude-handoff");
@@ -247,7 +256,9 @@ pub fn prepare_neovibe_to_cli_handoff(
 ) -> Result<HandoffOutcome, HandoffError> {
     let lease = SessionLease::try_acquire(provider, canonical_cwd, provider_session_id).map_err(HandoffError::Lease)?;
     let binary = locate_handoff_binary().map_err(HandoffError::BinaryNotFound)?;
-    let fd = lease.into_inherited_fd().map_err(|e| HandoffError::Lease(LeaseError::Io(e)))?;
+    let fd = lease
+        .into_inherited_fd()
+        .map_err(|e| HandoffError::Lease(LeaseError::Io(e)))?;
 
     let child = match Command::new(&binary)
         .env("NEOVIBE_LEASE_FD", fd.to_string())
@@ -312,8 +323,14 @@ mod tests {
     /// that has never taken a turn has no Claude session id, and there is no command to give.
     #[test]
     fn a_conversation_with_no_session_id_yields_no_command_at_all() {
-        assert_eq!(claude_resume_argv("").unwrap_err(), ResumeCommandError::MissingSessionId);
-        assert_eq!(claude_resume_argv("   ").unwrap_err(), ResumeCommandError::MissingSessionId);
+        assert_eq!(
+            claude_resume_argv("").unwrap_err(),
+            ResumeCommandError::MissingSessionId
+        );
+        assert_eq!(
+            claude_resume_argv("   ").unwrap_err(),
+            ResumeCommandError::MissingSessionId
+        );
         assert_eq!(
             ClaudeResumeCommand::for_session("/tmp/project", "").unwrap_err(),
             ResumeCommandError::MissingSessionId
@@ -328,15 +345,24 @@ mod tests {
             claude_resume_argv("--dangerously-skip-permissions").unwrap_err(),
             ResumeCommandError::SessionIdLooksLikeAFlag
         );
-        assert_eq!(claude_resume_argv("-r").unwrap_err(), ResumeCommandError::SessionIdLooksLikeAFlag);
+        assert_eq!(
+            claude_resume_argv("-r").unwrap_err(),
+            ResumeCommandError::SessionIdLooksLikeAFlag
+        );
     }
 
     /// Claude stores a session under the directory it was created in, so a command with nowhere to
     /// run is not a weaker command, it is a different one.
     #[test]
     fn a_command_with_no_directory_to_run_in_is_refused() {
-        assert_eq!(ClaudeResumeCommand::for_session("", "abc").unwrap_err(), ResumeCommandError::MissingCwd);
-        assert_eq!(ClaudeResumeCommand::for_session("  ", "abc").unwrap_err(), ResumeCommandError::MissingCwd);
+        assert_eq!(
+            ClaudeResumeCommand::for_session("", "abc").unwrap_err(),
+            ResumeCommandError::MissingCwd
+        );
+        assert_eq!(
+            ClaudeResumeCommand::for_session("  ", "abc").unwrap_err(),
+            ResumeCommandError::MissingCwd
+        );
     }
 
     /// What this actually pins, stated exactly, because an earlier version of this doc claimed
@@ -351,7 +377,10 @@ mod tests {
     fn the_displayed_line_is_the_literal_resume_invocation() {
         let command = ClaudeResumeCommand::for_session("/home/user/project", "abc-123").unwrap();
         assert_eq!(command.argv(), claude_resume_argv("abc-123").unwrap().as_slice());
-        assert_eq!(command.shell_command_line(), "cd /home/user/project && claude --resume abc-123");
+        assert_eq!(
+            command.shell_command_line(),
+            "cd /home/user/project && claude --resume abc-123"
+        );
         assert_eq!(command.provider_session_id(), "abc-123");
     }
 
@@ -361,13 +390,22 @@ mod tests {
     #[test]
     fn a_directory_is_quoted_only_when_the_shell_would_need_it() {
         let plain = ClaudeResumeCommand::for_session("/home/user/project", "abc").unwrap();
-        assert_eq!(plain.shell_command_line(), "cd /home/user/project && claude --resume abc");
+        assert_eq!(
+            plain.shell_command_line(),
+            "cd /home/user/project && claude --resume abc"
+        );
 
         let spaced = ClaudeResumeCommand::for_session("/home/user/my project", "abc").unwrap();
-        assert_eq!(spaced.shell_command_line(), "cd '/home/user/my project' && claude --resume abc");
+        assert_eq!(
+            spaced.shell_command_line(),
+            "cd '/home/user/my project' && claude --resume abc"
+        );
 
         let quoted = ClaudeResumeCommand::for_session("/home/user/it's", "abc").unwrap();
-        assert_eq!(quoted.shell_command_line(), r"cd '/home/user/it'\''s' && claude --resume abc");
+        assert_eq!(
+            quoted.shell_command_line(),
+            r"cd '/home/user/it'\''s' && claude --resume abc"
+        );
     }
 
     /// The id is trimmed on the way in, so a stray newline out of a record or a wire field cannot

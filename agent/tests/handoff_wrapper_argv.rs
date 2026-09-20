@@ -77,7 +77,11 @@ fn run_wrapper(session_id: &str) -> (bool, Vec<String>, String) {
     let _ = std::fs::remove_dir_all(&dir);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (output.status.success(), stdout.lines().map(str::to_string).collect(), stderr)
+    (
+        output.status.success(),
+        stdout.lines().map(str::to_string).collect(),
+        stderr,
+    )
 }
 
 #[test]
@@ -103,7 +107,9 @@ fn the_wrapper_execs_exactly_the_plain_interactive_resume_invocation() {
     assert_eq!(lines[1..], agent::handoff::claude_resume_argv(id).unwrap()[1..]);
     assert_eq!(
         lines[1..],
-        agent::handoff::ClaudeResumeCommand::for_session("/tmp", id).unwrap().argv()[1..]
+        agent::handoff::ClaudeResumeCommand::for_session("/tmp", id)
+            .unwrap()
+            .argv()[1..]
     );
 }
 

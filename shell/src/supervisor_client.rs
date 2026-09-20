@@ -25,7 +25,10 @@ pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> Agen
     // that was still pending when the session died stays in the projection on purpose (it is real
     // history, and deleting it would read as a resolution nobody made), so without this ordering a
     // dead session showed a permanent Blocked dot in the dashboard.
-    if matches!(projection.status, ProjectionStatus::Unavailable { .. } | ProjectionStatus::Closed { .. }) {
+    if matches!(
+        projection.status,
+        ProjectionStatus::Unavailable { .. } | ProjectionStatus::Closed { .. }
+    ) {
         return AgentStatus::Done;
     }
     if !projection.pending_permissions.is_empty() {
@@ -114,12 +117,7 @@ impl SupervisorClient {
         let socket_path = supervisor::socket_path();
 
         if let Ok(stream) = UnixStream::connect(&socket_path) {
-            return PendingSupervisor::Ready(Self::finish_connecting(
-                stream,
-                instance_id,
-                project_name,
-                project_dir,
-            ));
+            return PendingSupervisor::Ready(Self::finish_connecting(stream, instance_id, project_name, project_dir));
         }
 
         // Nothing is listening, and that is where this used to spawn one. It no longer does by
@@ -178,8 +176,7 @@ impl SupervisorClient {
             for wait_ms in schedule {
                 std::thread::sleep(std::time::Duration::from_millis(wait_ms));
                 if let Ok(stream) = UnixStream::connect(&socket_path) {
-                    let client =
-                        Self::finish_connecting(stream, instance_id, project_name, &project_dir);
+                    let client = Self::finish_connecting(stream, instance_id, project_name, &project_dir);
                     let _ = tx.send(client);
                     return;
                 }
@@ -196,7 +193,12 @@ impl SupervisorClient {
     /// `instance_id` is captured into the returned `Self` (not just used once and discarded) --
     /// `send_status` (below) needs it on every call to build a `ShellMessage::Status`, since the
     /// wire protocol has no per-connection implicit identity beyond what `Register` announced.
-    fn finish_connecting(mut stream: UnixStream, instance_id: String, project_name: String, project_dir: &Path) -> Option<Self> {
+    fn finish_connecting(
+        mut stream: UnixStream,
+        instance_id: String,
+        project_name: String,
+        project_dir: &Path,
+    ) -> Option<Self> {
         // Non-blocking for reads (poll_activate must never stall the GTK main loop), but the
         // initial Register write below happens before this is set, while the connection is still
         // in its default blocking mode -- a single small write to a socket the peer just accepted
@@ -212,7 +214,13 @@ impl SupervisorClient {
 
         stream.set_nonblocking(true).ok()?;
         let reader = BufReader::new(stream.try_clone().ok()?);
-        Some(Self { stream, reader, instance_id, last_sent_status: None, dead: false })
+        Some(Self {
+            stream,
+            reader,
+            instance_id,
+            last_sent_status: None,
+            dead: false,
+        })
     }
 
     /// Sends a `Status` message only if `status` differs from the last one actually sent --
@@ -222,8 +230,13 @@ impl SupervisorClient {
         if self.dead || self.last_sent_status == Some(status) {
             return;
         }
-        let msg = ShellMessage::Status { instance_id: self.instance_id.clone(), status };
-        let Ok(payload) = serde_json::to_string(&msg) else { return };
+        let msg = ShellMessage::Status {
+            instance_id: self.instance_id.clone(),
+            status,
+        };
+        let Ok(payload) = serde_json::to_string(&msg) else {
+            return;
+        };
         if self.stream.write_all(format!("{payload}\n").as_bytes()).is_ok() {
             self.last_sent_status = Some(status);
         } else {
@@ -253,7 +266,9 @@ impl SupervisorClient {
                     }
                     match serde_json::from_str::<SupervisorMessage>(trimmed) {
                         Ok(SupervisorMessage::Activate) => activated = true,
-                        Err(e) => eprintln!("shell: unparseable message from neovibe-supervisor: {e} -- raw: {trimmed}"),
+                        Err(e) => {
+                            eprintln!("shell: unparseable message from neovibe-supervisor: {e} -- raw: {trimmed}")
+                        }
                     }
                     continue;
                 }
@@ -300,14 +315,26 @@ mod tests {
     #[test]
     fn the_first_attempt_is_prompt_and_the_waits_only_grow() {
         let schedule = retry_schedule();
-        assert!(schedule[0] <= 50, "first wait should be near-immediate, got {}ms", schedule[0]);
+        assert!(
+            schedule[0] <= 50,
+            "first wait should be near-immediate, got {}ms",
+            schedule[0]
+        );
         for pair in schedule.windows(2) {
-            assert!(pair[1] >= pair[0], "waits must never shrink: {}ms then {}ms", pair[0], pair[1]);
+            assert!(
+                pair[1] >= pair[0],
+                "waits must never shrink: {}ms then {}ms",
+                pair[0],
+                pair[1]
+            );
         }
     }
 
     fn base_state() -> AgentSessionProjection {
-        AgentSessionProjection { status: ProjectionStatus::Running, ..Default::default() }
+        AgentSessionProjection {
+            status: ProjectionStatus::Running,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -322,7 +349,13 @@ mod tests {
         state.pending_permissions.insert(
             "r1".into(),
             // `seq` orders this card in the panel's own rendering; `derive_status` never reads it.
-            PermissionRequestRecord { seq: 0, permission_id: "r1".into(), tool_use_id: None, tool_name: "Read".into(), input: serde_json::json!({}) },
+            PermissionRequestRecord {
+                seq: 0,
+                permission_id: "r1".into(),
+                tool_use_id: None,
+                tool_name: "Read".into(),
+                input: serde_json::json!({}),
+            },
         );
         assert_eq!(derive_status(Some(&state)), AgentStatus::Blocked);
     }
@@ -337,14 +370,18 @@ mod tests {
     #[test]
     fn done_when_closed_and_no_turn_in_progress() {
         let mut state = base_state();
-        state.status = ProjectionStatus::Closed { reason: "closed_by_host".into() };
+        state.status = ProjectionStatus::Closed {
+            reason: "closed_by_host".into(),
+        };
         assert_eq!(derive_status(Some(&state)), AgentStatus::Done);
     }
 
     #[test]
     fn done_when_unavailable_and_no_turn_in_progress() {
         let mut state = base_state();
-        state.status = ProjectionStatus::Unavailable { reason: "provider process exited unexpectedly".into() };
+        state.status = ProjectionStatus::Unavailable {
+            reason: "provider process exited unexpectedly".into(),
+        };
         assert_eq!(derive_status(Some(&state)), AgentStatus::Done);
     }
 

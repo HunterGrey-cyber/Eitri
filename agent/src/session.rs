@@ -15,8 +15,8 @@
 
 use crate::event::{AgentEvent, PermissionSource};
 use crate::process::{AgentProcess, PermissionMode};
-use crate::provider::PermissionDecision;
 use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
+use crate::provider::PermissionDecision;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -76,7 +76,10 @@ impl AgentSession {
     /// `turn_in_progress`.
     pub fn send_turn(&mut self, text: &str) -> std::io::Result<Vec<AgentDomainEvent>> {
         if self.projection.active_turn_id.is_some() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "a turn is already in progress on this session"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a turn is already in progress on this session",
+            ));
         }
         self.process.send_turn(text)?;
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -101,7 +104,10 @@ impl AgentSession {
         let mut events = Vec::with_capacity(pending_ids.len());
         for permission_id in pending_ids {
             self.pending_permission_sources.remove(&permission_id);
-            let event = AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::CancelledByInterrupt };
+            let event = AgentDomainEvent::PermissionResolved {
+                permission_id,
+                outcome: PermissionOutcome::CancelledByInterrupt,
+            };
             self.fold(event.clone());
             events.push(event);
         }
@@ -122,14 +128,29 @@ impl AgentSession {
     /// folded locally because it is the ONLY place the fact exists. That is a property of this
     /// backend's wire, not a pattern to copy -- on a path where the provider does report the
     /// resolution, the provider's event is the authority and this side must not pre-empt it.
-    pub fn respond_permission(&mut self, permission_id: &str, decision: PermissionDecision) -> std::io::Result<Vec<AgentDomainEvent>> {
+    pub fn respond_permission(
+        &mut self,
+        permission_id: &str,
+        decision: PermissionDecision,
+    ) -> std::io::Result<Vec<AgentDomainEvent>> {
         let Some(source) = self.pending_permission_sources.get(permission_id).copied() else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no pending permission request with id {permission_id}")));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no pending permission request with id {permission_id}"),
+            ));
         };
-        self.process.respond_permission(permission_id, source, decision.allows(), decision.reason())?;
+        self.process
+            .respond_permission(permission_id, source, decision.allows(), decision.reason())?;
         self.pending_permission_sources.remove(permission_id);
-        let outcome = if decision.allows() { PermissionOutcome::Allowed } else { PermissionOutcome::Denied };
-        let event = AgentDomainEvent::PermissionResolved { permission_id: permission_id.to_string(), outcome };
+        let outcome = if decision.allows() {
+            PermissionOutcome::Allowed
+        } else {
+            PermissionOutcome::Denied
+        };
+        let event = AgentDomainEvent::PermissionResolved {
+            permission_id: permission_id.to_string(),
+            outcome,
+        };
         self.fold(event.clone());
         Ok(vec![event])
     }
@@ -191,9 +212,14 @@ impl AgentSession {
         let pending_ids: Vec<String> = self.projection.pending_permissions.keys().cloned().collect();
         for permission_id in pending_ids {
             self.pending_permission_sources.remove(&permission_id);
-            self.fold(AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::CancelledBySessionClose });
+            self.fold(AgentDomainEvent::PermissionResolved {
+                permission_id,
+                outcome: PermissionOutcome::CancelledBySessionClose,
+            });
         }
-        self.fold(AgentDomainEvent::SessionClosed { reason: "closed_by_host".to_string() });
+        self.fold(AgentDomainEvent::SessionClosed {
+            reason: "closed_by_host".to_string(),
+        });
     }
 
     /// Folds one domain event into `self.projection` and appends it to `self.event_log` -- the one
@@ -247,30 +273,75 @@ pub(crate) fn translate_wire_event(
             // provider session id -- `session_id` here already *is* the real Claude CLI UUID
             // (it comes straight from the CLI's own `init` line), so both fields get the same
             // value.
-            vec![AgentDomainEvent::SessionOpened { session_id: session_id.clone(), provider_session_id: session_id, model, cwd }]
+            vec![AgentDomainEvent::SessionOpened {
+                session_id: session_id.clone(),
+                provider_session_id: session_id,
+                model,
+                cwd,
+            }]
         }
         AgentEvent::AssistantText { text } => {
-            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
-            vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Text, text }]
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
+                return vec![];
+            };
+            vec![AgentDomainEvent::ContentDelta {
+                turn_id,
+                kind: ContentKind::Text,
+                text,
+            }]
         }
         AgentEvent::Thinking { text } => {
-            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
-            vec![AgentDomainEvent::ContentDelta { turn_id, kind: ContentKind::Thinking, text }]
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
+                return vec![];
+            };
+            vec![AgentDomainEvent::ContentDelta {
+                turn_id,
+                kind: ContentKind::Thinking,
+                text,
+            }]
         }
         AgentEvent::ToolStarted { id, name, input } => {
-            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
-            vec![AgentDomainEvent::ToolCallStarted { turn_id, tool_use_id: id, name, input }]
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
+                return vec![];
+            };
+            vec![AgentDomainEvent::ToolCallStarted {
+                turn_id,
+                tool_use_id: id,
+                name,
+                input,
+            }]
         }
         AgentEvent::ToolResult { id, content, is_error } => {
-            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else { return vec![] };
-            vec![AgentDomainEvent::ToolCallCompleted { turn_id, tool_use_id: id, content, is_error }]
+            let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
+                return vec![];
+            };
+            vec![AgentDomainEvent::ToolCallCompleted {
+                turn_id,
+                tool_use_id: id,
+                content,
+                is_error,
+            }]
         }
-        AgentEvent::PermissionRequest { request_id, tool_use_id, tool_name, input, source } => {
+        AgentEvent::PermissionRequest {
+            request_id,
+            tool_use_id,
+            tool_name,
+            input,
+            source,
+        } => {
             pending_permission_sources.insert(request_id.clone(), source);
             vec![permission_requested_event(request_id, tool_use_id, tool_name, input)]
         }
-        AgentEvent::TurnFinished { result_text, is_error, stop_reason, total_cost_usd, num_turns } => {
-            let turn_id = active_turn_id.map(|t| t.to_string()).unwrap_or_else(|| "unknown-turn".to_string());
+        AgentEvent::TurnFinished {
+            result_text,
+            is_error,
+            stop_reason,
+            total_cost_usd,
+            num_turns,
+        } => {
+            let turn_id = active_turn_id
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "unknown-turn".to_string());
             let outcome = if *interrupt_requested {
                 *interrupt_requested = false;
                 TurnOutcome::Interrupted
@@ -286,13 +357,27 @@ pub(crate) fn translate_wire_event(
             // reaching here was genuinely reported. This backend has real session-cumulative
             // figures; the sidecar backend has none, and sends `None` rather than a zero
             // standing in for them.
-            let usage = Some(crate::UsageInfo { total_cost_usd, num_turns });
-            vec![AgentDomainEvent::TurnCompleted { turn_id, outcome, result_text, stop_reason, usage }]
+            let usage = Some(crate::UsageInfo {
+                total_cost_usd,
+                num_turns,
+            });
+            vec![AgentDomainEvent::TurnCompleted {
+                turn_id,
+                outcome,
+                result_text,
+                stop_reason,
+                usage,
+            }]
         }
         AgentEvent::ProcessExited { success: true, .. } => {
-            vec![AgentDomainEvent::SessionClosed { reason: "provider_exited".to_string() }]
+            vec![AgentDomainEvent::SessionClosed {
+                reason: "provider_exited".to_string(),
+            }]
         }
-        AgentEvent::ProcessExited { success: false, stderr_tail } => {
+        AgentEvent::ProcessExited {
+            success: false,
+            stderr_tail,
+        } => {
             // The generic text alone actively misdirected a real investigation (2026-09-18): a
             // multi-account launcher on this host's `PATH` refused the gate-bearing `--settings`
             // flag and the child died before ever emitting `system`/`init`, so nothing upstream of
@@ -402,7 +487,12 @@ mod tests {
 
         assert_eq!(produced.len(), 1);
         match &produced[0] {
-            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, .. } => {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                tool_name,
+                ..
+            } => {
                 assert_eq!(
                     tool_use_id.as_deref(),
                     Some(REAL_ID),
@@ -442,7 +532,11 @@ mod tests {
         );
 
         match &produced[0] {
-            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(permission_id, "ctu-1");
                 assert_eq!(*tool_use_id, None);
             }
@@ -464,7 +558,12 @@ mod tests {
             json!({"command": "echo hello"}),
         );
         match event {
-            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, tool_name, .. } => {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                tool_name,
+                ..
+            } => {
                 assert_eq!(permission_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
                 assert_eq!(tool_use_id.as_deref(), Some("toolu_01CtdezhmhUCrBaswxW5HYmC"));
                 assert_eq!(tool_name, "Bash");
@@ -480,7 +579,11 @@ mod tests {
     fn a_request_with_no_supplied_id_stays_unlinked_rather_than_borrowing_its_permission_id() {
         let event = permission_requested_event("ctu-1".to_string(), None, "Bash".to_string(), json!({}));
         match event {
-            AgentDomainEvent::PermissionRequested { permission_id, tool_use_id, .. } => {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(permission_id, "ctu-1");
                 assert_eq!(tool_use_id, None);
             }
@@ -493,7 +596,8 @@ mod tests {
     /// sidecar provider's own translation step.
     #[test]
     fn an_empty_supplied_id_does_not_become_a_link() {
-        let event = permission_requested_event("perm-1".to_string(), Some(String::new()), "Bash".to_string(), json!({}));
+        let event =
+            permission_requested_event("perm-1".to_string(), Some(String::new()), "Bash".to_string(), json!({}));
         match event {
             AgentDomainEvent::PermissionRequested { tool_use_id, .. } => assert_eq!(tool_use_id, None),
             other => panic!("expected PermissionRequested, got {other:?}"),

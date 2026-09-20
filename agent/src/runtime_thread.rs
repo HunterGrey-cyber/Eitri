@@ -38,8 +38,14 @@ impl RuntimeThread {
             // life, since nothing could ever signal it to stop).
             let _ = runtime.block_on(shutdown_rx);
         });
-        let handle = handle_rx.recv().expect("runtime thread died before sending its Handle back");
-        Self { handle, shutdown: Some(shutdown_tx), thread: Some(thread) }
+        let handle = handle_rx
+            .recv()
+            .expect("runtime thread died before sending its Handle back");
+        Self {
+            handle,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        }
     }
 
     /// Runs `future` on this runtime thread and blocks the CALLING thread (never the runtime
@@ -105,7 +111,9 @@ mod tests {
     #[test]
     fn block_on_returns_the_future_s_result_within_the_timeout() {
         let runtime_thread = RuntimeThread::spawn();
-        let result = runtime_thread.block_on(async { 2 + 2 }, Duration::from_secs(1)).unwrap();
+        let result = runtime_thread
+            .block_on(async { 2 + 2 }, Duration::from_secs(1))
+            .unwrap();
         assert_eq!(result, 4);
     }
 
@@ -138,7 +146,9 @@ mod tests {
     fn dropping_many_runtime_threads_in_a_row_does_not_hang_or_leak_unboundedly() {
         for _ in 0..20 {
             let runtime_thread = RuntimeThread::spawn();
-            let result = runtime_thread.block_on(async { 1 + 1 }, Duration::from_secs(1)).unwrap();
+            let result = runtime_thread
+                .block_on(async { 1 + 1 }, Duration::from_secs(1))
+                .unwrap();
             assert_eq!(result, 2);
             drop(runtime_thread);
         }
