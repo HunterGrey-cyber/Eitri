@@ -246,6 +246,11 @@ mod tests {
             provider_session_id: "claude-uuid-not-the-sidecars".into(),
             model: "claude-sonnet-5".into(),
             cwd: "/tmp".into(),
+            // New in the protocol bump of 2026-09-20: the sidecar now reports the permission mode
+            // actually in force, rather than leaving the caller to assume the one it asked for.
+            // Nothing on this side reads it yet, so the fixture carries the empty string rather
+            // than a value a reader could mistake for an assertion.
+            permission_mode: String::new(),
         }));
         assert_eq!(
             translate(event),

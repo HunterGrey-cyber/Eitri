@@ -318,6 +318,9 @@ fn tool_policy_deny_really_stops_a_bypass_session_from_running_bash() {
     );
     request.policy.as_mut().unwrap().tool_policy = Some(ToolPolicy {
         deny: vec!["NotebookEdit".to_string()],
+        // The control arm states a restriction, so this must be false: the sidecar refuses the
+        // pair rather than guessing which of the two the caller meant.
+        unrestricted: false,
         allow: None,
     });
     let session_id = control.open_session(request).expect("control session");

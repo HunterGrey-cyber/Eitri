@@ -556,6 +556,7 @@ fn build_create_request(
     resume_provider_session_id: Option<String>,
     fork: bool,
 ) -> ProtoCreateSessionRequest {
+    let denied = crate::process::disallowed_tools_for(permission_mode);
     ProtoCreateSessionRequest {
         cwd,
         policy: Some(ClaudeHostPolicy {
@@ -587,6 +588,9 @@ fn build_create_request(
                 // written down as a constraint.
                 sources: vec![SettingSource::Project as i32, SettingSource::Local as i32],
             }),
+            // Bound once: `deny` and `unrestricted` are two statements about the same list, and the
+            // sidecar refuses the pair if they disagree.
+            //
             // Sent explicitly even under `Bypass`, and that is parity rather than a new restriction:
             // the legacy path passes `--disallowedTools` unconditionally and only skips the hook.
             // Stating it also means it is honoured verbatim; omitting it would earn the sidecar's
@@ -599,10 +603,20 @@ fn build_create_request(
             // built-in tools at all", stated. Neovibe has no allowlist to express, so it says
             // nothing rather than saying the empty set.
             tool_policy: Some(ToolPolicy {
-                deny: crate::process::disallowed_tools_for(permission_mode)
-                    .iter()
-                    .map(|t| (*t).to_string())
-                    .collect(),
+                deny: denied.iter().map(|t| (*t).to_string()).collect(),
+                // `unrestricted` states "this caller restricts no tool, and means it" -- the exit
+                // Verdandi built for exactly this case (`usesDefaultBypassDeny`, `session.ts`).
+                // **Without it, emptying the deny list would have changed nothing on this path**:
+                // an empty list under `bypass` reads as silence, and the sidecar then injects its
+                // own `CONSERVATIVE_BYPASS_DENY` -- the same four tool names this side just stopped
+                // sending. Measured against the sidecar's source before the change was made, not
+                // discovered afterwards.
+                //
+                // Derived from the list rather than set by hand, because the sidecar REJECTS
+                // `unrestricted` alongside any stated restriction (`runtimeServiceImpl.ts`) rather
+                // than guessing which of the two the caller meant. The two can therefore never
+                // disagree here.
+                unrestricted: denied.is_empty(),
                 allow: None,
             }),
         }),

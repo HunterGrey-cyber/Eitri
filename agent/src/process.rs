@@ -77,9 +77,28 @@ pub const CONSERVATIVE_DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "N
 /// whose blast radius is not a file but a machine. Un-denying `Bash` is a separate decision with
 /// its own evidence, not a rounding error in this one.
 ///
-/// **`Bypass` keeps all four**, which is a narrower answer than removing the mode. The mode stays
-/// available and honest: it runs tools without asking, and the tools it may run are the ones whose
-/// worst case is bounded by what the model can already do through `Read`/`Grep`.
+/// **`Bypass` kept all four until 2026-09-20**, which was a narrower answer than removing the mode:
+/// the mode stayed available and honest, running tools without asking, and the tools it could run
+/// were the ones whose worst case is bounded by what the model can already do through `Read`/`Grep`.
+///
+/// **Overridden by the owner, 2026-09-20: `Bypass` now denies nothing.** He put it plainly -- "bypass
+/// 不是应该是具有所有权限吗" -- and the paragraph above is the answer to why it was not, kept because
+/// its reasoning is unchanged and will be the argument against this when the permission design is
+/// revisited. What the paragraph got wrong is not the risk, it is the NAME: a mode labelled "bypass
+/// all permissions" that is the only mode which cannot edit a file is not a narrow answer, it is a
+/// mode whose label is false. `Auto` allows the three editing tools and gates them with a card;
+/// `Bypass` allowed none of them. The weaker-sounding mode was strictly the more capable one.
+///
+/// **This is a debugging-phase decision with a stated expiry** ("我们在调试阶段，权限设计快上线了再做").
+/// What it restores is exactly the risk the paragraph above names, and nothing has changed about
+/// that risk: with no hook installed, an `Edit` rewrites a file under a live buffer with no diff, no
+/// decision, and nothing in the transcript that had to be read. Before this ships to anyone else,
+/// the survey's recommendation is on record and is a better answer than either version of this
+/// function -- stop using `bypassPermissions` at all, run `Auto` with the host auto-answering every
+/// request, and keep the tool calls and their diffs in the transcript. That is the shape every other
+/// implementation uses: ACP's `PermissionOptionKind` makes "stop asking me" an ANSWER
+/// (`AllowAlways`), never a capability the agent loses. See
+/// `docs/canonical/2026-09-20-cursor-permission-survey.md`.
 ///
 /// This is best-effort in both modes and was documented as such from the start -- no single
 /// permission flag reliably blocks all tool use. It is the second line; the hook is the first.
@@ -87,7 +106,13 @@ pub fn disallowed_tools_for(mode: PermissionMode) -> &'static [&'static str] {
     match mode {
         // The hook gates every tool (matcher `*`), so an edit reaches the user as a card.
         PermissionMode::Auto => &["Bash"],
-        PermissionMode::Bypass => CONSERVATIVE_DISALLOWED_TOOLS,
+        // Empty, not `CONSERVATIVE_DISALLOWED_TOOLS`. On the sidecar path this ALONE would have
+        // changed nothing -- an empty list under `bypass` reads to Verdandi as silence and earns its
+        // own identical floor -- so the request also states `unrestricted` (see
+        // `providers::claude_sidecar::build_create_request`). The constant itself is untouched: it
+        // is still the floor Verdandi injects for a caller that says nothing, and it is still
+        // hand-copied there as `CONSERVATIVE_BYPASS_DENY`.
+        PermissionMode::Bypass => &[],
     }
 }
 
@@ -901,28 +926,44 @@ impl Drop for AgentProcess {
 #[cfg(test)]
 mod tests {
 
-    /// The two modes must not get the same list, and the test says why rather than just that.
+    /// **Superseded by the owner's ruling of 2026-09-20, and kept as this paragraph because its
+    /// reasoning is the argument against the ruling when the permission design is revisited.**
+    /// It read: the two modes must not get the same list, and the test says why rather than just
+    /// that. `Bypass` installs no `PreToolUse` gate at all, so an `Edit` there is a file rewritten
+    /// under a live buffer with no card and no decision. Collapsing these two lists into one -- in
+    /// either direction -- is the change this asserts against: widening `Bypass` ships that hole,
+    /// and narrowing `Auto` back makes the permission card unreachable for the one thing the
+    /// product's own MVP sentence is about.
     ///
-    /// `Bypass` installs no `PreToolUse` gate at all, so an `Edit` there is a file rewritten under a
-    /// live buffer with no card and no decision. Collapsing these two lists into one -- in either
-    /// direction -- is the change this asserts against: widening `Bypass` ships that hole, and
-    /// narrowing `Auto` back makes the permission card unreachable for the one thing the product's
-    /// own MVP sentence is about.
+    /// The half of that which survives is `Auto`'s, and it is still asserted below. What the old
+    /// assertion could not see is that the mode labelled "bypass all permissions" was the ONLY mode
+    /// unable to edit a file -- strictly less capable than the mode with a gate. The hole it names
+    /// is real and is now open; `disallowed_tools_for`'s own doc carries the ruling, its stated
+    /// expiry, and the better answer (auto-answer under a gate, the shape ACP uses).
+    ///
+    /// This test now pins the ruling, so restoring the old list fails here and has to argue with
+    /// the paragraph above rather than around it.
     #[test]
-    fn auto_may_edit_because_the_gate_covers_it_and_bypass_may_not_because_nothing_does() {
+    fn auto_may_edit_because_the_gate_covers_it_and_bypass_may_edit_because_the_owner_ruled_so() {
         let auto = disallowed_tools_for(PermissionMode::Auto);
         let bypass = disallowed_tools_for(PermissionMode::Bypass);
         for tool in ["Edit", "Write", "NotebookEdit"] {
             assert!(!auto.contains(&tool), "Auto must permit {tool}: the hook gates it");
             assert!(
-                bypass.contains(&tool),
-                "Bypass must deny {tool}: nothing gates it there"
+                !bypass.contains(&tool),
+                "Bypass must permit {tool}: a mode named after having every permission cannot be \
+                 the one mode that may not edit (owner's ruling, 2026-09-20)"
             );
         }
-        // Bash stays denied in both. Its worst case is not a file, and un-denying it is a separate
-        // decision that owes its own evidence.
+        // `Auto` still denies Bash: its worst case is not a file, and un-denying it there is a
+        // separate decision that owes its own evidence. `Bypass` denies nothing at all, which is
+        // what the word means.
         assert!(auto.contains(&"Bash"));
-        assert!(bypass.contains(&"Bash"));
+        assert!(
+            bypass.is_empty(),
+            "Bypass denies nothing; an empty list is also what makes the sidecar request state \
+             `unrestricted`, without which Verdandi re-applies its own identical floor"
+        );
         assert_ne!(auto, bypass, "one list for both modes cannot be right for either");
     }
 

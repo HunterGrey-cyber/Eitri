@@ -27,6 +27,9 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // compiles.
             tool_policy: Some(claude_runtime_protocol::v1::ToolPolicy {
                 deny: vec!["Bash".to_string()],
+                // False beside a stated restriction, which is the only pair the sidecar accepts:
+                // it rejects `unrestricted` alongside a deny list rather than guessing.
+                unrestricted: false,
                 allow: None,
             }),
             setting_sources: Some(claude_runtime_protocol::v1::SettingSourceSelection {
