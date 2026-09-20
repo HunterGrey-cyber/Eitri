@@ -41,9 +41,7 @@ fn main() {
     run(&web_dir, "npm", &["run", "build"]);
 
     if !dist_index.exists() {
-        panic!(
-            "agent-ui/web build did not produce dist/index.html -- check the npm build output above"
-        );
+        panic!("agent-ui/web build did not produce dist/index.html -- check the npm build output above");
     }
 }
 

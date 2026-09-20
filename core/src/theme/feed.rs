@@ -82,7 +82,10 @@ impl ThemeFeed {
         let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
         // 0700: the socket accepts colours from anyone who can connect to it.
         if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            eprintln!("[theme] could not create {}: {e} -- colours stay on the built-in fallback", dir.display());
+            eprintln!(
+                "[theme] could not create {}: {e} -- colours stay on the built-in fallback",
+                dir.display()
+            );
             return None;
         }
         let fail = |what: String| {
@@ -117,13 +120,21 @@ impl ThemeFeed {
             return None;
         }
         println!("[theme] feed at {}", socket_path.display());
-        Some(ThemeFeed { dir, socket_path, lua_path, listener: Some(listener) })
+        Some(ThemeFeed {
+            dir,
+            socket_path,
+            lua_path,
+            listener: Some(listener),
+        })
     }
 
     /// Set on the nvim child only, through `NeovideEditorPaneOptions::child_env`.
     pub fn child_env(&self) -> Vec<(String, String)> {
         vec![
-            ("NEOVIBE_THEME_SOCKET".to_string(), self.socket_path.display().to_string()),
+            (
+                "NEOVIBE_THEME_SOCKET".to_string(),
+                self.socket_path.display().to_string(),
+            ),
             ("NEOVIBE_THEME_LUA".to_string(), self.lua_path.display().to_string()),
         ]
     }
@@ -228,13 +239,18 @@ mod tests {
     use std::time::Instant;
 
     fn line(colors_name: &str) -> String {
-        format!(r#"{{"v":1,"groups":{{}},"options":{{"background":"dark","guifont":"","colors_name":"{colors_name}"}}}}"#)
+        format!(
+            r#"{{"v":1,"groups":{{}},"options":{{"background":"dark","guifont":"","colors_name":"{colors_name}"}}}}"#
+        )
     }
 
     #[test]
     fn the_lua_snippet_requests_every_group_derivation_reads() {
         for group in GROUPS_READ {
-            assert!(NVIM_THEME_LUA.contains(&format!("\"{group}\"")), "nvim_theme.lua does not request {group}");
+            assert!(
+                NVIM_THEME_LUA.contains(&format!("\"{group}\"")),
+                "nvim_theme.lua does not request {group}"
+            );
         }
     }
 
@@ -263,7 +279,10 @@ mod tests {
         let got = latest_payload(vec![line("a"), "garbage".into(), line("b")]).unwrap();
         assert_eq!(got.options.colors_name, "b");
         let got = latest_payload(vec![line("a"), "garbage".into()]).unwrap();
-        assert_eq!(got.options.colors_name, "a", "a bad line never discards an earlier good one");
+        assert_eq!(
+            got.options.colors_name, "a",
+            "a bad line never discards an earlier good one"
+        );
         assert!(latest_payload(Vec::new()).is_none());
     }
 
@@ -276,7 +295,10 @@ mod tests {
         assert!(socket.starts_with(&feed.dir) && lua.starts_with(&feed.dir));
         assert_eq!(std::fs::read_to_string(&lua).unwrap(), NVIM_THEME_LUA);
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&feed.dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&feed.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(feed.nvim_args(), vec!["--cmd".to_string(), LOADER_CMD.to_string()]);
         feed.cleanup();
         assert!(!feed.dir.exists());
@@ -393,7 +415,10 @@ mod tests {
         // And on whatever `TMPDIR` this host actually has, with its real pid.
         let here = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
         let path = agent::socket_path::in_dir(&here, SOCKET_NAME).expect("must fit");
-        assert!(path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES, "{path:?}");
+        assert!(
+            path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES,
+            "{path:?}"
+        );
     }
 
     #[test]
@@ -438,7 +463,12 @@ mod tests {
         let mut child = std::process::Command::new("nvim")
             .args(["--headless", "--clean"])
             .args(feed.nvim_args())
-            .args(["-c", "autocmd VimEnter * lua vim.uv.sleep(400)", "-c", "colorscheme retrobox"])
+            .args([
+                "-c",
+                "autocmd VimEnter * lua vim.uv.sleep(400)",
+                "-c",
+                "colorscheme retrobox",
+            ])
             .envs(feed.child_env())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -451,14 +481,22 @@ mod tests {
         let mut received = Vec::new();
         // Polled at POLL_INTERVAL, exactly as `shell::theme::feed::listen` polls on the GTK main loop.
         while Instant::now() < deadline && received.len() < 2 {
-            received.extend(accept_pending_lines(listener).iter().filter_map(|line| parse_payload(line).ok()));
+            received.extend(
+                accept_pending_lines(listener)
+                    .iter()
+                    .filter_map(|line| parse_payload(line).ok()),
+            );
             std::thread::sleep(POLL_INTERVAL);
         }
         let _ = child.kill();
         let _ = child.wait();
         feed.cleanup();
 
-        assert!(received.len() >= 2, "expected the ColorScheme and the VimEnter payload, got {}", received.len());
+        assert!(
+            received.len() >= 2,
+            "expected the ColorScheme and the VimEnter payload, got {}",
+            received.len()
+        );
         assert!(received.iter().all(|p| p.options.colors_name == "retrobox"));
     }
 }

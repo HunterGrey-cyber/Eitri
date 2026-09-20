@@ -59,20 +59,33 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
     eprintln!("---- {label}: {} events ----", events.len());
     for event in events {
         match event {
-            AgentDomainEvent::SessionOpened { session_id, provider_session_id, .. } => {
+            AgentDomainEvent::SessionOpened {
+                session_id,
+                provider_session_id,
+                ..
+            } => {
                 eprintln!("  SessionOpened   session_id={session_id} provider_session_id={provider_session_id}")
             }
             AgentDomainEvent::TurnStarted { turn_id } => eprintln!("  TurnStarted     turn_id={turn_id}"),
             AgentDomainEvent::ContentDelta { kind, text, .. } => {
-                eprintln!("  ContentDelta    {kind:?} {:?}", text.chars().take(40).collect::<String>())
+                eprintln!(
+                    "  ContentDelta    {kind:?} {:?}",
+                    text.chars().take(40).collect::<String>()
+                )
             }
             AgentDomainEvent::ToolCallStarted { name, tool_use_id, .. } => {
                 eprintln!("  ToolCallStarted {name} tool_use_id={tool_use_id}")
             }
-            AgentDomainEvent::ToolCallCompleted { tool_use_id, is_error, .. } => {
+            AgentDomainEvent::ToolCallCompleted {
+                tool_use_id, is_error, ..
+            } => {
                 eprintln!("  ToolCallDone    tool_use_id={tool_use_id} is_error={is_error}")
             }
-            AgentDomainEvent::PermissionRequested { permission_id, tool_name, .. } => {
+            AgentDomainEvent::PermissionRequested {
+                permission_id,
+                tool_name,
+                ..
+            } => {
                 eprintln!("  PermissionReq   {tool_name} permission_id={permission_id}")
             }
             AgentDomainEvent::PermissionResolved { permission_id, outcome } => {
@@ -118,15 +131,27 @@ fn create_bypass_session_with(provider: &ClaudeSidecarProvider, streaming: agent
 }
 
 /// Sends one turn and drains until it completes. Returns every event produced during it.
-fn run_turn(provider: &ClaudeSidecarProvider, session_id: &str, text: &str, deadline_secs: u64) -> Vec<AgentDomainEvent> {
+fn run_turn(
+    provider: &ClaudeSidecarProvider,
+    session_id: &str,
+    text: &str,
+    deadline_secs: u64,
+) -> Vec<AgentDomainEvent> {
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.to_string(), text: text.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+        })
         .expect("send_turn should be accepted");
     let events = drain_until(provider, deadline_secs, |events| {
-        events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
     });
     assert!(
-        events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })),
         "turn {text:?} did not complete within {deadline_secs}s; got: {events:?}"
     );
     events
@@ -150,7 +175,11 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         "Remember this number for later: 4271. Reply with just: OK",
         60,
     );
-    assert_eq!(turn_outcomes(&first), vec![TurnOutcome::Completed], "first turn: {first:?}");
+    assert_eq!(
+        turn_outcomes(&first),
+        vec![TurnOutcome::Completed],
+        "first turn: {first:?}"
+    );
 
     let second = run_turn(
         &provider,
@@ -158,7 +187,11 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         "What number did I ask you to remember? Reply with just the number.",
         60,
     );
-    assert_eq!(turn_outcomes(&second), vec![TurnOutcome::Completed], "second turn: {second:?}");
+    assert_eq!(
+        turn_outcomes(&second),
+        vec![TurnOutcome::Completed],
+        "second turn: {second:?}"
+    );
 
     let recalled = text_of(&second);
     assert!(
@@ -182,13 +215,18 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
         .iter()
         .chain(second.iter())
         .filter_map(|e| match e {
-            AgentDomainEvent::SessionOpened { session_id, provider_session_id, .. } => {
-                Some((session_id, provider_session_id))
-            }
+            AgentDomainEvent::SessionOpened {
+                session_id,
+                provider_session_id,
+                ..
+            } => Some((session_id, provider_session_id)),
             _ => None,
         })
         .collect();
-    assert!(!opened.is_empty(), "expected at least one SessionOpened; got: {first:?} {second:?}");
+    assert!(
+        !opened.is_empty(),
+        "expected at least one SessionOpened; got: {first:?} {second:?}"
+    );
     for (event_session_id, _) in &opened {
         assert_eq!(
             **event_session_id, session_id,
@@ -197,9 +235,14 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
     }
     // The Claude identity is stable across turns and genuinely distinct from the sidecar's.
     let provider_ids: std::collections::BTreeSet<&&String> = opened.iter().map(|(_, p)| p).collect();
-    assert_eq!(provider_ids.len(), 1, "the provider session id must not change between turns: {provider_ids:?}");
+    assert_eq!(
+        provider_ids.len(),
+        1,
+        "the provider session id must not change between turns: {provider_ids:?}"
+    );
     assert_ne!(
-        ***provider_ids.iter().next().unwrap(), session_id,
+        ***provider_ids.iter().next().unwrap(),
+        session_id,
         "the Claude session id and the sidecar session id are different identities and must not be collapsed"
     );
 
@@ -219,7 +262,11 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
             _ => None,
         })
         .collect();
-    assert_eq!(turn_ids.len(), 2, "expected exactly two TurnStarted events, got: {turn_ids:?}");
+    assert_eq!(
+        turn_ids.len(),
+        2,
+        "expected exactly two TurnStarted events, got: {turn_ids:?}"
+    );
     assert_ne!(turn_ids[0], turn_ids[1], "two turns must not share a turn id");
 
     // And each TurnStarted must pair with the TurnCompleted for the same turn.
@@ -231,7 +278,10 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
             _ => None,
         })
         .collect();
-    assert_eq!(turn_ids, completed_ids, "every started turn must complete under the same id");
+    assert_eq!(
+        turn_ids, completed_ids,
+        "every started turn must complete under the same id"
+    );
 
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
 }
@@ -258,17 +308,27 @@ fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
     // Interrupt only once the turn is genuinely underway. Interrupting before the turn has started
     // would test a different (and much less interesting) thing: whether a no-op interrupt is safe.
     let started = drain_until(&provider, 60, |events| {
-        events.iter().any(|e| matches!(e, AgentDomainEvent::ContentDelta { .. }))
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::ContentDelta { .. }))
     });
     assert!(
-        started.iter().any(|e| matches!(e, AgentDomainEvent::ContentDelta { .. })),
+        started
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::ContentDelta { .. })),
         "the turn never produced any content to interrupt; got: {started:?}"
     );
 
-    provider.interrupt_turn(InterruptTurnRequest { session_id: session_id.clone() }).unwrap();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: session_id.clone(),
+        })
+        .unwrap();
 
     let after_interrupt = drain_until(&provider, 60, |events| {
-        events.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
     });
     assert_eq!(
         turn_outcomes(&after_interrupt),
@@ -276,7 +336,9 @@ fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
         "an interrupted turn must terminate as Interrupted, not Completed or Failed; got: {after_interrupt:?}"
     );
     assert!(
-        !after_interrupt.iter().any(|e| matches!(e, AgentDomainEvent::SessionClosed { .. })),
+        !after_interrupt
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionClosed { .. })),
         "interrupt must not close the session; got: {after_interrupt:?}"
     );
 
@@ -287,7 +349,11 @@ fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
         vec![TurnOutcome::Completed],
         "the session did not survive the interrupt; got: {second:?}"
     );
-    assert!(text_of(&second).to_lowercase().contains("pong"), "got: {:?}", text_of(&second));
+    assert!(
+        text_of(&second).to_lowercase().contains("pong"),
+        "got: {:?}",
+        text_of(&second)
+    );
 
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
 }
@@ -319,7 +385,9 @@ fn real_bypass_runs_a_tool_with_no_permission_request() {
     );
 
     assert!(
-        !events.iter().any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
         "BYPASS raised a permission request, which nothing in this milestone can answer; got: {events:?}"
     );
 
@@ -332,10 +400,13 @@ fn real_bypass_runs_a_tool_with_no_permission_request() {
         "no tool ran at all -- 'no permission request' is meaningless without this. got: {events:?}"
     );
 
-    let completed_without_error = events.iter().any(|e| {
-        matches!(e, AgentDomainEvent::ToolCallCompleted { is_error: false, .. })
-    });
-    assert!(completed_without_error, "the tool call never completed successfully; got: {events:?}");
+    let completed_without_error = events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::ToolCallCompleted { is_error: false, .. }));
+    assert!(
+        completed_without_error,
+        "the tool call never completed successfully; got: {events:?}"
+    );
 
     let reply = text_of(&events);
     assert!(
@@ -404,13 +475,22 @@ fn a_connected_provider_reports_wire_sourced_capabilities_and_versions() {
     assert!(!info.actual_claude_code_version.is_empty(), "got: {info:?}");
     assert!(!info.advertised_capabilities.is_empty(), "got: {info:?}");
 
-    assert!(capabilities.interrupt, "interrupt_turn is advertised and exercised by this very suite");
+    assert!(
+        capabilities.interrupt,
+        "interrupt_turn is advertised and exercised by this very suite"
+    );
     assert!(capabilities.bypass_permission_mode);
     // Resume is advertised by the sidecar AND implemented by this client, so it reports true.
     // Fork is advertised on the wire but this client does not drive it, so the intersection is
     // false -- that asymmetry is the point of the intersection rule.
-    assert!(capabilities.resume, "resume_session should be advertised and implemented by now");
-    assert!(!capabilities.fork, "fork must stay false until this client actually drives one");
+    assert!(
+        capabilities.resume,
+        "resume_session should be advertised and implemented by now"
+    );
+    assert!(
+        !capabilities.fork,
+        "fork must stay false until this client actually drives one"
+    );
 }
 
 /// T4.6 -- the resume acceptance criterion, and the single most important test in this file.
@@ -437,7 +517,10 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
 
     let (provider_session_id, original_session_id) = {
         let provider = connect();
-        assert!(provider.capabilities().resume, "the sidecar must advertise resume before this can pass");
+        assert!(
+            provider.capabilities().resume,
+            "the sidecar must advertise resume before this can pass"
+        );
         let session_id = create_bypass_session(&provider);
 
         let events = run_turn(
@@ -450,13 +533,22 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
         let provider_session_id = events
             .iter()
             .find_map(|e| match e {
-                AgentDomainEvent::SessionOpened { provider_session_id, .. } => Some(provider_session_id.clone()),
+                AgentDomainEvent::SessionOpened {
+                    provider_session_id, ..
+                } => Some(provider_session_id.clone()),
                 _ => None,
             })
             .expect("the first turn must report a provider session id");
-        assert_ne!(provider_session_id, session_id, "the two identities must not be the same value");
+        assert_ne!(
+            provider_session_id, session_id,
+            "the two identities must not be the same value"
+        );
 
-        provider.close_session(CloseSessionRequest { session_id: session_id.clone() }).unwrap();
+        provider
+            .close_session(CloseSessionRequest {
+                session_id: session_id.clone(),
+            })
+            .unwrap();
         (provider_session_id, session_id)
     }; // the whole first provider -- process, runtime thread and all -- is gone here
 
@@ -487,11 +579,16 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
     let resumed_provider_ids: Vec<&String> = events
         .iter()
         .filter_map(|e| match e {
-            AgentDomainEvent::SessionOpened { provider_session_id, .. } => Some(provider_session_id),
+            AgentDomainEvent::SessionOpened {
+                provider_session_id, ..
+            } => Some(provider_session_id),
             _ => None,
         })
         .collect();
-    assert!(!resumed_provider_ids.is_empty(), "the resumed turn reported no SessionOpened at all");
+    assert!(
+        !resumed_provider_ids.is_empty(),
+        "the resumed turn reported no SessionOpened at all"
+    );
     for id in &resumed_provider_ids {
         assert_eq!(
             **id, provider_session_id,
@@ -506,5 +603,9 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
         "the resumed conversation did not remember the original's content. got: {recalled:?}"
     );
 
-    provider.close_session(CloseSessionRequest { session_id: resumed_session_id }).unwrap();
+    provider
+        .close_session(CloseSessionRequest {
+            session_id: resumed_session_id,
+        })
+        .unwrap();
 }

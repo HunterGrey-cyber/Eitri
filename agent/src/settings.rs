@@ -89,14 +89,17 @@ fn hook_settings_arg_with_hook_path(socket_path: &Path, agent_hook_path: &Path) 
 /// production code path under real exercise.
 fn locate_agent_hook_binary() -> std::io::Result<PathBuf> {
     let current = std::env::current_exe()?;
-    let dir = current.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory")
-    })?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current_exe has no parent directory"))?;
     let candidate = dir.join("agent-hook");
     if candidate.exists() {
         return Ok(candidate);
     }
-    let one_dir_deeper = matches!(dir.file_name().and_then(|n| n.to_str()), Some("deps") | Some("examples"));
+    let one_dir_deeper = matches!(
+        dir.file_name().and_then(|n| n.to_str()),
+        Some("deps") | Some("examples")
+    );
     if one_dir_deeper {
         if let Some(parent) = dir.parent() {
             let fallback = parent.join("agent-hook");

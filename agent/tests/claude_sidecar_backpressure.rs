@@ -20,14 +20,12 @@
 //! on a developer machine are themselves processes named `claude`.
 
 use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind,
-    CreateSessionRequest, InterruptTurnRequest, PermissionMode, ProjectionStatus, SendTurnRequest,
-    StreamingPreference, TurnOutcome,
+    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
+    InterruptTurnRequest, PermissionMode, ProjectionStatus, SendTurnRequest, StreamingPreference, TurnOutcome,
 };
 use std::time::{Duration, Instant};
 
-const LONG_PROMPT: &str =
-    "Write about 800 words on the history of version control, from SCCS to modern distributed \
+const LONG_PROMPT: &str = "Write about 800 words on the history of version control, from SCCS to modern distributed \
      systems. Continuous prose, no headings, no bullet points.";
 
 fn connect() -> ClaudeSidecarProvider {
@@ -49,7 +47,11 @@ fn text_of(events: &[AgentDomainEvent]) -> String {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentDomainEvent::ContentDelta { kind: ContentKind::Text, text, .. } => Some(text.as_str()),
+            AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -65,7 +67,10 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             // produced by `provider.pump()`, which is all this test drains. Matched anyway so this
             // exhaustive `match` still compiles after adding the variant.
             AgentDomainEvent::UserPromptSubmitted { .. } => "UserPromptSubmitted",
-            AgentDomainEvent::ContentDelta { kind: ContentKind::Text, .. } => "ContentDelta(text)",
+            AgentDomainEvent::ContentDelta {
+                kind: ContentKind::Text,
+                ..
+            } => "ContentDelta(text)",
             AgentDomainEvent::ContentDelta { .. } => "ContentDelta(thinking)",
             AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",
             AgentDomainEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
@@ -113,7 +118,10 @@ fn a_watch_stream_that_dies_mid_turn_reports_a_typed_loss_not_silence() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: LONG_PROMPT.to_string(),
+        })
         .unwrap();
 
     // Wait for real streamed content, so the kill genuinely lands mid-reply.
@@ -124,12 +132,20 @@ fn a_watch_stream_that_dies_mid_turn_reports_a_typed_loss_not_silence() {
         std::thread::sleep(Duration::from_millis(25));
     }
     let partial_text = text_of(&streamed);
-    assert!(partial_text.len() >= 300, "no partial content arrived, so there was no mid-turn to interrupt");
     assert!(
-        streamed.iter().all(|e| !matches!(e, AgentDomainEvent::TurnCompleted { .. })),
+        partial_text.len() >= 300,
+        "no partial content arrived, so there was no mid-turn to interrupt"
+    );
+    assert!(
+        streamed
+            .iter()
+            .all(|e| !matches!(e, AgentDomainEvent::TurnCompleted { .. })),
         "the turn finished before the stream could be killed mid-reply"
     );
-    eprintln!("killing sidecar pid {sidecar_pid} after {} streamed chars", partial_text.len());
+    eprintln!(
+        "killing sidecar pid {sidecar_pid} after {} streamed chars",
+        partial_text.len()
+    );
 
     // ONLY the pid this provider reports having spawned. Never by name.
     // SAFETY: `sidecar_pid` came from this provider's own `Child::id()`.
@@ -148,7 +164,10 @@ fn a_watch_stream_that_dies_mid_turn_reports_a_typed_loss_not_silence() {
          active turn and a truncated reply that looks finished, with nothing for a UI to show",
     );
     eprintln!("reported loss reason: {reason}");
-    assert!(!reason.trim().is_empty(), "the loss reason must say something a user can act on");
+    assert!(
+        !reason.trim().is_empty(),
+        "the loss reason must say something a user can act on"
+    );
 
     // And the turn must not be left looking like it is still running.
     let mut projection = agent::AgentSessionProjection::default();
@@ -176,7 +195,10 @@ fn a_consumer_that_stalls_for_twenty_seconds_loses_nothing() {
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: LONG_PROMPT.to_string(),
+        })
         .unwrap();
 
     // Deliberately do not pump at all. Every event produced in this window has to be held somewhere.
@@ -204,7 +226,8 @@ fn a_consumer_that_stalls_for_twenty_seconds_loses_nothing() {
         "the turn never completed after the stall"
     );
     assert!(
-        !all.iter().any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+        !all.iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
         "a stalled consumer must not be reported as a loss -- nothing was actually lost"
     );
 
@@ -239,7 +262,10 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
     let session_id = open(&provider);
 
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: LONG_PROMPT.to_string(),
+        })
         .unwrap();
 
     // Let a real backlog build without draining it, then interrupt on top of it. 25s, not 12:
@@ -247,7 +273,11 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
     // delta existed, and passed on 5 total events -- proving nothing about ordering under backlog.
     // The sibling stall test measured ~213 events accumulating in 20s on this same prompt.
     std::thread::sleep(Duration::from_secs(25));
-    provider.interrupt_turn(InterruptTurnRequest { session_id: session_id.clone() }).unwrap();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: session_id.clone(),
+        })
+        .unwrap();
     eprintln!("interrupted with an undrained backlog");
 
     let mut all = Vec::new();
@@ -260,7 +290,10 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
 
     // Guards the test's own premise. Without this it passes vacuously whenever the interrupt lands
     // before streaming starts, which is exactly what happened the first time it was run.
-    let content_events = all.iter().filter(|e| matches!(e, AgentDomainEvent::ContentDelta { .. })).count();
+    let content_events = all
+        .iter()
+        .filter(|e| matches!(e, AgentDomainEvent::ContentDelta { .. }))
+        .count();
     assert!(
         content_events > 50,
         "only {content_events} content events -- no real backlog existed, so this run is not \
@@ -286,14 +319,20 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
         .iter()
         .filter(|e| matches!(e, AgentDomainEvent::ContentDelta { .. }))
         .count();
-    assert_eq!(content_after_terminal, 0, "content arrived AFTER the turn's terminal event");
+    assert_eq!(
+        content_after_terminal, 0,
+        "content arrived AFTER the turn's terminal event"
+    );
 
     // The session survives.
     let mut projection = agent::AgentSessionProjection::default();
     for event in &all {
         projection.apply(event);
     }
-    assert_eq!(projection.active_turn_id, None, "the interrupted turn must not still be active");
+    assert_eq!(
+        projection.active_turn_id, None,
+        "the interrupted turn must not still be active"
+    );
     assert!(!matches!(projection.status, ProjectionStatus::Unavailable { .. }));
 
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
@@ -337,7 +376,10 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
     rss("before the turn");
 
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: LONG_PROMPT.to_string(),
+        })
         .unwrap();
 
     // Phase 1: drain attentively, the shape a healthy UI has. Highest sustained event rate.
@@ -358,7 +400,10 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
     // Phase 2: a second turn with NO pumping at all, for 30s. The client's own Vec absorbs it; the
     // point is to see whether anything moves on the sidecar's side while it does.
     provider
-        .send_turn(SendTurnRequest { session_id: session_id.clone(), text: LONG_PROMPT.to_string() })
+        .send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: LONG_PROMPT.to_string(),
+        })
         .unwrap();
     for i in 0..6 {
         std::thread::sleep(Duration::from_secs(5));
@@ -370,8 +415,11 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
     let stats = provider.backpressure_stats();
     eprintln!(
         "[client] pending={} received={} max_lag_ms={} last_lag_ms={} watch_reconnects={}",
-        stats.pending_events, stats.events_received, stats.max_delivery_lag_ms,
-        stats.last_delivery_lag_ms, stats.watch_reconnects
+        stats.pending_events,
+        stats.events_received,
+        stats.max_delivery_lag_ms,
+        stats.last_delivery_lag_ms,
+        stats.watch_reconnects
     );
 
     eprintln!("[sidecar] write-queue lines it printed (ring holds the last 40 stderr lines):");
@@ -382,9 +430,14 @@ fn the_sidecar_write_queue_under_a_real_turn_and_a_pump_stall() {
             eprintln!("    {line}");
         }
     }
-    assert!(seen_any, "the write-queue seam printed nothing -- is this sidecar built from a revision that has it?");
+    assert!(
+        seen_any,
+        "the write-queue seam printed nothing -- is this sidecar built from a revision that has it?"
+    );
 
-    provider.close_session(agent::CloseSessionRequest { session_id }).unwrap();
+    provider
+        .close_session(agent::CloseSessionRequest { session_id })
+        .unwrap();
 }
 
 /// The sidecar's resident memory, by the pid this provider reports spawning -- never by name, since

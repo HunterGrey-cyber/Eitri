@@ -42,7 +42,11 @@ impl NvimThemePayload {
         NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: HashMap::new(),
-            options: NvimOptions { background: "dark".to_string(), guifont: String::new(), colors_name: String::new() },
+            options: NvimOptions {
+                background: "dark".to_string(),
+                guifont: String::new(),
+                colors_name: String::new(),
+            },
         }
     }
 }
@@ -51,7 +55,10 @@ pub(crate) fn parse_payload(line: &str) -> Result<NvimThemePayload, String> {
     let payload: NvimThemePayload =
         serde_json::from_str(line.trim()).map_err(|e| format!("malformed theme payload: {e}"))?;
     if payload.v != PAYLOAD_VERSION {
-        return Err(format!("theme payload version {} (this build reads {PAYLOAD_VERSION})", payload.v));
+        return Err(format!(
+            "theme payload version {} (this build reads {PAYLOAD_VERSION})",
+            payload.v
+        ));
     }
     Ok(payload)
 }
@@ -67,8 +74,22 @@ mod tests {
         let payload = parse_payload(&format!("{DAWN}\n")).expect("valid");
         assert_eq!(payload.options.colors_name, "rose-pine");
         assert_eq!(payload.options.background, "light");
-        assert_eq!(payload.groups["Normal"], HlAttrs { fg: Some(0x575279), bg: Some(0xfaf4ed), reverse: false });
-        assert_eq!(payload.groups["IncSearch"], HlAttrs { fg: None, bg: None, reverse: true });
+        assert_eq!(
+            payload.groups["Normal"],
+            HlAttrs {
+                fg: Some(0x575279),
+                bg: Some(0xfaf4ed),
+                reverse: false
+            }
+        );
+        assert_eq!(
+            payload.groups["IncSearch"],
+            HlAttrs {
+                fg: None,
+                bg: None,
+                reverse: true
+            }
+        );
     }
 
     #[test]
@@ -88,7 +109,10 @@ mod tests {
         assert!(parse_payload("").is_err());
         assert!(parse_payload("not json").is_err());
         assert!(parse_payload(r#"{"v":1,"groups":{}}"#).is_err(), "options is required");
-        assert!(parse_payload(r#"{"v":1,"groups":[],"options":{"background":"dark","guifont":"","colors_name":""}}"#).is_err());
+        assert!(
+            parse_payload(r#"{"v":1,"groups":[],"options":{"background":"dark","guifont":"","colors_name":""}}"#)
+                .is_err()
+        );
     }
 
     #[test]

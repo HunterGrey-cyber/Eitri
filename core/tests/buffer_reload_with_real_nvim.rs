@@ -36,9 +36,21 @@ fn buffer_after_a_disk_change(extra_args: &[String], modify_buffer_first: bool) 
     }
     let out = dir.join("out.txt");
     let status = command
-        .args(["-c", &format!("lua vim.fn.system('printf \"DISK\\\\nchange\\\\n\" > {}')", file.display())])
+        .args([
+            "-c",
+            &format!(
+                "lua vim.fn.system('printf \"DISK\\\\nchange\\\\n\" > {}')",
+                file.display()
+            ),
+        ])
         .args(["-c", &format!("sleep {}m", RELOAD_INTERVAL_MS + 800)])
-        .args(["-c", &format!("lua vim.fn.writefile(vim.api.nvim_buf_get_lines(0,0,-1,false), '{}')", out.display())])
+        .args([
+            "-c",
+            &format!(
+                "lua vim.fn.writefile(vim.api.nvim_buf_get_lines(0,0,-1,false), '{}')",
+                out.display()
+            ),
+        ])
         .args(["-c", "qa!"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -56,7 +68,10 @@ fn buffer_after_a_disk_change(extra_args: &[String], modify_buffer_first: bool) 
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_file_changed_on_disk_reaches_an_unmodified_buffer_with_no_help() {
     let reloaded = buffer_after_a_disk_change(&nvim_args(), false);
-    assert!(reloaded.contains("DISK"), "the timer did not reload the buffer; it holds: {reloaded:?}");
+    assert!(
+        reloaded.contains("DISK"),
+        "the timer did not reload the buffer; it holds: {reloaded:?}"
+    );
     assert!(!reloaded.contains("one"), "the old contents survived: {reloaded:?}");
 }
 
@@ -67,7 +82,10 @@ fn a_file_changed_on_disk_reaches_an_unmodified_buffer_with_no_help() {
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn without_the_cmd_the_same_buffer_stays_stale() {
     let stale = buffer_after_a_disk_change(&[], false);
-    assert!(stale.contains("one"), "nvim reloaded on its own, so the positive test proves nothing: {stale:?}");
+    assert!(
+        stale.contains("one"),
+        "nvim reloaded on its own, so the positive test proves nothing: {stale:?}"
+    );
     assert!(!stale.contains("DISK"), "{stale:?}");
 }
 
@@ -79,5 +97,8 @@ fn without_the_cmd_the_same_buffer_stays_stale() {
 fn a_buffer_with_unsaved_edits_is_left_alone() {
     let kept = buffer_after_a_disk_change(&nvim_args(), true);
     assert!(kept.contains("EDITED"), "the user's unsaved edit was lost: {kept:?}");
-    assert!(!kept.contains("DISK"), "a modified buffer must not be reloaded: {kept:?}");
+    assert!(
+        !kept.contains("DISK"),
+        "a modified buffer must not be reloaded: {kept:?}"
+    );
 }

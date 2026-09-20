@@ -15,16 +15,14 @@ fn parses_real_pretooluse_stdin_shape() {
 
 #[test]
 fn format_decision_allow_matches_real_confirmed_shape() {
-    let expected: serde_json::Value =
-        serde_json::from_str(&fixture("v2_hook_decision_allow.json")).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&fixture("v2_hook_decision_allow.json")).unwrap();
     let actual: serde_json::Value = serde_json::from_str(&format_decision(true, None)).unwrap();
     assert_eq!(actual, expected);
 }
 
 #[test]
 fn format_decision_deny_matches_real_confirmed_shape() {
-    let expected: serde_json::Value =
-        serde_json::from_str(&fixture("v2_hook_decision_deny.json")).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&fixture("v2_hook_decision_deny.json")).unwrap();
     let actual: serde_json::Value =
         serde_json::from_str(&format_decision(false, Some("blocked by capture test"))).unwrap();
     assert_eq!(actual, expected);

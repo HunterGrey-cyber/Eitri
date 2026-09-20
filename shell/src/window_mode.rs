@@ -18,7 +18,9 @@ pub(crate) enum WindowMode {
     Windowed,
     Fullscreen,
     /// `from_fullscreen` remembers which mode to restore when immersive mode is toggled off.
-    Immersive { from_fullscreen: bool },
+    Immersive {
+        from_fullscreen: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,7 +320,10 @@ mod tests {
         // press 1: requested true. press 2 compares against the REQUEST, so it is issued.
         assert_eq!(classify_window_notify(Some(false), false, true), WindowNotify::Stale);
         // ...and once the compositor catches up with the latest request, it is just confirmed.
-        assert_eq!(classify_window_notify(Some(false), false, false), WindowNotify::Confirmed);
+        assert_eq!(
+            classify_window_notify(Some(false), false, false),
+            WindowNotify::Confirmed
+        );
     }
 
     #[test]
@@ -333,7 +338,10 @@ mod tests {
     #[test]
     fn our_own_write_is_recognised_and_a_real_let_is_not() {
         assert!(is_our_echo(Some(true), true));
-        assert!(!is_our_echo(Some(true), false), "the user set it the other way while ours was in flight");
+        assert!(
+            !is_our_echo(Some(true), false),
+            "the user set it the other way while ours was in flight"
+        );
         assert!(!is_our_echo(None, true), "nothing of ours outstanding: a real :let");
     }
 

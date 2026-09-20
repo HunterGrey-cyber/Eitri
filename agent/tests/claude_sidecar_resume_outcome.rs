@@ -60,7 +60,10 @@ fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
     // Typed as a refused RESUME, not as a generic provider failure -- the two call for different
     // things from a user, and only one of them means "that conversation is gone".
     match &error {
-        ConversationError::ResumeRejected { provider_session_id, reason } => {
+        ConversationError::ResumeRejected {
+            provider_session_id,
+            reason,
+        } => {
             assert_eq!(provider_session_id, missing);
             assert!(
                 reason.contains(missing),
@@ -75,7 +78,10 @@ fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
 
     // Not benign: the caller asked for a conversation and does not have one, so the panel must show
     // the start screen rather than reporting a recoverable hiccup and carrying on.
-    assert!(!error.is_benign(), "a refused resume must not be treated as a survivable command error");
+    assert!(
+        !error.is_benign(),
+        "a refused resume must not be treated as a survivable command error"
+    );
 }
 
 /// **The refusal is a verdict the provider stated, not a conclusion drawn from silence.**

@@ -46,8 +46,11 @@ use std::time::Duration;
 /// How long to wait before each reconnect attempt. Three tries inside ~1 second: long enough to ride
 /// out a transient transport hiccup, short enough that a genuinely dead sidecar becomes a visible
 /// error while the user is still looking at the reply it truncated.
-pub(crate) const WATCH_RECONNECT_BACKOFF: [Duration; 3] =
-    [Duration::from_millis(100), Duration::from_millis(250), Duration::from_millis(600)];
+pub(crate) const WATCH_RECONNECT_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(600),
+];
 
 /// What to do with one event, judged only by the sequence it carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +117,10 @@ impl SequenceTracker {
             return SequenceVerdict::Duplicate;
         }
         if sequence > self.last_delivered + 1 {
-            return SequenceVerdict::Lost { first: self.last_delivered + 1, last: sequence - 1 };
+            return SequenceVerdict::Lost {
+                first: self.last_delivered + 1,
+                last: sequence - 1,
+            };
         }
         self.last_delivered = sequence;
         SequenceVerdict::Deliver
@@ -135,24 +141,27 @@ pub(crate) enum OpenFailure {
 /// and `SESSION_NOT_FOUND` means the sidecar has already evicted the session itself.
 pub(crate) fn classify_open_failure(error: &ProviderError) -> OpenFailure {
     match error {
-        ProviderError::Provider { code: ProviderErrorCode::EventGap, .. } => OpenFailure::Fatal(
-            "the provider's replay buffer no longer holds the events that were missed".to_string(),
-        ),
-        ProviderError::Provider { code: ProviderErrorCode::SessionNotFound, .. } => {
-            OpenFailure::Fatal("the provider no longer has this session".to_string())
-        }
+        ProviderError::Provider {
+            code: ProviderErrorCode::EventGap,
+            ..
+        } => OpenFailure::Fatal("the provider's replay buffer no longer holds the events that were missed".to_string()),
+        ProviderError::Provider {
+            code: ProviderErrorCode::SessionNotFound,
+            ..
+        } => OpenFailure::Fatal("the provider no longer has this session".to_string()),
         // The server refusing our cursor as impossible means this client sent one it could not have
         // received -- a bug on this side, not a transport problem, and retrying sends it again.
         // Surfaced with the provider's own words because they name the cursor and the latest
         // sequence, which is what a reader needs to see that the two are unrelated.
-        ProviderError::Provider { code: ProviderErrorCode::InvalidConfiguration, message } => {
-            OpenFailure::Fatal(format!("the provider refused this client's replay cursor: {message}"))
-        }
+        ProviderError::Provider {
+            code: ProviderErrorCode::InvalidConfiguration,
+            message,
+        } => OpenFailure::Fatal(format!("the provider refused this client's replay cursor: {message}")),
         // Any other typed refusal is also unanswerable by a retry, but says something this client
         // did not anticipate -- carry its own words rather than paraphrasing them.
-        ProviderError::Provider { code, message } => {
-            OpenFailure::Fatal(format!("the provider refused to stream this session's events ({code:?}): {message}"))
-        }
+        ProviderError::Provider { code, message } => OpenFailure::Fatal(format!(
+            "the provider refused to stream this session's events ({code:?}): {message}"
+        )),
         ProviderError::UnsupportedCapability(what) => {
             OpenFailure::Fatal(format!("the provider cannot stream this session's events: {what}"))
         }
@@ -264,7 +273,10 @@ mod tests {
     #[test]
     fn a_transport_failure_is_worth_retrying() {
         let error = ProviderError::Transport("broken pipe".to_string());
-        assert_eq!(classify_open_failure(&error), OpenFailure::Retry("broken pipe".to_string()));
+        assert_eq!(
+            classify_open_failure(&error),
+            OpenFailure::Retry("broken pipe".to_string())
+        );
     }
 
     /// Every reason string is shown to a human in the panel's error banner, so none of them may be

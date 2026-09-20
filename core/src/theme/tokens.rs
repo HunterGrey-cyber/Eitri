@@ -61,11 +61,44 @@ const SYNTAX: [(&str, &str, &str); 12] = [
 /// in any consumer's build, which is a worse thing to read than a narrower one.
 #[cfg(test)]
 pub(crate) const GROUPS_READ: &[&str] = &[
-    "Normal", "NormalFloat", "Pmenu", "StatusLine", "WinSeparator", "VertSplit", "Comment", "Visual",
-    "IncSearch", "Search", "DiagnosticWarn", "WarningMsg", "DiagnosticError", "ErrorMsg", "DiagnosticOk",
-    "DiagnosticInfo", "Function", "String", "@keyword", "Statement", "@function", "@string", "@type", "Type",
-    "@comment", "@number", "Number", "@constant", "Constant", "@variable", "Identifier", "@operator",
-    "Operator", "@punctuation", "Delimiter", "@property", "@tag", "Tag",
+    "Normal",
+    "NormalFloat",
+    "Pmenu",
+    "StatusLine",
+    "WinSeparator",
+    "VertSplit",
+    "Comment",
+    "Visual",
+    "IncSearch",
+    "Search",
+    "DiagnosticWarn",
+    "WarningMsg",
+    "DiagnosticError",
+    "ErrorMsg",
+    "DiagnosticOk",
+    "DiagnosticInfo",
+    "Function",
+    "String",
+    "@keyword",
+    "Statement",
+    "@function",
+    "@string",
+    "@type",
+    "Type",
+    "@comment",
+    "@number",
+    "Number",
+    "@constant",
+    "Constant",
+    "@variable",
+    "Identifier",
+    "@operator",
+    "Operator",
+    "@punctuation",
+    "Delimiter",
+    "@property",
+    "@tag",
+    "Tag",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,11 +168,17 @@ impl Groups<'_> {
     }
 
     fn fg_of(&self, names: &[&str]) -> Option<Rgb> {
-        names.iter().filter_map(|n| self.payload.groups.get(*n)).find_map(|a| self.effective(a).0)
+        names
+            .iter()
+            .filter_map(|n| self.payload.groups.get(*n))
+            .find_map(|a| self.effective(a).0)
     }
 
     fn bg_of(&self, names: &[&str]) -> Option<Rgb> {
-        names.iter().filter_map(|n| self.payload.groups.get(*n)).find_map(|a| self.effective(a).1)
+        names
+            .iter()
+            .filter_map(|n| self.payload.groups.get(*n))
+            .find_map(|a| self.effective(a).1)
     }
 }
 
@@ -150,7 +189,11 @@ impl ThemeTokens {
 
     pub fn derive(payload: &NvimThemePayload) -> Self {
         let light = payload.options.background == "light";
-        let (default_bg, default_fg) = if light { (DEFAULT_DARK_FG, DEFAULT_DARK_BG) } else { (DEFAULT_DARK_BG, DEFAULT_DARK_FG) };
+        let (default_bg, default_fg) = if light {
+            (DEFAULT_DARK_FG, DEFAULT_DARK_BG)
+        } else {
+            (DEFAULT_DARK_BG, DEFAULT_DARK_FG)
+        };
         let normal = payload.groups.get("Normal");
         let bg = normal.and_then(|a| a.bg).map(Rgb::from_u32).unwrap_or(default_bg);
         let fg = normal.and_then(|a| a.fg).map(Rgb::from_u32).unwrap_or(default_fg);
@@ -160,7 +203,11 @@ impl ThemeTokens {
         let hint_bg = g.bg_of(&["IncSearch"]).unwrap_or(fg);
         let hint_fg_raw = g.fg_of(&["IncSearch"]).unwrap_or(bg);
         // Toward whichever of Normal's two colours stands out more against the label background.
-        let hint_toward = if hint_bg.contrast(bg) >= hint_bg.contrast(fg) { bg } else { fg };
+        let hint_toward = if hint_bg.contrast(bg) >= hint_bg.contrast(fg) {
+            bg
+        } else {
+            fg
+        };
         // Normal's two colours cannot always carry text on a mid-luminance IncSearch: on rose-pine
         // dawn's real `#d7827e`, the best either reaches is 2.60:1, and `ensure_contrast` would
         // hand back that failing colour. Black or white always reaches 4.5:1 on one side of any
@@ -171,24 +218,43 @@ impl ThemeTokens {
                 toward_normal
             } else {
                 let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(0xff, 0xff, 0xff));
-                let pole = if hint_bg.contrast(black) >= hint_bg.contrast(white) { black } else { white };
+                let pole = if hint_bg.contrast(black) >= hint_bg.contrast(white) {
+                    black
+                } else {
+                    white
+                };
                 ensure_contrast(hint_fg_raw, hint_bg, pole, TEXT_CONTRAST)
             }
         };
-        let signal = |names: &[&str], fallback: Rgb| ensure_contrast(g.fg_of(names).unwrap_or(fallback), bg, fg, UI_CONTRAST);
+        let signal =
+            |names: &[&str], fallback: Rgb| ensure_contrast(g.fg_of(names).unwrap_or(fallback), bg, fg, UI_CONTRAST);
         let comment = g.fg_of(&["Comment"]);
         let function = g.fg_of(&["Function"]);
 
         // Text on chrome is guarded against chrome itself, toward whichever of Normal's colours
         // stands out more from it. Never against `bg`: a reversed StatusLine makes chrome Normal's fg.
         let chrome = g.bg_of(&["StatusLine"]).unwrap_or(surface);
-        let chrome_toward = if chrome.contrast(bg) >= chrome.contrast(fg) { bg } else { fg };
-        let chrome_fg = ensure_contrast(g.fg_of(&["StatusLine"]).unwrap_or(fg), chrome, chrome_toward, TEXT_CONTRAST);
+        let chrome_toward = if chrome.contrast(bg) >= chrome.contrast(fg) {
+            bg
+        } else {
+            fg
+        };
+        let chrome_fg = ensure_contrast(
+            g.fg_of(&["StatusLine"]).unwrap_or(fg),
+            chrome,
+            chrome_toward,
+            TEXT_CONTRAST,
+        );
 
         // A reversed Visual draws the selection in inverse video; as a band under fg-coloured text
         // that would be the text colour itself. Only a Visual that paints its own background counts.
         // Two guards, readability last: visibly a band against bg, and fg text on it still reads.
-        let visual_band = payload.groups.get("Visual").filter(|a| !a.reverse).and_then(|a| a.bg).map(Rgb::from_u32);
+        let visual_band = payload
+            .groups
+            .get("Visual")
+            .filter(|a| !a.reverse)
+            .and_then(|a| a.bg)
+            .map(Rgb::from_u32);
         let cursorline = ensure_contrast(
             ensure_contrast(visual_band.unwrap_or(surface), bg, fg, CURSORLINE_CONTRAST),
             fg,
@@ -202,9 +268,16 @@ impl ThemeTokens {
             surface,
             chrome,
             chrome_fg,
-            chrome_muted: ensure_contrast(comment.unwrap_or_else(|| chrome.mix(chrome_fg, 0.5)), chrome, chrome_fg, TEXT_CONTRAST),
+            chrome_muted: ensure_contrast(
+                comment.unwrap_or_else(|| chrome.mix(chrome_fg, 0.5)),
+                chrome,
+                chrome_fg,
+                TEXT_CONTRAST,
+            ),
             chrome_accent: ensure_contrast(function.unwrap_or(chrome_fg), chrome, chrome_fg, UI_CONTRAST),
-            border: g.fg_of(&["WinSeparator", "VertSplit"]).unwrap_or_else(|| bg.mix(fg, 0.15)),
+            border: g
+                .fg_of(&["WinSeparator", "VertSplit"])
+                .unwrap_or_else(|| bg.mix(fg, 0.15)),
             muted: ensure_contrast(comment.unwrap_or_else(|| bg.mix(fg, 0.5)), bg, fg, TEXT_CONTRAST),
             cursorline,
             hint_bg,
@@ -215,7 +288,10 @@ impl ThemeTokens {
             ok: signal(&["DiagnosticOk", "DiagnosticInfo"], FALLBACK_OK),
             mode_browse: function.unwrap_or(fg),
             mode_input: g.fg_of(&["String"]).unwrap_or(fg),
-            syntax: SYNTAX.iter().map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg))).collect(),
+            syntax: SYNTAX
+                .iter()
+                .map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg)))
+                .collect(),
             font_mono: mono_font_stack(&payload.options.guifont),
             color_scheme: if light { "light" } else { "dark" },
         }
@@ -242,9 +318,15 @@ impl ThemeTokens {
             ("mode-browse", self.mode_browse),
             ("mode-input", self.mode_input),
         ];
-        let mut vars: Vec<(String, String)> =
-            colours.into_iter().map(|(name, colour)| (format!("--nv-{name}"), colour.hex())).collect();
-        vars.extend(self.syntax.iter().map(|(name, colour)| (format!("--nv-syn-{name}"), colour.hex())));
+        let mut vars: Vec<(String, String)> = colours
+            .into_iter()
+            .map(|(name, colour)| (format!("--nv-{name}"), colour.hex()))
+            .collect();
+        vars.extend(
+            self.syntax
+                .iter()
+                .map(|(name, colour)| (format!("--nv-syn-{name}"), colour.hex())),
+        );
         vars.push(("--nv-font-prose".to_string(), PROSE_FONT_STACK.to_string()));
         vars.push(("--nv-font-mono".to_string(), self.font_mono.clone()));
         vars.push(("--nv-color-scheme".to_string(), self.color_scheme.to_string()));
@@ -263,7 +345,11 @@ pub(crate) fn mono_font_stack(guifont: &str) -> String {
     let mut stack: Vec<String> = families
         .split(',')
         .map(|f| f.replace("\\ ", " ").replace('_', " "))
-        .map(|f| f.chars().filter(|c| !matches!(c, '"' | '\\' | ';' | '{' | '}' | '<' | '>')).collect::<String>())
+        .map(|f| {
+            f.chars()
+                .filter(|c| !matches!(c, '"' | '\\' | ';' | '{' | '}' | '<' | '>'))
+                .collect::<String>()
+        })
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty())
         .map(|f| format!("\"{f}\""))
@@ -285,8 +371,15 @@ mod tests {
     fn payload(background: &str, groups: &[(&str, HlAttrs)]) -> NvimThemePayload {
         NvimThemePayload {
             v: PAYLOAD_VERSION,
-            groups: groups.iter().map(|(n, a)| (n.to_string(), a.clone())).collect::<HashMap<_, _>>(),
-            options: NvimOptions { background: background.into(), guifont: String::new(), colors_name: "t".into() },
+            groups: groups
+                .iter()
+                .map(|(n, a)| (n.to_string(), a.clone()))
+                .collect::<HashMap<_, _>>(),
+            options: NvimOptions {
+                background: background.into(),
+                guifont: String::new(),
+                colors_name: "t".into(),
+            },
         }
     }
 
@@ -298,7 +391,9 @@ mod tests {
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
         assert_eq!(vars.len(), 33);
-        assert!(vars.iter().all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
+        assert!(vars
+            .iter()
+            .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names.len(), 33, "no duplicate variable names");
     }
@@ -324,7 +419,11 @@ mod tests {
             ],
         ));
         assert_eq!(t.surface.hex(), "#fffaf3");
-        assert_eq!(t.cursorline.hex(), "#dfdad9", "1.27:1 already clears the 1.15 cursorline guard");
+        assert_eq!(
+            t.cursorline.hex(),
+            "#dfdad9",
+            "1.27:1 already clears the 1.15 cursorline guard"
+        );
         assert_eq!(t.hint_bg.hex(), "#d7827e");
         // Neither of Normal's colours reaches 4.5:1 on this IncSearch (2.56 and 2.60): the label
         // text must still read.
@@ -339,7 +438,17 @@ mod tests {
     fn a_reversed_group_with_no_colours_draws_normal_inverted() {
         let t = ThemeTokens::derive(&payload(
             "dark",
-            &[("Normal", hl(Some(0xffffff), Some(0x000000))), ("IncSearch", HlAttrs { fg: None, bg: None, reverse: true })],
+            &[
+                ("Normal", hl(Some(0xffffff), Some(0x000000))),
+                (
+                    "IncSearch",
+                    HlAttrs {
+                        fg: None,
+                        bg: None,
+                        reverse: true,
+                    },
+                ),
+            ],
         ));
         assert_eq!(t.hint_bg.hex(), "#ffffff");
         assert_eq!(t.hint_fg.hex(), "#000000");
@@ -359,7 +468,13 @@ mod tests {
 
     #[test]
     fn the_treesitter_group_wins_over_the_legacy_one() {
-        let both = ThemeTokens::derive(&payload("dark", &[("@keyword", hl(Some(0x111111), None)), ("Statement", hl(Some(0x222222), None))]));
+        let both = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                ("@keyword", hl(Some(0x111111), None)),
+                ("Statement", hl(Some(0x222222), None)),
+            ],
+        ));
         let legacy_only = ThemeTokens::derive(&payload("dark", &[("Statement", hl(Some(0x222222), None))]));
         let keyword = |t: &ThemeTokens| t.syntax.iter().find(|(n, _)| *n == "keyword").unwrap().1;
         assert_eq!(keyword(&both).hex(), "#111111");
@@ -369,7 +484,13 @@ mod tests {
     #[test]
     fn signal_colours_are_guarded_at_three_to_one() {
         // Near-white warning text on white: unusable as-is.
-        let t = ThemeTokens::derive(&payload("light", &[("Normal", hl(Some(0x000000), Some(0xffffff))), ("DiagnosticWarn", hl(Some(0xfff8e0), None))]));
+        let t = ThemeTokens::derive(&payload(
+            "light",
+            &[
+                ("Normal", hl(Some(0x000000), Some(0xffffff))),
+                ("DiagnosticWarn", hl(Some(0xfff8e0), None)),
+            ],
+        ));
         assert!(t.warn.contrast(t.bg) >= 3.0);
     }
 
@@ -380,10 +501,23 @@ mod tests {
         // row carries.
         let t = ThemeTokens::derive(&payload(
             "dark",
-            &[("Normal", hl(Some(0xebdbb2), Some(0x282828))), ("Visual", HlAttrs { fg: None, bg: Some(0x665c54), reverse: true })],
+            &[
+                ("Normal", hl(Some(0xebdbb2), Some(0x282828))),
+                (
+                    "Visual",
+                    HlAttrs {
+                        fg: None,
+                        bg: Some(0x665c54),
+                        reverse: true,
+                    },
+                ),
+            ],
         ));
         assert_ne!(t.cursorline, t.fg);
-        assert!(t.cursorline.contrast(t.fg) >= 4.5, "fg text on a hovered row must stay readable");
+        assert!(
+            t.cursorline.contrast(t.fg) >= 4.5,
+            "fg text on a hovered row must stay readable"
+        );
         assert!(t.cursorline.contrast(t.bg) >= 1.15);
     }
 
@@ -392,12 +526,29 @@ mod tests {
         // lunaperche (dark) and quiet (light) as nvim 0.12 ships them: StatusLine is reverse-only and
         // Function has no fg, so chrome becomes Normal's fg -- the colour bg-guarded tokens are pushed
         // toward. Every text token drawn on chrome must be guarded against chrome itself.
-        for (background, normal, comment) in [("dark", hl(Some(0xc6c6c6), Some(0x000000)), 0x949494), ("light", hl(Some(0x000000), Some(0xd7d7d7)), 0x000000)] {
+        for (background, normal, comment) in [
+            ("dark", hl(Some(0xc6c6c6), Some(0x000000)), 0x949494),
+            ("light", hl(Some(0x000000), Some(0xd7d7d7)), 0x000000),
+        ] {
             let t = ThemeTokens::derive(&payload(
                 background,
-                &[("Normal", normal), ("StatusLine", HlAttrs { fg: None, bg: None, reverse: true }), ("Comment", hl(Some(comment), None))],
+                &[
+                    ("Normal", normal),
+                    (
+                        "StatusLine",
+                        HlAttrs {
+                            fg: None,
+                            bg: None,
+                            reverse: true,
+                        },
+                    ),
+                    ("Comment", hl(Some(comment), None)),
+                ],
             ));
-            assert_eq!(t.chrome, t.fg, "{background}: a reversed StatusLine paints chrome with Normal's fg");
+            assert_eq!(
+                t.chrome, t.fg,
+                "{background}: a reversed StatusLine paints chrome with Normal's fg"
+            );
             assert!(t.chrome_fg.contrast(t.chrome) >= 4.5, "{background}: chrome_fg");
             assert!(t.chrome_muted.contrast(t.chrome) >= 4.5, "{background}: chrome_muted");
             assert!(t.chrome_accent.contrast(t.chrome) >= 3.0, "{background}: chrome_accent");
@@ -418,7 +569,10 @@ mod tests {
     #[test]
     fn guifont_is_parsed_the_way_neovide_parses_it() {
         assert_eq!(mono_font_stack(""), "\"FiraCode Nerd Font\", monospace");
-        assert_eq!(mono_font_stack("Maple_Mono_NF_CN:h14"), "\"Maple Mono NF CN\", \"FiraCode Nerd Font\", monospace");
+        assert_eq!(
+            mono_font_stack("Maple_Mono_NF_CN:h14"),
+            "\"Maple Mono NF CN\", \"FiraCode Nerd Font\", monospace"
+        );
         assert_eq!(
             mono_font_stack("Fira\\ Code,Symbols Nerd Font:h12:b"),
             "\"Fira Code\", \"Symbols Nerd Font\", \"FiraCode Nerd Font\", monospace"
@@ -427,6 +581,9 @@ mod tests {
 
     #[test]
     fn guifont_cannot_break_out_of_a_css_value() {
-        assert_eq!(mono_font_stack("evil\";}body{x"), "\"evilbodyx\", \"FiraCode Nerd Font\", monospace");
+        assert_eq!(
+            mono_font_stack("evil\";}body{x"),
+            "\"evilbodyx\", \"FiraCode Nerd Font\", monospace"
+        );
     }
 }

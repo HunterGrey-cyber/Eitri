@@ -52,11 +52,7 @@ impl CommandRegistry {
 }
 
 /// `pub`: `LuaEngine::new` calls this.
-pub fn install(
-    lua: &Lua,
-    neovibe: &Table,
-    registry: Rc<RefCell<CommandRegistry>>,
-) -> mlua::Result<()> {
+pub fn install(lua: &Lua, neovibe: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
     let command_table = lua.create_table()?;
     let register_fn = lua.create_function(move |lua, spec: Table| {
         let id: String = spec.get("id")?;
@@ -64,9 +60,14 @@ pub fn install(
         let keybinding: Option<String> = spec.get("keybinding")?;
         let action: mlua::Function = spec.get("action")?;
         let action_key = lua.create_registry_value(action)?;
-        registry
-            .borrow_mut()
-            .register(id, CommandEntry { title, keybinding, action: Rc::new(action_key) });
+        registry.borrow_mut().register(
+            id,
+            CommandEntry {
+                title,
+                keybinding,
+                action: Rc::new(action_key),
+            },
+        );
         Ok(())
     })?;
     command_table.set("register", register_fn)?;

@@ -64,7 +64,9 @@ pub fn emit(lua: &Lua, bus: &RefCell<EventBus>, event_name: &str, payload: Value
         }
     };
     for key in &keys {
-        let Ok(f) = lua.registry_value::<mlua::Function>(key) else { continue };
+        let Ok(f) = lua.registry_value::<mlua::Function>(key) else {
+            continue;
+        };
         if let Err(err) = f.call::<()>(payload.clone()) {
             eprintln!("[lua] event '{event_name}' handler error: {err}");
         }

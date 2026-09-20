@@ -21,7 +21,6 @@ use gtk4::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-
 /// The index of the first pane in `panes` whose element appears in `chain`, walking `chain` in
 /// order (the focus widget first, then each ancestor). `None` means focus is in none of them: the
 /// top bar's buttons, say, or no focus widget at all.
@@ -83,7 +82,10 @@ pub(crate) fn install(
 /// This is where a key typed now would go, rather than the last focused pane. `Ctrl+a Ctrl+a`
 /// forwards its `Ctrl+a` here.
 pub(crate) fn focused_pane(window: &gtk4::ApplicationWindow, panes: &[gtk4::Widget]) -> Option<usize> {
-    owning_pane(std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent()), panes)
+    owning_pane(
+        std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent()),
+        panes,
+    )
 }
 
 #[cfg(test)]
@@ -97,12 +99,18 @@ mod tests {
 
     #[test]
     fn a_widget_inside_a_pane_counts_as_that_pane() {
-        assert_eq!(owning_pane(["textarea-ish", "agent", "overlay", "window"], &["editor", "agent"]), Some(1));
+        assert_eq!(
+            owning_pane(["textarea-ish", "agent", "overlay", "window"], &["editor", "agent"]),
+            Some(1)
+        );
     }
 
     #[test]
     fn focus_outside_every_pane_is_none() {
-        assert_eq!(owning_pane(["reload-button", "topbar", "window"], &["editor", "agent"]), None);
+        assert_eq!(
+            owning_pane(["reload-button", "topbar", "window"], &["editor", "agent"]),
+            None
+        );
         assert_eq!(owning_pane(Vec::<&str>::new(), &["editor", "agent"]), None);
     }
 
@@ -117,13 +125,19 @@ mod tests {
     fn every_pane_gets_one_first_report_then_only_changes() {
         assert_eq!(focus_changes(&[None, None], Some(0), true), vec![(0, true), (1, false)]);
         assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), true), vec![]);
-        assert_eq!(focus_changes(&[Some(true), Some(false)], Some(1), true), vec![(0, false), (1, true)]);
+        assert_eq!(
+            focus_changes(&[Some(true), Some(false)], Some(1), true),
+            vec![(0, false), (1, true)]
+        );
     }
 
     #[test]
     fn an_inactive_window_gives_no_pane_the_keys() {
         // Alt-tab away: the editor stops drawing its cursor.
-        assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), false), vec![(0, false)]);
+        assert_eq!(
+            focus_changes(&[Some(true), Some(false)], Some(0), false),
+            vec![(0, false)]
+        );
         // Focus on the top bar: neither pane has the keys.
         assert_eq!(focus_changes(&[Some(false), Some(true)], None, true), vec![(1, false)]);
     }

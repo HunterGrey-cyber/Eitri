@@ -81,8 +81,11 @@ fn claude_resolved_from_inherited_path_accepts_the_products_gate_bearing_setting
     // socket path that this test never binds and nothing ever connects to -- what is under test
     // here is whether the resolved binary accepts a `--settings` value shaped like this at all,
     // not whether a real hook fires (that is `agent::process`'s own, much larger, test suite).
-    let probe_socket = agent::socket_path::in_dir(&std::env::temp_dir(), &format!("nv-env-conf-{}.sock", uuid::Uuid::new_v4().simple()))
-        .expect("the probe socket path must fit the macOS length limit, same as every real one");
+    let probe_socket = agent::socket_path::in_dir(
+        &std::env::temp_dir(),
+        &format!("nv-env-conf-{}.sock", uuid::Uuid::new_v4().simple()),
+    )
+    .expect("the probe socket path must fit the macOS length limit, same as every real one");
     let settings_json = agent::settings::hook_settings_arg(&probe_socket)
         .expect("building the hook-settings argument does not itself require a live socket or a real claude");
 

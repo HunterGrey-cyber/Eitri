@@ -7,7 +7,10 @@
 //! For WebView rehydration, calling `load_html` again with the embedded document lets a
 //! `snapshot` restore prior state. Literal `WebView::reload()` leaves this content blank.
 
-use agent::{AgentDomainEvent, AgentSession, PermissionDecision, PermissionMode, ProjectionStatus, TurnOutcome, CONSERVATIVE_DISALLOWED_TOOLS};
+use agent::{
+    AgentDomainEvent, AgentSession, PermissionDecision, PermissionMode, ProjectionStatus, TurnOutcome,
+    CONSERVATIVE_DISALLOWED_TOOLS,
+};
 
 #[test]
 #[ignore]
@@ -45,7 +48,10 @@ fn real_pretooluse_hook_allow_end_to_end() {
     session.send_turn("run: echo hello, and tell me the output").unwrap();
     let mut gated_tool_use_id: Option<Option<String>> = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline && session.projection.pending_permissions.is_empty() && gated_tool_use_id.is_none() {
+    while std::time::Instant::now() < deadline
+        && session.projection.pending_permissions.is_empty()
+        && gated_tool_use_id.is_none()
+    {
         for event in session.pump() {
             if let AgentDomainEvent::PermissionRequested { tool_use_id, .. } = event {
                 gated_tool_use_id = Some(tool_use_id);
@@ -62,7 +68,9 @@ fn real_pretooluse_hook_allow_end_to_end() {
     );
 
     let permission_id = session.projection.pending_permissions.keys().next().unwrap().clone();
-    session.respond_permission(&permission_id, PermissionDecision::Allow).unwrap();
+    session
+        .respond_permission(&permission_id, PermissionDecision::Allow)
+        .unwrap();
     assert!(
         !session.projection.pending_permissions.contains_key(&permission_id),
         "respond_permission must remove the answered request immediately"
@@ -74,7 +82,12 @@ fn real_pretooluse_hook_allow_end_to_end() {
     // The step the capture notes leave as an inference: the id the hook gated really is the id of
     // a tool call in this same conversation's transcript. Checked after the turn, because the
     // assistant `tool_use` block and the `PreToolUse` hook have no guaranteed arrival order.
-    let recorded: Vec<&str> = session.projection.tool_calls.iter().map(|c| c.tool_use_id.as_str()).collect();
+    let recorded: Vec<&str> = session
+        .projection
+        .tool_calls
+        .iter()
+        .map(|c| c.tool_use_id.as_str())
+        .collect();
     assert!(
         recorded.contains(&gated_tool_use_id.as_str()),
         "the gated tool_use_id {gated_tool_use_id} names no tool call in this conversation; \
@@ -112,20 +125,34 @@ fn real_pretooluse_hook_deny_end_to_end() {
         }
         let pending_ids: Vec<String> = session.projection.pending_permissions.keys().cloned().collect();
         for permission_id in pending_ids {
-            session.respond_permission(&permission_id, PermissionDecision::Deny { reason: Some(DENY_REASON.to_string()) }).unwrap();
+            session
+                .respond_permission(
+                    &permission_id,
+                    PermissionDecision::Deny {
+                        reason: Some(DENY_REASON.to_string()),
+                    },
+                )
+                .unwrap();
             denied_any = true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    assert!(denied_any, "expected at least one real PreToolUse-hook-sourced PermissionRequested to deny");
+    assert!(
+        denied_any,
+        "expected at least one real PreToolUse-hook-sourced PermissionRequested to deny"
+    );
     let result_text = result_text.expect("no TurnCompleted within 90s");
 
     let denied_results: Vec<_> = session
         .projection
         .tool_calls
         .iter()
-        .filter_map(|call| call.result.as_ref().map(|r| (call.name.clone(), r.content.clone(), r.is_error)))
+        .filter_map(|call| {
+            call.result
+                .as_ref()
+                .map(|r| (call.name.clone(), r.content.clone(), r.is_error))
+        })
         .collect();
     assert!(
         denied_results.iter().any(|(_, content, is_error)| *is_error && content.to_string().contains(DENY_REASON)),
@@ -234,7 +261,12 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
 
     let pending_ids: Vec<String> = session_a.projection.pending_permissions.keys().cloned().collect();
     for permission_id in pending_ids {
-        let _ = session_a.respond_permission(&permission_id, PermissionDecision::Deny { reason: Some("test cleanup".to_string()) });
+        let _ = session_a.respond_permission(
+            &permission_id,
+            PermissionDecision::Deny {
+                reason: Some("test cleanup".to_string()),
+            },
+        );
     }
     session_a.shutdown();
     session_b.shutdown();
@@ -271,7 +303,13 @@ fn real_interrupt_mid_permission_denies_pending_requests_without_ending_the_sess
         "interrupt() must deny and clear every pending permission immediately"
     );
     assert!(
-        interrupt_events.iter().all(|e| matches!(e, AgentDomainEvent::PermissionResolved { outcome: agent::PermissionOutcome::CancelledByInterrupt, .. })),
+        interrupt_events.iter().all(|e| matches!(
+            e,
+            AgentDomainEvent::PermissionResolved {
+                outcome: agent::PermissionOutcome::CancelledByInterrupt,
+                ..
+            }
+        )),
         "interrupt() must return exactly the PermissionResolved events it caused, got: {interrupt_events:?}"
     );
 
@@ -285,9 +323,17 @@ fn real_interrupt_mid_permission_denies_pending_requests_without_ending_the_sess
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(turn_outcome, Some(TurnOutcome::Interrupted), "expected the interrupted turn's own TurnCompleted to report outcome Interrupted");
+    assert_eq!(
+        turn_outcome,
+        Some(TurnOutcome::Interrupted),
+        "expected the interrupted turn's own TurnCompleted to report outcome Interrupted"
+    );
     assert!(session.projection.active_turn_id.is_none());
-    assert_eq!(session.projection.status, ProjectionStatus::Running, "session must survive interrupt(), not end up Unavailable/Closed");
+    assert_eq!(
+        session.projection.status,
+        ProjectionStatus::Running,
+        "session must survive interrupt(), not end up Unavailable/Closed"
+    );
 
     session.send_turn("reply with exactly the word: pong").unwrap();
     let result = drain_until_finished(&mut session);
@@ -334,8 +380,12 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     let target = dir.join("greeting.txt");
     std::fs::write(&target, "hello world\n").unwrap();
 
-    let mut session =
-        AgentSession::start(&dir, PermissionMode::Auto, agent::disallowed_tools_for(PermissionMode::Auto)).unwrap();
+    let mut session = AgentSession::start(
+        &dir,
+        PermissionMode::Auto,
+        agent::disallowed_tools_for(PermissionMode::Auto),
+    )
+    .unwrap();
     session
         .send_turn(&format!(
             "Use the Edit tool to change the word 'world' to 'neovibe' in {}. Do not use a shell.",
@@ -354,12 +404,19 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     while std::time::Instant::now() < deadline && !finished {
         for event in session.pump() {
             match &event {
-                AgentDomainEvent::PermissionRequested { permission_id, tool_name, input, .. } => {
+                AgentDomainEvent::PermissionRequested {
+                    permission_id,
+                    tool_name,
+                    input,
+                    ..
+                } => {
                     if tool_name == "Edit" {
                         edit_request = Some(input.clone());
                     }
                     if answered.insert(permission_id.clone()) {
-                        session.respond_permission(permission_id, PermissionDecision::Allow).unwrap();
+                        session
+                            .respond_permission(permission_id, PermissionDecision::Allow)
+                            .unwrap();
                     }
                 }
                 AgentDomainEvent::TurnCompleted { .. } => finished = true,
@@ -368,7 +425,11 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(finished, "the turn never completed after answering {} request(s)", answered.len());
+    assert!(
+        finished,
+        "the turn never completed after answering {} request(s)",
+        answered.len()
+    );
 
     // Clause 1 and 2's data: the model reached for `Edit`, and the gated request carries exactly the
     // fields `agent-ui/web/src/diff.ts` draws a diff from. Asserted on the real wire value rather
@@ -378,13 +439,19 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
          and it is the failure the MVP sentence's first clause describes",
     );
     for field in ["file_path", "old_string", "new_string"] {
-        assert!(input.get(field).is_some(), "a reviewable Edit request must carry {field}: {input}");
+        assert!(
+            input.get(field).is_some(),
+            "a reviewable Edit request must carry {field}: {input}"
+        );
     }
     assert_eq!(input["file_path"].as_str().unwrap(), target.display().to_string());
 
     // Clause 4: approving really wrote it.
     let after = std::fs::read_to_string(&target).unwrap();
-    assert!(after.contains("neovibe"), "the approved edit did not land; the file holds: {after:?}");
+    assert!(
+        after.contains("neovibe"),
+        "the approved edit did not land; the file holds: {after:?}"
+    );
     assert!(!after.contains("world"), "the old text survived: {after:?}");
 
     session.shutdown();

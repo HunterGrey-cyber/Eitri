@@ -19,11 +19,7 @@ pub struct ConfigStore {
 }
 
 /// `pub`: `LuaEngine::new` calls this.
-pub fn install(
-    lua: &Lua,
-    neovibe: &Table,
-    store: Rc<RefCell<ConfigStore>>,
-) -> mlua::Result<()> {
+pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
     let config_table = lua.create_table()?;
 
     let store_for_get = store.clone();
@@ -59,10 +55,7 @@ mod tests {
         lua.globals().set("neovibe", neovibe).unwrap();
 
         lua.load(r#"neovibe.config.set("greeting", "hello")"#).exec().unwrap();
-        let value: String = lua
-            .load(r#"return neovibe.config.get("greeting")"#)
-            .eval()
-            .unwrap();
+        let value: String = lua.load(r#"return neovibe.config.get("greeting")"#).eval().unwrap();
         assert_eq!(value, "hello");
     }
 

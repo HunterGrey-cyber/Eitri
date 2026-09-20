@@ -149,8 +149,17 @@ pub(crate) fn handle_mouse_button(
         position_from_event
     };
 
-    session.harness.send_mouse_button(button, pressed, grid_pos, &modifier_string);
-    session.active_drag.set(if pressed { Some(DragState { button, last_grid_pos: grid_pos }) } else { None });
+    session
+        .harness
+        .send_mouse_button(button, pressed, grid_pos, &modifier_string);
+    session.active_drag.set(if pressed {
+        Some(DragState {
+            button,
+            last_grid_pos: grid_pos,
+        })
+    } else {
+        None
+    });
     session.wants_frame.set(true);
 }
 
@@ -199,7 +208,10 @@ pub(crate) fn handle_mouse_motion(
 
     let modifier_string = format_modifier_string(controller.current_event_state());
     session.harness.send_mouse_drag(drag.button, grid_pos, &modifier_string);
-    session.active_drag.set(Some(DragState { button: drag.button, last_grid_pos: grid_pos }));
+    session.active_drag.set(Some(DragState {
+        button: drag.button,
+        last_grid_pos: grid_pos,
+    }));
     session.wants_frame.set(true);
 }
 

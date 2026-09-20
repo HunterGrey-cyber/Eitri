@@ -179,7 +179,11 @@ fn canonicalize_source(source: &RootSource, cwd: io::Result<PathBuf>) -> Result<
     // `canonicalize` succeeds for a regular file, so `shell README.md` would otherwise reach nvim
     // and the agent as a cwd and fail two different ways, none of them here.
     if !resolved.is_dir() {
-        return Err(format!("{} is not a directory ({})", source.describe(), resolved.display()));
+        return Err(format!(
+            "{} is not a directory ({})",
+            source.describe(),
+            resolved.display()
+        ));
     }
     Ok(resolved)
 }
@@ -189,10 +193,7 @@ mod tests {
     use super::*;
 
     /// `select_root_source` over `&str` literals, which is what almost every case below wants.
-    fn select<'a>(
-        args: impl IntoIterator<Item = &'a str>,
-        env: Option<&str>,
-    ) -> Result<RootSource, String> {
+    fn select<'a>(args: impl IntoIterator<Item = &'a str>, env: Option<&str>) -> Result<RootSource, String> {
         let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
         select_root_source(args.iter().map(OsString::as_os_str), env.map(OsStr::new))
     }
@@ -203,7 +204,10 @@ mod tests {
 
     #[test]
     fn a_positional_argument_wins_over_everything() {
-        assert_eq!(select(["/srv/project"], Some("/from/env")), Ok(argument("/srv/project")));
+        assert_eq!(
+            select(["/srv/project"], Some("/from/env")),
+            Ok(argument("/srv/project"))
+        );
     }
 
     #[test]
@@ -244,9 +248,15 @@ mod tests {
         // stopped testing anything the `-myproj` line above did not already cover, so it is kept
         // below as the *unknown*-token case and `--clean` carries the known-token one.
         assert_eq!(select(["--", "--clean"], None), Ok(argument("--clean")));
-        assert_eq!(select(["--clean", "--", "--terminal"], None), Ok(argument("--terminal")));
+        assert_eq!(
+            select(["--clean", "--", "--terminal"], None),
+            Ok(argument("--terminal"))
+        );
         // A bare trailing `--` is "no positional argument", not an error and not an empty path.
-        assert_eq!(select(["--clean", "--"], Some("/from/env")), Ok(RootSource::Env(OsString::from("/from/env"))));
+        assert_eq!(
+            select(["--clean", "--"], Some("/from/env")),
+            Ok(RootSource::Env(OsString::from("/from/env")))
+        );
     }
 
     #[test]
@@ -270,7 +280,10 @@ mod tests {
 
     #[test]
     fn the_environment_is_used_only_when_no_argument_was_given() {
-        assert_eq!(select([], Some("/from/env")), Ok(RootSource::Env(OsString::from("/from/env"))));
+        assert_eq!(
+            select([], Some("/from/env")),
+            Ok(RootSource::Env(OsString::from("/from/env")))
+        );
     }
 
     #[test]

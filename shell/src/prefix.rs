@@ -110,7 +110,9 @@ enum State {
     Idle,
     Armed,
     /// After a repeatable command: another repeatable key before `until` runs without the prefix.
-    Repeat { until: Instant },
+    Repeat {
+        until: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -123,7 +125,10 @@ pub(crate) struct Prefix {
 
 impl Prefix {
     pub(crate) fn new() -> Self {
-        Prefix { state: State::Idle, held: None }
+        Prefix {
+            state: State::Idle,
+            held: None,
+        }
     }
 
     /// Whether the prefix is waiting for its next key, as shown in the top bar.
@@ -157,7 +162,9 @@ impl Prefix {
             // terminal's own auto-repeat does under tmux's `-r`; anything else reaches nobody.
             if let (State::Repeat { .. }, PrefixKey::Plain(ch)) = (self.state, key) {
                 if let Some((cmd, true)) = command(ch) {
-                    self.state = State::Repeat { until: now + REPEAT_TIME };
+                    self.state = State::Repeat {
+                        until: now + REPEAT_TIME,
+                    };
                     return Outcome::Run(cmd);
                 }
             }
@@ -183,7 +190,9 @@ impl Prefix {
                     PrefixKey::Plain(ch) => match command(ch) {
                         Some((cmd, repeatable)) => {
                             if repeatable {
-                                self.state = State::Repeat { until: now + REPEAT_TIME };
+                                self.state = State::Repeat {
+                                    until: now + REPEAT_TIME,
+                                };
                             }
                             Outcome::Run(cmd)
                         }
@@ -201,7 +210,9 @@ impl Prefix {
                 }
                 PrefixKey::Plain(ch) if matches!(command(ch), Some((_, true))) => {
                     self.held = Some(keycode);
-                    self.state = State::Repeat { until: now + REPEAT_TIME };
+                    self.state = State::Repeat {
+                        until: now + REPEAT_TIME,
+                    };
                     Outcome::Run(command(ch).expect("matched above").0)
                 }
                 // Not repeatable: repeat mode ends and the key goes to the pane as usual (tmux).
@@ -321,7 +332,10 @@ mod tests {
         assert_eq!(classify(Key::M, ModifierType::SHIFT_MASK), PrefixKey::Plain('M'));
         assert_eq!(classify(Key::Escape, ModifierType::empty()), PrefixKey::Escape);
         assert_eq!(classify(Key::Shift_L, ModifierType::SHIFT_MASK), PrefixKey::Modifier);
-        assert_eq!(classify(Key::Control_L, ModifierType::CONTROL_MASK), PrefixKey::Modifier);
+        assert_eq!(
+            classify(Key::Control_L, ModifierType::CONTROL_MASK),
+            PrefixKey::Modifier
+        );
         assert_eq!(classify(Key::Return, ModifierType::empty()), PrefixKey::Other);
     }
 
@@ -390,16 +404,25 @@ mod tests {
         let t0 = Instant::now();
         let mut p = Prefix::new();
         p.press(PrefixKey::Prefix, CTRL_A, t0);
-        assert_eq!(p.press(PrefixKey::Plain('h'), H, t0), Outcome::Run(PrefixCommand::Resize(Direction::Left)));
+        assert_eq!(
+            p.press(PrefixKey::Plain('h'), H, t0),
+            Outcome::Run(PrefixCommand::Resize(Direction::Left))
+        );
         p.release(H);
 
         let t1 = t0 + Duration::from_millis(400);
-        assert_eq!(p.press(PrefixKey::Plain('h'), H, t1), Outcome::Run(PrefixCommand::Resize(Direction::Left)));
+        assert_eq!(
+            p.press(PrefixKey::Plain('h'), H, t1),
+            Outcome::Run(PrefixCommand::Resize(Direction::Left))
+        );
         p.release(H);
 
         // The window restarts from t1, not t0: another repeatable key 400ms after THAT still runs.
         let t2 = t1 + Duration::from_millis(400);
-        assert_eq!(p.press(PrefixKey::Plain('l'), L, t2), Outcome::Run(PrefixCommand::Resize(Direction::Right)));
+        assert_eq!(
+            p.press(PrefixKey::Plain('l'), L, t2),
+            Outcome::Run(PrefixCommand::Resize(Direction::Right))
+        );
         p.release(L);
 
         // 600ms after the last one: past the window, so the key passes through unprefixed.
@@ -431,7 +454,10 @@ mod tests {
         let t0 = Instant::now();
         let mut p = Prefix::new();
         p.press(PrefixKey::Prefix, CTRL_A, t0);
-        assert_eq!(p.press(PrefixKey::Plain('h'), H, t0), Outcome::Run(PrefixCommand::Resize(Direction::Left)));
+        assert_eq!(
+            p.press(PrefixKey::Plain('h'), H, t0),
+            Outcome::Run(PrefixCommand::Resize(Direction::Left))
+        );
         p.release(H);
 
         let t1 = t0 + Duration::from_millis(100);
@@ -453,13 +479,22 @@ mod tests {
         assert_eq!(p.press(PrefixKey::Prefix, CTRL_A, t0), Outcome::Swallow);
         assert!(p.is_armed());
         p.release(CTRL_A);
-        assert_eq!(p.press(PrefixKey::Prefix, CTRL_A, t0), Outcome::Run(PrefixCommand::SendPrefix));
+        assert_eq!(
+            p.press(PrefixKey::Prefix, CTRL_A, t0),
+            Outcome::Run(PrefixCommand::SendPrefix)
+        );
 
         let mut p = Prefix::new();
         p.press(PrefixKey::Prefix, CTRL_A, t0);
-        assert_eq!(p.press(PrefixKey::Plain('h'), H, t0), Outcome::Run(PrefixCommand::Resize(Direction::Left)));
+        assert_eq!(
+            p.press(PrefixKey::Plain('h'), H, t0),
+            Outcome::Run(PrefixCommand::Resize(Direction::Left))
+        );
         // Holding h (same keycode, no release) keeps running the command.
-        assert_eq!(p.press(PrefixKey::Plain('h'), H, t0), Outcome::Run(PrefixCommand::Resize(Direction::Left)));
+        assert_eq!(
+            p.press(PrefixKey::Plain('h'), H, t0),
+            Outcome::Run(PrefixCommand::Resize(Direction::Left))
+        );
 
         let mut p = Prefix::new();
         p.press(PrefixKey::Prefix, CTRL_A, t0);
@@ -476,7 +511,11 @@ mod tests {
         let mut p = Prefix::new();
         assert_eq!(p.press(PrefixKey::Prefix, CTRL_A, t0), Outcome::Swallow);
         p.cancel();
-        assert_eq!(p.press(PrefixKey::Prefix, CTRL_A, t0), Outcome::Swallow, "a fresh press arms again");
+        assert_eq!(
+            p.press(PrefixKey::Prefix, CTRL_A, t0),
+            Outcome::Swallow,
+            "a fresh press arms again"
+        );
         assert!(p.is_armed());
     }
 

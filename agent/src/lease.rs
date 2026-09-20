@@ -223,7 +223,9 @@ impl SessionLease {
 /// Uses `std::time::SystemTime` and UTC calendar arithmetic without an extra dependency.
 /// The field is for human inspection; no parser reads it back.
 fn chrono_like_now() -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let days = secs / 86400;
     let time_of_day = secs % 86400;

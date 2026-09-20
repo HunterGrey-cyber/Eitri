@@ -86,7 +86,10 @@ mod tests {
     /// "simplifying" this line.
     #[test]
     fn the_timer_callback_hops_to_the_main_loop_before_running_a_command() {
-        assert!(RELOAD_CMD.contains("vim.schedule("), "checktime must not run in a fast event");
+        assert!(
+            RELOAD_CMD.contains("vim.schedule("),
+            "checktime must not run in a fast event"
+        );
     }
 
     /// A local timer handle is collected and the timer stops at an unpredictable moment. It must be
@@ -115,6 +118,9 @@ mod tests {
     /// documented constant is exactly the class this project's other protocols keep pinning.
     #[test]
     fn the_documented_interval_is_the_one_the_timer_uses() {
-        assert!(RELOAD_CMD.contains(&format!(":start({RELOAD_INTERVAL_MS}, {RELOAD_INTERVAL_MS},")), "{RELOAD_CMD}");
+        assert!(
+            RELOAD_CMD.contains(&format!(":start({RELOAD_INTERVAL_MS}, {RELOAD_INTERVAL_MS},")),
+            "{RELOAD_CMD}"
+        );
     }
 }
