@@ -10,4 +10,4 @@ pub mod feed;
 pub mod payload;
 pub mod tokens;
 
-pub use tokens::ThemeTokens;
+pub use tokens::{ThemeTokens, DEFAULT_PANEL_FONT_SIZE_PX, PANEL_FONT_SIZE_RANGE_PX};
