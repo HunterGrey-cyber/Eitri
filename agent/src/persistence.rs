@@ -118,19 +118,11 @@ pub fn title_from_prompt(prompt: &str) -> Option<String> {
 }
 
 /// A previous conversation in this workspace that can be offered for continuation.
-///
-/// **This is the whole of what one record knows about a session, and it is thin**: a provider name,
-/// a session id, and two timestamps. There is no title, no first prompt, no turn or message count,
-/// no model -- nothing a picker could use to say what a session was ABOUT. **Correction
-/// (2026-09-19): there is a title now**, `title` below -- recorded here at write time, exactly the
-/// route the last sentence of this paragraph names; the rest of what follows still holds. `ConversationRecord` has
-/// never carried any of that, and the one place on disk that does -- the real Claude CLI's own
-/// transcript under `~/.claude/projects/` -- is deliberately off limits: `agent::transcript`'s
-/// module doc states that it "never reads or interprets transcript *content* -- only the file's
-/// existence and modification time", matching this project's repeated decision not to reimplement
-/// Claude's private storage format. So a UI built on this can honestly offer "which session" and
-/// "when", and must not fabricate "what about". Making richer labels possible means recording more
-/// HERE, at write time, not reading someone else's file.
+/// Stores the provider, session id, timestamps and a title captured at write time.
+/// The stored title is first-one-wins. `BackendGreeting::for_kind` can display the CLI's
+/// `type:"ai-title"` from the transcript instead, rereading it on each greeting without
+/// persisting it. The picker falls back to the stored title, then the id and timestamps;
+/// it must not invent a label when neither title exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumableSession {
     pub provider: String,
@@ -232,6 +224,23 @@ fn read_conversation_records(conversation_id: &str) -> Vec<ConversationRecord> {
     records
 }
 
+/// Every `provider_session_id` this conversation still has a record for, in no particular order.
+///
+/// Both layouts, because `read_conversation_records` reads both. The one caller is
+/// `history::store`'s orphan sweep, which deletes a stored history whose session is no longer
+/// offerable; an id missing here is exactly what "no longer offerable" means, since the picker is
+/// built from the same function.
+///
+/// An EMPTY result is deliberately ambiguous and its caller must treat it as such: it means "no
+/// records" and "the directory could not be read" alike, and deleting every history file on the
+/// strength of a failed `read_dir` would be the worst possible reading of it.
+pub(crate) fn recorded_session_ids(conversation_id: &str) -> Vec<String> {
+    read_conversation_records(conversation_id)
+        .into_iter()
+        .map(|r| r.provider_session_id)
+        .collect()
+}
+
 /// The one pre-2026-09-15 `<conversation_id>.json`, if this workspace still has one.
 ///
 /// `dir` is the per-conversation directory, so the legacy file is its sibling of the same name plus
@@ -266,7 +275,7 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
 /// Both components really do pass: the conversation id is 32 hex chars, and a Claude provider
 /// session id is a UUID, i.e. hex digits and `-` (pinned by
 /// `a_real_claude_session_uuid_is_a_valid_path_component` below).
-fn validate_path_component(label: &str, value: &str) -> std::io::Result<()> {
+pub(crate) fn validate_path_component(label: &str, value: &str) -> std::io::Result<()> {
     let valid = !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if valid {
         Ok(())
@@ -332,7 +341,7 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
 ///
 /// No lock is taken, and none is needed: each session writes its OWN file, so two sessions in one
 /// workspace are not two writers of one path.
-fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().expect("a record path always has a parent directory");
     // `.tmp` extension, not `.json`: `read_conversation_records` filters on the extension, so a
     // reader that lists the directory mid-write cannot pick this up as a record.

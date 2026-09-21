@@ -21,6 +21,7 @@ export function initialState(): AgentUiState {
     pendingPermissions: [],
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
+    history: null,
     assistantMessageOpen: false,
     nextSeq: 0,
     turnThinking: false,

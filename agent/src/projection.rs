@@ -11,7 +11,7 @@
 //! provider health/compatibility warning, and handoff state (all Phase 4+ concerns). Revisit this
 //! struct's shape when whichever later phase actually needs one of those, not before.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -188,7 +188,7 @@ pub enum AgentDomainEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallResult {
     pub content: serde_json::Value,
     pub is_error: bool,
@@ -200,7 +200,7 @@ pub struct ToolCallResult {
 /// A bare `String` until 2026-09-15, which is what made the panel render every tool card below
 /// every assistant message: the three collections reached the frontend with nothing saying how they
 /// interleave. See `AgentSessionProjection::transcript` for why the order has to originate here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptMessage {
     /// Ordering key, shared with `UserPromptRecord::seq`, `ToolCallRecord::seq` and
     /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
@@ -217,7 +217,7 @@ pub struct TranscriptMessage {
 /// coalescing (`assistant_message_open` plus `transcript.last_mut()`) is what keeps 400 streaming
 /// deltas one markdown-parsed message, and a user prompt must never be a thing that walk can land
 /// on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserPromptRecord {
     /// Ordering key, shared with `TranscriptMessage::seq`, `ToolCallRecord::seq` and
     /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
@@ -225,7 +225,7 @@ pub struct UserPromptRecord {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// Ordering key, shared with `UserPromptRecord::seq`, `TranscriptMessage::seq` and
     /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
@@ -235,13 +235,18 @@ pub struct ToolCallRecord {
     pub name: String,
     pub input: serde_json::Value,
     /// `None` until the matching `ToolCallCompleted` arrives.
+    ///
+    /// `#[serde(default)]` for the read side only (`history::store`): a stored history is a file,
+    /// and a file written by an older build must still load. It is NOT `skip_serializing_if`,
+    /// because the frontend distinguishes `result: null` from an absent key.
+    #[serde(default)]
     pub result: Option<ToolCallResult>,
 }
 
 /// One unanswered permission request. Deliberately carries no `PermissionSource`
 /// (`HookRelay`/`CanUseTool`) -- that Claude-wire-internal routing detail stays in
 /// `agent::session`'s own bookkeeping, never in this provider-neutral type.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequestRecord {
     /// Ordering key, shared with `UserPromptRecord::seq`, `TranscriptMessage::seq` and
     /// `ToolCallRecord::seq`. See `AgentSessionProjection::apply`.
@@ -299,7 +304,7 @@ pub(crate) fn tool_use_link(id: impl Into<String>) -> Option<String> {
 
 /// What a provider actually reported about a turn's cost. Only ever constructed from figures a
 /// provider sent; a provider that sends none produces `None`, never a zeroed `UsageInfo`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageInfo {
     pub total_cost_usd: f64,
     pub num_turns: u32,
@@ -309,6 +314,13 @@ pub struct UsageInfo {
 /// is a map (not the old `Vec`) so a caller can look up/remove one specific request by id in O(1)
 /// -- exactly what answering one permission card needs, and exactly what the design doc's own
 /// "pending permissions map" wording asks for.
+///
+/// **This type is `Serialize` and deliberately not `Deserialize`, and the six record types above
+/// are both.** A projection that can be read off disk is a projection that can arrive carrying
+/// `status: Running`, an `active_turn_id` for a turn nobody is running, and two session ids for
+/// sessions that ended -- i.e. a declaration of live state restored from a file. Restoring history
+/// (`history::store`) is refolding data through `apply`, never rehydrating a state declaration, and
+/// leaving this derive off is what makes the difference a compiler error rather than a discipline.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentSessionProjection {
     pub session_id: Option<String>,
@@ -362,6 +374,62 @@ pub struct AgentSessionProjection {
     /// `throughRevision` reports, and what a later `events{fromRevision, throughRevision, ...}`
     /// batch continues from.
     pub last_revision: u64,
+    /// Set once, before any live event is folded, when a resumed conversation was seeded with what
+    /// it already said (`history::load`). `None` on every fresh session and on a resume that found
+    /// nothing to restore.
+    ///
+    /// **Not an item and not ordered.** It occupies no `seq`, is never produced by `apply`, and is
+    /// not part of the four collections -- it is one statement ABOUT them: how many of them came
+    /// off a disk, which disk, and where the live part starts (`upto_seq`). `apply` leaves it
+    /// exactly as it found it, which is what makes "the history notice describes the seed" true for
+    /// the whole life of the projection rather than only at the moment of loading.
+    pub history: Option<HistoryNotice>,
+}
+
+/// Which source supplied the restored history.
+///
+/// The CLI's transcript is what `claude --resume` in a terminal shows. The host keeps a separate
+/// copy, and the two can differ. The panel identifies the source so users can tell which history
+/// they are seeing and whether a fallback was used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySource {
+    /// B: the real Claude CLI's own `<uuid>.jsonl`.
+    ClaudeTranscript,
+    /// A: `history::store`, Neovibe's own copy, used only when B could not be read.
+    NeovibeCopy,
+}
+
+/// The information the panel displays about restored history: the conversation, its source,
+/// any omissions and the reason for using a fallback. This struct is the sole input to the notice
+/// row, which appears whenever history is restored, even if nothing was truncated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryNotice {
+    pub source: HistorySource,
+    /// Conversational items actually folded in: prompts, assistant messages and tool calls. The
+    /// TRUE count, which is usually below `HISTORY_MAX_ITEMS` even when truncation happened,
+    /// because the character budget binds first about as often.
+    pub restored_items: usize,
+    /// Items dropped by TRUNCATION. `None` means records were certainly omitted but cannot be
+    /// counted -- the scan started partway into a file too large to read whole. Never counts a
+    /// skipped line type (attachments, side records, unknown lines): those are not omitted
+    /// conversation and go to the log instead.
+    pub omitted_items: Option<usize>,
+    /// The exclusive `seq` bound of restored history: historical items are below it and live items
+    /// are at or above it. Present whenever history is restored, even without truncation, so the
+    /// panel can distinguish historical tool calls that cannot complete from live calls still running.
+    pub upto_seq: u64,
+    /// The file this history was actually read from. Always non-empty: a notice exists only when
+    /// history was restored, and history can only come from one file.
+    pub source_path: String,
+    /// The Claude transcript that was looked for and not used. `None` when `source` is
+    /// `ClaudeTranscript` (it would repeat `source_path`) and when no path could be built at all.
+    pub attempted_transcript_path: Option<String>,
+    /// Why B was not used, in the user's own terms. `Some` exactly when `source` is `NeovibeCopy`.
+    pub fallback_reason: Option<String>,
+    /// The CLI version that wrote the transcript, from the file itself. B only -- A has no such
+    /// concept. **Not a schema version**; nothing branches on it.
+    pub writer_version: Option<String>,
 }
 
 impl AgentSessionProjection {

@@ -19,6 +19,7 @@ mod wire;
 
 pub mod external_writer;
 pub mod handoff;
+pub mod history;
 pub mod hook_protocol;
 pub mod ingestion;
 pub mod lease;
@@ -43,9 +44,9 @@ pub use session::AgentSession;
 pub use wire::translate_line;
 
 pub use projection::{
-    describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome,
-    PermissionRequestRecord, ProjectionStatus, ResumeStatus, ToolCallRecord, ToolCallResult, TranscriptMessage,
-    TurnOutcome, UsageInfo, UserPromptRecord,
+    describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource,
+    PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ResumeStatus, ToolCallRecord, ToolCallResult,
+    TranscriptMessage, TurnOutcome, UsageInfo, UserPromptRecord,
 };
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,

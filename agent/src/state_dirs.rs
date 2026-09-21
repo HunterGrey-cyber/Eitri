@@ -1,10 +1,11 @@
 // agent/src/state_dirs.rs
-//! The two directories this crate writes into, and the one redirect its tests use.
+//! The three directories this crate writes into, and the one redirect its tests use.
 //!
 //! Split out of `persistence.rs` and `lease.rs` for a single reason: a test must be able to move
-//! both somewhere disposable. Without that, `cargo test -p agent` writes real conversation records
-//! into the developer's own `$XDG_STATE_HOME/neovibe/conversations/` and real lock files into their
-//! `$XDG_RUNTIME_DIR/neovibe/session-leases/`, and neither is removed afterwards. That is not
+//! them somewhere disposable. Without that, `cargo test -p agent` writes real conversation records
+//! into the developer's own `$XDG_STATE_HOME/neovibe/conversations/`, real stored histories into
+//! `$XDG_STATE_HOME/neovibe/history/`, and real lock files into their
+//! `$XDG_RUNTIME_DIR/neovibe/session-leases/`, and none of them is removed afterwards. That is not
 //! avoidable by "just not calling persistence" either: the record write and the session-lease
 //! acquire both happen on `AgentConversation`'s own ingestion thread when the provider's first
 //! `SessionOpened` is folded, so any test that drives a conversation past that event reaches them.
@@ -47,6 +48,24 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
     Ok(PathBuf::from(home).join(".local/state/neovibe/conversations"))
+}
+
+/// Returns the history directory beside `conversations_dir()`, using the same resolution.
+///
+/// History files stay outside `conversations/<conversation_id>/` because both
+/// `persistence::read_conversation_records` and `persistence::prune` treat JSON files there
+/// as `ConversationRecord`s. History would fail to parse on each start screen and remain
+/// unpruned, occupying a slot because pruning preserves files it cannot parse.
+pub(crate) fn history_dir() -> std::io::Result<PathBuf> {
+    if let Some(root) = test_root() {
+        return Ok(root.join("history"));
+    }
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(state_home).join("neovibe/history"));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
+    Ok(PathBuf::from(home).join(".local/state/neovibe/history"))
 }
 
 /// Returns the session-lease lock directory. Every process for one user on one machine
@@ -198,6 +217,7 @@ mod tests {
     fn a_redirected_process_writes_neither_records_nor_leases_into_the_real_xdg_dirs() {
         let root = redirect_state_to_a_test_root();
         assert!(conversations_dir().unwrap().starts_with(&root));
+        assert!(history_dir().unwrap().starts_with(&root));
         assert!(leases_dir().unwrap().starts_with(&root));
         assert!(
             root.starts_with(std::env::temp_dir()),
@@ -248,6 +268,22 @@ mod tests {
             .expect("dscl output")
             .trim();
         assert_eq!(account_home_dir().unwrap(), Path::new(expected));
+    }
+
+    /// The whole point of `history_dir` being its own directory: `read_conversation_records` and
+    /// `prune` walk `conversations/` and treat every `.json` there as a record, and `prune` never
+    /// deletes what it cannot parse. A history file underneath it would be read and discarded on
+    /// every start screen, and would hold one of that conversation's 16 slots forever.
+    #[test]
+    fn history_lives_beside_the_conversation_records_and_never_inside_them() {
+        redirect_state_to_a_test_root();
+        let history = history_dir().unwrap();
+        let conversations = conversations_dir().unwrap();
+        assert!(
+            !history.starts_with(&conversations),
+            "{history:?} is inside {conversations:?}"
+        );
+        assert_eq!(history.parent(), conversations.parent());
     }
 
     #[test]
