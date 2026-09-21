@@ -288,7 +288,7 @@ pub(crate) fn persist_record(
 /// Milliseconds since the Unix epoch, as a string. No date library is a dependency of this crate
 /// and adding one to stamp two fields would be a poor trade; a monotonic-enough integer is what
 /// these fields are actually used for (ordering and "how stale is this record").
-fn epoch_millis() -> String {
+pub(crate) fn epoch_millis() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().to_string())
@@ -376,6 +376,9 @@ impl AgentConversation {
             capabilities.resume,
             None,
             None,
+            // A fresh session has nothing to restore. `create` never reads either history record --
+            // not even to check -- because a conversation that has not happened yet cannot have one.
+            crate::AgentSessionProjection::default(),
         );
         Self {
             conversation_id,
@@ -434,14 +437,39 @@ impl AgentConversation {
             Err(other) => return Err(ConversationError::Lease(other)),
         };
 
+        let conversation_id = conversation_id_for_cwd(&canonical_cwd);
+
+        // Design §4.2: here, and nowhere else. The stability probe has just confirmed nothing is
+        // writing the transcript (step 3), the lease is in hand so no other Neovibe window is
+        // driving this session (step 4), and the provider has not yet produced a byte -- so the
+        // file cannot move under this read and no live event can precede what it restores.
+        //
+        // A resume the provider later REFUSES throws this work away along with the whole
+        // conversation (`watch_resume_take_hold` below), which is deliberate: the alternative is
+        // loading after the verdict, which means injecting history into a projection that has
+        // already folded live events, and that is the one thing that would break the `seq` total
+        // order.
+        //
+        // **This comment used to end:** "Reading the largest real transcript on this machine whole
+        // takes 0.143s in Python." That was offered as the reason the cost is negligible, and it
+        // was a Python measurement standing in for Rust. Kept above rather than deleted, because
+        // what replaced it only moves the conclusion, not the direction: the design doc's §5.3
+        // amendment records the real figures for the product path on this machine's largest
+        // transcript (48,805,214 B, tail-scanned), 3 runs each, hot cache -- **70-84 ms in release
+        // and 513-519 ms in debug**. So release is about twice as fast as the Python number and
+        // debug about 3.6x slower than it, and debug is what every `cargo test` and every
+        // `cargo run -p shell` uses. It is still not a stall: this runs on the worker thread
+        // `AgentBackend::start` was spawned onto (`shell/src/agent_panel.rs`), never on the GTK
+        // main loop, so what it costs is the panel filling in that much later after a resume of
+        // that one outsized session. Every other transcript here is a few milliseconds.
+        let seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
+
         let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
             provider_session_id: provider_session_id.to_string(),
             cwd: cwd_string.clone(),
             permission_mode,
             streaming: crate::provider::StreamingPreference::Partial,
         })?;
-
-        let conversation_id = conversation_id_for_cwd(&canonical_cwd);
 
         let ingest = ConversationIngest::start(
             Arc::clone(&provider),
@@ -452,6 +480,7 @@ impl AgentConversation {
             // the lease was taken before the provider was called at all.
             Some(provider_session_id.to_string()),
             Some(lease),
+            seed,
         );
         let mut conversation = Self {
             conversation_id,
@@ -1067,6 +1096,266 @@ mod tests {
         let record =
             crate::persistence::load_conversation_record(conversation.conversation_id(), "claude-uuid-abc").unwrap();
         assert_eq!(record.title.as_deref(), Some("the real subject"));
+    }
+
+    fn turn_completed(turn_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn_id.into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        }
+    }
+
+    /// The stored history (A) for the adopted session, once it exists.
+    fn stored_history(conversation: &AgentConversation) -> crate::history::StoredHistory {
+        wait_for(conversation, "the session's stored history on disk", |c| {
+            crate::history::store::load(c.conversation_id(), "claude-uuid-abc").is_ok()
+        });
+        crate::history::store::load(conversation.conversation_id(), "claude-uuid-abc").unwrap()
+    }
+
+    fn history_path(conversation: &AgentConversation) -> std::path::PathBuf {
+        crate::history::store::history_path(conversation.conversation_id(), "claude-uuid-abc").unwrap()
+    }
+
+    /// The whole of task 3's wiring, driven through the real `AgentConversation::resume`.
+    ///
+    /// The unit tests in `history::load` prove the loader; this proves the loader is REACHED and
+    /// that what it produces is the projection the panel reads. Without it, `resume` could hand
+    /// `ConversationIngest::start` a `default()` projection and every one of those tests would
+    /// still pass.
+    ///
+    /// The transcript (B) cannot exist for a fresh uuid, so this exercises the fallback to Neovibe's
+    /// own copy, which is also the only half a test can set up without writing under
+    /// `$CLAUDE_CONFIG_DIR` -- something this feature never does (invariant 11).
+    #[test]
+    fn a_resumed_conversation_opens_carrying_what_it_already_said() {
+        let dir = unique_dir();
+        let canonical = dir.canonicalize().expect("the test workspace exists");
+        let conversation_id = conversation_id_for_cwd(&canonical);
+        let session = format!("sess-{}", uuid::Uuid::new_v4().simple());
+        crate::history::store::save(&crate::history::StoredHistory::from_collections(
+            conversation_id.clone(),
+            session.clone(),
+            vec![crate::UserPromptRecord {
+                seq: 1,
+                text: "what did we say?".into(),
+            }],
+            vec![crate::TranscriptMessage {
+                seq: 2,
+                text: "this much".into(),
+            }],
+            vec![],
+        ))
+        .expect("writing the stored history should succeed");
+
+        /// Accepts the resume and then states the verdict, so `watch_resume_take_hold` answers at
+        /// once instead of spending its whole window. The live delta rides in the same pump, which
+        /// is what makes it genuinely live: it is folded after the seed, by the ingestion thread.
+        struct Resuming {
+            events: Mutex<Vec<AgentDomainEvent>>,
+        }
+        impl AgentProvider for Resuming {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    resume: true,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                }
+            }
+            fn info(&self) -> ProviderInfo {
+                ProviderInfo {
+                    sidecar_version: "fake".into(),
+                    protocol_major: 1,
+                    ..Default::default()
+                }
+            }
+            fn create_session(&self, _r: CreateSessionRequest) -> Result<String, ProviderError> {
+                unreachable!("this test only resumes")
+            }
+            fn resume_session(&self, _r: ResumeSessionRequest) -> Result<String, ProviderError> {
+                Ok("verdandi-session-resumed".into())
+            }
+            fn send_turn(&self, _r: SendTurnRequest) -> Result<String, ProviderError> {
+                Ok("turn-1".into())
+            }
+            fn interrupt_turn(&self, _r: InterruptTurnRequest) -> Result<(), ProviderError> {
+                Ok(())
+            }
+            fn resolve_permission(&self, _r: ResolvePermissionRequest) -> Result<(), ProviderError> {
+                Ok(())
+            }
+            fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
+                Ok(())
+            }
+            fn pump(&self) -> Vec<AgentDomainEvent> {
+                std::mem::take(&mut *self.events.lock().unwrap())
+            }
+        }
+
+        let provider = Arc::new(Resuming {
+            events: Mutex::new(vec![
+                AgentDomainEvent::ResumeOutcome {
+                    requested_provider_session_id: session.clone(),
+                    status: crate::ResumeStatus::Attached,
+                    attached_provider_session_id: Some(session.clone()),
+                    forked: false,
+                    detail: None,
+                },
+                AgentDomainEvent::ContentDelta {
+                    turn_id: "t-live".into(),
+                    kind: crate::ContentKind::Text,
+                    text: "and here is more".into(),
+                },
+            ]),
+        });
+
+        let conversation = AgentConversation::resume(provider, &dir, &session, PermissionMode::Bypass)
+            .expect("the fake provider attaches to the session it was asked for");
+        wait_for_ingest(&conversation, 2);
+
+        let projection = conversation.projection();
+        let notice = projection.history.clone().expect("the stored copy was restored");
+        assert_eq!(notice.source, crate::HistorySource::NeovibeCopy);
+        assert_eq!(notice.restored_items, 2);
+        assert_eq!(
+            projection
+                .user_prompts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["what did we say?"]
+        );
+        // The live delta is its own message, not an appendix to the restored one -- the flag was
+        // closed after loading -- and it sorts above the whole restored range.
+        assert_eq!(
+            projection
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["this much", "and here is more"]
+        );
+        assert!(projection.transcript[0].seq < notice.upto_seq);
+        assert!(projection.transcript[1].seq >= notice.upto_seq);
+    }
+
+    /// §6.5: nothing is stored mid-turn, and the turn boundary stores everything the turn produced.
+    ///
+    /// The negative half has to come first and has to be real: a partial-streamed reply is 400+
+    /// events, and a write per event is 800 fsyncs for one answer.
+    #[test]
+    fn history_is_written_at_a_turn_boundary_and_not_before() {
+        let fake = Arc::new(FakeProvider::new());
+        let conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        adopted_record(&conversation);
+        fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        fake.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: crate::ContentKind::Text,
+            text: "thinking about it".into(),
+        });
+        settle(&fake, &conversation);
+        assert!(
+            !history_path(&conversation).exists(),
+            "an unfinished turn must not have been stored"
+        );
+
+        fake.queue(turn_completed("t1"));
+
+        let stored = stored_history(&conversation);
+        assert_eq!(stored.version, crate::history::HISTORY_FORMAT_VERSION);
+        assert_eq!(stored.provider_session_id, "claude-uuid-abc");
+        assert_eq!(stored.transcript.len(), 1);
+        assert_eq!(stored.transcript[0].text, "thinking about it");
+    }
+
+    /// Invariant 12, and the reason it is an invariant: the title feature's first version argued
+    /// the same property from a lock and was wrong, 20 reproductions out of 20. A history write is
+    /// strictly heavier -- two fsyncs and a serialization of the whole conversation -- so this is
+    /// asserted from the thread that actually performed the write, not from where the code sits.
+    #[test]
+    fn the_history_write_happens_on_the_ingestion_thread() {
+        let fake = Arc::new(FakeProvider::new());
+        let conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        adopted_record(&conversation);
+        fake.queue(turn_completed("t1"));
+        stored_history(&conversation);
+
+        let writer = crate::ingestion::tests::HISTORY_WRITER_THREAD.lock().unwrap().clone();
+        let writer = writer.expect("a history write must have been recorded");
+        assert_eq!(
+            writer, "neovibe-agent-ingest",
+            "the write must not be on the caller's thread"
+        );
+        assert_ne!(
+            Some(writer.as_str()),
+            std::thread::current().name(),
+            "this test's own thread must not be the writer"
+        );
+    }
+
+    /// A second turn rewrites the file with both turns in it, and the sweep does not run again --
+    /// it is a first-write-only cost (§6.7).
+    #[test]
+    fn a_later_turn_rewrites_the_stored_history_with_everything_so_far() {
+        let fake = Arc::new(FakeProvider::new());
+        let conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        adopted_record(&conversation);
+        fake.queue(AgentDomainEvent::UserPromptSubmitted { text: "first".into() });
+        fake.queue(turn_completed("t1"));
+        wait_for(&conversation, "the first turn stored", |c| {
+            crate::history::store::load(c.conversation_id(), "claude-uuid-abc").is_ok_and(|h| h.user_prompts.len() == 1)
+        });
+
+        fake.queue(AgentDomainEvent::UserPromptSubmitted { text: "second".into() });
+        fake.queue(turn_completed("t2"));
+        wait_for(&conversation, "the second turn stored", |c| {
+            crate::history::store::load(c.conversation_id(), "claude-uuid-abc").is_ok_and(|h| h.user_prompts.len() == 2)
+        });
+        let stored = stored_history(&conversation);
+        assert_eq!(
+            stored.user_prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    /// The stored history holds history and nothing else (§6.1, invariant 4). Asserted on the JSON
+    /// rather than the type, because the risk is a field ARRIVING here later -- a serialized
+    /// projection would carry `status`, and a `status: Running` read off a file is precisely what
+    /// §4.3 forbids.
+    #[test]
+    fn the_stored_history_holds_no_live_session_state() {
+        let fake = Arc::new(FakeProvider::new());
+        let conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        adopted_record(&conversation);
+        fake.queue(turn_completed("t1"));
+        stored_history(&conversation);
+
+        let text = std::fs::read_to_string(history_path(&conversation)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        for forbidden in [
+            "status",
+            "active_turn_id",
+            "pending_permissions",
+            "session_id",
+            "model",
+            "cwd",
+            "usage",
+            "last_revision",
+            "next_seq",
+        ] {
+            assert!(!keys.contains(&forbidden), "{forbidden} must never be stored: {keys:?}");
+        }
     }
 
     fn resume_outcome(

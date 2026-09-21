@@ -131,6 +131,19 @@ pub fn title_from_prompt(prompt: &str) -> Option<String> {
 /// Claude's private storage format. So a UI built on this can honestly offer "which session" and
 /// "when", and must not fabricate "what about". Making richer labels possible means recording more
 /// HERE, at write time, not reading someone else's file.
+///
+/// **Correction (2026-09-20, the owner's ruling).** The two sentences above about the transcript
+/// are overturned: it is no longer off limits, and richer labels no longer have to be recorded
+/// here. `agent::transcript` READS it now -- see that module's own corrected doc, and constraint 3
+/// in particular -- and `BackendGreeting::for_kind` layers the CLI's own `type:"ai-title"` over
+/// `title` when it builds the picker. What that changes is only what a row DISPLAYS. This struct
+/// and the record behind it are untouched: `title` is still what this project recorded at write
+/// time, still first-one-wins, still the only title that reaches disk, and the CLI's is re-read on
+/// every greeting and written nowhere.
+///
+/// **"must not fabricate 'what about'" stands, and is now load-bearing in a second place**: it is
+/// why the display ladder has three real levels (the CLI's title, then this one, then the bare id
+/// and timestamps) rather than a generated label for a row that has neither.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumableSession {
     pub provider: String,
@@ -261,6 +274,23 @@ fn read_conversation_records(conversation_id: &str) -> Vec<ConversationRecord> {
     records
 }
 
+/// Every `provider_session_id` this conversation still has a record for, in no particular order.
+///
+/// Both layouts, because `read_conversation_records` reads both. The one caller is
+/// `history::store`'s orphan sweep, which deletes a stored history whose session is no longer
+/// offerable; an id missing here is exactly what "no longer offerable" means, since the picker is
+/// built from the same function.
+///
+/// An EMPTY result is deliberately ambiguous and its caller must treat it as such: it means "no
+/// records" and "the directory could not be read" alike, and deleting every history file on the
+/// strength of a failed `read_dir` would be the worst possible reading of it.
+pub(crate) fn recorded_session_ids(conversation_id: &str) -> Vec<String> {
+    read_conversation_records(conversation_id)
+        .into_iter()
+        .map(|r| r.provider_session_id)
+        .collect()
+}
+
 /// The one pre-2026-09-15 `<conversation_id>.json`, if this workspace still has one.
 ///
 /// `dir` is the per-conversation directory, so the legacy file is its sibling of the same name plus
@@ -295,7 +325,7 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
 /// Both components really do pass: the conversation id is 32 hex chars, and a Claude provider
 /// session id is a UUID, i.e. hex digits and `-` (pinned by
 /// `a_real_claude_session_uuid_is_a_valid_path_component` below).
-fn validate_path_component(label: &str, value: &str) -> std::io::Result<()> {
+pub(crate) fn validate_path_component(label: &str, value: &str) -> std::io::Result<()> {
     let valid = !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if valid {
         Ok(())
@@ -361,7 +391,7 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
 ///
 /// No lock is taken, and none is needed: each session writes its OWN file, so two sessions in one
 /// workspace are not two writers of one path.
-fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().expect("a record path always has a parent directory");
     // `.tmp` extension, not `.json`: `read_conversation_records` filters on the extension, so a
     // reader that lists the directory mid-write cannot pick this up as a record.

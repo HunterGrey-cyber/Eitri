@@ -671,6 +671,29 @@ fn client_implements_resume(kind: BackendKind) -> bool {
     }
 }
 
+/// One picker row's title: the CLI's own, then Neovibe's own, then none (design §3.1.3's
+/// Amendment ②, the owner's ruling of 2026-09-20).
+///
+/// The layering is **display only**. `session` is a value on its way to the frontend; nothing here
+/// writes, so `ConversationRecord::title` keeps its first-one-wins rule, `updated_at` stays what it
+/// means, and the question "what if the CLI changes its title later" never has to be answered
+/// (`agent::transcript`'s constraint 3). Each greeting re-reads, so a resume refreshes the row.
+///
+/// **A row never invents a title.** A transcript that cannot be found, cannot be read, holds no
+/// `ai-title` within `AI_TITLE_TAIL_BYTES`, or holds one this code cannot render, all leave
+/// `session.title` exactly as it was -- which is the row as it looked before this existed. That
+/// degradation is silent by design and is pinned by a test rather than by this comment
+/// (`with_no_ai_title_a_row_reads_exactly_as_it_did_before`).
+fn title_for(canonical_cwd: &str, mut session: ResumableSession) -> ResumableSession {
+    if let Some(title) = agent::transcript::transcript_path(canonical_cwd, &session.provider_session_id)
+        .ok()
+        .and_then(|path| agent::transcript::newest_ai_title(&path))
+    {
+        session.title = Some(title);
+    }
+    session
+}
+
 /// What the frontend is told at handshake time, before any session exists.
 pub struct BackendGreeting {
     pub kind: BackendKind,
@@ -695,6 +718,15 @@ pub struct BackendGreeting {
     /// prompt, no turn count. See its own doc for why the one place on disk that could supply a
     /// subject line (Claude's private transcript) is off limits. A picker built on this offers
     /// "which session" and "when"; it must not invent "what about".
+    ///
+    /// **Correction (2026-09-20, the owner's ruling): that transcript is no longer off limits for a
+    /// title.** `for_kind` below layers the CLI's own `type:"ai-title"` line over `title` at
+    /// DISPLAY time (`agent::transcript::newest_ai_title`), read fresh on every greeting and never
+    /// written to disk -- see `agent::transcript`'s module doc, constraint 3, and
+    /// `agent::ResumableSession`'s own doc, both corrected in the same commit. The sentence this
+    /// correction sits under is otherwise unchanged, and its last clause is the load-bearing half:
+    /// each level of the ladder is a real title from a real source, and a row with none still shows
+    /// its id and its timestamps rather than an invented label.
     pub resumable: Vec<ResumableSession>,
 }
 
@@ -704,6 +736,15 @@ impl BackendGreeting {
     /// the small JSON records in it; `agent::persistence`'s own retention cap is what keeps that
     /// bounded rather than growing with every session the workspace has ever had. It has not been
     /// moved off the main thread, and if the cap ever rises far it should be.
+    ///
+    /// **Since 2026-09-20 it also reads a fixed 64 KiB tail of each row's Claude transcript**, for
+    /// the display title (`title_for`). That is one more bounded read per row, and the row count is
+    /// what `agent::persistence` already bounds (`MAX_RECORDS_PER_CONVERSATION` + 1, so 17 rather
+    /// than 16 -- that doc explains the extra one). Measured at 1.74 ms hot and 5.92 ms cold over
+    /// this machine's 16 largest sessions.
+    /// **It must stay a fixed-size read**: parsing those files whole would swap a bounded read of
+    /// Neovibe's own records for one that grows with a file this project neither writes nor knows a
+    /// bound for, and it would do it here, on the loop that draws the editor.
     pub fn for_kind(kind: BackendKind, project_dir: PathBuf) -> Self {
         // Keyed on the CANONICAL directory, matching what `AgentConversation` persists -- otherwise
         // `/x/proj` and `/x/../x/proj` would look up two different records for one workspace.
@@ -715,8 +756,14 @@ impl BackendGreeting {
             project_dir
                 .canonicalize()
                 .ok()
-                .map(|cwd| agent::conversation_id_for_cwd(&cwd))
-                .map(|id| agent::resumable_sessions(&id))
+                .map(|cwd| {
+                    let id = agent::conversation_id_for_cwd(&cwd);
+                    let cwd = cwd.to_string_lossy().into_owned();
+                    agent::resumable_sessions(&id)
+                        .into_iter()
+                        .map(|session| title_for(&cwd, session))
+                        .collect()
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -967,6 +1014,180 @@ mod tests {
             LEGACY_CAPABILITIES.resume,
             "the same record, the same workspace -- only the capability differs"
         );
+    }
+
+    // ---- The picker's title ladder (design §3.1.3's Amendment; invariants 16 and 17) -----------
+
+    /// Points `CLAUDE_CONFIG_DIR` at one disposable root for this whole test binary, and returns
+    /// the `projects/` directory under it.
+    ///
+    /// A process-wide variable set from a multi-threaded test binary, which this project normally
+    /// refuses (`agent::state_dirs`'s own module doc says so). It is set exactly ONCE, to a value
+    /// that never changes, from inside a `OnceLock` initializer, so no thread can observe it being
+    /// two different things -- and the alternative would have been a second global redirect in
+    /// `agent` competing with the `CLAUDE_CONFIG_DIR` the external-writer tests already set. Any
+    /// other test in this crate that reaches a transcript path finds an empty directory here, which
+    /// is what it would have found anyway.
+    fn a_claude_projects_root() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("neovibe-core-claude-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("projects")).expect("creating the fake config root should succeed");
+            std::env::set_var("CLAUDE_CONFIG_DIR", &root);
+            root
+        })
+        .join("projects")
+        .leak()
+    }
+
+    /// A workspace holding one offerable record, and optionally a transcript beside it.
+    ///
+    /// `recorded_title` is what Neovibe itself wrote at write time; `ai_title` is what the CLI
+    /// wrote into its own transcript. Either can be absent, which is what makes the three levels of
+    /// the ladder reachable from one helper.
+    fn a_workspace_with(recorded_title: Option<&str>, ai_title: Option<&str>) -> PathBuf {
+        let projects = a_claude_projects_root();
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("title-ladder");
+        let canonical = dir.canonicalize().expect("a just-created directory canonicalizes");
+        let session = format!("prov-{}", uuid::Uuid::new_v4());
+        agent::persistence::save_conversation_record(&agent::persistence::ConversationRecord {
+            conversation_id: agent::conversation_id_for_cwd(&canonical),
+            provider: "claude".into(),
+            provider_session_id: session.clone(),
+            canonical_cwd: canonical.to_string_lossy().into_owned(),
+            created_at: "1000".into(),
+            updated_at: "2000".into(),
+            provider_advertised_resume: true,
+            title: recorded_title.map(str::to_owned),
+        })
+        .expect("writing a record into the test state root should succeed");
+        if let Some(ai_title) = ai_title {
+            let bucket = projects.join(agent::transcript::sanitize_cwd_for_claude_projects(
+                &canonical.to_string_lossy(),
+            ));
+            std::fs::create_dir_all(&bucket).expect("creating the transcript bucket should succeed");
+            std::fs::write(
+                bucket.join(format!("{session}.jsonl")),
+                format!("{}\n", serde_json::json!({"type": "ai-title", "aiTitle": ai_title})),
+            )
+            .expect("writing a fake transcript should succeed");
+        }
+        dir
+    }
+
+    fn the_only_row(workspace: PathBuf) -> ResumableSession {
+        let greeting = BackendGreeting::for_kind(BackendKind::Sidecar, workspace);
+        assert_eq!(greeting.resumable.len(), 1, "the planted record must be offerable");
+        greeting.resumable.into_iter().next().expect("checked just above")
+    }
+
+    /// Level 1 of the ladder: the CLI's own title is layered ABOVE Neovibe's own, at display time.
+    /// Both exist here, and the CLI's wins -- which is the owner's ruling (2026-09-20) and the only
+    /// thing this change buys, since 37 of this machine's 44 sessions already have one on disk while
+    /// Neovibe's own `title` only exists for sessions started after 2026-09-19.
+    #[test]
+    fn the_clis_own_title_is_what_a_row_shows_when_the_transcript_has_one() {
+        let row = the_only_row(a_workspace_with(
+            Some("what neovibe recorded"),
+            Some("what the CLI recorded"),
+        ));
+        assert_eq!(row.title.as_deref(), Some("what the CLI recorded"));
+    }
+
+    /// **The negative control, and the whole promise of the fallback** (invariant 17). The same
+    /// record with no transcript beside it must read EXACTLY as it did before this change: the
+    /// title Neovibe recorded, then the bare id. Without this pair, "it degrades back to today's
+    /// behaviour" would only be a sentence -- and the degradation is silent, so nothing else would
+    /// notice the day the CLI stops writing that line.
+    #[test]
+    fn with_no_ai_title_a_row_reads_exactly_as_it_did_before() {
+        // Level 2: Neovibe's own recorded title.
+        assert_eq!(
+            the_only_row(a_workspace_with(Some("what neovibe recorded"), None))
+                .title
+                .as_deref(),
+            Some("what neovibe recorded")
+        );
+        // Level 3: no title at all -- the row falls back to its id and timestamps, and invents
+        // nothing.
+        assert_eq!(the_only_row(a_workspace_with(None, None)).title, None);
+        // And the two really are different answers for the same absence, which is what makes this
+        // a control rather than a restatement.
+        assert_ne!(
+            the_only_row(a_workspace_with(
+                Some("what neovibe recorded"),
+                Some("what the CLI recorded")
+            ))
+            .title,
+            the_only_row(a_workspace_with(Some("what neovibe recorded"), None)).title
+        );
+    }
+
+    /// An `ai-title` this code cannot render drops to the next level rather than rendering blank:
+    /// the value is someone else's process's output, normalized through the same
+    /// `title_from_prompt` as every other title, and a blank one declines.
+    #[test]
+    fn an_unusable_ai_title_falls_through_to_the_recorded_one() {
+        let row = the_only_row(a_workspace_with(Some("what neovibe recorded"), Some("   ")));
+        assert_eq!(row.title.as_deref(), Some("what neovibe recorded"));
+    }
+
+    /// **Invariant 16: nothing read from a transcript is ever persisted.** The record on disk is
+    /// byte-identical before and after the picker is built, so the CLI's title cannot collide with
+    /// `title`'s own first-one-wins rule and cannot move `updated_at`.
+    #[test]
+    fn building_the_picker_never_writes_the_clis_title_into_the_record() {
+        let workspace = a_workspace_with(Some("what neovibe recorded"), Some("what the CLI recorded"));
+        let canonical = workspace.canonicalize().expect("the workspace canonicalizes");
+        let records = agent::state_dirs::redirect_state_to_a_test_root()
+            .join("conversations")
+            .join(agent::conversation_id_for_cwd(&canonical));
+        let before = every_file_under(&records);
+        assert!(!before.is_empty(), "one planted record has to be on disk");
+        let row = the_only_row(workspace);
+        assert_eq!(
+            row.title.as_deref(),
+            Some("what the CLI recorded"),
+            "the transcript really was read, or this proves nothing"
+        );
+        assert_eq!(
+            every_file_under(&records),
+            before,
+            "reading a title must leave the record byte-identical"
+        );
+        // And what stayed there is Neovibe's own title, unchanged by the one the row showed.
+        assert!(
+            before
+                .iter()
+                .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("what neovibe recorded")),
+            "the record on disk still holds the title this project recorded"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("what the CLI recorded")),
+            "the CLI's title must never reach disk"
+        );
+    }
+
+    /// Every file under `dir`, path and bytes, sorted. The bytes, not a parsed record: invariant 16
+    /// is about what is written, and a comparison of parsed values would pass over a rewrite that
+    /// only changed formatting or a field this crate does not read.
+    fn every_file_under(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut found: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| {
+                let bytes = std::fs::read(entry.path()).expect("a file just listed should be readable");
+                (entry.path(), bytes)
+            })
+            .collect();
+        found.sort();
+        found
     }
 
     /// A refused resume must fail AS a resume. The legacy backend has none, and the check happens

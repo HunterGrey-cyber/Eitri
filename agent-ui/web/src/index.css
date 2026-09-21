@@ -1071,6 +1071,33 @@ body,
    user needs protecting from clicking away, unlike the lost-session row (`App.tsx`'s
    `sessionEndedBanner`, `row-error`, no dismiss control) that says the transcript may be
    incomplete. */
+/* The restored-history notice (design §5.5/§10): one line at the top of the list saying where the
+   conversation above the live turn came from, with a Copy path button for the file itself.
+
+   Its shape is `.command-notice`'s below -- flex, a `flex: 1` span, a button -- and its COLOUR
+   deliberately is not. That rule borders in `--nv-warn`, which is the palette's "this was refused"
+   colour; restoring history is not a warning, and painting it like one would teach the reader to
+   read a normal, successful resume as a problem (§14 item 10). `--nv-muted` is the neutral token
+   the panel already guards for text against `--nv-bg` at 4.5:1, so this needs no new entry in
+   `indexCss.test.ts`'s exemption list -- and needing one would have been the sign that the choice
+   was wrong. */
+.history-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 10px;
+  border: 1px solid var(--nv-muted);
+  border-left-width: 3px;
+  border-radius: 4px;
+  color: var(--nv-muted);
+  font-size: 12px;
+}
+.history-notice > span {
+  flex: 1;
+  min-width: 0;
+}
+
 .command-notice {
   display: flex;
   align-items: flex-start;

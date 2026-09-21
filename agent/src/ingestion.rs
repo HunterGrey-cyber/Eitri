@@ -132,6 +132,9 @@ struct IngestState {
     /// reproduced 20/20). `true` from the start for a resume, whose record `resume()` writes before
     /// it returns.
     record_written: bool,
+    /// Whether this conversation has produced something worth storing since its history was last
+    /// written. Set by `fold` at a turn boundary and nowhere else -- see `flush_history`.
+    history_dirty: bool,
 }
 
 impl IngestState {
@@ -157,6 +160,18 @@ impl IngestState {
         }
         self.projection.apply(&event);
         self.stats.events_ingested += 1;
+        // A turn boundary, and only a turn boundary: that is the quiet moment. `apply` has just
+        // closed `assistant_message_open`, so nothing half-written can be stored, and one write per
+        // turn is three orders of magnitude fewer than one per event -- a partial-streamed reply is
+        // 400+ events and each write is two fsyncs.
+        if matches!(
+            event,
+            AgentDomainEvent::TurnCompleted { .. }
+                | AgentDomainEvent::SessionClosed { .. }
+                | AgentDomainEvent::SessionUnavailable { .. }
+        ) {
+            self.history_dirty = true;
+        }
 
         if self.resync_pending {
             // Already owed a snapshot; queueing more events would be holding raw data the UI is
@@ -229,10 +244,18 @@ impl ConversationIngest {
         // from being mistaken for a fresh adoption and re-taking a lease already held.
         initial_provider_session_id: Option<String>,
         initial_lease: Option<SessionLease>,
+        // What this conversation already said, restored from disk -- `AgentSessionProjection::default()`
+        // for a fresh session, a seeded one for a resume (`history::load`). It is a PARAMETER, and
+        // that is the whole ordering argument: this function spawns the thread that starts pumping
+        // the provider, so the only moment at which "no live event has been folded yet" is certain
+        // is before it is called. Seeding here therefore makes every live `seq` greater than every
+        // historical one by construction -- no renumbering, no offset, nothing for the frontend's
+        // `throughRevision` seeding to change.
+        seed: AgentSessionProjection,
     ) -> Self {
         let record_written = initial_provider_session_id.is_some();
         let state = Arc::new(Mutex::new(IngestState {
-            projection: AgentSessionProjection::default(),
+            projection: seed,
             provider_session_id: initial_provider_session_id,
             lease: initial_lease,
             pending_ui: VecDeque::new(),
@@ -241,6 +264,7 @@ impl ConversationIngest {
             stats: IngestStats::default(),
             pending_title: None,
             record_written,
+            history_dirty: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let context = AdoptionContext {
@@ -347,6 +371,9 @@ fn ingest_loop(
         let events = provider.pump();
         // Before the idle check, so a title noted while the provider is quiet still gets written.
         flush_title(&state, &context);
+        // Likewise: the turn whose completion marked the history dirty is usually the last event of
+        // a quiet stretch, so waiting for the next non-empty pump would delay every write.
+        flush_history(&state, &context);
         if events.is_empty() {
             std::thread::sleep(INGEST_POLL_INTERVAL);
             continue;
@@ -410,6 +437,67 @@ fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
     }
 }
 
+/// Writes this session's history (A, `history::store`) -- on THIS thread, at a turn boundary, and
+/// only when there is something new to write.
+///
+/// **Which thread this runs on is the whole point, and it is not a style preference.** The title
+/// feature's first version wrote from the UI thread and argued from a lock that it was safe; a
+/// review found the session id becomes visible before the record is on disk and reproduced the
+/// title being dropped in that gap, 20 runs out of 20 (`record_written`'s own doc). A history write
+/// is strictly worse on that thread than a title write was: it is two fsyncs and a serialization of
+/// the whole conversation, landing on a 33ms GTK tick.
+///
+/// The lock is held only long enough to read the dirty flag and CLONE the three collections.
+/// Serializing and writing happen after it is released. That does not contradict `ProjectionGuard`'s
+/// "do not clone the transcript on every tick" rule -- that rule is about the 33ms tick, and this
+/// runs once per turn.
+///
+/// Two gates, the same two `flush_title` has: the record must be on disk (a history file for a
+/// session with no record would be an orphan from birth), and there must be a
+/// `provider_session_id`, which is the file's name.
+///
+/// Best-effort. A failure is one line on stderr and a resume that falls back further; it must never
+/// fail a live session. Precedent: `persist_record` and `flush_title`.
+///
+/// **What this deliberately does not do is flush at shutdown.** `AgentConversation::shutdown` stops
+/// this thread FIRST and then folds its terminal events on the caller's thread, so the
+/// `SessionClosed` it synthesizes never reaches this function -- writing it from there would put the
+/// write back on the UI thread, which is the one thing this whole arrangement exists to prevent.
+/// The cost is the design's own accepted one: a `kill -9`, a power loss or a close can lose the last
+/// turn. A is the fallback; B normally covers it.
+fn flush_history(state: &Mutex<IngestState>, context: &AdoptionContext) {
+    let (provider_session_id, user_prompts, transcript, tool_calls) = {
+        let mut guard = state.lock().unwrap();
+        if !guard.history_dirty || !guard.record_written {
+            return;
+        }
+        let Some(id) = guard.provider_session_id.clone() else {
+            return;
+        };
+        // Cleared before the write, not after: a turn that completes while this one is writing must
+        // mark the history dirty again rather than be swallowed by a later clear.
+        guard.history_dirty = false;
+        (
+            id,
+            guard.projection.user_prompts.clone(),
+            guard.projection.transcript.clone(),
+            guard.projection.tool_calls.clone(),
+        )
+    };
+    let history = crate::history::StoredHistory::from_collections(
+        context.conversation_id.clone(),
+        provider_session_id.clone(),
+        user_prompts,
+        transcript,
+        tool_calls,
+    );
+    #[cfg(test)]
+    tests::note_history_writer_thread();
+    if let Err(e) = crate::history::store::save(&history) {
+        eprintln!("agent: could not store the history of session {provider_session_id}: {e}");
+    }
+}
+
 fn adopt_provider_session(
     context: &AdoptionContext,
     provider_session_id: &str,
@@ -450,9 +538,111 @@ fn adopt_provider_session(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{ContentKind, ProjectionStatus};
+
+    /// The name of the thread that last wrote a stored history.
+    ///
+    /// Test-only, written by `flush_history`, which is the only place a history write happens.
+    /// It exists because "the write is on the ingestion thread" (invariant 12) is otherwise only
+    /// argued from where the code sits, and the title feature's own history is what that argument
+    /// is worth: its first version made the same argument from a lock and was wrong.
+    pub(crate) static HISTORY_WRITER_THREAD: Mutex<Option<String>> = Mutex::new(None);
+
+    pub(super) fn note_history_writer_thread() {
+        *HISTORY_WRITER_THREAD.lock().unwrap() = Some(std::thread::current().name().unwrap_or("<unnamed>").to_string());
+    }
+
+    fn adoption_context(conversation_id: &str) -> AdoptionContext {
+        AdoptionContext {
+            conversation_id: conversation_id.to_string(),
+            canonical_cwd: "/tmp/ws".to_string(),
+            provider_advertises_resume: true,
+        }
+    }
+
+    /// The `record_written` gate, which `provider_session_id` alone does NOT cover.
+    ///
+    /// There is a real window in which the id is visible and the record is not yet on disk:
+    /// adoption sets the id under the lock and writes the record after releasing it. That window is
+    /// what lost 20 titles out of 20 in the review of `7fb787b`. A history file written in it would
+    /// belong to a session with no record -- an orphan from birth, unreachable from the picker and
+    /// swept by the next new session. Driven directly rather than raced, because a test that had to
+    /// hit that window would be a flaky test of a deterministic rule.
+    #[test]
+    fn nothing_is_stored_while_the_session_id_is_known_but_the_record_is_not_written() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut initial = state();
+        initial.provider_session_id = Some("sess-in-the-gap".to_string());
+        initial.record_written = false;
+        initial.history_dirty = true;
+        initial
+            .projection
+            .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        let state = Mutex::new(initial);
+
+        flush_history(&state, &adoption_context(&conversation_id));
+
+        assert!(
+            !crate::history::store::history_path(&conversation_id, "sess-in-the-gap")
+                .unwrap()
+                .exists(),
+            "a history file must not exist before the session's record does"
+        );
+        // And the work is not lost: the flag stays set, so the write happens once the record lands.
+        assert!(state.lock().unwrap().history_dirty);
+
+        state.lock().unwrap().record_written = true;
+        flush_history(&state, &adoption_context(&conversation_id));
+        assert!(crate::history::store::load(&conversation_id, "sess-in-the-gap").is_ok());
+    }
+
+    /// A turn boundary marks the history dirty; nothing inside a turn does. The negative half is
+    /// the load-bearing one: a partial-streamed reply is 400+ events, and marking on any of them
+    /// would mean 400 writes, each two fsyncs.
+    #[test]
+    fn only_a_turn_boundary_marks_the_history_dirty() {
+        let mut state = state();
+        state.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        state.fold(text("partial"));
+        state.fold(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({}),
+        });
+        state.fold(AgentDomainEvent::UserPromptSubmitted { text: "hello".into() });
+        assert!(!state.history_dirty, "nothing inside a turn may mark the history dirty");
+
+        state.fold(AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        });
+        assert!(state.history_dirty);
+    }
+
+    /// The two terminal events mark it too: a session that ends without completing a turn still has
+    /// whatever it said, and that is exactly the conversation most worth not losing.
+    #[test]
+    fn a_session_ending_marks_the_history_dirty() {
+        for event in [
+            AgentDomainEvent::SessionClosed {
+                reason: "closed_by_host".into(),
+            },
+            AgentDomainEvent::SessionUnavailable {
+                reason: "crashed".into(),
+            },
+        ] {
+            let mut state = state();
+            state.fold(event);
+            assert!(state.history_dirty);
+        }
+    }
 
     fn state() -> IngestState {
         IngestState {
@@ -465,6 +655,7 @@ mod tests {
             stats: IngestStats::default(),
             pending_title: None,
             record_written: false,
+            history_dirty: false,
         }
     }
 

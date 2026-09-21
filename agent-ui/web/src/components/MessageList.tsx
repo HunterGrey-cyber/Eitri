@@ -3,6 +3,7 @@ import type { AgentUiState, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
 import { buildTimeline, isUsableLink } from "../timeline";
 import { renderMarkdown } from "../markdown";
+import { HistoryNotice } from "./HistoryNotice";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import type { PermissionDecision } from "../bridge";
@@ -182,6 +183,12 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
 
   return (
     <div className="message-list" data-focused={String(focused)} ref={listRef} onScroll={onScroll}>
+      {/* The top of the list, above the first conversation item and inside the scroll box with it:
+          it describes where everything below came from, so it belongs at the head of that document
+          rather than pinned over it. It is not a `TimelineItem` and holds no `seq` -- see
+          `HistoryNotice` for why it must never become a row. `null` for every fresh session, which
+          is most of them. */}
+      {state.history !== null && <HistoryNotice notice={state.history} />}
       {timeline.map((item, index) => {
         const current = index === cursor;
         switch (item.kind) {

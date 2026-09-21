@@ -210,6 +210,47 @@ describe("applyEvent", () => {
     console.warn = consoleWarn;
   });
 
+  /* A restored history (design §4, §5.5) reaches this side only inside a snapshot -- there is no
+   * event for it, because it is folded in Rust before the ingestion thread that produces events
+   * even starts. So a resync or a panel reload is the ONLY path it travels, and it has to survive
+   * one intact: a notice lost on a resync would leave a panel showing last session's messages with
+   * nothing saying they are old. */
+  it("a resync keeps the restored-history notice and the items it describes", () => {
+    const restored = {
+      ...initialState(),
+      userPrompts: [{ seq: 0, text: "what did we say?" }],
+      transcript: [{ seq: 1, text: "this much" }],
+      history: {
+        source: "claude_transcript" as const,
+        restoredItems: 2,
+        omittedItems: 3,
+        uptoSeq: 2,
+        sourcePath: "/claude/projects/p/sess.jsonl",
+        attemptedTranscriptPath: null,
+        fallbackReason: null,
+        writerVersion: "2.1.272",
+      },
+    };
+    // `throughRevision` is the seed for locally folded items, and it is what keeps a live item
+    // sorting after every restored one across a resync.
+    const state = applySnapshot(initialState(), restored, 2);
+    expect(state.history).toEqual(restored.history);
+    expect(state.nextSeq).toBe(2);
+    // Closed, exactly as it is closed in Rust after a load: otherwise the first live delta appends
+    // to the last restored assistant message and the two render as one bubble.
+    expect(state.assistantMessageOpen).toBe(false);
+    const live = applyEvent(state, { type: "content_delta", turn_id: "t-live", kind: "text", text: "a live answer" });
+    expect(live.transcript.map((m) => m.text)).toEqual(["this much", "a live answer"]);
+    expect(live.transcript[1].seq).toBeGreaterThanOrEqual(restored.history.uptoSeq);
+    expect(live.history).toEqual(restored.history);
+  });
+
+  it("a fresh session carries no history notice", () => {
+    expect(initialState().history).toBeNull();
+    // `r` on an ended session starts over, and starting over restores nothing.
+    expect(resetToStartScreen({ ...initialState(), history: { source: "neovibe_copy", restoredItems: 1, omittedItems: 0, uptoSeq: 1, sourcePath: "/x", attemptedTranscriptPath: null, fallbackReason: "transcript file not found", writerVersion: null } }).history).toBeNull();
+  });
+
   it("applySnapshot replaces the whole state wholesale", () => {
     const snapshot = { ...initialState(), sessionId: "replaced", transcript: [{ seq: 0, text: "from snapshot" }] };
     const state = applySnapshot(initialState(), snapshot, 1);

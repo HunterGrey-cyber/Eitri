@@ -10,6 +10,16 @@ pub mod feed;
 
 pub use compose::{compose_turn_text, EditorContext, Selection, CONTENT_LIMIT, TRUNCATION_MARKER};
 
+/// The inverse of [`compose_turn_text`], re-exported here so that the two directions are reachable
+/// from one place, as the resume-history design (§3.1.2) specifies.
+///
+/// It is *defined* in `agent::history::composed_block` rather than in [`compose`] for a reason the
+/// crate graph forces: `neovibe-core` depends on `agent`, and the transcript reader that needs the
+/// inverse lives in `agent`, so defining it here would require `agent -> neovibe-core -> agent`.
+/// The property that ties the two together -- `strip(compose(t, ctx)) == t` -- is asserted in
+/// [`compose`]'s own tests, beside the cases for the forward direction.
+pub use agent::history::strip_composed_block;
+
 /// What a turn composer asks, at send time, for where the user is.
 ///
 /// A closure rather than the feed itself, so the agent panel never learns that a socket exists: it

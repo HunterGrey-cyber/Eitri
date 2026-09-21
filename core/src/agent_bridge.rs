@@ -188,6 +188,13 @@ pub fn serialize_command_result_for_js(request_id: &str, result: Result<(), &str
 /// prompt, recorded by this project at write time (`agent::persistence::title_from_prompt`), not read
 /// from anyone else's file. It is `null` for a session recorded before titles were kept, and the
 /// rule stands for those rows: no label is invented.
+/// **Correction (2026-09-20, the owner's ruling): "not read from anyone else's file" is no longer
+/// true of this field.** `BackendGreeting::for_kind` fills it from the CLI's own `type:"ai-title"`
+/// line where the transcript has one, falling back to the recorded title and then to `null`
+/// (`agent::transcript`'s constraint 3). **The frontend is deliberately not told which level a
+/// title came from**: source would otherwise leak into rendering, and the whole point of the
+/// fallback is that losing the CLI's line returns the picker silently to how it looks today.
+/// Nothing about the payload's SHAPE changes, and the no-invented-label rule is untouched.
 pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
     json!({
         "kind": "hello",
@@ -418,8 +425,33 @@ pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         })
     });
 
+    // What this conversation was seeded with before it took its first live event, or `null` on a
+    // fresh session. Emitted as an explicit `null` rather than omitted, so the panel can tell "this
+    // session restored nothing" from "this build predates the field".
+    //
+    // `uptoSeq` is the only field here the panel needs for anything other than its notice row: it is
+    // the boundary between what was restored and what this session produced, and a tool call below
+    // it with no result can never complete -- rendering that as `Running…` would be a spinner on a
+    // process that has been gone for days.
+    let history = projection.history.as_ref().map(|notice| {
+        json!({
+            "source": match notice.source {
+                agent::HistorySource::ClaudeTranscript => "claude_transcript",
+                agent::HistorySource::NeovibeCopy => "neovibe_copy",
+            },
+            "restoredItems": notice.restored_items,
+            "omittedItems": notice.omitted_items,
+            "uptoSeq": notice.upto_seq,
+            "sourcePath": notice.source_path,
+            "attemptedTranscriptPath": notice.attempted_transcript_path,
+            "fallbackReason": notice.fallback_reason,
+            "writerVersion": notice.writer_version,
+        })
+    });
+
     let state = json!({
         "backend": view.backend,
+        "history": history,
         // Three identities, three fields. Never one.
         "conversationId": view.conversation_id,
         "sessionId": view.session_id,
@@ -893,6 +925,85 @@ mod tests {
             pending.as_object().unwrap().contains_key("toolUseId"),
             "the key must be present and null, not absent"
         );
+    }
+
+    /// The notice a restored history puts on the wire (design §5.5). Every key is checked, because
+    /// the panel's four wordings each read a different one and a missing key renders as
+    /// `undefined` -- which is not a state the TS type admits.
+    #[test]
+    fn a_restored_history_reaches_the_frontend_as_one_notice_object() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::UserPromptSubmitted {
+            text: "what did we say?".into(),
+        });
+        projection.history = Some(agent::HistoryNotice {
+            source: agent::HistorySource::NeovibeCopy,
+            restored_items: 314,
+            omitted_items: Some(1431),
+            upto_seq: projection.last_revision,
+            source_path: "/state/neovibe/history/conv/sess.json".into(),
+            attempted_transcript_path: Some("/claude/projects/p/sess.jsonl".into()),
+            fallback_reason: Some("transcript file not found".into()),
+            writer_version: None,
+        });
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities {
+                resume: true,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let history = &parsed["state"]["history"];
+        assert_eq!(history["source"], "neovibe_copy");
+        assert_eq!(history["restoredItems"], 314);
+        assert_eq!(history["omittedItems"], 1431);
+        assert_eq!(history["uptoSeq"], 1);
+        assert_eq!(history["sourcePath"], "/state/neovibe/history/conv/sess.json");
+        assert_eq!(history["attemptedTranscriptPath"], "/claude/projects/p/sess.jsonl");
+        assert_eq!(history["fallbackReason"], "transcript file not found");
+        assert!(history["writerVersion"].is_null());
+        // Every restored item sits below `uptoSeq`, which is what lets the panel tell a historical
+        // tool call that can never complete from a live one that is still running (§3.3).
+        assert!(parsed["state"]["userPrompts"][0]["seq"].as_u64().unwrap() < history["uptoSeq"].as_u64().unwrap());
+    }
+
+    /// A session that restored nothing -- every fresh one -- sends an explicit `null`. Omitting the
+    /// key would make "this session has no history" indistinguishable from "this build predates the
+    /// field", the same distinction the `toolUseId` test above exists for.
+    #[test]
+    fn a_session_with_no_restored_history_says_null_rather_than_omitting_the_key() {
+        let projection = AgentSessionProjection::default();
+        let view = SnapshotView {
+            backend: "legacy",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let state = parsed["state"].as_object().unwrap();
+        assert!(
+            state.contains_key("history"),
+            "the key must be present and null, not absent"
+        );
+        assert!(state["history"].is_null());
     }
 
     /// The legacy backend's own shape, which the two tests above do not cover between them: on its

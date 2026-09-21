@@ -584,6 +584,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // every use here only ever needs `&self` methods.) Same connect_close_request -> shutdown()
     // -> unconditional glib::Propagation::Proceed pattern as standalone.rs: the app is exiting
     // either way, regardless of whether a clean `NeovimExited` was actually observed.
+    let app_for_close = app.clone();
     window.connect_close_request(move |_window| {
         pane.shutdown();
         // Capturing `pane_switch` here is load-bearing twice over. First, it keeps the
@@ -614,7 +615,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         // session is otherwise only reachable from closures internal to agent_panel.rs, none of
         // which run on window close on their own. See `AgentPanelHandle`'s own doc for the full
         // consequences (settings backup restore, hook socket cleanup, child SIGTERM) this closes.
-        agent_panel_handle.shutdown();
+        // `app` travels in because the panel does not block this thread waiting for its children:
+        // it takes a `gio` application hold instead, so THE PANEL'S HALF returns at once and the
+        // process stays alive with no window on screen until the teardown reports. See
+        // `AgentPanelHandle::shutdown`.
+        //
+        // Not the whole handler, and the distinction matters to anyone debugging a slow close:
+        // `pane.shutdown()` above runs FIRST and on this thread, and it spins until nvim exits
+        // (`LiveHarness::shutdown` in the fork). A slow `:qa!` therefore still holds the window on
+        // screen, with nothing below involved. Pre-existing, out of scope here, and named because
+        // three consecutive reviews of this path died on a comment that over-claimed.
+        agent_panel_handle.shutdown(&app_for_close);
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
         // here is what keeps its `Rc` alive for the life of the window rather than dropping as
         // soon as `build_ui` returns -- nothing else in this function holds a reference past

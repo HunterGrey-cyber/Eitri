@@ -664,3 +664,52 @@ describe("MessageList cursor highlight", () => {
     expect(container.querySelector(".row-current")).toBeNull();
   });
 });
+
+/* The restored-history notice (design §5.5/§10). It lives at the head of the list rather than above
+   it, because it describes the conversation below it. */
+describe("the restored-history notice", () => {
+  const notice = {
+    source: "claude_transcript" as const,
+    restoredItems: 2,
+    omittedItems: 0,
+    uptoSeq: 3,
+    sourcePath: "/claude/projects/p/sess.jsonl",
+    attemptedTranscriptPath: null,
+    fallbackReason: null,
+    writerVersion: "2.1.272",
+  };
+
+  function renderList(history: AgentUiState["history"]) {
+    render(
+      <MessageList
+        state={state({ history, userPrompts: [{ seq: 1, text: "do the thing" }], transcript: texts("on it") })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={() => {}}
+      />,
+    );
+    return document.querySelector<HTMLElement>(".message-list")!;
+  }
+
+  it("is drawn whenever history was restored, at the top of the list", () => {
+    const list = renderList(notice);
+    expect(list.firstElementChild!.className).toBe("history-notice");
+    expect(list.textContent).toContain("read from Claude's own transcript");
+  });
+
+  it("is absent for a fresh session, which is most of them", () => {
+    expect(renderList(null).querySelector(".history-notice")).toBeNull();
+  });
+
+  /* The cursor is an index into `buildTimeline(state)`, and the notice is not in it. If the notice
+     ever became a row, every index below it would be off by one and `Enter`/`y`/`a`/`d` would act
+     on the wrong item. */
+  it("leaves the row count -- and therefore every cursor index -- unchanged", () => {
+    const withNotice = renderList(notice).querySelectorAll('[data-nav-stop="row"]').length;
+    cleanup();
+    const without = renderList(null).querySelectorAll('[data-nav-stop="row"]').length;
+    expect(withNotice).toBe(without);
+    expect(without).toBe(2);
+  });
+});

@@ -95,6 +95,7 @@ fn truncate(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_context::strip_composed_block;
 
     fn ctx(file: &str, selection: Option<Selection>) -> EditorContext {
         EditorContext {
@@ -249,5 +250,82 @@ mod tests {
     fn an_empty_prompt_still_carries_the_context_cleanly() {
         let out = compose_turn_text("", Some(&ctx("/f", None)));
         assert!(out.starts_with("The user opened"), "{out}");
+    }
+
+    /// The round trip the resume-history design (§3.1.2) requires, kept beside the forward cases so
+    /// the two directions cannot be changed independently.
+    ///
+    /// It matters because the prompt text a transcript stores is the WIRE turn, not what the user
+    /// typed: measured 2026-09-20, 2 of the 6 SDK-driven sessions on this machine end with a block
+    /// this function appended. Rendering that as
+    /// `AgentDomainEvent::UserPromptSubmitted` -- whose own doc says `text` is "the text the user
+    /// typed, deliberately NOT the text that went on the wire" -- would show a file path and a
+    /// selection nobody wrote.
+    ///
+    /// `strip_composed_block` lives in `agent`, not in this file, because `neovibe-core` depends on
+    /// `agent`; see this module's re-export for the full reason.
+    #[test]
+    fn stripping_the_composed_block_recovers_exactly_what_the_user_typed() {
+        let selections = [
+            None,
+            Some(Selection {
+                start_line: 1,
+                end_line: 1,
+                text: "one line".into(),
+            }),
+            Some(Selection {
+                start_line: 12,
+                end_line: 40,
+                text: "fn a() {}\nfn b() {}\n\nfn c() {}".into(),
+            }),
+            // Blank selected text: the template still emits `:\n` with nothing after it.
+            Some(Selection {
+                start_line: 3,
+                end_line: 3,
+                text: String::new(),
+            }),
+            // Long enough that `compose_turn_text` appends its own truncation marker, which is part
+            // of the block and must come off with it.
+            Some(Selection {
+                start_line: 1,
+                end_line: 999,
+                text: "字".repeat(CONTENT_LIMIT + 10),
+            }),
+        ];
+        let texts = [
+            "",
+            "why is this slow?",
+            "a prompt\n\nwith a blank line in it",
+            "a prompt ending in the hedge: This may or may not be related to the current task.",
+            // A prompt that quotes a whole composed block. Stripping must take off only the one
+            // this call appends.
+            "see: The user opened the file /x in the IDE. This may or may not be related to the current task.",
+        ];
+        let files = ["/p/src/main.rs", "/p/a b/c-d.rs", "/p/中文/文件.rs"];
+        for text in texts {
+            for file in files {
+                for selection in &selections {
+                    let context = ctx(file, selection.clone());
+                    let composed = compose_turn_text(text, Some(&context));
+                    assert_eq!(
+                        strip_composed_block(&composed),
+                        text,
+                        "text={text:?} file={file:?} selection={selection:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The negative control for the round trip: text this function never touched comes back
+    /// byte-for-byte. Without it, a `strip_composed_block` that returned `""` for everything would
+    /// still pass the test above for the one input that is already empty.
+    #[test]
+    fn stripping_leaves_a_turn_that_carried_no_context_untouched() {
+        for text in ["", "just a question", "The user opened a can of worms."] {
+            let composed = compose_turn_text(text, None);
+            assert_eq!(composed, text);
+            assert_eq!(strip_composed_block(&composed), text);
+        }
     }
 }

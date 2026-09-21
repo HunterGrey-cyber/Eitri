@@ -40,10 +40,196 @@ const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.
 /// for why this is a poll at all (agent's own reader-thread channel is intentionally private).
 const PUMP_POLL_INTERVAL_MS: u64 = 33;
 
-/// How long a window close waits for an in-flight terminal-handoff worker before abandoning it.
-/// See `AgentPanelHandle::shutdown` for what this does and does not cover -- it is sized for the
-/// legacy backend's real close time, and is knowingly short of the sidecar path's worst case.
-const HANDOFF_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// The backstop on a terminal-handoff worker's close, once the window that started it is gone.
+///
+/// A separate number from `SESSION_CLOSE_BACKSTOP` although the two now bound the same SHAPE of
+/// work: this one bounds a worker somebody else already started, that one a teardown started on
+/// the close path itself, so a future reason to move either has nothing to do with the other.
+/// Sharing one number would make the next change to it silently change the other.
+///
+/// It is the legacy backend's real close time with room to spare (~0.8s of grace periods plus
+/// three thread joins) and is knowingly shorter than the sidecar path's documented worst case;
+/// `AgentPanelHandle::shutdown`'s handoff branch says what expiring costs.
+const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The backstop on a backend this panel is tearing down itself, once the window is gone.
+///
+/// **Nothing waits on this. No thread blocks on it at all, and the GTK main loop least of all.**
+/// It is a deadline observed by a `CLOSE_WATCH_POLL` tick on the main loop (`close_watch_step`),
+/// which does a `try_recv` and returns. The window is already destroyed and the teardown is on a
+/// worker; what keeps the process alive meanwhile is a `gio` application hold, not a wait. Read
+/// `watch_off_the_main_loop` for the mechanism before changing this number.
+///
+/// **What is inside the span it bounds:** the whole of `AgentBackend::shutdown()` AND the drop of
+/// the backend afterwards -- `tear_down_holding_the_application` drops it explicitly before the
+/// worker reports. On the sidecar path those are two different waits and only the second one kills
+/// anything: `shutdown()` issues `close_session`, a unary RPC bounded at 10s (`UNARY_RPC_TIMEOUT`,
+/// agent/src/providers/claude_sidecar/mod.rs), and it is `SpawnedSidecar::drop` (close stdin, poll
+/// up to 3s, then SIGKILL) plus `RuntimeThread::drop` that end the child. 15 seconds covers that
+/// ~13s worst case with a little room; a round of this branch's review found an earlier version
+/// deriving 15 from those same two numbers while reporting BEFORE the drop, so the escalation it
+/// was sized for sat outside the window it bounded.
+///
+/// **What expiring costs**, since it is a bound and not a guarantee: one line on stderr naming what
+/// is still outstanding, then the hold is released anyway, `Application::run` returns, and the
+/// detached worker dies with the process -- i.e. exactly the orphaned `claude`/sidecar/`node` this
+/// file keeps chasing with pid diffs, which is why the number is generous rather than tight.
+const SESSION_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a window close keeps the process alive for a backend that is still CONNECTING.
+///
+/// Not a teardown budget like the two above: what this waits out is `AgentBackend::start`
+/// finishing, so that a backend which finishes after the window is gone can be shut down rather
+/// than left running with nothing owning it. Three seconds is well past a warm connect and well
+/// short of a cold one (`npm ci` in a fresh Verdandi checkout is minutes), so it deliberately does
+/// not cover every case; what it must not do is cover none of them by exiting instantly.
+const CONNECT_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often the main loop looks at a close that is running on a worker. A `try_recv` and an
+/// `Instant::elapsed`, so the interval only sets how long the process lingers past a teardown that
+/// has already finished -- not how much work the main loop does.
+const CLOSE_WATCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What one tick of the close watch decides.
+///
+/// A value rather than control flow so the decision -- specifically that a report observed on the
+/// same tick as the deadline counts as a report -- is assertable without a GTK main loop, which
+/// `shell`'s tests cannot start.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CloseWatch {
+    /// Still running, still inside the backstop: keep holding the application.
+    KeepHolding,
+    /// The worker reported. Everything the span covers is done.
+    Finished,
+    /// The sender dropped without a report: the worker panicked inside the teardown. Immediate,
+    /// and NOT a timeout -- calling it one would send a future debugger looking for a hang that
+    /// never happened.
+    WorkerDied,
+    /// The backstop expired with the teardown still outstanding.
+    Expired,
+}
+
+fn close_watch_step<T>(reported: &Result<T, mpsc::TryRecvError>, past_backstop: bool) -> CloseWatch {
+    match reported {
+        // Checked first on purpose: a `try_recv` that finds the value also finds the sender gone on
+        // the NEXT call, and a teardown that finished in the same tick as the deadline finished.
+        Ok(_) => CloseWatch::Finished,
+        Err(mpsc::TryRecvError::Disconnected) => CloseWatch::WorkerDied,
+        Err(mpsc::TryRecvError::Empty) if past_backstop => CloseWatch::Expired,
+        Err(mpsc::TryRecvError::Empty) => CloseWatch::KeepHolding,
+    }
+}
+
+/// Keeps the process alive until `rx` reports, WITHOUT anything waiting for it.
+///
+/// **The mechanism, because the previous two versions of this code got its premise wrong.** A
+/// window close that has teardown left to do has two bad options if it insists on a wait: return
+/// from `connect_close_request` immediately and let the process exit with `claude`, the sidecar and
+/// `node` still running, or block the GTK main thread -- which keeps the window mapped and
+/// unresponsive for as long as the wait lasts, because `window.connect_close_request` runs ON that
+/// thread and nothing is destroyed until it returns. The first round of this branch moved the WORK
+/// to a worker and kept a 3s wait on the main thread; the second raised that wait to 15s while
+/// declaring the main loop no longer waited. It did. That is a 15-second frozen window, not a
+/// bound.
+///
+/// There is a third option and it is the one GLib is built for: `g_application_hold`
+/// (`gio::prelude::ApplicationExtManual::hold`) raises the application's use count, so
+/// `Application::run` keeps iterating the main loop after the last window is gone instead of
+/// returning. **This function's caller** returns at once, the main loop keeps running, and this
+/// function's `CLOSE_WATCH_POLL` tick drops the guard once the worker reports or the backstop
+/// expires. Releasing it is what lets `run` return and the process exit --
+/// once nothing else holds the application, that is: the close path can install up to three of
+/// these watches, and `run` returns when the last one releases. Nothing anywhere blocks.
+///
+/// Verified rather than declared, in two places, because this doc is the third attempt at it:
+/// `a_hold_keeps_the_application_running_after_its_last_window` (this module, `#[ignore]`d --
+/// `Application::run` wants the default main context and must not race the rest of the suite for
+/// it) drives a real `gio::Application` with no window at all and shows `run` returning only after
+/// the guard drops; `close_watch_step`'s own tests pin what each tick decides.
+///
+/// `what` names the branch in the log: the callers fail for different reasons and a debugger
+/// reading one line needs to know which one it is looking at.
+fn watch_off_the_main_loop<T: 'static>(
+    app: &Application,
+    what: &'static str,
+    rx: mpsc::Receiver<T>,
+    backstop: std::time::Duration,
+    mut on_value: impl FnMut(T) + 'static,
+) {
+    // Taken BEFORE this function returns, i.e. before `connect_close_request` returns and GTK
+    // destroys the last window -- which is the moment the application would otherwise release
+    // itself and `run` would return.
+    let mut hold = Some(app.hold());
+    let started = std::time::Instant::now();
+    gtk4::glib::timeout_add_local(CLOSE_WATCH_POLL, move || {
+        let reported = rx.try_recv();
+        match close_watch_step(&reported, started.elapsed() >= backstop) {
+            CloseWatch::KeepHolding => return gtk4::glib::ControlFlow::Continue,
+            // `on_value` runs BEFORE the release below, which matters for the one caller that has
+            // one: the mid-connect branch starts a teardown here, and that teardown takes a hold of
+            // its own. Taking it while this one is still held is what keeps the use count off zero
+            // between the two.
+            CloseWatch::Finished => {
+                if let Ok(value) = reported {
+                    on_value(value);
+                }
+            }
+            CloseWatch::WorkerDied => {
+                eprintln!("[agent_panel] {what}: its worker died without reporting")
+            }
+            CloseWatch::Expired => eprintln!(
+                "[agent_panel] {what} had still not finished {}s after the window closed; the \
+                 process is exiting anyway and whatever is left of it -- possibly a live `claude`, \
+                 sidecar or `node` -- is being abandoned",
+                backstop.as_secs()
+            ),
+        }
+        // Dropping the guard IS the release, and it has to happen here rather than be left to the
+        // closure's captures falling when GLib frees the removed source: the release is the thing
+        // that lets `Application::run` return, so leaving it to the source's own teardown would
+        // make process exit depend on GLib freeing a closure whose last act was to ask for exit.
+        hold.take();
+        gtk4::glib::ControlFlow::Break
+    });
+}
+
+/// Tears a backend down on a worker thread while the application is held, and never waits for it.
+///
+/// **One mechanism for every backend this panel shuts down itself**, which is the point of it
+/// being a function: `AgentPanelHandle::shutdown` has two such backends (the installed session,
+/// and one that finished connecting while the window was closing) and a review found the second
+/// still being torn down inline on the GTK main loop, 60 lines under a comment claiming that never
+/// happens. A comment true of one branch and false of its sibling is worse than none.
+///
+/// Why it may not happen inline: `AgentBackend::shutdown` stops ingestion first, and
+/// `ConversationIngest::stop` JOINS the ingestion thread, which since the resume-history branch
+/// may be inside `history::store::save` -- serializing up to `HISTORY_MAX_CHARS`, an `sync_all`, a
+/// rename and a directory fsync, plus (on a first write) a `read_dir` and up to 17 record parses
+/// to sweep orphans. That is a disk wait, and this repository already has one recorded whole-window
+/// freeze from exactly the family "the GTK thread waits on something slow" (the projection-guard
+/// deadlock, 2026-09-15); a frozen window during close is the same symptom whether the cause is a
+/// mutex or an fsync on a full disk.
+///
+/// **`drop(backend)` is explicit and its position is the point.** On the sidecar path `shutdown()`
+/// only issues `close_session` and joins ingestion; the child is killed by `SpawnedSidecar::drop`
+/// (close stdin, poll up to 3s, SIGKILL) and its Tokio thread joined by `RuntimeThread::drop`. A
+/// version of this function reported to the watcher first and let the backend fall at the end of
+/// the closure, which put the only part of the teardown that actually ends the process AFTER the
+/// thing that decides the process may exit -- so the escalation raced process exit and the backstop
+/// did not cover what its own doc derived it from.
+fn tear_down_holding_the_application(app: &Application, what: &'static str, mut backend: AgentBackend) {
+    let (closed_tx, closed_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        backend.shutdown();
+        // Explicit, and BEFORE the report below rather than at the end of this closure: on the
+        // sidecar path this line is where the child actually dies. See this function's doc.
+        drop(backend);
+        // The receiver is gone if the watch already released; that is the abandoned case, not an
+        // error.
+        let _ = closed_tx.send(());
+    });
+    watch_off_the_main_loop(app, what, closed_rx, SESSION_CLOSE_BACKSTOP, |()| {});
+}
 
 /// What the frontend is told when the close worker died inside `shutdown()`. One constant because
 /// it is both logged and dispatched, and the two drifting apart would make a log line unmatchable
@@ -78,6 +264,15 @@ struct AgentPanelState {
     /// Set once a start-failure has been reported, so the 33ms tick reports it exactly once rather
     /// than every tick for as long as the dead session is installed.
     reported_start_failure: bool,
+    /// Set by `AgentPanelHandle::shutdown`, i.e. only on the window-close path, and never cleared.
+    ///
+    /// **It exists because the main loop now outlives the window.** `shutdown` holds the
+    /// application so the process can finish tearing its children down, which means every
+    /// main-loop source this panel installed keeps firing for up to `SESSION_CLOSE_BACKSTOP`
+    /// afterwards -- against a destroyed window and a `WebView` that is no longer in a widget
+    /// tree. The pump reads this and stops; `poll_activate` reads it and stops answering, because
+    /// its caller's reaction is `window.present()` on a window GTK has already destroyed.
+    shutting_down: bool,
     /// Set while a backend is being constructed on a worker thread. Holds the requestId whose
     /// `command_result` is owed once that finishes -- the reply is deferred, not dropped, which is
     /// exactly what a requestId-addressed protocol is for.
@@ -143,7 +338,14 @@ struct PendingStart {
 struct PendingHandoff {
     request_id: String,
     command: agent::handoff::ClaudeResumeCommand,
+    /// Reports when `AgentBackend::shutdown()` RETURNED, which is what the command waits on.
     closed_rx: mpsc::Receiver<()>,
+    /// Reports when the backend has also been DROPPED -- on the sidecar path that is the child's
+    /// actual death (`SpawnedSidecar::drop`), which `shutdown()` does not perform. Read only by
+    /// `AgentPanelHandle::shutdown`, which holds the application until it arrives; the ordinary
+    /// path ignores it and it is dropped with the rest of this struct when the command is
+    /// dispatched, at which point the worker's send simply fails.
+    dropped_rx: mpsc::Receiver<()>,
 }
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
@@ -172,66 +374,112 @@ impl AgentPanelHandle {
     /// Taking `pending_start` is load-bearing twice over: it lets a backend that already finished be
     /// shut down properly, and it makes any later `collect_pending_start` tick early-return instead
     /// of installing a session into a panel that has already torn down.
-    pub(crate) fn shutdown(&self) {
+    ///
+    /// **This function does not wait for anything, and that is its most important property.** It
+    /// runs from `window.connect_close_request` on the GTK main thread, where a wait keeps the
+    /// window mapped and frozen until it returns; two previous versions of this code waited there
+    /// (3s, then 15s) while describing themselves as not doing so. All three branches below instead
+    /// hand their receiver to `watch_off_the_main_loop`, which holds the application and polls.
+    /// **This function** returns immediately and the process stays alive -- with no window on
+    /// screen -- until the teardowns report or their backstops expire.
+    ///
+    /// **Scoped to the panel, deliberately, because the previous two versions of this doc were not
+    /// and were false for it** (2026-09-21, third consecutive review finding on this path). The
+    /// whole close handler does NOT return immediately: `main.rs`'s `connect_close_request` calls
+    /// `pane.shutdown()` first, on the GTK thread, and that spins until nvim exits
+    /// (`LiveHarness::shutdown` in the fork). So "the window disappears at once" is a claim about
+    /// this half only, and a slow `:qa!` -- a hung plugin, a slow `BufWritePre` -- still delays the
+    /// close with nothing here involved. That is pre-existing and out of this branch's scope; it is
+    /// named so a verifier who sees a lingering window does not come looking here first.
+    ///
+    /// `app` is a parameter rather than a field for the same reason `install_reload_action` takes
+    /// one: this handle is per-window, and the hold belongs to the application that owns the loop
+    /// this panel's timers run on.
+    pub(crate) fn shutdown(&self, app: &Application) {
+        {
+            let mut state = self.state.borrow_mut();
+            // Read by the 33ms pump and by `poll_activate`, both of which keep ticking now that the
+            // loop outlives the window. See the field's own doc.
+            state.shutting_down = true;
+        }
         let pending = self.state.borrow_mut().pending_start.take();
         let pending_handoff = self.state.borrow_mut().pending_handoff.take();
-        if let Some(mut session) = self.state.borrow_mut().session.take() {
-            session.shutdown();
+        // Taken out in its own statement, like the two above it, so the `RefMut` is dropped before
+        // anything else runs. In edition 2021 an `if let` scrutinee's temporary lives to the end of
+        // the block, which would have meant holding a `RefCell` borrow across the calls below --
+        // and one of them (`tear_down_holding_the_application`) installs a main-loop source.
+        let session = self.state.borrow_mut().session.take();
+        if let Some(session) = session {
+            // On a worker, held rather than waited for. The reasoning, and the other caller it is
+            // shared with, are in `tear_down_holding_the_application`.
+            tear_down_holding_the_application(app, "the session's teardown", session);
         }
         if let Some(handoff) = pending_handoff {
             // The worker already owns the backend and is already shutting it down -- there is
-            // nothing to start here, only a reason to wait. Exiting the process first would leave
-            // the `claude` child mid-close.
+            // nothing to start here, only a reason to keep the process alive. Exiting first would
+            // leave the `claude` child mid-close.
             //
-            // **A bounded wait, not a guarantee, and the bound is only honest for the default
-            // backend.** On `legacy`, `AgentBackend::shutdown()` is ~0.8s of grace periods
-            // (`NATURAL_EXIT_GRACE_PERIOD` 500ms + `GRACE_PERIOD` 300ms, agent/src/process.rs) plus
-            // three thread joins, so this covers it with room to spare. On `sidecar` it does not:
-            // `close_session` is a unary RPC bounded at 10s (`UNARY_RPC_TIMEOUT`,
-            // agent/src/providers/claude_sidecar/mod.rs) and the spawned sidecar's own drop adds up
-            // to 3s of SIGKILL escalation, so the worst case is ~13s and this wait can expire with
-            // the close still in flight. When it does, `main` quits, the detached worker dies with
-            // the process, and whatever the sidecar and `claude` were doing is abandoned -- the
-            // orphan class this repository keeps having to chase with pid diffs. Raising the wait
-            // to cover it would trade that for a window close that appears to hang for 13 seconds,
-            // so the choice here is to stay short and say so rather than to claim a bound that is
-            // not one. See shell/MANUAL_VERIFICATION.md's owed check for this path.
-            match handoff.closed_rx.recv_timeout(HANDOFF_CLOSE_WAIT) {
-                Ok(()) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
-                    "[agent_panel] window closed while a terminal handoff was closing the session, and \
-                     the worker did not report within {}s; its close is being abandoned",
-                    HANDOFF_CLOSE_WAIT.as_secs()
-                ),
-                // NOT a timeout, and it fires immediately: the worker's sender dropped, which means
-                // it panicked inside `shutdown()`. Logging this as a timeout would send a future
-                // debugger looking for a hang that never happened.
-                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!(
-                    "[agent_panel] window closed during a terminal handoff and the close worker died \
-                     inside shutdown() without reporting"
-                ),
-            }
+            // **`dropped_rx`, not `closed_rx`.** The worker reports on `closed_rx` as soon as
+            // `shutdown()` returns, because that is when the handoff command becomes true and may
+            // be dispatched; on the sidecar path the child is still alive at that moment and is
+            // killed by the backend's drop afterwards (`SpawnedSidecar::drop`: close stdin, poll up
+            // to 3s, SIGKILL). `dropped_rx` reports after that drop, so what is held here is the
+            // whole teardown rather than its first half.
+            //
+            // **The backstop is only generous for the default backend, and says so.** On `legacy`,
+            // `AgentBackend::shutdown()` is ~0.8s of grace periods (`NATURAL_EXIT_GRACE_PERIOD`
+            // 500ms + `GRACE_PERIOD` 300ms, agent/src/process.rs) plus three thread joins, so
+            // `HANDOFF_CLOSE_BACKSTOP` covers it with room to spare. On `sidecar` it does not:
+            // `close_session` alone is bounded at 10s, so this can expire with the close in flight
+            // and leave the orphan class this repository keeps chasing with pid diffs. It is left
+            // at 3s rather than raised to `SESSION_CLOSE_BACKSTOP` because nothing here has ever
+            // measured this path -- the window has to be closed inside the second between
+            // confirming a handoff and the card appearing -- and inventing a number for it would
+            // read as evidence. See shell/MANUAL_VERIFICATION.md's owed check for this path.
+            watch_off_the_main_loop(
+                app,
+                "the terminal handoff's close",
+                handoff.dropped_rx,
+                HANDOFF_CLOSE_BACKSTOP,
+                |()| {},
+            );
         }
         if let Some(pending) = pending {
-            // Bounded, and blocking on purpose: this runs on the window-close path, where waiting
-            // for a clean teardown is the whole point. The worker is either about to finish or has
-            // already failed; three seconds is well past a warm connect and well short of a hang.
-            match pending.result_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-                Ok(Ok(mut backend)) => {
-                    eprintln!(
-                        "[agent_panel] window closed mid-connect; shutting down the backend that finished anyway"
-                    );
-                    backend.shutdown();
-                }
-                Ok(Err(e)) => eprintln!(
-                    "[agent_panel] window closed mid-connect; the backend had already failed: {}",
-                    e.message
-                ),
-                Err(_) => eprintln!(
-                    "[agent_panel] window closed mid-connect and the worker did not report within 3s; \
-                     any backend it produces will be dropped with its channel"
-                ),
-            }
+            // A connect, not a teardown -- see `CONNECT_CLOSE_BACKSTOP`. The reason to hold the
+            // process open for it at all is that a backend which finishes after the process is
+            // gone is exactly the orphan described at the top of this function.
+            let app_for_teardown = app.clone();
+            watch_off_the_main_loop(
+                app,
+                "the connect that was still running",
+                pending.result_rx,
+                CONNECT_CLOSE_BACKSTOP,
+                move |result| match result {
+                    Ok(backend) => {
+                        eprintln!(
+                            "[agent_panel] window closed mid-connect; shutting down the backend that finished anyway"
+                        );
+                        // Held and bounded, exactly like the installed session above. This branch
+                        // used to call `backend.shutdown()` inline and unbounded, which a review
+                        // caught: it reaches the same `ConversationIngest::stop` thread join, and
+                        // `fold` marks `history_dirty` on `SessionUnavailable` and `SessionClosed`
+                        // as well as `TurnCompleted`, both of which can arrive before the panel ever
+                        // installs the session -- so nothing here makes it safe. Narrow in practice
+                        // (it also needs `record_written`), but the point of the declaration in
+                        // `tear_down_holding_the_application` is that it holds without a caller-side
+                        // argument.
+                        tear_down_holding_the_application(
+                            &app_for_teardown,
+                            "the backend that finished mid-connect",
+                            backend,
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "[agent_panel] window closed mid-connect; the backend had already failed: {}",
+                        e.message
+                    ),
+                },
+            );
         }
     }
 
@@ -268,7 +516,12 @@ impl AgentPanelHandle {
     /// `window.present()` in response -- this handle has no `Window` reference of its own (see
     /// `AgentPanelHandle`'s own top-level doc: window lifecycle stays owned by `main.rs`).
     pub(crate) fn poll_activate(&self) -> bool {
-        if let Some(supervisor) = self.state.borrow_mut().supervisor.as_mut() {
+        let mut state = self.state.borrow_mut();
+        // The window this would raise is gone; see `AgentPanelState::shutting_down`.
+        if state.shutting_down {
+            return false;
+        }
+        if let Some(supervisor) = state.supervisor.as_mut() {
             supervisor.poll_activate()
         } else {
             false
@@ -458,6 +711,7 @@ pub(crate) fn build_agent_panel(
         pending_handoff: None,
         last_handoff: None,
         reported_start_failure: false,
+        shutting_down: false,
         turn_trace: None,
         theme: neovibe_core::theme::ThemeTokens::fallback(),
         pane_focused: false,
@@ -506,6 +760,12 @@ pub(crate) fn build_agent_panel(
 /// sends nothing.
 fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(PUMP_POLL_INTERVAL_MS), move || {
+        // The window has been closed and its session taken; everything below would be a no-op
+        // against a destroyed window for as long as the close watch holds the application. Stop
+        // instead of ticking 30 times a second at nothing. See `AgentPanelState::shutting_down`.
+        if state.borrow().shutting_down {
+            return gtk4::glib::ControlFlow::Break;
+        }
         collect_pending_start(&state, &webview);
         collect_pending_handoff(&state, &webview);
 
@@ -1179,17 +1439,26 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 return;
             };
             let (closed_tx, closed_rx) = mpsc::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
             std::thread::spawn(move || {
                 backend.shutdown();
                 // Sent after `shutdown()` returns, which is the whole signal: the command is not
                 // dispatched until this arrives. A panic inside `shutdown()` drops the sender
                 // instead, which `collect_pending_handoff` reads as a failed close.
                 let _ = closed_tx.send(());
+                // Then the drop, which is a separate and later event: `shutdown()` issues
+                // `close_session` and joins ingestion, while it is `SpawnedSidecar::drop` that ends
+                // the child. The command is deliberately NOT made to wait for it -- the user has
+                // been told the conversation is closed in Neovibe, which `close_session` makes
+                // true -- but a window closing at this moment is, so it gets its own signal.
+                drop(backend);
+                let _ = dropped_tx.send(());
             });
             state.borrow_mut().pending_handoff = Some(PendingHandoff {
                 request_id,
                 command,
                 closed_rx,
+                dropped_rx,
             });
             // No command_result yet -- `collect_pending_handoff` owes it once the close finishes.
         }
@@ -1319,6 +1588,110 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What each tick of the close watch decides, including the two orderings that are judgements
+    /// rather than mechanics.
+    ///
+    /// This is the whole of what `shell`'s own suite can say about the close path: it cannot open a
+    /// window, so `AgentPanelHandle::shutdown` itself, the hold, and the fact that GTK destroys the
+    /// window as soon as the handler returns are all owed to a human
+    /// (`shell/MANUAL_VERIFICATION.md`, the resume-history section's item 8). What a test CAN pin is
+    /// that no tick misreports what it saw.
+    #[test]
+    fn a_close_watch_tick_reports_what_it_saw() {
+        // Still running, still inside the backstop: the application stays held.
+        assert_eq!(
+            close_watch_step::<()>(&Err(mpsc::TryRecvError::Empty), false),
+            CloseWatch::KeepHolding
+        );
+        // Still running, past the deadline: the process gives up on it.
+        assert_eq!(
+            close_watch_step::<()>(&Err(mpsc::TryRecvError::Empty), true),
+            CloseWatch::Expired
+        );
+        // A report ARRIVING on the same tick as the deadline is a report. A teardown that finished
+        // must never be logged as an abandoned one -- that line names a possible orphaned `claude`.
+        assert_eq!(close_watch_step(&Ok(()), true), CloseWatch::Finished);
+        assert_eq!(close_watch_step(&Ok(()), false), CloseWatch::Finished);
+        // A dead worker is a dead worker at any point in the window, never a timeout: the two send
+        // a debugger to completely different places (a panic in `shutdown()` vs. a hang in it).
+        assert_eq!(
+            close_watch_step::<()>(&Err(mpsc::TryRecvError::Disconnected), true),
+            CloseWatch::WorkerDied
+        );
+        assert_eq!(
+            close_watch_step::<()>(&Err(mpsc::TryRecvError::Disconnected), false),
+            CloseWatch::WorkerDied
+        );
+    }
+
+    /// The premise the whole close path now rests on: a `gio` application hold keeps
+    /// `Application::run` iterating the main loop with no window on screen, and dropping the guard
+    /// is what lets `run` return.
+    ///
+    /// **`#[ignore]`d, and the reason is not flakiness.** `g_application_run` iterates the DEFAULT
+    /// main context; two of these in two test threads would fight over it, and `cargo test` runs
+    /// this crate's tests in parallel. Run it alone:
+    /// `cargo test -p shell a_hold_keeps_the_application_running -- --ignored --exact ...`.
+    ///
+    /// It drives a plain `gio::Application` rather than a `gtk4::Application` deliberately -- the
+    /// latter needs a display, which is what stops `shell` from testing any of this -- and
+    /// `gtk4::Application` IS a `gio::Application`, which is where `hold` is defined and what
+    /// `AgentPanelHandle::shutdown` calls it through.
+    ///
+    /// The first half is a control: without the hold, `run` returns as soon as `activate` does. Its
+    /// point is that the second half's 300ms is the hold's doing and not the loop's own latency.
+    #[test]
+    #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
+    fn a_hold_keeps_the_application_running_after_its_last_window() {
+        use gtk4::gio;
+
+        let control = gio::Application::new(None, gio::ApplicationFlags::empty());
+        control.connect_activate(|_| {});
+        let started = std::time::Instant::now();
+        control.run_with_args(&["shell-hold-control"]);
+        let without_a_hold = started.elapsed();
+        assert!(
+            without_a_hold < std::time::Duration::from_millis(100),
+            "an application with nothing holding it must not stay in its main loop at all; it took {without_a_hold:?}"
+        );
+
+        let held = gio::Application::new(None, gio::ApplicationFlags::empty());
+        held.connect_activate(|app| {
+            let mut hold = Some(app.hold());
+            // The shape `watch_off_the_main_loop` uses: a main-loop source, and a release from
+            // inside it once its work is done.
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                if started_long_enough_ago() {
+                    hold.take();
+                    return gtk4::glib::ControlFlow::Break;
+                }
+                gtk4::glib::ControlFlow::Continue
+            });
+        });
+        let started = std::time::Instant::now();
+        RELEASE_AT.with(|cell| cell.set(Some(started + std::time::Duration::from_millis(300))));
+        held.run_with_args(&["shell-hold"]);
+        let with_a_hold = started.elapsed();
+        assert!(
+            with_a_hold >= std::time::Duration::from_millis(290),
+            "the hold did not keep the loop running: run() returned after {with_a_hold:?}"
+        );
+        assert!(
+            with_a_hold < std::time::Duration::from_secs(5),
+            "releasing the hold did not let run() return: it took {with_a_hold:?}"
+        );
+    }
+
+    thread_local! {
+        /// When the ignored hold test's source should release. A thread-local rather than a capture
+        /// so the closure above stays the same shape as the real one.
+        static RELEASE_AT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn started_long_enough_ago() -> bool {
+        RELEASE_AT.with(|cell| cell.get().is_some_and(|at| std::time::Instant::now() >= at))
+    }
 
     /// A refused command still delivers what the backend already folded.
     ///

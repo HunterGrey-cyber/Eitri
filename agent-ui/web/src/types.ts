@@ -121,6 +121,46 @@ export type ProviderInfo = {
   startupDiagnostics: string[];
 };
 
+/** Which of the two records a restored history came from. The panel says which, because the two
+ * can genuinely differ: Claude's own transcript is what `claude --resume` in a terminal would show,
+ * while Neovibe's copy is this side's unilateral record of the same session. */
+export type HistorySource = "claude_transcript" | "neovibe_copy";
+
+/** One statement about the history a resumed session was seeded with (design §5.5).
+ *
+ * **Not a timeline item**: it holds no `seq`, never reaches `buildTimeline`, and must never be
+ * rendered as a conversation row -- row indices are counted across the whole panel, so an extra row
+ * would shift every cursor index. It is one fixed line at the top of the list.
+ *
+ * `uptoSeq` is the one field here that is not about the notice at all: it is the boundary between
+ * what was restored and what this session produced. A tool call below it with no result can never
+ * complete, so rendering it as `Running…` would be a spinner on a process that ended days ago. */
+export type HistoryNotice = {
+  source: HistorySource;
+  /** Rows this restore put in the list: prompts, assistant messages and tool calls, counted in Rust
+   * AFTER the projection folded them, so it is what the panel draws rather than what the reader
+   * parsed. Usually well below the 400-item ceiling, because the character budget binds first about
+   * as often -- which is exactly why the notice prints this number and no longer prints the cap. */
+  restoredItems: number;
+  /** Items dropped by TRUNCATION, or `null` when records were certainly omitted and cannot be
+   * counted (the scan started partway into a file too large to read whole). Never counts skipped
+   * line types: those are not omitted conversation and stay in the Rust log. */
+  omittedItems: number | null;
+  /** Exclusive upper bound of the restored `seq` range. Every live item sits at or above it. */
+  uptoSeq: Seq;
+  /** The file this history was read from. Always non-empty -- a notice exists only when history was
+   * restored, and history can only come from one file. */
+  sourcePath: string;
+  /** The Claude transcript that was looked for and not used. `null` when `source` is
+   * `claude_transcript`, and when no path could be built at all. */
+  attemptedTranscriptPath: string | null;
+  /** Why Claude's own transcript was not used. Non-null exactly when `source` is `neovibe_copy`. */
+  fallbackReason: string | null;
+  /** The CLI release that wrote the transcript. Never a schema version, and nothing branches on
+   * it. `null` on the `neovibe_copy` path, which has no such concept. */
+  writerVersion: string | null;
+};
+
 export type AgentUiState = {
   backend: BackendKind;
   /** Three identities, deliberately never collapsed into one field.
@@ -137,6 +177,10 @@ export type AgentUiState = {
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
   capabilities: Capabilities;
   provider: ProviderInfo | null;
+  /** What this session was seeded with before it produced anything of its own, or `null` when it
+   * restored nothing -- which is every fresh session. On the wire, so it survives a resync and a
+   * panel reload exactly as the four collections do. */
+  history: HistoryNotice | null;
   /** Reducer-internal, never on the wire: true while the last folded event was assistant text, so
    * the next chunk continues the same message. See `reducer.ts`'s `content_delta` case. */
   assistantMessageOpen: boolean;
