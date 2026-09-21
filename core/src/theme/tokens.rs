@@ -142,9 +142,30 @@ pub struct ThemeTokens {
     pub syntax: Vec<(&'static str, Rgb)>,
     /// A CSS `font-family` value.
     pub font_mono: String,
+    /// The agent panel's base text size, in CSS pixels, and the ONE number every other size in
+    /// `index.css` is a ratio of (2026-09-21). It is not derived from the payload: nvim's own
+    /// `guifont` height is the editor's size for a monospace face, and the panel is mostly
+    /// proportional prose, so following it 1:1 would make the two panes disagree by however much
+    /// the two faces disagree. This is a host setting -- `init.lua`'s
+    /// `neovibe.config.set("agent.font_size", ...)` -- that `shell` writes over the default after
+    /// deriving the rest. [`DEFAULT_PANEL_FONT_SIZE_PX`] is what the panel shipped with, so an
+    /// unset key changes nothing.
+    pub font_size_px: f32,
     /// `"light"` or `"dark"`, for CSS `color-scheme`.
     pub color_scheme: &'static str,
 }
+
+/// The `font-size` `index.css` was written against, and what `--nv-font-size` is unless a host says
+/// otherwise. Changing this number rescales the whole panel; every other size there is a ratio of
+/// it, so the proportions hold.
+pub const DEFAULT_PANEL_FONT_SIZE_PX: f32 = 14.0;
+
+/// The range `shell` accepts for `agent.font_size`. Not taste -- arithmetic: below the floor the
+/// 0.786 ratio in `index.css`'s smallest step rounds to under 7px, and above the ceiling a single
+/// tool-result line stops fitting a narrow panel. A value outside it is a startup failure that
+/// names the key, never a silent clamp: silently ignoring a number someone typed is how a knob
+/// gets reported as broken.
+pub const PANEL_FONT_SIZE_RANGE_PX: std::ops::RangeInclusive<f32> = 9.0..=32.0;
 
 /// Group lookups that understand `reverse` and fall through a list of names.
 struct Groups<'a> {
@@ -293,6 +314,7 @@ impl ThemeTokens {
                 .map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg)))
                 .collect(),
             font_mono: mono_font_stack(&payload.options.guifont),
+            font_size_px: DEFAULT_PANEL_FONT_SIZE_PX,
             color_scheme: if light { "light" } else { "dark" },
         }
     }
@@ -329,6 +351,8 @@ impl ThemeTokens {
         );
         vars.push(("--nv-font-prose".to_string(), PROSE_FONT_STACK.to_string()));
         vars.push(("--nv-font-mono".to_string(), self.font_mono.clone()));
+        // `{}` on an `f32` prints `14`, not `14.0`, so the common case reads as it was typed.
+        vars.push(("--nv-font-size".to_string(), format!("{}px", self.font_size_px)));
         vars.push(("--nv-color-scheme".to_string(), self.color_scheme.to_string()));
         vars
     }
@@ -390,12 +414,47 @@ mod tests {
         assert_eq!(t.fg.hex(), "#e0e2ea");
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
-        assert_eq!(vars.len(), 33);
+        assert_eq!(vars.len(), 34);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 33, "no duplicate variable names");
+        assert_eq!(names.len(), 34, "no duplicate variable names");
+        // The count alone would be satisfied by any 34th variable, and this one carries a UNIT --
+        // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
+        // silently falls back to the browser default.
+        assert_eq!(
+            vars.iter().find(|(n, _)| n == "--nv-font-size").map(|(_, v)| v.as_str()),
+            Some("14px")
+        );
+    }
+
+    /// The panel's own default, its accepted range, and the fact that a size is a plain number of
+    /// CSS pixels -- three things `shell` validates against and `index.css` is written around.
+    #[test]
+    fn the_panel_font_size_is_a_host_setting_with_a_default_that_changes_nothing() {
+        assert_eq!(DEFAULT_PANEL_FONT_SIZE_PX, 14.0);
+        assert_eq!(ThemeTokens::fallback().font_size_px, DEFAULT_PANEL_FONT_SIZE_PX);
+        assert!(PANEL_FONT_SIZE_RANGE_PX.contains(&DEFAULT_PANEL_FONT_SIZE_PX));
+        assert!(!PANEL_FONT_SIZE_RANGE_PX.contains(&0.0));
+        assert!(!PANEL_FONT_SIZE_RANGE_PX.contains(&100.0));
+
+        // A host writes over the default after deriving, and only that one variable moves.
+        let mut t = ThemeTokens::fallback();
+        t.font_size_px = 16.5;
+        let vars = t.css_vars();
+        assert_eq!(
+            vars.iter().find(|(n, _)| n == "--nv-font-size").map(|(_, v)| v.as_str()),
+            Some("16.5px")
+        );
+        let unchanged = ThemeTokens::fallback().css_vars();
+        let moved: Vec<&str> = vars
+            .iter()
+            .zip(unchanged.iter())
+            .filter(|((_, a), (_, b))| a != b)
+            .map(|((n, _), _)| n.as_str())
+            .collect();
+        assert_eq!(moved, vec!["--nv-font-size"]);
     }
 
     #[test]

@@ -186,6 +186,35 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // points at no directory is a hard startup failure naming the source -- never a silent fallback
     // to "whichever shell launched this window", which is the accident that made a resumed session
     // open empty on 2026-09-21 (see `agent::account`).
+    // How big the agent panel's text is. One number: every other size in `index.css` is a ratio of
+    // it, so this rescales the panel coherently instead of moving one label. It is NOT taken from
+    // nvim's `guifont` height, which is the editor's size for a MONOSPACE face while the panel is
+    // mostly proportional prose -- following it 1:1 would make the two panes disagree by however
+    // much the two faces disagree at the same nominal size. Unset changes nothing.
+    //
+    // Out of range is a startup failure naming the key, the same discipline as `agent.account`
+    // above: silently clamping a number someone typed is how a knob gets reported as broken.
+    let panel_font_size = match lua_engine.config.borrow().get("agent.font_size").map(str::to_owned) {
+        None => neovibe_core::theme::DEFAULT_PANEL_FONT_SIZE_PX,
+        Some(raw) => match raw.trim().parse::<f32>() {
+            Ok(px) if neovibe_core::theme::PANEL_FONT_SIZE_RANGE_PX.contains(&px) => {
+                eprintln!("[panel] font size {px}px (init.lua's agent.font_size)");
+                px
+            }
+            Ok(px) => {
+                eprintln!(
+                    "neovibe: neovibe.config.set(\"agent.font_size\", {raw:?}): {px} is outside {:?}",
+                    neovibe_core::theme::PANEL_FONT_SIZE_RANGE_PX
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("neovibe: neovibe.config.set(\"agent.font_size\", {raw:?}): not a number ({e})");
+                std::process::exit(1);
+            }
+        },
+    };
+
     let account_from_env = std::env::var("VERDANDI_CLAUDE_ACCOUNT").ok();
     let account_from_config = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
     match agent::account::resolve_for(account_from_env.as_deref(), account_from_config.as_deref()) {
@@ -279,7 +308,18 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let bg = tokens.bg;
         (bg.r, bg.g, bg.b)
     };
-    agent_panel_handle.set_theme(&neovibe_core::theme::ThemeTokens::fallback());
+    // One helper, so the startup theme and every later one cannot disagree about the size. The
+    // editor's clear colour and the GTK chrome do not take it: it is the panel's text, not the
+    // window's.
+    let panel_tokens = move |payload: Option<&neovibe_core::theme::payload::NvimThemePayload>| {
+        let mut tokens = match payload {
+            Some(p) => neovibe_core::theme::ThemeTokens::derive(p),
+            None => neovibe_core::theme::ThemeTokens::fallback(),
+        };
+        tokens.font_size_px = panel_font_size;
+        tokens
+    };
+    agent_panel_handle.set_theme(&panel_tokens(None));
     pane.set_clear_color(editor_clear(&neovibe_core::theme::ThemeTokens::fallback()));
     if let Some(feed) = theme_feed.as_mut() {
         let theme_css = theme_css.clone();
@@ -292,7 +332,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 payload.options.colors_name, payload.options.background
             );
             theme_css.update(&tokens);
-            agent_panel_handle.set_theme(&tokens);
+            agent_panel_handle.set_theme(&panel_tokens(Some(&payload)));
             pane_for_theme.set_clear_color(editor_clear(&tokens));
         });
     }

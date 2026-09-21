@@ -15,7 +15,7 @@ body,
   background: var(--nv-bg);
   color: var(--nv-fg);
   font-family: var(--nv-font-prose);
-  font-size: 14px;
+  font-size: var(--fs-base);
 }
 
 .agent-ui-root {
@@ -100,7 +100,7 @@ body,
   background: var(--nv-chrome);
   color: var(--nv-chrome-fg);
   font-family: var(--nv-font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .winbar {
   border-bottom: 1px solid var(--nv-border);
@@ -131,12 +131,114 @@ body,
    it emits and nothing else in an assistant row renders a bare `<pre>`, so this rule is fully
    superseded, not narrowed. */
 
+/* --- the panel's own horizontal geometry, as tokens (2026-09-21) ----------------------------
+   These four were literals scattered across eight rules, and two of them had to agree with each
+   other by hand: `.row`'s `22px` sign column plus its `8px` column gap is exactly the `30px` every
+   `calc(100cqw - 30px)` escape below subtracts. Nothing checked that. A reviewer found it directly:
+   "the cqw magic numbers are hardcoded independently rather than derived from the grid's own
+   22px/8px, so a grid-geometry change would silently desync them" -- the escapes would have kept
+   subtracting 30 while the grid moved, and no test in `indexCss.test.ts` reads the arithmetic, only
+   the literal `calc()` strings. Now `--row-gutter` IS that sum, so the two cannot disagree.
+
+   **No container-query unit travels inside a custom property here, deliberately.** The first
+   version of this block put the whole `calc(100cqw - ...)` in `--row-escape`. By the spec that is
+   fine -- a `var()` is substituted as tokens and parsed at the use site, so the `cqw` would resolve
+   against `.row`, the `container-type: inline-size` element -- and it rendered correctly in
+   Chromium. But this panel runs in WebKitGTK, container units in custom properties are exactly the
+   corner where an engine has shipped bugs before, and the failure mode is not subtle: resolve them
+   against the viewport instead of the row and every width in the panel is wrong. So the token
+   carries only the NUMBER (`--row-gutter`), each rule writes its own `100cqw`, and the prompt's
+   inset is expressed in percentages, which resolve against the grid area and have worked
+   everywhere for twenty years. The magic-number problem is solved either way; this way costs one
+   `var()` per rule and depends on nothing clever.
+
+   `--prose-measure` is the knob the owner asked for. `1fr` is "use the panel you have": prose fills
+   the row the way code and tool output already do. Setting it to `62ch` restores, exactly, the
+   readable measure this panel shipped with until today -- one declaration, nothing else to change.
+   Worth knowing before you leave it at `1fr`: on a panel zoomed to a wide screen (`Ctrl+a m`) a
+   paragraph really does run the whole width, which is long for Latin prose and fine for CJK.
+
+   `--prompt-inset` is how far your own message steps away from the left edge. The shape is Cursor's
+   -- its `--conversation-opposed-inset: clamp(0px,(100% - 480px) * 0.4,20%)`, read out of
+   `/usr/share/cursor/.../workbench.desktop.main.css` rather than remembered -- because the idea is
+   right: distinguish the two speakers by POSITION, proportionally, and give the space back on a
+   narrow panel instead of reserving it. The numbers are not Cursor's: the cap is 8% of the row and
+   never more than 120px, against its 20% and no absolute bound, and the knee is 560px rather than
+   480px -- this panel keeps its sign column and adds a rule, so it needs far less displacement to
+   say the same thing, and its sign cell is a cursor that must not be stranded from its own row. Cursor also floors its inset at
+   `max(32px, ...)`; this deliberately does not, because at narrow widths that 32px is taken from an
+   already cramped measure to repeat something the `\u203a` glyph and the rule already say. */
+:root {
+  --row-sign-w: 22px;
+  --row-gap: 8px;
+  /* The left gutter every row reserves: the sign column plus the gap beside it. Subtract it from
+     `100cqw` and you are on the row's own right edge -- which is what every escape below does. */
+  --row-gutter: calc(var(--row-sign-w) + var(--row-gap));
+  --prose-measure: 1fr;
+  /* Your own message's displacement, as a ramp rather than a step: nothing at all until the ROW is
+     past the knee, then three tenths of the surplus, capped. The three parts are separate because
+     only the shape is worth keeping stable -- tune any one of them without restating the others.
+     Lower bound 0 is the point: a narrow panel gives the space back to the text instead of
+     reserving it, which is where this deliberately parts company with Cursor's `max(32px, ...)`.
+
+     Each is a plain length, a unitless number and a plain number, so that no custom property here
+     carries a container-query unit (see the block above for why). The `cqw` is written once, at the
+     one rule that uses these.
+
+     **The basis is the ROW, not the body's grid area, and that is a correction.** A first revision
+     wrote the whole ramp in percentages, which on a grid item resolve against the grid AREA -- so
+     the inset silently depended on `--prose-measure`, and a reviewer measured the consequence:
+     setting the documented `62ch` made the area 496.5px, 3.5px under a 500px knee, and the
+     displacement vanished at every width with nothing to show for it. Against `100cqw` the two
+     knobs are independent, which is what the comment above always claimed they were. */
+  --prompt-inset-knee: 560px;
+  --prompt-inset-slope: 0.3;
+  /* Percent of the row. Also bounded absolutely: at a 1900px panel an unbounded 8% put 155px of
+     nothing between the sign cell -- which is the panel's cursor, and its only focus signal -- and
+     the row it marks. Measured, not guessed. */
+  --prompt-inset-cap: 8;
+  --prompt-inset-cap-max: 120px;
+}
+
+/* --- one text size, and every other one a ratio of it (2026-09-21) --------------------------
+   The owner: "右边的字体大小能不能自定义". It could not: thirty-one `font-size` literals sat in this
+   file at six values, so "make the panel bigger" meant editing thirty-one numbers and hoping the
+   proportions survived. `--nv-font-size` is emitted by Rust with every other `--nv-*`
+   (`core/src/theme/tokens.rs`, `DEFAULT_PANEL_FONT_SIZE_PX`) and set from `init.lua`'s
+   `neovibe.config.set("agent.font_size", "16")`. Unset, it is 14px and nothing here moves.
+
+   The ratios are written as the fraction they came from -- `* 12.5 / 14`, not `* 0.893` -- so each
+   one still says what it was when the base was 14, and none of them drifts by rounding. Six steps
+   is what the file already used; rationalising that into a smaller scale is a separate visual
+   decision nobody has looked at.
+
+   **Every reference carries the `14px` fallback on purpose.** An undefined `var()` makes the whole
+   `calc()` invalid at computed-value time, so without it a panel whose `--nv-*` injection had not
+   arrived would lose EVERY font size at once and fall back to the browser's 16px -- not a colour
+   degrading to something, a layout collapsing. jsdom found this immediately: `.status-line`'s
+   `4ch` measured 32px instead of 24px. The literal is a second copy of Rust's
+   `DEFAULT_PANEL_FONT_SIZE_PX`, and `indexCss.test.ts` holds the two equal.
+
+   Deliberately NOT nvim's `guifont` height. That is the editor's size for a MONOSPACE face, and
+   this panel is mostly proportional prose; following it 1:1 would make the two panes disagree by
+   however much the two faces disagree at the same nominal size. Following `g:neovide_scale_factor`
+   -- so one `Ctrl+=` zooms both panes -- is the better answer and needs a fork change; it is not
+   done here. */
+:root {
+  --fs-xs: calc(var(--nv-font-size, 14px) * 11 / 14);
+  --fs-sm: calc(var(--nv-font-size, 14px) * 12 / 14);
+  --fs-code: calc(var(--nv-font-size, 14px) * 12.5 / 14);
+  --fs-md: calc(var(--nv-font-size, 14px) * 13 / 14);
+  --fs-base: var(--nv-font-size, 14px);
+  --fs-prose: calc(var(--nv-font-size, 14px) * 15 / 14);
+}
+
 /* --- the sign-column grid (panel-as-document, task 3) --------------------------------------
    One grid for every row, so signs line up down the whole document however the body is built. */
 .row {
   display: grid;
-  grid-template-columns: 22px minmax(0, 62ch);
-  gap: 0 8px;
+  grid-template-columns: var(--row-sign-w) minmax(0, var(--prose-measure));
+  gap: 0 var(--row-gap);
   align-items: start;
   padding: 2px 0;
   /* Every row reserves the same 2px, transparent unless a state below gives it a real colour.
@@ -196,17 +298,60 @@ body,
 }
 .row-body {
   font-family: var(--nv-font-prose);
-  font-size: 15px;
+  font-size: var(--fs-prose);
   line-height: 1.65;
   min-width: 0;
 }
+/* Your own message (2026-09-21). It used to be muted text flush with the left edge, which made the
+   thing YOU typed the faintest thing on the page and left the two speakers distinguishable only by
+   a glyph. It is now displaced to the right in proportion to the panel (`--prompt-inset` above) and
+   marked with a rule down its own left edge.
+
+   **It is deliberately not a bubble.** A filled, rounded, right-hugging pill is the signature of
+   every other chat product -- Cursor's is `border-radius: 12px` on a bordered, filled
+   `width: fit-content` box -- and the owner's constraint was to take the idea without taking the
+   look. Three candidates were rendered at 560px and 1150px, light and dark, before this one was
+   chosen: a filled square block read as a fourth kind of card (it competed with `.tool-card` and
+   `.permission-card`, which are the panel's real boxes and use `--nv-surface` for exactly that),
+   and position alone read as an accidental indent. The rule is this panel's own vocabulary --
+   state travels on a border and never on text colour, the same sentence three comments in this
+   file already make -- applied to a different edge of a different element than the row's own
+   signal border, so the two cannot be confused.
+
+   The rule is `--nv-muted`, and that is a correction a review measured rather than argued: it was
+   `--nv-border` first, which Rust derives as `bg.mix(fg, 0.15)` and does not contrast-guard --
+   1.27:1 on rose-pine dawn, 1.15:1 once the cursor is on your own message. Below the knee the
+   inset is exactly 0, so that hairline is the ENTIRE speaker cue. `--nv-muted` is one of the two
+   colours Rust guards for text (>= 4.5:1), far past the 3:1 WCAG 1.4.11 asks of a meaningful
+   non-text indicator. Colour on a border, never on the glyph -- the same rule every signal here
+   follows. `--nv-fg` replaces `--nv-muted` on the text itself, also a guarded-for-text colour, so
+   `indexCss.test.ts`'s colour scan is satisfied by construction rather than by exemption. The sign
+   column does NOT move: it is the spine the whole document lines up on. */
 .row-prompt .row-body {
-  color: var(--nv-muted);
+  color: var(--nv-fg);
   white-space: pre-wrap;
+  margin-left: clamp(
+    0px,
+    (100cqw - var(--prompt-inset-knee)) * var(--prompt-inset-slope),
+    min(var(--prompt-inset-cap) * 1cqw, var(--prompt-inset-cap-max))
+  );
+  border-left: 2px solid var(--nv-muted);
+  padding-left: 10px;
+  /* A review predicted the inset would newly push an unbreakable token out of the row. Measured
+     against the PRISTINE stylesheet, it is not a regression -- it is a live bug, and worse today:
+     a 110-char token in a prompt (what pasting a JWT looks like) scrolls the whole conversation
+     sideways by 533px at a 420px panel and 53px at 900px on the build before this change, against
+     1px at every width with this line. The sign-column spine moves with it, which is the part that
+     makes it more than cosmetic. `.row-error pre` and `.tool-result-body` already carry
+     `word-break` for the same reason; the one `pre-wrap` block without it was the user's own
+     message. `anywhere` rather than `break-word` because it also lets the line BREAK for
+     min-content sizing, which is what stops the grid being sized by the token in the first
+     place. */
+  overflow-wrap: anywhere;
 }
 .row-tool .row-body {
   font-family: var(--nv-font-mono);
-  font-size: 12.5px;
+  font-size: var(--fs-code);
 }
 /* Signal colour goes on a border, never on the sign's own text. `indexCss.test.ts` pins every
    `color:` declaration in this file to --nv-fg/--nv-muted -- Rust guards only those two for text;
@@ -249,7 +394,7 @@ body,
 }
 .row-hint {
   color: var(--nv-muted);
-  font-size: 12.5px;
+  font-size: var(--fs-code);
   margin-top: 4px;
 }
 /* --- wide content escapes the 62ch prose measure (Task 1, 2026-09-20) -------------------------
@@ -287,7 +432,7 @@ body,
 .code-block,
 .tool-result-body,
 .tool-card-generic {
-  width: calc(100cqw - 30px);
+  width: calc(100cqw - var(--row-gutter));
 }
 /* The one state where the `- 30px` above is wrong, found in the whole-branch review (2026-09-20).
    `.tool-result-error` below adds `border-left: 2px` + `padding-left: 6px` to `.tool-result`, the
@@ -299,7 +444,9 @@ body,
    alignment the whole rule exists to get right. `.tool-result-error .tool-result-body` is (0,2,0)
    against (0,1,0) and sits later in the file, so it wins twice over. */
 .tool-result-error .tool-result-body {
-  width: calc(100cqw - 38px);
+  /* The 8px is `.tool-result-error`'s own gutter -- its `border-left: 2px` plus `padding-left: 6px`
+     -- taken off the escape rather than written as a second magic number. */
+  width: calc(100cqw - var(--row-gutter) - 8px);
 }
 /* The JSON dump itself: an ordinary block `<pre>` with no width of its own, so it already fills
    whatever width `.tool-card-generic` above gives its box. `overflow-x: auto` is what keeps ONE
@@ -311,7 +458,7 @@ body,
 }
 .tool-result-folded {
   color: var(--nv-muted);
-  font-size: 12.5px;
+  font-size: var(--fs-code);
 }
 
 .tool-card {
@@ -320,7 +467,7 @@ body,
   padding: 6px 10px;
   border-radius: 4px;
   font-family: var(--nv-font-mono);
-  font-size: 12.5px;
+  font-size: var(--fs-code);
 }
 .tool-card-skill {
   border-left-color: var(--nv-ok);
@@ -332,7 +479,7 @@ body,
 .tool-result {
   margin-top: 4px;
   font-family: var(--nv-font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .tool-result-pending {
   color: var(--nv-muted);
@@ -364,7 +511,7 @@ body,
 }
 .tool-result-truncated {
   color: var(--nv-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-top: 2px;
 }
 /* The tool call a pending permission is blocking, marked where the call itself is rather than only
@@ -373,7 +520,7 @@ body,
   color: var(--nv-fg);
   border-left: 2px solid var(--nv-warn);
   padding-left: 6px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-top: 2px;
 }
 
@@ -389,7 +536,7 @@ body,
 .permission-card-tool-use-id {
   color: var(--nv-muted);
   font-family: var(--nv-font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-bottom: 4px;
 }
 /* The raw-JSON `<pre>` a permission card renders for every NON-Edit tool -- and per CLAUDE.md's
@@ -407,7 +554,7 @@ body,
   padding: 6px;
   border-radius: 4px;
   overflow-x: auto;
-  width: calc(100cqw - 30px);
+  width: calc(100cqw - var(--row-gutter));
   margin-left: -11px;
 }
 .permission-card-buttons button {
@@ -431,7 +578,7 @@ body,
 .composer-closing {
   flex: 0 0 100%;
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--nv-fg);
   border-left: 2px solid var(--nv-warn);
   padding-left: 6px;
@@ -475,7 +622,7 @@ body,
 .mode-selector .detail {
   display: block;
   opacity: 0.75;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   margin-top: 2px;
 }
 .mode-selector .connecting {
@@ -489,7 +636,7 @@ body,
   border-radius: 4px;
   background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
   color: var(--nv-fg);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   text-align: left;
 }
 .mode-selector code {
@@ -758,7 +905,7 @@ body,
   padding: 0 12px;
   min-height: 22px;
   font-family: var(--nv-font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--nv-muted);
 }
 .which-key-help {
@@ -816,11 +963,11 @@ body,
   background: var(--nv-bg);
   color: var(--nv-fg);
   font-family: var(--nv-font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .keymap-overlay h2 {
   margin: 16px 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .keymap-overlay section:first-child h2 {
   margin-top: 0;
@@ -852,7 +999,7 @@ body,
   border-radius: 4px;
   background: color-mix(in srgb, var(--nv-error) 8%, transparent);
   color: var(--nv-fg);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .fatal-error pre {
   margin: 8px 0;
@@ -923,7 +1070,7 @@ body,
    already says the session was lost -- this only explains why these buttons no longer do anything. */
 .permission-card-stale {
   margin-top: 8px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--nv-muted);
 }
 
@@ -976,14 +1123,14 @@ body,
   gap: 8px;
   flex-wrap: wrap;
   padding: 0 12px 10px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .handoff-open {
   background: none;
   border: 1px solid var(--nv-border);
   border-radius: 4px;
   color: var(--nv-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 4px 8px;
   cursor: pointer;
 }
@@ -1007,7 +1154,7 @@ body,
   border: 1px solid var(--nv-warn);
   border-radius: 4px;
   background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .handoff-confirm p {
   margin: 0 0 8px;
@@ -1030,7 +1177,7 @@ body,
   border: 1px solid var(--nv-mode-browse);
   border-radius: 4px;
   background: color-mix(in srgb, var(--nv-mode-browse) 8%, transparent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   text-align: left;
 }
 /* `.handoff-card` now lives on `.row-body` (`TerminalHandoff.tsx`'s `HandoffCommandCard`), and its
@@ -1091,7 +1238,7 @@ body,
   border-left-width: 3px;
   border-radius: 4px;
   color: var(--nv-muted);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .history-notice > span {
   flex: 1;
@@ -1109,7 +1256,7 @@ body,
   border-radius: 4px;
   background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
   color: var(--nv-fg);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .command-notice span {
   flex: 1;
@@ -1140,20 +1287,20 @@ body,
   border: 1px solid var(--nv-border);
   border-radius: 4px;
   overflow: hidden;
-  width: calc(100cqw - 30px);
+  width: calc(100cqw - var(--row-gutter));
   margin-left: -11px;
 }
 .permission-card-edit-head {
   display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
   padding: 6px 8px; background: var(--nv-surface); border-bottom: 1px solid var(--nv-border);
 }
-.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: 12px; color: var(--nv-fg); word-break: break-all; }
-.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: 12px; color: var(--nv-muted); white-space: nowrap; }
+.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-fg); word-break: break-all; }
+.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-muted); white-space: nowrap; }
 .permission-card-edit-note {
-  padding: 6px 8px; font-size: 12px; color: var(--nv-muted);
+  padding: 6px 8px; font-size: var(--fs-sm); color: var(--nv-muted);
   border-bottom: 1px solid var(--nv-border); border-left: 3px solid var(--nv-warn);
 }
-.permission-card-diff { margin: 0; padding: 0; font-family: var(--nv-font-mono); font-size: 12px; overflow-x: auto; }
+.permission-card-diff { margin: 0; padding: 0; font-family: var(--nv-font-mono); font-size: var(--fs-sm); overflow-x: auto; }
 .diff-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre; color: var(--nv-fg); }
 .diff-gutter { width: 1ch; flex: none; color: var(--nv-muted); }
 .diff-added { border-left: 3px solid var(--nv-ok); }
@@ -1166,7 +1313,7 @@ body,
    in the panel and in the buffer three inches to its left. */
 .code-block {
   font-family: var(--nv-font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 18px;
   /* --nv-surface, not --nv-bg: the --nv-syn-* colours below are derived against Normal's
      background, so painting them on --nv-surface is a small (~4%) departure from an exact editor
@@ -1270,7 +1417,7 @@ body,
   background: var(--nv-hint-bg);
   color: var(--nv-hint-fg);
   font-family: var(--nv-font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   line-height: 1;
   padding: 3px 4px;
