@@ -118,6 +118,9 @@ if [[ "$BACKEND" == sidecar && ! -x "$LIBDIR/verdandi-claude-sidecar" ]]; then
 	export NEOVIBE_VERDANDI_CHECKOUT="$VERDANDI"
 fi
 [[ -n "$BACKEND" ]] && export NEOVIBE_AGENT_BACKEND="$BACKEND"
+# Since 2026-09-21 this decides BOTH halves. It always moved which account the CLI authenticates as
+# and writes transcripts under; the binary now derives the directory it READS transcripts from by
+# the same convention (agent::account), so a resume finds the history the account really holds.
 [[ -n "$ACCOUNT" ]] && export VERDANDI_CLAUDE_ACCOUNT="$ACCOUNT"
 
 if [[ -z "${QUIET:-}" ]]; then
@@ -143,7 +146,9 @@ if [[ -z "${QUIET:-}" ]]; then
 			# app says so.
 			echo "         account $ACCOUNT (from VERDANDI_CLAUDE_ACCOUNT in the environment)"
 		else
-			echo "         account not pinned -- the sidecar will resolve its own; CLAUDE_PROFILE=${CLAUDE_PROFILE:-<unset>}"
+			# Not pinned HERE. init.lua can still pin one, and the binary prints what it
+			# took and where from; a flat claim here would contradict it.
+			echo "         account not pinned here -- init.lua may pin one; CLAUDE_PROFILE=${CLAUDE_PROFILE:-<unset>}"
 		fi
 	} >&2
 fi
