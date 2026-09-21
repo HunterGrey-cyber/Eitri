@@ -515,6 +515,21 @@ impl AgentProcess {
         binary: &str,
     ) -> std::io::Result<Self> {
         let conversation_id = Uuid::new_v4();
+        // A configured account (`init.lua`'s `agent.account`) governs the SIDECAR child and where
+        // this crate reads transcripts -- not this spawn. The `claude` on `PATH` here is, on the
+        // host this was written for, a launcher that accepts only a complete, exactly-matching
+        // four-variable tuple AND requires an approved `tmux` server for every non-test role; a
+        // GTK window started from a desktop entry has neither, so writing the tuple on here would
+        // turn a working spawn into `claude-wrapper: an approved tmux server is required`. So this
+        // child keeps inheriting the environment the window was launched from -- and says so,
+        // because the alternative is two halves of one product quietly spending two accounts.
+        if let Some(account) = crate::account::configured() {
+            eprintln!(
+                "[account] the legacy backend spawns '{binary}' with this window's own environment,                  NOT the configured account '{}' -- transcripts are read from {} while this child                  writes wherever its inherited CLAUDE_CONFIG_DIR points",
+                account.name(),
+                account.config_dir().display()
+            );
+        }
         let socket_path = crate::socket_path::hook_socket(&std::env::temp_dir(), conversation_id)?;
         let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 

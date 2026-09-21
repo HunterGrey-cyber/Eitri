@@ -526,6 +526,42 @@ fn checkout_path_for(explicit: Option<&str>) -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
 }
 
+/// Everything the sidecar child's process image is, in one place a test can read back.
+///
+/// `VERDANDI_CLAUDE_ACCOUNT` is the whole of the account handoff (2026-09-21). Verdandi's
+/// `packages/claude-runtime/src/account.ts` resolves it **once for the sidecar process** and then
+/// sets the full `CLAUDE_PROFILE`/`CLAUDE_CONFIG_DIR`/`CLAUDE_SECURESTORAGE_CONFIG_DIR`/
+/// `ANTHROPIC_CONFIG_DIR` tuple on every `claude` it spawns -- overriding whatever this process
+/// inherited. So neovibe hands over the *name* and lets the sidecar derive the rest: writing the
+/// tuple here as well would be a second copy of a convention that already lives on one side, and
+/// the copy that drifted would win silently on some hosts and lose on others. There is no proto
+/// field for this and none is needed -- it is a property of the process neovibe itself starts.
+///
+/// With no account configured this sets exactly what it always set, and the sidecar's own account
+/// support does not engage at all (`VERDANDI_CLAUDE_ACCOUNT` unset is its shipped default).
+fn sidecar_command(
+    program_path: &Path,
+    program_args: &[PathBuf],
+    socket_path: &Path,
+    account: Option<&crate::account::ClaudeAccount>,
+) -> Command {
+    let mut command = Command::new(program_path);
+    command
+        .args(program_args)
+        .env("VERDANDI_CLAUDE_SIDECAR_SOCKET", socket_path)
+        .stdin(Stdio::piped())
+        // stdout/stderr are captured, not nulled -- `supervisor`'s own follow-up review found that
+        // nulling a spawned child's stderr silently discards real crash diagnostics (2026-09-09,
+        // supervisor-robustness-followup plan). A Node.js sidecar crash during real CLI parity
+        // testing (Task 9) is exactly the kind of thing worth seeing.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(account) = account {
+        command.env("VERDANDI_CLAUDE_ACCOUNT", account.name());
+    }
+    command
+}
+
 /// Spawns a fresh sidecar for one `ClaudeSidecarProvider` instance. `instance_id` becomes part of
 /// the socket path (`crate::socket_path::sidecar_socket`, which mirrors the legacy backend's own
 /// per-conversation UUID socket and keeps both under macOS's 103-byte socket-path limit) so
@@ -569,17 +605,15 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     let socket_path = crate::socket_path::sidecar_socket(&std::env::temp_dir(), instance_id)?;
     let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
-    let mut command = Command::new(&program_path);
-    command
-        .args(&program_args)
-        .env("VERDANDI_CLAUDE_SIDECAR_SOCKET", &socket_path)
-        .stdin(Stdio::piped())
-        // stdout/stderr are captured, not nulled -- `supervisor`'s own follow-up review found that
-        // nulling a spawned child's stderr silently discards real crash diagnostics (2026-09-09,
-        // supervisor-robustness-followup plan). A Node.js sidecar crash during real CLI parity
-        // testing (Task 9) is exactly the kind of thing worth seeing.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let account = crate::account::configured();
+    if let Some(account) = account {
+        eprintln!(
+            "agent: sidecar pinned to claude account '{}' ({})",
+            account.name(),
+            account.config_dir().display()
+        );
+    }
+    let mut command = sidecar_command(&program_path, &program_args, &socket_path, account);
 
     let mut child = command.spawn()?;
     let stdin_keepalive = child.stdin.take();
@@ -987,5 +1021,73 @@ mod tests {
         let (description, _) = describe_checkout(&checkout);
         assert!(!description.contains("prebuilt"), "{description}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Reads the account back off the real `Command` the real spawn path builds -- the env map, not
+    /// a stand-in for it -- so deleting the `VERDANDI_CLAUDE_ACCOUNT` line fails here.
+    #[test]
+    fn a_configured_account_reaches_the_sidecar_child_as_one_named_variable() {
+        let account =
+            crate::account::ClaudeAccount::resolve_from("work", |k| (k == "HOME").then(|| "/home/user".to_string()))
+                .unwrap();
+        // Built through `socket_path`, not spelled out, so this test cannot become the one place
+        // in the crate that invents a socket path (`socket_path`'s own scanner enforces that).
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
+        let command = sidecar_command(
+            Path::new("/usr/lib/neovibe/verdandi-claude-sidecar"),
+            &[],
+            &socket,
+            Some(&account),
+        );
+        let env: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            env.contains(&("VERDANDI_CLAUDE_ACCOUNT".to_string(), Some("work".to_string()))),
+            "{env:?}"
+        );
+        assert!(
+            env.contains(&(
+                "VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string(),
+                Some(socket.to_string_lossy().to_string())
+            )),
+            "{env:?}"
+        );
+        // The tuple stays Verdandi's to derive; a second copy here is what would drift.
+        for derived in [
+            "CLAUDE_PROFILE",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "ANTHROPIC_CONFIG_DIR",
+        ] {
+            assert!(
+                !env.iter().any(|(k, _)| k == derived),
+                "{derived} should not be set here"
+            );
+        }
+    }
+
+    /// The shipped default: with nothing configured the child's environment is what it always was,
+    /// and the sidecar's own account support never engages.
+    #[test]
+    fn with_no_account_the_child_gets_exactly_the_socket_and_nothing_else() {
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
+        let command = sidecar_command(
+            Path::new("/usr/lib/neovibe/verdandi-claude-sidecar"),
+            &[],
+            &socket,
+            None,
+        );
+        let keys: Vec<String> = command
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(keys, vec!["VERDANDI_CLAUDE_SIDECAR_SOCKET".to_string()]);
     }
 }

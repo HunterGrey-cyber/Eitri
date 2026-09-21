@@ -173,6 +173,31 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
+    // Which local Claude account this window spends, from `init.lua`'s
+    // `neovibe.config.set("agent.account", "<name>")`. Read here, once, because this is the first
+    // point where `init.lua` has run and still before anything reads a transcript or starts a
+    // sidecar (the panel computes its greeting from a WebView `ready` signal, i.e. after the main
+    // loop starts). Unset is the shipped default and changes nothing. A name that is malformed or
+    // points at no directory is a hard startup failure naming the key -- never a silent fallback
+    // to "whichever shell launched this window", which is the accident that made a resumed
+    // session open empty on 2026-09-21 (see `agent::account`).
+    let configured_account = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
+    match agent::account::resolve_configured(configured_account.as_deref()) {
+        Ok(Some(account)) => {
+            eprintln!(
+                "[account] claude account '{}' -> {}",
+                account.name(),
+                account.config_dir().display()
+            );
+            agent::account::configure(account);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("neovibe: neovibe.config.set(\"agent.account\", ...): {err}");
+            std::process::exit(1);
+        }
+    }
+
     // Build the real layout from whatever ended up in the registry -- this is what makes
     // "built-in and plugin panels share one path" a fact about the running app, not just
     // documentation. `.expect()` here is deliberate: both slots are guaranteed non-empty by this

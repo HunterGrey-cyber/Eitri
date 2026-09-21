@@ -25,6 +25,7 @@ mod runtime_thread;
 mod session;
 mod wire;
 
+pub mod account;
 pub mod external_writer;
 pub mod handoff;
 pub mod history;
@@ -42,6 +43,7 @@ pub mod socket_path;
 pub mod state_dirs;
 pub mod transcript;
 
+pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 pub use event::{AgentEvent, PermissionSource};
 pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};

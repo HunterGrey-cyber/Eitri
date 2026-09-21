@@ -19,6 +19,10 @@ pub(crate) struct LuaEngine {
     pub(crate) panels: Rc<RefCell<PanelRegistry>>,
     pub(crate) commands: Rc<RefCell<CommandRegistry>>,
     events: Rc<RefCell<neovibe_core::lua::event::EventBus>>,
+    /// Kept as a field since 2026-09-21, and the comment in `new()` that said it need not be says
+    /// why the reason changed: the shell itself now reads a key out of it (`agent.account`) after
+    /// `init.lua` has run.
+    pub(crate) config: Rc<RefCell<neovibe_core::lua::config::ConfigStore>>,
 }
 
 impl LuaEngine {
@@ -29,17 +33,17 @@ impl LuaEngine {
         let panels = Rc::new(RefCell::new(PanelRegistry::default()));
         let commands = Rc::new(RefCell::new(CommandRegistry::default()));
         let events = Rc::new(RefCell::new(neovibe_core::lua::event::EventBus::default()));
-        // Not kept as a `LuaEngine` field: `config::install` clones this `Rc` into the
-        // `get`/`set` closures it registers on the `neovibe.config` table, and those closures
-        // are themselves kept alive by `lua` (a real field below) for as long as `LuaEngine`
-        // lives -- so a separate `LuaEngine.config` field would hold a third clone that nothing
-        // ever reads, not one needed to keep the store alive.
+        // Kept as a field now, and the note this replaces is worth keeping in view: the store is
+        // held alive regardless by the `get`/`set` closures `config::install` registers on the
+        // `neovibe.config` table, which `lua` (a real field below) owns for as long as
+        // `LuaEngine` lives. So this field exists for a reader, not for a lifetime -- `main()`
+        // reads `agent.account` out of it once `init.lua` has run.
         let config = Rc::new(RefCell::new(neovibe_core::lua::config::ConfigStore::default()));
 
         panel::install(&lua, &neovibe, panels.clone(), config_dir)?;
         neovibe_core::lua::command::install(&lua, &neovibe, commands.clone())?;
         neovibe_core::lua::event::install(&lua, &neovibe, events.clone())?;
-        neovibe_core::lua::config::install(&lua, &neovibe, config)?;
+        neovibe_core::lua::config::install(&lua, &neovibe, config.clone())?;
 
         lua.globals().set("neovibe", neovibe)?;
 
@@ -48,6 +52,7 @@ impl LuaEngine {
             panels,
             commands,
             events,
+            config,
         })
     }
 

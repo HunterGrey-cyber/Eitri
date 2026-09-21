@@ -18,6 +18,16 @@ pub struct ConfigStore {
     values: HashMap<String, String>,
 }
 
+impl ConfigStore {
+    /// Reads a key from Rust. Added 2026-09-21 for `agent.account`: `init.lua` is where the host
+    /// is configured, and the host has to be able to read what it was configured with. This is the
+    /// same store `neovibe.config.get` reads, not a parallel one -- a plugin and the shell see one
+    /// value for one key, which is the only arrangement that cannot drift.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
+}
+
 /// `pub`: `LuaEngine::new` calls this.
 pub fn install(lua: &Lua, neovibe: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
     let config_table = lua.create_table()?;
@@ -57,6 +67,21 @@ mod tests {
         lua.load(r#"neovibe.config.set("greeting", "hello")"#).exec().unwrap();
         let value: String = lua.load(r#"return neovibe.config.get("greeting")"#).eval().unwrap();
         assert_eq!(value, "hello");
+    }
+
+    #[test]
+    fn what_init_lua_set_is_readable_from_rust_through_the_same_store() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &neovibe, store.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        lua.load(r#"neovibe.config.set("agent.account", "work")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(store.borrow().get("agent.account"), Some("work"));
+        assert_eq!(store.borrow().get("agent.nothing"), None);
     }
 
     #[test]

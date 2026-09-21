@@ -72,7 +72,25 @@ use std::time::Duration;
 /// Errors with `ErrorKind::NotFound` when neither `CLAUDE_CONFIG_DIR` nor `HOME` is set, rather
 /// than silently falling back to the relative path `projects` -- matches `persistence.rs`'s
 /// `conversations_dir()`, which already errors the same way for the same condition.
+///
+/// **Correction (2026-09-21): this process's own `CLAUDE_CONFIG_DIR` is the *fallback*, not the
+/// answer.** When [`crate::account`] has been given an account -- `init.lua`'s
+/// `neovibe.config.set("agent.account", ...)` -- the directory comes from that account's own
+/// convention instead, because this process's variable says only which account launched the
+/// window, while the account says which one the CLI is spending. The two were different on the
+/// host this was found on (`.claude-personal` inherited, `.claude-work` written), which is why a
+/// resumed session opened empty. With no account configured this function is byte-identical to
+/// what it always was, and that is the shipped default.
 pub fn claude_projects_dir() -> std::io::Result<PathBuf> {
+    projects_dir_for(crate::account::configured())
+}
+
+/// The half that takes the account as a parameter, so the two branches can be tested without
+/// pinning a process-global account inside a shared test binary.
+fn projects_dir_for(account: Option<&crate::account::ClaudeAccount>) -> std::io::Result<PathBuf> {
+    if let Some(account) = account {
+        return Ok(account.config_dir().join("projects"));
+    }
     let base = match std::env::var("CLAUDE_CONFIG_DIR") {
         Ok(v) => PathBuf::from(v),
         Err(_) => {
@@ -313,6 +331,42 @@ mod tests {
             PathBuf::from("/tmp/fake-claude-config/projects/-tmp-project/prov-1.jsonl")
         );
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+    }
+
+    /// The defect this pair exists for: the host's own variable said `.claude-personal` while the
+    /// sidecar's CLI wrote under `.claude-work`, so the resumed session found no transcript.
+    /// A configured account wins over the inherited variable -- that is the whole fix.
+    #[test]
+    fn a_configured_account_decides_the_projects_dir_not_this_processs_own_variable() {
+        let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.claude-personal") };
+        let account =
+            crate::account::ClaudeAccount::resolve_from("work", |k| (k == "HOME").then(|| "/home/user".to_string()))
+                .unwrap();
+        assert_eq!(
+            projects_dir_for(Some(&account)).unwrap(),
+            PathBuf::from("/home/user/.claude-work/projects")
+        );
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+    }
+
+    /// The other direction, and the one that matters for everyone who configures nothing: with no
+    /// account pinned, this function is the function it was before accounts existed.
+    #[test]
+    fn with_no_account_the_resolution_is_byte_identical_to_the_environment_only_rule() {
+        let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/home/user/.claude-personal") };
+        assert_eq!(
+            projects_dir_for(None).unwrap(),
+            PathBuf::from("/home/user/.claude-personal/projects")
+        );
+        // ... and the `$HOME/.claude` fallback underneath it, unchanged.
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            projects_dir_for(None).unwrap(),
+            PathBuf::from(home).join(".claude").join("projects")
+        );
     }
 
     #[test]
