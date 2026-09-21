@@ -173,19 +173,30 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
-    // Which local Claude account this window spends, from `init.lua`'s
-    // `neovibe.config.set("agent.account", "<name>")`. Read here, once, because this is the first
-    // point where `init.lua` has run and still before anything reads a transcript or starts a
-    // sidecar (the panel computes its greeting from a WebView `ready` signal, i.e. after the main
-    // loop starts). Unset is the shipped default and changes nothing. A name that is malformed or
-    // points at no directory is a hard startup failure naming the key -- never a silent fallback
-    // to "whichever shell launched this window", which is the accident that made a resumed
-    // session open empty on 2026-09-21 (see `agent::account`).
-    let configured_account = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
-    match agent::account::resolve_configured(configured_account.as_deref()) {
+    // Which local Claude account this window spends. Two sources, and the environment wins:
+    // `neovibe --account <name>` (and this host's own `VERDANDI_CLAUDE_ACCOUNT`, exported for
+    // Verdandi and inherited by every `neovibe` started from a terminal) arrives as that variable,
+    // and `init.lua`'s `neovibe.config.set("agent.account", "<name>")` is the per-machine default
+    // underneath it -- which is what pins the account for a launch from the app menu, where no
+    // shell configuration has run. Read here, once: this is the first point where `init.lua` has
+    // run, and still before anything reads a transcript or starts a sidecar (the panel computes its
+    // greeting from a WebView `ready` signal, i.e. after the main loop starts).
+    //
+    // Nothing set anywhere is the shipped default and changes nothing. A name that is malformed or
+    // points at no directory is a hard startup failure naming the source -- never a silent fallback
+    // to "whichever shell launched this window", which is the accident that made a resumed session
+    // open empty on 2026-09-21 (see `agent::account`).
+    let account_from_env = std::env::var("VERDANDI_CLAUDE_ACCOUNT").ok();
+    let account_from_config = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
+    match agent::account::resolve_for(account_from_env.as_deref(), account_from_config.as_deref()) {
         Ok(Some(account)) => {
+            let source = if agent::account::name_to_use(account_from_env.as_deref(), None).is_some() {
+                "VERDANDI_CLAUDE_ACCOUNT"
+            } else {
+                "init.lua's agent.account"
+            };
             eprintln!(
-                "[account] claude account '{}' -> {}",
+                "[account] claude account '{}' from {source} -> {}",
                 account.name(),
                 account.config_dir().display()
             );
@@ -193,7 +204,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("neovibe: neovibe.config.set(\"agent.account\", ...): {err}");
+            eprintln!("neovibe: the configured claude account is unusable: {err}");
             std::process::exit(1);
         }
     }

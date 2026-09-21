@@ -187,31 +187,44 @@ impl ClaudeAccount {
     }
 }
 
-/// Which name this process should use: `init.lua`'s `agent.account` first, and failing that
-/// whatever `VERDANDI_CLAUDE_ACCOUNT` this process already inherited.
+/// Which name this process should use: an inherited `VERDANDI_CLAUDE_ACCOUNT` first, and failing
+/// that `init.lua`'s `agent.account`.
 ///
-/// The second term is not a convenience. The sidecar is a child of this process and reads that
-/// variable for itself, so an inherited value already decides which account the CLI writes to --
-/// ignoring it here would leave this side reading one account while the CLI writes another, which
-/// is the exact skew this module exists to close, arrived at from the other direction. An explicit
-/// `agent.account` still wins, and `shell` then writes it onto the child, so both halves agree on
-/// the name the window was configured with rather than the one its terminal happened to carry.
-pub fn name_to_use<'a>(configured: Option<&'a str>, inherited: Option<&'a str>) -> Option<&'a str> {
-    configured
+/// **That order is the launcher's, not a preference.** `packaging/neovibe.launcher.sh` has taken
+/// `neovibe --account <name>` since the package existed and exports exactly this variable; it also
+/// *prints* which account it chose and where from. A per-launch flag beating a per-machine config
+/// file is the ordinary expectation, and it is the only order under which that printed line stays
+/// true -- config-wins would have the launcher announce one account while the window used another,
+/// which is a worse failure than either choice of default.
+///
+/// Reading the inherited value at all is the other half of this module's point. The sidecar is a
+/// child of this process and reads that variable for itself, so before today `--account work`
+/// already moved where the CLI wrote while this side went on reading wherever the window's own
+/// `CLAUDE_CONFIG_DIR` pointed -- the same skew, arrived at from the other direction. Now one name
+/// decides both.
+pub fn name_to_use<'a>(from_environment: Option<&'a str>, from_config: Option<&'a str>) -> Option<&'a str> {
+    from_environment
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .or(inherited.map(str::trim).filter(|v| !v.is_empty()))
+        .or(from_config.map(str::trim).filter(|v| !v.is_empty()))
 }
 
-/// Both halves in order, for a host that has an optional configured value and nothing else:
-/// nothing configured and nothing inherited means `None` out and no filesystem touched, so a
-/// window that configures no account never pays for a feature it did not turn on. Any error here
-/// is a startup failure at the call site -- `shell` prints it and exits, naming the key -- because
-/// the alternative, falling back to whichever account launched the window, is the accident this
-/// module exists to end.
-pub fn resolve_configured(value: Option<&str>) -> Result<Option<ClaudeAccount>, AccountError> {
-    let inherited = std::env::var("VERDANDI_CLAUDE_ACCOUNT").ok();
-    let Some(name) = name_to_use(value, inherited.as_deref()) else {
+/// [`name_to_use`] and both halves of resolution, in order. Nothing from either source means
+/// `None` out and no filesystem touched, so a window that pins no account never pays for a feature
+/// it did not turn on. Any error here is a startup failure at the call site -- `shell` prints it
+/// and exits, naming the source -- because the alternative, falling back to whichever account
+/// launched the window, is the accident this module exists to end.
+///
+/// The caller passes the environment in rather than this reading it: `shell` is where an
+/// environment variable belongs, and a library that reads one makes its own tests depend on the
+/// machine they run on. This one caught that for real -- `VERDANDI_CLAUDE_ACCOUNT=work` is
+/// exported by this host's own shell configuration, so a test of "nothing is pinned" passed or
+/// failed by where it was run from.
+pub fn resolve_for(
+    from_environment: Option<&str>,
+    from_config: Option<&str>,
+) -> Result<Option<ClaudeAccount>, AccountError> {
+    let Some(name) = name_to_use(from_environment, from_config) else {
         return Ok(None);
     };
     let account = ClaudeAccount::resolve(name)?;
@@ -386,22 +399,24 @@ mod tests {
     #[test]
     fn an_unconfigured_window_resolves_to_nothing_and_touches_no_disk() {
         assert_eq!(name_to_use(None, None), None);
+        assert_eq!(resolve_for(None, None), Ok(None));
     }
 
-    /// An inherited `VERDANDI_CLAUDE_ACCOUNT` already decides the sidecar's account, so this side
-    /// follows it rather than reading a different one; an explicit `agent.account` still wins.
+    /// `neovibe --account <name>` is a statement about one launch and the launcher prints it, so it
+    /// outranks `init.lua`; `init.lua` outranks nothing at all. Either way ONE name decides both
+    /// the sidecar child and where transcripts are read.
     #[test]
-    fn an_explicit_account_wins_over_an_inherited_one_and_an_inherited_one_beats_nothing() {
-        assert_eq!(name_to_use(Some("work"), Some("personal")), Some("work"));
-        assert_eq!(name_to_use(None, Some("personal")), Some("personal"));
-        assert_eq!(name_to_use(Some("  "), Some("personal")), Some("personal"));
-        assert_eq!(name_to_use(Some("work"), None), Some("work"));
-        assert_eq!(name_to_use(None, Some("  ")), None);
+    fn the_launchers_account_outranks_init_lua_and_init_lua_outranks_nothing() {
+        assert_eq!(name_to_use(Some("personal"), Some("work")), Some("personal"));
+        assert_eq!(name_to_use(None, Some("work")), Some("work"));
+        assert_eq!(name_to_use(Some("  "), Some("work")), Some("work"));
+        assert_eq!(name_to_use(Some("personal"), None), Some("personal"));
+        assert_eq!(name_to_use(Some("  "), None), None);
     }
 
     #[test]
     fn a_misspelled_account_is_a_startup_error_carrying_the_name_and_the_path() {
-        let err = resolve_configured(Some("definitely-not-an-account-on-this-host")).unwrap_err();
+        let err = resolve_for(None, Some("definitely-not-an-account-on-this-host")).unwrap_err();
         assert!(
             matches!(err, AccountError::MissingConfigDir { .. }),
             "expected the directory check to catch it, got {err:?}"

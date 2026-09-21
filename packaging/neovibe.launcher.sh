@@ -4,7 +4,7 @@
 #   neovibe                  open the current directory
 #   neovibe ~/some/project   open that project
 #   neovibe --legacy ~/p     use the older in-process Claude backend
-#   neovibe --account work bill a specific Claude account
+#   neovibe --account work bill a specific Claude account (and read its history)
 set -euo pipefail
 
 LIBDIR=/usr/lib/neovibe
@@ -60,6 +60,11 @@ fi
 # Handed over only when there is no packaged artifact -- otherwise an unrelated checkout in the
 # operator's home directory would silently outrank the binary that shipped with the product.
 [[ "$BACKEND" == sidecar && ! -x "$PACKAGED_SIDECAR" ]] && export NEOVIBE_VERDANDI_CHECKOUT="$VERDANDI"
+# Since 2026-09-21 this variable decides BOTH halves, not just the sidecar's. It always moved which
+# account the CLI authenticates as and writes transcripts under; the binary now derives the
+# directory it READS transcripts from by the same convention (`agent::account`), so a resume finds
+# the history the account really holds. Before that the two disagreed silently on this host, where
+# the shell exports this for Verdandi and the window inherited a different `CLAUDE_CONFIG_DIR`.
 [[ -n "$ACCOUNT" ]] && export VERDANDI_CLAUDE_ACCOUNT="$ACCOUNT"
 
 if [[ -z "$QUIET" ]]; then
@@ -80,7 +85,9 @@ if [[ -z "$QUIET" ]]; then
 		elif [[ -n "$ACCOUNT" ]]; then
 			echo "         account $ACCOUNT (from VERDANDI_CLAUDE_ACCOUNT in the environment)"
 		else
-			echo "         account not pinned; CLAUDE_PROFILE=${CLAUDE_PROFILE:-<unset>}"
+			# Not "not pinned" -- not pinned HERE. `init.lua` can still pin one, and the
+			# binary prints what it took and where from; a flat claim here would contradict it.
+			echo "         account not pinned here; init.lua may pin one. CLAUDE_PROFILE=${CLAUDE_PROFILE:-<unset>}"
 		fi
 	} >&2
 fi
