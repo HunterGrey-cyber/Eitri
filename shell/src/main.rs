@@ -13,6 +13,7 @@ mod pane_switch;
 mod prefix;
 mod supervisor_client;
 mod terminal_handoff;
+mod text_size;
 mod theme;
 mod window_mode;
 
@@ -307,16 +308,27 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let bg = tokens.bg;
         (bg.r, bg.g, bg.b)
     };
+    // The panel's LIVE size: starts at the base and
+    // is kept current by `text_size_controller` below. `panel_tokens` reads this rather than the
+    // captured `panel_font_size` so a colorscheme change re-derives every OTHER token but never
+    // resets a zoom back to the un-zoomed base.
+    let panel_px = Rc::new(std::cell::Cell::new(panel_font_size));
     // One helper, so the startup theme and every later one cannot disagree about the size. The
     // editor's clear colour and the GTK chrome do not take it: it is the panel's text, not the
     // window's.
-    let panel_tokens = move |payload: Option<&neovibe_core::theme::payload::NvimThemePayload>| {
-        let mut tokens = match payload {
-            Some(p) => neovibe_core::theme::ThemeTokens::derive(p),
-            None => neovibe_core::theme::ThemeTokens::fallback(),
-        };
-        tokens.font_size_px = panel_font_size;
-        tokens
+    let panel_tokens = {
+        let panel_px = panel_px.clone();
+        move |payload: Option<&neovibe_core::theme::payload::NvimThemePayload>| {
+            let mut tokens = match payload {
+                Some(p) => neovibe_core::theme::ThemeTokens::derive(p),
+                None => neovibe_core::theme::ThemeTokens::fallback(),
+            };
+            tokens.font_size_px = text_size::live_panel_font_size_px(&panel_px);
+            // `live_panel_font_size_px` is unit-tested in `text_size.rs`, but this GTK closure has no
+            // headless test to catch using the captured startup `panel_font_size` instead. Check in the
+            // GUI that changing the colorscheme after zooming keeps the panel zoomed.
+            tokens
+        }
     };
     agent_panel_handle.set_theme(&panel_tokens(None));
     pane.set_clear_color(editor_clear(&neovibe_core::theme::ThemeTokens::fallback()));
@@ -335,6 +347,18 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             pane_for_theme.set_clear_color(editor_clear(&tokens));
         });
     }
+
+    // Zoom both panes together or each one alone. `app.text-larger`, `app.text-smaller`,
+    // and `app.text-reset` affect both panes and follow `g:neovide_scale_factor` from nvim.
+    // The `Ctrl+a` prefix's one-pane `=`/`-`/`0` calls `apply_editor` or `apply_panel`
+    // after resolving which pane holds the keys.
+    let text_size_controller = text_size::TextSizeController::install(
+        app,
+        editor_is_main.then(|| pane.clone()),
+        agent_panel_handle.clone(),
+        panel_font_size,
+        panel_px,
+    );
 
     let top_bar = chrome::build_top_bar(&window, project_root);
     root.append(&top_bar.widget);
@@ -445,6 +469,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let pane_contents = pane_contents.clone();
         let side_is_agent = side_widget == agent_widget;
         let app_name = top_bar.app_name.clone();
+        let text_size_controller = text_size_controller.clone();
         prefix::install(
             &window,
             move |command| match command {
@@ -458,6 +483,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         Some(0) if editor_is_main => editor.send_keys("<C-a>"),
                         Some(1) if side_is_agent => agent.select_all(),
                         _ => {}
+                    }
+                }
+                // Route text sizing by the pane that currently holds the keys, using `pane_focus`, rather than
+                // `last_pane`. Focus on the top bar or a plugin pane makes this a no-op, as for `SendPrefix`.
+                // `text_size::route_focused_pane` keeps the routing covered by its unit test.
+                prefix::PrefixCommand::TextSize(step) => {
+                    let focused = pane_focus::focused_pane(&window_for_focus, &pane_contents);
+                    match text_size::route_focused_pane(focused, editor_is_main, side_is_agent) {
+                        text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(step),
+                        text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(step),
+                        text_size::TextSizeTarget::Neither => {}
                     }
                 }
             },
@@ -732,100 +768,124 @@ mod tests {
         assert!(app.flags().contains(gtk4::gio::ApplicationFlags::NON_UNIQUE));
     }
 
-    /// The panel's `?` keymap lists the window's keys by hand (`agent-ui/web/src/keymap.ts`,
-    /// `WINDOW_KEYS`), since nothing on the web side can read what GTK binds. This test reads the
-    /// registrations rather than restating them: it walks this crate's own sources for
-    /// accelerator-shaped string literals and asserts each one has a row in that list.
-    ///
-    /// It looks for the literals rather than for `set_accels_for_action` calls because
-    /// `window_mode.rs` passes its two through a `format!` over a table, so a scan of the call
-    /// sites alone would miss `F11` and `<Control><Shift>F11` entirely. In `shell/src` an
-    /// accelerator-shaped literal is always an accelerator; a new one that is something else fails
-    /// loudly here, which is the safe direction.
-    ///
-    /// Reading the sources is also what gives this **both** directions. The hand-written list this
-    /// replaced could only catch a registration whose row was deleted; a key added in a new file
-    /// and never documented now fails too.
-    ///
-    /// The containment check is row-shaped, not substring-shaped: an accelerator must equal a whole
-    /// `keys:` value, or one `/`-separated alternative inside one. `keymap.ts.contains("Ctrl+Shift+F")`
-    /// was satisfied by the `Ctrl+Shift+F11` row, so deleting HINT's own row left the old test green.
-    #[test]
-    fn every_app_accelerator_is_in_the_panel_keymap() {
-        /// Every spelling a `keys:` row offers, each `/`-separated alternative on its own.
-        fn documented_keys(keymap: &str) -> std::collections::HashSet<String> {
-            let mut rows = std::collections::HashSet::new();
-            for after in keymap.split("keys: \"").skip(1) {
-                let Some(value) = after.split('"').next() else { continue };
-                rows.insert(value.to_string());
-                for alternative in value.split(" / ") {
-                    rows.insert(alternative.to_string());
-                }
+    /// Returns every `keys:` value and each `/`-separated alternative. Shared by the accelerator
+    /// checks so they use the same parsing logic.
+    fn documented_keys(keymap: &str) -> std::collections::HashSet<String> {
+        let mut rows = std::collections::HashSet::new();
+        for after in keymap.split("keys: \"").skip(1) {
+            let Some(value) = after.split('"').next() else { continue };
+            rows.insert(value.to_string());
+            for alternative in value.split(" / ") {
+                rows.insert(alternative.to_string());
             }
-            rows
         }
+        rows
+    }
 
-        /// A GTK accelerator (`<Control><Shift>f`) as `keymap.ts` spells it (`Ctrl+Shift+F`).
-        fn spell(accel: &str) -> String {
-            let mut parts: Vec<String> = Vec::new();
-            let mut rest = accel;
-            while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
-                parts.push(match &rest[1..end + 1] {
-                    "Control" | "Primary" => "Ctrl".to_string(),
-                    other => other.to_string(),
-                });
-                rest = &rest[end + 2..];
-            }
-            parts.push(if rest.chars().count() == 1 {
-                rest.to_uppercase()
-            } else {
-                rest.to_string()
+    /// Keysyms named literally (not a single character and not an `Fnn` function key) that
+    /// this test knows how to read for a person, and how it spells each one. The zoom-together
+    /// design's text-size accelerators (`<Control>equal` and friends) are the first accelerators
+    /// in this crate whose key part isn't a bare letter/digit or a function key, so `spell` and
+    /// `is_accel` both need to know them by name -- this table is the one place that names them
+    /// for both.
+    const NAMED_KEYSYMS: [(&str, &str); 7] = [
+        ("equal", "="),
+        ("plus", "+"),
+        ("minus", "-"),
+        ("KP_Add", "Keypad+"),
+        ("KP_Subtract", "Keypad-"),
+        ("KP_0", "Keypad0"),
+        // Keypad 0 with NumLock off reports as KP_Insert, not KP_0 -- text-reset binds both
+        // (2026-09-23).
+        ("KP_Insert", "Keypad0 (NumLock off)"),
+    ];
+
+    /// A GTK accelerator (`<Control><Shift>f`) as `keymap.ts` spells it (`Ctrl+Shift+F`).
+    fn spell(accel: &str) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut rest = accel;
+        while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
+            parts.push(match &rest[1..end + 1] {
+                "Control" | "Primary" => "Ctrl".to_string(),
+                other => other.to_string(),
             });
-            parts.join("+")
+            rest = &rest[end + 2..];
         }
+        parts.push(match NAMED_KEYSYMS.iter().find(|(keysym, _)| *keysym == rest) {
+            Some((_, spelled)) => spelled.to_string(),
+            None if rest.chars().count() == 1 => rest.to_uppercase(),
+            None => rest.to_string(),
+        });
+        parts.join("+")
+    }
 
-        /// `<Mod>…Key`, with at least one modifier or a function key. The shape the sources are
-        /// scanned for; anything else in a string literal is not an accelerator.
-        fn is_accel(literal: &str) -> bool {
-            let mut rest = literal;
-            let mut modifiers = 0;
-            while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
-                if !rest[1..end + 1].chars().all(|c| c.is_ascii_alphabetic()) {
-                    return false;
-                }
-                modifiers += 1;
-                rest = &rest[end + 2..];
+    /// `<Mod>…Key`, with at least one modifier or a function key. The shape the sources are
+    /// scanned for; anything else in a string literal is not an accelerator.
+    ///
+    /// A literal with a valid modifier-bracket prefix (so it is clearly meant as an
+    /// accelerator) whose key part is neither a bare letter/digit, an `Fnn` function key, nor
+    /// one of `NAMED_KEYSYMS` is a scanner FAILURE, not a silent skip: it panics, naming the
+    /// literal and the file, rather than quietly leaving `found` blind to it. That is the
+    /// direction this whole test is written to fail in -- see its own doc comment on "both
+    /// directions" -- and the reason it exists concretely: before `NAMED_KEYSYMS` exhausted,
+    /// `<Control>KP_Add` (underscore is not alphanumeric) would otherwise have been dropped
+    /// from `found` with nothing here noticing the guard had gone blind to it.
+    fn is_accel(literal: &str) -> bool {
+        let mut rest = literal;
+        let mut modifiers = 0;
+        while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
+            if !rest[1..end + 1].chars().all(|c| c.is_ascii_alphabetic()) {
+                return false;
             }
-            let function_key = rest.starts_with('F') && rest.len() > 1 && rest[1..].chars().all(|c| c.is_ascii_digit());
-            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) && (modifiers > 0 || function_key)
+            modifiers += 1;
+            rest = &rest[end + 2..];
         }
+        let function_key = rest.starts_with('F') && rest.len() > 1 && rest[1..].chars().all(|c| c.is_ascii_digit());
+        if rest.is_empty() || (modifiers == 0 && !function_key) {
+            return false;
+        }
+        if function_key
+            || rest.chars().all(|c| c.is_ascii_alphanumeric())
+            || NAMED_KEYSYMS.iter().any(|(keysym, _)| *keysym == rest)
+        {
+            return true;
+        }
+        panic!(
+            "{literal:?} has a modifier bracket ({modifiers} of them) but its key part {rest:?} \
+             is not one `spell`/`NAMED_KEYSYMS` knows how to read -- teach both, or this was \
+             never meant to be an accelerator"
+        );
+    }
 
-        /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module and its line comments cut
-        /// off -- so this test's own copies of the accelerators cannot satisfy it.
-        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-            for entry in std::fs::read_dir(dir).expect("shell/src is readable") {
-                let path = entry.expect("a readable entry").path();
-                if path.is_dir() {
-                    sources(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).expect("a readable source file");
-                    let code = text.split("#[cfg(test)]").next().unwrap_or_default();
-                    let code: String = code
-                        .lines()
-                        .map(|line| line.split("//").next().unwrap_or_default())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    out.push((path.display().to_string(), code));
-                }
+    /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module and its line comments cut
+    /// off -- so this test's own copies of the accelerators cannot satisfy it.
+    fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("shell/src is readable") {
+            let path = entry.expect("a readable entry").path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                let code: String = code
+                    .lines()
+                    .map(|line| line.split("//").next().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.push((path.display().to_string(), code));
             }
         }
+    }
 
+    /// Every accelerator-shaped string literal in `shell/src`, cut from `.rs` files by
+    /// [`sources`]/[`is_accel`]. Shared, so the two tests below scan the same tree the same way.
+    fn found_accelerators() -> Vec<(String, String)> {
         let mut files = Vec::new();
         sources(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
-        let mut found: Vec<(String, String)> = Vec::new();
+        let mut found = Vec::new();
         for (name, code) in &files {
             for (index, chunk) in code.split('"').enumerate() {
                 if index % 2 == 1 && is_accel(chunk) {
@@ -833,6 +893,27 @@ mod tests {
                 }
             }
         }
+        found
+    }
+
+    /// Checks that every accelerator-shaped string literal in this crate's sources has a matching
+    /// row in the panel's `?` keymap (`agent-ui/web/src/keymap.ts`, `WINDOW_KEYS`). The web side
+    /// cannot read GTK bindings, so the list is maintained by hand.
+    ///
+    /// Scanning literals also covers `window_mode.rs`, where `format!` passes table entries to the
+    /// registration call. Adding a literal in a new source file is checked automatically. Each
+    /// accelerator must match a complete `keys:` value or a complete `/`-separated alternative, so
+    /// `Ctrl+Shift+F11` cannot satisfy `Ctrl+Shift+F`.
+    ///
+    /// The scan only sees complete double-quoted literals. `format!("<Control>{}", "equal")`
+    /// reaches the malformed-key panic guard because `"{}"` is not a supported key. However,
+    /// `format!("{}{}", "<Control>", "Home")` goes unnoticed: neither separate literal looks like
+    /// an accelerator. Bindings assembled from multiple literals therefore need a separate check.
+    /// Lua keybindings supplied by `init.lua` are also outside this source scan because their
+    /// values are only known at runtime.
+    #[test]
+    fn every_app_accelerator_is_in_the_panel_keymap() {
+        let found = found_accelerators();
 
         // A floor, not a list: it catches a walk that silently stopped finding anything, without
         // restating what the sources say.
@@ -848,6 +929,80 @@ mod tests {
             assert!(
                 documented.contains(&spelled),
                 "{file} binds {accel}, but no keymap.ts row says `keys: \"{spelled}\"`"
+            );
+        }
+    }
+
+    /// Checks the reverse direction of `every_app_accelerator_is_in_the_panel_keymap`: documented
+    /// both-pane text-size keys must still be bound in `text_size::TEXT_SIZE_ACTIONS`. Removing a
+    /// binding must not leave a stale keymap row unnoticed.
+    ///
+    /// This is limited to the three both-pane text-size rows. Most other keymap entries describe
+    /// keys handled without GTK accelerator registrations, so a reverse scan of the whole file
+    /// would compare unrelated sets.
+    #[test]
+    fn every_documented_both_panes_text_size_key_is_still_bound_in_text_size_rs() {
+        let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, accels, _) in text_size::TEXT_SIZE_ACTIONS.iter().copied() {
+            for accel in accels {
+                bound.insert(spell(accel));
+            }
+        }
+        let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
+        let mut checked_any = false;
+        for line in keymap
+            .lines()
+            .filter(|l| l.contains("Text size") && l.contains("both panes"))
+        {
+            let Some(value) = line.split("keys: \"").nth(1).and_then(|rest| rest.split('"').next()) else {
+                continue;
+            };
+            for alternative in value.split(" / ") {
+                checked_any = true;
+                assert!(
+                    bound.contains(alternative),
+                    "keymap.ts documents {alternative:?} as a both-panes text-size key, but \
+                     text_size::TEXT_SIZE_ACTIONS no longer binds it"
+                );
+            }
+        }
+        assert!(
+            checked_any,
+            "no both-panes text-size row found in keymap.ts -- the scan is broken"
+        );
+    }
+
+    /// Checks `keymap.ts`'s hand-maintained `PREFIX_KEYS` against the actual characters bound by
+    /// `prefix::command`, through `prefix::bound_keys`. Checking both directions catches missing
+    /// documentation and stale rows without another hand-written list of bindings.
+    #[test]
+    fn prefix_keys_documents_exactly_the_chars_prefix_rs_binds() {
+        let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
+        let mut documented: std::collections::HashSet<char> = std::collections::HashSet::new();
+        for line in keymap.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("{ keys: \"Ctrl+a ") else {
+                continue;
+            };
+            let Some(value) = rest.split('"').next() else { continue };
+            for token in value.split(" / ") {
+                let mut chars = token.chars();
+                if let (Some(ch), None) = (chars.next(), chars.next()) {
+                    documented.insert(ch);
+                }
+            }
+        }
+        let bound: std::collections::HashSet<char> = prefix::bound_keys().into_iter().collect();
+
+        for &ch in &bound {
+            assert!(
+                documented.contains(&ch),
+                "prefix.rs binds {ch:?} after Ctrl+a, but no PREFIX_KEYS row mentions it"
+            );
+        }
+        for &ch in &documented {
+            assert!(
+                bound.contains(&ch),
+                "PREFIX_KEYS documents {ch:?} after Ctrl+a, but prefix::command no longer binds it"
             );
         }
     }
