@@ -24,6 +24,9 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     let hint_bg = tokens.hint_bg.hex();
     let hint_fg = tokens.hint_fg.hex();
     let font = PROSE_FONT_STACK;
+    // The module grid's own CSS node name, so its dividers take the rule below: it is the only
+    // container with dividers since the grid replaced the two `GtkPaned`s (modules design P1).
+    let grid = crate::module_grid::CSS_NAME;
 
     format!(
         r#"
@@ -85,7 +88,7 @@ window {{
     background-color: {bg};
 }}
 
-paned.content-area > separator {{
+{grid}.content-area > separator {{
     background-color: {border};
     background-image: none;
     min-width: 1px;
@@ -405,9 +408,9 @@ mod tests {
         })
     }
 
-    /// The global `f` HINT's GTK labels (top bar, editor, bottom slot) are the IncSearch pair, the
-    /// same as the panel's. `hint_fg` is guarded for text against `hint_bg` only, so the rule must
-    /// lay its own `hint_bg` fill under the text and use no other text colour.
+    /// The global `f` HINT's GTK labels (top-bar items, the editor, a Lua panel) are the IncSearch
+    /// pair, the same as the panel's. `hint_fg` is guarded for text against `hint_bg` only, so the
+    /// rule must lay its own `hint_bg` fill under the text and use no other text colour.
     #[test]
     fn a_hint_label_is_hint_fg_text_on_its_own_hint_bg_fill() {
         let incsearch = dawn_with_incsearch();
@@ -436,7 +439,10 @@ mod tests {
     #[test]
     fn the_divider_clears_any_background_image_a_user_theme_draws_it_with() {
         let css = gtk_css(&ThemeTokens::fallback());
-        let body = rule(&css, "paned.content-area > separator");
+        let body = rule(
+            &css,
+            &format!("{}.content-area > separator", crate::module_grid::CSS_NAME),
+        );
         assert!(body.contains("\n    background-image: none;"), "{body}");
     }
 }

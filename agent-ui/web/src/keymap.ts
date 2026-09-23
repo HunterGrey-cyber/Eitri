@@ -158,7 +158,7 @@ export const INPUT_KEYS: KeyHelp[] = [
 export const WINDOW_KEYS: KeyHelp[] = [
   { keys: "Ctrl+h / Ctrl+l", what: "Editor / this panel" },
   { keys: "Ctrl+k", what: "Top bar (h / l move, Ctrl+j or Esc go back)" },
-  { keys: "Ctrl+j", what: "Down to the terminal, when it is shown (Ctrl+k there comes back up)" },
+  { keys: "Ctrl+j", what: "Down to the terminal when it is shown, or a panel below (Ctrl+k comes back up)" },
   { keys: "Ctrl+Shift+F", what: "HINT from anywhere (f in this panel or the top bar)" },
   { keys: "F11", what: "Fullscreen" },
   { keys: "Ctrl+Shift+F11", what: "Immersive: fullscreen without the top bar" },

@@ -1,6 +1,7 @@
-//! shell: the real neovibe product window -- custom chrome, a two-pane layout, the
-//! neovide-editor crate embedded as the real editor pane, and the real agent-ui panel (a
-//! WebView-hosted frontend bridged to a lazily-started `agent::AgentSession`). See
+//! shell: the real neovibe product window -- custom chrome, the module grid (a layout that is data:
+//! docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md), the neovide-editor crate
+//! embedded as the real editor pane, and the real agent-ui panel (a WebView-hosted frontend bridged
+//! to a lazily-started `agent::AgentSession`). See
 //! docs/superpowers/specs/2026-09-06-shell-scaffolding-design.md.
 
 mod agent_panel;
@@ -9,6 +10,7 @@ mod editor_context;
 mod hint;
 mod layout;
 mod lua;
+mod module_grid;
 mod pane_focus;
 mod pane_switch;
 mod prefix;
@@ -19,6 +21,7 @@ mod text_size;
 mod theme;
 mod window_mode;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -27,7 +30,9 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
-use lua::{LuaEngine, PanelEntry, PanelSlot};
+use lua::{LuaEngine, PanelSlot};
+use module_grid::{HostKind, ModuleGrid};
+use neovibe_core::layout::{Direction, ModuleDecl, ModuleId, ModuleKind, Nav};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 
 const APP_ID: &str = "cn.huntergrey.neovibe";
@@ -43,6 +48,16 @@ fn config_dir() -> PathBuf {
 }
 
 fn main() -> glib::ExitCode {
+    // First, before any thread or fd exists: a pipe, socket or file on stdin would be handed to the
+    // embedded nvim by the Neovide fork, which reads it as a buffer and, for a pipe or socket whose
+    // writer stays open, blocks until EOF with the editor blank (`neovide_editor::stdin`; the GUI
+    // pass of 2026-09-23's defect 2). A terminal is left alone.
+    match neovide_editor::detach_stdin_from_nvim() {
+        Ok(Some(kind)) => eprintln!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now"),
+        Ok(None) => {}
+        Err(e) => eprintln!("[stdin] could not detach stdin from nvim ({e}); a pipe there will block the editor"),
+    }
+
     // Same `--clean` passthrough convenience as `neovide_embed_live`/`shell_composed`: pass
     // `--clean` on this binary's own command line to launch nvim with `--clean` instead of a
     // real embedding host's actual config.
@@ -143,19 +158,6 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let config_dir = config_dir();
     let lua_engine = Rc::new(LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"));
 
-    // Register built-in panels FIRST, through the exact same `PanelRegistry::register` that a
-    // Lua plugin's `neovibe.panel.register` call goes through -- then load init.lua, which may
-    // register more panels (including replacing a built-in slot: a later registration to an
-    // already-occupied slot just replaces the earlier one, per `PanelRegistry::register`).
-    let editor_widget: gtk4::Widget = pane.widget().clone().upcast();
-    lua_engine.register_builtin_panel(
-        PanelSlot::Main,
-        PanelEntry {
-            id: "editor".into(),
-            title: "Editor".into(),
-            widget: editor_widget,
-        },
-    );
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
     let editor_context_source = match context_feed.as_mut() {
@@ -164,29 +166,6 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     };
     let (agent_widget, agent_panel_handle) =
         agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source);
-    lua_engine.register_builtin_panel(
-        PanelSlot::Side,
-        PanelEntry {
-            id: "agent".into(),
-            title: "Agent".into(),
-            widget: agent_widget.clone(),
-        },
-    );
-
-    // The bottom terminal (spec docs/superpowers/specs/2026-09-23-bottom-terminal-design.md),
-    // registered like the other two built-ins so a Lua plugin can still take the bottom slot. Hidden
-    // until `Ctrl+a t`, and its shell is not started until then: a window whose terminal is never
-    // used starts no process and looks exactly as it did before the terminal existed.
-    let terminal = terminal::TerminalPane::new(project_root.to_path_buf());
-    let terminal_widget: gtk4::Widget = terminal.widget().clone().upcast();
-    lua_engine.register_builtin_panel(
-        PanelSlot::Bottom,
-        PanelEntry {
-            id: "terminal".into(),
-            title: "Terminal".into(),
-            widget: terminal_widget.clone(),
-        },
-    );
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
@@ -255,42 +234,87 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         }
     }
 
-    // Build the real layout from whatever ended up in the registry -- this is what makes
-    // "built-in and plugin panels share one path" a fact about the running app, not just
-    // documentation. `.expect()` here is deliberate: both slots are guaranteed non-empty by this
-    // point (the two `register_builtin_panel` calls above ran unconditionally, and even if
-    // init.lua replaced one, replacement never leaves a slot empty).
-    //
-    // The bottom slot is read as an `Option` rather than an `expect`, but not because it can
-    // still be empty in practice: since the bottom terminal (2026-09-23) all three slots are
-    // registered unconditionally, and nothing unregisters a panel, so `bottom` is always `Some`
-    // too by this point -- `Some(terminal)`, or `Some(<a Lua panel that replaced it>)`. Left as
-    // `Option` because `PanelRegistry::get`'s signature is the same for every slot; a `None` here
-    // would mean a real defect, not the empty bottom-slot case this comment used to describe
-    // before the terminal came back (window review 2026-09-23, M4).
-    let (main_widget, side_widget, bottom_widget) = {
-        let panels = lua_engine.panels.borrow();
-        let main = panels
-            .get(PanelSlot::Main)
-            .expect("main slot must be populated by this point");
-        let side = panels
-            .get(PanelSlot::Side)
-            .expect("side slot must be populated by this point");
-        let bottom = panels.get(PanelSlot::Bottom);
-        (
-            main.widget.clone(),
-            side.widget.clone(),
-            bottom.map(|e| e.widget.clone()),
-        )
-    };
+    // The bottom terminal (docs/superpowers/specs/2026-09-23-bottom-terminal-design.md), a module
+    // since the modules design's P1 re-homed it (its plan's Task 11). Hidden until `Ctrl+a t`, and
+    // its shell is not started until then: a window whose terminal is never used starts no process,
+    // touches no font manager, and looks exactly as it did before the terminal existed.
+    let terminal = terminal::TerminalPane::new(project_root.to_path_buf());
 
-    // A Lua plugin can take the main slot, in which case the editor is not pane 0 and must not
-    // be told it has the keys when that plugin does; also whether `window_mode`'s F11 sync has an
-    // nvim to write to at all (§2.4).
-    let editor_is_main = main_widget == pane.widget().clone().upcast::<gtk4::Widget>();
-    // Likewise the bottom slot: a Lua plugin there is not the terminal, and none of the terminal's
-    // wiring below applies to it.
-    let bottom_is_terminal = bottom_widget.as_ref() == Some(&terminal_widget);
+    // The layout is data (modules design P1, docs/superpowers/specs/
+    // 2026-09-23-modules-and-canvas-design.md §4): `[editor | agent]`, the terminal below both
+    // (hidden), then each Lua panel placed by its `position` in the order it was registered
+    // (`terminal::initial_layout`, `Layout::initial`, `PanelSlot::placement`). The editor, the agent
+    // and the terminal are not in the Lua registry at all: every window has all three, and a Lua
+    // panel no longer replaces any of them -- a Lua `bottom` panel goes under the terminal.
+    let lua_panels: Vec<(ModuleId, PanelSlot, gtk4::Widget)> = lua_engine
+        .panels
+        .borrow()
+        .entries()
+        .iter()
+        .map(|entry| (ModuleId::lua(&entry.id), entry.slot, entry.widget.clone()))
+        .collect();
+    let decls: Vec<ModuleDecl> = lua_panels
+        .iter()
+        .map(|(id, slot, _)| ModuleDecl {
+            id: id.clone(),
+            placement: slot.placement(),
+        })
+        .collect();
+    let module_layout = Rc::new(RefCell::new(
+        terminal::initial_layout(&decls)
+            .expect("the registry keeps one entry per id, and a Lua id never names a built-in"),
+    ));
+    // Every module's host, added once and never reparented (`module_grid`'s module doc).
+    let grid = ModuleGrid::new(module_layout.clone());
+    grid.add(ModuleId::editor(), pane.widget(), HostKind::Direct);
+    grid.add(ModuleId::agent(), &agent_widget, HostKind::Web);
+    // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to zero
+    // reports a 1-row grid to its shell.
+    terminal.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
+    grid.add(ModuleId::terminal(), terminal.widget(), HostKind::Direct);
+    for (id, slot, widget) in &lua_panels {
+        if *slot == PanelSlot::Bottom {
+            widget.set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
+        }
+        grid.add(id.clone(), widget, HostKind::Web);
+    }
+    grid.apply();
+    let modules = grid.hosts();
+
+    // Gives a module the keys. The editor goes through `NeovideEditorPane::grab_focus`, which also
+    // tells the input method; any other module is its host widget's own `grab_focus`. A hidden
+    // module is refused: GTK4's `grab_focus` does not refuse an unmapped widget, so the keys would
+    // go to a module nobody can see (the editor under a Lua `main` panel). Every caller today
+    // already avoids one -- `navigate` sees only shown modules, HINT only mapped ones, and the
+    // layout's `focus` is never hidden (`Layout::set_focus`) -- so this holds it for the next caller.
+    let focus_module: Rc<dyn Fn(&ModuleId) -> bool> = {
+        let pane = pane.clone();
+        let modules = modules.clone();
+        let module_layout = module_layout.clone();
+        Rc::new(move |id| {
+            match module_layout.try_borrow() {
+                Ok(layout) if !layout.is_shown(id) => {
+                    println!("[focus] {id} is hidden; the keys stay where they are");
+                    return false;
+                }
+                Ok(_) => {}
+                // No caller holds the layout for writing while it moves focus (`ModuleGrid::apply`,
+                // `hide_module`); this line is how a new one would show up.
+                Err(_) => eprintln!("[focus] BUG: the layout was borrowed for writing when {id} was given the keys"),
+            }
+            if id.kind() == ModuleKind::Editor {
+                pane.grab_focus();
+                // `NeovideEditorPane::grab_focus` returns nothing, so ask: did the editor's widget
+                // become the window's focus widget? (It used to say `true` unconditionally, so the
+                // `grab_focus=` in `[pane_switch]` lines could not be believed for the editor.)
+                return pane.widget().is_focus();
+            }
+            modules
+                .iter()
+                .find(|(m, _)| m == id)
+                .is_some_and(|(_, host)| host.grab_focus())
+        })
+    };
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -305,18 +329,6 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
-
-    let (content_widget, across) = layout::build_content_area(&main_widget, &side_widget);
-    let (content_widget, down) = match &bottom_widget {
-        Some(bottom) => {
-            let (widget, paned) = layout::build_vertical_split(&content_widget, bottom);
-            (widget, Some(paned))
-        }
-        None => (content_widget, None),
-    };
-    // Zoom and resize for the `Ctrl+a` prefix (spec 2026-09-19-window-modes-design.md §3.4-3.5).
-    // The built-in terminal starts hidden; a Lua bottom panel starts shown, as before.
-    let pane_layout = layout::PaneLayout::new(across, down, !bottom_is_terminal);
 
     // `app.reload-agent-panel` + Ctrl+Shift+R; the top bar's own `⟳` button points at the same
     // action. Everything about it -- why it is an app action, what it costs, what is still
@@ -385,7 +397,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // has resolved which pane holds the keys (below, alongside `Zoom`/`Resize`/`SendPrefix`).
     let text_size_controller = text_size::TextSizeController::install(
         app,
-        editor_is_main.then(|| pane.clone()),
+        // Every window has the editor since the modules design's P1: a Lua `main` panel hides it
+        // rather than replacing it, and a text-size write to an nvim that has not started yet is
+        // buffered by the pane (`ScaleWatch`).
+        Some(pane.clone()),
         agent_panel_handle.clone(),
         panel_font_size,
         panel_px,
@@ -393,11 +408,12 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     let top_bar = chrome::build_top_bar(&window, project_root);
     root.append(&top_bar.widget);
-    root.append(&content_widget);
+    root.append(&grid);
 
-    // The global `f` HINT draws its GTK labels (top bar, editor, bottom slot) as overlay children
-    // of this, positioned over whatever they label. Its only child is the whole window content, so
-    // the layout is exactly what it was without it; the labels never take a click.
+    // The global `f` HINT draws its GTK labels (top-bar items, the editor, each Lua panel) as
+    // overlay children of this, positioned over whatever they label. Its only child is the whole
+    // window content, so the layout is exactly what it was without it; the labels never take a
+    // click.
     let hint_overlay = gtk4::Overlay::new();
     hint_overlay.set_child(Some(&root));
     window.set_child(Some(&hint_overlay));
@@ -413,10 +429,12 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         overlay: hint_overlay.clone(),
         top_items: top_bar.items.clone(),
         editor: pane.clone(),
-        main_widget: main_widget.clone(),
-        side_widget: side_widget.clone(),
         agent_widget: agent_widget.clone(),
-        bottom: bottom_widget.clone(),
+        modules: {
+            let grid = grid.clone();
+            Rc::new(move || grid.hosts_in_tree_order())
+        },
+        focus_module: focus_module.clone(),
         agent: agent_panel_handle.clone(),
     });
     {
@@ -431,83 +449,60 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         app.set_accels_for_action("app.hint", &["<Control><Shift>f"]);
     }
 
-    // Which pane has the keys. One tracker drives the editor's cursor (solid, or not drawn,
+    // Which module has the keys. One tracker drives the editor's cursor (solid, or not drawn,
     // via Neovide itself) and the agent panel's cursor and mode block, so they cannot disagree. See
-    // `pane_focus`'s module doc.
-    let pane_contents: Vec<gtk4::Widget> = {
-        let mut v = vec![main_widget.clone(), side_widget.clone()];
-        v.extend(bottom_widget.clone());
-        v
-    };
-    // The pane above the terminal that last held the keys: where `Ctrl+k` from the terminal, and
-    // hiding it while it holds the keys, send focus back to.
-    let last_upper_pane = Rc::new(std::cell::Cell::new(0usize));
-    let last_pane = {
+    // `pane_focus`'s module doc. The module that last held them is the layout's `focus`: where the
+    // top bar's `Ctrl+j` returns to, what the `Ctrl+a` prefix zooms and resizes around, and the
+    // head of the MRU list `neighbor()` breaks ties with.
+    {
         let agent_panel_handle = agent_panel_handle.clone();
         let editor = pane.clone();
         let terminal = terminal.clone();
-        let last_upper_pane = last_upper_pane.clone();
-        pane_focus::install(&window, pane_contents.clone(), move |index, has_keys| {
-            println!("[pane_focus] pane {index} has_keys={has_keys}");
-            if has_keys && index < terminal::BOTTOM_PANE {
-                last_upper_pane.set(index);
-            }
-            match index {
-                0 if editor_is_main => editor.set_focused(has_keys),
-                1 => agent_panel_handle.set_pane_focused(has_keys),
-                terminal::BOTTOM_PANE if bottom_is_terminal => terminal.set_focused(has_keys),
-                _ => {}
-            }
-        })
-    };
+        let module_layout = module_layout.clone();
+        pane_focus::install(
+            &window,
+            modules.clone(),
+            move |id| match module_layout.try_borrow_mut() {
+                Ok(mut layout) => {
+                    // Refused for a hidden module (`Layout::set_focus`): GTK can put focus in an
+                    // unmapped widget, and the layout's `focus` -- what `Ctrl+j` from the top bar
+                    // returns to and the prefix acts on -- must stay on one that can be seen.
+                    if let Err(err) = layout.set_focus(id) {
+                        eprintln!("[pane_focus] {err}; the layout keeps {}", layout.focus());
+                    }
+                }
+                // Every writer of the layout releases it before touching focus (`ModuleGrid::apply`,
+                // `hide_module`); this line is how a new one that does not would show up.
+                Err(_) => eprintln!("[pane_focus] BUG: the layout was borrowed when focus moved to {id}"),
+            },
+            move |id, has_keys| {
+                println!("[pane_focus] {id} has_keys={has_keys}");
+                match id.kind() {
+                    ModuleKind::Editor => editor.set_focused(has_keys),
+                    ModuleKind::Agent => agent_panel_handle.set_pane_focused(has_keys),
+                    ModuleKind::Terminal => terminal.set_focused(has_keys),
+                    _ => {}
+                }
+            },
+        );
+    }
 
-    // Moves focus back to the pane that last had it. Used by the top bar's `Ctrl+j`/`Esc`. The
-    // editor goes through `NeovideEditorPane::grab_focus`, which also tells the input method.
+    // Moves focus back to the module that last had it. Used by the top bar's `Ctrl+j`/`Esc`.
     let return_to_pane: Rc<dyn Fn()> = {
-        let pane = pane.clone();
-        let pane_contents = pane_contents.clone();
-        let main_widget = main_widget.clone();
-        let last_pane = last_pane.clone();
-        std::rc::Rc::new(move || {
-            let target = &pane_contents[last_pane.get().min(pane_contents.len() - 1)];
-            if *target == main_widget {
-                pane.grab_focus();
-            } else {
-                target.grab_focus();
-            }
-        })
-    };
-
-    // Focus to the editor or the panel, whichever of the two last held the keys: `Ctrl+k` from the
-    // terminal, and `Ctrl+a t` hiding it (spec §2.4-2.5).
-    // The editor goes through `NeovideEditorPane::grab_focus` (which also tells the input method)
-    // only when it IS the main slot: with a Lua panel there, index 0 is that panel. (`return_to_pane`
-    // above compares against `main_widget` instead, which sends focus to an editor that is not in the
-    // window when a plugin owns the main slot; recorded, not changed here.)
-    let return_to_upper_pane: Rc<dyn Fn()> = {
-        let pane = pane.clone();
-        let pane_contents = pane_contents.clone();
-        let last_upper_pane = last_upper_pane.clone();
-        Rc::new(move || match last_upper_pane.get() {
-            0 if editor_is_main => {
-                pane.grab_focus();
-            }
-            index => {
-                pane_contents[index].grab_focus();
-            }
+        let focus_module = focus_module.clone();
+        let module_layout = module_layout.clone();
+        Rc::new(move || {
+            // Cloned out first: the grab below re-enters `pane_focus`, which writes the layout.
+            let target = module_layout.borrow().focus().clone();
+            focus_module(&target);
         })
     };
 
     // F11 fullscreen, Ctrl+Shift+F11 immersive, both following g:neovide_fullscreen (spec
     // 2026-09-19-window-modes-design.md §2). Needs `return_to_pane` for a top bar that hides while
     // it holds focus, and gives `focus_top_bar` its reveal.
-    let window_modes = window_mode::WindowModes::install(
-        app,
-        &window,
-        &top_bar,
-        editor_is_main.then(|| pane.clone()),
-        return_to_pane.clone(),
-    );
+    let window_modes =
+        window_mode::WindowModes::install(app, &window, &top_bar, Some(pane.clone()), return_to_pane.clone());
 
     let focus_top_bar = {
         let top_items = top_bar.items.clone();
@@ -522,28 +517,34 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // window-level controller that exists at startup, so it sees keys first; HINT's, added when a
     // HINT starts, still comes before it.
     {
-        let pane_layout = pane_layout.clone();
-        let last_pane = last_pane.clone();
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
         let editor = pane.clone();
         let agent = agent_panel_handle.clone();
         let window_for_focus = window.clone();
-        let pane_contents = pane_contents.clone();
-        let side_is_agent = side_widget == agent_widget;
+        let modules = modules.clone();
         let app_name = top_bar.app_name.clone();
         let text_size_controller = text_size_controller.clone();
         let terminal = terminal.clone();
-        let return_to_upper_pane = return_to_upper_pane.clone();
+        let focus_module = focus_module.clone();
         prefix::install(
             &window,
             move |command| match command {
-                prefix::PrefixCommand::Zoom => pane_layout.toggle_zoom(last_pane.get()),
-                prefix::PrefixCommand::Resize(direction) => {
-                    let cell = if editor_is_main { editor.cell_size() } else { None };
-                    pane_layout.resize(direction, last_pane.get(), cell.unwrap_or(layout::FALLBACK_CELL));
+                // Both act on the module that last held the keys, as the prefix always has.
+                prefix::PrefixCommand::Zoom => {
+                    let target = module_layout.borrow().focus().clone();
+                    grid.toggle_zoom(&target);
                 }
+                prefix::PrefixCommand::Resize(direction) => {
+                    let target = module_layout.borrow().focus().clone();
+                    let cell = editor.cell_size().unwrap_or(layout::FALLBACK_CELL);
+                    grid.resize(&target, direction, layout::resize_px(direction, cell));
+                }
+                // Keyed by the kind of the module that holds the keys (`terminal::literal_target`, a
+                // tested pure function), not re-derived here.
                 prefix::PrefixCommand::SendPrefix => {
-                    let focused = pane_focus::focused_pane(&window_for_focus, &pane_contents);
-                    match terminal::literal_target(focused, editor_is_main, side_is_agent, bottom_is_terminal) {
+                    let focused = pane_focus::focused_module(&window_for_focus, &modules);
+                    match terminal::literal_target(focused.as_ref().map(ModuleId::kind)) {
                         terminal::LiteralTarget::Editor => editor.send_keys("<C-a>"),
                         terminal::LiteralTarget::Panel => agent.select_all(),
                         terminal::LiteralTarget::Terminal => {
@@ -557,11 +558,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // Only the terminal takes a literal `Ctrl+l`: in nvim `<C-l>` is
                 // vim-tmux-navigator's move-right, and the panel has no use for one. Routed
                 // through `terminal::literal_target`, the same tested pure function `SendPrefix`
-                // uses just above, rather than re-deriving its Terminal arm inline (review
+                // uses just above, rather than re-deriving its Terminal arm inline (`main`'s review
                 // 2026-09-23, task-8 minor 2).
                 prefix::PrefixCommand::SendCtrlL => {
-                    let focused = pane_focus::focused_pane(&window_for_focus, &pane_contents);
-                    if terminal::literal_target(focused, editor_is_main, side_is_agent, bottom_is_terminal)
+                    let focused = pane_focus::focused_module(&window_for_focus, &modules);
+                    if terminal::literal_target(focused.as_ref().map(ModuleId::kind))
                         == terminal::LiteralTarget::Terminal
                     {
                         for input in terminal::keys::control_letter('l') {
@@ -569,39 +570,52 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         }
                     }
                 }
-                // The pane that HOLDS THE KEYS right now (`pane_focus`'s own definition), not
-                // `last_pane`: with any other focus (top bar, a plugin pane) this is a no-op
+                // `Ctrl+a t` (bottom-terminal spec §2.4) on the module grid, in the order
+                // `ToggleAction::steps` gives and the terminal's own tests pin: every action unzooms
+                // first. The keys leave before the terminal hides, inside `Hide` (`hide_module`).
+                // Shown or hidden is the layout's (`is_shown`, which a zoom does not change).
+                prefix::PrefixCommand::ToggleTerminal => {
+                    let id = ModuleId::terminal();
+                    let has_keys = pane_focus::focused_module(&window_for_focus, &modules).as_ref() == Some(&id);
+                    let shown = module_layout.borrow().is_shown(&id);
+                    for step in terminal::toggle_action(shown, has_keys).steps() {
+                        match step {
+                            terminal::ToggleStep::Unzoom => {
+                                grid.unzoom();
+                            }
+                            terminal::ToggleStep::Show => {
+                                if let Err(err) = grid.show_module(&id) {
+                                    eprintln!("[terminal] not shown: {err}");
+                                }
+                            }
+                            terminal::ToggleStep::Start => terminal.start(),
+                            terminal::ToggleStep::FocusTerminal => {
+                                focus_module(&id);
+                            }
+                            // `hide_module` gives the keys to the module the layout chooses -- the
+                            // most recent of those next to the terminal, which is the editor or the
+                            // agent above it unless a Lua panel under or beside it was more recent --
+                            // and only then unmaps it (S3 change 3; `module_grid::hide_then_unmap`,
+                            // tested).
+                            terminal::ToggleStep::Hide => {
+                                if let Err(err) = grid.hide_module(&id, &*focus_module) {
+                                    eprintln!("[terminal] not hidden: {err}");
+                                }
+                            }
+                        }
+                    }
+                }
+                // The module that HOLDS THE KEYS right now (`pane_focus`'s own definition), not
+                // the layout's `focus`: with any other focus (top bar, a plugin pane) this is a no-op
                 // (spec §3), the same way `SendPrefix` just above already reads it. Routing is
-                // `text_size::route_focused_pane`, not re-derived here, so a swap of the two arms
+                // `text_size::route_focused_module`, not re-derived here, so a swap of the two arms
                 // fails that module's own test rather than only a GUI pass (item 3g).
                 prefix::PrefixCommand::TextSize(step) => {
-                    let focused = pane_focus::focused_pane(&window_for_focus, &pane_contents);
-                    match text_size::route_focused_pane(focused, editor_is_main, side_is_agent) {
+                    let focused = pane_focus::focused_module(&window_for_focus, &modules);
+                    match text_size::route_focused_module(focused.as_ref()) {
                         text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(step),
                         text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(step),
                         text_size::TextSizeTarget::Neither => {}
-                    }
-                }
-                prefix::PrefixCommand::ToggleTerminal => {
-                    if !bottom_is_terminal {
-                        return;
-                    }
-                    let has_keys =
-                        pane_focus::focused_pane(&window_for_focus, &pane_contents) == Some(terminal::BOTTOM_PANE);
-                    // The order is `ToggleAction::steps`'s, and tested there.
-                    for step in terminal::toggle_action(pane_layout.bottom_shown(), has_keys).steps() {
-                        match step {
-                            terminal::ToggleStep::Unzoom => {
-                                pane_layout.unzoom();
-                            }
-                            terminal::ToggleStep::Show => pane_layout.set_bottom_shown(true),
-                            terminal::ToggleStep::Start => terminal.start(),
-                            terminal::ToggleStep::FocusTerminal => {
-                                terminal.grab_focus();
-                            }
-                            terminal::ToggleStep::FocusAbove => return_to_upper_pane(),
-                            terminal::ToggleStep::Hide => pane_layout.set_bottom_shown(false),
-                        }
                     }
                 }
             },
@@ -615,135 +629,121 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         );
     }
 
-    // --- Ctrl+l: editor -> agent panel, decided by Neovim itself.
+    // --- Ctrl+h/j/k/l between modules, by geometry (modules design §6.2). One function for every
+    // source: the editor's shim letters below, and each web module's capture-phase controller
+    // below that. A move unzooms first, as tmux's `select-pane` does (spec §3.4); `Up` with nothing
+    // above goes to the top bar, which is above every module; anything else with nothing there is
+    // tmux's no-op at the edge of its grid, and `false` lets the key go on to the module -- which
+    // is what the agent panel's `Ctrl+l`/`Ctrl+j` always did.
+    let move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool> = {
+        let grid = grid.clone();
+        let focus_module = focus_module.clone();
+        let focus_top_bar = focus_top_bar.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        Rc::new(move |from, direction| match grid.navigate(from, direction) {
+            Nav::Module(to) => {
+                grid.unzoom();
+                let grabbed = focus_module(&to);
+                println!("[pane_switch] {from} {direction:?} -> {to} (grab_focus={grabbed})");
+                // Arriving by keyboard means "I want to type": open the composer with the caret in
+                // it (owner, 2026-09-19). A click on a row does not come through here and still
+                // lands in BROWSE on that row.
+                if grabbed && to.kind() == ModuleKind::Agent {
+                    agent_panel_handle.enter_input();
+                }
+                true
+            }
+            Nav::TopBar => {
+                let grabbed = focus_top_bar();
+                println!("[pane_switch] {from} {direction:?} -> the top bar (grab_focus={grabbed})");
+                true
+            }
+            Nav::Nothing => {
+                // Not "ignoring": from a web module the key goes on to that module (`false`), which
+                // is where the panel's own `Ctrl+l`/`Ctrl+j` have always gone.
+                println!("[pane_switch] {from} {direction:?} -> no module that way, not moving");
+                false
+            }
+        })
+    };
+
+    // --- From the editor: decided by Neovim itself.
     //
     // This half deliberately has no key handler at all. The embedded nvim received `TMUX`,
     // `TMUX_PANE` and a fake-`tmux`-carrying `PATH` at spawn time (see `pane_switch`), so the
-    // user's real `vim-tmux-navigator` runs its own `wincmd l` first and only calls out to
-    // "tmux" once the cursor is at a genuine Neovim window boundary -- which is what reaches us
-    // here as an `'R'`. Real `:vsplit` navigation therefore keeps working untouched; `shell`
-    // never sees the keypresses that Neovim resolved internally.
+    // user's real `vim-tmux-navigator` runs its own `wincmd` first and only calls out to "tmux"
+    // once the cursor is at a genuine Neovim window boundary -- which is what reaches us here as a
+    // letter. Real `:vsplit` navigation therefore keeps working untouched; `shell` never sees the
+    // keypresses that Neovim resolved internally.
     if let Some(ps) = pane_switch.as_mut() {
-        let side_widget = side_widget.clone();
-        let focus_top_bar = focus_top_bar.clone();
-        let agent_panel_handle = agent_panel_handle.clone();
-        let pane_layout = pane_layout.clone();
-        // Only the built-in agent panel has a composer. A Lua panel in the side slot just gets focus.
-        let side_is_agent = side_widget == agent_widget;
-        let terminal = terminal.clone();
-        pane_switch::listen(ps, move |direction| match direction {
-            'R' => {
-                // tmux `select-pane` unzooms first (spec §3.4).
-                pane_layout.unzoom();
-                // A `WebView` is an ordinary focusable GTK widget -- unlike a bare `GtkGLArea`,
-                // which needs `focusable(true)` set explicitly before `grab_focus()` does
-                // anything. Verified in the sandbox rather than assumed; see
-                // `shell/MANUAL_VERIFICATION.md`.
-                let grabbed = side_widget.grab_focus();
-                println!("[pane_switch] direction R -> focusing the side panel (grab_focus={grabbed})");
-                // Arriving by keyboard means "I want to type": open the composer with the caret in
-                // it (owner, 2026-09-19). A click on a row does not go through here and still lands
-                // in BROWSE on that row.
-                if grabbed && side_is_agent {
-                    agent_panel_handle.enter_input();
-                }
+        let move_focus = move_focus.clone();
+        pane_switch::listen(ps, move |letter| match pane_switch::letter_direction(letter) {
+            Some(direction) => {
+                move_focus(&ModuleId::editor(), direction);
             }
-            // Ctrl+k at nvim's topmost window: the top bar is above every pane.
-            'U' => {
-                let grabbed = focus_top_bar();
-                println!("[pane_switch] direction U -> focusing the top bar (grab_focus={grabbed})");
-            }
-            // Ctrl+j at nvim's bottom window, with the terminal shown below (bottom-terminal spec
-            // §2.5; the arm the 2026-09-19 cut removed, restored for the terminal only -- a Lua
-            // bottom panel stays mouse-reachable, as before).
-            'D' if bottom_is_terminal && pane_layout.bottom_shown() => {
-                pane_layout.unzoom();
-                let grabbed = terminal.grab_focus();
-                println!("[pane_switch] direction D -> focusing the terminal (grab_focus={grabbed})");
-            }
-            // The editor is already the leftmost pane, and nothing is below it when the terminal is
-            // hidden. These are the same no-ops real tmux performs at the edge of its own grid.
-            other => println!("[pane_switch] direction {other} -> no pane in that direction, ignoring"),
+            None => println!("[pane_switch] unknown direction {letter:?}, ignoring"),
         });
     }
 
-    // --- Ctrl+h: agent panel -> editor.
+    // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host.
     //
-    // The reverse direction cannot go through the mechanism above: `vim-tmux-navigator` lives
-    // inside Neovim, which is not the focused widget here, so nothing would ever run. This is a
-    // direct GTK capture-phase handler on whatever widget currently occupies the side slot
-    // (which may be a Lua-registered panel rather than the built-in agent panel -- attaching to
-    // the slot's widget rather than to `agent_widget` specifically is what keeps this working in
-    // that case). Capture phase, not bubble: a `WebView` handles key events itself and would
-    // otherwise consume the chord before a bubble-phase controller on the same widget ran.
+    // `vim-tmux-navigator` lives inside Neovim, which is not the focused widget here, so nothing
+    // would ever run. Capture phase, not bubble: a `WebView` handles key events itself and would
+    // otherwise consume the chord before a bubble-phase controller on the same widget ran. Only a
+    // chord that moves is claimed.
+    for (id, host) in modules
+        .iter()
+        .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
-        let pane = pane.clone();
-        let focus_top_bar = focus_top_bar.clone();
-        let pane_layout = pane_layout.clone();
-        let terminal = terminal.clone();
+        let id = id.clone();
+        let move_focus = move_focus.clone();
+        // A chord this controller lets through to the page comes back through it once more if the
+        // page does not handle it: WebKit puts the same event back on the queue for GTK's own
+        // bindings (`pane_switch::LetThrough`). The second delivery is not a second press.
+        let let_through = RefCell::new(pane_switch::LetThrough::new());
         let controller = EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-            // Down to the terminal, when it is shown: it spans the full width, so "below" the panel
-            // is the terminal. Hidden, `Ctrl+j` stays the panel's, as it was before (spec §2.5).
-            // `terminal::navigation`'s exact-Ctrl rule, not `key == Key::j` re-derived inline: that
-            // matched CapsLock's `Key::J` never, and `Ctrl+Alt+j` always (review 2026-09-23, task-8
-            // minor 3).
-            if terminal::navigation(key, state) == Some(layout::Direction::Down)
-                && bottom_is_terminal
-                && pane_layout.bottom_shown()
+        controller.connect_key_pressed(move |controller, key, _keycode, state| {
+            let Some(direction) = pane_switch::nav_direction(key, state) else {
+                return glib::Propagation::Proceed;
+            };
+            let event = controller.current_event().map(pane_switch::SameEvent);
+            if event
+                .as_ref()
+                .is_some_and(|event| let_through.borrow_mut().is_second_delivery(event))
             {
-                pane_layout.unzoom();
-                terminal.grab_focus();
-                println!("[pane_switch] Ctrl+j in the side panel -> focusing the terminal");
+                return glib::Propagation::Proceed;
+            }
+            if move_focus(&id, direction) {
                 return glib::Propagation::Stop;
             }
-            if key == Key::k && state.contains(ModifierType::CONTROL_MASK) {
-                focus_top_bar();
-                println!("[pane_switch] Ctrl+k in the side panel -> focusing the top bar");
-                return glib::Propagation::Stop;
-            }
-            if key == Key::h && state.contains(ModifierType::CONTROL_MASK) {
-                // tmux `select-pane` unzooms first (spec §3.4).
-                pane_layout.unzoom();
-                // `NeovideEditorPane::grab_focus()`, not a bare `widget().grab_focus()`: the
-                // pane's own method also calls `im_context.focus_in()`, without which the input
-                // method keeps believing the panel still owns the keyboard.
-                pane.grab_focus();
-                println!("[pane_switch] Ctrl+h in the side panel -> focusing the editor");
-                return glib::Propagation::Stop;
+            if let Some(event) = event {
+                let_through.borrow_mut().let_through(event);
             }
             glib::Propagation::Proceed
         });
-        side_widget.add_controller(controller);
+        host.add_controller(controller);
     }
 
     // --- Ctrl+h/j/k/l in the terminal: neovibe's, always (owner, 2026-09-23: "neovibe的按键优先").
-    //
-    // Capture phase on the terminal's own widget, the same shape as the side slot's controller
-    // above, so the chord is claimed before the terminal's key controller hands it to the shell.
-    // All four are swallowed even with no pane in that direction, so what the shell receives never
-    // depends on the layout: `Ctrl+k` goes to the pane above that last held the keys, and `Ctrl+h`,
-    // `Ctrl+l`, `Ctrl+j` are the edge no-ops real tmux performs. The literal forms the shell loses
-    // are `Ctrl+a Ctrl+a` and `Ctrl+a Ctrl+l`, above; the rest are in the spec's remap table.
-    if bottom_is_terminal {
-        let pane_layout = pane_layout.clone();
-        let return_to_upper_pane = return_to_upper_pane.clone();
+    // Capture phase on its own widget, like the web modules' controllers above, so the chord is
+    // claimed before the terminal's key controller hands it to the shell. Unlike theirs, all four
+    // are swallowed even with no module that way, so what the shell receives never depends on the
+    // layout (bottom-terminal spec §5.4): `Ctrl+k` goes to the most recent module above it (the MRU
+    // tie `neighbor()` breaks, which is `main`'s `last_upper_pane`), and the rest are tmux's no-op
+    // at the edge unless a module is there. The literal forms the shell loses are `Ctrl+a Ctrl+a`
+    // and `Ctrl+a Ctrl+l`, above; the rest are in the spec's remap table.
+    {
+        let move_focus = move_focus.clone();
         let controller = EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         controller.connect_key_pressed(move |_controller, key, _keycode, state| {
             match terminal::navigation(key, state) {
-                None => glib::Propagation::Proceed,
-                Some(layout::Direction::Up) => {
-                    pane_layout.unzoom();
-                    return_to_upper_pane();
-                    println!("[pane_switch] Ctrl+k in the terminal -> the pane above");
-                    glib::Propagation::Stop
-                }
                 Some(direction) => {
-                    println!("[pane_switch] {direction:?} from the terminal -> no pane there, ignoring");
+                    move_focus(&ModuleId::terminal(), direction);
                     glib::Propagation::Stop
                 }
+                None => glib::Propagation::Proceed,
             }
         });
         terminal.widget().add_controller(controller);
@@ -821,11 +821,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         }
     }
 
+    // The layout's first focus is the editor, unless a Lua `main` panel hid it. Read BEFORE
+    // `present()`: GTK4's `gtk_window_show` moves focus Tab-forward when there is none, and were
+    // that ever to land inside a module, `pane_focus` would rewrite the layout's `focus` before this
+    // line read it. Today the top bar's `↻` is the first focusable widget, so it never has.
+    let first = module_layout.borrow().focus().clone();
     window.present();
     // grab_focus() after present(), matching standalone.rs's own
     // `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
     // meaningless.
-    pane.grab_focus();
+    focus_module(&first);
 
     // The one real v1 event: fires once the window is actually up, so any Lua handler reacting
     // to it sees a fully-built shell (panels registered, commands bound, window shown).

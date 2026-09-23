@@ -9,6 +9,9 @@ name = "neovide_editor"
 
 [dependencies]
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
+# `fstat` and `dup2` for `stdin::detach_stdin_from_nvim`, which std does not expose. Already in the
+# shipped binary through `agent`, so this adds no crate to what `shell` links.
+libc = "0.2"
 libloading = "0.9.0"
 skia-safe = { version = "0.153.3", features = ["gl"] }
 # The patched Neovide fork (branch `neovibe-integration`), pinned to a real commit rather than

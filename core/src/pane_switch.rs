@@ -96,13 +96,13 @@ impl PaneSwitchChannel {
         // path this process has not yet created is worth not having at all.
         if let Err(e) = std::fs::create_dir_all(&bin_dir) {
             eprintln!(
-                "[pane_switch] could not create {}: {e} -- Ctrl+h/Ctrl+l pane switching disabled",
+                "[pane_switch] could not create {}: {e} -- Ctrl+h/j/k/l out of nvim disabled",
                 bin_dir.display()
             );
             return None;
         }
         let fail = |what: String| {
-            eprintln!("[pane_switch] {what} -- Ctrl+h/Ctrl+l pane switching disabled");
+            eprintln!("[pane_switch] {what} -- Ctrl+h/j/k/l out of nvim disabled");
             let _ = std::fs::remove_dir_all(&dir);
         };
 

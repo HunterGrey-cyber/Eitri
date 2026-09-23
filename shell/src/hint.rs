@@ -46,6 +46,7 @@ use gtk4::graphene;
 use gtk4::prelude::*;
 
 use neovibe_core::hint::{order_targets, HintSession, HintStep, LabelPlan, Landing, Slot, TargetOrder, WindowLayout};
+use neovibe_core::layout::ModuleId;
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::{AgentPanelHandle, HintInbound};
@@ -198,6 +199,10 @@ struct Active {
     timeout: Option<glib::SourceId>,
 }
 
+/// The window's modules as HINT needs them: every module's id and host widget, in the layout's
+/// tree order. Read afresh at each HINT, because the layout is data and may have changed.
+pub(crate) type ModuleHosts = Rc<dyn Fn() -> Vec<(ModuleId, gtk4::Widget)>>;
+
 pub(crate) struct HintCoordinator {
     window: gtk4::ApplicationWindow,
     /// Wraps the window's root; labels are its overlay children.
@@ -205,12 +210,10 @@ pub(crate) struct HintCoordinator {
     top_items: Vec<gtk4::Widget>,
     editor: Rc<NeovideEditorPane>,
     editor_widget: gtk4::Widget,
-    /// The main slot's widget. The editor unless a Lua plugin replaced it.
-    main_widget: gtk4::Widget,
-    /// The side slot's widget. The agent panel unless a Lua plugin replaced it.
-    side_widget: gtk4::Widget,
     agent_widget: gtk4::Widget,
-    bottom: Option<gtk4::Widget>,
+    modules: ModuleHosts,
+    /// Lands on a module the way that module takes focus (the editor tells the input method).
+    focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
     agent: AgentPanelHandle,
     next_session: Cell<u64>,
     active: RefCell<Option<Active>>,
@@ -225,10 +228,9 @@ pub(crate) struct HintWidgets {
     pub(crate) overlay: gtk4::Overlay,
     pub(crate) top_items: Vec<gtk4::Widget>,
     pub(crate) editor: Rc<NeovideEditorPane>,
-    pub(crate) main_widget: gtk4::Widget,
-    pub(crate) side_widget: gtk4::Widget,
     pub(crate) agent_widget: gtk4::Widget,
-    pub(crate) bottom: Option<gtk4::Widget>,
+    pub(crate) modules: ModuleHosts,
+    pub(crate) focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
     pub(crate) agent: AgentPanelHandle,
 }
 
@@ -246,10 +248,9 @@ impl HintCoordinator {
             top_items: w.top_items,
             editor: w.editor,
             editor_widget,
-            main_widget: w.main_widget,
-            side_widget: w.side_widget,
             agent_widget: w.agent_widget,
-            bottom: w.bottom,
+            modules: w.modules,
+            focus_module: w.focus_module,
             agent: w.agent,
             next_session: Cell::new(0),
             active: RefCell::new(None),
@@ -281,21 +282,20 @@ impl HintCoordinator {
     fn layout(&self) -> WindowLayout {
         WindowLayout {
             top_visible: self.top_items.iter().map(visible).collect(),
-            main_visible: visible(&self.main_widget),
-            main_is_editor: self.main_widget == self.editor_widget,
-            side_visible: visible(&self.side_widget),
-            side_is_agent_panel: self.side_widget == self.agent_widget,
-            bottom_visible: self.bottom.as_ref().is_some_and(visible),
+            modules: (self.modules)()
+                .iter()
+                .map(|(id, host)| (id.clone(), visible(host)))
+                .collect(),
         }
     }
 
-    fn slot_widget(&self, slot: Slot) -> Option<gtk4::Widget> {
+    fn slot_widget(&self, slot: &Slot) -> Option<gtk4::Widget> {
         match slot {
-            Slot::Top(i) => self.top_items.get(i).cloned(),
-            Slot::Editor => Some(self.editor_widget.clone()),
-            Slot::Main => Some(self.main_widget.clone()),
-            Slot::Side => Some(self.side_widget.clone()),
-            Slot::Bottom => self.bottom.clone(),
+            Slot::Top(i) => self.top_items.get(*i).cloned(),
+            Slot::Module(id) => (self.modules)()
+                .into_iter()
+                .find(|(m, _)| m == id)
+                .map(|(_, host)| host),
         }
     }
 
@@ -498,7 +498,7 @@ impl HintCoordinator {
             .zip(&plan.before)
             .chain(order.after.iter().zip(&plan.after))
         {
-            let Some(widget) = self.slot_widget(*slot) else {
+            let Some(widget) = self.slot_widget(slot) else {
                 continue;
             };
             let Some(point) = widget.compute_point(&self.overlay, &graphene::Point::new(0.0, 0.0)) else {
@@ -597,12 +597,15 @@ impl HintCoordinator {
                 self.agent.hint_land(session_id, i);
             }
             Landing::Gtk(slot) => {
-                match (slot, self.slot_widget(slot)) {
-                    (Slot::Editor, _) => self.editor.grab_focus(),
-                    (_, Some(w)) => {
-                        w.grab_focus();
+                match &slot {
+                    Slot::Module(id) => {
+                        (self.focus_module)(id);
                     }
-                    (_, None) => {}
+                    Slot::Top(_) => {
+                        if let Some(w) = self.slot_widget(&slot) {
+                            w.grab_focus();
+                        }
+                    }
                 }
                 // The panel may be showing labels too; a GTK landing must clear them.
                 if panel_asked {

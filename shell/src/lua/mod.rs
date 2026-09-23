@@ -7,7 +7,7 @@ mod panel;
 
 pub(crate) use neovibe_core::lua::command::CommandRegistry;
 pub(crate) use neovibe_core::lua::panel::PanelSlot;
-pub(crate) use panel::{PanelEntry, PanelRegistry};
+pub(crate) use panel::PanelRegistry;
 
 use mlua::{Lua, Value};
 use std::cell::RefCell;
@@ -80,19 +80,10 @@ impl LuaEngine {
         }
     }
 
-    /// Registers a built-in (non-Lua) panel through the exact same `PanelRegistry::register`
-    /// function `neovibe.panel.register` calls -- this, not documentation, is what makes
-    /// "built-in and plugin panels share one path" true. Bypasses the Lua-facing WebView-only
-    /// content-type check entirely, since built-in panels construct their own native widget in
-    /// Rust and were never going through a Lua table to begin with.
-    pub(crate) fn register_builtin_panel(&self, slot: PanelSlot, entry: PanelEntry) {
-        self.panels.borrow_mut().register(slot, entry);
-    }
-
     /// Loads and executes `path` (expected: `<config_dir>/init.lua`). Never propagates a Lua
     /// error up to the caller -- a broken or missing init.lua must not crash the shell; this
-    /// logs and the shell continues with whatever's already registered (the built-in panels,
-    /// registered by the caller *before* this is called -- see `main.rs`'s `build_ui` ordering).
+    /// logs and the shell continues with whatever it registered before the error (the editor and
+    /// the agent are not registered here at all: every window has them).
     pub(crate) fn load_init_file(&self, path: &std::path::Path) {
         if !path.exists() {
             println!(

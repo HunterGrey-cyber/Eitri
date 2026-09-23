@@ -181,12 +181,11 @@ impl TerminalPane {
         TerminalPane { area, state }
     }
 
+    /// The module host `main.rs` adds to the grid. The keys reach it through `main.rs`'s
+    /// `focus_module`, as every module's do since the modules design's P1 re-homed the terminal
+    /// (which refuses a hidden module): the pane's own `grab_focus` went with that.
     pub(crate) fn widget(&self) -> &GLArea {
         &self.area
-    }
-
-    pub(crate) fn grab_focus(&self) -> bool {
-        self.area.grab_focus()
     }
 
     /// A shell is wanted: spawn it now if the pane has been laid out, else at its first allocation.

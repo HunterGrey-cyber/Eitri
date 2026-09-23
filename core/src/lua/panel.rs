@@ -6,19 +6,15 @@
 
 use mlua::Table;
 
-/// The named layout slots a panel can claim -- deliberately not a general docking system (no
-/// tabs, no arbitrary panel count per slot; a later registration to an already-occupied slot
-/// replaces the earlier one, logging a warning). `main` is the left/primary pane (today: the
-/// editor); `side` is the right/secondary pane (today: the agent panel); `bottom` spans the full
-/// width beneath both and is plugin-only -- nothing built-in claims it. A plugin
-/// registering to any of them will replace whatever built-in is there -- accepted as this
-/// project's stated personal-tool risk tolerance, not guarded against with a "protected slots"
-/// concept nobody has asked for.
+use crate::layout::Placement;
+
+/// A Lua panel's `position`: `main`, `side` or `bottom`.
 ///
-/// `bottom` differs from the other two in one way worth knowing: it is the only slot that can be
-/// **empty**. `main` and `side` always have a built-in, so the layout can assume them; the bottom
-/// pane only exists when something claims it, and the window is built without a vertical split at
-/// all when nothing has.
+/// **Since the modules design's P1 this is a first-launch placement hint and nothing more**
+/// (docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md, decision 1, §4.5). It used to
+/// be the layout itself: three fixed slots, one panel each, a later registration replacing the
+/// earlier one -- including the built-in editor and agent. Now the layout is a tree of modules,
+/// and [`PanelSlot::placement`] says where in it a panel goes the first time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelSlot {
     Main,
@@ -27,6 +23,16 @@ pub enum PanelSlot {
 }
 
 impl PanelSlot {
+    /// `side` goes right of the whole root and `bottom` below it; `main` keeps its visual meaning
+    /// by taking the editor's leaf, with the editor hidden, not gone (spec §4.5).
+    pub fn placement(self) -> Placement {
+        match self {
+            PanelSlot::Main => Placement::InPlaceOfEditor,
+            PanelSlot::Side => Placement::RightOfRoot,
+            PanelSlot::Bottom => Placement::BelowRoot,
+        }
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s {
             "main" => Some(Self::Main),
@@ -50,6 +56,14 @@ pub struct ParsedPanelSpec {
 /// `cargo test`.
 pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
     let id: String = spec.get("id")?;
+    // The panel's module is `lua:<id>`, and `lua:` alone names nothing `ModuleId::parse` accepts:
+    // P2's state file would drop it on every read and reopen the panel at its default placement
+    // on every launch. Refused here, the same way an unknown `position` is.
+    if id.is_empty() {
+        return Err(mlua::Error::RuntimeError(
+            "neovibe.panel.register: id must not be empty".to_string(),
+        ));
+    }
     let title: String = spec.get("title")?;
     let position: String = spec.get("position")?;
     let content: Table = spec.get("content")?;
@@ -146,15 +160,13 @@ mod tests {
         assert!(err.to_string().contains("unsupported content.type"));
     }
 
-    /// `bottom` is a real slot. Since the terminal pane was frozen out (2026-09-19,
-    /// `freeze/terminal-stack`) nothing built-in registers into it, so Lua is now the *only* way
-    /// to claim it -- which makes this the only test in the workspace pinning `"bottom"` as
+    /// `bottom` is a real position. This is the only test in the workspace pinning `"bottom"` as
     /// parseable at all.
     ///
     /// **Do not delete it as terminal-era leftover.** Without it, `PanelSlot::parse`'s `"bottom"`
-    /// arm, `ParsedPanelSpec`'s slot handling and `main.rs`'s `panels.get(PanelSlot::Bottom)` read
-    /// have no coverage, and a later refactor could drop `Bottom` from the parser and ship a green
-    /// build in which `neovibe.panel.register{ position = "bottom" }` errors at runtime.
+    /// arm and `ParsedPanelSpec`'s slot handling have no coverage, and a later refactor could drop
+    /// `Bottom` from the parser and ship a green build in which
+    /// `neovibe.panel.register{ position = "bottom" }` errors at runtime.
     #[test]
     fn accepts_the_bottom_position() {
         let lua = Lua::new();
@@ -170,6 +182,33 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(parse_panel_spec(&spec).unwrap().slot, PanelSlot::Bottom);
+    }
+
+    #[test]
+    fn each_position_is_a_placement_and_none_replaces_a_built_in() {
+        assert_eq!(PanelSlot::Main.placement(), Placement::InPlaceOfEditor);
+        assert_eq!(PanelSlot::Side.placement(), Placement::RightOfRoot);
+        assert_eq!(PanelSlot::Bottom.placement(), Placement::BelowRoot);
+    }
+
+    /// An empty `id` would be the module `lua:`, which does not round-trip through
+    /// `ModuleId::parse` (see `layout::module`'s tests).
+    #[test]
+    fn rejects_an_empty_id() {
+        let lua = Lua::new();
+        let spec: Table = lua
+            .load(
+                r#"
+                return {
+                    id = "", title = "Nameless", position = "side",
+                    content = { type = "webview", url = "x.html" },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let err = parse_panel_spec(&spec).unwrap_err();
+        assert!(err.to_string().contains("id must not be empty"), "{err}");
     }
 
     #[test]

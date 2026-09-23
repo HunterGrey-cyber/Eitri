@@ -16,6 +16,7 @@ pub mod buffer_reload;
 pub mod editor_context;
 pub mod hint;
 pub mod instance_dir;
+pub mod layout;
 pub mod lua;
 pub mod pane_switch;
 pub mod project_root;

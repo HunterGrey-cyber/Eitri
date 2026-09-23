@@ -45,23 +45,23 @@
 //! # Directions
 //!
 //! A message only ever arrives while the *editor* has focus (that is the only context in which
-//! the Neovim plugin's mappings are live) and Neovim has already hit its own boundary:
+//! the Neovim plugin's mappings are live) and Neovim has already hit its own boundary. Each letter
+//! is a [`Direction`] ([`letter_direction`]), and where it goes is geometry, not a table: the
+//! neighbouring module that way (`neovibe_core::layout::navigate`, modules design §6.2). For the
+//! default `[editor | agent]` that is exactly what the old four arms did -- `R` the agent (the
+//! load-bearing case), `U` the top bar, `L`/`D` tmux's no-op at the edge of its grid -- and
+//! `navigation_reproduces_todays_dispatch_on_the_default_tree` holds it there. **What changed:**
+//! `D` now reaches a module below the editor. It used to reach the native terminal pane, went
+//! with it on 2026-09-19 (`freeze/terminal-stack`), and was never wired for a Lua panel in the
+//! bottom slot, which was mouse-reachable only until the modules design. The bottom terminal that
+//! came back on 2026-09-23 is such a module: shown, `D` unzooms and focuses it, as its own `'D'` arm
+//! did on `main` before the modules design re-homed it; hidden, it is not in the geometry and `D`
+//! is the edge's no-op again (`main`'s window review, M4, is why `U` above says the top bar).
 //!
-//! - `R` -- the load-bearing case: give focus to the agent panel.
-//! - `L` -- harmless no-op; the editor is already the leftmost pane, which is exactly what real
-//!   tmux does when you press `Ctrl+h` in the leftmost tmux pane.
-//! - `U` -- focuses the top bar (`main.rs`'s catch-all handler). Not a no-op, and was already not
-//!   one before this doc's own "both no-ops" was last true (window review 2026-09-23, M4).
-//! - `D` -- with the built-in terminal shown, unzooms and focuses it (restored 2026-09-23; the
-//!   native terminal pane this bullet used to describe was frozen out on 2026-09-19
-//!   (`freeze/terminal-stack`), and its `'D'` arm did go with it then, but a new one was added for
-//!   the revived terminal). Hidden, or with a Lua-registered panel occupying the bottom slot
-//!   instead -- nothing routes focus into a plugin panel -- `'D'` falls into `main.rs`'s catch-all
-//!   and prints "no pane in that direction, ignoring"; the slot is mouse-reachable only in that case.
-//!
-//! The opposite direction (agent panel focused, `Ctrl+h` back to the editor) does **not** go
+//! The opposite direction (a web module focused, `Ctrl+h` back to the editor) does **not** go
 //! through this mechanism -- the Neovim plugin has no relevance while a `WebView` has focus. That
-//! is a direct GTK capture-phase key handler, wired in `main.rs`.
+//! is a GTK capture-phase key handler on each web module's host ([`nav_direction`], wired in
+//! `main.rs`), and it asks the same geometry.
 //!
 //! # Failure mode
 //!
@@ -72,10 +72,115 @@
 
 use std::path::{Path, PathBuf};
 
+use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 
+use crate::layout::Direction;
 pub(crate) use neovibe_core::pane_switch::PaneSwitchChannel;
 use neovibe_core::pane_switch::{accept_pending_directions, sweep_stale_dirs, POLL_INTERVAL};
+
+/// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
+/// else is not a direction (the shim only ever sends these four).
+pub(crate) fn letter_direction(letter: char) -> Option<Direction> {
+    match letter {
+        'L' => Some(Direction::Left),
+        'R' => Some(Direction::Right),
+        'U' => Some(Direction::Up),
+        'D' => Some(Direction::Down),
+        _ => None,
+    }
+}
+
+/// `Ctrl+h/j/k/l` in a web module or the bottom terminal (`terminal::navigation` is this): Control
+/// held and nothing else but CapsLock -- `Shift`, `Alt`, `Super` or `Meta` held means it is not a
+/// move, so a page's (or a terminal program's) `Ctrl+Shift+K` or `Ctrl+Alt+h` stays its own.
+///
+/// **The bottom terminal's exact-Ctrl rule since it was hosted as a module** (modules P1, Task 11).
+/// Until then this matched the key itself, lower case, with Control held and anything else ignored:
+/// the rule the agent panel's controller had always used for `Ctrl+h`/`Ctrl+k`. `main`'s terminal
+/// review replaced that for the panel's `Ctrl+j` into the terminal with this one, because it
+/// matched CapsLock's `Key::J` never and `Ctrl+Alt+j` always (review 2026-09-23, task-8 minor 3).
+/// One controller asks the geometry for all four chords now, so they share the rule: CapsLock no
+/// longer turns `Ctrl+h/j/k/l` in a web module into a key for the page, and `Ctrl+Alt+h/k/l` no
+/// longer moves.
+pub(crate) fn nav_direction(key: Key, state: ModifierType) -> Option<Direction> {
+    let others = ModifierType::SHIFT_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
+    if !state.contains(ModifierType::CONTROL_MASK) || state.intersects(others) {
+        return None;
+    }
+    // GDK delivers the UPPERCASE keyval under CapsLock, not `Key::k` with `LOCK_MASK` alone.
+    match key.to_lower() {
+        Key::h => Some(Direction::Left),
+        Key::j => Some(Direction::Down),
+        Key::k => Some(Direction::Up),
+        Key::l => Some(Direction::Right),
+        _ => None,
+    }
+}
+
+/// How many let-through key events [`LetThrough`] remembers. A page that handles a key never sends
+/// it back, so its entry stays until this many later ones push it out.
+const LET_THROUGH_REMEMBERED: usize = 16;
+
+/// The key events a web module's `Ctrl+h/j/k/l` controller let through to the page, so it knows
+/// each one when WebKit hands it back.
+///
+/// **WebKit delivers a key the page did not handle twice.** Its key handling is asynchronous: the
+/// first delivery goes to the web process, and when the page reports the key unhandled, WebKitGTK
+/// puts the SAME `GdkEvent` back on the display's queue so GTK's own bindings get a turn
+/// (`webkitWebViewBasePropagateKeyEvent`, `gdk_display_put_event`, WebKitWebViewBase.cpp in
+/// 2.52.6). That second dispatch starts at the window again and runs the capture-phase controller
+/// on the host again. A chord with nowhere to go is exactly that case: `move_focus` answers
+/// `false`, the key goes on to the page, the panel does not handle `Ctrl+l`, and the chord comes
+/// back. The GUI pass of 2026-09-23 (item 2) saw "no module that way" logged twice per press.
+/// Nothing moved twice, because nothing moved.
+///
+/// Holds the events themselves (a reference each, for `gdk::Event`), so no address is reused by a
+/// later event while it is remembered, and equality is identity. More than one because the
+/// round trip through the web process is asynchronous, so a second chord can be let through before
+/// the first comes back.
+#[derive(Debug)]
+pub(crate) struct LetThrough<E> {
+    outstanding: std::collections::VecDeque<E>,
+}
+
+impl<E: PartialEq> LetThrough<E> {
+    pub(crate) fn new() -> Self {
+        Self {
+            outstanding: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Remembers `event` as let through to the page.
+    pub(crate) fn let_through(&mut self, event: E) {
+        if self.outstanding.len() == LET_THROUGH_REMEMBERED {
+            self.outstanding.pop_front();
+        }
+        self.outstanding.push_back(event);
+    }
+
+    /// `true` if `event` was let through and this is WebKit handing it back. Forgets it: WebKit
+    /// hands an event back at most once.
+    pub(crate) fn is_second_delivery(&mut self, event: &E) -> bool {
+        match self.outstanding.iter().position(|e| e == event) {
+            Some(at) => {
+                self.outstanding.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A `gdk::Event` compared by identity, which is what [`LetThrough`] needs: WebKit hands back the
+/// same event object, and `gdk::Event` itself has no `PartialEq`.
+pub(crate) struct SameEvent(pub(crate) gtk4::gdk::Event);
+
+impl PartialEq for SameEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ptr() == other.0.as_ptr()
+    }
+}
 
 /// Reclaims stale directories, finds the shim binary and binds the channel, or returns `None`
 /// having logged why.
@@ -121,14 +226,107 @@ fn locate_shim_binary() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            eprintln!("[pane_switch] current_exe() failed: {e} -- Ctrl+h/Ctrl+l pane switching disabled");
+            eprintln!("[pane_switch] current_exe() failed: {e} -- Ctrl+h/j/k/l out of nvim disabled");
             return None;
         }
     };
     let candidate = exe.parent()?.join("neovibe-tmux-shim");
     if !Path::new(&candidate).is_file() {
-        eprintln!("[pane_switch] {} not found -- Ctrl+h/Ctrl+l pane switching disabled (build it with `cargo build -p shell`)", candidate.display());
+        eprintln!(
+            "[pane_switch] {} not found -- Ctrl+h/j/k/l out of nvim disabled (build it with `cargo build -p shell`)",
+            candidate.display()
+        );
         return None;
     }
     Some(candidate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shims_four_letters_are_the_four_directions() {
+        assert_eq!(letter_direction('L'), Some(Direction::Left));
+        assert_eq!(letter_direction('R'), Some(Direction::Right));
+        assert_eq!(letter_direction('U'), Some(Direction::Up));
+        assert_eq!(letter_direction('D'), Some(Direction::Down));
+        assert_eq!(letter_direction('r'), None);
+        assert_eq!(letter_direction('X'), None);
+    }
+
+    #[test]
+    fn only_control_with_hjkl_and_nothing_else_held_moves() {
+        let ctrl = ModifierType::CONTROL_MASK;
+        assert_eq!(nav_direction(Key::h, ctrl), Some(Direction::Left));
+        assert_eq!(nav_direction(Key::j, ctrl), Some(Direction::Down));
+        assert_eq!(nav_direction(Key::k, ctrl), Some(Direction::Up));
+        assert_eq!(nav_direction(Key::l, ctrl), Some(Direction::Right));
+        assert_eq!(
+            nav_direction(Key::k, ModifierType::empty()),
+            None,
+            "plain k is a letter"
+        );
+        assert_eq!(nav_direction(Key::K, ctrl | ModifierType::SHIFT_MASK), None);
+        assert_eq!(nav_direction(Key::a, ctrl), None, "Ctrl+a is the prefix's");
+        // The terminal's exact-Ctrl rule (`main`'s review 2026-09-23, task-8 minor 3), now every
+        // web module's: CapsLock is not a chord, and it delivers the uppercase keyval.
+        assert_eq!(
+            nav_direction(Key::J, ctrl | ModifierType::LOCK_MASK),
+            Some(Direction::Down),
+            "CapsLock delivers the uppercase keyval"
+        );
+        for held in [
+            ModifierType::ALT_MASK,
+            ModifierType::SUPER_MASK,
+            ModifierType::META_MASK,
+        ] {
+            assert_eq!(nav_direction(Key::j, ctrl | held), None, "{held:?} held: the page's");
+        }
+    }
+
+    /// A chord let through to the page comes back once, and is known when it does -- so the
+    /// controller does not decide it (and log it) a second time. Identity stands in for `gdk::Event`'s
+    /// pointer equality here: `1` is one press, `2` another.
+    #[test]
+    fn a_key_let_through_to_the_page_is_known_when_webkit_hands_it_back() {
+        let mut seen = LetThrough::new();
+        assert!(!seen.is_second_delivery(&1), "the first delivery is new");
+        seen.let_through(1);
+        assert!(seen.is_second_delivery(&1), "WebKit put it back");
+        assert!(
+            !seen.is_second_delivery(&1),
+            "forgotten once handed back: WebKit hands an event back at most once"
+        );
+        assert!(
+            !seen.is_second_delivery(&2),
+            "a press never let through never comes back"
+        );
+    }
+
+    /// The round trip through the web process is asynchronous: a second chord can be let through
+    /// before the first comes back, and both are still known, in either order.
+    #[test]
+    fn two_chords_in_flight_are_each_known_when_they_come_back() {
+        let mut seen = LetThrough::new();
+        seen.let_through(1);
+        seen.let_through(2);
+        assert!(seen.is_second_delivery(&2));
+        assert!(seen.is_second_delivery(&1));
+        assert!(!seen.is_second_delivery(&1));
+    }
+
+    /// A key the page handled never comes back; it is pushed out by later ones instead of being
+    /// held for the life of the window.
+    #[test]
+    fn a_key_the_page_handled_is_forgotten_after_enough_later_ones() {
+        let mut seen = LetThrough::new();
+        seen.let_through(0);
+        for press in 1..=LET_THROUGH_REMEMBERED {
+            seen.let_through(press);
+        }
+        assert!(!seen.is_second_delivery(&0), "pushed out");
+        assert!(seen.is_second_delivery(&1), "the oldest still remembered");
+        assert!(seen.is_second_delivery(&LET_THROUGH_REMEMBERED), "the newest");
+    }
 }
