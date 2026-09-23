@@ -13,6 +13,7 @@ mod pane_focus;
 mod pane_switch;
 mod prefix;
 mod supervisor_client;
+mod terminal;
 mod terminal_handoff;
 mod text_size;
 mod theme;
@@ -172,6 +173,21 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         },
     );
 
+    // The bottom terminal (spec docs/superpowers/specs/2026-09-23-bottom-terminal-design.md),
+    // registered like the other two built-ins so a Lua plugin can still take the bottom slot. Hidden
+    // until `Ctrl+a t`, and its shell is not started until then: a window whose terminal is never
+    // used starts no process and looks exactly as it did before the terminal existed.
+    let terminal = terminal::TerminalPane::new(project_root.to_path_buf());
+    let terminal_widget: gtk4::Widget = terminal.widget().clone().upcast();
+    lua_engine.register_builtin_panel(
+        PanelSlot::Bottom,
+        PanelEntry {
+            id: "terminal".into(),
+            title: "Terminal".into(),
+            widget: terminal_widget.clone(),
+        },
+    );
+
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
     // Which local Claude account this window spends. Two sources, and the environment wins:
@@ -245,9 +261,13 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // point (the two `register_builtin_panel` calls above ran unconditionally, and even if
     // init.lua replaced one, replacement never leaves a slot empty).
     //
-    // The bottom slot is the one that can legitimately be empty -- no plugin claiming it -- so
-    // it is an `Option` rather than an `expect`, and an empty one means the
-    // window is built with no vertical split at all.
+    // The bottom slot is read as an `Option` rather than an `expect`, but not because it can
+    // still be empty in practice: since the bottom terminal (2026-09-23) all three slots are
+    // registered unconditionally, and nothing unregisters a panel, so `bottom` is always `Some`
+    // too by this point -- `Some(terminal)`, or `Some(<a Lua panel that replaced it>)`. Left as
+    // `Option` because `PanelRegistry::get`'s signature is the same for every slot; a `None` here
+    // would mean a real defect, not the empty bottom-slot case this comment used to describe
+    // before the terminal came back (window review 2026-09-23, M4).
     let (main_widget, side_widget, bottom_widget) = {
         let panels = lua_engine.panels.borrow();
         let main = panels
@@ -268,6 +288,9 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // be told it has the keys when that plugin does; also whether `window_mode`'s F11 sync has an
     // nvim to write to at all (§2.4).
     let editor_is_main = main_widget == pane.widget().clone().upcast::<gtk4::Widget>();
+    // Likewise the bottom slot: a Lua plugin there is not the terminal, and none of the terminal's
+    // wiring below applies to it.
+    let bottom_is_terminal = bottom_widget.as_ref() == Some(&terminal_widget);
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -292,7 +315,8 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         None => (content_widget, None),
     };
     // Zoom and resize for the `Ctrl+a` prefix (spec 2026-09-19-window-modes-design.md §3.4-3.5).
-    let pane_layout = layout::PaneLayout::new(across, down);
+    // The built-in terminal starts hidden; a Lua bottom panel starts shown, as before.
+    let pane_layout = layout::PaneLayout::new(across, down, !bottom_is_terminal);
 
     // `app.reload-agent-panel` + Ctrl+Shift+R; the top bar's own `⟳` button points at the same
     // action. Everything about it -- why it is an app action, what it costs, what is still
@@ -335,10 +359,12 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     };
     agent_panel_handle.set_theme(&panel_tokens(None));
     pane.set_clear_color(editor_clear(&neovibe_core::theme::ThemeTokens::fallback()));
+    terminal.set_colors(terminal::colors_from(&neovibe_core::theme::ThemeTokens::fallback()));
     if let Some(feed) = theme_feed.as_mut() {
         let theme_css = theme_css.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
+        let terminal = terminal.clone();
         theme::feed::listen(feed, move |payload| {
             let tokens = neovibe_core::theme::ThemeTokens::derive(&payload);
             println!(
@@ -348,6 +374,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             theme_css.update(&tokens);
             agent_panel_handle.set_theme(&panel_tokens(Some(&payload)));
             pane_for_theme.set_clear_color(editor_clear(&tokens));
+            terminal.set_colors(terminal::colors_from(&tokens));
         });
     }
 
@@ -412,14 +439,23 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         v.extend(bottom_widget.clone());
         v
     };
+    // The pane above the terminal that last held the keys: where `Ctrl+k` from the terminal, and
+    // hiding it while it holds the keys, send focus back to.
+    let last_upper_pane = Rc::new(std::cell::Cell::new(0usize));
     let last_pane = {
         let agent_panel_handle = agent_panel_handle.clone();
         let editor = pane.clone();
+        let terminal = terminal.clone();
+        let last_upper_pane = last_upper_pane.clone();
         pane_focus::install(&window, pane_contents.clone(), move |index, has_keys| {
             println!("[pane_focus] pane {index} has_keys={has_keys}");
+            if has_keys && index < terminal::BOTTOM_PANE {
+                last_upper_pane.set(index);
+            }
             match index {
                 0 if editor_is_main => editor.set_focused(has_keys),
                 1 => agent_panel_handle.set_pane_focused(has_keys),
+                terminal::BOTTOM_PANE if bottom_is_terminal => terminal.set_focused(has_keys),
                 _ => {}
             }
         })
@@ -438,6 +474,26 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 pane.grab_focus();
             } else {
                 target.grab_focus();
+            }
+        })
+    };
+
+    // Focus to the editor or the panel, whichever of the two last held the keys: `Ctrl+k` from the
+    // terminal, and `Ctrl+a t` hiding it (spec §2.4-2.5).
+    // The editor goes through `NeovideEditorPane::grab_focus` (which also tells the input method)
+    // only when it IS the main slot: with a Lua panel there, index 0 is that panel. (`return_to_pane`
+    // above compares against `main_widget` instead, which sends focus to an editor that is not in the
+    // window when a plugin owns the main slot; recorded, not changed here.)
+    let return_to_upper_pane: Rc<dyn Fn()> = {
+        let pane = pane.clone();
+        let pane_contents = pane_contents.clone();
+        let last_upper_pane = last_upper_pane.clone();
+        Rc::new(move || match last_upper_pane.get() {
+            0 if editor_is_main => {
+                pane.grab_focus();
+            }
+            index => {
+                pane_contents[index].grab_focus();
             }
         })
     };
@@ -475,6 +531,8 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let side_is_agent = side_widget == agent_widget;
         let app_name = top_bar.app_name.clone();
         let text_size_controller = text_size_controller.clone();
+        let terminal = terminal.clone();
+        let return_to_upper_pane = return_to_upper_pane.clone();
         prefix::install(
             &window,
             move |command| match command {
@@ -484,10 +542,31 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     pane_layout.resize(direction, last_pane.get(), cell.unwrap_or(layout::FALLBACK_CELL));
                 }
                 prefix::PrefixCommand::SendPrefix => {
-                    match pane_focus::focused_pane(&window_for_focus, &pane_contents) {
-                        Some(0) if editor_is_main => editor.send_keys("<C-a>"),
-                        Some(1) if side_is_agent => agent.select_all(),
-                        _ => {}
+                    let focused = pane_focus::focused_pane(&window_for_focus, &pane_contents);
+                    match terminal::literal_target(focused, editor_is_main, side_is_agent, bottom_is_terminal) {
+                        terminal::LiteralTarget::Editor => editor.send_keys("<C-a>"),
+                        terminal::LiteralTarget::Panel => agent.select_all(),
+                        terminal::LiteralTarget::Terminal => {
+                            for input in terminal::keys::control_letter('a') {
+                                terminal.send(input);
+                            }
+                        }
+                        terminal::LiteralTarget::Neither => {}
+                    }
+                }
+                // Only the terminal takes a literal `Ctrl+l`: in nvim `<C-l>` is
+                // vim-tmux-navigator's move-right, and the panel has no use for one. Routed
+                // through `terminal::literal_target`, the same tested pure function `SendPrefix`
+                // uses just above, rather than re-deriving its Terminal arm inline (review
+                // 2026-09-23, task-8 minor 2).
+                prefix::PrefixCommand::SendCtrlL => {
+                    let focused = pane_focus::focused_pane(&window_for_focus, &pane_contents);
+                    if terminal::literal_target(focused, editor_is_main, side_is_agent, bottom_is_terminal)
+                        == terminal::LiteralTarget::Terminal
+                    {
+                        for input in terminal::keys::control_letter('l') {
+                            terminal.send(input);
+                        }
                     }
                 }
                 // The pane that HOLDS THE KEYS right now (`pane_focus`'s own definition), not
@@ -501,6 +580,28 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(step),
                         text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(step),
                         text_size::TextSizeTarget::Neither => {}
+                    }
+                }
+                prefix::PrefixCommand::ToggleTerminal => {
+                    if !bottom_is_terminal {
+                        return;
+                    }
+                    let has_keys =
+                        pane_focus::focused_pane(&window_for_focus, &pane_contents) == Some(terminal::BOTTOM_PANE);
+                    // The order is `ToggleAction::steps`'s, and tested there.
+                    for step in terminal::toggle_action(pane_layout.bottom_shown(), has_keys).steps() {
+                        match step {
+                            terminal::ToggleStep::Unzoom => {
+                                pane_layout.unzoom();
+                            }
+                            terminal::ToggleStep::Show => pane_layout.set_bottom_shown(true),
+                            terminal::ToggleStep::Start => terminal.start(),
+                            terminal::ToggleStep::FocusTerminal => {
+                                terminal.grab_focus();
+                            }
+                            terminal::ToggleStep::FocusAbove => return_to_upper_pane(),
+                            terminal::ToggleStep::Hide => pane_layout.set_bottom_shown(false),
+                        }
                     }
                 }
             },
@@ -529,6 +630,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let pane_layout = pane_layout.clone();
         // Only the built-in agent panel has a composer. A Lua panel in the side slot just gets focus.
         let side_is_agent = side_widget == agent_widget;
+        let terminal = terminal.clone();
         pane_switch::listen(ps, move |direction| match direction {
             'R' => {
                 // tmux `select-pane` unzooms first (spec §3.4).
@@ -551,11 +653,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 let grabbed = focus_top_bar();
                 println!("[pane_switch] direction U -> focusing the top bar (grab_focus={grabbed})");
             }
-            // The editor is already the leftmost pane, and nothing routes focus into the bottom
-            // slot: a Lua-registered panel can still occupy it (`layout::build_vertical_split`
-            // above), but the `'D'` arm went with the native terminal pane on 2026-09-19 and was
-            // never wired for plugin panels, so that slot is mouse-reachable only. These are
-            // therefore the same no-ops real tmux performs at the edge of its own pane grid.
+            // Ctrl+j at nvim's bottom window, with the terminal shown below (bottom-terminal spec
+            // §2.5; the arm the 2026-09-19 cut removed, restored for the terminal only -- a Lua
+            // bottom panel stays mouse-reachable, as before).
+            'D' if bottom_is_terminal && pane_layout.bottom_shown() => {
+                pane_layout.unzoom();
+                let grabbed = terminal.grab_focus();
+                println!("[pane_switch] direction D -> focusing the terminal (grab_focus={grabbed})");
+            }
+            // The editor is already the leftmost pane, and nothing is below it when the terminal is
+            // hidden. These are the same no-ops real tmux performs at the edge of its own grid.
             other => println!("[pane_switch] direction {other} -> no pane in that direction, ignoring"),
         });
     }
@@ -573,9 +680,24 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let pane = pane.clone();
         let focus_top_bar = focus_top_bar.clone();
         let pane_layout = pane_layout.clone();
+        let terminal = terminal.clone();
         let controller = EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            // Down to the terminal, when it is shown: it spans the full width, so "below" the panel
+            // is the terminal. Hidden, `Ctrl+j` stays the panel's, as it was before (spec §2.5).
+            // `terminal::navigation`'s exact-Ctrl rule, not `key == Key::j` re-derived inline: that
+            // matched CapsLock's `Key::J` never, and `Ctrl+Alt+j` always (review 2026-09-23, task-8
+            // minor 3).
+            if terminal::navigation(key, state) == Some(layout::Direction::Down)
+                && bottom_is_terminal
+                && pane_layout.bottom_shown()
+            {
+                pane_layout.unzoom();
+                terminal.grab_focus();
+                println!("[pane_switch] Ctrl+j in the side panel -> focusing the terminal");
+                return glib::Propagation::Stop;
+            }
             if key == Key::k && state.contains(ModifierType::CONTROL_MASK) {
                 focus_top_bar();
                 println!("[pane_switch] Ctrl+k in the side panel -> focusing the top bar");
@@ -594,6 +716,37 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             glib::Propagation::Proceed
         });
         side_widget.add_controller(controller);
+    }
+
+    // --- Ctrl+h/j/k/l in the terminal: neovibe's, always (owner, 2026-09-23: "neovibe的按键优先").
+    //
+    // Capture phase on the terminal's own widget, the same shape as the side slot's controller
+    // above, so the chord is claimed before the terminal's key controller hands it to the shell.
+    // All four are swallowed even with no pane in that direction, so what the shell receives never
+    // depends on the layout: `Ctrl+k` goes to the pane above that last held the keys, and `Ctrl+h`,
+    // `Ctrl+l`, `Ctrl+j` are the edge no-ops real tmux performs. The literal forms the shell loses
+    // are `Ctrl+a Ctrl+a` and `Ctrl+a Ctrl+l`, above; the rest are in the spec's remap table.
+    if bottom_is_terminal {
+        let pane_layout = pane_layout.clone();
+        let return_to_upper_pane = return_to_upper_pane.clone();
+        let controller = EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            match terminal::navigation(key, state) {
+                None => glib::Propagation::Proceed,
+                Some(layout::Direction::Up) => {
+                    pane_layout.unzoom();
+                    return_to_upper_pane();
+                    println!("[pane_switch] Ctrl+k in the terminal -> the pane above");
+                    glib::Propagation::Stop
+                }
+                Some(direction) => {
+                    println!("[pane_switch] {direction:?} from the terminal -> no pane there, ignoring");
+                    glib::Propagation::Stop
+                }
+            }
+        });
+        terminal.widget().add_controller(controller);
     }
 
     // --- The top bar, from the keyboard. `h`/`l` move between its items, `Enter`/`Space`
@@ -704,6 +857,9 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let app_for_close = app.clone();
     window.connect_close_request(move |_window| {
         pane.shutdown();
+        // Hangs the terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
+        // the process exit first, the kernel closing the PTY master hangs it up anyway.
+        terminal.shutdown();
         // Capturing `pane_switch` here is load-bearing twice over. First, it keeps the
         // `PaneSwitch` alive for the window's whole lifetime -- it is otherwise a local of
         // `build_ui`, and its directory (holding the fake-`tmux` symlink and the live socket)
@@ -1025,11 +1181,15 @@ mod tests {
     /// existing test green, because nothing previously read `PREFIX_KEYS` at all (item 3f).
     ///
     /// Checked both ways against [`prefix::bound_keys`], which reads the actual bound characters
-    /// out of `prefix::command`'s own match arms rather than a third, hand-typed copy of them.
+    /// out of `prefix::command`'s own match arms rather than a third, hand-typed copy of them. The
+    /// `Ctrl+a Ctrl+<letter>` rows are held the same way to [`prefix::bound_control_keys`], which
+    /// drives the prefix itself: before that, a one-character scan skipped them, and the
+    /// `Ctrl+a Ctrl+l` row the bottom terminal added was unguarded (review 2026-09-23, finding 19).
     #[test]
     fn prefix_keys_documents_exactly_the_chars_prefix_rs_binds() {
         let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
         let mut documented: std::collections::HashSet<char> = std::collections::HashSet::new();
+        let mut documented_control: std::collections::HashSet<char> = std::collections::HashSet::new();
         for line in keymap.lines() {
             let Some(rest) = line.trim_start().strip_prefix("{ keys: \"Ctrl+a ") else {
                 continue;
@@ -1040,8 +1200,17 @@ mod tests {
                 if let (Some(ch), None) = (chars.next(), chars.next()) {
                     documented.insert(ch);
                 }
+                let mut letter = token.strip_prefix("Ctrl+").unwrap_or_default().chars();
+                if let (Some(ch), None) = (letter.next(), letter.next()) {
+                    documented_control.insert(ch);
+                }
             }
         }
+        let bound_control: std::collections::HashSet<char> = prefix::bound_control_keys().into_iter().collect();
+        assert_eq!(
+            documented_control, bound_control,
+            "PREFIX_KEYS' Ctrl+a Ctrl+<letter> rows and what prefix.rs binds after Ctrl+a disagree"
+        );
         let bound: std::collections::HashSet<char> = prefix::bound_keys().into_iter().collect();
 
         for &ch in &bound {
@@ -1056,5 +1225,35 @@ mod tests {
                 "PREFIX_KEYS documents {ch:?} after Ctrl+a, but prefix::command no longer binds it"
             );
         }
+    }
+
+    /// `WINDOW_KEYS` names `Ctrl+h/j/k/l` by hand, and its `Ctrl+j` row exists only because of the
+    /// terminal. Every chord the terminal gives up to neovibe (`terminal::navigation`, asked about
+    /// each letter) must be named there. The reverse is not checked: those rows also describe the
+    /// editor's and the panel's own routes.
+    #[test]
+    fn every_chord_the_terminal_gives_up_is_in_window_keys() {
+        let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
+        let start = keymap.find("export const WINDOW_KEYS").expect("WINDOW_KEYS");
+        let end = start + keymap[start..].find("];").expect("the end of WINDOW_KEYS");
+        let documented: std::collections::HashSet<&str> = keymap[start..end]
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("{ keys: \""))
+            .filter_map(|rest| rest.split('"').next())
+            .flat_map(|value| value.split(" / "))
+            .collect();
+        let mut taken = 0;
+        for letter in 'a'..='z' {
+            let key = gtk4::gdk::Key::from_name(letter.to_string()).expect("a letter keyval");
+            if terminal::navigation(key, gtk4::gdk::ModifierType::CONTROL_MASK).is_some() {
+                taken += 1;
+                let name = format!("Ctrl+{letter}");
+                assert!(
+                    documented.contains(name.as_str()),
+                    "the terminal gives up {name}, but no WINDOW_KEYS row names it"
+                );
+            }
+        }
+        assert_eq!(taken, 4, "Ctrl+h/j/k/l, and nothing else");
     }
 }

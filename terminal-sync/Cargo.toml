@@ -1,0 +1,28 @@
+[package]
+name = "terminal-sync"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+# Moved from Verdandi (`crates/terminal-sync` @ e5f9cc3) into neovibe on 2026-09-23, the owner's decision 4.1(a)
+# in docs/superpowers/specs/2026-09-23-bottom-terminal-design.md: neovibe is its only product consumer.
+# Verdandi stated no licence for it; it is the owner's own code, MIT with the rest of neovibe from here.
+description = "DECSET 2026 synchronized-output publication barrier for the verdandi terminal runtime engine."
+
+# NOTE: vte is deliberately NOT a direct dependency. `alacritty_terminal` re-exports the exact
+# vte it was compiled against (`pub use vte;`), so taking it through the re-export makes a
+# two-vte-versions-in-one-binary mistake structurally impossible. build.rs still reads the vte
+# version out of Cargo.lock, so the generated code tracks the real resolved version.
+[dependencies]
+alacritty_terminal = "0.26.0"
+
+[dev-dependencies]
+libc = "0.2"
+rustix-openpty = "0.2.0"
+
+[features]
+# Negative control ONLY. Swaps the parser's Timeout impl back to vte's stock StdSyncHandler,
+# which re-enables vte's 2 MiB raw-byte sync buffer. Tests that assert the locked semantic model
+# ("Term keeps parsing and mutating during the update") MUST FAIL under this feature. See
+# tests/control_stock_sync_handler.rs and README.md.
+control-stock-sync-handler = []

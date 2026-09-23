@@ -97,6 +97,29 @@ ALLOWLIST = {
         "cover it."),
 }
 
+# Workspace members that are NOT neovibe's own MIT code. Every other workspace member is covered by
+# LICENSE and left out of this file; these were moved in with a licence of their own, which travels
+# with the binary exactly as a crates.io dependency's does (bottom-terminal spec, decision 4.1).
+WORKSPACE_THIRD_PARTY = {
+    "terminal-input": (
+        "derived from Alacritty (commit 94e7c8874e526b1e67b349d9ba30ddf81669119e) and Apache-2.0, "
+        "which cannot be relicensed. Moved into neovibe from Verdandi with its LICENSE-APACHE and its "
+        "NOTICE, both reproduced as Apache-2.0 section 4 requires."),
+}
+
+
+def own_code(name, license):
+    """Whether workspace member `name` is neovibe's own code, covered by LICENSE and not listed here.
+    A member declaring anything but MIT (or nothing) must be in WORKSPACE_THIRD_PARTY -- a moved-in
+    crate that kept its own licence must never be skipped as if it were neovibe's."""
+    if name in WORKSPACE_THIRD_PARTY:
+        return False
+    if license in (None, "MIT"):
+        return True
+    raise Fail(f"workspace member {name} declares {license!r}: not neovibe's MIT, and not in "
+               "WORKSPACE_THIRD_PARTY")
+
+
 # Allowlisted for its licence, NOT for its text: the header promises this one's own licence file
 # is reproduced, so a release of it without one must fail rather than print an empty entry.
 ALLOWLIST_TEXT_REQUIRED = {("npm", "@anthropic-ai/claude-agent-sdk")}
@@ -248,7 +271,7 @@ def cargo_packages():
         if len(cands) != 1:
             raise Fail(f"cargo tree names {nv[0]} {nv[1]}, which matches {len(cands)} packages in cargo metadata")
         p = cands[0]
-        if p["id"] in workspace:
+        if p["id"] in workspace and own_code(p["name"], p["license"]):
             continue  # neovibe's own code: covered by LICENSE, not by this file
         out.append({
             "eco": "cargo", "name": p["name"], "version": p["version"], "license": p["license"],
@@ -333,6 +356,9 @@ def resolve(pkg, by_nv, counts):
     for (e, n, v) in list(TEXT_OVERRIDES) + list(SIBLING_TEXT):
         if (e, n) == key and v != ver:
             raise Fail(f"an override names {n} {v} but the tree has {ver}; re-check the text and update it")
+
+    if eco == "cargo" and name in WORKSPACE_THIRD_PARTY:
+        note = "in neovibe's own repository, under its own licence: " + WORKSPACE_THIRD_PARTY[name]
 
     lic = pkg["license"]
     if key in ALLOWLIST:

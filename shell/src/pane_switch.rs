@@ -50,11 +50,14 @@
 //! - `R` -- the load-bearing case: give focus to the agent panel.
 //! - `L` -- harmless no-op; the editor is already the leftmost pane, which is exactly what real
 //!   tmux does when you press `Ctrl+h` in the leftmost tmux pane.
-//! - `U`/`D` -- both no-ops. `D` used to reach the native terminal pane in the bottom slot; that
-//!   pane was frozen out on 2026-09-19 (`freeze/terminal-stack`) and its `'D'` match arm went with
-//!   it. A Lua-registered panel can still occupy the bottom slot, but nothing routes focus into it
-//!   -- the arm was never wired for plugin panels -- so `'D'` now falls into `main.rs`'s catch-all
-//!   and prints "no pane in that direction, ignoring". The slot is mouse-reachable only.
+//! - `U` -- focuses the top bar (`main.rs`'s catch-all handler). Not a no-op, and was already not
+//!   one before this doc's own "both no-ops" was last true (window review 2026-09-23, M4).
+//! - `D` -- with the built-in terminal shown, unzooms and focuses it (restored 2026-09-23; the
+//!   native terminal pane this bullet used to describe was frozen out on 2026-09-19
+//!   (`freeze/terminal-stack`), and its `'D'` arm did go with it then, but a new one was added for
+//!   the revived terminal). Hidden, or with a Lua-registered panel occupying the bottom slot
+//!   instead -- nothing routes focus into a plugin panel -- `'D'` falls into `main.rs`'s catch-all
+//!   and prints "no pane in that direction, ignoring"; the slot is mouse-reachable only in that case.
 //!
 //! The opposite direction (agent panel focused, `Ctrl+h` back to the editor) does **not** go
 //! through this mechanism -- the Neovim plugin has no relevance while a `WebView` has focus. That

@@ -9,13 +9,19 @@ members = [
     "poc/shell_composed",
     "poc/tools/wlr_vptr_drag",
     "poc/webkit_pane",
-    "poc/vt_renderer_spike",
     "neovide-editor",
     "shell",
     "agent",
     "core",
     "supervisor",
+    "terminal",
+    "terminal-frame",
+    "terminal-input",
+    "terminal-render",
+    "terminal-sync",
 ]
+# The Neovide fork is a submodule with its own workspace; it is a path dependency, not a member.
+exclude = ["neovide"]
 
 [workspace.package]
 edition = "2021"

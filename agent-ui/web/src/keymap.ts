@@ -158,6 +158,7 @@ export const INPUT_KEYS: KeyHelp[] = [
 export const WINDOW_KEYS: KeyHelp[] = [
   { keys: "Ctrl+h / Ctrl+l", what: "Editor / this panel" },
   { keys: "Ctrl+k", what: "Top bar (h / l move, Ctrl+j or Esc go back)" },
+  { keys: "Ctrl+j", what: "Down to the terminal, when it is shown (Ctrl+k there comes back up)" },
   { keys: "Ctrl+Shift+F", what: "HINT from anywhere (f in this panel or the top bar)" },
   { keys: "F11", what: "Fullscreen" },
   { keys: "Ctrl+Shift+F11", what: "Immersive: fullscreen without the top bar" },
@@ -175,6 +176,8 @@ export const PREFIX_KEYS: KeyHelp[] = [
   { keys: "Ctrl+a m / z", what: "Zoom this pane, or restore" },
   { keys: "Ctrl+a h / j / k / l", what: "Move a divider 5 cells (repeat within 500 ms)" },
   { keys: "Ctrl+a Ctrl+a", what: "Send Ctrl+a itself" },
+  { keys: "Ctrl+a Ctrl+l", what: "Send Ctrl+l itself to the terminal (clear screen)" },
+  { keys: "Ctrl+a t", what: "Terminal: show and focus it, or hide it when it has the keys" },
   { keys: "Ctrl+a = / -", what: "Text size larger / smaller, this pane only (repeat within 500 ms)" },
   { keys: "Ctrl+a 0", what: "Text size reset, this pane only" },
 ];

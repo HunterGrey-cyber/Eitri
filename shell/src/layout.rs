@@ -112,21 +112,97 @@ pub(crate) fn resize_target(direction: Direction, focused_pane: usize, has_botto
 pub(crate) struct PaneLayout {
     /// Editor (start) | panel host (end).
     across: Paned,
-    /// `across` (start) over the bottom slot (end), when something claimed the bottom slot.
+    /// `across` (start) over the bottom slot (end). Kept `Option` for the shape it had before
+    /// something always claimed the bottom slot; since the bottom terminal (2026-09-23) this is
+    /// always `Some` in practice too, matching `build_vertical_split`'s own doc (window review
+    /// 2026-09-23, M4).
     down: Option<Paned>,
     zoomed: Cell<Option<usize>>,
     /// Both divider positions from just before the zoom, put back by `unzoom`.
     saved: Cell<(i32, Option<i32>)>,
+    /// Whether the bottom slot is shown at all, apart from any zoom. False for the built-in
+    /// terminal until `Ctrl+a t` (bottom-terminal spec §4.5); a Lua bottom panel is shown from the
+    /// start, as before.
+    bottom_shown: Cell<bool>,
+    /// The divider as the bottom slot was last hidden with, put back when it is shown again. `None`
+    /// until it has been shown once: the first show sizes it from the window instead.
+    bottom_position: Cell<Option<i32>>,
+}
+
+/// Whether the bottom slot is visible: shown, and not hidden by a zoom. A zoom ending must not
+/// reveal a terminal nobody asked for -- `unzoom` used to show every child unconditionally.
+pub(crate) fn bottom_visible(bottom_shown: bool, zoom: Hidden) -> bool {
+    bottom_shown && !zoom.bottom
+}
+
+/// Whether `set_bottom_shown(shown)` must unzoom before it hides: the bottom slot is itself the
+/// zoomed pane (`zoomed == Some(2)`), so `hidden_for_zoom(2, ..)` hides only the top row -- hiding
+/// the bottom on top of that would leave nothing visible at all. Hiding while a DIFFERENT pane is
+/// zoomed is not this hole: `hidden_for_zoom` already sets `bottom: true` for panes 0 and 1, so the
+/// bottom slot is hidden by the zoom already and `set_bottom_shown`'s own hide changes nothing
+/// visible (review 2026-09-23, M3).
+pub(crate) fn hiding_bottom_must_unzoom(shown: bool, zoomed: Option<usize>) -> bool {
+    !shown && zoomed == Some(2)
+}
+
+/// Where the divider goes when the bottom slot is shown: back where it was last hidden, or -- the
+/// first time -- a third of `height` (the vertical `GtkPaned`'s, logical px) for the bottom. The
+/// divider's build-time position is a constant 480px, which in a maximized window would give the
+/// terminal most of the screen on its first appearance. `None`: nothing to go on yet (no height).
+pub(crate) fn shown_position(saved: Option<i32>, height: i32) -> Option<i32> {
+    saved.or_else(|| (height > 0).then(|| height * 2 / 3))
 }
 
 impl PaneLayout {
-    pub(crate) fn new(across: Paned, down: Option<Paned>) -> Rc<Self> {
-        Rc::new(PaneLayout {
+    /// `bottom_shown` is whether a bottom slot starts out shown: not for the built-in terminal
+    /// (bottom-terminal spec §4.5), yes for a Lua panel.
+    pub(crate) fn new(across: Paned, down: Option<Paned>, bottom_shown: bool) -> Rc<Self> {
+        let layout = Rc::new(PaneLayout {
             across,
             down,
             zoomed: Cell::new(None),
             saved: Cell::new((0, None)),
-        })
+            bottom_shown: Cell::new(bottom_shown),
+            bottom_position: Cell::new(None),
+        });
+        layout.set_hidden(Hidden::default());
+        layout
+    }
+
+    /// There is a bottom slot and it is shown -- what zoom and resize treat as "has a bottom".
+    pub(crate) fn bottom_shown(&self) -> bool {
+        self.down.is_some() && self.bottom_shown.get()
+    }
+
+    /// Shows or hides the bottom slot. Hiding never unrealizes it: the terminal's shell keeps
+    /// running, and a hidden pane keeps its last size (it reports no allocation while hidden).
+    /// Showing puts the divider where [`shown_position`] says; hiding remembers where it was.
+    ///
+    /// Hiding while the bottom slot is itself the zoomed pane unzooms first ([`hiding_bottom_must_unzoom`]):
+    /// `hidden_for_zoom(2, ..)` only hides the top row, so hiding the bottom on top of that zoom
+    /// would leave nothing visible at all -- only `ToggleAction::steps`'s leading `Unzoom`
+    /// prevented this before (review 2026-09-23, M3); a second caller (phase 5's `Ctrl+a x`) would
+    /// have hit it.
+    pub(crate) fn set_bottom_shown(&self, shown: bool) {
+        if hiding_bottom_must_unzoom(shown, self.zoomed.get()) {
+            self.unzoom();
+        }
+        if let (Some(down), true) = (&self.down, shown != self.bottom_shown.get()) {
+            if shown {
+                if let Some(position) = shown_position(self.bottom_position.get(), down.height()) {
+                    down.set_position(position);
+                }
+            } else {
+                self.bottom_position.set(Some(down.position()));
+            }
+        }
+        self.bottom_shown.set(shown);
+        let zoom = self
+            .zoomed
+            .get()
+            .and_then(|pane| hidden_for_zoom(pane, true))
+            .unwrap_or_default();
+        self.set_hidden(zoom);
     }
 
     fn set_hidden(&self, hidden: Hidden) {
@@ -139,7 +215,7 @@ impl PaneLayout {
         show(self.across.end_child(), hidden.side);
         if let Some(down) = &self.down {
             show(down.start_child(), hidden.top_row);
-            show(down.end_child(), hidden.bottom);
+            show(down.end_child(), !bottom_visible(self.bottom_shown.get(), hidden));
         }
     }
 
@@ -148,7 +224,7 @@ impl PaneLayout {
         if self.unzoom() {
             return;
         }
-        let Some(hidden) = hidden_for_zoom(pane, self.down.is_some()) else {
+        let Some(hidden) = hidden_for_zoom(pane, self.bottom_shown()) else {
             return;
         };
         self.saved
@@ -180,7 +256,7 @@ impl PaneLayout {
         // Decided BEFORE unzooming: a direction with no divider on that side is a no-op, and a
         // no-op must not silently undo a zoom. tmux's `resize-pane` unzooms because it resizes;
         // at the edge of its own grid it does nothing at all.
-        let Some((split, sign)) = resize_target(direction, focused_pane, self.down.is_some()) else {
+        let Some((split, sign)) = resize_target(direction, focused_pane, self.bottom_shown()) else {
             return;
         };
         self.unzoom();
@@ -293,9 +369,13 @@ pub(crate) fn install_webview_resize_throttle(agent: &gtk4::Widget) -> gtk4::Wid
 
 /// Puts `bottom` underneath `content`, full width, in a vertical `GtkPaned`.
 ///
-/// Called only when something has claimed the bottom slot. When nothing has, the window keeps the
-/// exact shape it had before this slot existed -- no extra `Paned`, no extra allocation pass -- so
-/// an unused feature costs the default layout nothing.
+/// Called only when something has claimed the bottom slot. Since the bottom terminal
+/// (2026-09-23) something always has: the terminal, which is registered as the built-in bottom
+/// panel and hidden until `Ctrl+a t`, or a Lua panel that replaced it. So this `Paned` now always
+/// exists; while the terminal is hidden its end child is not visible, and the `Paned` gives
+/// `content` the whole height. (Before, a window with nothing in the bottom slot had no `Paned` at
+/// all.) The 480px below is only a starting value: the terminal's first show sets the divider from
+/// the window's height (`shown_position`).
 ///
 /// `bottom` gets `shrink = false` and a `size_request` floor for a reason a terminal makes
 /// concrete: a `GtkPaned` child with shrink enabled can be dragged to zero height, and a terminal
@@ -369,6 +449,57 @@ mod tests {
                 ..Hidden::default()
             })
         );
+    }
+
+    #[test]
+    fn the_first_show_gives_the_bottom_a_third_and_later_ones_put_the_divider_back() {
+        assert_eq!(
+            shown_position(None, 1440),
+            Some(960),
+            "a maximized window: 480px of terminal"
+        );
+        assert_eq!(shown_position(Some(700), 1440), Some(700), "where the user left it");
+        assert_eq!(shown_position(None, 0), None, "not laid out: leave the divider alone");
+    }
+
+    /// Only the pure rule: whether `set_hidden` really consults it (instead of `hidden.bottom`) is
+    /// GTK code no unit test here reaches, and is on the GUI checklist ("with the terminal hidden,
+    /// `Ctrl+a z` twice must NOT reveal it").
+    #[test]
+    fn a_hidden_bottom_slot_stays_hidden_whatever_the_zoom_does() {
+        assert!(
+            !bottom_visible(false, Hidden::default()),
+            "unzoom must not reveal a hidden terminal"
+        );
+        assert!(!bottom_visible(false, hidden_for_zoom(0, true).unwrap()));
+        assert!(
+            !bottom_visible(true, hidden_for_zoom(1, true).unwrap()),
+            "zooming a pane above hides it"
+        );
+        assert!(bottom_visible(true, Hidden::default()));
+        assert!(
+            bottom_visible(true, hidden_for_zoom(2, true).unwrap()),
+            "zooming the terminal itself"
+        );
+    }
+
+    /// Review 2026-09-23, M3: `set_bottom_shown(false)` while `zoomed == Some(2)` used to compute
+    /// `hidden_for_zoom(2, true)` (top row hidden) and then hide the bottom too, leaving nothing
+    /// visible. Only `ToggleAction::steps`'s own leading `Unzoom` masked this for `Ctrl+a t`; a
+    /// second caller of `set_bottom_shown` (phase 5's `Ctrl+a x`) would have hit it directly.
+    #[test]
+    fn hiding_the_bottom_while_it_is_the_zoomed_pane_must_unzoom_first() {
+        assert!(hiding_bottom_must_unzoom(false, Some(2)));
+        assert!(!hiding_bottom_must_unzoom(true, Some(2)), "showing is unaffected");
+        assert!(
+            !hiding_bottom_must_unzoom(false, Some(0)),
+            "a different pane's zoom already hides the bottom via hidden_for_zoom's own bottom: true"
+        );
+        assert!(
+            !hiding_bottom_must_unzoom(false, Some(1)),
+            "same as pane 0: hidden_for_zoom(1, true) already sets bottom: true"
+        );
+        assert!(!hiding_bottom_must_unzoom(false, None), "nothing zoomed");
     }
 
     #[test]

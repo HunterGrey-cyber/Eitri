@@ -11,10 +11,12 @@
 //!
 //! The count in that paragraph is history, and is deliberately left at what it was: the terminal
 //! pane was frozen out of this line of development on 2026-09-19 (`freeze/terminal-stack`), so the
-//! resolved root reaches **two** panes today -- the `nvim --embed` child and the agent panel --
-//! plus the top bar's project-name label, which is not a pane. The invariant is the same at any
-//! count, which is why the mechanism did not change with it; `canonicalize_source`'s own comments
-//! below name today's two consumers rather than this paragraph's three.
+//! resolved root reached **two** panes -- the `nvim --embed` child and the agent panel -- plus the
+//! top bar's project-name label, which is not a pane. The invariant is the same at any count, which
+//! is why the mechanism did not change with it.
+//!
+//! **Three again since 2026-09-23**: the bottom terminal came back (`shell/src/terminal/`), and its
+//! shell starts in this root. `canonicalize_source`'s own comment below names all three.
 //!
 //! Everything here works in `OsStr`/`OsString`, never `String`. `std::env::args()` is documented
 //! to panic on an argument that is not valid UTF-8, and a filesystem path is exactly the argument
@@ -169,10 +171,10 @@ fn canonicalize_source(source: &RootSource, cwd: io::Result<PathBuf>) -> Result<
             )
         })?,
     };
-    // Canonicalized, not merely made absolute. This one path is handed to the nvim child and to
-    // the agent panel, and `agent`'s lease and conversation records key on a "canonical cwd" of
-    // their own -- two spellings of one directory (a symlink, a `..`, a relative argument) would
-    // read downstream as two different projects.
+    // Canonicalized, not merely made absolute. This one path is handed to the nvim child, to the
+    // agent panel and to the bottom terminal's shell, and `agent`'s lease and conversation records
+    // key on a "canonical cwd" of their own -- two spellings of one directory (a symlink, a `..`, a
+    // relative argument) would read downstream as two different projects.
     let resolved = raw
         .canonicalize()
         .map_err(|e| format!("cannot open {} as a project directory: {e}", source.describe()))?;

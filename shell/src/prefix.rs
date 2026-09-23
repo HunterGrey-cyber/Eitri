@@ -1,6 +1,8 @@
 //! The `Ctrl+a` prefix, copied from the owner's tmux (spec:
 //! docs/superpowers/specs/2026-09-19-window-modes-design.md §3). `Ctrl+a`, then `m`/`z` zoom,
-//! `h`/`j`/`k`/`l` resize by 5 cells, `Ctrl+a` hands a real `Ctrl+a` to the pane.
+//! `h`/`j`/`k`/`l` resize by 5 cells, `Ctrl+a` hands a real `Ctrl+a` to the pane. The bottom
+//! terminal (spec 2026-09-23-bottom-terminal-design.md) adds `t` (show/focus/hide it) and `Ctrl+l`
+//! (a literal `Ctrl+l` for it, his own `base.conf:73`).
 //!
 //! A window-level capture controller, added at startup. GTK runs a widget's controllers
 //! most-recently-added first, and the window's shortcut manager was added when the window was
@@ -47,6 +49,9 @@ pub(crate) enum PrefixKey {
     Prefix,
     /// A key with no Ctrl/Alt/Super, as the character it types (`M` with Shift, like a terminal).
     Plain(char),
+    /// `Ctrl` plus one letter other than `a`, nothing else held but Ctrl: what `Ctrl+a Ctrl+l`
+    /// needs to see. Everywhere but that one arm it behaves exactly as `Other` did.
+    Control(char),
     Escape,
     Modifier,
     Other,
@@ -65,8 +70,13 @@ pub(crate) fn classify(key: Key, state: ModifierType) -> PrefixKey {
         | ModifierType::META_MASK
         | ModifierType::HYPER_MASK;
     let others = chords.difference(ModifierType::CONTROL_MASK) | ModifierType::SHIFT_MASK;
-    if state.contains(ModifierType::CONTROL_MASK) && !state.intersects(others) && key.to_lower() == Key::a {
-        return PrefixKey::Prefix;
+    if state.contains(ModifierType::CONTROL_MASK) && !state.intersects(others) {
+        if key.to_lower() == Key::a {
+            return PrefixKey::Prefix;
+        }
+        if let Some(letter) = key.to_lower().to_unicode().filter(char::is_ascii_lowercase) {
+            return PrefixKey::Control(letter);
+        }
     }
     if state.intersects(chords) {
         return PrefixKey::Other;
@@ -86,6 +96,11 @@ pub(crate) enum PrefixCommand {
     /// `=`/`-`/`0` (zoom-together spec §3): text size, for whichever pane holds the keys. Not
     /// named `Zoom` -- that name is already `PrefixCommand::Zoom` above, the pane-fill toggle.
     TextSize(TextStep),
+    /// `t`: show, focus or hide the bottom terminal (bottom-terminal spec §2.4). Not repeatable.
+    ToggleTerminal,
+    /// `Ctrl+l`: hand the terminal a literal `Ctrl+l` (clear screen), which bare `Ctrl+l` cannot
+    /// be -- neovibe takes that for pane navigation. His tmux's own answer: `base.conf:73`.
+    SendCtrlL,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +126,7 @@ fn command(ch: char) -> Option<(PrefixCommand, bool)> {
         '=' => (PrefixCommand::TextSize(TextStep::Larger), true),
         '-' => (PrefixCommand::TextSize(TextStep::Smaller), true),
         '0' => (PrefixCommand::TextSize(TextStep::Reset), false),
+        't' => (PrefixCommand::ToggleTerminal, false),
         _ => return None,
     })
 }
@@ -126,6 +142,27 @@ pub(crate) fn bound_keys() -> Vec<char> {
     (0u8..=127u8)
         .map(char::from)
         .filter(|&ch| command(ch).is_some())
+        .collect()
+}
+
+/// Every letter whose `Ctrl` chord right after `Ctrl+a` runs a command: `a` (the literal `Ctrl+a`)
+/// and, since the bottom terminal, `l`. Derived by driving [`Prefix`] itself, for the reason
+/// [`bound_keys`] is derived from [`command`]: `main.rs` holds `PREFIX_KEYS`' `Ctrl+a Ctrl+<x>`
+/// rows to it, which [`bound_keys`] cannot, since those tokens are not one character.
+#[cfg(test)]
+pub(crate) fn bound_control_keys() -> Vec<char> {
+    ('a'..='z')
+        .filter(|&letter| {
+            let now = Instant::now();
+            let mut prefix = Prefix::new();
+            prefix.press(PrefixKey::Prefix, 0, now);
+            let key = if letter == 'a' {
+                PrefixKey::Prefix
+            } else {
+                PrefixKey::Control(letter)
+            };
+            matches!(prefix.press(key, 1, now), Outcome::Run(_))
+        })
         .collect()
 }
 
@@ -211,6 +248,7 @@ impl Prefix {
                 self.state = State::Idle;
                 match key {
                     PrefixKey::Prefix => Outcome::Run(PrefixCommand::SendPrefix),
+                    PrefixKey::Control('l') => Outcome::Run(PrefixCommand::SendCtrlL),
                     PrefixKey::Plain(ch) => match command(ch) {
                         Some((cmd, repeatable)) => {
                             if repeatable {
@@ -348,6 +386,7 @@ mod tests {
     const EQUALS: u32 = 21;
     const MINUS: u32 = 20;
     const ZERO: u32 = 19;
+    const T: u32 = 28;
 
     #[test]
     fn classify_every_row_of_the_spec_table() {
@@ -360,7 +399,12 @@ mod tests {
             classify(Key::a, ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK),
             PrefixKey::Other
         );
-        assert_eq!(classify(Key::h, ModifierType::CONTROL_MASK), PrefixKey::Other);
+        assert_eq!(classify(Key::h, ModifierType::CONTROL_MASK), PrefixKey::Control('h'));
+        assert_eq!(classify(Key::l, ModifierType::CONTROL_MASK), PrefixKey::Control('l'));
+        assert_eq!(
+            classify(Key::l, ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK),
+            PrefixKey::Other
+        );
         assert_eq!(classify(Key::m, ModifierType::empty()), PrefixKey::Plain('m'));
         assert_eq!(classify(Key::M, ModifierType::SHIFT_MASK), PrefixKey::Plain('M'));
         assert_eq!(classify(Key::Escape, ModifierType::empty()), PrefixKey::Escape);
@@ -399,6 +443,8 @@ mod tests {
             (PrefixKey::Plain('='), EQUALS, PrefixCommand::TextSize(TextStep::Larger)),
             (PrefixKey::Plain('-'), MINUS, PrefixCommand::TextSize(TextStep::Smaller)),
             (PrefixKey::Plain('0'), ZERO, PrefixCommand::TextSize(TextStep::Reset)),
+            (PrefixKey::Plain('t'), T, PrefixCommand::ToggleTerminal),
+            (PrefixKey::Control('l'), L, PrefixCommand::SendCtrlL),
         ];
         for (key, keycode, expected) in cases {
             let mut p = Prefix::new();
@@ -595,6 +641,52 @@ mod tests {
     fn bound_keys_names_exactly_the_commands_table() {
         let mut keys = bound_keys();
         keys.sort_unstable();
-        assert_eq!(keys, ['-', '0', '=', 'h', 'j', 'k', 'l', 'm', 'z']);
+        assert_eq!(keys, ['-', '0', '=', 'h', 'j', 'k', 'l', 'm', 't', 'z']);
+    }
+
+    #[test]
+    fn bound_control_keys_are_ctrl_a_and_ctrl_l() {
+        assert_eq!(bound_control_keys(), ['a', 'l']);
+    }
+
+    /// `Ctrl+l` is the prefix's only after `Ctrl+a`: idle, and in a repeat window, it passes to the
+    /// pane exactly as every other Ctrl chord does, and any other Ctrl letter after the prefix is
+    /// swallowed like any unbound key.
+    #[test]
+    fn ctrl_l_is_the_prefixs_only_right_after_ctrl_a() {
+        let t0 = Instant::now();
+        let mut p = Prefix::new();
+        assert_eq!(p.press(PrefixKey::Control('l'), L, t0), Outcome::Pass);
+
+        let mut p = Prefix::new();
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        assert_eq!(p.press(PrefixKey::Control('x'), X, t0), Outcome::Swallow);
+        assert!(!p.is_armed());
+
+        let mut p = Prefix::new();
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        p.press(PrefixKey::Plain('h'), H, t0);
+        p.release(H);
+        assert_eq!(
+            p.press(PrefixKey::Control('l'), L, t0 + Duration::from_millis(100)),
+            Outcome::Pass
+        );
+    }
+
+    /// `t` is one-shot: a second `t` inside the repeat window is typed, not a second toggle.
+    #[test]
+    fn t_does_not_repeat() {
+        let t0 = Instant::now();
+        let mut p = Prefix::new();
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        assert_eq!(
+            p.press(PrefixKey::Plain('t'), T, t0),
+            Outcome::Run(PrefixCommand::ToggleTerminal)
+        );
+        p.release(T);
+        assert_eq!(
+            p.press(PrefixKey::Plain('t'), T, t0 + Duration::from_millis(100)),
+            Outcome::Pass
+        );
     }
 }
