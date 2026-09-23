@@ -4,6 +4,9 @@
 /docs/workspace/
 /.worktrees/
 /dist/
+# Loading collect-licenses.py via importlib (packaging/test_collect_licenses.py) writes bytecode
+# here; every Python script in the tree gets the same treatment.
+__pycache__/
 
 # Editor/agent scratch that was tracked by accident. `.codex/hooks.json` in particular carried a
 # real absolute host path and a socket name from an earlier scheme that was renamed away (2026-09-17) -- the

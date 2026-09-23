@@ -14,6 +14,11 @@ members = [
     "agent",
     "core",
     "supervisor",
+    "terminal",
+    "terminal-frame",
+    "terminal-input",
+    "terminal-render",
+    "terminal-sync",
 ]
 # The Neovide fork is a submodule with its own workspace; it is a path dependency, not a member.
 exclude = ["neovide"]

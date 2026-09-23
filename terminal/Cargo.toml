@@ -1,0 +1,31 @@
+[package]
+name = "neovibe-terminal"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+description = "The bottom terminal's engine: an owned PTY, one session thread per terminal, and the Skia paint of a terminal-render PaintList. GTK-free by construction (src/manifest_guard.rs)."
+
+# Never gtk4/glib/gdk/webkit6, used or not -- `src/manifest_guard.rs` fails the build's tests on the
+# commit that adds one. `shell/src/terminal/` is the GTK half; the macOS track hosts this crate in an
+# NSView instead, which is the reason the line is drawn here and not at `shell`.
+[dependencies]
+terminal-render = { path = "../terminal-render" }
+terminal-frame = { path = "../terminal-frame" }
+terminal-sync = { path = "../terminal-sync" }
+terminal-input = { path = "../terminal-input" }
+# The one emulator. Same version the four crates above resolve; never `alacritty_terminal::tty` --
+# see `src/pty.rs` for the five reasons.
+alacritty_terminal = "0.26.0"
+# `openpty` itself. Already in the graph through `alacritty_terminal`, so this adds no crate.
+rustix-openpty = "0.2.0"
+# termios (IUTF8, TIOCSWINSZ) through rustix rather than raw ioctls. Same version rustix-openpty
+# re-exports; `std` so an `Errno` converts into `std::io::Error`.
+rustix = { version = "1", features = ["std", "termios"] }
+# `setsid`/`TIOCSCTTY`/`signal` in the child's `pre_exec`, `poll`, `kill`, `waitpid`, `getpwuid_r`.
+libc = "0.2"
+skia-safe = "0.153.3"
+
+[dev-dependencies]
+# The replay test counts vte's own "[unhandled ...]" debug records.
+log = "0.4"
