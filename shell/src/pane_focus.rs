@@ -1,25 +1,28 @@
-//! Tracks keyboard focus and updates the pane indicators from GTK's focus widget.
+//! Tracks keyboard focus and signals it through the editor cursor and panel sign cell.
+//! Keyboard arrival in the panel enters BROWSE without a composer caret, so the
+//! caret cannot identify the focused pane.
 //!
-//! `Ctrl+l` enters the panel in BROWSE without a textarea caret. Cursor indicators make the
-//! focused pane visible while keeping the three-mode keyboard model.
+//! The editor forwards focus through `set_focused` and sends nvim `FocusGained`
+//! or `FocusLost`. It hides its cursor when unfocused using
+//! `HIDE_UNFOCUSED_CURSOR_CMD`. The agent panel receives a `pane_focus` envelope
+//! (`AgentPanelHandle::set_pane_focused`) and draws the current row's sign cell
+//! solid with focus and hollow without. The hollow cell shows where returning
+//! focus will land. There is no separate focus label in the status bar.
 //!
-//! The editor forwards focus through `NeovideEditorPane::set_focused`, which also sends nvim
-//! `FocusGained`/`FocusLost`. `neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD` hides the editor cursor
-//! when unfocused. The panel receives a `pane_focus` envelope through
-//! `AgentPanelHandle::set_pane_focused`. Its current row's sign cell is solid with focus and
-//! hollow without, so the panel still shows where focus will return.
-//! The cursors provide the focus indicators.
+//! One function updates these signals from GTK's `GtkWindow:focus-widget` and
+//! window activity. A pane counts as focused for its cursor only when it holds
+//! the focus widget and the window is active; bright BROWSE means keys go there now.
+//! `notify::is-active` reruns the function when activity changes.
+//! The last focused module is written to the layout's `focus` even while the
+//! window is inactive. It is the destination for the top bar's `Ctrl+j` and the
+//! module zoomed by the `Ctrl+a` prefix. `Layout::set_focus` refuses hidden modules.
+//! This behavior has not been checked on screen.
 //!
-//! Changes to `GtkWindow:focus-widget` update all indicators through one function so they agree.
-//! A pane has the keys only when it holds the focus widget and the window is active.
-//! `notify::is-active` runs the same function, so switching to another application clears that state.
-//! The last focused pane is remembered even while the window is inactive. The top bar's
-//! `Ctrl+j` returns to it, and the `Ctrl+a` prefix zooms it.
-//! Visual behavior has not been checked on screen.
+//! Panes are keyed by `ModuleId`, which identifies a module independently of its
+//! position. Numeric indices cannot identify modules in a layout whose structure varies.
 
 use gtk4::prelude::*;
-use std::cell::Cell;
-use std::rc::Rc;
+use neovibe_core::layout::ModuleId;
 
 /// The index of the first pane in `panes` whose element appears in `chain`, walking `chain` in
 /// order (the focus widget first, then each ancestor). `None` means focus is in none of them: the
@@ -29,6 +32,18 @@ use std::rc::Rc;
 /// chain.
 pub(crate) fn owning_pane<T: PartialEq>(chain: impl IntoIterator<Item = T>, panes: &[T]) -> Option<usize> {
     chain.into_iter().find_map(|w| panes.iter().position(|p| *p == w))
+}
+
+/// [`owning_pane`], answered with the module's id: the module whose host is nearest to the focus
+/// widget on its way up to the window. Generic for the same reason.
+pub(crate) fn owning_module<T: PartialEq>(
+    chain: impl IntoIterator<Item = T>,
+    modules: &[(ModuleId, T)],
+) -> Option<ModuleId> {
+    chain
+        .into_iter()
+        .find_map(|w| modules.iter().find(|(_, host)| *host == w))
+        .map(|(id, _)| id.clone())
 }
 
 /// Which panes' "has the keys" answer changed, as `(index, now)`. `last` holds the previous
@@ -45,62 +60,65 @@ pub(crate) fn focus_changes(last: &[Option<bool>], focused: Option<usize>, activ
         .collect()
 }
 
-/// Wires the tracker to `window` and applies it once for the current focus. `panes` are the
-/// widgets whose subtree counts as that pane, in the order `on_pane_focus` reports indices.
+/// Wires the tracker to `window` and applies it once for the current focus. `modules` are the
+/// module hosts whose subtree counts as that module.
 ///
-/// `on_pane_focus(index, has_keys)` is called when a pane's answer changes. Returns the index of
-/// the pane that most recently held focus, which the top bar's `Ctrl+j` uses to go back to it.
+/// `on_owner(id)` is called whenever focus lands inside module `id`, whether or not the window is
+/// active: that module is where the top bar's `Ctrl+j` goes back to and what the `Ctrl+a` prefix
+/// zooms. `on_has_keys(id, has_keys)` is called when a module's "has the keys" answer changes.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
-    panes: Vec<gtk4::Widget>,
-    on_pane_focus: impl Fn(usize, bool) + 'static,
-) -> Rc<Cell<usize>> {
-    let last_pane = Rc::new(Cell::new(0));
-    let last: std::cell::RefCell<Vec<Option<bool>>> = std::cell::RefCell::new(vec![None; panes.len()]);
-    let remembered = last_pane.clone();
+    modules: Vec<(ModuleId, gtk4::Widget)>,
+    on_owner: impl Fn(&ModuleId) + 'static,
+    on_has_keys: impl Fn(&ModuleId, bool) + 'static,
+) {
+    let last: std::cell::RefCell<Vec<Option<bool>>> = std::cell::RefCell::new(vec![None; modules.len()]);
+    let hosts: Vec<gtk4::Widget> = modules.iter().map(|(_, w)| w.clone()).collect();
     let apply = move |window: &gtk4::ApplicationWindow| {
         let chain = std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent());
-        let focused = owning_pane(chain, &panes);
+        let focused = owning_pane(chain, &hosts);
         if let Some(i) = focused {
-            remembered.set(i);
+            on_owner(&modules[i].0);
         }
-        // Said on every focus change, not only on a pane's own transition, because the two states
-        // that look identical from the per-pane callback are exactly the two a "I cannot type"
+        // Said on every focus change, not only on a module's own transition, because the two states
+        // that look identical from the per-module callback are exactly the two a "I cannot type"
         // report has to tell apart (2026-09-20, after one such report this log could not explain):
         // the window went inactive -- ordinary, the keys are in another application -- or the
-        // window is STILL ACTIVE and focus is sitting on a widget that is neither pane, in which
+        // window is STILL ACTIVE and focus is sitting on a widget that is in no module, in which
         // case the keys are going nowhere and that is a bug. `has_keys` is false either way.
         // The widget's type name is what names the culprit: the top bar after `Ctrl+k`, HINT's
         // overlay, or `None` after a control removed itself.
         println!(
-            "[pane_focus] active={} focus={} owning_pane={:?}",
+            "[pane_focus] active={} focus={} owning_module={:?}",
             window.is_active(),
             gtk4::prelude::GtkWindowExt::focus(window)
                 .map(|w| w.type_().name().to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            focused,
+            focused.map(|i| modules[i].0.as_str()),
         );
         let changes = focus_changes(&last.borrow(), focused, window.is_active());
         for (i, now) in changes {
             last.borrow_mut()[i] = Some(now);
-            on_pane_focus(i, now);
+            on_has_keys(&modules[i].0, now);
         }
     };
     apply(window);
-    let apply = Rc::new(apply);
+    let apply = std::rc::Rc::new(apply);
     let on_active = apply.clone();
     window.connect_notify_local(Some("focus-widget"), move |window, _| apply(window));
     window.connect_notify_local(Some("is-active"), move |window, _| on_active(window));
-    last_pane
 }
 
-/// The pane holding the window's focus widget, or `None` for the top bar or no focus widget.
-/// This is where a key typed now would go, rather than the last focused pane. `Ctrl+a Ctrl+a`
+/// The module holding the window's focus widget, or `None` for the top bar or no focus widget.
+/// This is where a key typed now would go, rather than the last focused module. `Ctrl+a Ctrl+a`
 /// forwards its `Ctrl+a` here.
-pub(crate) fn focused_pane(window: &gtk4::ApplicationWindow, panes: &[gtk4::Widget]) -> Option<usize> {
-    owning_pane(
+pub(crate) fn focused_module(
+    window: &gtk4::ApplicationWindow,
+    modules: &[(ModuleId, gtk4::Widget)],
+) -> Option<ModuleId> {
+    owning_module(
         std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent()),
-        panes,
+        modules,
     )
 }
 
@@ -144,6 +162,33 @@ mod tests {
         assert_eq!(
             focus_changes(&[Some(true), Some(false)], Some(1), true),
             vec![(0, false), (1, true)]
+        );
+    }
+
+    #[test]
+    fn the_owning_module_is_named_by_its_id_not_its_position() {
+        let modules = [
+            (ModuleId::agent(), "agent-host"),
+            (ModuleId::editor(), "editor-host"),
+            (ModuleId::lua("notes"), "notes-host"),
+        ];
+        assert_eq!(
+            owning_module(["editor-host", "grid", "window"], &modules),
+            Some(ModuleId::editor())
+        );
+        assert_eq!(
+            owning_module(["textarea", "notes-host", "grid"], &modules),
+            Some(ModuleId::lua("notes"))
+        );
+        assert_eq!(owning_module(["reload-button", "topbar"], &modules), None);
+    }
+
+    #[test]
+    fn a_module_nested_in_another_module_owns_its_own_focus() {
+        let modules = [(ModuleId::agent(), "outer"), (ModuleId::lua("inner"), "inner")];
+        assert_eq!(
+            owning_module(["inner", "outer", "window"], &modules),
+            Some(ModuleId::lua("inner"))
         );
     }
 

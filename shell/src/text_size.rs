@@ -53,6 +53,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
+use neovibe_core::layout::{ModuleId, ModuleKind};
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::AgentPanelHandle;
@@ -342,7 +343,7 @@ impl TextSize {
     }
 }
 
-/// The target for `Ctrl+a =`/`-`/`0`, selected by the pane holding the keys. Centralizing this
+/// The target for `Ctrl+a =`/`-`/`0`, selected by the module holding the keys. Centralizing this
 /// choice keeps `main.rs` from duplicating the editor, panel and no-op routing at each call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextSizeTarget {
@@ -351,14 +352,14 @@ pub(crate) enum TextSizeTarget {
     Neither,
 }
 
-/// `focused`: [`crate::pane_focus::focused_pane`]'s own answer -- the pane that HOLDS THE KEYS
-/// right now, not `last_pane`. `editor_is_main`/`side_is_agent`: whether the main/side slots are
-/// actually the editor/agent panel and not a Lua plugin. Any other focus (top bar, a plugin pane)
-/// is [`TextSizeTarget::Neither`].
-pub(crate) fn route_focused_pane(focused: Option<usize>, editor_is_main: bool, side_is_agent: bool) -> TextSizeTarget {
-    match focused {
-        Some(0) if editor_is_main => TextSizeTarget::Editor,
-        Some(1) if side_is_agent => TextSizeTarget::Panel,
+/// Routes the module currently holding the keys, supplied by [`crate::pane_focus::focused_module`].
+/// The editor and agent receive their respective text-size controls. Other focus targets,
+/// including the top bar, Lua panels and the terminal, yield [`TextSizeTarget::Neither`].
+/// Routing uses module kind, so a Lua panel with the id `"editor"` cannot be treated as the editor.
+pub(crate) fn route_focused_module(focused: Option<&ModuleId>) -> TextSizeTarget {
+    match focused.map(ModuleId::kind) {
+        Some(ModuleKind::Editor) => TextSizeTarget::Editor,
+        Some(ModuleKind::Agent) => TextSizeTarget::Panel,
         _ => TextSizeTarget::Neither,
     }
 }
@@ -405,14 +406,16 @@ pub(crate) const TEXT_SIZE_ACTIONS: &[(&str, &[&str], TextStep)] = &[
 /// back from nvim. `main.rs`'s `Ctrl+a` prefix routing calls [`apply_editor`](Self::apply_editor)/
 /// [`apply_panel`](Self::apply_panel) directly rather than going through an action, since those
 /// two are one-pane operations the prefix has already resolved a target for (via
-/// [`route_focused_pane`]).
+/// [`route_focused_module`]).
 pub(crate) struct TextSizeController {
     /// A `RefCell`, not a `Cell` (2026-09-23): `TextSize` holds a `Vec` (`burst`) and so is no
     /// longer `Copy`.
     state: RefCell<TextSize>,
     /// `None` when there is no nvim to receive `g:neovide_scale_factor` writes.
     /// In that case `apply_editor` logs and does nothing, while `apply_both` scales the
-    /// panel alone so the remaining pane can still be resized.
+    /// panel alone so the remaining pane can still be resized. Every window has an editor,
+    /// even when a Lua `main` panel hides it, so `main.rs` passes `Some`. The pane buffers
+    /// writes made before nvim starts.
     editor: Option<Rc<NeovideEditorPane>>,
     panel: AgentPanelHandle,
     /// The panel's live px, shared with `main.rs`'s colorscheme listener (`panel_tokens`, via
@@ -477,7 +480,7 @@ impl TextSizeController {
     /// Without an editor, they scale the panel alone.
     pub(crate) fn apply_both(self: &Rc<Self>, step: TextStep) {
         let Some(editor) = &self.editor else {
-            eprintln!("[text-size] {step:?} (both panes): no nvim in the main slot, scaling the panel alone");
+            eprintln!("[text-size] {step:?} (both panes): no editor pane, scaling the panel alone");
             let next = self.state.borrow().clone().apply_panel_step(step);
             *self.state.borrow_mut() = next;
             self.push_panel_px();
@@ -507,7 +510,7 @@ impl TextSizeController {
     /// `Ctrl+a =`/`-`/`0` with the editor focused.
     pub(crate) fn apply_editor(self: &Rc<Self>, step: TextStep) {
         let Some(editor) = &self.editor else {
-            eprintln!("[text-size] {step:?} (editor): no nvim in the main slot, ignoring");
+            eprintln!("[text-size] {step:?} (editor): no editor pane, ignoring");
             return;
         };
         let (next, write) = self.state.borrow().clone().apply_editor_step(step);
@@ -1230,19 +1233,28 @@ mod tests {
     }
 
     #[test]
-    fn route_focused_pane_sends_pane_zero_to_the_editor_and_pane_one_to_the_panel() {
-        assert_eq!(route_focused_pane(Some(0), true, true), TextSizeTarget::Editor);
-        assert_eq!(route_focused_pane(Some(1), true, true), TextSizeTarget::Panel);
+    fn route_focused_module_sends_the_editor_to_the_editor_and_the_agent_to_the_panel() {
+        assert_eq!(route_focused_module(Some(&ModuleId::editor())), TextSizeTarget::Editor);
+        assert_eq!(route_focused_module(Some(&ModuleId::agent())), TextSizeTarget::Panel);
     }
 
     #[test]
-    fn route_focused_pane_is_neither_off_the_wrong_pane_or_the_wrong_widget_there() {
-        assert_eq!(route_focused_pane(None, true, true), TextSizeTarget::Neither);
-        assert_eq!(route_focused_pane(Some(2), true, true), TextSizeTarget::Neither);
-        // pane 0 exists but is not the editor (a Lua plugin took the main slot).
-        assert_eq!(route_focused_pane(Some(0), false, true), TextSizeTarget::Neither);
-        // pane 1 exists but is not the agent panel.
-        assert_eq!(route_focused_pane(Some(1), true, false), TextSizeTarget::Neither);
+    fn route_focused_module_is_neither_off_the_top_bar_or_in_a_lua_panel() {
+        assert_eq!(route_focused_module(None), TextSizeTarget::Neither);
+        assert_eq!(
+            route_focused_module(Some(&ModuleId::lua("notes"))),
+            TextSizeTarget::Neither
+        );
+        // A Lua panel that named itself "editor" is still a Lua panel.
+        assert_eq!(
+            route_focused_module(Some(&ModuleId::lua("editor"))),
+            TextSizeTarget::Neither
+        );
+        // The bottom terminal's text size is its own until its phase 4 (`main`: pane 2, Neither).
+        assert_eq!(
+            route_focused_module(Some(&ModuleId::terminal())),
+            TextSizeTarget::Neither
+        );
     }
 
     #[test]

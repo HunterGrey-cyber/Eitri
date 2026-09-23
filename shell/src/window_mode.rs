@@ -79,8 +79,9 @@ pub(crate) struct WindowModes {
     window: gtk4::ApplicationWindow,
     top_bar: gtk4::Widget,
     controls: gtk4::Widget,
-    /// `None` when a Lua plugin replaces the editor in the main slot, leaving no nvim
-    /// to sync with. `F11` still works.
+    /// `None` when there is no nvim to sync with; `F11` still works.
+    /// Every window has an editor, which a Lua `main` panel hides rather than replaces,
+    /// so `main.rs` always passes `Some`.
     editor: Option<Rc<NeovideEditorPane>>,
     /// Moves focus back to the pane that last had it; used when the top bar hides while it holds
     /// focus, since GTK would otherwise leave the keys on an invisible button.

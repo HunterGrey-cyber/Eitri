@@ -11,6 +11,9 @@
 mod gl_interop;
 mod keyboard;
 mod mouse;
+mod stdin;
+
+pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -317,6 +320,45 @@ fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
     args
 }
 
+/// Delay after mapping `GLArea` before requesting another frame. A request in the same main-loop
+/// turn can coalesce into the first frame. The 50 ms delay restored content in 50 of 50 re-shows;
+/// a same-turn request worked in only 6 of 8. A frame-clock tick has not been measured here.
+const REMAP_RENDER_DELAY: Duration = Duration::from_millis(50);
+
+/// Schedules one delayed render per map. A new map replaces any pending render, so a burst of
+/// hide/show cycles requests only one frame.
+///
+/// Showing the pane over the same rectangle after `set_child_visible(false)` need not emit
+/// `resize` or set `wants_frame`. If nvim redrew while hidden, its traffic is still drained,
+/// but the first mapped frame can show only the cursor until another redraw arrives.
+/// `GtkPaned::set_visible(true)` forces a resize and further renders, masking this case.
+/// It is unclear whether the incomplete frame comes from the renderer or GTK's remapped texture.
+struct RemapKick {
+    pending: Rc<RefCell<Option<glib::SourceId>>>,
+}
+
+impl RemapKick {
+    fn new() -> Self {
+        RemapKick {
+            pending: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn schedule(&self, delay: Duration, render: impl FnOnce() + 'static) {
+        if let Some(earlier) = self.pending.borrow_mut().take() {
+            earlier.remove();
+        }
+        let pending = self.pending.clone();
+        let id = glib::timeout_add_local_once(delay, move || {
+            // This source is finished once it fires; taking its id here is what stops a later map
+            // from `remove`-ing a source glib no longer has.
+            pending.borrow_mut().take();
+            render();
+        });
+        *self.pending.borrow_mut() = Some(id);
+    }
+}
+
 /// Whether the tick callback's `Ready` arm should queue another render this frame, given each
 /// independent reason the render loop already tracks. Split out of the tick closure -- which
 /// borrows `GLArea`/`LiveSession` types no unit test can construct -- for the same reason the fork
@@ -517,6 +559,28 @@ impl NeovideEditorPane {
                         // size directly.
                     }
                 }
+            });
+        }
+
+        // --- map: one more frame ~50ms after this pane is back on screen. See `RemapKick` for why
+        // a host that hides panes by `set_child_visible` needs it, and for what was measured.
+        {
+            let live_state = live_state.clone();
+            let kick = RemapKick::new();
+            gl_area.connect_map(move |widget| {
+                let widget = widget.downgrade();
+                let live_state = live_state.clone();
+                kick.schedule(REMAP_RENDER_DELAY, move || {
+                    let Some(widget) = widget.upgrade() else {
+                        return;
+                    };
+                    if let Ok(live) = live_state.try_borrow() {
+                        if let LiveState::Ready(session) = &*live {
+                            session.wants_frame.set(true);
+                        }
+                    }
+                    widget.queue_render();
+                });
             });
         }
 
@@ -1164,7 +1228,55 @@ impl NeovideEditorPane {
 
 #[cfg(test)]
 mod tests {
-    use super::{nvim_args, tick_should_render, ScaleWatch};
+    use super::{nvim_args, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY};
+    use gtk4::glib;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    /// A map requests one delayed render, never in the same main-loop turn; a burst of maps requests
+    /// only one. This test covers scheduling without a display. Real `connect_map` wiring and restored
+    /// content after editing while hidden require a display to check.
+    #[test]
+    fn a_map_asks_for_one_render_after_the_delay_and_never_in_the_same_turn() {
+        assert_eq!(
+            REMAP_RENDER_DELAY,
+            Duration::from_millis(50),
+            "S3's measured fix; another delay, or a frame-clock tick, needs the same 50-cycle check first"
+        );
+        let context = glib::MainContext::default();
+        let _owner = context
+            .acquire()
+            .expect("no other test in this crate runs the default main context");
+        // Longer than the product's 50ms on purpose: "nothing in the same turn" is checked by running
+        // the loop once without blocking, and a test thread descheduled for longer than the delay
+        // would see the render fire there and fail for a reason that is not the code's.
+        let delay = Duration::from_millis(300);
+        let renders = Rc::new(Cell::new(0));
+        let kick = RemapKick::new();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let renders = renders.clone();
+            kick.schedule(delay, move || renders.set(renders.get() + 1));
+        }
+        while context.iteration(false) {}
+        assert_eq!(
+            renders.get(),
+            0,
+            "nothing in the turn the show happens in: it would coalesce into the first frame (S3: 6/8)"
+        );
+        while renders.get() == 0 && start.elapsed() < Duration::from_secs(2) {
+            context.iteration(true);
+        }
+        assert_eq!(renders.get(), 1, "three maps in a row ask for one render");
+        assert!(start.elapsed() >= delay);
+        let after = Instant::now();
+        while after.elapsed() < Duration::from_millis(150) {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(renders.get(), 1, "and nothing after it");
+    }
 
     #[test]
     fn clean_comes_first_then_the_cursor_default_then_the_hosts_extras() {

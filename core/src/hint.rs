@@ -1,7 +1,10 @@
-//! The pure half of the global `f` HINT.
-//! Label assignment, the typing state machine and the split of one label set across the window's
-//! regions. No GTK and no WebView: `shell::hint` drives this with widget indices, the panel with
-//! its own target indices, and neither can disagree with the other about which label is whose.
+//! Pure logic for the global `f` HINT: label assignment, typing state, and distributing one
+//! label set across window regions. `shell::hint` uses module ids and the panel uses target
+//! indices, so both share label assignments without GTK or WebView dependencies. The window
+//! is a list of modules in tree order; regions follow the layout rather than fixed main,
+//! side, and bottom slots.
+
+use crate::layout::{ModuleId, ModuleKind};
 
 /// Label letters in priority order: home row first. `f` is absent on purpose, so pressing `f`
 /// twice can never land anywhere.
@@ -93,11 +96,11 @@ impl HintSession {
 /// Where a global label index points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
-    /// A GTK target before the panel (top bar items, then the editor).
+    /// A GTK target before the panel (top bar items, then every module ahead of the agent).
     Before(usize),
     /// The panel's own target at this index.
     Panel(usize),
-    /// A GTK target after the panel (the bottom plugin pane).
+    /// A GTK target after the panel (every module behind the agent in tree order).
     After(usize),
 }
 
@@ -147,20 +150,14 @@ impl LabelPlan {
 
 /// Where one GTK-side HINT target lives in the window. `shell` maps each to its widget; nothing
 /// here knows what a widget is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slot {
     /// The top bar's item at this index (of the items `shell` passed in `WindowLayout::top_visible`).
     Top(usize),
-    /// The main slot, holding the editor: focused through the editor pane, which also tells the
-    /// input method, never through a bare widget focus.
-    Editor,
-    /// The main slot, holding a Lua plugin's widget in place of the editor.
-    Main,
-    /// The side slot, holding a Lua plugin's widget in place of the agent panel: one target,
-    /// because only the built-in panel can label its own inside.
-    Side,
-    /// The bottom plugin slot.
-    Bottom,
+    /// A module's host, as one target. The editor is focused through the editor pane, which also
+    /// tells the input method -- `shell`'s job, by the module's kind. The agent is never one: it
+    /// labels its own inside (`TargetOrder::ask_panel`).
+    Module(ModuleId),
 }
 
 /// The window state `shell` sees when a HINT starts.
@@ -168,18 +165,12 @@ pub enum Slot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowLayout {
     pub top_visible: Vec<bool>,
-    pub main_visible: bool,
-    /// The main slot holds the editor (no Lua plugin replaced it).
-    pub main_is_editor: bool,
-    pub side_visible: bool,
-    /// The side slot holds the built-in agent panel (no Lua plugin replaced it).
-    pub side_is_agent_panel: bool,
-    /// `false` when there is no bottom slot at all.
-    pub bottom_visible: bool,
+    /// Every module in the layout's tree order (`Layout::leaves`), with whether it is on screen.
+    pub modules: Vec<(ModuleId, bool)>,
 }
 
 /// Where a landing goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     Gtk(Slot),
     /// The panel's own target at this index (`hint_land`).
@@ -189,14 +180,18 @@ pub enum Landing {
 /// The GTK targets in spec order around the panel's, and whether the panel is asked for its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetOrder {
-    /// Top bar items, then the main slot, then a Lua side panel.
+    /// Top bar items, then every visible module ahead of the agent in tree order.
     pub before: Vec<Slot>,
     /// Only the built-in agent panel, and only when it is on screen: a panel that is hidden or
-    /// replaced is never sent `hint_collect`, so a HINT never waits the timeout for it.
+    /// zoomed away is never sent `hint_collect`, so a HINT never waits the timeout for it.
     pub ask_panel: bool,
+    /// Every visible module after the agent in tree order.
     pub after: Vec<Slot>,
 }
 
+/// Orders visible top bar items first, then visible modules in tree order, with the agent's
+/// own labels at its position. For `[editor | agent]` with an optional bottom panel, this gives
+/// top bar, main slot, panel, bottom slot.
 pub fn order_targets(layout: &WindowLayout) -> TargetOrder {
     let mut before: Vec<Slot> = layout
         .top_visible
@@ -205,22 +200,20 @@ pub fn order_targets(layout: &WindowLayout) -> TargetOrder {
         .filter(|(_, v)| **v)
         .map(|(i, _)| Slot::Top(i))
         .collect();
-    if layout.main_visible {
-        before.push(if layout.main_is_editor {
-            Slot::Editor
+    let mut after = Vec::new();
+    let mut ask_panel = false;
+    for (id, visible) in &layout.modules {
+        if !visible {
+            continue;
+        }
+        if id.kind() == ModuleKind::Agent {
+            ask_panel = true;
+        } else if ask_panel {
+            after.push(Slot::Module(id.clone()));
         } else {
-            Slot::Main
-        });
+            before.push(Slot::Module(id.clone()));
+        }
     }
-    let ask_panel = layout.side_is_agent_panel && layout.side_visible;
-    if !layout.side_is_agent_panel && layout.side_visible {
-        before.push(Slot::Side);
-    }
-    let after = if layout.bottom_visible {
-        vec![Slot::Bottom]
-    } else {
-        Vec::new()
-    };
     TargetOrder {
         before,
         ask_panel,
@@ -239,9 +232,9 @@ impl TargetOrder {
     /// Where global label `index` of `plan` lands.
     pub fn landing(&self, plan: &LabelPlan, index: usize) -> Option<Landing> {
         match plan.region_of(index)? {
-            Region::Before(i) => self.before.get(i).copied().map(Landing::Gtk),
+            Region::Before(i) => self.before.get(i).cloned().map(Landing::Gtk),
             Region::Panel(i) => Some(Landing::Panel(i)),
-            Region::After(i) => self.after.get(i).copied().map(Landing::Gtk),
+            Region::After(i) => self.after.get(i).cloned().map(Landing::Gtk),
         }
     }
 }
@@ -328,56 +321,84 @@ mod tests {
         assert_eq!(plan.region_of(6), None);
     }
 
+    fn editor() -> Slot {
+        Slot::Module(ModuleId::editor())
+    }
+
+    fn lua(id: &str) -> ModuleId {
+        ModuleId::lua(id)
+    }
+
+    /// Today's window with a Lua panel below: `[editor | agent]` over `lua:bottom`.
     fn layout() -> WindowLayout {
         WindowLayout {
             top_visible: vec![true, false, true],
-            main_visible: true,
-            main_is_editor: true,
-            side_visible: true,
-            side_is_agent_panel: true,
-            bottom_visible: true,
+            modules: vec![
+                (ModuleId::editor(), true),
+                (ModuleId::agent(), true),
+                (lua("bottom"), true),
+            ],
         }
     }
 
-    /// Targets are ordered: visible top bar items, main slot, panel, bottom slot.
+    /// Visible targets follow top bar, main slot, panel, bottom slot order.
+    /// Labels and landings stay the same when editor and bottom slots are represented as modules.
     #[test]
     fn targets_are_ordered_top_bar_then_main_then_panel_then_bottom() {
         let order = order_targets(&layout());
-        assert_eq!(order.before, vec![Slot::Top(0), Slot::Top(2), Slot::Editor]);
+        assert_eq!(order.before, vec![Slot::Top(0), Slot::Top(2), editor()]);
         assert!(order.ask_panel);
-        assert_eq!(order.after, vec![Slot::Bottom]);
+        assert_eq!(order.after, vec![Slot::Module(lua("bottom"))]);
         let plan = order.plan(2);
         assert_eq!(plan.all(), assign_labels(6));
         assert_eq!(order.landing(&plan, 1), Some(Landing::Gtk(Slot::Top(2))));
-        assert_eq!(order.landing(&plan, 2), Some(Landing::Gtk(Slot::Editor)));
+        assert_eq!(order.landing(&plan, 2), Some(Landing::Gtk(editor())));
         assert_eq!(order.landing(&plan, 4), Some(Landing::Panel(1)));
-        assert_eq!(order.landing(&plan, 5), Some(Landing::Gtk(Slot::Bottom)));
+        assert_eq!(order.landing(&plan, 5), Some(Landing::Gtk(Slot::Module(lua("bottom")))));
         assert_eq!(order.landing(&plan, 6), None);
     }
 
-    /// A Lua plugin in either slot is one plain target, and one in the side slot takes the
-    /// panel's place in the order: after the main slot, never before it.
+    /// The default window, no bottom panel: the same order as before minus the bottom.
     #[test]
-    fn a_lua_plugin_in_a_slot_is_one_target_in_that_slots_place() {
+    fn the_default_window_is_top_bar_then_editor_then_panel() {
         let order = order_targets(&WindowLayout {
-            main_is_editor: false,
-            side_is_agent_panel: false,
+            modules: vec![(ModuleId::editor(), true), (ModuleId::agent(), true)],
             ..layout()
         });
-        assert_eq!(order.before, vec![Slot::Top(0), Slot::Top(2), Slot::Main, Slot::Side]);
-        assert!(!order.ask_panel, "a replaced agent panel is never asked");
+        assert_eq!(order.before, vec![Slot::Top(0), Slot::Top(2), editor()]);
+        assert!(order.ask_panel);
+        assert!(order.after.is_empty());
+    }
+
+    /// A Lua panel is one plain target in its tree position: one that took the editor's place
+    /// comes before the panel, one placed right of the root after it.
+    #[test]
+    fn a_lua_panel_is_one_target_where_it_sits_in_the_tree() {
+        let order = order_targets(&WindowLayout {
+            top_visible: vec![],
+            modules: vec![
+                (lua("main"), true),
+                (ModuleId::editor(), false),
+                (ModuleId::agent(), true),
+                (lua("side"), true),
+            ],
+        });
+        assert_eq!(order.before, vec![Slot::Module(lua("main"))]);
+        assert!(order.ask_panel);
+        assert_eq!(order.after, vec![Slot::Module(lua("side"))]);
     }
 
     /// A hidden agent panel is not asked, so the HINT does not wait 300ms for an answer that
     /// cannot help; nothing hidden gets a label.
     #[test]
-    fn a_hidden_panel_is_not_asked_and_hidden_slots_get_no_label() {
+    fn a_hidden_panel_is_not_asked_and_hidden_modules_get_no_label() {
         let order = order_targets(&WindowLayout {
             top_visible: vec![false],
-            main_visible: false,
-            side_visible: false,
-            bottom_visible: false,
-            ..layout()
+            modules: vec![
+                (ModuleId::editor(), false),
+                (ModuleId::agent(), false),
+                (lua("bottom"), false),
+            ],
         });
         assert_eq!(
             order,
@@ -388,18 +409,26 @@ mod tests {
             }
         );
         let order = order_targets(&WindowLayout {
-            side_visible: false,
-            side_is_agent_panel: false,
+            modules: vec![
+                (ModuleId::editor(), true),
+                (ModuleId::agent(), false),
+                (lua("bottom"), true),
+            ],
             ..layout()
         });
-        assert!(!order.before.contains(&Slot::Side));
+        assert!(!order.ask_panel);
+        assert_eq!(
+            order.before,
+            vec![Slot::Top(0), Slot::Top(2), editor(), Slot::Module(lua("bottom"))],
+            "with the panel off screen everything visible is one run, in tree order"
+        );
     }
 
     /// A count from a panel that was never asked labels nothing in it.
     #[test]
     fn an_unasked_panels_answer_is_ignored() {
         let order = order_targets(&WindowLayout {
-            side_is_agent_panel: false,
+            modules: vec![(ModuleId::editor(), true), (ModuleId::agent(), false)],
             ..layout()
         });
         let plan = order.plan(5);
