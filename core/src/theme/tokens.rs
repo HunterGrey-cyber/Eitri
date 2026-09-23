@@ -424,7 +424,9 @@ mod tests {
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
         assert_eq!(
-            vars.iter().find(|(n, _)| n == "--nv-font-size").map(|(_, v)| v.as_str()),
+            vars.iter()
+                .find(|(n, _)| n == "--nv-font-size")
+                .map(|(_, v)| v.as_str()),
             Some("14px")
         );
     }
@@ -444,7 +446,9 @@ mod tests {
         t.font_size_px = 16.5;
         let vars = t.css_vars();
         assert_eq!(
-            vars.iter().find(|(n, _)| n == "--nv-font-size").map(|(_, v)| v.as_str()),
+            vars.iter()
+                .find(|(n, _)| n == "--nv-font-size")
+                .map(|(_, v)| v.as_str()),
             Some("16.5px")
         );
         let unchanged = ThemeTokens::fallback().css_vars();

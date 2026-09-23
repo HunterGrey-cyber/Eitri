@@ -162,6 +162,12 @@ export const WINDOW_KEYS: KeyHelp[] = [
   { keys: "F11", what: "Fullscreen" },
   { keys: "Ctrl+Shift+F11", what: "Immersive: fullscreen without the top bar" },
   { keys: "Ctrl+Shift+R", what: "Reload this panel (the session keeps running)" },
+  { keys: "Ctrl+= / Ctrl++ / Ctrl+Keypad+", what: "Text size larger (both panes)" },
+  { keys: "Ctrl+- / Ctrl+Keypad-", what: "Text size smaller (both panes)" },
+  {
+    keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)",
+    what: "Text size reset (both panes)",
+  },
 ];
 
 /** `shell/src/prefix.rs`: tmux's own prefix, as the owner's tmux has it. */
@@ -169,4 +175,6 @@ export const PREFIX_KEYS: KeyHelp[] = [
   { keys: "Ctrl+a m / z", what: "Zoom this pane, or restore" },
   { keys: "Ctrl+a h / j / k / l", what: "Move a divider 5 cells (repeat within 500 ms)" },
   { keys: "Ctrl+a Ctrl+a", what: "Send Ctrl+a itself" },
+  { keys: "Ctrl+a = / -", what: "Text size larger / smaller, this pane only (repeat within 500 ms)" },
+  { keys: "Ctrl+a 0", what: "Text size reset, this pane only" },
 ];

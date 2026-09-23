@@ -548,6 +548,21 @@ impl AgentPanelHandle {
                 }
             });
     }
+
+    /// Updates only the recorded theme's `font_size_px` and re-sends it -- the zoom-together
+    /// design's path (`text_size::TextSizeController`) for pushing a new panel scale without
+    /// re-deriving any other themed colour or token. Built on `set_theme`, so both a panel reload
+    /// (`reload_document`, which reads straight from the recorded theme) and a fresh `ready`
+    /// handshake (whose `hello` theme payload comes from the same recorded field) pick the new
+    /// size up automatically -- neither has a separate path that could fall out of sync with it.
+    pub(crate) fn set_panel_font_size_px(&self, font_size_px: f32) {
+        let tokens = {
+            let mut tokens = self.state.borrow().theme.clone();
+            tokens.font_size_px = font_size_px;
+            tokens
+        };
+        self.set_theme(&tokens);
+    }
 }
 
 impl AgentPanelHandle {

@@ -28,3 +28,7 @@ harness = false
 [[test]]
 name = "fullscreen_setting"
 harness = false
+
+[[test]]
+name = "scale_factor_setting"
+harness = false

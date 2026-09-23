@@ -16,6 +16,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use crate::layout::Direction;
+use crate::text_size::TextStep;
 
 /// tmux's default `repeat-time`; the owner's config does not set it (§1).
 pub(crate) const REPEAT_TIME: Duration = Duration::from_millis(500);
@@ -82,6 +83,9 @@ pub(crate) enum PrefixCommand {
     Resize(Direction),
     /// Hand a real `Ctrl+a` to the pane that has focus (§3.2).
     SendPrefix,
+    /// `=`/`-`/`0` (zoom-together spec §3): text size, for whichever pane holds the keys. Not
+    /// named `Zoom` -- that name is already `PrefixCommand::Zoom` above, the pane-fill toggle.
+    TextSize(TextStep),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +98,8 @@ pub(crate) enum Outcome {
     Run(PrefixCommand),
 }
 
-/// The command a key after the prefix names, and whether tmux binds it with `-r` (§3.1).
+/// The command a key after the prefix names, and whether tmux binds it with `-r` (§3.1). `=`/`-`
+/// repeat like `m`/`h`/`j`/`k`/`l`; `0` is one-shot like `z` (zoom-together spec §3).
 fn command(ch: char) -> Option<(PrefixCommand, bool)> {
     Some(match ch {
         'm' => (PrefixCommand::Zoom, true),
@@ -103,8 +108,25 @@ fn command(ch: char) -> Option<(PrefixCommand, bool)> {
         'j' => (PrefixCommand::Resize(Direction::Down), true),
         'k' => (PrefixCommand::Resize(Direction::Up), true),
         'l' => (PrefixCommand::Resize(Direction::Right), true),
+        '=' => (PrefixCommand::TextSize(TextStep::Larger), true),
+        '-' => (PrefixCommand::TextSize(TextStep::Smaller), true),
+        '0' => (PrefixCommand::TextSize(TextStep::Reset), false),
         _ => return None,
     })
+}
+
+/// Every character [`command`] recognises after the prefix -- derived by actually calling it
+/// rather than a second, hand-typed list, so `main.rs`'s own two-way check against `PREFIX_KEYS`
+/// (`agent-ui/web/src/keymap.ts`) cannot itself drift from this table by restating it (item 3f:
+/// deleting both of `text_size.rs`'s `PREFIX_KEYS` rows stayed green until this existed, because
+/// nothing previously checked that direction at all). Test-only: nothing in the running product
+/// needs the bound-keys list itself, only this crate's own tests (here and in `main.rs`) do.
+#[cfg(test)]
+pub(crate) fn bound_keys() -> Vec<char> {
+    (0u8..=127u8)
+        .map(char::from)
+        .filter(|&ch| command(ch).is_some())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +345,9 @@ mod tests {
     const ESC: u32 = 9;
     const F11: u32 = 95;
     const SHIFT_L: u32 = 50;
+    const EQUALS: u32 = 21;
+    const MINUS: u32 = 20;
+    const ZERO: u32 = 19;
 
     #[test]
     fn classify_every_row_of_the_spec_table() {
@@ -371,6 +396,9 @@ mod tests {
             (PrefixKey::Plain('k'), K, PrefixCommand::Resize(Direction::Up)),
             (PrefixKey::Plain('l'), L, PrefixCommand::Resize(Direction::Right)),
             (PrefixKey::Prefix, CTRL_A, PrefixCommand::SendPrefix),
+            (PrefixKey::Plain('='), EQUALS, PrefixCommand::TextSize(TextStep::Larger)),
+            (PrefixKey::Plain('-'), MINUS, PrefixCommand::TextSize(TextStep::Smaller)),
+            (PrefixKey::Plain('0'), ZERO, PrefixCommand::TextSize(TextStep::Reset)),
         ];
         for (key, keycode, expected) in cases {
             let mut p = Prefix::new();
@@ -458,6 +486,31 @@ mod tests {
         assert_eq!(p.press(PrefixKey::Plain('m'), M, t2), Outcome::Run(PrefixCommand::Zoom));
     }
 
+    /// `=`/`-` repeat like `m`/`h`/`j`/`k`/`l`; `0` is one-shot like `z` (zoom-together spec §3).
+    #[test]
+    fn equals_and_minus_repeat_and_zero_does_not() {
+        let t0 = Instant::now();
+
+        for (ch, keycode, expected) in [
+            ('=', EQUALS, PrefixCommand::TextSize(TextStep::Larger)),
+            ('-', MINUS, PrefixCommand::TextSize(TextStep::Smaller)),
+        ] {
+            let mut p = Prefix::new();
+            p.press(PrefixKey::Prefix, CTRL_A, t0);
+            p.press(PrefixKey::Plain(ch), keycode, t0);
+            p.release(keycode);
+            let t1 = t0 + Duration::from_millis(100);
+            assert_eq!(p.press(PrefixKey::Plain(ch), keycode, t1), Outcome::Run(expected));
+        }
+
+        let mut p = Prefix::new();
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        p.press(PrefixKey::Plain('0'), ZERO, t0);
+        p.release(ZERO);
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!(p.press(PrefixKey::Plain('0'), ZERO, t1), Outcome::Pass);
+    }
+
     #[test]
     fn a_non_repeatable_key_in_repeat_mode_ends_it_and_passes() {
         let t0 = Instant::now();
@@ -536,5 +589,12 @@ mod tests {
         assert!(p.is_armed());
         p.cancel();
         assert!(!p.is_armed());
+    }
+
+    #[test]
+    fn bound_keys_names_exactly_the_commands_table() {
+        let mut keys = bound_keys();
+        keys.sort_unstable();
+        assert_eq!(keys, ['-', '0', '=', 'h', 'j', 'k', 'l', 'm', 'z']);
     }
 }

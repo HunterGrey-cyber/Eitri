@@ -274,6 +274,7 @@ impl TickStats {
 /// `clippy::type_complexity` -- no behavior difference from writing the nested type out inline.
 type ExitedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 type FullscreenCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
+type ScaleFactorCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f32)>>>>;
 
 /// The embeddable Neovide/Skia editor surface. Wraps a single `GtkGLArea` driving a real
 /// `nvim --embed` connection (`neovide::live_harness::LiveHarness`), with resize/IME/keyboard/
@@ -302,6 +303,11 @@ pub struct NeovideEditorPane {
     /// A [`NeovideEditorPane::set_fullscreen_setting`] made before nvim existed, handed over the
     /// moment it does -- the same shape as `focused`. Only the last one matters.
     pending_fullscreen: Rc<Cell<Option<bool>>>,
+    /// See [`NeovideEditorPane::on_scale_factor_setting`].
+    scale_factor_callback: ScaleFactorCallbackSlot,
+    /// See [`ScaleWatch`]'s own doc for why the per-tick change watch and the pre-`Ready` pending
+    /// write live in one unit.
+    scale_watch: Rc<ScaleWatch>,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -370,6 +376,91 @@ fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
     args
 }
 
+/// Whether the tick callback's `Ready` arm should queue another render this frame, given each
+/// independent reason the render loop already tracks. Split out of the tick closure -- which
+/// borrows `GLArea`/`LiveSession` types no unit test can construct -- for the same reason the fork
+/// splits `focus_changed`/`scale_factor_changed` out of `LiveHarness`: it is the one decision here
+/// worth testing on its own.
+///
+/// `scale_factor_changed_now` exists because a scale-factor write produces none of the other three
+/// signals: it does not touch `redraw_batches_seen` (nvim itself sent nothing new -- the value is
+/// applied inside `LiveHarness::render_frame`, not delivered as a redraw batch), it is not a resize
+/// (the window doesn't move, so `connect_resize` never fires), and no keypress or resize handler
+/// sets `wants_frame` for it either. Dropping this term is exactly the failure the zoom-together
+/// design measured: a `:let g:neovide_scale_factor` (or `set_scale_factor_setting`) with nothing
+/// else in flight would apply inside the harness and then sit on screen unpainted until some
+/// unrelated activity eventually asked for a frame.
+fn tick_should_render(
+    last_animating: bool,
+    new_content: bool,
+    wants_frame: bool,
+    scale_factor_changed_now: bool,
+) -> bool {
+    last_animating || new_content || wants_frame || scale_factor_changed_now
+}
+
+/// One tick's [`ScaleWatch::observe`] result: whether `g:neovide_scale_factor` moved since the
+/// last tick, and its current value either way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScaleObservation {
+    pub(crate) changed: bool,
+    pub(crate) value: f32,
+}
+
+/// The per-tick "did `g:neovide_scale_factor` change" watch, plus a pre-`Ready`
+/// [`NeovideEditorPane::set_scale_factor_setting`] write waiting for a harness to exist. Bundled
+/// into one unit, rather than the two independent `Cell`s (`last_scale_factor_setting` on
+/// `LiveSession`, `pending_scale_factor` on the pane) an earlier revision of this file kept, so the
+/// tick closure and the `Ready`-construction arm each call exactly one method and cannot
+/// independently drop a piece of what the zoom-together design's L2 layer needs: the callback
+/// firing, [`tick_should_render`] seeing the change, and a pre-`Ready` write reaching nvim once it
+/// exists. A GTK call site that inlined this logic itself had all three go missing at once under a
+/// review's mutation testing -- a literal `false` in place of the real signal, the callback
+/// invocation dropped, the pending flush at `Ready` dropped -- each of which stayed green because
+/// nothing in this crate called `observe`/`take_pending_for_ready` by name for a test to hold onto.
+#[derive(Debug)]
+pub(crate) struct ScaleWatch {
+    last: Cell<f32>,
+    pending: Cell<Option<f32>>,
+}
+
+impl ScaleWatch {
+    /// `initial` is what a tick compares the FIRST real report against -- Neovide's own default
+    /// (`1.0`), so a value `init.lua` set is reported as a change on the first tick, matching
+    /// `last_fullscreen_setting`'s own starting value.
+    pub(crate) fn new(initial: f32) -> Self {
+        ScaleWatch {
+            last: Cell::new(initial),
+            pending: Cell::new(None),
+        }
+    }
+
+    /// Called once per tick with nvim's current report. Bit equality is deliberate: the value comes
+    /// from nvim verbatim, so an unchanged variable compares equal bit for bit -- including a NaN,
+    /// which `!=` would report as a change on every tick (a forced render and a panel theme re-send
+    /// 60 times a second after `:let g:neovide_scale_factor = 0/0`).
+    pub(crate) fn observe(&self, current: f32) -> ScaleObservation {
+        let changed = self.last.replace(current).to_bits() != current.to_bits();
+        ScaleObservation {
+            changed,
+            value: current,
+        }
+    }
+
+    /// A host write made before nvim existed (buffered because there was no harness yet). Only the
+    /// last one matters, mirroring `pending_fullscreen`.
+    pub(crate) fn buffer_pending(&self, value: f32) {
+        self.pending.set(Some(value));
+    }
+
+    /// Takes the buffered pre-`Ready` write, if any -- call once, right after the harness is
+    /// constructed and before its first tick, and hand the result straight to
+    /// `LiveHarness::set_scale_factor_setting`. `None` every other time.
+    pub(crate) fn take_pending_for_ready(&self) -> Option<f32> {
+        self.pending.take()
+    }
+}
+
 impl NeovideEditorPane {
     /// The colour painted where the editor's own grid does not reach -- today exactly one place:
     /// the band at the TOP that `gl_interop::snap_region_to_grid` creates by moving the sub-cell
@@ -433,6 +524,8 @@ impl NeovideEditorPane {
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
         let fullscreen_callback: FullscreenCallbackSlot = Rc::new(RefCell::new(None));
         let pending_fullscreen: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
+        let scale_factor_callback: ScaleFactorCallbackSlot = Rc::new(RefCell::new(None));
+        let scale_watch: Rc<ScaleWatch> = Rc::new(ScaleWatch::new(1.0));
 
         // --- resize: GtkGLArea's FBO can be resized/recreated under us, so drop the cached
         // Surface and let the next render() rebuild it against the new framebuffer dimensions
@@ -559,6 +652,7 @@ impl NeovideEditorPane {
             let clear_color = clear_color.clone();
             let focused = focused.clone();
             let pending_fullscreen = pending_fullscreen.clone();
+            let scale_watch_for_ready = scale_watch.clone();
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -706,6 +800,12 @@ impl NeovideEditorPane {
                                 if let Some(fullscreen) = pending_fullscreen.take() {
                                     harness.set_fullscreen_setting(fullscreen);
                                 }
+                                // Same again for a scale-factor write the host made before nvim
+                                // existed (the zoom-together design's app accelerators/prefix keys
+                                // can fire before this pane's first frame ever reaches `Ready`).
+                                if let Some(scale_factor) = scale_watch_for_ready.take_pending_for_ready() {
+                                    harness.set_scale_factor_setting(scale_factor);
+                                }
                                 *live = LiveState::Ready(Box::new(LiveSession::new(harness, grid_size)));
                             }
                             Err(err) => {
@@ -796,6 +896,10 @@ impl NeovideEditorPane {
             // Fired after `live` is dropped, for the same reentrancy reason as the exited callback:
             // the host's handler calls straight back into `set_fullscreen_setting`.
             let fullscreen_callback_for_tick = fullscreen_callback.clone();
+            // Same reentrancy reason again: the host's handler (`shell`'s pending/echo tracking)
+            // calls straight back into `set_scale_factor_setting`.
+            let scale_factor_callback_for_tick = scale_factor_callback.clone();
+            let scale_watch_for_tick = scale_watch.clone();
             let tick_stats = Rc::new(TickStats::new());
             gl_area.add_tick_callback(move |widget, _clock| {
                 let mut live = live_state.borrow_mut();
@@ -804,6 +908,7 @@ impl NeovideEditorPane {
                 // ordering matters.
                 let mut should_fire_exited_callback = false;
                 let mut fullscreen_changed: Option<bool> = None;
+                let mut scale_factor_changed: Option<f32> = None;
                 let issued = match &mut *live {
                     LiveState::Ready(session) => {
                         // Cheap, non-blocking drain of any nvim redraw traffic that arrived since
@@ -812,6 +917,21 @@ impl NeovideEditorPane {
                         let fullscreen = session.harness.fullscreen_setting();
                         if session.last_fullscreen_setting.replace(fullscreen) != fullscreen {
                             fullscreen_changed = Some(fullscreen);
+                        }
+                        // One call, one `ScaleObservation`, used below for both the callback and
+                        // `tick_should_render` -- see `ScaleWatch`'s own doc for why this used to
+                        // be an inline `Cell` comparison a mutation could pick apart.
+                        //
+                        // known limit: `ScaleWatch::observe` itself is unit-tested (see this
+                        // file's `tests` module), but this call site -- reading
+                        // `scale_observation.changed` into both `scale_factor_changed_now` and the
+                        // `if` below rather than, say, one of them silently reading `false` -- runs
+                        // only inside a real `add_tick_callback`, which needs a live `GtkGLArea` on
+                        // a real display. No test here exercises this exact wiring; a GUI pass does.
+                        let scale_observation = scale_watch_for_tick.observe(session.harness.scale_factor_setting());
+                        let scale_factor_changed_now = scale_observation.changed;
+                        if scale_observation.changed {
+                            scale_factor_changed = Some(scale_observation.value);
                         }
                         let batches_now = session.harness.redraw_batches_seen();
                         let new_content = batches_now != session.last_seen_batches.get();
@@ -875,7 +995,12 @@ impl NeovideEditorPane {
                             should_fire_exited_callback = true;
                         }
 
-                        session.last_animating.get() || new_content || wants_frame
+                        tick_should_render(
+                            session.last_animating.get(),
+                            new_content,
+                            wants_frame,
+                            scale_factor_changed_now,
+                        )
                     }
                     // NotStarted/Starting: the placeholder-frame dance and the one blocking
                     // `LiveHarness::with_options` call both happen *inside* the render callback
@@ -891,6 +1016,13 @@ impl NeovideEditorPane {
                     println!("[live] g:neovide_fullscreen is now {fullscreen}");
                     if let Some(cb) = fullscreen_callback_for_tick.borrow().as_ref() {
                         cb(fullscreen);
+                    }
+                }
+
+                if let Some(scale_factor) = scale_factor_changed {
+                    println!("[live] g:neovide_scale_factor is now {scale_factor}");
+                    if let Some(cb) = scale_factor_callback_for_tick.borrow().as_ref() {
+                        cb(scale_factor);
                     }
                 }
 
@@ -923,6 +1055,8 @@ impl NeovideEditorPane {
             focused,
             fullscreen_callback,
             pending_fullscreen,
+            scale_factor_callback,
+            scale_watch,
         }
     }
 
@@ -964,8 +1098,14 @@ impl NeovideEditorPane {
     /// Registers `callback`, called with the new value each time `g:neovide_fullscreen` changes in
     /// nvim -- a `:let`, a mapping, or a value `init.lua` set (reported on the first tick after
     /// nvim is ready). This pane owns no window, so it acts on nothing itself: the host owns the
-    /// real window and follows the variable. Read from the tick callback, so while this pane's
-    /// widget is hidden a change waits until it is shown again. Replaces any earlier callback.
+    /// real window and follows the variable. Read from the tick callback. **Corrected 2026-09-23:**
+    /// this used to claim that while this pane's widget is hidden (`set_visible(false)`, e.g. a
+    /// pane zoom) a change waits until it is shown again. An adversarial recheck found that
+    /// unverified and, per GTK 4.22.5's own source, most likely false: `gtkwidget.c` disconnects a
+    /// widget's tick callback only in `gtk_widget_real_unrealize`, and `gtk_widget_on_frame_clock_update`
+    /// (what actually invokes it) has no mapped/visible check at all -- so a merely-hidden
+    /// (unmapped, not unrealized) widget most likely keeps ticking. Not confirmed on a screen
+    /// either way; do not rely on either behaviour without checking. Replaces any earlier callback.
     pub fn on_fullscreen_setting(&self, callback: impl Fn(bool) + 'static) {
         *self.fullscreen_callback.borrow_mut() = Some(Box::new(callback));
     }
@@ -981,6 +1121,51 @@ impl NeovideEditorPane {
             session.harness.set_fullscreen_setting(fullscreen);
         } else {
             self.pending_fullscreen.set(Some(fullscreen));
+        }
+    }
+
+    /// `LiveHarness::scale_factor_setting()` (`g:neovide_scale_factor`) right now, or `1.0` before
+    /// nvim exists -- Neovide's own default, and this pane's own "not zoomed" answer for a host
+    /// that asks before a live session exists at all. Unlike fullscreen, this one is also a
+    /// getter and not just a callback: the zoom-together design's `shell` side needs a synchronous
+    /// read to reconcile its own pending write against nvim's report (see that design's
+    /// "asynchrony and echo" section) without waiting for the next tick's callback.
+    pub fn scale_factor_setting(&self) -> f32 {
+        if let LiveState::Ready(session) = &*self.live_state.borrow() {
+            session.harness.scale_factor_setting()
+        } else {
+            1.0
+        }
+    }
+
+    /// Registers `callback`, called with the new value each time `g:neovide_scale_factor` changes
+    /// in nvim -- a `:let`, a mapping, or a value `init.lua` set (reported on the first tick after
+    /// nvim is ready). This pane owns no window and applies the scale to its own renderer already
+    /// (inside `LiveHarness::render_frame`); a host follows the callback to scale anything of its
+    /// own alongside the editor. Read from the tick callback -- see
+    /// [`on_fullscreen_setting`](Self::on_fullscreen_setting)'s own doc (corrected 2026-09-23) for
+    /// what is and is not known about whether hiding this pane's widget pauses that tick: most
+    /// likely it does not, per GTK's own source, but that has never been confirmed on a screen.
+    /// `shell`'s zoom-together pending model (`shell/src/text_size.rs`) no longer has any
+    /// time-based fallback for a paused tick to defeat -- a write it makes stays pending, however
+    /// long nvim takes to answer, rather than assuming a fixed delay and going stale against it.
+    /// Replaces any earlier callback.
+    pub fn on_scale_factor_setting(&self, callback: impl Fn(f32) + 'static) {
+        *self.scale_factor_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Writes `g:neovide_scale_factor` in nvim, for a host whose text-size key nvim never sees
+    /// (the zoom-together design's app-level accelerators and `Ctrl+a` prefix). The write goes
+    /// through nvim's own watcher like a `:let`, so the host's
+    /// [`on_scale_factor_setting`](Self::on_scale_factor_setting) callback sees it come back; a
+    /// host that already matches the value it is told does nothing and so cannot ping-pong.
+    /// Before nvim is ready the value is held and written the moment it is -- mirrors
+    /// [`set_fullscreen_setting`](Self::set_fullscreen_setting) exactly.
+    pub fn set_scale_factor_setting(&self, scale_factor: f32) {
+        if let LiveState::Ready(session) = &*self.live_state.borrow() {
+            session.harness.set_scale_factor_setting(scale_factor);
+        } else {
+            self.scale_watch.buffer_pending(scale_factor);
         }
     }
 
@@ -1055,7 +1240,7 @@ impl NeovideEditorPane {
 
 #[cfg(test)]
 mod tests {
-    use super::nvim_args;
+    use super::{nvim_args, tick_should_render, ScaleWatch};
 
     #[test]
     fn clean_comes_first_then_the_cursor_default_then_the_hosts_extras() {
@@ -1068,5 +1253,104 @@ mod tests {
         assert_eq!(nvim_args(false, &extra), vec!["--cmd", hide, "--cmd", "lua print(1)"]);
         assert_eq!(nvim_args(true, &[]), vec!["--clean", "--cmd", hide]);
         assert_eq!(nvim_args(false, &[]), vec!["--cmd", hide]);
+    }
+
+    /// A scale-factor change alone -- nothing animating, no new nvim content, no pending
+    /// resize/keypress -- still has to queue a render. If `tick_should_render` ever drops its
+    /// fourth term, this is the assertion that catches it: with everything else `false`, only the
+    /// scale term can make the result `true`. Red-checked by temporarily deleting
+    /// `|| scale_factor_changed_now` from `tick_should_render`'s body; see this file's own commit
+    /// message and `.superpowers/zoom/L2-report.md` for the failing output that produced.
+    #[test]
+    fn a_scale_factor_change_alone_still_queues_a_render() {
+        assert!(tick_should_render(false, false, false, true));
+        assert!(!tick_should_render(false, false, false, false));
+    }
+
+    /// The other three reasons to render still work on their own, unaffected by the new term --
+    /// this is what would catch an `&&` typo'd in place of the intended `||`.
+    #[test]
+    fn each_existing_render_reason_still_works_alone() {
+        assert!(tick_should_render(true, false, false, false));
+        assert!(tick_should_render(false, true, false, false));
+        assert!(tick_should_render(false, false, true, false));
+    }
+
+    // --- ScaleWatch: the unit the tick and the Ready-construction arm each call exactly once. ---
+
+    #[test]
+    fn observe_reports_unchanged_then_changed_then_unchanged_again() {
+        let watch = ScaleWatch::new(1.0);
+        let first = watch.observe(1.0);
+        assert!(!first.changed);
+        assert_eq!(first.value, 1.0);
+
+        let second = watch.observe(1.5);
+        assert!(second.changed);
+        assert_eq!(second.value, 1.5);
+
+        let third = watch.observe(1.5);
+        assert!(!third.changed, "the same value twice in a row is not a change");
+    }
+
+    /// A NaN held by nvim is one change, not one per tick: `!=` says NaN differs from itself.
+    #[test]
+    fn a_nan_scale_is_reported_once_not_on_every_tick() {
+        let watch = ScaleWatch::new(1.0);
+        assert!(watch.observe(f32::NAN).changed);
+        assert!(
+            !watch.observe(f32::NAN).changed,
+            "the same NaN on the next tick is not a change"
+        );
+        assert!(watch.observe(1.0).changed);
+    }
+
+    /// `init.lua`'s own startup value must register as a change on the very first tick, the same
+    /// way `last_fullscreen_setting`'s starting value does -- this is what `ScaleWatch::new`'s
+    /// `initial` parameter is for.
+    #[test]
+    fn a_startup_value_different_from_the_initial_default_is_a_change_on_the_first_observe() {
+        let watch = ScaleWatch::new(1.0);
+        let first = watch.observe(1.4);
+        assert!(first.changed);
+        assert_eq!(first.value, 1.4);
+    }
+
+    #[test]
+    fn no_pending_write_is_taken_when_none_was_buffered() {
+        let watch = ScaleWatch::new(1.0);
+        assert_eq!(watch.take_pending_for_ready(), None);
+    }
+
+    #[test]
+    fn a_buffered_write_is_taken_exactly_once() {
+        let watch = ScaleWatch::new(1.0);
+        watch.buffer_pending(1.7);
+        assert_eq!(watch.take_pending_for_ready(), Some(1.7));
+        assert_eq!(
+            watch.take_pending_for_ready(),
+            None,
+            "a second take must not replay the same write"
+        );
+    }
+
+    /// Only the last buffered write matters, mirroring `pending_fullscreen`.
+    #[test]
+    fn buffering_twice_before_a_take_keeps_only_the_last_value() {
+        let watch = ScaleWatch::new(1.0);
+        watch.buffer_pending(1.2);
+        watch.buffer_pending(1.8);
+        assert_eq!(watch.take_pending_for_ready(), Some(1.8));
+    }
+
+    /// `observe` and the pending write are independent: taking the pending write must not disturb
+    /// what the next `observe` compares against.
+    #[test]
+    fn observe_and_the_pending_write_do_not_interfere() {
+        let watch = ScaleWatch::new(1.0);
+        watch.buffer_pending(1.6);
+        let observed = watch.observe(1.0);
+        assert!(!observed.changed, "the pending write has not been applied to nvim yet");
+        assert_eq!(watch.take_pending_for_ready(), Some(1.6));
     }
 }
