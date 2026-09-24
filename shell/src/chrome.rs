@@ -31,14 +31,30 @@ pub(crate) struct TopBar {
     /// Minimize/maximize/close. Hidden whenever the window is fullscreen (`window_mode`).
     pub(crate) controls: gtk4::Widget,
     /// The `neovibe` label, drawn as a solid block while the `Ctrl+a` prefix waits (`prefix`).
-    #[allow(dead_code)] // Intended for the `prefix` module; not consumed yet.
     pub(crate) app_name: gtk4::Label,
+    /// Where the prefix strip goes, right of the app name (`prefix_strip`).
+    pub(crate) strip: gtk4::Box,
+    /// Where the tray goes, left of `↻` (`tray`). Its chips precede the other top-bar items;
+    /// `main.rs` joins the two lists.
+    pub(crate) tray: gtk4::Box,
+}
+
+/// `h`/`l` on the top bar: the visible item `step` away from `current`, stopping at either end, or
+/// `None` when no item is visible. A tray chip whose module is on screen is not visible, and is
+/// stepped over. From no current item, the first visible one.
+pub(crate) fn step_item(visible: &[bool], current: Option<usize>, step: isize) -> Option<usize> {
+    let shown: Vec<usize> = (0..visible.len()).filter(|&i| visible[i]).collect();
+    let Some(current) = current.and_then(|c| shown.iter().position(|&i| i == c)) else {
+        return shown.first().copied();
+    };
+    let next = (current as isize + step).clamp(0, shown.len() as isize - 1) as usize;
+    Some(shown[next])
 }
 
 /// Builds the top bar and returns the parts other modules use (`TopBar`).
 /// `Ctrl+k` reaches the bar from either pane because it is above both. `h` and `l` move
-/// between its items, currently only `↻`. Window controls cannot take focus, so an accidental
-/// `Enter` after `Ctrl+k` cannot close the window.
+/// between the tray chips and `↻`; `main.rs` joins the two lists. Window controls cannot take
+/// focus, so an accidental `Enter` after `Ctrl+k` cannot close the window.
 pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> TopBar {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("topbar");
@@ -51,6 +67,11 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     project_name.add_css_class("topbar-project-name");
     project_name.set_hexpand(true);
     project_name.set_halign(gtk4::Align::Start);
+    // Ellipsize the project name when the prefix strip needs room in a narrow window.
+    // The strip's labels also ellipsize through `PrefixStrip::show`, so neither forces the bar
+    // or window to fit the full text. Tray chips do not shrink, so many chips at a large zoom
+    // can still increase the minimum width.
+    project_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     // Reload the agent panel through the same `app.reload-agent-panel` action as Ctrl+Shift+R.
     // The button lives in the window chrome so it remains available when the panel's page hangs.
@@ -69,8 +90,16 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
 
     let controls = build_window_controls(window);
 
+    let strip = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    strip.set_valign(gtk4::Align::Center);
+    let tray = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    tray.set_valign(gtk4::Align::Center);
+    tray.set_margin_end(6);
+
     bar.append(&app_name);
+    bar.append(&strip);
     bar.append(&project_name);
+    bar.append(&tray);
     bar.append(&reload_agent);
     bar.append(&controls);
 
@@ -81,6 +110,8 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
         items: vec![reload_agent.upcast()],
         controls,
         app_name,
+        strip,
+        tray,
     }
 }
 
@@ -154,5 +185,28 @@ mod tests {
     #[test]
     fn the_root_directory_has_no_last_component_so_it_falls_back_to_itself() {
         assert_eq!(project_display_name(Path::new("/")), "/");
+    }
+
+    /// `h` and `l` skip tray chips that are hidden and stop at either end.
+    #[test]
+    fn h_and_l_step_over_items_that_are_not_shown() {
+        use super::step_item;
+        // [editor chip (hidden), terminal chip, agent chip (hidden), ↻]
+        let visible = [false, true, false, true];
+        assert_eq!(
+            step_item(&visible, None, 1),
+            Some(1),
+            "Ctrl+k lands on the first shown item"
+        );
+        assert_eq!(step_item(&visible, Some(1), 1), Some(3));
+        assert_eq!(step_item(&visible, Some(3), 1), Some(3), "stops at the end");
+        assert_eq!(step_item(&visible, Some(3), -1), Some(1));
+        assert_eq!(step_item(&visible, Some(1), -1), Some(1), "stops at the start");
+        assert_eq!(
+            step_item(&visible, Some(0), 1),
+            Some(1),
+            "from a hidden item: the first shown"
+        );
+        assert_eq!(step_item(&[false, false], None, 1), None);
     }
 }

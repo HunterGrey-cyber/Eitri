@@ -228,6 +228,15 @@ pub fn serialize_enter_input_for_js() -> String {
     json!({ "kind": "enter_input" }).to_string()
 }
 
+/// `{"kind":"focus_permission"}`: the chat was brought back to answer a card -- its tray chip
+/// `agent ⚑N` activated, or `Ctrl+a a` with a card waiting. The panel goes to
+/// BROWSE with its cursor on the oldest pending card. `shell` sends it only when the count it
+/// keeps (`crate::attention`) is above zero; a panel that finds no card takes the composer instead,
+/// as it does for `enter_input`.
+pub fn serialize_focus_permission_for_js() -> String {
+    json!({ "kind": "focus_permission" }).to_string()
+}
+
 /// `{"kind":"select_all"}`: `Ctrl+a Ctrl+a` from the shell prefix while the panel has focus.
 /// WebKitGTK cannot receive the key itself, so the panel selects all text in the focused
 /// field and does nothing if no field has focus.
@@ -503,6 +512,12 @@ mod tests {
     fn serializes_enter_input() {
         let value: serde_json::Value = serde_json::from_str(&serialize_enter_input_for_js()).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "enter_input" }));
+    }
+
+    #[test]
+    fn serializes_focus_permission() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_focus_permission_for_js()).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "focus_permission" }));
     }
 
     #[test]

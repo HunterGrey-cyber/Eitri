@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline } from "./timeline";
+import { buildTimeline, oldestPendingPermission } from "./timeline";
 import { initialState } from "./reducer";
 import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage } from "./types";
 
@@ -201,5 +201,21 @@ describe("buildTimeline", () => {
       ["tool", 6],
     ]);
     expect(new Set(items.map((i) => i.key)).size).toBe(6);
+  });
+});
+
+describe("oldestPendingPermission (focus_permission's target)", () => {
+  it("is the card with the lowest seq, wherever it is drawn", () => {
+    // perm-late (seq 5) hangs under tool t1 (seq 1); perm-early (seq 3) has no call and sits at seq 3.
+    const s = state({ toolCalls: [tool(1, "t1")], pendingPermissions: [perm(5, "perm-late", "t1"), perm(3, "perm-early", null)] });
+    const timeline = buildTimeline(s);
+    const index = oldestPendingPermission(timeline);
+    expect(index).not.toBeNull();
+    const item = timeline[index!];
+    expect(item.kind === "permission" && item.request.permissionId).toBe("perm-early");
+  });
+
+  it("is null with no card pending", () => {
+    expect(oldestPendingPermission(buildTimeline(state({ transcript: [msg(1, "hi")] })))).toBeNull();
   });
 });

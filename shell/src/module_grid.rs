@@ -1,16 +1,13 @@
-//! `ModuleGrid` contains every module and replaces `layout::build_content_area`,
-//! `layout::build_vertical_split` and `PaneLayout`'s index matches.
+//! `ModuleGrid` contains every module. Each host gets its parent once in [`ModuleGrid::add`]
+//! and loses it only in `dispose`, when the window goes away.
+//! Hiding uses `set_child_visible(false)`. Zoom, resize, split, swap, move and even operations
+//! allocate the same children again. Unparenting unrealizes the editor, whose Skia
+//! `DirectContext` is created once on the `GLArea`'s GL context and cannot survive unrealization.
+//! Each host logs unrealize in [`ModuleGrid::add`] so unexpected unrealization can be detected.
 //!
-//! Every module host is parented once in `ModuleGrid::add` and unparented only in `dispose`
-//! when the window closes. Hiding uses `set_child_visible(false)`; layout changes allocate the
-//! same children again. The editor's Skia `DirectContext` is tied to the `GLArea`'s GL context,
-//! and the editor cannot survive unrealize. Unparenting would unrealize it. Every host logs
-//! unrealize in `ModuleGrid::add`, allowing a GUI check that layout changes preserve this
-//! invariant.
-//!
-//! Rectangles come from `layout::arrange`. This container measures children to supply their
-//! minimum sizes, allocates the resulting geometry and holds web hosts at their settled size
-//! during resizing through `throttle`, then turns divider drags into ratios.
+//! Rectangles come from the layout's `arrange` function. The grid measures children's minimum
+//! sizes, allocates the resulting geometry, holds web hosts at their settled size during
+//! resizing ([`throttle`]), and converts divider drags into ratios.
 
 mod throttle;
 
@@ -49,6 +46,12 @@ pub(crate) enum HostKind {
 /// all unless the terminal held the keys, which at startup nothing does.
 pub(crate) const UNALLOCATED: Size = Size { w: 1280, h: 721 };
 
+/// Every module and its host, asked for at the moment it is needed, so a module added after the
+/// window is up is never missing from it. In whatever order the closure's builder promises:
+/// `ModuleGrid::live_hosts` is add order, and HINT's (`HintWidgets::modules`) is the layout's tree
+/// order.
+pub(crate) type ModuleHosts = Rc<dyn Fn() -> Vec<(ModuleId, gtk4::Widget)>>;
+
 /// The size the geometry is computed against: the grid's allocation, or [`UNALLOCATED`] while GTK
 /// still reports none (0x0 until the first allocation).
 fn frame_size(width: i32, height: i32) -> Size {
@@ -85,6 +88,10 @@ mod imp {
         pub(super) on_screen: RefCell<BTreeSet<ModuleId>>,
         /// Web hosts allocated at a held size this pass, with the rectangle each is clipped to.
         pub(super) clips: RefCell<Vec<(gtk4::Widget, Rect)>>,
+        /// Called after every change to the layout ([`ModuleGrid::connect_changed`]).
+        pub(super) changed: RefCell<Vec<Rc<dyn Fn()>>>,
+        /// Called after a pinned split got its length ([`ModuleGrid::connect_settled`]).
+        pub(super) settled: RefCell<Vec<Rc<dyn Fn()>>>,
     }
 
     #[glib::object_subclass]
@@ -170,11 +177,10 @@ impl ModuleGrid {
     /// the pool. A tree over n leaves has at most n - 1 splits, so all dividers exist before
     /// allocation and none needs to be created during it.
     ///
-    /// Every host must be added before `present()`. `main.rs` passes the startup host list to
-    /// `pane_focus::install`, `focus_module` and each web module's `Ctrl+h/j/k/l` controller.
-    /// Only HINT reads the grid live through [`ModuleGrid::hosts_in_tree_order`]. A lazily added
-    /// module would be invisible to focus tracking, `Ctrl+a Ctrl+a` and `Ctrl+h/j/k/l` until
-    /// those callers also read the grid live.
+    /// A host may be added after `present()`. Focus tracking, `focus_module` and the prefix read
+    /// the grid live through [`ModuleGrid::live_hosts`] and [`ModuleGrid::hosts`]. HINT uses
+    /// [`ModuleGrid::hosts_in_tree_order`]. Each new web host needs its own `Ctrl+h/j/k/l`
+    /// controller, installed by `main.rs`'s `install_module_nav` when the host is added.
     ///
     /// Hosts are stacked below every divider handle ([`host_stack_index`]). GTK gives a press
     /// to the last child containing it, and a host contains the first pixel column of the divider
@@ -255,9 +261,12 @@ impl ModuleGrid {
                 let Some(first_px) = dragged_first_px(&begin, &now, dx, dy) else {
                     return;
                 };
-                let ratio = now.ratio_for(first_px);
-                if grid.layout().borrow_mut().set_ratio(&now.path, ratio).is_ok() {
+                // A ratio on a ratio split, pixels on a pinned one (`move_divider`): a dragged bottom
+                // row keeps the height it was dragged to when the window grows.
+                let moved = neovibe_core::layout::move_divider(&mut grid.layout().borrow_mut(), &now, first_px);
+                if moved.is_ok() {
                     grid.queue_allocate();
+                    grid.notify_changed();
                 }
             });
         }
@@ -266,6 +275,12 @@ impl ModuleGrid {
         });
         widget.add_controller(drag);
         Handle { widget, current }
+    }
+
+    /// [`ModuleGrid::hosts`], as a function the caller keeps and asks again each time.
+    pub(crate) fn live_hosts(&self) -> ModuleHosts {
+        let grid = self.downgrade();
+        Rc::new(move || grid.upgrade().map(|grid| grid.hosts()).unwrap_or_default())
     }
 
     /// Every module and its host, in the order they were added.
@@ -309,6 +324,66 @@ impl ModuleGrid {
             }
         }
         self.queue_resize();
+        self.notify_changed();
+    }
+
+    /// `f` runs after every change to the layout: each [`ModuleGrid::apply`] and a divider drag. A
+    /// pinned split getting its length (`settle_pins`, inside an allocation) is not one: nothing
+    /// moved on screen, and the state file's save that follows the change which put the split on
+    /// screen -- 500ms later -- already holds the length. What hangs off it: the per-project state
+    /// file's debounced save, the top bar's tray, and starting the terminal's shell once it is shown
+    /// however it got there. Runs with the layout released.
+    pub(crate) fn connect_changed(&self, f: impl Fn() + 'static) {
+        self.imp().changed.borrow_mut().push(Rc::new(f));
+    }
+
+    fn notify_changed(&self) {
+        // Cloned out: a hook may add another.
+        let hooks: Vec<Rc<dyn Fn()>> = self.imp().changed.borrow().clone();
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    /// `f` runs after a pinned split got its length (`settle_pins`, inside an allocation) -- which
+    /// [`ModuleGrid::connect_changed`] does not report, since nothing moved -- so the state file's
+    /// saver can count the length as what the window opened with rather than as a change. Runs with
+    /// the layout released, inside `size_allocate`: a hook must not touch a widget.
+    pub(crate) fn connect_settled(&self, f: impl Fn() + 'static) {
+        self.imp().settled.borrow_mut().push(Rc::new(f));
+    }
+
+    /// `Ctrl+a \ <key>` / `Ctrl+a " <key>`: `module` into a new split after `target` along `axis`,
+    /// moved there if it is elsewhere, shown if hidden (`neovibe_core::layout::place`). The layout
+    /// gives `module` the keys; the caller gives it GTK focus.
+    pub(crate) fn place_module(&self, module: &ModuleId, target: &ModuleId, axis: Axis) -> Result<(), LayoutError> {
+        let hosted: Vec<ModuleId> = self.hosts().into_iter().map(|(id, _)| id).collect();
+        placeable(&hosted, module)?;
+        neovibe_core::layout::place(&mut self.layout().borrow_mut(), module, target, axis)?;
+        self.apply();
+        Ok(())
+    }
+
+    /// `Ctrl+a H/J/K/L` (`neovibe_core::layout::swap`). The neighbour, if they swapped.
+    pub(crate) fn swap_modules(&self, focused: &ModuleId, direction: Direction) -> Option<ModuleId> {
+        let size = self.size();
+        let swapped = {
+            let layout = self.layout();
+            let mut layout = layout.borrow_mut();
+            self.with_frame(size, |frame| {
+                neovibe_core::layout::swap(&mut layout, focused, direction, frame)
+            })
+        };
+        if swapped.is_some() {
+            self.apply();
+        }
+        swapped
+    }
+
+    /// `Ctrl+a |` / `Ctrl+a _` (`neovibe_core::layout::even`).
+    pub(crate) fn even_modules(&self, axis: Axis) {
+        neovibe_core::layout::even(&mut self.layout().borrow_mut(), axis);
+        self.apply();
     }
 
     /// The divider thickness: the separators' own CSS size (`.content-area > separator`, 1px).
@@ -413,7 +488,7 @@ impl ModuleGrid {
     /// `focus` before `id` is unmapped, so GTK's focus chain cannot give them to the WebView instead.
     /// [`hide_then_unmap`] enforces this order and is tested without a display; this method supplies
     /// the grid's frame and the GTK effects.
-    /// `Ctrl+a t` uses this when hiding the focused bottom terminal through `ToggleStep::Hide`.
+    /// Every hide uses this path: `Ctrl+a x`, the focused module's toggle key, `Ctrl+a t`, and the Lua hide API.
     pub(crate) fn hide_module(&self, id: &ModuleId, focus: &dyn Fn(&ModuleId) -> bool) -> Result<(), LayoutError> {
         let size = self.size();
         let layout = self.layout();
@@ -442,6 +517,29 @@ impl ModuleGrid {
 
     fn allocate_children(&self, width: i32, height: i32) {
         let imp = self.imp();
+        // A pinned split that is on screen for the first time keeps the length its ratio gives it at
+        // this, the real allocation (`settle_pins`); never at `UNALLOCATED`'s stand-in size. Asked
+        // first (`has_pin_to_settle`, no geometry), so a drag or a resize sweep arranges once per
+        // allocation, as it did before pins.
+        if width > 0
+            && height > 0
+            && self
+                .layout()
+                .try_borrow()
+                .is_ok_and(|layout| layout.has_pin_to_settle())
+        {
+            let settled = self.layout().try_borrow_mut().is_ok_and(|mut layout| {
+                self.with_frame(Size { w: width, h: height }, |frame| {
+                    neovibe_core::layout::settle_pins(&mut layout, frame)
+                })
+            });
+            if settled {
+                let hooks: Vec<Rc<dyn Fn()>> = imp.settled.borrow().clone();
+                for hook in hooks {
+                    hook();
+                }
+            }
+        }
         let arrangement = {
             let layout = self.layout();
             let layout = layout.borrow();
@@ -582,6 +680,18 @@ fn hide_then_unmap(
 /// Handles also paint after every host.
 fn host_stack_index<T>(children: &[T], is_handle: impl Fn(&T) -> bool) -> usize {
     children.iter().position(is_handle).unwrap_or(children.len())
+}
+
+/// Allows `module` into the tree only if this window has a host for it. Parsing an id does not
+/// ensure a host exists: a mistyped `lua:x` or an uncreated `canvas` can still be a valid id.
+/// A leaf without a host leaves space empty, lacks a divider and can receive focus with no widget.
+/// The grid knows which hosts exist; a canvas host must be added before placing the canvas.
+fn placeable(hosted: &[ModuleId], module: &ModuleId) -> Result<(), LayoutError> {
+    if hosted.contains(module) {
+        Ok(())
+    } else {
+        Err(LayoutError::NotInTree(module.clone()))
+    }
 }
 
 /// Where a divider drag puts the first child: the divider as it is allocated **now**, plus the
@@ -932,5 +1042,56 @@ mod tests {
             layout.set_ratio(&now.path, now.ratio_for(first_px)).unwrap();
         }
         assert_eq!(inner(&layout).rect.x, pointer_start + 150);
+    }
+
+    /// Dragging the bottom terminal's pinned divider keeps it under the pointer and stores a
+    /// height in pixels that remains unchanged when the window grows taller.
+    #[test]
+    fn a_dragged_pinned_divider_stays_under_the_pointer_and_keeps_its_height() {
+        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
+        layout.show(&ModuleId::terminal()).unwrap();
+        let frame = Frame::new(UNALLOCATED, 1);
+        assert!(neovibe_core::layout::settle_pins(&mut layout, &frame));
+        let root_divider = |layout: &Layout| {
+            arrange(layout, &frame)
+                .dividers
+                .into_iter()
+                .find(|d| d.path.is_empty())
+                .unwrap()
+        };
+        let begin = root_divider(&layout);
+        assert_eq!(begin.rect.y, 480, "the terminal's first show, a third of 721");
+        for step in 1..=10 {
+            let pointer = begin.rect.y - 10 * step;
+            let now = root_divider(&layout);
+            let dy = f64::from(pointer - now.rect.y);
+            let first_px = dragged_first_px(&begin, &now, 0.0, dy).unwrap();
+            neovibe_core::layout::move_divider(&mut layout, &now, first_px).unwrap();
+        }
+        assert_eq!(root_divider(&layout).rect.y, 380);
+        let taller = Frame::new(neovibe_core::layout::Size { w: 1280, h: 1041 }, 1);
+        assert_eq!(
+            arrange(&layout, &taller).rect_of(&ModuleId::terminal()).map(|r| r.h),
+            Some(340),
+            "dragged to 340px, and kept at 340 when the window grows"
+        );
+    }
+
+    /// Rejects a `canvas` with no host or a mistyped `lua:` id, using the same missing-module error
+    /// as other layout operations instead of inserting a leaf with no host.
+    #[test]
+    fn only_a_module_with_a_host_can_be_placed() {
+        let hosted = [
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::terminal(),
+            ModuleId::lua("notes"),
+        ];
+        for id in &hosted {
+            assert_eq!(placeable(&hosted, id), Ok(()));
+        }
+        for id in [ModuleId::parse("canvas").unwrap(), ModuleId::lua("nots")] {
+            assert_eq!(placeable(&hosted, &id), Err(LayoutError::NotInTree(id.clone())));
+        }
     }
 }

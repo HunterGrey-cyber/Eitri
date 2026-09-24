@@ -1,41 +1,38 @@
-//! Tracks keyboard focus and signals it through the editor cursor and panel sign cell.
-//! Keyboard arrival in the panel enters BROWSE without a composer caret, so the
-//! caret cannot identify the focused pane.
+//! Tracks keyboard focus and updates the pane indicators from GTK's focus widget.
 //!
-//! The editor forwards focus through `set_focused` and sends nvim `FocusGained`
-//! or `FocusLost`. It hides its cursor when unfocused using
-//! `HIDE_UNFOCUSED_CURSOR_CMD`. The agent panel receives a `pane_focus` envelope
-//! (`AgentPanelHandle::set_pane_focused`) and draws the current row's sign cell
-//! solid with focus and hollow without. The hollow cell shows where returning
-//! focus will land. There is no separate focus label in the status bar.
+//! `Ctrl+l` enters the panel in BROWSE without a textarea caret. Cursor indicators make the
+//! focused pane visible while keeping the three-mode keyboard model.
 //!
-//! One function updates these signals from GTK's `GtkWindow:focus-widget` and
-//! window activity. A pane counts as focused for its cursor only when it holds
-//! the focus widget and the window is active; bright BROWSE means keys go there now.
-//! `notify::is-active` reruns the function when activity changes.
-//! The last focused module is written to the layout's `focus` even while the
-//! window is inactive. It is the destination for the top bar's `Ctrl+j` and the
-//! module zoomed by the `Ctrl+a` prefix. `Layout::set_focus` refuses hidden modules.
-//! This behavior has not been checked on screen.
+//! The editor forwards focus through `NeovideEditorPane::set_focused`, which also sends nvim
+//! `FocusGained`/`FocusLost`. `neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD` hides the editor cursor
+//! when unfocused. The panel receives a `pane_focus` envelope through
+//! `AgentPanelHandle::set_pane_focused`. Its current row's sign cell is solid with focus and
+//! hollow without, so the panel still shows where focus will return.
+//! The cursors provide the focus indicators.
 //!
-//! Panes are keyed by `ModuleId`, which identifies a module independently of its
-//! position. Numeric indices cannot identify modules in a layout whose structure varies.
+//! Changes to `GtkWindow:focus-widget` update all indicators through one function so they agree.
+//! A pane has the keys only when it holds the focus widget and the window is active.
+//! `notify::is-active` runs the same function, so switching to another application clears that state.
+//! The last focused module is written to the layout's `focus` even while the window is inactive.
+//! The top bar's `Ctrl+j` returns to it, and the `Ctrl+a` prefix zooms it.
+//! `Layout::set_focus` rejects hidden modules. Visual behavior has not been checked on screen.
+//!
+//! Modules are keyed by `ModuleId` rather than fixed slot indices, so identity survives layout changes.
+//! `install` reads `ModuleGrid::live_hosts` on every focus change and remembers each module's
+//! state by id. Modules added after the window appears are tracked from their first focus change.
+
+use std::collections::BTreeMap;
 
 use gtk4::prelude::*;
 use neovibe_core::layout::ModuleId;
 
-/// The index of the first pane in `panes` whose element appears in `chain`, walking `chain` in
-/// order (the focus widget first, then each ancestor). `None` means focus is in none of them: the
-/// top bar's buttons, say, or no focus widget at all.
-///
-/// Generic so the decision can be unit-tested without a display. The GTK half only builds the
-/// chain.
-pub(crate) fn owning_pane<T: PartialEq>(chain: impl IntoIterator<Item = T>, panes: &[T]) -> Option<usize> {
-    chain.into_iter().find_map(|w| panes.iter().position(|p| *p == w))
-}
+use crate::module_grid::ModuleHosts;
 
-/// [`owning_pane`], answered with the module's id: the module whose host is nearest to the focus
-/// widget on its way up to the window. Generic for the same reason.
+/// Returns the module whose host is nearest to the focus widget in `chain`, which starts at
+/// the focus widget and continues through its ancestors. Returns `None` for focus outside all
+/// module hosts, such as the top bar, or when there is no focus widget.
+///
+/// Generic so the lookup can be tested without a display. The GTK caller only builds the chain.
 pub(crate) fn owning_module<T: PartialEq>(
     chain: impl IntoIterator<Item = T>,
     modules: &[(ModuleId, T)],
@@ -46,39 +43,48 @@ pub(crate) fn owning_module<T: PartialEq>(
         .map(|(id, _)| id.clone())
 }
 
-/// Which panes' "has the keys" answer changed, as `(index, now)`. `last` holds the previous
-/// answer per pane (`None` before the first report), `focused` is the pane holding focus, and
-/// `active` is whether the window is. Only changes are reported, so a focus move between two
-/// widgets inside the editor sends nothing, and every pane gets one report on the first run.
-pub(crate) fn focus_changes(last: &[Option<bool>], focused: Option<usize>, active: bool) -> Vec<(usize, bool)> {
-    last.iter()
-        .enumerate()
-        .filter_map(|(i, prev)| {
-            let now = focused == Some(i) && active;
-            (*prev != Some(now)).then_some((i, now))
+/// Which modules' "has the keys" answer changed, as `(id, now)`, in `modules`' order. `last` holds
+/// each module's previous answer (none before its first report), `focused` is the module holding
+/// focus, and `active` is whether the window is. Only changes are reported, so a focus move between
+/// two widgets inside the editor sends nothing, and every module gets one report the first time it
+/// is seen -- at startup, or whenever it joined the grid.
+pub(crate) fn focus_changes(
+    last: &BTreeMap<ModuleId, bool>,
+    modules: &[ModuleId],
+    focused: Option<&ModuleId>,
+    active: bool,
+) -> Vec<(ModuleId, bool)> {
+    modules
+        .iter()
+        .filter_map(|id| {
+            let now = focused == Some(id) && active;
+            (last.get(id) != Some(&now)).then(|| (id.clone(), now))
         })
         .collect()
 }
 
-/// Wires the tracker to `window` and applies it once for the current focus. `modules` are the
-/// module hosts whose subtree counts as that module.
+/// Wires the tracker to `window` and applies it once for the current focus. `hosts` answers, each
+/// time, with every module and the host whose subtree counts as that module.
 ///
 /// `on_owner(id)` is called whenever focus lands inside module `id`, whether or not the window is
 /// active: that module is where the top bar's `Ctrl+j` goes back to and what the `Ctrl+a` prefix
 /// zooms. `on_has_keys(id, has_keys)` is called when a module's "has the keys" answer changes.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
-    modules: Vec<(ModuleId, gtk4::Widget)>,
+    hosts: ModuleHosts,
     on_owner: impl Fn(&ModuleId) + 'static,
     on_has_keys: impl Fn(&ModuleId, bool) + 'static,
 ) {
-    let last: std::cell::RefCell<Vec<Option<bool>>> = std::cell::RefCell::new(vec![None; modules.len()]);
-    let hosts: Vec<gtk4::Widget> = modules.iter().map(|(_, w)| w.clone()).collect();
+    let last: std::cell::RefCell<BTreeMap<ModuleId, bool>> = std::cell::RefCell::new(BTreeMap::new());
     let apply = move |window: &gtk4::ApplicationWindow| {
+        // Read the module list on every focus change so modules added after `present()` are found.
+        // Reading it once before this closure would miss them. Headless tests do not catch that change;
+        // focus tracking, `Ctrl+a Ctrl+a`, and `Ctrl+h/j/k/l` need checking with a module added at runtime.
+        let modules = hosts();
         let chain = std::iter::successors(gtk4::prelude::GtkWindowExt::focus(window), |w| w.parent());
-        let focused = owning_pane(chain, &hosts);
-        if let Some(i) = focused {
-            on_owner(&modules[i].0);
+        let focused = owning_module(chain, &modules);
+        if let Some(id) = &focused {
+            on_owner(id);
         }
         // Said on every focus change, not only on a module's own transition, because the two states
         // that look identical from the per-module callback are exactly the two a "I cannot type"
@@ -94,12 +100,13 @@ pub(crate) fn install(
             gtk4::prelude::GtkWindowExt::focus(window)
                 .map(|w| w.type_().name().to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            focused.map(|i| modules[i].0.as_str()),
+            focused.as_ref().map(ModuleId::as_str),
         );
-        let changes = focus_changes(&last.borrow(), focused, window.is_active());
-        for (i, now) in changes {
-            last.borrow_mut()[i] = Some(now);
-            on_has_keys(&modules[i].0, now);
+        let ids: Vec<ModuleId> = modules.into_iter().map(|(id, _)| id).collect();
+        let changes = focus_changes(&last.borrow(), &ids, focused.as_ref(), window.is_active());
+        for (id, now) in changes {
+            last.borrow_mut().insert(id.clone(), now);
+            on_has_keys(&id, now);
         }
     };
     apply(window);
@@ -126,42 +133,41 @@ pub(crate) fn focused_module(
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_focus_widget_itself_can_be_the_pane() {
-        assert_eq!(owning_pane(["editor", "box", "window"], &["editor", "agent"]), Some(0));
+    fn last(answers: &[(ModuleId, bool)]) -> BTreeMap<ModuleId, bool> {
+        answers.iter().cloned().collect()
     }
 
     #[test]
-    fn a_widget_inside_a_pane_counts_as_that_pane() {
+    fn every_module_gets_one_first_report_then_only_changes() {
+        let (e, a) = (ModuleId::editor(), ModuleId::agent());
+        let both = [e.clone(), a.clone()];
         assert_eq!(
-            owning_pane(["textarea-ish", "agent", "overlay", "window"], &["editor", "agent"]),
-            Some(1)
+            focus_changes(&last(&[]), &both, Some(&e), true),
+            vec![(e.clone(), true), (a.clone(), false)]
+        );
+        assert_eq!(
+            focus_changes(&last(&[(e.clone(), true), (a.clone(), false)]), &both, Some(&e), true),
+            vec![]
+        );
+        assert_eq!(
+            focus_changes(&last(&[(e.clone(), true), (a.clone(), false)]), &both, Some(&a), true),
+            vec![(e, false), (a, true)]
         );
     }
 
+    /// A module added after `install` receives its first report on the next focus change that
+    /// sees it. Known modules whose focus state has not changed report nothing new.
     #[test]
-    fn focus_outside_every_pane_is_none() {
-        assert_eq!(
-            owning_pane(["reload-button", "topbar", "window"], &["editor", "agent"]),
-            None
+    fn a_module_added_later_gets_its_first_report_and_nothing_else_moves() {
+        let (e, a, canvas) = (
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::parse("canvas").unwrap(),
         );
-        assert_eq!(owning_pane(Vec::<&str>::new(), &["editor", "agent"]), None);
-    }
-
-    #[test]
-    fn the_nearest_ancestor_wins() {
-        // A pane nested inside another pane (a Lua plugin could do this) belongs to the inner one:
-        // that is the one whose keys are being typed into.
-        assert_eq!(owning_pane(["inner", "outer", "window"], &["outer", "inner"]), Some(1));
-    }
-
-    #[test]
-    fn every_pane_gets_one_first_report_then_only_changes() {
-        assert_eq!(focus_changes(&[None, None], Some(0), true), vec![(0, true), (1, false)]);
-        assert_eq!(focus_changes(&[Some(true), Some(false)], Some(0), true), vec![]);
+        let known = last(&[(e.clone(), true), (a.clone(), false)]);
         assert_eq!(
-            focus_changes(&[Some(true), Some(false)], Some(1), true),
-            vec![(0, false), (1, true)]
+            focus_changes(&known, &[e.clone(), a.clone(), canvas.clone()], Some(&e), true),
+            vec![(canvas, false)]
         );
     }
 
@@ -181,6 +187,11 @@ mod tests {
             Some(ModuleId::lua("notes"))
         );
         assert_eq!(owning_module(["reload-button", "topbar"], &modules), None);
+        assert_eq!(
+            owning_module(Vec::<&str>::new(), &modules),
+            None,
+            "no focus widget at all"
+        );
     }
 
     #[test]
@@ -194,12 +205,17 @@ mod tests {
 
     #[test]
     fn an_inactive_window_gives_no_pane_the_keys() {
+        let (e, a) = (ModuleId::editor(), ModuleId::agent());
+        let both = [e.clone(), a.clone()];
         // Alt-tab away: the editor stops drawing its cursor.
         assert_eq!(
-            focus_changes(&[Some(true), Some(false)], Some(0), false),
-            vec![(0, false)]
+            focus_changes(&last(&[(e.clone(), true), (a.clone(), false)]), &both, Some(&e), false),
+            vec![(e.clone(), false)]
         );
-        // Focus on the top bar: neither pane has the keys.
-        assert_eq!(focus_changes(&[Some(false), Some(true)], None, true), vec![(1, false)]);
+        // Focus on the top bar: neither module has the keys.
+        assert_eq!(
+            focus_changes(&last(&[(e, false), (a.clone(), true)]), &both, None, true),
+            vec![(a, false)]
+        );
     }
 }

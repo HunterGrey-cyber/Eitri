@@ -4,11 +4,21 @@
 //! macOS host would allocate the same rectangles into its own views.
 
 pub mod geometry;
+pub mod keys;
 pub mod module;
+pub mod ops;
+pub mod persist;
+pub mod reconcile;
+pub mod tray;
 pub mod tree;
 
 pub use geometry::{
-    arrange, hide, min_size, navigate, neighbor, resize, Arrangement, Direction, Divider, Frame, Nav, Rect, Size,
+    arrange, hide, min_size, move_divider, navigate, neighbor, resize, settle_pins, Arrangement, Direction, Divider,
+    Frame, Nav, Rect, Size,
 };
+pub use keys::{key_action, strip, KeyAction, KeyError, ModuleKeys, StripEntry};
 pub use module::{ModuleDecl, ModuleError, ModuleId, ModuleKind, Placement};
-pub use tree::{Axis, Branch, Layout, LayoutError, Node, SplitPath, ZoomChange};
+pub use ops::{even, place, swap};
+pub use reconcile::{reconcile, reconcile_default, ReconcileError, Reconciled};
+pub use tray::{agent_place, chip_label, tray};
+pub use tree::{Axis, Branch, Layout, LayoutError, Node, Pin, SplitPath, ZoomChange};

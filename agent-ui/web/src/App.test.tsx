@@ -147,6 +147,56 @@ describe("pane focus", () => {
   });
 });
 
+describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card waiting)", () => {
+  function modeBlock(container: HTMLElement): HTMLElement {
+    return container.querySelector<HTMLElement>("[data-testid=mode-block]")!;
+  }
+  function withTwoCards() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "tidy up" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { cmd: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_2", name: "Write", input: { file_path: "a" } },
+      { type: "permission_requested", permission_id: "perm-2", tool_use_id: "toolu_2", tool_name: "Write", input: {} },
+    ];
+    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    return rendered;
+  }
+
+  it("lands in BROWSE on the oldest pending card", () => {
+    const { container } = withTwoCards();
+    dispatch({ kind: "focus_permission" });
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+    const current = container.querySelector(".row-current")!;
+    expect(current.classList.contains("row-permission")).toBe(true);
+    expect(current.textContent).toContain("Permission requested: Bash");
+  });
+
+  it("leaves INPUT for the card, so a and d answer it at once", () => {
+    const { container } = withTwoCards();
+    enterInputMode(container);
+    expect(modeBlock(container).textContent).toBe("INPUT");
+    dispatch({ kind: "focus_permission" });
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+  });
+
+  it("takes the composer when the card was answered in between", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "focus_permission" });
+    expect(modeBlock(container).textContent).toBe("INPUT");
+  });
+});
+
 describe("select_all (Ctrl+a Ctrl+a from shell's prefix)", () => {
   it("selects all of the composer textarea's text while it has focus", () => {
     const { container } = render(<App />);

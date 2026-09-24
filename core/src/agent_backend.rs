@@ -1561,6 +1561,58 @@ mod tests {
         backend.shutdown();
     }
 
+    /// A hidden chat still answers requests that need no human and counts the card it holds.
+    /// The panel's 33 ms pump timer ignores visibility, so the tracker uses `on_screen = false`.
+    /// The projection holds both pending requests until the provider's resolution arrives, including
+    /// the automatically answered `Read`. The tracker counts only the card delivered to the panel.
+    #[test]
+    fn a_hidden_chat_counts_the_card_it_holds_and_still_answers_what_needs_no_human() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let mut tracker = crate::attention::AttentionTracker::default();
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-read".into(),
+            tool_use_id: Some("tool-1".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-write".into(),
+            tool_use_id: Some("tool-2".into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+        });
+        let delivered = pump_until_delivery(&mut backend, &dir);
+        tracker.observe(&delivered, false);
+        tracker.retain_pending(|id| backend.projection().pending_permissions.contains_key(id));
+
+        assert_eq!(tracker.attention().pending, 1, "the Write's card, and not the Read's");
+        assert_eq!(backend.projection().pending_permissions.len(), 2, "the premise");
+        assert_eq!(
+            provider.resolutions(),
+            vec![("perm-read".to_string(), true)],
+            "the Read was answered while the chat was hidden"
+        );
+
+        // The user answers it; the provider's resolution comes back on a later pump.
+        backend
+            .respond_permission("perm-write", PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .expect("a pending card can be answered");
+        provider.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: "perm-write".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
+        let delivered = pump_until_delivery(&mut backend, &dir);
+        tracker.observe(&delivered, false);
+        tracker.retain_pending(|id| backend.projection().pending_permissions.contains_key(id));
+        assert_eq!(tracker.attention().pending, 0);
+        backend.shutdown();
+    }
+
     /// A refusal that now carries events must still be a refusal.
     ///
     /// `AgentBackend::send_turn`'s legacy arm builds its error as

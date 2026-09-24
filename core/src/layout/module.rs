@@ -112,7 +112,10 @@ pub enum Placement {
     InPlaceOfEditor,
 }
 
-/// A module added to the layout beyond the editor and agent that every window has.
+/// A module beyond the editor and agent built into every window. Its key lives in
+/// [`super::keys::ModuleKeys`] and its title in `shell`'s `tray::module_title`.
+/// Keeping them separate avoids adding fields to the literal constructed by
+/// `shell/src/terminal/mod.rs::initial_layout`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDecl {
     pub id: ModuleId,

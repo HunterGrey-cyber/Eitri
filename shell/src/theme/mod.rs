@@ -8,3 +8,4 @@
 
 pub(crate) mod feed;
 pub(crate) mod gtk_css;
+pub(crate) mod restyle;
