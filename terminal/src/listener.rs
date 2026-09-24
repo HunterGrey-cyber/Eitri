@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::vte::ansi::Rgb;
 
 /// Something the program asked for that has to be answered on the PTY, in the order asked.
@@ -26,9 +27,13 @@ pub struct HostEvents {
     /// `Some(Some(t))` a new title, `Some(None)` a reset, `None` nothing new.
     pub title: Option<Option<String>>,
     pub bell: bool,
-    /// Text a program copied with OSC 52. A *load* never gets this far: `Term` refuses it
-    /// (`Osc52::OnlyCopy`, see `screen::term_config`).
+    /// Text a program copied to the clipboard with OSC 52 (`ESC ] 52 ; c ; …`). A *load* never gets
+    /// this far: `Term` refuses it (`Osc52::OnlyCopy`, see `screen::term_config`).
     pub clipboard: Option<String>,
+    /// Text a program copied to the primary selection with OSC 52 (`p`, and `s`, which `Term` reads
+    /// as the same thing): what a middle click pastes. Kept apart from `clipboard` (bottom-terminal
+    /// phase 2) so an nvim `"*y` inside the terminal does not overwrite what `Ctrl+V` pastes.
+    pub primary: Option<String>,
 }
 
 #[derive(Default)]
@@ -53,7 +58,8 @@ impl EventListener for Listener {
             Event::Title(title) => pending.events.title = Some(Some(title)),
             Event::ResetTitle => pending.events.title = Some(None),
             Event::Bell => pending.events.bell = true,
-            Event::ClipboardStore(_, text) => pending.events.clipboard = Some(text),
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => pending.events.clipboard = Some(text),
+            Event::ClipboardStore(ClipboardType::Selection, text) => pending.events.primary = Some(text),
             // Refused inside `Term` by `Osc52::OnlyCopy` before it could get here. Should a later
             // alacritty_terminal send one anyway, answering nothing IS the refusal: a program in the
             // terminal reading the owner's clipboard is a data leak (spec, OSC 52).

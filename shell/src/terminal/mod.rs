@@ -13,7 +13,10 @@
 //! layout's (`neovibe_core::layout`, `ModuleGrid`), not a slot index's: this module keeps only the
 //! decisions that are the terminal's own.
 
+mod bell;
 mod gl;
+mod ime;
+mod input_queue;
 pub(crate) mod keys;
 mod pane;
 

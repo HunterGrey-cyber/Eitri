@@ -4,7 +4,7 @@
 mod common;
 
 use common::{metrics, size, spec, Harness, Raster, WAIT};
-use neovibe_terminal::{SessionCommand, SessionConfig, TerminalColors};
+use neovibe_terminal::{layout_preedit, Screen, SessionCommand, SessionConfig, TerminalColors};
 use terminal_render::RgbColor;
 
 const BG: RgbColor = RgbColor::new(0xfa, 0xf4, 0xed); // rose-pine dawn's base, a LIGHT background
@@ -122,4 +122,82 @@ fn a_block_cursor_on_a_cell_a_program_painted_takes_that_cells_colours_swapped()
     // And the character is still there, drawn in the cell's background on top of it.
     let glyph = r.ink(&m, 0, 0, 1, body);
     assert!(glyph > 0, "the X under the block must stay readable");
+}
+
+/// Bottom-terminal phase 2: the host paints an input method's preedit over a finished frame with
+/// `paint_ops`, which must not clear the canvas first as `paint` does. On a CPU raster, pixels read
+/// back: the printed text is untouched, the preedit's cells gain ink where they had none, the block
+/// cursor under the preedit is covered (one caret on screen, not two), the caret beam follows it,
+/// and nothing else moves.
+#[test]
+fn a_preedit_is_painted_over_the_frame_without_clearing_it() {
+    let mut screen = Screen::new(size(40, 6), themed());
+    screen.feed(b"hello");
+    let list = screen.render(true);
+    let anchor = screen.cursor_cell();
+    assert_eq!((anchor.row, anchor.col), (0, 5));
+    let preedit = layout_preedit("ni hao", 6, anchor, list.cols, list.rows, &themed()).unwrap();
+    let m = metrics();
+    let bg = (BG.r, BG.g, BG.b);
+    let before = Raster::of(&list, &m);
+    let after = Raster::of_with(&list, &preedit.ops, &m);
+    assert_eq!(
+        before.cells(&m, 0, 0, 5),
+        after.cells(&m, 0, 0, 5),
+        "'hello' must be exactly as it was"
+    );
+    assert!(after.ink(&m, 0, 0, 5, bg) > 0);
+    let block = before.ink(&m, 0, 5, 1, bg);
+    assert!(
+        after.ink(&m, 0, 5, 1, bg) < block,
+        "the block cursor ({block}px) is covered by the preedit's first cell"
+    );
+    for col in 6..11 {
+        assert_eq!(before.ink(&m, 0, col, 1, bg), 0, "cell {col} was empty");
+        assert!(after.ink(&m, 0, col, 1, bg) > 0, "no preedit ink in cell {col}");
+    }
+    assert!(after.ink(&m, 0, 11, 1, bg) > 0, "the caret after the preedit");
+    assert_eq!(
+        before.cells(&m, 1, 0, 40),
+        after.cells(&m, 1, 0, 40),
+        "the next row is untouched"
+    );
+}
+
+/// The same promise at the right edge, with the caret at the composition's END (GTK's simple
+/// context; rime with `PreeditCursorPositionAtBeginning` off): the cursor is in the last column, so
+/// the composition shifts left one cell further than its text needs, to give the end caret a cell
+/// of its own -- and that cell is the one the frame's block cursor is in. The re-review of
+/// 2026-09-24 (N1) measured it with the block still fully drawn there (189 px, exactly the bare
+/// block's) and the beam invisible inside it. The oracle is the same layout painted over an EMPTY
+/// frame: the cell must hold exactly what the preedit alone puts there, a beam on the background.
+#[test]
+fn a_composition_shifted_in_from_the_last_column_still_covers_the_block_cursor() {
+    let mut screen = Screen::new(size(40, 6), themed());
+    screen.feed(&[b'x'; 39]);
+    let list = screen.render(true);
+    let anchor = screen.cursor_cell();
+    assert_eq!((anchor.row, anchor.col), (0, 39));
+    let end = layout_preedit("ni hao", 6, anchor, list.cols, list.rows, &themed()).unwrap();
+    assert_eq!(end.caret_col, 39, "the end caret has the last column to itself");
+    let m = metrics();
+    let bg = (BG.r, BG.g, BG.b);
+    let before = Raster::of(&list, &m);
+    let block = before.ink(&m, 0, 39, 1, bg);
+    assert!(
+        block > 0,
+        "the block cursor is drawn in the last column before the preedit"
+    );
+    let after = Raster::of_with(&list, &end.ops, &m);
+    let blank = Screen::new(size(40, 6), themed()).render(false);
+    let beam_alone = Raster::of_with(&blank, &end.ops, &m);
+    assert_eq!(
+        after.cells(&m, 0, 39, 1),
+        beam_alone.cells(&m, 0, 39, 1),
+        "the last column holds the beam on the background, not the block ({block}px) with a beam inside"
+    );
+    assert!(after.ink(&m, 0, 39, 1, bg) < block);
+    for col in 33..39 {
+        assert!(after.ink(&m, 0, col, 1, bg) > 0, "no preedit ink in cell {col}");
+    }
 }

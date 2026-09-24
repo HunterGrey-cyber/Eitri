@@ -24,6 +24,32 @@
 //! then `/bin/sh`; if none starts, the pane says so in its own frame and waits for Enter, rather
 //! than trying again on every resize.
 //!
+//! **Chinese input (bottom-terminal phase 2)** is `ime.rs`'s: a `GtkIMMulticontext` on this widget's
+//! key controller, its commits through [`submit`], its unfinished composition drawn over the frame
+//! at the cursor the session reports (`Update::cursor`), and the input method pointed at its caret
+//! on every `preedit-*`, when the terminal gains the keys, and when a frame moves the cursor while
+//! it has them. **GTK's key controller owns the input method's focus** (`set_im_context`) and
+//! focuses it out from inside a focus change, before `pane_focus` reports anything -- which is when
+//! fcitx5 commits whatever was being composed. So the commit handler asks GTK whether the terminal
+//! still has the keys ([`connect_ime`]), and a composition cut off by the keys leaving is dropped,
+//! never typed (`ime.rs`'s module doc has the sources). Its client widget is set by
+//! [`TerminalPane::start`], so a window whose terminal is never shown creates no input-method client.
+//! **No `RefCell` borrow is held across a call into the input method** (`reset`,
+//! `set_cursor_location`, `set_client_widget`): `reset` can emit `commit` or `preedit-changed` before
+//! it returns, and those handlers borrow the state.
+//!
+//! **Everything bound for the shell goes through one door, [`submit`]** (bottom-terminal phase 2):
+//! typed keys, the prefix's literals, `Ctrl+Shift+V`'s text and input-method commits. A paste reads
+//! the clipboard asynchronously, and what is typed while it is read waits behind it (`input_queue`),
+//! so an Enter can never overtake the text it was meant to run. `Ctrl+Shift+C` is still held back:
+//! nothing can be selected until phase 3.
+//!
+//! **A program's copy lands on the desktop, and its bell flashes the pane** (bottom-terminal phase
+//! 2). An OSC 52 copy goes to GTK's clipboard (`c`) or primary selection (`p`/`s`), hidden or not; a
+//! read is still refused, by `Term` itself. A bell tints the pane for a moment (`bell.rs`), and a
+//! bell rung while the terminal was hidden is not flashed when it comes back. The title a program
+//! sets has nowhere to go: the spec sends it to the pane's header "when one exists", and none does.
+//!
 //! **The font metrics are lazy too, and never panic** (review 2026-09-23, M8/task-8 minor). A
 //! window whose terminal is never shown never touches a font manager: `TerminalMetrics` is built
 //! by [`ensure_session`], the same gate that lazily spawns the shell, not at [`TerminalPane::new`].
@@ -34,25 +60,35 @@ use std::cell::RefCell;
 use std::panic;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use gtk4::gdk::ModifierType;
+use gtk4::gdk::{ModifierType, Rectangle};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{EventControllerFocus, EventControllerKey, GLArea, GestureClick};
+use gtk4::{EventControllerFocus, EventControllerKey, GLArea, GestureClick, IMMulticontext, InputPurpose};
 
 use neovibe_terminal::pty::{fallback_shell, passwd_shell};
 use neovibe_terminal::{
-    PtySize, Screen, SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics, TerminalSession,
+    layout_preedit, CursorCell, PreeditLayout, PtySize, Screen, SessionCommand, SessionConfig, SpawnSpec,
+    TerminalColors, TerminalMetrics, TerminalSession,
 };
 use terminal_input::NormalizedInput;
 use terminal_render::PaintList;
 
+use super::bell::{self, BellFlash};
 use super::gl::SkiaState;
-use super::keys::{self, DeliveredKeys, RawKey, RepeatTracker};
+use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
+use super::input_queue::{InputQueue, PasteTicket};
+use super::keys::{self, ClipboardChord, DeliveredKeys, RawKey, RepeatTracker};
 
 /// Phase 1's face: the frozen pane's own default. Phase 4 takes nvim's `guifont` (spec §2.7).
 const FONT_FAMILY: &str = "monospace";
 const FONT_SIZE_PT: f32 = 13.0;
+
+/// How long `Ctrl+Shift+V` waits for the clipboard before typing goes on without the paste
+/// (`input_queue`'s module doc). A read from this process takes microseconds and one through a
+/// Wayland pipe milliseconds; two seconds is a clipboard owner that is not answering.
+pub(crate) const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct State {
     skia: Option<SkiaState>,
@@ -70,10 +106,20 @@ struct State {
     /// the failure message) stays, and Enter restarts it.
     exited: bool,
     frame: Option<PaintList>,
+    /// Where the cursor is on `frame`, as the session reported it with that frame: where a
+    /// composition is drawn (phase 2). `None` is "unknown" -- before the first frame, with a frame
+    /// that carried none, and after a restart -- and nothing is drawn at a stale cell then.
+    cursor: Option<CursorCell>,
+    /// The input method's composition and what of it may reach the shell (phase 2).
+    ime: ImeGate,
     repeats: RepeatTracker,
     /// Keyvals whose press this pane forwarded, so it knows which releases are its to forward too
     /// (review 2026-09-23, M2).
     delivered: DeliveredKeys,
+    /// What is bound for the shell and waits behind a paste still being read (phase 2).
+    queue: InputQueue,
+    /// The bell's flash (phase 2).
+    bell: BellFlash,
     colors: TerminalColors,
     focused: bool,
     cwd: PathBuf,
@@ -93,8 +139,12 @@ impl State {
             session: None,
             exited: false,
             frame: None,
+            cursor: None,
+            ime: ImeGate::new(),
             repeats: RepeatTracker::new(),
             delivered: DeliveredKeys::new(),
+            queue: InputQueue::new(),
+            bell: BellFlash::new(),
             colors: TerminalColors::default(),
             focused: false,
             cwd,
@@ -116,6 +166,92 @@ impl State {
             metrics.resize(allocation.width, allocation.height)
         };
         changed.then(|| PtySize::from_metrics(metrics))
+    }
+
+    /// The composition laid out over the latest frame, at the cursor the session reported with it.
+    /// `None` with no composition, or while the cursor is unknown.
+    fn preedit_layout(&self) -> Option<PreeditLayout> {
+        let preedit = self.ime.preedit()?;
+        let frame = self.frame.as_ref()?;
+        layout_preedit(
+            &preedit.text,
+            preedit.caret,
+            self.cursor?,
+            frame.cols,
+            frame.rows,
+            &self.colors,
+        )
+    }
+
+    /// The cell the input method's candidate window belongs at: the composition's caret while there
+    /// is one, else the cursor. `None` while the cursor is unknown.
+    fn ime_caret(&self) -> Option<(u16, u16)> {
+        if let Some(layout) = self.preedit_layout() {
+            return Some((layout.caret_row, layout.caret_col));
+        }
+        let cursor = self.cursor?;
+        Some((cursor.row, cursor.col))
+    }
+
+    /// [`Self::ime_caret`] as the rectangle `set_cursor_location` wants. `None` also before the
+    /// metrics exist.
+    fn ime_rect(&self, scale_factor: i32) -> Option<Rectangle> {
+        let (row, col) = self.ime_caret()?;
+        let metrics = self.metrics.as_ref()?;
+        Some(im_cursor_rect(metrics.cell_rect(row, col, 1), scale_factor))
+    }
+
+    /// A new frame's cursor, as the session reported it with the frame. A frame without one (a
+    /// contained panic's) makes it unknown rather than leaving the old cell in place. `true` when the
+    /// input method must be pointed again: the cursor moved while the terminal holds the keys. fcitx5
+    /// places the first candidate window of a composition before any `preedit-*` has told it where
+    /// (review S3), so it has to have been told already -- by this, and on gaining the keys.
+    fn take_cursor(&mut self, cursor: Option<CursorCell>) -> bool {
+        let cell = |cursor: Option<CursorCell>| cursor.map(|c| (c.row, c.col));
+        let moved = cell(cursor) != cell(self.cursor);
+        self.cursor = cursor;
+        moved && cursor.is_some() && self.focused
+    }
+
+    /// A bell the session reported. It flashes only a pane that is on screen: a bell rung while the
+    /// terminal was hidden is still pending when it is shown again, and flashing it then would be a
+    /// flash for something long over ([`connect_visibility`] takes it with `on_screen: false`).
+    fn bell(&mut self, on_screen: bool, now: Instant) -> Option<Instant> {
+        if on_screen {
+            self.bell.ring(now)
+        } else {
+            None
+        }
+    }
+
+    /// Straight to the running shell; dropped when there is none (not started, or exited).
+    fn send_input(&self, input: NormalizedInput) {
+        if let (Some(session), false) = (&self.session, self.exited) {
+            session.send(SessionCommand::Input(input));
+        }
+    }
+
+    /// Ends one paste and sends what it was holding back. `false`: the paste had already been given
+    /// up on (the timeout, or a restart), and its text is not sent.
+    fn finish_paste(&mut self, ticket: PasteTicket, input: Option<NormalizedInput>) -> bool {
+        match self.queue.finish(ticket, input) {
+            Some(ready) => {
+                for input in ready {
+                    self.send_input(input);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Enter after the shell exited: the old session goes, and so does anything still waiting to
+    /// reach it behind a paste, and where its cursor was (the new shell's first frame says).
+    fn forget_session(&mut self) {
+        self.session = None;
+        self.exited = false;
+        self.queue.clear();
+        self.cursor = None;
     }
 
     /// [`ensure_session`]'s gate, and the size it spawns at. `None`: nothing to start (no shell
@@ -157,6 +293,9 @@ struct Allocation {
 pub(crate) struct TerminalPane {
     area: GLArea,
     state: Rc<RefCell<State>>,
+    /// The input method (phase 2): `area`'s key controller runs it, and its client widget is `area`
+    /// from the first [`Self::start`].
+    im: IMMulticontext,
 }
 
 impl TerminalPane {
@@ -173,12 +312,20 @@ impl TerminalPane {
             .build();
         area.add_css_class("terminal");
         let state = Rc::new(RefCell::new(State::new(cwd)));
-        connect_resize(&area, &state);
+        // Its client widget is set at the first `start`, not here: that is what creates the input
+        // method's own client (for fcitx5-gtk, a D-Bus client and an input window), and a window
+        // whose terminal is never shown must not pay for one. Neither this nor the purpose does.
+        let im = IMMulticontext::new();
+        // What VTE tells the input method too: a terminal, where any character and the control
+        // codes are input. (fcitx5-gtk has no terminal case and treats it as free form.)
+        im.set_input_purpose(InputPurpose::Terminal);
+        connect_resize(&area, &state, &im);
         connect_render(&area, &state);
-        connect_keyboard(&area, &state);
+        connect_keyboard(&area, &state, &im);
+        connect_ime(&area, &state, &im);
         connect_click_to_focus(&area);
-        connect_visibility(&area, &state);
-        TerminalPane { area, state }
+        connect_visibility(&area, &state, &im);
+        TerminalPane { area, state, im }
     }
 
     /// The module host `main.rs` adds to the grid. The keys reach it through `main.rs`'s
@@ -189,17 +336,45 @@ impl TerminalPane {
     }
 
     /// A shell is wanted: spawn it now if the pane has been laid out, else at its first allocation.
+    /// Also where the input method gets its client widget, once (GTK ignores the same widget again;
+    /// set late, `GtkIMMulticontext` rebuilds its delegate with it, focus included).
     pub(crate) fn start(&self) {
+        self.im.set_client_widget(Some(&self.area));
         self.state.borrow_mut().wanted = true;
-        ensure_session(&self.state, &self.area);
+        ensure_session(&self.state, &self.area, &self.im);
     }
 
     /// Whether the pane holds the keys: a solid cursor or a hollow one (`pane_focus`'s rule).
+    ///
+    /// **This is not what focuses the input method in or out: GTK's key controller did, before
+    /// `pane_focus` could report** (`ime.rs`'s module doc), and a composition fcitx5 committed on the
+    /// way out was dropped by the commit handler asking GTK, not by this. What is left here: gaining
+    /// the keys points the input method at the cursor before the first key; losing them resets it,
+    /// which discards what survives a focus-out in the client (a dead-key sequence in GTK's simple
+    /// context or fcitx5-gtk's xkb compose state, `fcitximcontext.cpp:1113-1130`; the gate is
+    /// already closed, so nothing that reset commits passes), and takes the composition off the
+    /// screen.
+    ///
+    /// `SessionCommand::Focus` goes straight to the session, beside [`submit`], because it changes
+    /// only the cursor's shape: no byte reaches the program. **Phase 3's focus reports (DECSET 1004)
+    /// must not ride it that way:** a report is input, and one sent here would overtake keys still
+    /// waiting behind a paste (whole-branch review 2026-09-24, window minor 6).
     pub(crate) fn set_focused(&self, focused: bool) {
-        let mut state = self.state.borrow_mut();
-        state.focused = focused;
-        if let Some(session) = &state.session {
-            session.send(SessionCommand::Focus(focused));
+        let change = {
+            let mut state = self.state.borrow_mut();
+            state.focused = focused;
+            if let Some(session) = &state.session {
+                session.send(SessionCommand::Focus(focused));
+            }
+            state.ime.set_focused(focused)
+        };
+        match change {
+            FocusChange::In => point_input_method(&self.im, &self.state, &self.area),
+            FocusChange::Out => {
+                self.im.reset();
+                self.area.queue_render();
+            }
+            FocusChange::Unchanged => {}
         }
     }
 
@@ -214,12 +389,11 @@ impl TerminalPane {
     }
 
     /// Hands the running shell input that did not come from this widget's own keyboard -- the
-    /// prefix's literal `Ctrl+a`/`Ctrl+l`. Dropped when no shell is running.
+    /// prefix's literal `Ctrl+a`/`Ctrl+l`. Dropped when no shell is running; behind a paste still
+    /// being read, it waits for it ([`submit`]).
     pub(crate) fn send(&self, input: NormalizedInput) {
-        let state = self.state.borrow();
-        if let (Some(session), false) = (&state.session, state.exited) {
-            session.send(SessionCommand::Input(input));
-        }
+        discard_composition(&self.state, &self.im, &self.area);
+        submit(&self.state, input);
     }
 
     /// Window close: hang the shell up. Does not wait -- `TerminalSession`'s own `Drop`.
@@ -265,7 +439,7 @@ fn build_metrics(allocation: Allocation) -> Result<TerminalMetrics, String> {
 /// Spawns the session if one is wanted, the pane has real geometry, and none is running. Also
 /// where the terminal's font metrics are built, the first time they are needed -- never at
 /// construction, so a window whose terminal is never shown never touches a font manager.
-fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea) {
+fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
     let (cwd, size, colors, focused) = {
         let mut s = state.borrow_mut();
         let size = match s.spawn_size(build_metrics) {
@@ -338,13 +512,15 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea) {
     state.borrow_mut().session = Some(session);
     let state = Rc::downgrade(state);
     let area = area.downgrade();
+    let im = im.downgrade();
     // Ends when the session's thread drops the waker, i.e. when the session is over.
     glib::spawn_future_local(async move {
         while woken.recv().await.is_ok() {
-            let (Some(state), Some(area)) = (state.upgrade(), area.upgrade()) else {
+            let (Some(state), Some(area), Some(im)) = (state.upgrade(), area.upgrade(), im.upgrade()) else {
                 break;
             };
-            pump(&state, &area);
+            let on_screen = area.is_mapped();
+            pump(&state, &area, &im, on_screen);
         }
     });
 }
@@ -359,54 +535,104 @@ fn message_frame(size: PtySize, colors: TerminalColors, message: &str) -> PaintL
 
 /// Mapped and unmapped: hidden by `Ctrl+a t` or by a zoom of another pane. The session still reads
 /// and answers while hidden; it only stops rendering (`SessionCommand::Visible`).
-fn connect_visibility(area: &GLArea, state: &Rc<RefCell<State>>) {
-    for visible in [true, false] {
+///
+/// On the way back, what the session published while hidden is taken first, with bells unflashed
+/// (phase 2): a hidden session folds a bell into its pending update without waking this pane, so
+/// that bell would otherwise come out with the first frame after the show.
+fn connect_visibility(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
+    {
         let state = state.clone();
-        let tell = move |_: &GLArea| {
+        let im = im.clone();
+        area.connect_map(move |area| {
+            pump(&state, area, &im, false);
             if let Some(session) = &state.borrow().session {
-                session.send(SessionCommand::Visible(visible));
+                session.send(SessionCommand::Visible(true));
             }
-        };
-        if visible {
-            area.connect_map(tell);
-        } else {
-            area.connect_unmap(tell);
-        }
+        });
     }
+    let state = state.clone();
+    area.connect_unmap(move |_| {
+        if let Some(session) = &state.borrow().session {
+            session.send(SessionCommand::Visible(false));
+        }
+    });
 }
 
-/// Takes what the session published and schedules a repaint if there is a new frame.
-fn pump(state: &RefCell<State>, area: &GLArea) {
+/// Takes what the session published: the frame and where its cursor is, how the shell ended, a copy
+/// for the desktop, a bell. `on_screen: false` takes a bell without flashing it. After the borrow,
+/// because these are calls into GTK: the input method is pointed again when the cursor moved under
+/// the keys, and the copies go onto the desktop. The flash-end timer is armed for
+/// [`bell::repaint_delay`], not the raw remainder, so it never fires before the flash is actually
+/// over. **Known limit:** the clipboard calls, the input method and the timer's own firing are GTK's
+/// and are not tested without a display; the decisions are (`State::take_cursor`, `State::bell`,
+/// `BellFlash`, `bell::repaint_delay`, and the engine's OSC 52 tests).
+fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: bool) {
     let Some(update) = state.borrow().session.as_ref().map(|s| s.take_update()) else {
         return;
     };
-    let mut s = state.borrow_mut();
-    if let Some(frame) = update.frame {
-        s.frame = Some(frame);
+    let (repoint, flash_until) = {
+        let mut s = state.borrow_mut();
+        let mut repoint = false;
+        if let Some(frame) = update.frame {
+            s.frame = Some(frame);
+            repoint = s.take_cursor(update.cursor);
+            area.queue_render();
+        }
+        if let Some(exit) = update.exited {
+            s.exited = true;
+            println!("[terminal] {}", exit.notice());
+        }
+        let flash_until = if update.events.bell {
+            s.bell(on_screen, Instant::now())
+        } else {
+            None
+        };
+        (repoint, flash_until)
+    };
+    if repoint {
+        point_input_method(im, state, area);
+    }
+    // A copy lands whether the pane is shown or not; a read of either clipboard never gets this far
+    // (`Term` refuses it, `Osc52::OnlyCopy`).
+    if let Some(text) = update.events.clipboard {
+        area.clipboard().set_text(&text);
+        println!(
+            "[terminal] a program copied {} characters to the clipboard (OSC 52)",
+            text.chars().count()
+        );
+    }
+    if let Some(text) = update.events.primary {
+        area.primary_clipboard().set_text(&text);
+        println!(
+            "[terminal] a program copied {} characters to the primary selection (OSC 52)",
+            text.chars().count()
+        );
+    }
+    if let Some(until) = flash_until {
         area.queue_render();
+        let area = area.downgrade();
+        // `bell::repaint_delay`, not the raw `until - now`: glib truncates a `Duration` to whole
+        // milliseconds, so the raw remainder fires up to 1 ms before `until` while the flash is
+        // still active, and nothing else would then repaint the pane to clear it (review 2026-09-24).
+        glib::timeout_add_local_once(bell::repaint_delay(until, Instant::now()), move || {
+            if let Some(area) = area.upgrade() {
+                area.queue_render();
+            }
+        });
     }
-    if let Some(exit) = update.exited {
-        s.exited = true;
-        println!("[terminal] {}", exit.notice());
-    }
-    // Phase 2 puts these on the GTK clipboard, the pane's header and a bell; phase 1 says so.
-    if update.events.clipboard.is_some() {
-        println!("[terminal] a program copied to the clipboard (OSC 52); not wired until phase 2");
-    }
+    // `update.events.title` has nowhere to go: the spec gives it to the pane's header "when one
+    // exists", and the terminal has no header yet.
 }
 
 /// Enter after the shell exited: a fresh session on a fresh PTY, in the same place.
-fn restart(state: &Rc<RefCell<State>>, area: &GLArea) {
-    {
-        let mut s = state.borrow_mut();
-        s.session = None;
-        s.exited = false;
-    }
-    ensure_session(state, area);
+fn restart(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
+    state.borrow_mut().forget_session();
+    ensure_session(state, area, im);
 }
 
-fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>) {
+fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
     let state = state.clone();
+    let im = im.clone();
     area.connect_resize(move |area, width, height| {
         // A hidden or not-yet-laid-out pane can report no area. That must never reach the PTY: a
         // terminal keeps its last size while hidden (modules design §3.2).
@@ -429,7 +655,7 @@ fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>) {
         if let (Some(size), Some(session)) = (resized, state.borrow().session.as_ref()) {
             session.send(SessionCommand::Resize(size));
         }
-        ensure_session(&state, area);
+        ensure_session(&state, area, &im);
     });
 }
 
@@ -444,6 +670,10 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
                 skia.resize(width, height);
             }
         }
+        // Laid out before the fields are borrowed apart: it reads the frame, the cursor and the
+        // colours together.
+        let preedit = s.preedit_layout();
+        let flashing = s.bell.active(Instant::now());
         let State {
             skia,
             metrics,
@@ -461,7 +691,17 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
             return glib::Propagation::Stop;
         };
         match frame.as_ref().zip(metrics.as_ref()) {
-            Some((list, metrics)) => neovibe_terminal::paint(surface.canvas(), list, metrics),
+            Some((list, metrics)) => {
+                neovibe_terminal::paint(surface.canvas(), list, metrics);
+                // After the frame, over it: the input method's composition at the cursor (phase 2).
+                if let Some(preedit) = &preedit {
+                    neovibe_terminal::paint_ops(surface.canvas(), &preedit.ops, metrics);
+                }
+                // Over everything, for a moment: the bell (phase 2).
+                if flashing {
+                    bell::tint(surface.canvas(), colors.foreground);
+                }
+            }
             // No frame yet (or no metrics: the terminal has never been started), the theme's
             // background, never GTK's default or black.
             None => {
@@ -488,10 +728,15 @@ fn connect_click_to_focus(area: &GLArea) {
     area.add_controller(click);
 }
 
-fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>) {
+fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
     let keys = EventControllerKey::new();
+    // GTK runs the input method on every key before `key-pressed`/`key-released` below, and a key it
+    // consumes never reaches them (phase 2; the editor's own wiring, `neovide-editor/src/keyboard.rs`).
+    // neovibe's own chords never get this far: they are taken in the capture phase.
+    keys.set_im_context(Some(im));
     {
         let state = state.clone();
+        let im = im.clone();
         keys.connect_key_pressed(move |controller, keyval, keycode, modifier| {
             let Some(area) = controller.widget().and_downcast::<GLArea>() else {
                 return glib::Propagation::Stop;
@@ -499,13 +744,20 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>) {
             let repeat = state.borrow_mut().repeats.press(keyval);
             if state.borrow().exited {
                 if keys::restarts(keyval, modifier) {
-                    restart(&state, &area);
+                    restart(&state, &area, &im);
                 }
                 return glib::Propagation::Stop;
             }
-            if keys::clipboard_chord(keyval, modifier) {
-                println!("[terminal] Ctrl+Shift+C/V: copy and paste arrive in phase 2; held back meanwhile");
-                return glib::Propagation::Stop;
+            match keys::clipboard_chord(keyval, modifier) {
+                Some(ClipboardChord::Copy) => {
+                    println!("[terminal] Ctrl+Shift+C: nothing can be selected yet (phase 3); held back");
+                    return glib::Propagation::Stop;
+                }
+                Some(ClipboardChord::Paste) => {
+                    paste_clipboard(&state, &area, &im);
+                    return glib::Propagation::Stop;
+                }
+                None => {}
             }
             // Recorded before delivery: a release is forwarded only for a keyval whose press
             // reached here (review 2026-09-23, M2), never re-derived from the release's own
@@ -552,6 +804,94 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>) {
     area.add_controller(focus);
 }
 
+/// Throws away a composition in progress rather than letting it commit: a paste or a `Ctrl+a`
+/// literal is about to reach the shell, and half-typed pinyin must neither follow it nor precede it.
+/// What the input method commits out of this reset is dropped (`ImeGate::begin_reset`). Nothing to
+/// do, and no call into the input method, when nothing is being composed.
+fn discard_composition(state: &RefCell<State>, im: &IMMulticontext, area: &GLArea) {
+    {
+        let mut s = state.borrow_mut();
+        if !s.ime.composing() {
+            return;
+        }
+        s.ime.begin_reset();
+    }
+    println!("[terminal] a composition in progress was discarded");
+    im.reset();
+    state.borrow_mut().ime.end_reset();
+    area.queue_render();
+}
+
+/// The input method's news (`ime.rs`): a commit goes through the gate to [`submit`]; a composition
+/// that starts, changes or ends is kept, redrawn, and the input method told where its caret is.
+/// **Known limit:** these handlers and the GTK calls they make are not tested without a display;
+/// what they decide with is (`ImeGate`, `State::preedit_layout`, `State::ime_caret`,
+/// `State::ime_rect`, `State::take_cursor`, `im_cursor_rect`).
+fn connect_ime(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
+    {
+        let state = state.clone();
+        let area = area.downgrade();
+        im.connect_commit(move |_, text| {
+            // GTK focuses the input method out from inside a focus change, before `pane_focus`
+            // reports it, and fcitx5-gtk commits its composition right there (`ime.rs`'s module
+            // doc). GTK's own state is already updated by then, so ask it, not only the gate. Keep
+            // BOTH halves (`GtkFocus`'s doc): a focus move clears `has_focus` before that commit,
+            // but alt-tab clears only `is_active` -- `has_focus` alone would type `ni hao` there.
+            let gtk = area.upgrade().map_or(GtkFocus::default(), |area| GtkFocus {
+                widget_has_focus: area.has_focus(),
+                window_is_active: area
+                    .root()
+                    .and_downcast::<gtk4::Window>()
+                    .is_some_and(|window| window.is_active()),
+            });
+            let verdict = state.borrow_mut().ime.commit(text, gtk);
+            match verdict {
+                Commit::Send(input) => submit(&state, input),
+                Commit::Dropped(why) => println!(
+                    "[terminal] an input-method commit ({} characters) was dropped: {why}",
+                    text.chars().count()
+                ),
+            }
+            if let Some(area) = area.upgrade() {
+                area.queue_render();
+            }
+        });
+    }
+    let on_preedit = {
+        let state = state.clone();
+        let area = area.downgrade();
+        move |im: &IMMulticontext| {
+            if let Some(area) = area.upgrade() {
+                preedit_changed(im, &state, &area);
+            }
+        }
+    };
+    im.connect_preedit_start(on_preedit.clone());
+    im.connect_preedit_changed(on_preedit.clone());
+    im.connect_preedit_end(on_preedit);
+}
+
+/// A composition started, changed or ended: keep it, redraw it, and point the input method at its
+/// caret. On all three, as the editor does: `start` so the candidate window is in place, `changed`
+/// so it follows the composition, `end` so the next one never starts against a stale place. The
+/// preedit's pango attributes (rime's `HighLight` on the segment being converted) are not drawn.
+fn preedit_changed(im: &IMMulticontext, state: &RefCell<State>, area: &GLArea) {
+    let (text, _attributes, caret) = im.preedit_string();
+    state.borrow_mut().ime.preedit_changed(&text, caret);
+    point_input_method(im, state, area);
+    area.queue_render();
+}
+
+/// Tells the input method where its candidate window belongs ([`State::ime_rect`]); nothing while
+/// that is unknown. fcitx5-gtk skips a rectangle it already has (`fcitximcontext.cpp:827-832`), so
+/// calling this more often than needed costs nothing there.
+fn point_input_method(im: &IMMulticontext, state: &RefCell<State>, area: &GLArea) {
+    let rect = state.borrow().ime_rect(area.scale_factor());
+    if let Some(rect) = rect {
+        im.set_cursor_location(&rect);
+    }
+}
+
 fn raw_key(
     area: &GLArea,
     keyval: gtk4::gdk::Key,
@@ -582,9 +922,54 @@ fn raw_key(
 
 fn deliver(state: &RefCell<State>, raw: RawKey) {
     let Some(input) = keys::normalize_key(raw) else { return };
-    if let Some(session) = state.borrow().session.as_ref() {
-        session.send(SessionCommand::Input(input));
+    submit(state, input);
+}
+
+/// The one door to the shell: straight through, or behind a paste still being read.
+fn submit(state: &RefCell<State>, input: NormalizedInput) {
+    let mut s = state.borrow_mut();
+    if let Some(input) = s.queue.submit(input) {
+        s.send_input(input);
     }
+}
+
+/// `Ctrl+Shift+V`: reads the clipboard's text and pastes it. Its place in line is taken now, so
+/// what is typed while the read is in flight follows the paste; [`PASTE_TIMEOUT`] gives up on a
+/// clipboard that does not answer. **Known limit:** the read and the timer are GTK's and are not
+/// tested without a display; what they call (`State::finish_paste`, `InputQueue`) is.
+fn paste_clipboard(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
+    discard_composition(state, im, area);
+    let ticket = state.borrow_mut().queue.begin_paste();
+    let read = area.clipboard().read_text_future();
+    {
+        let state = Rc::downgrade(state);
+        glib::spawn_future_local(async move {
+            let text = match read.await {
+                Ok(Some(text)) => text.to_string(),
+                Ok(None) => {
+                    println!("[terminal] Ctrl+Shift+V: the clipboard holds no text");
+                    String::new()
+                }
+                Err(err) => {
+                    eprintln!("[terminal] Ctrl+Shift+V: could not read the clipboard: {err}");
+                    String::new()
+                }
+            };
+            let Some(state) = state.upgrade() else { return };
+            let input = keys::paste(&text);
+            let had_text = input.is_some();
+            if !state.borrow_mut().finish_paste(ticket, input) && had_text {
+                eprintln!("[terminal] Ctrl+Shift+V: the clipboard answered too late; that paste is dropped");
+            }
+        });
+    }
+    let state = Rc::downgrade(state);
+    glib::timeout_add_local_once(PASTE_TIMEOUT, move || {
+        let Some(state) = state.upgrade() else { return };
+        if state.borrow_mut().finish_paste(ticket, None) {
+            eprintln!("[terminal] Ctrl+Shift+V: no answer from the clipboard in {PASTE_TIMEOUT:?}; typing goes on");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -681,6 +1066,136 @@ mod tests {
             None,
             "the same allocation again is not a change"
         );
+    }
+
+    /// Bottom-terminal phase 2: Enter after an exit starts a new shell, and what was typed for the
+    /// old one while a paste was being read must not reach the new one when that paste ends.
+    #[test]
+    fn restarting_forgets_input_that_waited_behind_a_paste() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let ticket = state.queue.begin_paste();
+        let typed = NormalizedInput::Paste {
+            text: "for the old shell".to_string(),
+            bracketed: false,
+        };
+        assert_eq!(state.queue.submit(typed.clone()), None, "it waits behind the paste");
+        state.exited = true;
+        state.forget_session();
+        assert!(!state.exited);
+        assert!(
+            !state.finish_paste(ticket, None),
+            "that paste is gone with the old shell"
+        );
+        assert_eq!(state.queue.submit(typed.clone()), Some(typed), "nothing waits any more");
+    }
+
+    /// Bottom-terminal phase 2: a composition is drawn at the cursor the session reported with the
+    /// latest frame, the candidate window follows its caret, and without one the input method is
+    /// pointed at the cursor itself. Losing the keys takes the composition off the screen.
+    #[test]
+    fn a_composition_is_drawn_at_the_reported_cursor_and_the_candidates_follow_its_caret() {
+        use terminal_render::PaintOp;
+        let mut state = State::new(PathBuf::from("/tmp"));
+        assert_eq!(state.ime_caret(), None, "no frame yet: nowhere to point");
+        let mut screen = Screen::new(
+            PtySize {
+                cols: 20,
+                rows: 5,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+            TerminalColors::default(),
+        );
+        screen.feed(b"$ ");
+        state.frame = Some(screen.render(true));
+        state.cursor = Some(screen.cursor_cell());
+        assert_eq!(state.preedit_layout(), None);
+        assert_eq!(state.ime_caret(), Some((0, 2)), "no composition: the cursor");
+        state.ime.set_focused(true);
+        state.ime.preedit_changed("ni", 2);
+        let layout = state.preedit_layout().expect("a composition over a frame");
+        assert!(matches!(
+            layout.ops.first(),
+            Some(PaintOp::FillCells {
+                row: 0,
+                col: 2,
+                cols: 2,
+                ..
+            })
+        ));
+        assert_eq!(state.ime_caret(), Some((0, 4)), "the composition's caret");
+        state.ime.set_focused(false);
+        assert_eq!(state.preedit_layout(), None, "the keys left: nothing is drawn");
+    }
+
+    /// Review S3: fcitx5 shows the first candidate window of a composition before any `preedit-*`
+    /// has told it where, so it must already have been pointed at the cursor. A frame that moves
+    /// the cursor while the terminal holds the keys says so; one that does not move it, or moves it
+    /// while the keys are elsewhere, does not (and a visibility toggle alone is not a move).
+    #[test]
+    fn a_frame_repoints_the_input_method_only_when_the_cursor_moved_under_the_keys() {
+        let cell = |row, col, visible| CursorCell { row, col, visible };
+        let mut state = State::new(PathBuf::from("/tmp"));
+        assert!(
+            !state.take_cursor(Some(cell(0, 2, true))),
+            "moved, but the keys are elsewhere"
+        );
+        state.focused = true;
+        assert!(!state.take_cursor(Some(cell(0, 2, true))), "the same cell");
+        assert!(
+            !state.take_cursor(Some(cell(0, 2, false))),
+            "hidden in place is not a move"
+        );
+        assert!(state.take_cursor(Some(cell(1, 0, true))), "moved under the keys");
+        assert_eq!(state.cursor, Some(cell(1, 0, true)));
+    }
+
+    /// Review N2: a frame that carries no cursor (a contained panic's) and a restart both make the
+    /// cursor unknown, and a composition is then drawn nowhere rather than at the old cell.
+    #[test]
+    fn an_unknown_cursor_draws_no_composition_and_points_nowhere() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let mut screen = Screen::new(
+            PtySize {
+                cols: 20,
+                rows: 5,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+            TerminalColors::default(),
+        );
+        screen.feed(b"$ ");
+        state.frame = Some(screen.render(true));
+        state.focused = true;
+        state.ime.set_focused(true);
+        state.take_cursor(Some(screen.cursor_cell()));
+        state.ime.preedit_changed("ni", 0);
+        assert!(state.preedit_layout().is_some());
+        assert!(!state.take_cursor(None), "nothing to point at");
+        assert_eq!(state.preedit_layout(), None, "no composition at a stale cell");
+        assert_eq!(state.ime_caret(), None);
+        state.take_cursor(Some(screen.cursor_cell()));
+        state.forget_session();
+        assert_eq!(state.cursor, None, "a restart forgets where the old shell's cursor was");
+        assert_eq!(state.ime_caret(), None);
+    }
+
+    /// Bottom-terminal phase 2: a bell rung while the terminal was hidden comes out with the first
+    /// update after it is shown again, and must not flash then; one rung on screen flashes.
+    ///
+    /// This only reaches `State::bell`'s `on_screen` branch (review 2026-09-24, minor): it does not
+    /// drive `connect_visibility`'s map handler, which is what actually calls `pump(.., false)`
+    /// before sending `Visible(true)`, nor the session's own folding of a hidden bell
+    /// (`session.rs:571-576`) into one `Update` never woken for. That whole path needs a display and
+    /// is Task 6 item 8's GUI-pass job; this test is the pure half only.
+    #[test]
+    fn a_bell_from_while_the_pane_was_hidden_does_not_flash() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let now = Instant::now();
+        assert_eq!(state.bell(false, now), None);
+        assert!(!state.bell.active(now), "nothing shows");
+        assert!(state.bell(true, now).is_some());
+        assert!(state.bell.active(now));
     }
 
     /// The gate itself: nothing is spawned for a pane nobody asked for, and nothing twice.

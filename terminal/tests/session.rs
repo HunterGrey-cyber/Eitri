@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use common::{ctrl, plain_sh, size, spec, Harness, WAIT};
 use neovibe_terminal::pty::HANGUP_GRACE;
 use neovibe_terminal::session::SYNC_UPDATE_TIMEOUT;
-use neovibe_terminal::{SessionCommand, SessionConfig, TerminalColors, REPLY_CAP};
+use neovibe_terminal::{CursorCell, SessionCommand, SessionConfig, TerminalColors, REPLY_CAP};
 use terminal_input::NormalizedInput;
 use terminal_render::RgbColor;
 
@@ -100,6 +100,63 @@ fn osc52_copy_reaches_the_host_and_osc52_paste_is_refused() {
     h.wait_for(WAIT, |h| h.exited.is_some());
     assert_eq!(h.events.clipboard.as_deref(), Some("hi"));
     assert!(h.has_line("load=[]"), "{:?}", h.text());
+}
+
+/// Bottom-terminal phase 2: an OSC 52 copy to the selection (`s`, nvim's `"*`) reaches the host as
+/// the primary selection, apart from a copy to the clipboard in the same stream.
+#[test]
+fn an_osc52_selection_copy_reaches_the_host_apart_from_the_clipboard() {
+    let script = r#"printf '\033]52;s;aGk=\007\033]52;c;Ynll\007'"#;
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 5));
+    h.wait_for(WAIT, |h| h.exited.is_some());
+    assert_eq!(h.events.primary.as_deref(), Some("hi"));
+    assert_eq!(h.events.clipboard.as_deref(), Some("bye"));
+}
+
+/// A copy is the one event a hidden terminal rings the host for (the pump puts it on the desktop's
+/// clipboard at once, hidden or not). Bottom-terminal phase 2: a copy to the selection too. Before
+/// it, `publish_events` rang only for `clipboard`, and a hidden terminal's `"*y` waited, unseen, for
+/// the next show.
+#[test]
+fn a_hidden_selection_copy_rings_the_host_like_a_clipboard_copy() {
+    let script = r#"stty -echo; printf ready; read _; printf '\033]52;s;aGk=\007'; exec sleep 5"#;
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
+    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with("ready")));
+    h.session.send(SessionCommand::Visible(false));
+    std::thread::sleep(Duration::from_millis(50));
+    h.wait_for(WAIT, |_| true);
+    h.pending_wakes();
+    h.type_str("\n");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        h.pending_wakes() > 0,
+        "a hidden terminal's selection copy must ring the host"
+    );
+    h.wait_for(WAIT, |h| h.events.primary.is_some());
+    assert_eq!(h.events.primary.as_deref(), Some("hi"));
+}
+
+/// Bottom-terminal phase 2: every frame comes with the cell the cursor is in, even when the program
+/// hid it and the frame paints no cursor -- the host draws an input method's preedit there.
+#[test]
+fn every_frame_says_where_the_cursor_is_even_when_it_is_hidden() {
+    let script = r#"printf 'ab\033[?25l'; exec sleep 5"#;
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
+    h.wait_for(WAIT, |h| {
+        h.text().first().is_some_and(|l| l == "ab") && h.cursor.is_some_and(|c| !c.visible)
+    });
+    assert!(
+        h.frame.as_ref().unwrap().cursor().is_none(),
+        "the frame paints no cursor"
+    );
+    assert_eq!(
+        h.cursor,
+        Some(CursorCell {
+            row: 0,
+            col: 2,
+            visible: false
+        })
+    );
 }
 
 #[test]
@@ -215,9 +272,17 @@ fn an_exited_shell_keeps_its_screen_and_says_how_it_ended() {
     assert_eq!(h.exited.and_then(|e| e.code), Some(3));
     let text = h.text();
     assert!(text.iter().any(|l| l == "last words"), "{text:?}");
-    assert!(
-        text.iter().any(|l| l == "[process exited 3 \u{2014} Enter restarts]"),
-        "{text:?}"
+    let notice = "[process exited 3 \u{2014} Enter restarts]";
+    let row = text.iter().position(|l| l == notice).expect("the notice");
+    // The final frame's cursor rides with it (whole-branch review 2026-09-24, engine minor 1's
+    // M9): just after the notice, where `show_end` left it -- not missing, not the last render's.
+    assert_eq!(
+        h.cursor,
+        Some(CursorCell {
+            row: row as u16,
+            col: notice.chars().count() as u16,
+            visible: true
+        })
     );
 }
 

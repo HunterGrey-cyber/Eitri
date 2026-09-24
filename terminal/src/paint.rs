@@ -1,6 +1,8 @@
 //! Moved from `terminal-pane/src/backend.rs` on `freeze/terminal-stack` @ `1e715ab` (2026-09-23),
-//! unchanged below this paragraph but for rustfmt at this repository's `max_width = 120`. Where it
-//! says "Verdandi" or "the handoff", the contract now lives in this workspace's `terminal-render/`.
+//! unchanged below this paragraph but for rustfmt at this repository's `max_width = 120` and one
+//! split: the op loop of [`paint`] is [`paint_ops`] (bottom-terminal phase 2), so the host can paint
+//! an input method's preedit over a finished frame without clearing it. Where it says "Verdandi" or
+//! "the handoff", the contract now lives in this workspace's `terminal-render/`.
 //!
 //! Executes a `PaintList` onto a Skia canvas. This is the entire backend.
 //!
@@ -64,10 +66,16 @@ pub fn paint(canvas: &Canvas, list: &PaintList, metrics: &TerminalMetrics) {
     // has to come from somewhere -- this is that colour, and skipping it leaves the previous frame
     // showing through in the margin.
     canvas.clear(to_skia(list.surface_background));
+    paint_ops(canvas, &list.ops, metrics);
+}
 
+/// Executes `ops` on top of whatever the canvas already holds, without clearing it: [`paint`]'s own
+/// loop, and how the host paints something over a finished frame -- an input method's preedit
+/// (`crate::preedit`). The same lattice, the same fonts, the same rules; nothing is interpreted.
+pub fn paint_ops(canvas: &Canvas, ops: &[PaintOp], metrics: &TerminalMetrics) {
     // Front to back, in the order given. `ops` is guaranteed non-decreasing in PaintLayer, so
     // honouring the given order IS honouring z-order -- this loop must never sort or batch by type.
-    for op in &list.ops {
+    for op in ops {
         match op {
             PaintOp::FillCells { row, col, cols, color } => {
                 canvas.draw_rect(metrics.cell_rect(*row, *col, *cols), &fill_paint(*color));
