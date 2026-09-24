@@ -16,11 +16,15 @@ end
 -- fast the user types, and 150ms is far below the time it takes to move a hand to the panel.
 local INTERVAL_MS = 150
 
--- Never fetch more than this many lines of a selection. The host truncates the text at 2000
--- characters anyway, so fetching a 100,000-line selection would be work done only to be thrown
+-- Never fetch more than this many lines of a selection. Only the first 2000 characters are sent,
+-- so fetching a 100,000-line selection would be work done only to be thrown
 -- away -- and measured at ~33ms on nvim's own loop, which is where the editor's input latency
 -- lives. The reported line range is always the TRUE one; only the text is bounded.
 local MAX_SELECTION_LINES = 400
+-- Same Unicode-scalar cap and marker as editor_context::compose. Apply it before JSON encoding:
+-- even one valid selected line can be larger than the host's bounded socket reader permits.
+local CONTENT_LIMIT = 2000
+local TRUNCATION_MARKER = "\n... (truncated)"
 
 local dirty = true
 
@@ -48,7 +52,13 @@ local function selection()
   if not ok or type(lines) ~= "table" then
     return nil
   end
-  return { start_line = first[2], end_line = last[2], text = table.concat(lines, "\n") }
+  -- Keep one extra character to distinguish an exact-length selection from a truncated one.
+  -- strcharpart/strchars count composing characters separately by default, matching Rust chars().
+  local text = vim.fn.strcharpart(table.concat(lines, "\n"), 0, CONTENT_LIMIT + 1)
+  if vim.fn.strchars(text) > CONTENT_LIMIT then
+    text = vim.fn.strcharpart(text, 0, CONTENT_LIMIT) .. TRUNCATION_MARKER
+  end
+  return { start_line = first[2], end_line = last[2], text = text }
 end
 
 local function send()
@@ -64,9 +74,8 @@ local function send()
   if not ok or not payload then
     return
   end
-  -- Blocking connect/write/close, inside the timer callback, exactly as the theme feed does: the
-  -- host accepts one connection per line and reads it whole, so the line is normally already in the
-  -- socket when it is accepted.
+  -- Connect/write/close are asynchronous. The host may accept before this connect callback writes
+  -- any bytes; it retains incomplete lines across polls instead of waiting on the GTK thread.
   local pipe = vim.uv.new_pipe(false)
   pipe:connect(socket, function(err)
     if err then
