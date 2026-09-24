@@ -4,6 +4,14 @@
 //! terminal (spec 2026-09-23-bottom-terminal-design.md) adds `t` (show/focus/hide it) and `Ctrl+l`
 //! (a literal `Ctrl+l` for it, his own `base.conf:73`).
 //!
+//! **Modules P2** (docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md §6.3) adds the tmux
+//! verbs over the module tree, as his `base.conf` binds them: `x` hides the module with the keys
+//! (his `kill-pane`, reinterpreted -- "先做只隐藏吧"); `e`/`a` and each Lua panel's key show, focus or
+//! hide that module; `\` or `"` then a module key opens it right of / below the module with the keys,
+//! or moves it there; `H/J/K/L` swap; `|`/`_` even. `q` stays unbound on purpose (his `kill-window`).
+//! None of them repeats. After `\` or `"` the prefix waits for a module key ([`Waiting::Module`]);
+//! anything else is swallowed and ends the wait, `Esc` included.
+//!
 //! A window-level capture controller, added at startup. GTK runs a widget's controllers
 //! most-recently-added first, and the window's shortcut manager was added when the window was
 //! created, so this sees every key before any app accelerator and before the editor, the panel or
@@ -16,6 +24,8 @@ use std::time::{Duration, Instant};
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 use gtk4::prelude::*;
+
+use neovibe_core::layout::Axis;
 
 use crate::layout::Direction;
 use crate::text_size::TextStep;
@@ -101,6 +111,19 @@ pub(crate) enum PrefixCommand {
     /// `Ctrl+l`: hand the terminal a literal `Ctrl+l` (clear screen), which bare `Ctrl+l` cannot
     /// be -- neovibe takes that for pane navigation. His tmux's own answer: `base.conf:73`.
     SendCtrlL,
+    /// `x`: hide the module with the keys; refused for the last one on screen.
+    Hide,
+    /// `e`, `a` or a Lua panel's key: that module's four-case rule (spec §4.3).
+    Module(char),
+    /// `\` (`Axis::Row`) or `"` (`Axis::Column`), then the module key `key`.
+    Place {
+        key: char,
+        axis: Axis,
+    },
+    /// `H`/`J`/`K`/`L`: swap the module with the keys with its neighbour that way.
+    Swap(Direction),
+    /// `|` (`Axis::Row`) / `_` (`Axis::Column`): every shown module in one row / column.
+    Even(Axis),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,35 +136,99 @@ pub(crate) enum Outcome {
     Run(PrefixCommand),
 }
 
-/// The command a key after the prefix names, and whether tmux binds it with `-r` (§3.1). `=`/`-`
-/// repeat like `m`/`h`/`j`/`k`/`l`; `0` is one-shot like `z` (zoom-together spec §3).
-fn command(ch: char) -> Option<(PrefixCommand, bool)> {
+/// What a key right after the prefix does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// Runs this command; `true` if tmux binds it with `-r` (§3.1).
+    Run(PrefixCommand, bool),
+    /// `\` / `"`: waits for a module key, then places it along this axis.
+    AwaitModule(Axis),
+}
+
+/// The binding a key after the prefix names (§3.1). `=`/`-` repeat like `m`/`h`/`j`/`k`/`l`; `0` is
+/// one-shot like `z` (zoom-together spec §3); modules P2's keys are all one-shot, as the spec's
+/// table has them (§6.3). The module keys `e`/`a` are here because they are neovibe's own; a Lua
+/// panel's key is not a binding of this table but of the window ([`Prefix::with_module_keys`]).
+fn binding(ch: char) -> Option<Binding> {
+    use Binding::{AwaitModule, Run};
     Some(match ch {
-        'm' => (PrefixCommand::Zoom, true),
-        'z' => (PrefixCommand::Zoom, false),
-        'h' => (PrefixCommand::Resize(Direction::Left), true),
-        'j' => (PrefixCommand::Resize(Direction::Down), true),
-        'k' => (PrefixCommand::Resize(Direction::Up), true),
-        'l' => (PrefixCommand::Resize(Direction::Right), true),
-        '=' => (PrefixCommand::TextSize(TextStep::Larger), true),
-        '-' => (PrefixCommand::TextSize(TextStep::Smaller), true),
-        '0' => (PrefixCommand::TextSize(TextStep::Reset), false),
-        't' => (PrefixCommand::ToggleTerminal, false),
+        'm' => Run(PrefixCommand::Zoom, true),
+        'z' => Run(PrefixCommand::Zoom, false),
+        'h' => Run(PrefixCommand::Resize(Direction::Left), true),
+        'j' => Run(PrefixCommand::Resize(Direction::Down), true),
+        'k' => Run(PrefixCommand::Resize(Direction::Up), true),
+        'l' => Run(PrefixCommand::Resize(Direction::Right), true),
+        '=' => Run(PrefixCommand::TextSize(TextStep::Larger), true),
+        '-' => Run(PrefixCommand::TextSize(TextStep::Smaller), true),
+        '0' => Run(PrefixCommand::TextSize(TextStep::Reset), false),
+        't' => Run(PrefixCommand::ToggleTerminal, false),
+        'x' => Run(PrefixCommand::Hide, false),
+        'e' | 'a' => Run(PrefixCommand::Module(ch), false),
+        'H' => Run(PrefixCommand::Swap(Direction::Left), false),
+        'J' => Run(PrefixCommand::Swap(Direction::Down), false),
+        'K' => Run(PrefixCommand::Swap(Direction::Up), false),
+        'L' => Run(PrefixCommand::Swap(Direction::Right), false),
+        '|' => Run(PrefixCommand::Even(Axis::Row), false),
+        '_' => Run(PrefixCommand::Even(Axis::Column), false),
+        '\\' => AwaitModule(Axis::Row),
+        '"' => AwaitModule(Axis::Column),
         _ => return None,
     })
 }
 
-/// Every character [`command`] recognises after the prefix -- derived by actually calling it
+/// The command a key names, when it names one, and whether it repeats.
+fn command(ch: char) -> Option<(PrefixCommand, bool)> {
+    match binding(ch)? {
+        Binding::Run(command, repeatable) => Some((command, repeatable)),
+        Binding::AwaitModule(_) => None,
+    }
+}
+
+/// The module keys every window has: `e` the editor, `a` the agent, `t` the terminal
+/// (`neovibe_core::layout::ModuleKeys::built_in`).
+const BUILT_IN_MODULE_KEYS: [char; 3] = ['e', 'a', 't'];
+
+/// Every character [`binding`] recognises after the prefix -- derived by actually calling it
 /// rather than a second, hand-typed list, so `main.rs`'s own two-way check against `PREFIX_KEYS`
 /// (`agent-ui/web/src/keymap.ts`) cannot itself drift from this table by restating it (item 3f:
 /// deleting both of `text_size.rs`'s `PREFIX_KEYS` rows stayed green until this existed, because
-/// nothing previously checked that direction at all). Test-only: nothing in the running product
-/// needs the bound-keys list itself, only this crate's own tests (here and in `main.rs`) do.
+/// nothing previously checked that direction at all). `\` and `"` are in it (spec §6.5: "`bound_keys()`
+/// must also report `\` and `"`"). Test-only: nothing in the running product needs the bound-keys
+/// list itself, only this crate's own tests (here and in `main.rs`) do.
 #[cfg(test)]
 pub(crate) fn bound_keys() -> Vec<char> {
     (0u8..=127u8)
         .map(char::from)
-        .filter(|&ch| command(ch).is_some())
+        .filter(|&ch| binding(ch).is_some())
+        .collect()
+}
+
+/// The keys that wait for a module key, and for each, the module keys it takes -- found by driving
+/// a [`Prefix`] with no Lua keys through `Ctrl+a`, the key, and every character (spec §6.5: "the
+/// module keys must be checked through the `AwaitModule` state, not only through `command()`").
+#[cfg(test)]
+pub(crate) fn module_keys_after() -> Vec<(char, Vec<char>)> {
+    let now = Instant::now();
+    (0u8..=127u8)
+        .map(char::from)
+        .filter(|&ch| matches!(binding(ch), Some(Binding::AwaitModule(_))))
+        .map(|split| {
+            let taken = (0u8..=127u8)
+                .map(char::from)
+                .filter(|&ch| {
+                    let mut prefix = Prefix::new();
+                    prefix.press(PrefixKey::Prefix, 0, now);
+                    prefix.press(PrefixKey::Plain(split), 1, now);
+                    // A key that names itself: a capital taken for the module key it capitalizes
+                    // (Shift still down from `"`) is a fallback, not a key of its own.
+                    matches!(
+                        prefix.press(PrefixKey::Plain(ch), 2, now),
+                        Outcome::Run(PrefixCommand::Place { key, .. }) if key == ch
+                    )
+                })
+                .collect();
+            (split, taken)
+        })
         .collect()
 }
 
@@ -170,10 +257,25 @@ pub(crate) fn bound_control_keys() -> Vec<char> {
 enum State {
     Idle,
     Armed,
+    /// After `\` or `"`: the next key names the module to place along `axis`.
+    AwaitModule {
+        axis: Axis,
+    },
     /// After a repeatable command: another repeatable key before `until` runs without the prefix.
     Repeat {
         until: Instant,
     },
+}
+
+/// What the prefix is waiting for: what the top bar shows (spec §6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Waiting {
+    /// Nothing (repeat mode included, which tmux does not show either).
+    No,
+    /// A command key: the bar's indicator, and the strip of module keys and verbs.
+    Command,
+    /// A module key after `\` or `"`: the strip shows the module keys alone.
+    Module(Axis),
 }
 
 #[derive(Debug)]
@@ -182,20 +284,39 @@ pub(crate) struct Prefix {
     /// The hardware keycode of the last key this machine consumed, until it is released. Its
     /// auto-repeat is not a new key: holding `Ctrl+a` must not turn into `Ctrl+a Ctrl+a` (§3.1).
     held: Option<u32>,
+    /// Every key that names a module: the built-ins, then each Lua panel's.
+    module_keys: Vec<char>,
 }
 
 impl Prefix {
+    /// The prefix with the built-in module keys only: what every test here drives.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Prefix::with_module_keys(&[])
+    }
+
+    /// The prefix, answering also to each Lua panel's key (`ModuleKeys::lua_keys`, already checked
+    /// against the reserved set, so none of them is a binding of its own).
+    pub(crate) fn with_module_keys(lua_keys: &[char]) -> Self {
         Prefix {
             state: State::Idle,
             held: None,
+            module_keys: BUILT_IN_MODULE_KEYS.iter().chain(lua_keys).copied().collect(),
         }
     }
 
     /// Whether the prefix is waiting for its next key: what the top bar shows (§3.1). Repeat mode
     /// is not shown, as tmux does not show it.
     pub(crate) fn is_armed(&self) -> bool {
-        self.state == State::Armed
+        self.waiting() != Waiting::No
+    }
+
+    pub(crate) fn waiting(&self) -> Waiting {
+        match self.state {
+            State::Armed => Waiting::Command,
+            State::AwaitModule { axis } => Waiting::Module(axis),
+            State::Idle | State::Repeat { .. } => Waiting::No,
+        }
     }
 
     pub(crate) fn cancel(&mut self) {
@@ -249,8 +370,8 @@ impl Prefix {
                 match key {
                     PrefixKey::Prefix => Outcome::Run(PrefixCommand::SendPrefix),
                     PrefixKey::Control('l') => Outcome::Run(PrefixCommand::SendCtrlL),
-                    PrefixKey::Plain(ch) => match command(ch) {
-                        Some((cmd, repeatable)) => {
+                    PrefixKey::Plain(ch) => match binding(ch) {
+                        Some(Binding::Run(cmd, repeatable)) => {
                             if repeatable {
                                 self.state = State::Repeat {
                                     until: now + REPEAT_TIME,
@@ -258,8 +379,38 @@ impl Prefix {
                             }
                             Outcome::Run(cmd)
                         }
+                        Some(Binding::AwaitModule(axis)) => {
+                            self.state = State::AwaitModule { axis };
+                            Outcome::Swallow
+                        }
+                        // A Lua panel's key: never one of the table's (they are reserved).
+                        None if self.module_keys.contains(&ch) => Outcome::Run(PrefixCommand::Module(ch)),
                         None => Outcome::Swallow,
                     },
+                    _ => Outcome::Swallow,
+                }
+            }
+            State::AwaitModule { axis } => {
+                if key == PrefixKey::Modifier {
+                    return Outcome::Swallow;
+                }
+                self.held = Some(keycode);
+                self.state = State::Idle;
+                match key {
+                    PrefixKey::Plain(ch) if self.module_keys.contains(&ch) => {
+                        Outcome::Run(PrefixCommand::Place { key: ch, axis })
+                    }
+                    // `"` is Shift+' on the owner's layout, so the key after it often arrives with
+                    // Shift still down: `A` for `a`. tmux's `"` takes no second key and never meets
+                    // this. A Lua panel that registered the capital itself was matched just above
+                    // (never a built-in's capital: `ModuleKeys::build` refuses those).
+                    PrefixKey::Plain(ch) if self.module_keys.contains(&ch.to_ascii_lowercase()) => {
+                        Outcome::Run(PrefixCommand::Place {
+                            key: ch.to_ascii_lowercase(),
+                            axis,
+                        })
+                    }
+                    // Not a module key, `Esc` included: swallowed, and the wait is over (spec §6.3).
                     _ => Outcome::Swallow,
                 }
             }
@@ -287,37 +438,39 @@ impl Prefix {
     }
 }
 
-/// Installs the prefix on `window`. `on_command` runs a command; `on_armed` hears every change of
-/// `is_armed()` (the top bar's indicator). Cancelled by the window losing activation and by any
-/// click -- the click still does what it does, it just also ends the wait (§3.1).
+/// Installs the prefix on `window`, answering also to `lua_keys` (each Lua panel's module key).
+/// `on_command` runs a command; `on_waiting` hears every change of `waiting()` (the top bar's
+/// indicator and its strip). Cancelled by the window losing activation and by any click -- the
+/// click still does what it does, it just also ends the wait (§3.1).
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
+    lua_keys: &[char],
     on_command: impl Fn(PrefixCommand) + 'static,
-    on_armed: impl Fn(bool) + 'static,
+    on_waiting: impl Fn(Waiting) + 'static,
 ) -> Rc<RefCell<Prefix>> {
-    let prefix = Rc::new(RefCell::new(Prefix::new()));
-    let on_armed: Rc<dyn Fn(bool)> = Rc::new(on_armed);
+    let prefix = Rc::new(RefCell::new(Prefix::with_module_keys(lua_keys)));
+    let on_waiting: Rc<dyn Fn(Waiting)> = Rc::new(on_waiting);
 
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
     {
         let prefix = prefix.clone();
-        let on_armed = on_armed.clone();
+        let on_waiting = on_waiting.clone();
         keys.connect_key_pressed(move |_, key, keycode, state| {
-            let (outcome, was_armed, is_armed) = {
+            let (outcome, was, now) = {
                 let mut p = prefix.borrow_mut();
-                let was_armed = p.is_armed();
+                let was = p.waiting();
                 let outcome = p.press(classify(key, state), keycode, Instant::now());
-                (outcome, was_armed, p.is_armed())
+                (outcome, was, p.waiting())
             };
-            if was_armed != is_armed {
+            if was != now {
                 // While the prefix is armed this same capture controller swallows every key that is
                 // not one of its own bindings -- by design, matching tmux -- so an arm that never
                 // disarms is indistinguishable from the window refusing input. Logged both ways
                 // since 2026-09-20, when a report of exactly that symptom could not be told apart
                 // from a stuck HINT or a stranded focus, because none of the three said anything.
-                println!("[prefix] armed={is_armed}");
-                on_armed(is_armed);
+                println!("[prefix] armed={} waiting={now:?}", now != Waiting::No);
+                on_waiting(now);
             }
             match outcome {
                 Outcome::Pass => glib::Propagation::Proceed,
@@ -338,13 +491,13 @@ pub(crate) fn install(
 
     let cancel = {
         let prefix = prefix.clone();
-        let on_armed = on_armed.clone();
+        let on_waiting = on_waiting.clone();
         Rc::new(move || {
             let mut p = prefix.borrow_mut();
             if p.is_armed() {
                 p.cancel();
                 drop(p);
-                on_armed(false);
+                on_waiting(Waiting::No);
             }
         })
     };
@@ -380,6 +533,7 @@ mod tests {
     const K: u32 = 45;
     const L: u32 = 46;
     const X: u32 = 53;
+    const Q: u32 = 24;
     const ESC: u32 = 9;
     const F11: u32 = 95;
     const SHIFT_L: u32 = 50;
@@ -461,7 +615,7 @@ mod tests {
     #[test]
     fn an_unbound_key_after_the_prefix_is_swallowed_and_ends_it() {
         let t0 = Instant::now();
-        for (key, keycode) in [(PrefixKey::Plain('x'), X), (PrefixKey::Other, F11)] {
+        for (key, keycode) in [(PrefixKey::Plain('q'), Q), (PrefixKey::Other, F11)] {
             let mut p = Prefix::new();
             p.press(PrefixKey::Prefix, CTRL_A, t0);
             assert_eq!(p.press(key, keycode, t0), Outcome::Swallow);
@@ -606,9 +760,10 @@ mod tests {
 
         let mut p = Prefix::new();
         p.press(PrefixKey::Prefix, CTRL_A, t0);
-        assert_eq!(p.press(PrefixKey::Plain('x'), X, t0), Outcome::Swallow);
-        // Holding an unbound key is swallowed too, not passed on a second time.
-        assert_eq!(p.press(PrefixKey::Plain('x'), X, t0), Outcome::Swallow);
+        assert_eq!(p.press(PrefixKey::Plain('q'), Q, t0), Outcome::Swallow);
+        // Holding an unbound key is swallowed too, not passed on a second time. (`q`, not `x`, since
+        // modules P2 bound `x`: `q` stays unbound on purpose.)
+        assert_eq!(p.press(PrefixKey::Plain('q'), Q, t0), Outcome::Swallow);
     }
 
     /// A key down when the window loses focus produces no release, so `cancel` has to forget it --
@@ -641,7 +796,190 @@ mod tests {
     fn bound_keys_names_exactly_the_commands_table() {
         let mut keys = bound_keys();
         keys.sort_unstable();
-        assert_eq!(keys, ['-', '0', '=', 'h', 'j', 'k', 'l', 'm', 't', 'z']);
+        assert_eq!(
+            keys,
+            [
+                '"', '-', '0', '=', 'H', 'J', 'K', 'L', '\\', '_', 'a', 'e', 'h', 'j', 'k', 'l', 'm', 't', 'x', 'z',
+                '|'
+            ]
+        );
+    }
+
+    /// Every key the prefix binds is one no Lua panel may take (spec §6.4), so a panel's key can
+    /// never shadow one of neovibe's own.
+    #[test]
+    fn every_bound_key_is_reserved_against_lua_panels() {
+        for ch in bound_keys() {
+            assert!(
+                neovibe_core::layout::keys::RESERVED.contains(&ch),
+                "{ch:?} is bound after Ctrl+a but a Lua panel could take it"
+            );
+        }
+        let built_in: Vec<char> = neovibe_core::layout::ModuleKeys::built_in()
+            .entries()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(built_in, BUILT_IN_MODULE_KEYS, "one list of built-in module keys");
+    }
+
+    /// Modules P2 (spec §6.3): each new key after the prefix runs its command once and disarms;
+    /// none repeats, so a second press inside the repeat window is typed, not run again.
+    #[test]
+    fn the_module_verbs_run_once_and_do_not_repeat() {
+        let t0 = Instant::now();
+        let cases = [
+            ('x', PrefixCommand::Hide),
+            ('e', PrefixCommand::Module('e')),
+            ('a', PrefixCommand::Module('a')),
+            ('H', PrefixCommand::Swap(Direction::Left)),
+            ('J', PrefixCommand::Swap(Direction::Down)),
+            ('K', PrefixCommand::Swap(Direction::Up)),
+            ('L', PrefixCommand::Swap(Direction::Right)),
+            ('|', PrefixCommand::Even(Axis::Row)),
+            ('_', PrefixCommand::Even(Axis::Column)),
+        ];
+        for (ch, expected) in cases {
+            let mut p = Prefix::new();
+            p.press(PrefixKey::Prefix, CTRL_A, t0);
+            assert_eq!(p.press(PrefixKey::Plain(ch), X, t0), Outcome::Run(expected), "{ch}");
+            assert!(!p.is_armed());
+            p.release(X);
+            assert_eq!(
+                p.press(PrefixKey::Plain(ch), X, t0 + Duration::from_millis(100)),
+                Outcome::Pass,
+                "{ch} does not repeat"
+            );
+        }
+    }
+
+    /// `Ctrl+a \ <key>` and `Ctrl+a " <key>`: the prefix waits for a module key, and says so; a
+    /// module key places that module; anything else -- `Esc`, a verb, an unknown key -- is swallowed
+    /// and ends the wait (spec §6.3's mechanics).
+    #[test]
+    fn a_split_key_waits_for_a_module_key() {
+        let t0 = Instant::now();
+        for (split, axis) in [('\\', Axis::Row), ('"', Axis::Column)] {
+            for (key, keycode, expected) in [
+                (
+                    PrefixKey::Plain('a'),
+                    X,
+                    Outcome::Run(PrefixCommand::Place { key: 'a', axis }),
+                ),
+                (
+                    PrefixKey::Plain('t'),
+                    T,
+                    Outcome::Run(PrefixCommand::Place { key: 't', axis }),
+                ),
+                (PrefixKey::Plain('x'), X, Outcome::Swallow),
+                (PrefixKey::Plain('q'), X, Outcome::Swallow),
+                (PrefixKey::Escape, ESC, Outcome::Swallow),
+            ] {
+                let mut p = Prefix::new();
+                assert_eq!(p.waiting(), Waiting::No);
+                p.press(PrefixKey::Prefix, CTRL_A, t0);
+                // Armed, it waits for a command: the strip lists the module keys AND the verbs
+                // (Task 9's review, minor 3 -- no test told `Command` from `Module(..)` here).
+                assert_eq!(p.waiting(), Waiting::Command);
+                assert_eq!(p.press(PrefixKey::Plain(split), M, t0), Outcome::Swallow);
+                assert_eq!(p.waiting(), Waiting::Module(axis));
+                assert_eq!(p.press(PrefixKey::Modifier, SHIFT_L, t0), Outcome::Swallow);
+                assert_eq!(
+                    p.waiting(),
+                    Waiting::Module(axis),
+                    "a bare modifier is not the next key"
+                );
+                assert_eq!(p.press(key, keycode, t0), expected, "{split} then {key:?}");
+                assert_eq!(p.waiting(), Waiting::No);
+            }
+        }
+    }
+
+    /// `"` is Shift+' on the owner's layout, so `Ctrl+a " a` often arrives as `" A`, Shift released a
+    /// beat late. tmux never meets this -- its `"` takes no second key -- so the capital is taken as
+    /// the module key it capitalizes (the plan review's second round, finding 4). A Lua panel that
+    /// registered the capital itself is matched exactly first -- never a built-in's capital, which
+    /// `ModuleKeys::build` refuses (`E`/`A`/`T`/`C`), so `" A` is always the chat -- and a capital
+    /// naming nothing is swallowed.
+    #[test]
+    fn a_module_key_still_shifted_from_the_quote_names_its_module() {
+        let t0 = Instant::now();
+        let place = |key| {
+            Outcome::Run(PrefixCommand::Place {
+                key,
+                axis: Axis::Column,
+            })
+        };
+        let none: &[char] = &[];
+        for (lua_keys, pressed, expected) in [
+            (none, 'A', place('a')),
+            (none, 'T', place('t')),
+            (&['g', 'G'][..], 'G', place('G')),
+            (&['g'][..], 'G', place('g')),
+            (none, 'Q', Outcome::Swallow),
+        ] {
+            let mut p = Prefix::with_module_keys(lua_keys);
+            p.press(PrefixKey::Prefix, CTRL_A, t0);
+            p.press(PrefixKey::Plain('"'), M, t0);
+            assert_eq!(
+                p.press(PrefixKey::Plain(pressed), X, t0),
+                expected,
+                "{lua_keys:?} then {pressed}"
+            );
+        }
+    }
+
+    /// A Lua panel's key is a module key like `e`/`a`/`t`: on its own, and after `\`/`"`. A
+    /// window without that panel swallows it like any unbound key.
+    #[test]
+    fn a_lua_panels_key_names_its_module() {
+        let t0 = Instant::now();
+        let mut p = Prefix::with_module_keys(&['N']);
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        assert_eq!(
+            p.press(PrefixKey::Plain('N'), X, t0),
+            Outcome::Run(PrefixCommand::Module('N'))
+        );
+        p.release(X);
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        p.press(PrefixKey::Plain('"'), M, t0);
+        assert_eq!(
+            p.press(PrefixKey::Plain('N'), X, t0),
+            Outcome::Run(PrefixCommand::Place {
+                key: 'N',
+                axis: Axis::Column
+            })
+        );
+        let mut plain = Prefix::new();
+        plain.press(PrefixKey::Prefix, CTRL_A, t0);
+        assert_eq!(plain.press(PrefixKey::Plain('N'), X, t0), Outcome::Swallow);
+    }
+
+    /// `q` is deliberately unbound (decision c: in his tmux it is `kill-window`); `c` waits for P3's
+    /// canvas; `-` stays text size, not split-below.
+    #[test]
+    fn q_and_c_are_swallowed_and_minus_is_still_text_size() {
+        let t0 = Instant::now();
+        for ch in ['q', 'c'] {
+            let mut p = Prefix::new();
+            p.press(PrefixKey::Prefix, CTRL_A, t0);
+            assert_eq!(p.press(PrefixKey::Plain(ch), X, t0), Outcome::Swallow, "{ch}");
+        }
+        let mut p = Prefix::new();
+        p.press(PrefixKey::Prefix, CTRL_A, t0);
+        assert_eq!(
+            p.press(PrefixKey::Plain('-'), MINUS, t0),
+            Outcome::Run(PrefixCommand::TextSize(TextStep::Smaller))
+        );
+    }
+
+    #[test]
+    fn the_split_keys_take_every_built_in_module_key() {
+        let mut found = module_keys_after();
+        for (_, keys) in &mut found {
+            keys.sort_unstable();
+        }
+        assert_eq!(found, [('"', vec!['a', 'e', 't']), ('\\', vec!['a', 'e', 't'])]);
     }
 
     #[test]

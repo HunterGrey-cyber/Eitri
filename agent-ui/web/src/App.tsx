@@ -5,7 +5,7 @@ import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
 import type { KeyLike, PanelMode } from "./keymap";
-import { buildTimeline } from "./timeline";
+import { buildTimeline, oldestPendingPermission } from "./timeline";
 import { controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
@@ -338,6 +338,10 @@ export default function App() {
    *  is also passed to `Composer` as `focusRequest`, which re-focuses a textarea that is already
    *  mounted, since `setMode("input")` alone does nothing when the mode was already INPUT. */
   const [inputRequest, setInputRequest] = useState(0);
+  /** Bumped by each `focus_permission` envelope (modules P2: the tray's `agent ⚑N` chip, or `Ctrl+a a`
+   *  with a card waiting). A counter for the reason `inputRequest` is one: the handler is installed
+   *  once and reads no state; the effect below finds the card against the current render. */
+  const [permissionRequest, setPermissionRequest] = useState(0);
   /** Whether keyboard focus is on a stop that is NOT a conversation row -- a banner's Dismiss, the
    *  status line's Stop, the handoff button (`./nav`). While it is, the row cursor is drawn hollow,
    *  the same way it is when another pane has the keys: it is where `k` brings you back to, and it
@@ -525,6 +529,22 @@ export default function App() {
     setMode("input");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inputRequest]);
+  /* `focus_permission` (modules spec §3.3): BROWSE, with the cursor on the oldest pending card, so
+     `a`/`d` answer it at once. `shell` sends it only when it counts a card; if the card was answered
+     in between, there is nothing to land on, and the arrival is an ordinary keyboard one -- the
+     composer, as `enter_input` gives it. Keyed on the request alone, like `inputRequest`. */
+  useEffect(() => {
+    if (permissionRequest === 0) return;
+    const index = oldestPendingPermission(timeline);
+    if (index === null) {
+      setInputRequest((n) => n + 1);
+      return;
+    }
+    setMode("browse");
+    setCursor(index);
+    containerRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [permissionRequest]);
   /** The start screen's own focus target, for the same reason `containerRef` needs one: a keydown
    *  bubbles from whatever has real focus, and nothing here claims it by default. Only ever used to
    *  make `y` (copying a handoff command, see `handleStartScreenKeyDown`) reachable without an
@@ -621,6 +641,10 @@ export default function App() {
         // the overlay must not be left covering it and eating what gets typed.
         setKeymapOpen(false);
         setInputRequest((n) => n + 1);
+      } else if (payload.kind === "focus_permission") {
+        // The overlay would cover the card the cursor is about to land on.
+        setKeymapOpen(false);
+        setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "select_all") {
         // `Ctrl+a Ctrl+a` (shell's prefix): what `Ctrl+a` does in a text field, since WebKitGTK
         // cannot be handed the key itself. Nothing when no text field has focus.

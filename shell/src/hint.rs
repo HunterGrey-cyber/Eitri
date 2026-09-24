@@ -50,6 +50,7 @@ use neovibe_core::layout::ModuleId;
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::{AgentPanelHandle, HintInbound};
+use crate::module_grid::ModuleHosts;
 
 /// How long `shell` waits for the panel's `hint_targets` before labelling the GTK targets alone
 /// (spec §3.3). A panel that never answers -- not loaded, wedged, replaced -- must not hold the
@@ -199,10 +200,6 @@ struct Active {
     timeout: Option<glib::SourceId>,
 }
 
-/// The window's modules as HINT needs them: every module's id and host widget, in the layout's
-/// tree order. Read afresh at each HINT, because the layout is data and may have changed.
-pub(crate) type ModuleHosts = Rc<dyn Fn() -> Vec<(ModuleId, gtk4::Widget)>>;
-
 pub(crate) struct HintCoordinator {
     window: gtk4::ApplicationWindow,
     /// Wraps the window's root; labels are its overlay children.
@@ -211,6 +208,7 @@ pub(crate) struct HintCoordinator {
     editor: Rc<NeovideEditorPane>,
     editor_widget: gtk4::Widget,
     agent_widget: gtk4::Widget,
+    /// [`HintWidgets::modules`].
     modules: ModuleHosts,
     /// Lands on a module the way that module takes focus (the editor tells the input method).
     focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
@@ -229,6 +227,11 @@ pub(crate) struct HintWidgets {
     pub(crate) top_items: Vec<gtk4::Widget>,
     pub(crate) editor: Rc<NeovideEditorPane>,
     pub(crate) agent_widget: gtk4::Widget,
+    /// Every module and its host **in the layout's tree order** (`ModuleGrid::hosts_in_tree_order`):
+    /// HINT feeds it straight into `WindowLayout::modules`, which orders its labels by it. The alias
+    /// promises no order of its own -- `ModuleGrid::live_hosts` is add order -- so a builder that
+    /// "tidied" `main.rs`'s closure into `live_hosts()` would reorder every label, and nothing
+    /// headless would notice (Task 8's review, minor 1).
     pub(crate) modules: ModuleHosts,
     pub(crate) focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
     pub(crate) agent: AgentPanelHandle,

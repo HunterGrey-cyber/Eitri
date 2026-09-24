@@ -113,8 +113,10 @@ pub enum Placement {
 }
 
 /// A module the layout is built with beyond the two built-ins every window has (the editor and the
-/// agent). `title` and `key` join it in P2, whose tray chips and `Ctrl+a <key>` are their first
-/// readers.
+/// agent). The spec's `title` and `key` (§3.1) live beside it, not on it (modules P2): a module's key
+/// is in [`super::keys::ModuleKeys`] and its title is `shell`'s `tray::module_title`, because
+/// `shell/src/terminal/mod.rs::initial_layout` builds this struct by literal and a new field would be
+/// an edit in the terminal's own files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDecl {
     pub id: ModuleId,

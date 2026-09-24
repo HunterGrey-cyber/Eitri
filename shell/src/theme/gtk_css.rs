@@ -105,6 +105,49 @@ window {{
     background-color: {bg};
 }}
 
+/* The tray (modules P2, `shell::tray`): a chip for each module not on screen. Quiet like the
+   project name until the agent's asks (`agent ⚑N`), which takes the bar's full text colour. Its
+   cursor is `.topbar-item:focus`, below -- and must stay below: `.tray-chip.attention` is as
+   specific, so the later rule wins, and a focused chip asking for the user must still be drawn as
+   the cursor. */
+.tray-chip {{
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid {border};
+    box-shadow: none;
+    color: {chrome_muted};
+    min-height: 22px;
+    padding: 0 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}}
+
+.tray-chip.attention {{
+    color: {chrome_fg};
+    font-weight: 700;
+}}
+
+/* The prefix strip (modules P2, `shell::prefix_strip`): the module keys and verbs while `Ctrl+a`
+   waits, a hidden module in the muted colour -- a token, never opacity, which this project has had
+   to take back three times. `·` between two runs is muted too. The right margin keeps the last run
+   off the project name (the GUI pass's C1: `H J K L swapproj`): 10px, about one run-to-run gap,
+   and with no `·` before the name it reads as the end of the list rather than as one more run. It
+   adds those 10px to the armed bar's minimum width; while the prefix does not wait the strip is
+   hidden, margin and all. */
+.prefix-strip {{
+    color: {chrome_fg};
+    font-size: 12px;
+    margin-right: 10px;
+}}
+
+.prefix-strip .dimmed {{
+    color: {chrome_muted};
+}}
+
+.prefix-strip .strip-dot {{
+    color: {chrome_muted};
+}}
+
 /* The top bar's keyboard cursor. `Ctrl+k` brings focus here, and the focused item is drawn the
    way every other cursor in this window is: a solid block with the glyph knocked out. The editor's
    block is Neovide's own, the panel's is its current row's sign cell. That is the whole focus
@@ -122,6 +165,26 @@ window {{
 .topbar-app-name.prefix-armed {{
     background-color: {chrome_fg};
     color: {chrome};
+}}
+
+/* A layout verb was refused -- `Ctrl+a x` on the last module on screen (modules P2, spec §3.2): the
+   same block, for 200ms (`main.rs`'s `refuse`). Its own class, so the prefix's own indicator is
+   never switched off by the flash ending. */
+.topbar-app-name.refused {{
+    background-color: {chrome_fg};
+    color: {chrome};
+}}
+
+/* The toast (modules P2, `shell::toast`): a hidden chat's new permission card, over everything in
+   the top right. The top bar's own guarded pair, so it reads the same in every mode, Immersive
+   included, where it is the only thing that says so. */
+.module-toast {{
+    background-color: {chrome};
+    color: {chrome_fg};
+    border: 1px solid {border};
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
 }}
 
 /* The global f HINT's GTK labels -- top bar items, the editor pane, a bottom plugin pane
@@ -174,8 +237,13 @@ impl ThemeCss {
         ThemeCss { provider }
     }
 
-    pub(crate) fn update(&self, tokens: &ThemeTokens) {
+    /// Reloads the stylesheet with `tokens`, then has every widget under `root` that GTK would leave
+    /// on the previous stylesheet take this one ([`super::restyle::restyle_unrealized`]; modules P2's
+    /// GUI pass, D1: a tray chip first shown after startup kept the fallback's colours). `root` is
+    /// the window: every widget this stylesheet paints is under it.
+    pub(crate) fn update(&self, tokens: &ThemeTokens, root: &gtk4::Widget) {
         self.provider.load_from_string(&gtk_css(tokens));
+        super::restyle::restyle_unrealized(root);
     }
 }
 
@@ -276,6 +344,12 @@ mod tests {
         });
         let css = gtk_css(&t);
         for (selector, colour, min) in [
+            (".module-toast", t.chrome_fg, 4.5),
+            (".tray-chip", t.chrome_muted, 4.5),
+            (".tray-chip.attention", t.chrome_fg, 4.5),
+            (".prefix-strip", t.chrome_fg, 4.5),
+            (".prefix-strip .dimmed", t.chrome_muted, 4.5),
+            (".prefix-strip .strip-dot", t.chrome_muted, 4.5),
             (".topbar-app-name", t.chrome_fg, 4.5),
             (".topbar-project-name", t.chrome_muted, 4.5),
             (".win-btn", t.chrome_muted, 4.5),
@@ -313,6 +387,55 @@ mod tests {
                 css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(),
                 "hover must not win"
             );
+        }
+    }
+
+    /// A focused chip is drawn as the cursor even while it asks for the user: `.tray-chip.attention`
+    /// is as specific as `.topbar-item:focus`, so it has to come first.
+    #[test]
+    fn a_focused_chip_is_the_cursor_even_while_it_asks() {
+        let css = gtk_css(&ThemeTokens::fallback());
+        assert!(css.find("\n.tray-chip.attention {").unwrap() < css.find("\n.topbar-item:focus {").unwrap());
+        assert!(css.find("\n.tray-chip {").unwrap() < css.find("\n.topbar-item:focus {").unwrap());
+    }
+
+    /// The GUI pass's C1 (2026-09-24): armed, the strip's last run touched the project name
+    /// (`H J K L swapproj`). The strip ends in a margin of its own -- on the strip, which is hidden
+    /// while the prefix does not wait, so the unarmed bar is not moved by it.
+    #[test]
+    fn the_strip_keeps_off_the_project_name() {
+        let css = gtk_css(&ThemeTokens::fallback());
+        let strip = rule(&css, ".prefix-strip");
+        assert!(strip.contains("\n    margin-right: 10px;"), "{strip}");
+        let name = rule(&css, ".topbar-project-name");
+        assert!(
+            !name.contains("margin"),
+            "the name must not move when the prefix is not armed: {name}"
+        );
+    }
+
+    /// `theme::restyle` toggles a class to make GTK recompute a widget's style; a rule naming that
+    /// class would paint every widget it touches for the moment it is set.
+    #[test]
+    fn no_rule_names_the_restyle_class() {
+        for t in [dawn(), ThemeTokens::fallback(), lunaperche()] {
+            assert!(!gtk_css(&t).contains(crate::theme::restyle::RESTYLE_CLASS));
+        }
+    }
+
+    /// The refusal flash is the prefix indicator's block (spec §3.2), and like it wins over the
+    /// app name's own colours by coming later.
+    #[test]
+    fn the_refusal_flash_is_the_prefix_indicators_block() {
+        for t in [dawn(), ThemeTokens::fallback()] {
+            let css = gtk_css(&t);
+            let refused = rule(&css, ".topbar-app-name.refused");
+            assert!(
+                refused.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+                "{refused}"
+            );
+            assert!(refused.contains(&format!("color: {};", t.chrome.hex())), "{refused}");
+            assert!(css.find("\n.topbar-app-name {").unwrap() < css.find("\n.topbar-app-name.refused").unwrap());
         }
     }
 

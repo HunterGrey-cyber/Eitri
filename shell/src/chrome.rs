@@ -33,16 +33,32 @@ pub(crate) struct TopBar {
     /// Minimize/maximize/close. Hidden whenever the window is fullscreen (`window_mode`).
     pub(crate) controls: gtk4::Widget,
     /// The `neovibe` label, drawn as a solid block while the `Ctrl+a` prefix waits (`prefix`).
-    #[allow(dead_code)] // read by the `prefix` module (plan Task 3, spec §3.1); not consumed by Task 1
     pub(crate) app_name: gtk4::Label,
+    /// Where the prefix strip goes, right of the app name (`prefix_strip`, modules P2).
+    pub(crate) strip: gtk4::Box,
+    /// Where the tray goes, left of `↻` (`tray`, modules P2). Its chips are top-bar items too, before
+    /// `items` -- `main.rs` joins the two lists.
+    pub(crate) tray: gtk4::Box,
+}
+
+/// `h`/`l` on the top bar: the visible item `step` away from `current`, stopping at either end, or
+/// `None` when no item is visible. A tray chip whose module is on screen is not visible, and is
+/// stepped over. From no current item, the first visible one.
+pub(crate) fn step_item(visible: &[bool], current: Option<usize>, step: isize) -> Option<usize> {
+    let shown: Vec<usize> = (0..visible.len()).filter(|&i| visible[i]).collect();
+    let Some(current) = current.and_then(|c| shown.iter().position(|&i| i == c)) else {
+        return shown.first().copied();
+    };
+    let next = (current as isize + step).clamp(0, shown.len() as isize - 1) as usize;
+    Some(shown[next])
 }
 
 /// Builds the top bar. Returns the bar and the parts of it other modules act on (`TopBar`).
 ///
 /// `Ctrl+k` reaches the top bar from either pane (2026-09-19): it is spatially above both, the
-/// same way `Ctrl+l` reaches the panel. The items are what `h`/`l` move between once there. Today
-/// that is only `↻`; the project switcher the UI spec puts at the left (§2.1) joins it when it
-/// lands. **The window controls are deliberately not items and cannot take focus at all** (see
+/// same way `Ctrl+l` reaches the panel. The items are what `h`/`l` move between once there: `↻`
+/// here, and since modules P2 the tray's chips ahead of it (`main.rs` joins the two lists); the
+/// project switcher the UI spec puts at the left (§2.1) joins them when it lands. **The window controls are deliberately not items and cannot take focus at all** (see
 /// `build_window_controls`): a stray `Enter` after `Ctrl+k` must never be able to close the window.
 pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> TopBar {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -56,6 +72,12 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     project_name.add_css_class("topbar-project-name");
     project_name.set_hexpand(true);
     project_name.set_halign(gtk4::Align::Start);
+    // The name gives way when the bar is short of room -- in a narrow window while the prefix strip
+    // lists every key beside it (modules P2). The strip's own labels ellipsize too
+    // (`PrefixStrip::show`); an ellipsized label's minimum is its ellipsis, so neither raises the
+    // bar's minimum width, and so the window's. The tray's chips do not shrink: a zoom that puts
+    // many of them on a narrow bar can still widen it (not seen on a screen either way).
+    project_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     // Reload the agent panel's frontend -- the same `app.reload-agent-panel` action Ctrl+Shift+R
     // fires (see `agent_panel::install_reload_action`). It lives in the window chrome rather than in
@@ -78,8 +100,16 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
 
     let controls = build_window_controls(window);
 
+    let strip = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    strip.set_valign(gtk4::Align::Center);
+    let tray = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    tray.set_valign(gtk4::Align::Center);
+    tray.set_margin_end(6);
+
     bar.append(&app_name);
+    bar.append(&strip);
     bar.append(&project_name);
+    bar.append(&tray);
     bar.append(&reload_agent);
     bar.append(&controls);
 
@@ -90,6 +120,8 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
         items: vec![reload_agent.upcast()],
         controls,
         app_name,
+        strip,
+        tray,
     }
 }
 
@@ -163,5 +195,29 @@ mod tests {
     #[test]
     fn the_root_directory_has_no_last_component_so_it_falls_back_to_itself() {
         assert_eq!(project_display_name(Path::new("/")), "/");
+    }
+
+    /// Modules P2: the tray's chips come and go, and `h`/`l` step over the ones that are not shown,
+    /// stopping at the ends as they always did.
+    #[test]
+    fn h_and_l_step_over_items_that_are_not_shown() {
+        use super::step_item;
+        // [editor chip (hidden), terminal chip, agent chip (hidden), ↻]
+        let visible = [false, true, false, true];
+        assert_eq!(
+            step_item(&visible, None, 1),
+            Some(1),
+            "Ctrl+k lands on the first shown item"
+        );
+        assert_eq!(step_item(&visible, Some(1), 1), Some(3));
+        assert_eq!(step_item(&visible, Some(3), 1), Some(3), "stops at the end");
+        assert_eq!(step_item(&visible, Some(3), -1), Some(1));
+        assert_eq!(step_item(&visible, Some(1), -1), Some(1), "stops at the start");
+        assert_eq!(
+            step_item(&visible, Some(0), 1),
+            Some(1),
+            "from a hidden item: the first shown"
+        );
+        assert_eq!(step_item(&[false, false], None, 1), None);
     }
 }

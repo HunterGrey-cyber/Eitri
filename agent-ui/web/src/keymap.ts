@@ -180,4 +180,10 @@ export const PREFIX_KEYS: KeyHelp[] = [
   { keys: "Ctrl+a t", what: "Terminal: show and focus it, or hide it when it has the keys" },
   { keys: "Ctrl+a = / -", what: "Text size larger / smaller, this pane only (repeat within 500 ms)" },
   { keys: "Ctrl+a 0", what: "Text size reset, this pane only" },
+  { keys: "Ctrl+a x", what: "Hide this module; it keeps running (not the last one on screen)" },
+  { keys: "Ctrl+a e / a", what: "Editor / agent: show and focus it, or hide it when it has the keys" },
+  { keys: "Ctrl+a \\ then e / a / t", what: "Open that module right of this one, or move it there" },
+  { keys: "Ctrl+a \" then e / a / t", what: "Open that module below this one, or move it there" },
+  { keys: "Ctrl+a | / _", what: "Every module in one row / one column, at equal sizes" },
+  { keys: "Ctrl+a H / J / K / L", what: "Swap this module with the one left / below / above / right" },
 ];

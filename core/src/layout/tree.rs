@@ -15,6 +15,14 @@
 //! hidden module** -- [`Layout::set_focus`] refuses one, and [`super::geometry::hide`] moves them
 //! before it hides the module that holds them (the spec's P1 row: "a test that a hidden module never
 //! holds focus").
+//!
+//! **A split divides by its ratio, unless it is pinned** (modules P2). A [`Pin`] keeps one side's
+//! length in pixels when the space the split divides changes, as an IDE's bottom panel keeps its
+//! height when the window grows -- the owner's call on the spec's §14 question, "a bottom row keeps
+//! its height when the window grows". Only a module placed below the whole root is pinned
+//! ([`Placement::BelowRoot`]: the bottom terminal, a Lua `bottom` panel). Its first show still
+//! divides by the ratio, a third of the height at whatever size the window has then, as `main`'s
+//! `shown_position` did; [`super::geometry::settle_pins`] then freezes that length.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -51,6 +59,30 @@ pub const RIGHT_OF_ROOT_SHARE: f32 = 0.67;
 /// the editor is shown again (P2): until then the split collapses and the module fills the leaf.
 const IN_PLACE_SHARE: f32 = 0.5;
 
+/// Puts module `id`, which `root` does not contain, where `placement` says (spec §4.5). `true` when
+/// it took the editor's leaf, so the editor has to be hidden -- a Lua `main` panel. Shared by the first
+/// launch and by `super::reconcile`, which places a module a saved layout has never seen the way a
+/// first launch would. A tree with no editor leaf gets an `InPlaceOfEditor` module right of the root.
+pub(super) fn place_new(root: Node, id: &ModuleId, placement: Placement) -> (Node, bool) {
+    let leaf = Node::Leaf(id.clone());
+    match placement {
+        Placement::InPlaceOfEditor if root.leaves().contains(&ModuleId::editor()) => {
+            let mut root = root;
+            root.replace_leaf(&ModuleId::editor(), |editor| {
+                Node::split(Axis::Row, IN_PLACE_SHARE, leaf, editor)
+            });
+            (root, true)
+        }
+        Placement::RightOfRoot | Placement::InPlaceOfEditor => {
+            (Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, root, leaf), false)
+        }
+        Placement::BelowRoot => (
+            Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
+            false,
+        ),
+    }
+}
+
 /// `Row`: side by side, with a vertical divider between them. `Column`: stacked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
@@ -68,13 +100,26 @@ pub enum Branch {
 /// A split, named by the branches that lead to it from the root (the root split is `[]`).
 pub type SplitPath = Vec<Branch>;
 
+/// A split that keeps one side's length when the length it divides changes (this file's doc). The
+/// other side takes whatever is left, within both sides' minimum sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pin {
+    /// The child whose length is kept.
+    pub side: Branch,
+    /// That child's length in pixels, once the split has been on screen with both sides; `None`
+    /// until then, and the split divides by its ratio.
+    pub px: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Leaf(ModuleId),
     Split {
         axis: Axis,
-        /// The first child's share of the length the split divides, `MIN_RATIO..=MAX_RATIO`.
+        /// The first child's share of the length the split divides, `MIN_RATIO..=MAX_RATIO`. A
+        /// pinned split uses it only until its pin has a length.
         ratio: f32,
+        pin: Option<Pin>,
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -85,6 +130,19 @@ impl Node {
         Node::Split {
             axis,
             ratio,
+            pin: None,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    /// A split whose `side` keeps its length once it has one ([`Pin`]); until then it divides by
+    /// `ratio`.
+    pub fn pinned(axis: Axis, ratio: f32, side: Branch, first: Node, second: Node) -> Node {
+        Node::Split {
+            axis,
+            ratio,
+            pin: Some(Pin { side, px: None }),
             first: Box::new(first),
             second: Box::new(second),
         }
@@ -119,6 +177,33 @@ impl Node {
         }
     }
 
+    fn pins(&self, out: &mut Vec<Pin>) {
+        if let Node::Split { pin, first, second, .. } = self {
+            out.extend(*pin);
+            first.pins(out);
+            second.pins(out);
+        }
+    }
+
+    fn any_leaf(&self, shown: &dyn Fn(&ModuleId) -> bool) -> bool {
+        match self {
+            Node::Leaf(id) => shown(id),
+            Node::Split { first, second, .. } => first.any_leaf(shown) || second.any_leaf(shown),
+        }
+    }
+
+    /// A pinned split with no length yet and a `shown` leaf on both sides, anywhere below.
+    fn has_pin_to_settle(&self, shown: &dyn Fn(&ModuleId) -> bool) -> bool {
+        match self {
+            Node::Leaf(_) => false,
+            Node::Split { pin, first, second, .. } => {
+                (matches!(pin, Some(Pin { px: None, .. })) && first.any_leaf(shown) && second.any_leaf(shown))
+                    || first.has_pin_to_settle(shown)
+                    || second.has_pin_to_settle(shown)
+            }
+        }
+    }
+
     fn at_path_mut(&mut self, path: &[Branch]) -> Option<&mut Node> {
         match (path.split_first(), self) {
             (None, node) => Some(node),
@@ -130,8 +215,48 @@ impl Node {
         }
     }
 
+    /// This tree without the leaf `id`, whose sibling takes the split's place, as a hidden module's
+    /// sibling takes its space. The split goes with its ratio and its pin. `None` if `id` was the
+    /// whole tree; unchanged if `id` is not in it.
+    pub(super) fn without(self, id: &ModuleId) -> Option<Node> {
+        match self {
+            Node::Leaf(leaf) if leaf == *id => None,
+            Node::Leaf(leaf) => Some(Node::Leaf(leaf)),
+            Node::Split {
+                axis,
+                ratio,
+                pin,
+                first,
+                second,
+            } => match (first.without(id), second.without(id)) {
+                (Some(first), Some(second)) => Some(Node::Split {
+                    axis,
+                    ratio,
+                    pin,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            },
+        }
+    }
+
+    /// The leaves `a` and `b` exchange places; every split keeps its axis, ratio and pin.
+    pub(super) fn swap_leaves(&mut self, a: &ModuleId, b: &ModuleId) {
+        match self {
+            Node::Leaf(id) if id == a => *id = b.clone(),
+            Node::Leaf(id) if id == b => *id = a.clone(),
+            Node::Leaf(_) => {}
+            Node::Split { first, second, .. } => {
+                first.swap_leaves(a, b);
+                second.swap_leaves(a, b);
+            }
+        }
+    }
+
     /// Replaces the leaf `id` with `with(leaf)`. `false` if there is no such leaf.
-    fn replace_leaf(&mut self, id: &ModuleId, with: impl FnOnce(Node) -> Node) -> bool {
+    pub(super) fn replace_leaf(&mut self, id: &ModuleId, with: impl FnOnce(Node) -> Node) -> bool {
         match self {
             Node::Leaf(leaf) if leaf == id => {
                 let old = std::mem::replace(self, Node::Leaf(id.clone()));
@@ -164,6 +289,10 @@ pub enum LayoutError {
     Ratio(f32),
     /// A path that does not lead to a split.
     NotASplit(SplitPath),
+    /// A pinned length below zero.
+    Pin(i32),
+    /// A module cannot be placed next to itself (tmux: "source and target panes must be different").
+    SameModule(ModuleId),
 }
 
 impl fmt::Display for LayoutError {
@@ -175,6 +304,8 @@ impl fmt::Display for LayoutError {
             LayoutError::LastVisible(id) => write!(f, "'{id}' is the last visible module and cannot be hidden"),
             LayoutError::Ratio(r) => write!(f, "ratio {r} is outside {MIN_RATIO}..={MAX_RATIO}"),
             LayoutError::NotASplit(path) => write!(f, "{path:?} does not lead to a split"),
+            LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
+            LayoutError::SameModule(id) => write!(f, "'{id}' cannot be placed next to itself"),
         }
     }
 }
@@ -219,6 +350,11 @@ impl Layout {
         if let Some(bad) = ratios.into_iter().find(|r| !(MIN_RATIO..=MAX_RATIO).contains(r)) {
             return Err(LayoutError::Ratio(bad));
         }
+        let mut pins = Vec::new();
+        root.pins(&mut pins);
+        if let Some(bad) = pins.into_iter().filter_map(|p| p.px).find(|px| *px < 0) {
+            return Err(LayoutError::Pin(bad));
+        }
         if !seen.contains(&focus) {
             return Err(LayoutError::NotInTree(focus));
         }
@@ -250,17 +386,11 @@ impl Layout {
             if root.leaves().contains(&decl.id) {
                 return Err(LayoutError::Duplicate(decl.id.clone()));
             }
-            let leaf = Node::Leaf(decl.id.clone());
-            match decl.placement {
-                Placement::RightOfRoot => root = Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, root, leaf),
-                Placement::BelowRoot => root = Node::split(Axis::Column, BELOW_ROOT_SHARE, root, leaf),
-                Placement::InPlaceOfEditor => {
-                    root.replace_leaf(&ModuleId::editor(), |editor| {
-                        Node::split(Axis::Row, IN_PLACE_SHARE, leaf, editor)
-                    });
-                    hide_editor = true;
-                    in_editors_place.get_or_insert(decl.id.clone());
-                }
+            let (placed, took_editors_place) = place_new(root, &decl.id, decl.placement);
+            root = placed;
+            if took_editors_place {
+                hide_editor = true;
+                in_editors_place.get_or_insert(decl.id.clone());
             }
         }
         let focus = in_editors_place.unwrap_or_else(ModuleId::editor);
@@ -268,6 +398,23 @@ impl Layout {
         if hide_editor {
             layout.hide_unfocused(&ModuleId::editor())?;
         }
+        Ok(layout)
+    }
+
+    /// A layout rebuilt from what a state file (or `init.lua`) holds: [`Layout::new`]'s checks, then
+    /// `hidden`, which must name leaves (invariant 2) and must not include `focus` -- which is also
+    /// what keeps one module on screen (invariant 3), since `focus` is a leaf. The only way back into
+    /// a `Layout` from outside the process, so a file cannot skip an invariant the constructors hold
+    /// (the P1 plan's warning against deriving `Deserialize` on this type).
+    pub fn from_parts(root: Node, hidden: BTreeSet<ModuleId>, focus: ModuleId) -> Result<Layout, LayoutError> {
+        let mut layout = Layout::new(root, focus.clone())?;
+        if let Some(stray) = hidden.iter().find(|id| !layout.contains(id)) {
+            return Err(LayoutError::NotInTree(stray.clone()));
+        }
+        if hidden.contains(&focus) {
+            return Err(LayoutError::Hidden(focus));
+        }
+        layout.hidden = hidden;
         Ok(layout)
     }
 
@@ -310,6 +457,13 @@ impl Layout {
         self.is_shown(id) && self.zoomed.as_ref().is_none_or(|z| z == id)
     }
 
+    /// Whether [`super::geometry::settle_pins`] has anything to do: nothing zoomed, and a pinned
+    /// split with no length yet and a shown module on each side. Cheap -- no geometry -- so the grid
+    /// asks it on every allocation and arranges twice only on the one where a pin settles.
+    pub fn has_pin_to_settle(&self) -> bool {
+        self.zoomed.is_none() && self.root.has_pin_to_settle(&|id| self.is_shown(id))
+    }
+
     /// Every module on screen now, in tree order.
     pub fn visible_leaves(&self) -> Vec<ModuleId> {
         self.leaves().into_iter().filter(|id| self.is_visible(id)).collect()
@@ -323,16 +477,31 @@ impl Layout {
     /// `Ctrl+j` and the `Ctrl+a` prefix would then act on a module nobody can see. A module zoomed
     /// away is still shown and may take the keys; the move that gives them to it unzooms.
     pub fn set_focus(&mut self, id: &ModuleId) -> Result<(), LayoutError> {
+        self.can_focus(id)?;
+        self.focus = id.clone();
+        self.mru.retain(|m| m != id);
+        self.mru.insert(0, id.clone());
+        Ok(())
+    }
+
+    /// Whether [`Layout::set_focus`] would take `id`: in the tree, and not hidden. What `shell` asks
+    /// before it moves anything -- a refused focus must not end a zoom on its way to being refused.
+    pub fn can_focus(&self, id: &ModuleId) -> Result<(), LayoutError> {
         if !self.contains(id) {
             return Err(LayoutError::NotInTree(id.clone()));
         }
         if self.hidden.contains(id) {
             return Err(LayoutError::Hidden(id.clone()));
         }
-        self.focus = id.clone();
-        self.mru.retain(|m| m != id);
-        self.mru.insert(0, id.clone());
         Ok(())
+    }
+
+    /// A zoom is on, and it is not `id`'s: putting `id` on screen -- giving it the keys, showing it
+    /// -- has to end it first. `false` for the zoomed module itself: tmux's `select-pane` onto the
+    /// zoomed pane leaves the zoom on, and so does `Ctrl+a a` onto a zoomed chat (the whole-branch
+    /// review's finding 3).
+    pub fn zoom_hides(&self, id: &ModuleId) -> bool {
+        self.zoomed.as_ref().is_some_and(|z| z != id)
     }
 
     /// `Ctrl+a m`/`z`: zoom `target`, or end the zoom if one is on (whatever `target` is, as
@@ -363,15 +532,49 @@ impl Layout {
     }
 
     /// Sets the ratio of the split at `path`, clamped into `MIN_RATIO..=MAX_RATIO`. A NaN changes
-    /// nothing (a divider dragged by a broken pointer event must not wedge the tree).
+    /// nothing (a divider dragged by a broken pointer event must not wedge the tree). On a pinned
+    /// split it also forgets the pinned length, so the ratio is what the next allocation shows and
+    /// is then frozen again. A drag and `Ctrl+a h/j/k/l` go through
+    /// [`super::geometry::move_divider`], which keeps a pin in pixels.
     pub fn set_ratio(&mut self, path: &[Branch], ratio: f32) -> Result<(), LayoutError> {
-        match self.root.at_path_mut(path) {
-            Some(Node::Split { ratio: r, .. }) => {
-                if !ratio.is_nan() {
-                    *r = ratio.clamp(MIN_RATIO, MAX_RATIO);
-                }
-                Ok(())
+        let (r, pin) = self.split_at_mut(path)?;
+        if !ratio.is_nan() {
+            *r = ratio.clamp(MIN_RATIO, MAX_RATIO);
+            if let Some(pin) = pin {
+                pin.px = None;
             }
+        }
+        Ok(())
+    }
+
+    /// Replaces the tree with `root`, for `super::ops`, which rearranges the tree and keeps the
+    /// other invariants itself. `root` must hold every module this layout holds; it may hold one
+    /// more (a module placed for the first time), which joins the end of the MRU list.
+    pub(super) fn replace_root(&mut self, root: Node) {
+        let leaves = root.leaves();
+        debug_assert!(
+            self.mru.iter().all(|id| leaves.contains(id)),
+            "a rearrangement lost a module"
+        );
+        for id in leaves {
+            if !self.mru.contains(&id) {
+                self.mru.push(id);
+            }
+        }
+        self.root = root;
+    }
+
+    /// Takes `id` out of `hidden` without the checks [`Layout::show`] makes, for `super::ops`,
+    /// which has just placed it. `true` if it was hidden.
+    pub(super) fn unhide(&mut self, id: &ModuleId) -> bool {
+        self.hidden.remove(id)
+    }
+
+    /// The ratio and the pin of the split at `path`: what the geometry turns a divider position back
+    /// into (`move_divider`, `settle_pins`).
+    pub(super) fn split_at_mut(&mut self, path: &[Branch]) -> Result<(&mut f32, &mut Option<Pin>), LayoutError> {
+        match self.root.at_path_mut(path) {
+            Some(Node::Split { ratio, pin, .. }) => Ok((ratio, pin)),
             _ => Err(LayoutError::NotASplit(path.to_vec())),
         }
     }
@@ -448,9 +651,10 @@ mod tests {
         );
         assert_eq!(
             layout.root(),
-            &Node::split(
+            &Node::pinned(
                 Axis::Column,
                 BELOW_ROOT_SHARE,
+                Branch::Second,
                 Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, row, Node::Leaf(lua("right"))),
                 Node::Leaf(lua("below"))
             )
@@ -690,5 +894,128 @@ mod tests {
             layout.set_ratio(&[Branch::Second], 0.5),
             Err(LayoutError::NotASplit(vec![Branch::Second]))
         );
+    }
+
+    /// Modules P2: a module placed below the root keeps its height (this file's doc). The pin has no
+    /// length yet -- the split divides by `BELOW_ROOT_SHARE` until it has been on screen -- and a
+    /// module placed right of the root, or in the editor's leaf, is not pinned.
+    #[test]
+    fn a_module_placed_below_the_root_is_pinned_on_its_own_side_and_nothing_else_is() {
+        let layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
+        match layout.root() {
+            Node::Split { axis, ratio, pin, .. } => {
+                assert_eq!((*axis, *ratio), (Axis::Column, BELOW_ROOT_SHARE));
+                assert_eq!(
+                    *pin,
+                    Some(Pin {
+                        side: Branch::Second,
+                        px: None
+                    })
+                );
+            }
+            Node::Leaf(_) => panic!("a leaf"),
+        }
+        for placement in [Placement::RightOfRoot, Placement::InPlaceOfEditor] {
+            let layout = Layout::initial(&[decl("x", placement)]).unwrap();
+            let mut pins = Vec::new();
+            layout.root().pins(&mut pins);
+            assert!(pins.is_empty(), "{placement:?}: {pins:?}");
+        }
+    }
+
+    /// `set_ratio` on a pinned split forgets the pinned length: the ratio is what shows next.
+    #[test]
+    fn set_ratio_forgets_a_pinned_length() {
+        let mut layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
+        *layout.split_at_mut(&[]).unwrap().1 = Some(Pin {
+            side: Branch::Second,
+            px: Some(240),
+        });
+        layout.set_ratio(&[], 0.5).unwrap();
+        assert_eq!(
+            layout.split_at_mut(&[]).unwrap(),
+            (
+                &mut 0.5,
+                &mut Some(Pin {
+                    side: Branch::Second,
+                    px: None
+                })
+            )
+        );
+    }
+
+    /// The door a state file comes back through (P1 plan, deferred item 11): every check
+    /// `Layout::new` makes, and the three `hidden` can break.
+    #[test]
+    fn from_parts_rebuilds_a_layout_and_refuses_what_breaks_an_invariant() {
+        let root = || {
+            Node::pinned(
+                Axis::Column,
+                BELOW_ROOT_SHARE,
+                Branch::Second,
+                Node::split(
+                    Axis::Row,
+                    0.5,
+                    Node::Leaf(ModuleId::editor()),
+                    Node::Leaf(ModuleId::agent()),
+                ),
+                Node::Leaf(ModuleId::terminal()),
+            )
+        };
+        let hidden = |ids: &[ModuleId]| ids.iter().cloned().collect::<BTreeSet<_>>();
+
+        let layout = Layout::from_parts(root(), hidden(&[ModuleId::terminal()]), ModuleId::agent()).unwrap();
+        assert_eq!(layout.visible_leaves(), [ModuleId::editor(), ModuleId::agent()]);
+        assert_eq!(layout.focus(), &ModuleId::agent());
+        assert_eq!(layout.zoomed(), None);
+
+        assert_eq!(
+            Layout::from_parts(root(), hidden(&[lua("gone")]), ModuleId::agent()),
+            Err(LayoutError::NotInTree(lua("gone")))
+        );
+        assert_eq!(
+            Layout::from_parts(root(), hidden(&[ModuleId::agent()]), ModuleId::agent()),
+            Err(LayoutError::Hidden(ModuleId::agent()))
+        );
+        assert_eq!(
+            Layout::from_parts(
+                root(),
+                hidden(&[ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()]),
+                ModuleId::editor()
+            ),
+            Err(LayoutError::Hidden(ModuleId::editor())),
+            "everything hidden is refused through the focus: it is always a leaf"
+        );
+        let mut bad_pin = root();
+        if let Node::Split { pin, .. } = &mut bad_pin {
+            *pin = Some(Pin {
+                side: Branch::Second,
+                px: Some(-1),
+            });
+        }
+        assert_eq!(
+            Layout::from_parts(bad_pin, BTreeSet::new(), ModuleId::editor()),
+            Err(LayoutError::Pin(-1))
+        );
+    }
+
+    /// What `shell` asks before a focus or a show moves anything: a module the keys cannot go to is
+    /// refused first, and a zoom ends only for a module it keeps off screen -- never for the zoomed
+    /// module itself.
+    #[test]
+    fn a_zoom_ends_only_for_a_module_it_keeps_off_screen() {
+        let mut layout = Layout::initial(&[decl("side", Placement::RightOfRoot)]).unwrap();
+        assert!(!layout.zoom_hides(&ModuleId::agent()), "nothing zoomed");
+        layout.toggle_zoom(&ModuleId::agent());
+        assert!(!layout.zoom_hides(&ModuleId::agent()), "the zoomed module itself");
+        assert!(layout.zoom_hides(&ModuleId::editor()));
+        layout.hide_unfocused(&lua("side")).unwrap();
+        assert!(
+            layout.zoom_hides(&lua("side")),
+            "shown later, it would still be off screen"
+        );
+        assert_eq!(layout.can_focus(&lua("side")), Err(LayoutError::Hidden(lua("side"))));
+        assert_eq!(layout.can_focus(&lua("gone")), Err(LayoutError::NotInTree(lua("gone"))));
+        assert_eq!(layout.can_focus(&ModuleId::editor()), Ok(()));
     }
 }

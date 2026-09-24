@@ -6,9 +6,14 @@
 //! rectangle to the other side and draws no divider. That reproduces, on purpose, what a `GtkPaned`
 //! with one visible child does -- which is exactly what today's zoom and a hidden bottom slot rely
 //! on. A zoom is the extreme case: the zoomed module alone, at full size.
+//!
+//! **A pinned split** (`tree::Pin`, modules P2) gives its pinned side the length it stores and the
+//! other side the rest, within both sides' minimums -- so a bottom row keeps its height when the
+//! window grows. Until the pin has a length it divides by its ratio, and [`settle_pins`] records
+//! that length the first time both sides are on screen.
 
 use super::module::ModuleId;
-use super::tree::{Axis, Branch, Layout, LayoutError, Node, SplitPath, MAX_RATIO, MIN_RATIO};
+use super::tree::{Axis, Branch, Layout, LayoutError, Node, Pin, SplitPath, MAX_RATIO, MIN_RATIO};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Size {
@@ -86,6 +91,22 @@ impl Divider {
         let px = first_px.clamp(lo, hi);
         (px as f32 / self.avail as f32).clamp(MIN_RATIO, MAX_RATIO)
     }
+
+    /// `first_px` kept off both children's minimums and inside the same `MIN_RATIO..=MAX_RATIO`
+    /// band a ratio is: what a pinned split stores when its divider is moved.
+    fn clamp_first(&self, first_px: i32) -> i32 {
+        let (band_lo, band_hi) = band(self.avail);
+        let hi = (self.avail - self.min_second).max(0).min(band_hi);
+        let lo = self.min_first.max(band_lo).min(hi);
+        first_px.clamp(lo, hi)
+    }
+}
+
+/// The `MIN_RATIO..=MAX_RATIO` band of `avail` in pixels, `lo <= hi` at any length: the first
+/// child's length a ratio can give, and so the most a pinned length may take at any size.
+fn band(avail: i32) -> (i32, i32) {
+    let hi = (avail as f32 * MAX_RATIO).floor() as i32;
+    (((avail as f32 * MIN_RATIO).ceil() as i32).min(hi), hi)
 }
 
 /// Every module on screen with its rectangle, in tree order, and every divider on screen.
@@ -121,7 +142,7 @@ pub fn min_size(layout: &Layout, frame: &Frame) -> Size {
 
 /// The same, as if nothing were zoomed. Navigation and resize decide on this, because tmux decides
 /// on the unzoomed window and unzooms only once it knows it will act.
-fn arrange_with(layout: &Layout, honour_zoom: bool, frame: &Frame) -> Arrangement {
+pub(super) fn arrange_with(layout: &Layout, honour_zoom: bool, frame: &Frame) -> Arrangement {
     let full = Rect {
         x: 0,
         y: 0,
@@ -187,6 +208,7 @@ fn place(
         Node::Split {
             axis,
             ratio,
+            pin,
             first,
             second,
         } => {
@@ -213,7 +235,24 @@ fn place(
             };
             let handle = frame.handle_px.min(length).max(0);
             let avail = length - handle;
-            let wanted = (avail as f32 * ratio).round() as i32;
+            // A pinned length is kept inside the band a ratio has, at this size and not only at the
+            // size it was dragged at: a row dragged to the top of a tall window must not leave the
+            // modules above it 0px (and still able to take the keys) once the window is smaller.
+            let in_band = |px: i32| {
+                let (lo, hi) = band(avail);
+                px.clamp(lo, hi)
+            };
+            let wanted = match pin {
+                Some(Pin {
+                    side: Branch::First,
+                    px: Some(px),
+                }) => in_band(*px),
+                Some(Pin {
+                    side: Branch::Second,
+                    px: Some(px),
+                }) => in_band(avail - px),
+                _ => (avail as f32 * ratio).round() as i32,
+            };
             let hi = (avail - min_b).max(0);
             let first_px = wanted.clamp(0, avail).min(hi).max(min_a.min(avail));
             let second_px = avail - first_px;
@@ -372,9 +411,53 @@ pub fn resize(layout: &mut Layout, focused: &ModuleId, dir: Direction, px: i32, 
         Direction::Left | Direction::Up => -1,
         Direction::Right | Direction::Down => 1,
     };
-    let ratio = divider.ratio_for(divider.first_px + sign * px);
+    let divider = divider.clone();
     layout.unzoom();
-    layout.set_ratio(&divider.path, ratio).is_ok()
+    move_divider(layout, &divider, divider.first_px + sign * px).is_ok()
+}
+
+/// Puts `divider` where its first child gets `first_px`, kept off both children's minimums: a ratio
+/// on a ratio split, the pinned side's pixels on a pinned one. What a divider drag and
+/// `Ctrl+a h/j/k/l` do. `divider` is one [`arrange`] returned for this layout.
+pub fn move_divider(layout: &mut Layout, divider: &Divider, first_px: i32) -> Result<(), LayoutError> {
+    let ratio = divider.ratio_for(first_px);
+    let (r, pin) = layout.split_at_mut(&divider.path)?;
+    match pin {
+        None => *r = ratio,
+        Some(pin) => {
+            let first = divider.clamp_first(first_px);
+            pin.px = Some(match pin.side {
+                Branch::First => first,
+                Branch::Second => divider.avail - first,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Gives every pinned split that is on screen with both sides, and has no length yet, the length
+/// its ratio gives it now -- from then on it keeps that length. `true` if one was given. `shell`'s
+/// grid calls this with its real allocation before it arranges, so a bottom row's first show is a
+/// third of the height at the window's size then (`main`'s `shown_position`), and after that the
+/// row keeps its height when the window grows (`main`'s `resize_end_child(false)`).
+pub fn settle_pins(layout: &mut Layout, frame: &Frame) -> bool {
+    let arrangement = arrange(layout, frame);
+    let mut settled = false;
+    for divider in &arrangement.dividers {
+        if divider.avail <= 0 {
+            continue;
+        }
+        if let Ok((_, Some(pin))) = layout.split_at_mut(&divider.path) {
+            if pin.px.is_none() {
+                pin.px = Some(match pin.side {
+                    Branch::First => divider.first_px,
+                    Branch::Second => divider.avail - divider.first_px,
+                });
+                settled = true;
+            }
+        }
+    }
+    settled
 }
 
 /// Hides `id` (spec §3.2). If `id` holds the keys, first chooses where they go -- the most
@@ -1000,5 +1083,129 @@ mod tests {
         assert_eq!(layout.toggle_zoom(&bottom()), ZoomChange::Nothing);
         assert_eq!(layout.zoomed(), None);
         assert_eq!(arrange(&layout, &frame()).modules.len(), 2);
+    }
+
+    /// The owner's call on the spec's §14 question, "a bottom row keeps its height when the window
+    /// grows": `main`'s `GtkPaned` kept the terminal at 240px through `F11` (`resize_end_child(false)`)
+    /// and P1's ratio took it to 347px, 360 immersive (P1's GUI pass, item 14). Once its pin has a
+    /// length, the bottom module keeps it at every height; without one it would still grow.
+    #[test]
+    fn a_pinned_bottom_row_keeps_its_height_when_the_window_grows() {
+        let height_at = |layout: &Layout, h: i32| {
+            arrange(layout, &Frame::new(Size { w: 1280, h }, HANDLE))
+                .rect_of(&bottom())
+                .unwrap()
+                .h
+        };
+        let unsettled = bottom_tree();
+        assert_eq!(height_at(&unsettled, 721), 240, "a third of the default window");
+        assert_eq!(height_at(&unsettled, 1041), 347, "F11 on 1080p, as P1 measured");
+        assert_eq!(height_at(&unsettled, 1080), 360, "immersive, as P1 measured");
+
+        let mut layout = bottom_tree();
+        assert!(settle_pins(&mut layout, &frame()));
+        assert_eq!(height_at(&layout, 721), 240);
+        assert_eq!(height_at(&layout, 1041), 240, "F11 on 1080p");
+        assert_eq!(height_at(&layout, 1080), 240, "immersive");
+        assert!(!settle_pins(&mut layout, &frame()), "settled once, then kept");
+    }
+
+    /// A pin is given its length only once both sides are on screen: a hidden bottom module (the
+    /// terminal until `Ctrl+a t`) gets its first show at a third of whatever height the window has
+    /// then -- `main`'s `shown_position(None, h)`.
+    #[test]
+    fn a_pin_is_settled_the_first_time_both_sides_are_on_screen() {
+        let mut layout = bottom_tree();
+        hide(&mut layout, &bottom(), &frame()).unwrap();
+        assert!(!layout.has_pin_to_settle());
+        assert!(!settle_pins(&mut layout, &frame()), "hidden: nothing to settle");
+        let tall = Frame::new(Size { w: 1920, h: 1041 }, HANDLE);
+        layout.show(&bottom()).unwrap();
+        assert!(layout.has_pin_to_settle(), "what the grid asks before it settles");
+        assert!(settle_pins(&mut layout, &tall));
+        assert!(!layout.has_pin_to_settle());
+        assert_eq!(arrange(&layout, &tall).rect_of(&bottom()).unwrap().h, 347);
+        assert_eq!(
+            arrange(&layout, &frame()).rect_of(&bottom()).unwrap().h,
+            347,
+            "the window shrinks back and the row keeps what it was given"
+        );
+        // A zoom takes the pinned split off screen; nothing settles behind it.
+        let mut zoomed = bottom_tree();
+        zoomed.toggle_zoom(&editor());
+        assert!(!zoomed.has_pin_to_settle());
+        assert!(!settle_pins(&mut zoomed, &frame()));
+    }
+
+    /// Dragging a pinned divider, or `Ctrl+a j/k` on it, moves its PIXELS: the new height is what
+    /// is kept when the window grows, as a dragged `GtkPaned` end child kept its new height.
+    #[test]
+    fn moving_a_pinned_divider_stores_pixels_and_the_row_keeps_them() {
+        let mut layout = bottom_tree();
+        settle_pins(&mut layout, &frame());
+        let divider = arrange(&layout, &frame()).dividers[0].clone();
+        assert_eq!(divider.path, Vec::<Branch>::new());
+        move_divider(&mut layout, &divider, 400).unwrap();
+        assert_eq!(arrange(&layout, &frame()).rect_of(&bottom()).unwrap().h, 320);
+        let big = Frame::new(Size { w: 1280, h: 1041 }, HANDLE);
+        assert_eq!(arrange(&layout, &big).rect_of(&bottom()).unwrap().h, 320);
+        // `Ctrl+a k` from the bottom: 40px up is 40px taller, and stays 360 at any height.
+        assert!(resize(&mut layout, &bottom(), Direction::Up, 40, &frame()));
+        assert_eq!(arrange(&layout, &big).rect_of(&bottom()).unwrap().h, 360);
+        // Dragged past the band a ratio has, it stops where a ratio would: 5% of 720 is 36.
+        let divider = arrange(&layout, &frame()).dividers[0].clone();
+        move_divider(&mut layout, &divider, 719).unwrap();
+        assert_eq!(arrange(&layout, &frame()).rect_of(&bottom()).unwrap().h, 36);
+    }
+
+    /// A window squeezed below what the pin asks for gives the upper row its minimum and the
+    /// bottom module the rest -- and the stored length is not what the squeeze made it: grown back,
+    /// the row returns to its height.
+    #[test]
+    fn a_squeeze_does_not_change_what_a_pin_keeps() {
+        let min = |id: &ModuleId| {
+            if *id == bottom() {
+                Size { w: 0, h: 80 }
+            } else {
+                Size { w: 0, h: 100 }
+            }
+        };
+        let at = |h: i32| Frame {
+            size: Size { w: 1280, h },
+            handle_px: HANDLE,
+            min: &min,
+        };
+        let mut layout = bottom_tree();
+        assert!(settle_pins(&mut layout, &at(721)));
+        assert_eq!(arrange(&layout, &at(721)).rect_of(&bottom()).unwrap().h, 240);
+        assert_eq!(
+            arrange(&layout, &at(301)).rect_of(&bottom()).unwrap().h,
+            200,
+            "the editor keeps its 100"
+        );
+        assert_eq!(arrange(&layout, &at(721)).rect_of(&bottom()).unwrap().h, 240);
+    }
+
+    /// A pinned length stays inside the band a ratio has at EVERY size, not only at the size it was
+    /// dragged at (the plan review's probe): a bottom row dragged to the top of a fullscreen window
+    /// keeps 95% of it, and when the window is made smaller the modules above keep 5% -- 36px of
+    /// 720, where the stored 988px alone would leave them 0px while the keys could still go there.
+    /// Grown back, the row is the height it was dragged to.
+    #[test]
+    fn a_pinned_row_never_takes_more_than_a_ratio_could_when_the_window_shrinks() {
+        let tall = Frame::new(Size { w: 1920, h: 1041 }, HANDLE);
+        let mut layout = bottom_tree();
+        assert!(settle_pins(&mut layout, &tall));
+        let divider = arrange(&layout, &tall).dividers[0].clone();
+        move_divider(&mut layout, &divider, 0).unwrap();
+        assert_eq!(
+            arrange(&layout, &tall).rect_of(&bottom()).unwrap().h,
+            988,
+            "95% of 1040"
+        );
+        let small = arrange(&layout, &frame());
+        assert_eq!(small.rect_of(&editor()).unwrap().h, 36, "5% of 720, not 0");
+        assert_eq!(small.rect_of(&bottom()).unwrap().h, 684);
+        assert_eq!(arrange(&layout, &tall).rect_of(&bottom()).unwrap().h, 988);
     }
 }

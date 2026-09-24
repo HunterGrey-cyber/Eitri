@@ -1,0 +1,240 @@
+//! What the top bar shows while the `Ctrl+a` prefix waits (modules spec §6.5): the module keys --
+//! `e editor · a agent · t terminal · <Lua keys>`, a hidden module dimmed -- then the verbs. After
+//! `\` or `"`, only the module keys, under where the module will go. Drawn as a row of labels in
+//! the top bar beside the app name, which already turns into a solid block while the prefix waits.
+//!
+//! **The `·` between runs is the spec's**, and was missing from the first build, which spaced the
+//! runs 10px apart (modules P2's GUI pass, C1, 2026-09-24). Several runs have spaces of their own
+//! (`| _ even`, `H J K L swap`), so a space alone left where one run ended to the eye:
+//! `| _ even  H J K L swap`. The same pass saw the last run touch the project name
+//! (`H J K L swapproj`); `.prefix-strip`'s right margin (`theme::gtk_css`) is that half.
+
+use gtk4::prelude::*;
+use neovibe_core::layout::{Axis, ModuleId, StripEntry};
+
+use crate::prefix::Waiting;
+
+/// The prefix's own keys that are not module keys, as the strip names them.
+const VERBS: [&str; 5] = ["x hide", "\\ right", "\" below", "| _ even", "H J K L swap"];
+
+/// The separator between two runs.
+const DOT: &str = "\u{00b7}";
+
+/// The strip's space between two pieces: about one space of its 12px text either side of a `·`, so a
+/// run, its `·` and the next run are spaced as `e editor · a agent` would be in running text. With
+/// the `·`'s own advance (about 4px at 12px in a sans face; not measured on a screen) that is about
+/// 10px from run to run, what the strip had before the `·` -- so the armed bar's minimum width stays
+/// where it was: every run ellipsizes, the `·` does not.
+const PIECE_SPACING: i32 = 3;
+
+/// One piece of the strip, left to right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StripPiece {
+    /// Where the next module goes, after `\`/`"`: `right of editor:`.
+    Heading(String),
+    /// A key and what it does, `e editor`; `dimmed` for a module that is hidden or not placed.
+    Run { text: String, dimmed: bool },
+    /// The `·` between two runs; never before the first, after the last, or after the heading.
+    Dot,
+}
+
+/// The strip's pieces, left to right. `focus_title` names the module with the keys (where `\`/`"`
+/// put the next module); `title` names any module.
+pub(crate) fn strip_pieces(
+    waiting: Waiting,
+    entries: &[StripEntry],
+    focus_title: &str,
+    title: &dyn Fn(&ModuleId) -> String,
+) -> Vec<StripPiece> {
+    let modules = entries.iter().map(|entry| StripPiece::Run {
+        text: format!("{} {}", entry.key, title(&entry.module)),
+        dimmed: entry.dimmed,
+    });
+    let (heading, runs): (Option<String>, Vec<StripPiece>) = match waiting {
+        Waiting::No => return Vec::new(),
+        Waiting::Command => (
+            None,
+            modules
+                .chain(VERBS.iter().map(|verb| StripPiece::Run {
+                    text: verb.to_string(),
+                    dimmed: false,
+                }))
+                .collect(),
+        ),
+        Waiting::Module(axis) => (
+            Some(match axis {
+                Axis::Row => format!("right of {focus_title}:"),
+                Axis::Column => format!("below {focus_title}:"),
+            }),
+            modules.collect(),
+        ),
+    };
+    let mut pieces: Vec<StripPiece> = heading.into_iter().map(StripPiece::Heading).collect();
+    for (i, run) in runs.into_iter().enumerate() {
+        if i > 0 {
+            pieces.push(StripPiece::Dot);
+        }
+        pieces.push(run);
+    }
+    pieces
+}
+
+/// The strip's widget, empty and hidden until the prefix waits.
+pub(crate) struct PrefixStrip {
+    widget: gtk4::Box,
+}
+
+impl PrefixStrip {
+    pub(crate) fn new() -> PrefixStrip {
+        let widget = gtk4::Box::new(gtk4::Orientation::Horizontal, PIECE_SPACING);
+        widget.add_css_class("prefix-strip");
+        widget.set_valign(gtk4::Align::Center);
+        widget.set_visible(false);
+        PrefixStrip { widget }
+    }
+
+    pub(crate) fn widget(&self) -> &gtk4::Box {
+        &self.widget
+    }
+
+    /// Replaces what the strip shows; nothing hides it.
+    ///
+    /// Each run and the heading ellipsize, so the strip's minimum width is a few ellipses rather than
+    /// every key and verb spelled out: armed, it is about 490px at 12px, and a label that cannot
+    /// shrink raises the top bar's minimum -- and so the window's -- above a half-tiled window's
+    /// width, which GTK answers by growing the window (the whole-branch review's window finding 4).
+    /// Short of room, a run reads `x hi…` rather than pushing the window controls off. A `·` is one
+    /// narrow glyph and does not ellipsize. known limit: GTK layout, so no headless test holds it;
+    /// `shell/MANUAL_VERIFICATION.md`'s Modules P2 item 11 looks at it.
+    pub(crate) fn show(&self, pieces: &[StripPiece]) {
+        while let Some(child) = self.widget.first_child() {
+            self.widget.remove(&child);
+        }
+        for piece in pieces {
+            let label = match piece {
+                StripPiece::Heading(text) | StripPiece::Run { text, .. } => {
+                    let label = gtk4::Label::new(Some(text));
+                    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    if let StripPiece::Run { dimmed: true, .. } = piece {
+                        label.add_css_class("dimmed");
+                    }
+                    label
+                }
+                StripPiece::Dot => {
+                    let dot = gtk4::Label::new(Some(DOT));
+                    dot.add_css_class("strip-dot");
+                    dot
+                }
+            };
+            self.widget.append(&label);
+        }
+        self.widget.set_visible(!pieces.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries() -> Vec<StripEntry> {
+        vec![
+            StripEntry {
+                key: 'e',
+                module: ModuleId::editor(),
+                dimmed: false,
+            },
+            StripEntry {
+                key: 'a',
+                module: ModuleId::agent(),
+                dimmed: false,
+            },
+            StripEntry {
+                key: 't',
+                module: ModuleId::terminal(),
+                dimmed: true,
+            },
+        ]
+    }
+
+    fn title(id: &ModuleId) -> String {
+        id.as_str().to_string()
+    }
+
+    /// The strip as it would read: each piece's text, a heading and a run as themselves, a `·` as
+    /// itself, a dimmed run in brackets; joined by one space.
+    fn reads(pieces: &[StripPiece]) -> String {
+        pieces
+            .iter()
+            .map(|piece| match piece {
+                StripPiece::Heading(text) => text.clone(),
+                StripPiece::Run { text, dimmed: false } => text.clone(),
+                StripPiece::Run { text, dimmed: true } => format!("[{text}]"),
+                StripPiece::Dot => "\u{00b7}".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn armed_it_lists_the_module_keys_then_the_verbs() {
+        let pieces = strip_pieces(Waiting::Command, &entries(), "editor", &title);
+        assert_eq!(
+            reads(&pieces),
+            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x hide \u{b7} \\ right \u{b7} \" below \u{b7} \
+             | _ even \u{b7} H J K L swap",
+            "a hidden module is dimmed"
+        );
+    }
+
+    #[test]
+    fn after_a_split_key_it_lists_only_the_module_keys_under_where_they_go() {
+        let below = strip_pieces(Waiting::Module(Axis::Column), &entries(), "agent", &title);
+        assert_eq!(
+            reads(&below),
+            "below agent: e editor \u{b7} a agent \u{b7} [t terminal]"
+        );
+        let right = strip_pieces(Waiting::Module(Axis::Row), &entries(), "agent", &title);
+        assert_eq!(right[0], StripPiece::Heading("right of agent:".to_string()));
+        assert!(strip_pieces(Waiting::No, &entries(), "agent", &title).is_empty());
+    }
+
+    /// The GUI pass's C1 (2026-09-24): the build spaced the runs with no `·`, so a run with spaces of
+    /// its own ran into the next (`| _ even  H J K L swap`). Spec §6.5 writes a `·` between every two
+    /// runs -- module keys and verbs alike -- and none before the first, after the last, or after the
+    /// heading (`below agent: e editor · a agent`), whatever the number of runs.
+    #[test]
+    fn a_dot_stands_between_every_two_runs_and_nowhere_else() {
+        for n in 0..=3 {
+            let some = &entries()[..n];
+            for waiting in [
+                Waiting::Command,
+                Waiting::Module(Axis::Row),
+                Waiting::Module(Axis::Column),
+            ] {
+                let pieces = strip_pieces(waiting, some, "agent", &title);
+                let body: &[StripPiece] = match pieces.first() {
+                    Some(StripPiece::Heading(_)) => &pieces[1..],
+                    _ => &pieces[..],
+                };
+                assert!(
+                    body.iter().all(|p| !matches!(p, StripPiece::Heading(_))),
+                    "{waiting:?}, {n}: {pieces:?}"
+                );
+                let runs = body.iter().filter(|p| matches!(p, StripPiece::Run { .. })).count();
+                for (i, piece) in body.iter().enumerate() {
+                    let expect_run = i % 2 == 0;
+                    assert_eq!(
+                        matches!(piece, StripPiece::Run { .. }),
+                        expect_run,
+                        "{waiting:?}, {n}: runs and dots alternate, a run first: {pieces:?}"
+                    );
+                }
+                assert_eq!(
+                    body.len(),
+                    if runs == 0 { 0 } else { 2 * runs - 1 },
+                    "{waiting:?}, {n}: a run last: {pieces:?}"
+                );
+            }
+        }
+    }
+}

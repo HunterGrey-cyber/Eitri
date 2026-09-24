@@ -49,6 +49,13 @@ pub struct ParsedPanelSpec {
     pub title: String,
     pub slot: PanelSlot,
     pub url: String,
+    /// `key`, as written: the panel's module key after `Ctrl+a` (modules spec §4.5). Checked by
+    /// `layout::ModuleKeys::build` once every panel has registered, because a clash between two
+    /// panels can only be seen then -- and a clash, or a string that is not one key, is a startup
+    /// failure naming it. A `key` that is not a string at all (`key = true`) is caught earlier, by
+    /// mlua's conversion here: `neovibe.panel.register` itself fails, which, like every `init.lua`
+    /// error, is logged and leaves that panel out. A number is taken as its text (`key = 1` is `'1'`).
+    pub key: Option<String>,
 }
 
 /// Pure validation of a `neovibe.panel.register` call's argument table -- no GTK/WebKit touched
@@ -74,12 +81,19 @@ pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
         )));
     }
     let url: String = content.get("url")?;
+    let key: Option<String> = spec.get("key")?;
     let slot = PanelSlot::parse(&position).ok_or_else(|| {
         mlua::Error::RuntimeError(format!(
             "neovibe.panel.register: unknown position '{position}' -- must be 'main', 'side' or 'bottom'"
         ))
     })?;
-    Ok(ParsedPanelSpec { id, title, slot, url })
+    Ok(ParsedPanelSpec {
+        id,
+        title,
+        slot,
+        url,
+        key,
+    })
 }
 
 /// True if `raw` already begins with a URI scheme (`data:`, `file:`, `http:`, `https:`, ...) --
@@ -140,6 +154,40 @@ mod tests {
         assert_eq!(parsed.title, "Test Panel");
         assert_eq!(parsed.slot, PanelSlot::Side);
         assert_eq!(parsed.url, "test.html");
+        assert_eq!(parsed.key, None);
+    }
+
+    /// Modules P2: `key` is optional and kept as written; whether it can be one is
+    /// `ModuleKeys::build`'s question, asked once every panel has registered.
+    #[test]
+    fn a_key_is_kept_as_written() {
+        let lua = Lua::new();
+        let spec: Table = lua
+            .load(
+                r#"
+                return {
+                    id = "notes", title = "Notes", position = "side", key = "N",
+                    content = { type = "webview", url = "notes.html" },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(parse_panel_spec(&spec).unwrap().key.as_deref(), Some("N"));
+
+        let spec_with = |key: &str| -> Table {
+            lua.load(format!(
+                r#"return {{ id = "notes", title = "Notes", position = "side", key = {key},
+                            content = {{ type = "webview", url = "notes.html" }} }}"#
+            ))
+            .eval()
+            .unwrap()
+        };
+        assert_eq!(parse_panel_spec(&spec_with("1")).unwrap().key.as_deref(), Some("1"));
+        assert!(
+            parse_panel_spec(&spec_with("true")).is_err(),
+            "not a string: register fails"
+        );
     }
 
     #[test]

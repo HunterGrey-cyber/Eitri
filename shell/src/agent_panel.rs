@@ -313,7 +313,17 @@ struct AgentPanelState {
     /// rather than a plain closure field because the hook must be cloned out of the borrow before
     /// being called -- see `handle_inbound_message`'s HintRequest/HintTargets arms for why.
     hint_hook: Option<Rc<dyn Fn(HintInbound)>>,
+    /// What the chat owes the user while it is not on screen (modules P2): the permission cards it
+    /// holds and whether a turn finished unseen. Fed by the pump, which runs whether or not the
+    /// panel is on screen; see `neovibe_core::attention` for why it counts deliveries.
+    attention: neovibe_core::attention::AttentionTracker,
+    /// Told whenever `attention` changes, with the value before and after: the tray's `agent ⚑N`,
+    /// the toast, `on_permission`.
+    attention_hook: Option<AttentionHook>,
 }
+
+/// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
+type AttentionHook = Rc<dyn Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention)>;
 
 /// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
 /// real gRPC handshake, and on a cold Verdandi checkout runs `npm ci` + `npm run build` -- minutes
@@ -646,6 +656,45 @@ impl AgentPanelHandle {
     pub(crate) fn on_hint(&self, hook: impl Fn(HintInbound) + 'static) {
         self.state.borrow_mut().hint_hook = Some(Rc::new(hook));
     }
+
+    /// What the chat owes the user now (modules spec §3.3): its pending permission cards, and
+    /// whether a turn finished while it was off screen.
+    pub(crate) fn attention(&self) -> neovibe_core::attention::Attention {
+        self.state.borrow().attention.attention()
+    }
+
+    /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes --
+    /// the one place that knows both, so `main.rs` keeps no copy of its own to drift (Task 10's
+    /// review, minor 4). `main.rs` installs this once.
+    pub(crate) fn on_attention(
+        &self,
+        hook: impl Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention) + 'static,
+    ) {
+        self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
+    }
+
+    /// The chat was brought back to answer a card (its tray chip, `Ctrl+a a`): BROWSE, with the
+    /// cursor on the oldest pending card. See `serialize_focus_permission_for_js`.
+    pub(crate) fn focus_permission(&self) {
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_focus_permission_for_js(),
+            "focus-permission",
+        );
+    }
+}
+
+/// Tells the attention hook, if the value changed. The hook is cloned out of the borrow first: it
+/// reaches the layout and the top bar, and must never find this panel's state borrowed.
+fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::attention::Attention) {
+    let (after, hook) = {
+        let state = state.borrow();
+        (state.attention.attention(), state.attention_hook.clone())
+    };
+    if after != before {
+        if let Some(hook) = hook {
+            hook(before, after);
+        }
+    }
 }
 
 pub(crate) fn build_agent_panel(
@@ -731,6 +780,8 @@ pub(crate) fn build_agent_panel(
         theme: neovibe_core::theme::ThemeTokens::fallback(),
         pane_focused: false,
         hint_hook: None,
+        attention: Default::default(),
+        attention_hook: None,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -747,6 +798,16 @@ pub(crate) fn build_agent_panel(
         let tokens = state.borrow().theme.clone();
         paint_webview_background(&webview, &tokens);
         webview.load_html(&themed_document(&tokens.css_vars()), None);
+    }
+
+    // Back on screen: whatever finished while the chat was away has been seen (the tray's `agent •`).
+    {
+        let state = state.clone();
+        webview.connect_map(move |_| {
+            let before = state.borrow().attention.attention();
+            state.borrow_mut().attention.seen();
+            report_attention(&state, before);
+        });
     }
 
     // Started once, at construction, rather than when a session starts: it is also what collects a
@@ -781,6 +842,8 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         if state.borrow().shutting_down {
             return gtk4::glib::ControlFlow::Break;
         }
+        // Read before anything below changes it: a session installed this tick resets the count.
+        let attention_before = state.borrow().attention.attention();
         collect_pending_start(&state, &webview);
         collect_pending_handoff(&state, &webview);
 
@@ -791,6 +854,8 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // today re-enters, which is exactly why it would stay latent until it didn't.
         report_a_session_that_never_opened(&state, &webview);
 
+        // The chat's own host: unmapped while it is hidden or zoomed away.
+        let on_screen = webview.is_mapped();
         let (payload, first_text_in_this_batch) = {
             let mut state_ref = state.borrow_mut();
             let AgentPanelState {
@@ -799,6 +864,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 supervisor,
                 supervisor_pending,
                 project_dir,
+                attention,
                 ..
             } = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -825,12 +891,14 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 // The project root travels in because the permission policy judges
                 // `Read`/`Grep`/`Glob` paths against it -- see
                 // `AgentBackend::answer_what_needs_no_human`.
-                match session.take_ui_delivery(project_dir) {
+                let payload = match session.take_ui_delivery(project_dir) {
                     UiDelivery::Nothing => None,
                     UiDelivery::Events(events) => {
                         if let Some(trace) = turn_trace.as_mut() {
                             first_text_in_this_batch = trace.observe(&events);
                         }
+                        // What the panel is handed is what it draws cards for (modules P2).
+                        attention.observe(&events, on_screen);
                         let through_revision = session.projection().last_revision;
                         Some(serialize_events_for_js(from_revision, through_revision, &events))
                     }
@@ -844,11 +912,23 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                     // being repainted has no such measurement to contribute, and recording one would
                     // report the stall as latency.
                     UiDelivery::Resync => {
+                        attention.resync(session.projection().pending_permissions.keys().cloned());
                         let view = SnapshotView::of(session);
                         Some(serialize_snapshot_for_js(&view))
                     }
-                }
+                };
+                // A card answered from the panel is gone from the projection; on legacy no
+                // delivery says so (`respond_permission` returns its resolution to the command).
+                let projection = session.projection();
+                attention.retain_pending(|id| projection.pending_permissions.contains_key(id));
+                payload
             });
+            // No session holds no card. Every place that takes one says so itself
+            // (`AttentionTracker::session_ended`); this is the backstop for the next one that
+            // does not (the whole-branch review's finding 2).
+            if session.is_none() {
+                attention.retain_pending(|_| false);
+            }
             // Bound first: `projection()` returns a guard on the sidecar path, and passing it
             // inline would drop the ingestion lock before `derive_status` had read through it.
             let projection = session.as_ref().map(|s| s.projection());
@@ -871,6 +951,10 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 }
             }
         }
+        // After the payload, not before it: a reaction that sends the panel an envelope -- one
+        // that lands on a card, say -- must find the card it names already there (Task 10's
+        // review, minor 3).
+        report_attention(&state, attention_before);
         gtk4::glib::ControlFlow::Continue
     });
 }
@@ -909,9 +993,12 @@ fn report_a_session_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webv
          conversation, it most likely no longer exists -- start a new session instead."
     );
     eprintln!("[agent_panel] {message}");
+    let on_screen = webview.is_mapped();
     let dead = {
         let mut state_ref = state.borrow_mut();
         state_ref.reported_start_failure = true;
+        // Its cards go with it (the pump reports the change).
+        state_ref.attention.session_ended(on_screen);
         state_ref.session.take()
     };
     if let Some(mut backend) = dead {
@@ -968,6 +1055,8 @@ fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView
                 // fails has to leave the command still recoverable, since on the legacy backend it
                 // is the only surviving reference to that conversation.
                 state_ref.last_handoff = None;
+                // A new conversation holds no card yet; the old one's are gone with it.
+                state_ref.attention = Default::default();
                 state_ref.session = Some(backend);
                 // The frontend has been showing a connecting state since it sent start_session; give
                 // it the real projection immediately rather than making it wait for the first event.
@@ -1207,7 +1296,16 @@ fn apply_command_outcome(
             //
             // Two statements, not `if let Some(..) = state.borrow_mut().session.take()`: the latter
             // keeps the `RefMut` alive across the whole body.
-            let dead = state.borrow_mut().session.take();
+            let attention_before = state.borrow().attention.attention();
+            let on_screen = webview.is_mapped();
+            let dead = {
+                let mut state_ref = state.borrow_mut();
+                // The cards of a session that is gone can no longer be answered (the whole-branch
+                // review's finding 2: a hidden chat kept reading `agent ⚑N`, and `Ctrl+a a` landed
+                // on a card nobody could answer).
+                state_ref.attention.session_ended(on_screen);
+                state_ref.session.take()
+            };
             if let Some(mut backend) = dead {
                 std::thread::spawn(move || backend.shutdown());
             }
@@ -1216,6 +1314,7 @@ fn apply_command_outcome(
                 &serialize_command_result_for_js(request_id, Err(&error.message)),
             );
             evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
+            report_attention(state, attention_before);
         }
     }
 }

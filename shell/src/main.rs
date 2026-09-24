@@ -9,16 +9,20 @@ mod chrome;
 mod editor_context;
 mod hint;
 mod layout;
+mod layout_state;
 mod lua;
 mod module_grid;
 mod pane_focus;
 mod pane_switch;
 mod prefix;
+mod prefix_strip;
 mod supervisor_client;
 mod terminal;
 mod terminal_handoff;
 mod text_size;
 mod theme;
+mod toast;
+mod tray;
 mod window_mode;
 
 use std::cell::RefCell;
@@ -32,10 +36,16 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
-use neovibe_core::layout::{Direction, ModuleDecl, ModuleId, ModuleKind, Nav};
+use neovibe_core::layout::{
+    Axis, Direction, KeyAction, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav,
+};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 
 const APP_ID: &str = "cn.huntergrey.neovibe";
+
+/// How long the top bar's app name shows the prefix indicator's block when a layout verb is refused
+/// (spec §3.2: "The refusal flashes the top bar, the same way the prefix indicator shows").
+const REFUSAL_FLASH: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// `NEOVIBE_CONFIG_DIR` overrides the config directory (used by sandboxed/manual verification
 /// runs so they don't touch a real `~/.config/neovibe`); otherwise the real per-user config dir.
@@ -211,6 +221,22 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         },
     };
 
+    // What a card for a hidden chat does (modules P2, spec §3.3, decision b): the tray's chip and a
+    // toast, or with `reveal` the chat itself. Anything but `badge`/`reveal` is a startup failure
+    // naming the key, like `agent.font_size` above.
+    let on_permission = match neovibe_core::attention::ChatOnPermission::parse(
+        lua_engine
+            .config
+            .borrow()
+            .get(neovibe_core::attention::ChatOnPermission::KEY),
+    ) {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("neovibe: {message}");
+            std::process::exit(1);
+        }
+    };
+
     let account_from_env = std::env::var("VERDANDI_CLAUDE_ACCOUNT").ok();
     let account_from_config = lua_engine.config.borrow().get("agent.account").map(str::to_owned);
     match agent::account::resolve_for(account_from_env.as_deref(), account_from_config.as_deref()) {
@@ -235,9 +261,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     }
 
     // The bottom terminal (docs/superpowers/specs/2026-09-23-bottom-terminal-design.md), a module
-    // since the modules design's P1 re-homed it (its plan's Task 11). Hidden until `Ctrl+a t`, and
-    // its shell is not started until then: a window whose terminal is never used starts no process,
-    // touches no font manager, and looks exactly as it did before the terminal existed.
+    // since the modules design's P1 re-homed it (its plan's Task 11). Hidden in a first launch, and
+    // its shell is not started until it is first shown, by any route (the change hook below): a
+    // window whose terminal is never shown starts no process, touches no font manager, and looks
+    // exactly as it did before the terminal existed. A layout that reopens with it shown starts it
+    // at launch.
     let terminal = terminal::TerminalPane::new(project_root.to_path_buf());
 
     // The layout is data (modules design P1, docs/superpowers/specs/
@@ -260,10 +288,56 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             placement: slot.placement(),
         })
         .collect();
-    let module_layout = Rc::new(RefCell::new(
-        terminal::initial_layout(&decls)
-            .expect("the registry keeps one entry per id, and a Lua id never names a built-in"),
-    ));
+    // Each Lua panel's module key after `Ctrl+a` (modules P2, spec §4.5). A key that is reserved,
+    // taken twice or not one character is a startup failure naming it, as `agent.font_size` is:
+    // `init.lua`'s own errors are only logged, and a key that silently did nothing is the failure
+    // this refuses.
+    let lua_keys: Vec<(ModuleId, Option<String>)> = lua_engine
+        .panels
+        .borrow()
+        .entries()
+        .iter()
+        .map(|entry| (ModuleId::lua(&entry.id), entry.key.clone()))
+        .collect();
+    let module_keys = match ModuleKeys::build(&lua_keys) {
+        Ok(keys) => Rc::new(keys),
+        Err(err) => {
+            eprintln!("neovibe: {err}");
+            std::process::exit(1);
+        }
+    };
+    // The layout this window opens with (modules P2, spec §4.4, §4.6): this project's state file if
+    // it can be used, else `init.lua`'s `neovibe.layout.default`, else the first launch. A malformed
+    // default is a startup failure naming the call; a state file that cannot be used is not, since it
+    // is state rather than config -- it is logged and the default opens.
+    let lua_default = match lua_engine.layout.borrow().default_tree().cloned() {
+        Some(Ok(tree)) => Some(tree),
+        Some(Err(message)) => {
+            eprintln!("neovibe: {message}");
+            std::process::exit(1);
+        }
+        None => None,
+    };
+    let state_dir = neovibe_core::layout::persist::state_dir(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    let loaded = state_dir
+        .as_deref()
+        .map(|dir| neovibe_core::layout::persist::load(dir, project_root, &decls));
+    let module_layout = match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls) {
+        Ok((layout, notes)) => {
+            for note in notes {
+                println!("[layout] {note}");
+            }
+            Rc::new(RefCell::new(layout))
+        }
+        Err(message) => {
+            eprintln!("neovibe: {message}");
+            std::process::exit(1);
+        }
+    };
+    let layout_saver = layout_state::LayoutSaver::new(state_dir, project_root, module_layout.clone(), decls.clone());
     // Every module's host, added once and never reparented (`module_grid`'s module doc).
     let grid = ModuleGrid::new(module_layout.clone());
     grid.add(ModuleId::editor(), pane.widget(), HostKind::Direct);
@@ -278,8 +352,39 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         }
         grid.add(id.clone(), widget, HostKind::Web);
     }
+    // The terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
+    // `Ctrl+a \ t`, its tray chip, `neovibe.layout.show`, a saved layout -- rather than only on the
+    // `Ctrl+a t` path. `start` does nothing once a shell is running or has exited.
+    {
+        let module_layout = module_layout.clone();
+        let terminal = terminal.clone();
+        grid.connect_changed(move || match module_layout.try_borrow() {
+            Ok(layout) if layout.is_shown(&ModuleId::terminal()) => {
+                drop(layout);
+                terminal.start();
+            }
+            Ok(_) => {}
+            // Hooks run with the layout released (`ModuleGrid::connect_changed`); this line is how a
+            // caller that breaks that would show up, instead of a terminal that silently never starts
+            // (Task 9's review, minor 4).
+            Err(_) => eprintln!("[terminal] BUG: the layout was borrowed when it changed; the shell was not started"),
+        });
+    }
     grid.apply();
-    let modules = grid.hosts();
+    // Every change of the arrangement is written to this project's state file, 500ms after the last
+    // one (spec §4.6), and once more when the window closes if it is still unwritten; a change of the
+    // keys alone never is. Hooked up only now, after the startup `apply`: a launch is not a change
+    // (`layout_state`'s module doc).
+    {
+        let layout_saver = layout_saver.clone();
+        grid.connect_changed(move || layout_saver.changed());
+    }
+    // A pinned row getting its length on its first frame is not a change: the saver takes it as
+    // what the window opened with (`layout_state`'s module doc).
+    {
+        let layout_saver = layout_saver.clone();
+        grid.connect_settled(move || layout_saver.settled());
+    }
 
     // Gives a module the keys. The editor goes through `NeovideEditorPane::grab_focus`, which also
     // tells the input method; any other module is its host widget's own `grab_focus`. A hidden
@@ -289,7 +394,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // layout's `focus` is never hidden (`Layout::set_focus`) -- so this holds it for the next caller.
     let focus_module: Rc<dyn Fn(&ModuleId) -> bool> = {
         let pane = pane.clone();
-        let modules = modules.clone();
+        let grid = grid.clone();
         let module_layout = module_layout.clone();
         Rc::new(move |id| {
             match module_layout.try_borrow() {
@@ -309,7 +414,8 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // `grab_focus=` in `[pane_switch]` lines could not be believed for the editor.)
                 return pane.widget().is_focus();
             }
-            modules
+            // Read live (modules P2): a module added after startup is found too.
+            grid.hosts()
                 .iter()
                 .find(|(m, _)| m == id)
                 .is_some_and(|(_, host)| host.grab_focus())
@@ -374,6 +480,8 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     terminal.set_colors(terminal::colors_from(&neovibe_core::theme::ThemeTokens::fallback()));
     if let Some(feed) = theme_feed.as_mut() {
         let theme_css = theme_css.clone();
+        // What the stylesheet paints, for the widgets GTK leaves on the old one (`theme::restyle`).
+        let window_for_theme = window.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
         let terminal = terminal.clone();
@@ -383,7 +491,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 "[theme] following nvim colorscheme {:?} (background={})",
                 payload.options.colors_name, payload.options.background
             );
-            theme_css.update(&tokens);
+            theme_css.update(&tokens, window_for_theme.upcast_ref());
             agent_panel_handle.set_theme(&panel_tokens(Some(&payload)));
             pane_for_theme.set_clear_color(editor_clear(&tokens));
             terminal.set_colors(terminal::colors_from(&tokens));
@@ -410,6 +518,32 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     root.append(&top_bar.widget);
     root.append(&grid);
 
+    // What each module is called on its tray chip and in the prefix strip (modules P2): the
+    // built-ins by kind, a Lua panel by the `title` it registered with.
+    let module_title: Rc<dyn Fn(&ModuleId) -> String> = {
+        let lua_titles: Vec<(ModuleId, String)> = lua_engine
+            .panels
+            .borrow()
+            .entries()
+            .iter()
+            .map(|entry| (ModuleId::lua(&entry.id), entry.title.clone()))
+            .collect();
+        Rc::new(move |id| tray::module_title(id, &lua_titles))
+    };
+    // The tray (spec §3.3): a chip for every module off screen, one per module, in the order the
+    // grid holds them. Its chips are top-bar items ahead of `↻`, for `h`/`l`, HINT and `Ctrl+k`.
+    let tray = tray::Tray::build(
+        &grid
+            .hosts()
+            .iter()
+            .map(|(id, _)| (id.clone(), module_title(id)))
+            .collect::<Vec<_>>(),
+    );
+    top_bar.tray.append(tray.widget());
+    let prefix_strip = Rc::new(prefix_strip::PrefixStrip::new());
+    top_bar.strip.append(prefix_strip.widget());
+    let top_items: Vec<gtk4::Widget> = tray.items().into_iter().chain(top_bar.items.iter().cloned()).collect();
+
     // The global `f` HINT draws its GTK labels (top-bar items, the editor, each Lua panel) as
     // overlay children of this, positioned over whatever they label. Its only child is the whole
     // window content, so the layout is exactly what it was without it; the labels never take a
@@ -417,6 +551,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let hint_overlay = gtk4::Overlay::new();
     hint_overlay.set_child(Some(&root));
     window.set_child(Some(&hint_overlay));
+    let toast = toast::Toast::install(&hint_overlay, &top_bar.widget);
 
     // The global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md). Three
     // triggers reach the same toggle: `Ctrl+Shift+F` from anywhere (the `app.hint` accelerator,
@@ -427,7 +562,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let hint_coordinator = hint::HintCoordinator::new(hint::HintWidgets {
         window: window.clone(),
         overlay: hint_overlay.clone(),
-        top_items: top_bar.items.clone(),
+        top_items: top_items.clone(),
         editor: pane.clone(),
         agent_widget: agent_widget.clone(),
         modules: {
@@ -461,7 +596,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let module_layout = module_layout.clone();
         pane_focus::install(
             &window,
-            modules.clone(),
+            grid.live_hosts(),
             move |id| match module_layout.try_borrow_mut() {
                 Ok(mut layout) => {
                     // Refused for a hidden module (`Layout::set_focus`): GTK can put focus in an
@@ -505,13 +640,173 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         window_mode::WindowModes::install(app, &window, &top_bar, Some(pane.clone()), return_to_pane.clone());
 
     let focus_top_bar = {
-        let top_items = top_bar.items.clone();
+        let top_items = top_items.clone();
         let window_modes = window_modes.clone();
         std::rc::Rc::new(move || {
             window_modes.reveal_top_bar();
-            top_items.first().is_some_and(|item| item.grab_focus())
+            // The first item that is showing: a tray chip, or `↻` when the tray is empty.
+            let visible: Vec<bool> = top_items.iter().map(|item| item.is_visible()).collect();
+            chrome::step_item(&visible, None, 1).is_some_and(|i| top_items[i].grab_focus())
         })
     };
+
+    // Where the keys land after a module key or a tray chip. Into the agent: on its oldest pending
+    // card if one waits (spec §3.3, `focus_permission`), else "I want to type" (owner, 2026-09-19),
+    // as every keyboard arrival there does (`move_focus`).
+    let arrive: Rc<dyn Fn(&ModuleId)> = {
+        let agent_panel_handle = agent_panel_handle.clone();
+        Rc::new(move |id| {
+            if id.kind() == ModuleKind::Agent {
+                if agent_panel_handle.attention().pending > 0 {
+                    agent_panel_handle.focus_permission();
+                } else {
+                    agent_panel_handle.enter_input();
+                }
+            }
+        })
+    };
+
+    // A card that arrives while the chat is not on screen (spec §3.3, decision b): a toast -- the
+    // only sign in Immersive mode -- or, with `modules.chat.on_permission = reveal` and nothing
+    // zoomed, the chat back where it was, the keys staying where they are.
+    {
+        let module_layout = module_layout.clone();
+        let grid = grid.clone();
+        let toast = toast.clone();
+        let tray = tray.clone();
+        agent_panel_handle.on_attention(move |before, after| {
+            let place = neovibe_core::layout::agent_place(&module_layout.borrow());
+            let reaction = neovibe_core::attention::react(on_permission, before, after, place);
+            println!("[attention] agent {after:?} ({place:?}) -> {reaction:?}");
+            tray.refresh(&module_layout.borrow(), after);
+            if reaction.reveal {
+                if let Err(err) = grid.show_module(&ModuleId::agent()) {
+                    eprintln!("[attention] could not reveal the chat: {err}");
+                }
+            }
+            if reaction.toast {
+                toast.show(&toast::permission_toast_text(after));
+            }
+        });
+    }
+    // The three ways a verb brings a module to the user, each written once and shared by every route
+    // that does it -- `Ctrl+a <key>` and its tray chip (`open_module` below), `Ctrl+a \`/`"`, and
+    // `neovibe.layout.*` -- so a change to one reaches them all (the whole-branch review's finding 7:
+    // three inlined copies had grown). Each returns the layout's refusal for its caller to report:
+    // the prefix and a chip flash the app name, a Lua call logs it.
+    //
+    // A zoom ends only when it would keep the module off screen (`Layout::zoom_hides`): `Ctrl+a a`,
+    // a chip, or `neovibe.layout.focus` onto the zoomed chat itself leaves it zoomed, as tmux's
+    // `select-pane` onto the zoomed pane does (the whole-branch review's finding 3).
+    //
+    // `focus_and_arrive`: gives `id` the keys and arrives (`arrive`). Refused before anything moves
+    // for a module the keys cannot go to (`Layout::can_focus`), so a refused focus does not end a
+    // zoom on its way to being refused.
+    let focus_and_arrive: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let focus_module = focus_module.clone();
+        let arrive = arrive.clone();
+        Rc::new(move |id| {
+            let zoom_hides = {
+                let layout = module_layout.borrow();
+                layout.can_focus(id)?;
+                layout.zoom_hides(id)
+            };
+            if zoom_hides {
+                grid.unzoom();
+            }
+            if focus_module(id) {
+                arrive(id);
+            }
+            Ok(())
+        })
+    };
+    // `show_on_screen`: shows `id` where it was hidden from, the keys staying where they are
+    // (`neovibe.layout.show`, and the first half of `Ctrl+a <key>` on a hidden module). A zoom that
+    // would keep it off screen ends first, as `Ctrl+a e`/`a` have always ended it: a module shown is a
+    // module on screen (Task 12's review, minor 2 -- `show` used to log success and leave it behind
+    // the zoom).
+    let show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        Rc::new(move |id| {
+            let zoom_hides = {
+                let layout = module_layout.borrow();
+                if !layout.contains(id) {
+                    return Err(LayoutError::NotInTree(id.clone()));
+                }
+                layout.zoom_hides(id)
+            };
+            if zoom_hides {
+                grid.unzoom();
+            }
+            grid.show_module(id).map(|_| ())
+        })
+    };
+    // `place_and_arrive`: `id` into a new split after the module with the keys, along `axis`, moved
+    // there if it is elsewhere, and the keys to it (`Ctrl+a \`/`"` + a key, `Ctrl+a <key>` for a
+    // module never placed, `neovibe.layout.split`).
+    let place_and_arrive: Rc<dyn Fn(&ModuleId, Axis) -> Result<(), LayoutError>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let focus_module = focus_module.clone();
+        let arrive = arrive.clone();
+        Rc::new(move |id, axis| {
+            let target = module_layout.borrow().focus().clone();
+            grid.place_module(id, &target, axis)?;
+            if focus_module(id) {
+                arrive(id);
+            }
+            Ok(())
+        })
+    };
+
+    // `Ctrl+a <key>`'s four cases for a module (modules spec §4.3, `neovibe_core::layout::key_action`),
+    // for the prefix and the tray's chips; a refusal flashes the app name (spec §3.2).
+    let open_module: Rc<dyn Fn(&ModuleId, KeyAction)> = {
+        let grid = grid.clone();
+        let focus_module = focus_module.clone();
+        let focus_and_arrive = focus_and_arrive.clone();
+        let show_on_screen = show_on_screen.clone();
+        let place_and_arrive = place_and_arrive.clone();
+        let app_name = top_bar.app_name.clone();
+        Rc::new(move |id, action| {
+            println!("[modules] {id}: {action:?}");
+            let result = match action {
+                KeyAction::ShowAndFocus => show_on_screen(id).and_then(|()| focus_and_arrive(id)),
+                KeyAction::Focus => focus_and_arrive(id),
+                KeyAction::Place => place_and_arrive(id, Axis::Row),
+                // The keys go to the neighbour first, then it unmaps (`module_grid::hide_then_unmap`).
+                KeyAction::Hide => grid.hide_module(id, &*focus_module),
+            };
+            if let Err(err) = result {
+                refuse(&app_name, &err);
+            }
+        })
+    };
+
+    // A chip is `Ctrl+a <key>` for its module, from the top bar: it never holds the keys itself.
+    {
+        let open_module = open_module.clone();
+        let module_layout = module_layout.clone();
+        tray.on_activate(move |id| {
+            let action = neovibe_core::layout::key_action(&module_layout.borrow(), id, false);
+            open_module(id, action);
+        });
+    }
+    // Every layout change redraws the tray.
+    {
+        let tray = tray.clone();
+        let module_layout = module_layout.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        grid.connect_changed(move || {
+            if let Ok(layout) = module_layout.try_borrow() {
+                tray.refresh(&layout, agent_panel_handle.attention());
+            }
+        });
+    }
+    tray.refresh(&module_layout.borrow(), agent_panel_handle.attention());
 
     // tmux's own prefix (spec 2026-09-19-window-modes-design.md §3). Installed after every other
     // window-level controller that exists at startup, so it sees keys first; HINT's, added when a
@@ -522,13 +817,21 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let editor = pane.clone();
         let agent = agent_panel_handle.clone();
         let window_for_focus = window.clone();
-        let modules = modules.clone();
         let app_name = top_bar.app_name.clone();
+        let refused_name = top_bar.app_name.clone();
         let text_size_controller = text_size_controller.clone();
         let terminal = terminal.clone();
         let focus_module = focus_module.clone();
+        let open_module = open_module.clone();
+        let place_and_arrive = place_and_arrive.clone();
+        let module_keys = module_keys.clone();
+        let strip_keys = module_keys.clone();
+        let strip_layout = module_layout.clone();
+        let strip_title = module_title.clone();
+        let prefix_strip = prefix_strip.clone();
         prefix::install(
             &window,
+            &module_keys.lua_keys(),
             move |command| match command {
                 // Both act on the module that last held the keys, as the prefix always has.
                 prefix::PrefixCommand::Zoom => {
@@ -543,7 +846,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // Keyed by the kind of the module that holds the keys (`terminal::literal_target`, a
                 // tested pure function), not re-derived here.
                 prefix::PrefixCommand::SendPrefix => {
-                    let focused = pane_focus::focused_module(&window_for_focus, &modules);
+                    let focused = pane_focus::focused_module(&window_for_focus, &grid.hosts());
                     match terminal::literal_target(focused.as_ref().map(ModuleId::kind)) {
                         terminal::LiteralTarget::Editor => editor.send_keys("<C-a>"),
                         terminal::LiteralTarget::Panel => agent.select_all(),
@@ -561,7 +864,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // uses just above, rather than re-deriving its Terminal arm inline (`main`'s review
                 // 2026-09-23, task-8 minor 2).
                 prefix::PrefixCommand::SendCtrlL => {
-                    let focused = pane_focus::focused_module(&window_for_focus, &modules);
+                    let focused = pane_focus::focused_module(&window_for_focus, &grid.hosts());
                     if terminal::literal_target(focused.as_ref().map(ModuleId::kind))
                         == terminal::LiteralTarget::Terminal
                     {
@@ -576,7 +879,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // Shown or hidden is the layout's (`is_shown`, which a zoom does not change).
                 prefix::PrefixCommand::ToggleTerminal => {
                     let id = ModuleId::terminal();
-                    let has_keys = pane_focus::focused_module(&window_for_focus, &modules).as_ref() == Some(&id);
+                    let has_keys = pane_focus::focused_module(&window_for_focus, &grid.hosts()).as_ref() == Some(&id);
                     let shown = module_layout.borrow().is_shown(&id);
                     for step in terminal::toggle_action(shown, has_keys).steps() {
                         match step {
@@ -597,9 +900,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                             // agent above it unless a Lua panel under or beside it was more recent --
                             // and only then unmaps it (S3 change 3; `module_grid::hide_then_unmap`,
                             // tested).
+                            // The last module on screen is refused with the top bar's flash, as
+                            // `Ctrl+a x` refuses it (spec §3.2).
                             terminal::ToggleStep::Hide => {
                                 if let Err(err) = grid.hide_module(&id, &*focus_module) {
-                                    eprintln!("[terminal] not hidden: {err}");
+                                    refuse(&refused_name, &err);
                                 }
                             }
                         }
@@ -611,20 +916,56 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 // `text_size::route_focused_module`, not re-derived here, so a swap of the two arms
                 // fails that module's own test rather than only a GUI pass (item 3g).
                 prefix::PrefixCommand::TextSize(step) => {
-                    let focused = pane_focus::focused_module(&window_for_focus, &modules);
+                    let focused = pane_focus::focused_module(&window_for_focus, &grid.hosts());
                     match text_size::route_focused_module(focused.as_ref()) {
                         text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(step),
                         text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(step),
                         text_size::TextSizeTarget::Neither => {}
                     }
                 }
-            },
-            move |armed| {
-                if armed {
-                    app_name.add_css_class("prefix-armed");
-                } else {
-                    app_name.remove_css_class("prefix-armed");
+                // Modules P2 (spec §6.3). `x` hides the module that last held the keys, as `m`
+                // zooms it: the layout's focus.
+                prefix::PrefixCommand::Hide => {
+                    let target = module_layout.borrow().focus().clone();
+                    open_module(&target, KeyAction::Hide);
                 }
+                prefix::PrefixCommand::Module(key) => {
+                    let Some(id) = module_keys.module(key).cloned() else {
+                        return;
+                    };
+                    let has_keys = pane_focus::focused_module(&window_for_focus, &grid.hosts()).as_ref() == Some(&id);
+                    let action = neovibe_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
+                    open_module(&id, action);
+                }
+                prefix::PrefixCommand::Place { key, axis } => {
+                    let Some(id) = module_keys.module(key).cloned() else {
+                        return;
+                    };
+                    if let Err(err) = place_and_arrive(&id, axis) {
+                        refuse(&refused_name, &err);
+                    }
+                }
+                prefix::PrefixCommand::Swap(direction) => {
+                    let target = module_layout.borrow().focus().clone();
+                    if grid.swap_modules(&target, direction).is_none() {
+                        println!("[modules] {target}: nothing to swap with {direction:?}");
+                    }
+                }
+                prefix::PrefixCommand::Even(axis) => grid.even_modules(axis),
+            },
+            move |waiting| {
+                if waiting == prefix::Waiting::No {
+                    app_name.remove_css_class("prefix-armed");
+                } else {
+                    app_name.add_css_class("prefix-armed");
+                }
+                // The module keys and the verbs, or after `\`/`"` the module keys alone (spec §6.5).
+                let pieces = {
+                    let layout = strip_layout.borrow();
+                    let entries = neovibe_core::layout::strip(&strip_keys, &layout);
+                    prefix_strip::strip_pieces(waiting, &entries, &strip_title(layout.focus()), &*strip_title)
+                };
+                prefix_strip.show(&pieces);
             },
         );
     }
@@ -685,44 +1026,14 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         });
     }
 
-    // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host.
-    //
-    // `vim-tmux-navigator` lives inside Neovim, which is not the focused widget here, so nothing
-    // would ever run. Capture phase, not bubble: a `WebView` handles key events itself and would
-    // otherwise consume the chord before a bubble-phase controller on the same widget ran. Only a
-    // chord that moves is claimed.
-    for (id, host) in modules
+    // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host
+    // (`install_module_nav`), one per web module here; a web module added later installs its own.
+    for (id, host) in grid
+        .hosts()
         .iter()
         .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
-        let id = id.clone();
-        let move_focus = move_focus.clone();
-        // A chord this controller lets through to the page comes back through it once more if the
-        // page does not handle it: WebKit puts the same event back on the queue for GTK's own
-        // bindings (`pane_switch::LetThrough`). The second delivery is not a second press.
-        let let_through = RefCell::new(pane_switch::LetThrough::new());
-        let controller = EventControllerKey::new();
-        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        controller.connect_key_pressed(move |controller, key, _keycode, state| {
-            let Some(direction) = pane_switch::nav_direction(key, state) else {
-                return glib::Propagation::Proceed;
-            };
-            let event = controller.current_event().map(pane_switch::SameEvent);
-            if event
-                .as_ref()
-                .is_some_and(|event| let_through.borrow_mut().is_second_delivery(event))
-            {
-                return glib::Propagation::Proceed;
-            }
-            if move_focus(&id, direction) {
-                return glib::Propagation::Stop;
-            }
-            if let Some(event) = event {
-                let_through.borrow_mut().let_through(event);
-            }
-            glib::Propagation::Proceed
-        });
-        host.add_controller(controller);
+        install_module_nav(id.clone(), host, move_focus.clone());
     }
 
     // --- Ctrl+h/j/k/l in the terminal: neovibe's, always (owner, 2026-09-23: "neovibe的按键优先").
@@ -755,7 +1066,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // gets them. Only the items `build_top_bar` returned are reachable: the window controls are
     // not focusable at all, so `Enter` here can never close the window.
     {
-        let top_items = top_bar.items.clone();
+        let top_items = top_items.clone();
         let return_to_pane = return_to_pane.clone();
         let window = window.clone();
         let hint_coordinator = hint_coordinator.clone();
@@ -780,13 +1091,13 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 Key::l | Key::Right => 1,
                 _ => return glib::Propagation::Proceed,
             };
+            // Over the items that are showing: a tray chip whose module is on screen is stepped over.
             let focus = gtk4::prelude::GtkWindowExt::focus(&window);
-            let current = top_items
-                .iter()
-                .position(|item| Some(item) == focus.as_ref())
-                .unwrap_or(0);
-            let next = (current as isize + step).clamp(0, top_items.len() as isize - 1) as usize;
-            top_items[next].grab_focus();
+            let current = top_items.iter().position(|item| Some(item) == focus.as_ref());
+            let visible: Vec<bool> = top_items.iter().map(|item| item.is_visible()).collect();
+            if let Some(next) = chrome::step_item(&visible, current, step) {
+                top_items[next].grab_focus();
+            }
             glib::Propagation::Stop
         });
         top_bar.widget.add_controller(controller);
@@ -802,6 +1113,35 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         });
     }
 
+    // `neovibe.layout.show/hide/focus/split` from a command or an event handler (modules P2, spec
+    // §4.5): queued by the Lua half while the handler runs, carried out here once it returns, so no
+    // layout change happens under a Lua call. Each refusal is logged, as a handler's own error is.
+    let apply_layout_requests: Rc<dyn Fn()> = {
+        let lua_engine = lua_engine.clone();
+        let grid = grid.clone();
+        let focus_module = focus_module.clone();
+        let focus_and_arrive = focus_and_arrive.clone();
+        let show_on_screen = show_on_screen.clone();
+        let place_and_arrive = place_and_arrive.clone();
+        Rc::new(move || {
+            let requests = lua_engine.layout.borrow_mut().take_requests();
+            for request in requests {
+                use neovibe_core::lua::layout::LayoutRequest;
+                println!("[lua] layout: {request:?}");
+                // The same three helpers `Ctrl+a` uses, so the two cannot drift apart.
+                let result = match &request {
+                    LayoutRequest::Show(id) => show_on_screen(id),
+                    LayoutRequest::Hide(id) => grid.hide_module(id, &*focus_module),
+                    LayoutRequest::Focus(id) => focus_and_arrive(id),
+                    LayoutRequest::Split(id, axis) => place_and_arrive(id, *axis),
+                };
+                if let Err(err) = result {
+                    eprintln!("[lua] layout: {request:?} refused: {err}");
+                }
+            }
+        })
+    };
+
     // Wire every Lua-registered command to a real GTK action, right before the window is shown:
     // GTK actions can be added before or after `present()`, so placement here is only for
     // clarity. Each command gets a `gio::SimpleAction` named `cmd-<id>` on `app`, whose
@@ -812,8 +1152,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let action = gtk4::gio::SimpleAction::new(&action_name, None);
         let id_owned = id.clone();
         let lua_engine_for_action = lua_engine.clone();
+        let apply_layout_requests = apply_layout_requests.clone();
         action.connect_activate(move |_, _| {
             lua_engine_for_action.invoke_command(&id_owned);
+            apply_layout_requests();
         });
         app.add_action(&action);
         if let Some(keybinding) = &entry.keybinding {
@@ -821,20 +1163,33 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         }
     }
 
-    // The layout's first focus is the editor, unless a Lua `main` panel hid it. Read BEFORE
-    // `present()`: GTK4's `gtk_window_show` moves focus Tab-forward when there is none, and were
-    // that ever to land inside a module, `pane_focus` would rewrite the layout's `focus` before this
-    // line read it. Today the top bar's `↻` is the first focusable widget, so it never has.
+    // The layout's first focus: where the keys were when this project's last arrangement change was
+    // written, from
+    // its state file (`layout_state`'s module doc); else the editor, or a Lua `main` panel that hid
+    // it (`Layout::initial`, `reconcile`). Read BEFORE `present()`: GTK4's `gtk_window_show` moves
+    // focus Tab-forward when there is none, and were that ever to land inside a module, `pane_focus`
+    // would rewrite the layout's `focus` before this line read it. Today a top-bar item (a tray chip,
+    // or `↻`) is the first focusable widget, so it never has.
     let first = module_layout.borrow().focus().clone();
     window.present();
     // grab_focus() after present(), matching standalone.rs's own
     // `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
-    // meaningless.
-    focus_module(&first);
+    // meaningless. And arrived at, as `Ctrl+a a` arrives (the whole-branch review's window finding
+    // 6): a project whose file has the keys in the chat reopens with them there the way every other
+    // keyboard route lands. At launch the panel has no session yet -- it is on its start screen, and
+    // its page may not have loaded -- so today `enter_input` is refused there and this changes
+    // nothing on screen; it is written so that a launch that resumes a session by itself lands in
+    // the composer, or on a waiting card, without anyone having to remember this line.
+    if focus_module(&first) {
+        arrive(&first);
+    }
 
     // The one real v1 event: fires once the window is actually up, so any Lua handler reacting
     // to it sees a fully-built shell (panels registered, commands bound, window shown).
+    // `neovibe.layout.show` and the rest work from here on, `shell:ready` handlers included.
+    lua_engine.layout.borrow_mut().accept_requests();
     lua_engine.emit("shell:ready");
+    apply_layout_requests();
 
     // Polls for a cross-window "come to the front" request from `neovibe-supervisor` -- e.g. the
     // dashboard's own UI, or another shell instance, asking this window to raise itself. Cloning
@@ -861,6 +1216,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // either way, regardless of whether a clean `NeovimExited` was actually observed.
     let app_for_close = app.clone();
     window.connect_close_request(move |_window| {
+        // First, and synchronously (spec §4.6): the debounce may still be waiting on an arrangement
+        // change. With none unwritten this writes nothing -- a click never does (`layout_state`'s
+        // module doc says what is written when).
+        layout_saver.save_now();
         pane.shutdown();
         // Hangs the terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
         // the process exit first, the kernel closing the PTY master hangs it up anyway.
@@ -921,6 +1280,64 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     );
 }
 
+thread_local! {
+    /// The timer that ends the refusal flash now showing, if one is ([`refuse`]).
+    static REFUSAL_ENDS: std::cell::RefCell<Option<glib::SourceId>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A layout verb the layout refused -- the last module on screen hidden, a module placed next to
+/// itself: said on stdout, and the top bar's app name shows the prefix indicator's block for
+/// [`REFUSAL_FLASH`] (spec §3.2). Its own class, so a prefix armed meanwhile keeps its indicator. A
+/// second refusal inside the flash restarts it rather than being cut short by the first one's timer
+/// (Task 9's review, minor 5). One window per process (`NON_UNIQUE`), so one timer per thread.
+fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
+    println!("[modules] refused: {err}");
+    app_name.add_css_class("refused");
+    let app_name = app_name.clone();
+    let ends = glib::timeout_add_local_once(REFUSAL_FLASH, move || {
+        REFUSAL_ENDS.with(|ends| ends.borrow_mut().take());
+        app_name.remove_css_class("refused");
+    });
+    if let Some(earlier) = REFUSAL_ENDS.with(|slot| slot.borrow_mut().replace(ends)) {
+        earlier.remove();
+    }
+}
+
+/// `Ctrl+h/j/k/l` from a web module (the agent panel, a Lua panel), on its host: a capture-phase
+/// controller, because `vim-tmux-navigator` lives inside Neovim, which is not the focused widget
+/// here, so nothing would ever run; capture, not bubble, because a `WebView` handles key events
+/// itself and would otherwise consume the chord before a bubble-phase controller on the same widget
+/// ran. Only a chord that moves is claimed. Called once per web module host, at startup and for one
+/// added later (modules P2; P3's canvas is the first).
+fn install_module_nav(id: ModuleId, host: &gtk4::Widget, move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool>) {
+    // A chord this controller lets through to the page comes back through it once more if the page
+    // does not handle it: WebKit puts the same event back on the queue for GTK's own bindings
+    // (`pane_switch::LetThrough`). The second delivery is not a second press.
+    let let_through = RefCell::new(pane_switch::LetThrough::new());
+    let controller = EventControllerKey::new();
+    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    controller.connect_key_pressed(move |controller, key, _keycode, state| {
+        let Some(direction) = pane_switch::nav_direction(key, state) else {
+            return glib::Propagation::Proceed;
+        };
+        let event = controller.current_event().map(pane_switch::SameEvent);
+        if event
+            .as_ref()
+            .is_some_and(|event| let_through.borrow_mut().is_second_delivery(event))
+        {
+            return glib::Propagation::Proceed;
+        }
+        if move_focus(&id, direction) {
+            return glib::Propagation::Stop;
+        }
+        if let Some(event) = event {
+            let_through.borrow_mut().let_through(event);
+        }
+        glib::Propagation::Proceed
+    });
+    host.add_controller(controller);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,16 +1365,36 @@ mod tests {
     /// every accelerator-guard test below, not just `every_app_accelerator_is_in_the_panel_keymap`
     /// (item 3f: these used to live nested inside that one test function, so no other test could
     /// use them without a second, drift-prone copy).
+    ///
+    /// Each row read as JavaScript reads it ([`js_keys_value`]), so `Ctrl+a \\` is one backslash and
+    /// `Ctrl+a \"` is not cut at its quote (Task 9's review, minor 6).
     fn documented_keys(keymap: &str) -> std::collections::HashSet<String> {
         let mut rows = std::collections::HashSet::new();
-        for after in keymap.split("keys: \"").skip(1) {
-            let Some(value) = after.split('"').next() else { continue };
-            rows.insert(value.to_string());
+        for value in keymap.lines().filter_map(js_keys_value) {
             for alternative in value.split(" / ") {
                 rows.insert(alternative.to_string());
             }
+            rows.insert(value);
         }
         rows
+    }
+
+    /// The `keys:` value on one `keymap.ts` row, as JavaScript reads it: `\\` is a backslash and
+    /// `\"` a quote. Modules P2's `Ctrl+a \\` and `Ctrl+a \"` rows need both; splitting the raw
+    /// line at `"` read the second as the row `Ctrl+a \\`. The row may open on an earlier line
+    /// (`{` alone, then `keys: "..."`).
+    fn js_keys_value(line: &str) -> Option<String> {
+        let start = line.find("keys: \"")? + "keys: \"".len();
+        let mut value = String::new();
+        let mut chars = line[start..].chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => value.push(chars.next()?),
+                '"' => return Some(value),
+                _ => value.push(c),
+            }
+        }
+        None
     }
 
     /// Keysyms named literally (not a single character and not an `Fnn` function key) that
@@ -1190,16 +1627,43 @@ mod tests {
     /// `Ctrl+a Ctrl+<letter>` rows are held the same way to [`prefix::bound_control_keys`], which
     /// drives the prefix itself: before that, a one-character scan skipped them, and the
     /// `Ctrl+a Ctrl+l` row the bottom terminal added was unguarded (review 2026-09-23, finding 19).
+    ///
+    /// A `Ctrl+a <split> then <keys>` row is held to what the prefix takes after that split key,
+    /// through its own `AwaitModule` state (spec §6.5), and each module key after `then` to exactly
+    /// one character: reading only a token's first character let `then editor / agent` pass for
+    /// `then e / a` (Task 9's review, minor 7).
     #[test]
     fn prefix_keys_documents_exactly_the_chars_prefix_rs_binds() {
         let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
         let mut documented: std::collections::HashSet<char> = std::collections::HashSet::new();
         let mut documented_control: std::collections::HashSet<char> = std::collections::HashSet::new();
+        // `Ctrl+a \\ then e / a / t`: the split key, and the module keys it is documented to take.
+        let mut documented_then: Vec<(char, Vec<char>)> = Vec::new();
         for line in keymap.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("{ keys: \"Ctrl+a ") else {
+            let Some(value) = js_keys_value(line) else { continue };
+            let Some(value) = value.strip_prefix("Ctrl+a ") else {
                 continue;
             };
-            let Some(value) = rest.split('"').next() else { continue };
+            if let Some((split, modules)) = value.split_once(" then ") {
+                let mut split = split.chars();
+                let (Some(split), None) = (split.next(), split.next()) else {
+                    panic!("a `then` row names one key before `then`: {value:?}");
+                };
+                documented.insert(split);
+                let mut keys: Vec<char> = modules
+                    .split(" / ")
+                    .map(|token| {
+                        let mut key = token.chars();
+                        match (key.next(), key.next()) {
+                            (Some(key), None) => key,
+                            _ => panic!("a module key after `then` is one character, not {token:?}: {value:?}"),
+                        }
+                    })
+                    .collect();
+                keys.sort_unstable();
+                documented_then.push((split, keys));
+                continue;
+            }
             for token in value.split(" / ") {
                 let mut chars = token.chars();
                 if let (Some(ch), None) = (chars.next(), chars.next()) {
@@ -1230,6 +1694,17 @@ mod tests {
                 "PREFIX_KEYS documents {ch:?} after Ctrl+a, but prefix::command no longer binds it"
             );
         }
+
+        // The split keys, through the prefix's own `AwaitModule` state (spec §6.5).
+        let mut taken = prefix::module_keys_after();
+        for (_, keys) in &mut taken {
+            keys.sort_unstable();
+        }
+        documented_then.sort();
+        assert_eq!(
+            documented_then, taken,
+            "PREFIX_KEYS' `Ctrl+a <split> then <keys>` rows and what prefix.rs takes after a split key disagree"
+        );
     }
 
     /// `WINDOW_KEYS` names `Ctrl+h/j/k/l` by hand, and its `Ctrl+j` row exists only because of the

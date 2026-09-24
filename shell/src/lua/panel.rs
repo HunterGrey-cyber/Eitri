@@ -26,10 +26,13 @@ use webkit6::prelude::*;
 /// display; the product always holds a `gtk4::Widget`.
 pub(crate) struct PanelEntry<W = gtk4::Widget> {
     pub(crate) id: String,
-    #[allow(dead_code)] // P2's tray chips are its first reader
+    /// Its tray chip's and the prefix strip's name for it (modules P2).
     pub(crate) title: String,
     /// Where it goes the first time (`PanelSlot::placement`), nothing more.
     pub(crate) slot: PanelSlot,
+    /// Its module key after `Ctrl+a`, as written (modules P2). `main.rs` checks every panel's
+    /// together (`ModuleKeys::build`) once `init.lua` has run.
+    pub(crate) key: Option<String>,
     pub(crate) widget: W,
 }
 
@@ -82,6 +85,7 @@ pub(crate) fn install(
             id: parsed.id,
             title: parsed.title,
             slot: parsed.slot,
+            key: parsed.key,
             widget: webview.upcast(),
         });
         Ok(())
@@ -100,6 +104,7 @@ mod tests {
             id: id.to_string(),
             title: id.to_string(),
             slot,
+            key: None,
             widget,
         }
     }

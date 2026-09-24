@@ -126,3 +126,18 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
   }
   return out;
 }
+
+/**
+ * Where `focus_permission` puts the cursor (modules spec §3.3): the timeline index of the OLDEST
+ * pending card -- the lowest `seq`, the one the model has waited on longest, whatever row it is
+ * drawn under -- or `null` when no card is pending.
+ */
+export function oldestPendingPermission(timeline: TimelineItem[]): number | null {
+  let best: number | null = null;
+  timeline.forEach((item, index) => {
+    if (item.kind !== "permission") return;
+    const current = best === null ? null : timeline[best];
+    if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
+  });
+  return best;
+}

@@ -80,6 +80,10 @@ type InboundHandler = (
      *  whichever one has focus, nothing when none does. See `serialize_select_all_for_js` in
      *  `core/src/agent_bridge.rs`. */
     | { kind: "select_all" }
+    /** The chat was brought back to answer a card (its tray chip `agent ⚑N`, or `Ctrl+a a`): BROWSE,
+     *  with the cursor on the oldest pending card. See `serialize_focus_permission_for_js` in
+     *  `core/src/agent_bridge.rs`. */
+    | { kind: "focus_permission" }
     /** Global `f` HINT: shell asking panel to report visible targets and freeze the list. */
     | { kind: "hint_collect"; sessionId: number }
     /** shell showing the frozen targets their labels, ready to start typing. */
@@ -114,6 +118,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "pane_focus" ||
         obj.kind === "enter_input" ||
         obj.kind === "select_all" ||
+        obj.kind === "focus_permission" ||
         obj.kind === "hint_collect" ||
         obj.kind === "hint_show" ||
         obj.kind === "hint_prefix" ||

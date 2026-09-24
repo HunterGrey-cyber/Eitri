@@ -23,6 +23,8 @@ pub(crate) struct LuaEngine {
     /// why the reason changed: the shell itself now reads a key out of it (`agent.account`) after
     /// `init.lua` has run.
     pub(crate) config: Rc<RefCell<neovibe_core::lua::config::ConfigStore>>,
+    /// `neovibe.layout.*` (modules P2): `init.lua`'s default tree, and the requests commands queue.
+    pub(crate) layout: Rc<RefCell<neovibe_core::lua::layout::LayoutStore>>,
 }
 
 impl LuaEngine {
@@ -44,6 +46,8 @@ impl LuaEngine {
         neovibe_core::lua::command::install(&lua, &neovibe, commands.clone())?;
         neovibe_core::lua::event::install(&lua, &neovibe, events.clone())?;
         neovibe_core::lua::config::install(&lua, &neovibe, config.clone())?;
+        let layout = Rc::new(RefCell::new(neovibe_core::lua::layout::LayoutStore::default()));
+        neovibe_core::lua::layout::install(&lua, &neovibe, layout.clone())?;
 
         lua.globals().set("neovibe", neovibe)?;
 
@@ -53,6 +57,7 @@ impl LuaEngine {
             commands,
             events,
             config,
+            layout,
         })
     }
 
