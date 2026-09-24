@@ -2564,6 +2564,7 @@ dependencies = [
  "terminal-input",
  "terminal-render",
  "terminal-sync",
+ "unicode-width",
 ]
 
 [[package]]

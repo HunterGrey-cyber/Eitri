@@ -96,6 +96,19 @@ impl TerminalColors {
     }
 }
 
+/// Where the cursor is on the frame [`Screen::render`] last produced: window cells, the same space
+/// as every `PaintOp`. Reported whether or not the program hid the cursor (`ESC[?25l`), because it
+/// is still where the next character lands -- which is where the host draws an input method's
+/// preedit and places its candidate window (bottom-terminal phase 2). The `PaintList` itself carries
+/// the cursor only while it is visible, which is `terminal-render`'s contract and is not changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorCell {
+    pub row: u16,
+    pub col: u16,
+    /// DECTCEM: `false` while the program has hidden the cursor.
+    pub visible: bool,
+}
+
 /// The `Term` configuration every neovibe terminal runs with. A function, so a test can pin it.
 ///
 /// - `osc52: OnlyCopy` -- a program may SET the clipboard (nvim's `"+y`), never READ it.
@@ -308,6 +321,20 @@ impl Screen {
         std::mem::take(&mut self.listener.0.lock().expect("listener mutex").events)
     }
 
+    /// Where the cursor is on the frame the last [`Self::render`] produced, visible or not. Always
+    /// inside the grid: a frame's cursor line is an absolute grid line, which in the live view this
+    /// screen always renders is the window row itself, and it is clamped rather than trusted.
+    pub fn cursor_cell(&self) -> CursorCell {
+        let cursor = &self.frame.cursor;
+        let last_row = self.frame.rows.saturating_sub(1);
+        let last_col = self.frame.cols.saturating_sub(1);
+        CursorCell {
+            row: u16::try_from(cursor.line.max(0)).unwrap_or(u16::MAX).min(last_row),
+            col: cursor.col.min(last_col),
+            visible: cursor.visible,
+        }
+    }
+
     /// Render the visible screen. `focused` selects a solid cursor when keys go here and a
     /// hollow cursor otherwise.
     ///
@@ -379,6 +406,8 @@ mod tests {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
         screen.feed(b"\x1b]52;c;?\x07");
         assert_eq!(screen.take_replies(), b"", "a read of the clipboard is never answered");
+        screen.feed(b"\x1b]52;p;?\x07\x1b]52;s;?\x07");
+        assert_eq!(screen.take_replies(), b"", "nor a read of the selection");
         screen.feed(b"\x1b]52;c;aGk=\x07");
         assert_eq!(screen.take_events().clipboard.as_deref(), Some("hi"));
     }
@@ -400,26 +429,114 @@ mod tests {
             }
         }
 
-        let record = |osc52: Osc52| {
+        let record = |osc52: Osc52, read: &[u8]| {
             let listener = RecordingListener::default();
             let grid = GridSize { cols: 20, rows: 5 };
             let config = Config { osc52, ..term_config() };
             let mut term = Term::new(config, &grid, listener.clone());
             let mut sync = SyncDriver::new();
-            sync.feed(&mut term, b"\x1b]52;c;?\x07", |_, _| {});
+            sync.feed(&mut term, read, |_, _| {});
             // The `let` binding (not a bare tail expression) matters: it ends the `MutexGuard`'s
             // scope here, before `listener` itself is dropped at the end of this closure body.
             let received = listener.0.lock().unwrap().len();
             received
         };
 
-        assert_eq!(record(Osc52::OnlyCopy), 0, "Term itself never emits an event to refuse");
+        // `c` is the clipboard; `p` and `s` are the selection phase 2 puts on the primary
+        //: `Term::clipboard_load` checks the
+        // policy before it looks at the target, and this pins that for the selection too.
+        for read in [&b"\x1b]52;c;?\x07"[..], b"\x1b]52;p;?\x07", b"\x1b]52;s;?\x07"] {
+            let name = String::from_utf8_lossy(read).escape_debug().to_string();
+            assert_eq!(
+                record(Osc52::OnlyCopy, read),
+                0,
+                "{name}: Term itself never emits an event to refuse"
+            );
+            assert_eq!(
+                record(Osc52::CopyPaste, read),
+                1,
+                "{name}: under a config neovibe never uses, Term does emit ClipboardLoad -- \
+                 proving OnlyCopy's silence above is Term's own refusal, not an artifact of this test"
+            );
+        }
+    }
+
+    /// Bottom-terminal phase 2: OSC 52 names its target, and `Term` reports `c` as the clipboard and
+    /// both `p` and `s` as the selection (`alacritty_terminal-0.26.0` `clipboard_store`). nvim's own
+    /// OSC 52 provider copies `"*` with `s`. Before phase 2 the listener dropped the target, so a
+    /// `"*y` inside the terminal overwrote the CLIPBOARD used for `Ctrl+V`.
+    #[test]
+    fn osc52_to_the_selection_is_kept_apart_from_the_clipboard() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"\x1b]52;p;aGk=\x07");
+        let events = screen.take_events();
+        assert_eq!(events.primary.as_deref(), Some("hi"));
+        assert_eq!(events.clipboard, None, "the selection is not the clipboard");
+        screen.feed(b"\x1b]52;s;Ynll\x07\x1b]52;c;Y2xpcA==\x07");
+        let events = screen.take_events();
+        assert_eq!(events.primary.as_deref(), Some("bye"), "`s` is the selection too");
+        assert_eq!(events.clipboard.as_deref(), Some("clip"));
+    }
+
+    /// Bottom-terminal phase 2: where typing lands, which is where the input method's preedit is
+    /// drawn and its candidate window placed. The `PaintList` carries the cursor only while it is
+    /// visible (`terminal-render`'s contract); this is the same cell, reported either way, and
+    /// always the cell of the frame `render` just produced.
+    #[test]
+    fn the_cursor_cell_is_where_typing_lands_visible_or_not() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"ab\r\ncd");
+        screen.render(true);
         assert_eq!(
-            record(Osc52::CopyPaste),
-            1,
-            "under a config neovibe never uses, Term does emit ClipboardLoad -- proving \
-             OnlyCopy's silence above is Term's own refusal, not an artifact of this test"
+            screen.cursor_cell(),
+            CursorCell {
+                row: 1,
+                col: 2,
+                visible: true
+            }
         );
+        screen.feed(b"\x1b[?25lx");
+        let hidden = screen.render(true);
+        assert!(hidden.cursor().is_none(), "a hidden cursor is not painted");
+        assert_eq!(
+            screen.cursor_cell(),
+            CursorCell {
+                row: 1,
+                col: 3,
+                visible: false
+            },
+            "but it is still where the next character goes"
+        );
+        screen.feed("\u{4f60}".as_bytes());
+        screen.render(true);
+        assert_eq!(screen.cursor_cell().col, 5, "a wide character moves it two cells");
+        screen.feed(b"\x1b[5;20H");
+        screen.render(true);
+        assert_eq!((screen.cursor_cell().row, screen.cursor_cell().col), (4, 19));
+    }
+
+    /// While a synchronized update is open, the cursor must come from the snapshot that `render`
+    /// uses. Reading the live `Term` instead would place preedit and the input method's candidate
+    /// window at the cursor of a partially drawn update.
+    #[test]
+    fn inside_an_open_update_the_cursor_cell_is_the_snapshots_not_the_half_drawn_ones() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"ab");
+        screen.render(true);
+        screen.feed(b"\x1b[?2026h\x1b[3;7Hxyz");
+        assert!(screen.open_update().is_some());
+        screen.render(true);
+        let cell = screen.cursor_cell();
+        assert_eq!(
+            (cell.row, cell.col),
+            (0, 2),
+            "the snapshot's cursor, not the update's (2, 9)"
+        );
+        screen.feed(b"\x1b[?2026l");
+        assert!(screen.open_update().is_none());
+        screen.render(true);
+        let cell = screen.cursor_cell();
+        assert_eq!((cell.row, cell.col), (2, 9), "the update ended: now its cursor");
     }
 
     #[test]

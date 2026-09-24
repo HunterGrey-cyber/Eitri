@@ -48,7 +48,7 @@ use crate::clock::{RenderClock, FRAME_INTERVAL};
 use crate::listener::HostEvents;
 use crate::outbox::Outbox;
 use crate::pty::{set_nonblocking, PtyChild, PtySize, SpawnSpec, HANGUP_GRACE};
-use crate::screen::{Screen, TerminalColors};
+use crate::screen::{CursorCell, Screen, TerminalColors};
 
 /// One read.
 const READ_CHUNK: usize = 64 * 1024;
@@ -74,7 +74,8 @@ pub enum SessionCommand {
     Input(NormalizedInput),
     /// A new grid: `TIOCSWINSZ` on the PTY and a `Term` resize, together. Below one cell is one cell.
     Resize(PtySize),
-    /// Whether the pane holds the keys: a solid cursor or a hollow one.
+    /// Whether the pane holds the keys: a solid cursor or a hollow one. Nothing else: no focus report
+    /// (`CSI I`/`CSI O`, DECSET 1004) reaches the program before phase 3 adds one.
     Focus(bool),
     /// Whether the pane is on screen. Hidden, output is still read, parsed and answered, and nothing
     /// is rendered; shown again, the latest screen is rendered at once.
@@ -137,6 +138,10 @@ impl ExitInfo {
 #[derive(Default)]
 pub struct Update {
     pub frame: Option<PaintList>,
+    /// Where the cursor is on `frame`, visible or not (bottom-terminal phase 2): set with every
+    /// frame the session renders, and cleared with a contained panic's failure frame, so the two
+    /// always agree.
+    pub cursor: Option<CursorCell>,
     pub events: HostEvents,
     pub exited: Option<ExitInfo>,
 }
@@ -331,6 +336,10 @@ fn contain_panic(shared: &Shared, wake: &dyn Fn(), size: PtySize, colors: Termin
         if let Ok(frame) = frame {
             update.frame = Some(frame);
         }
+        // `Update::cursor` agrees with `frame`, and the failure frame has no cursor a composition
+        // could sit at. Without this, a frame rendered and not yet taken when the thread panicked
+        // left its cursor beside the failure frame.
+        update.cursor = None;
         update.exited = Some(ExitInfo::UNKNOWN);
     });
 }
@@ -535,21 +544,22 @@ impl Worker<'_> {
         Flow::Continue
     }
 
-    /// Title, bell and clipboard from the reads just done, merged into the pending update: latest
-    /// title and clipboard win, bells fold into one.
+    /// Title, bell and the two copies from the reads just done, merged into the pending update:
+    /// latest title and copy win, bells fold into one.
     /// Folds title/bell/clipboard into the pending update. Rides the render clock out rather than
     /// ringing the host itself: a stream with an event on most
     /// reads (a bell in a `cat` of a binary, say) used to wake the host once per loop turn instead
     /// of once per rendered frame, and did so even while hidden, where phase 1's pump does nothing
     /// with the wake anyway. Clipboard is the one exception: it is the one event this pump already
     /// acts on, so hidden or not it rings at once rather than waiting for a clock this pane, while
-    /// hidden, never polls.
+    /// hidden, never polls. A copy to the primary selection is the same kind of event (phase 2).
     fn publish_events(&mut self, now: Instant) {
         let events = self.screen.take_events();
         if events == HostEvents::default() {
             return;
         }
-        let has_clipboard = events.clipboard.is_some();
+        // Either copy: the pump puts both on the desktop at once (bottom-terminal phase 2).
+        let has_clipboard = events.clipboard.is_some() || events.primary.is_some();
         self.apply_pending(|update| {
             if events.title.is_some() {
                 update.events.title = events.title;
@@ -557,6 +567,9 @@ impl Worker<'_> {
             update.events.bell |= events.bell;
             if events.clipboard.is_some() {
                 update.events.clipboard = events.clipboard;
+            }
+            if events.primary.is_some() {
+                update.events.primary = events.primary;
             }
         });
         if !self.visible {
@@ -615,10 +628,14 @@ impl Worker<'_> {
         let changed = (dirty || self.events_pending) && self.clock.changed(now);
         if changed || self.clock.is_due(now) {
             let frame = self.screen.render(self.focused);
+            let cursor = self.screen.cursor_cell();
             self.clock.rendered(now);
             self.events_pending = false;
             self.shared.renders.fetch_add(1, Ordering::SeqCst);
-            self.publish(|update| update.frame = Some(frame));
+            self.publish(|update| {
+                update.frame = Some(frame);
+                update.cursor = Some(cursor);
+            });
         }
     }
 
@@ -656,9 +673,11 @@ impl Worker<'_> {
         self.screen
             .feed(format!("\r\n\x1b[0;2m{}\x1b[0m", exit.notice()).as_bytes());
         let frame = self.screen.render(self.focused);
+        let cursor = self.screen.cursor_cell();
         self.shared.renders.fetch_add(1, Ordering::SeqCst);
         self.publish(|update| {
             update.frame = Some(frame);
+            update.cursor = Some(cursor);
             update.exited = Some(exit);
         });
         exit
@@ -680,5 +699,42 @@ impl Worker<'_> {
                 Err(_) => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic can replace a rendered frame that the host has not taken yet.
+    /// The failure frame must not retain the previous frame's cursor, which would place preedit
+    /// and the input method on a screen that is gone. Calling `contain_panic` with a render still
+    /// pending exercises this case deterministically.
+    #[test]
+    fn a_contained_panic_does_not_leave_the_previous_frames_cursor_beside_its_own() {
+        let size = PtySize {
+            cols: 20,
+            rows: 3,
+            cell_width_px: 9,
+            cell_height_px: 18,
+        };
+        let shared = Shared::default();
+        let mut screen = Screen::new(size, TerminalColors::default());
+        screen.feed(b"abc");
+        let rendered = screen.render(true);
+        let cursor = screen.cursor_cell();
+        assert_eq!((cursor.row, cursor.col), (0, 3));
+        shared.publish(&|| {}, |update| {
+            update.frame = Some(rendered.clone());
+            update.cursor = Some(cursor);
+        });
+        contain_panic(&shared, &|| {}, size, TerminalColors::default(), &"hostile input");
+        let update = std::mem::take(&mut *shared.update());
+        assert_eq!(update.exited, Some(ExitInfo::UNKNOWN));
+        assert!(
+            update.frame.as_ref().is_some_and(|frame| *frame != rendered),
+            "the failure frame replaced the pending one"
+        );
+        assert_eq!(update.cursor, None, "the failure frame carries no cursor");
     }
 }

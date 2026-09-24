@@ -10,7 +10,10 @@
 //! The layout and `ModuleGrid` control placement, visibility, focus after hiding and
 //! `Ctrl+h/j/k/l` destinations. This module keeps the terminal-specific behavior.
 
+mod bell;
 mod gl;
+mod ime;
+mod input_queue;
 pub(crate) mod keys;
 mod pane;
 

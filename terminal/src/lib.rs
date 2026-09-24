@@ -14,6 +14,7 @@ mod listener;
 pub mod metrics;
 mod outbox;
 pub mod paint;
+pub mod preedit;
 pub mod pty;
 pub mod screen;
 pub mod session;
@@ -21,9 +22,10 @@ pub mod session;
 pub use listener::HostEvents;
 pub use metrics::TerminalMetrics;
 pub use outbox::REPLY_CAP;
-pub use paint::paint;
+pub use paint::{paint, paint_ops};
+pub use preedit::{layout_preedit, PreeditLayout};
 pub use pty::{child_environment, PtyChild, PtySize, SpawnSpec};
-pub use screen::{Screen, TerminalColors};
+pub use screen::{CursorCell, Screen, TerminalColors};
 pub use session::{ExitInfo, SessionCommand, SessionConfig, TerminalSession, Update};
 
 /// The guard that this crate's manifest never grows a GTK/WebKit dependency.

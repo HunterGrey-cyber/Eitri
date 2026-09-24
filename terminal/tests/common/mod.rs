@@ -9,8 +9,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use neovibe_terminal::{
-    paint, ExitInfo, HostEvents, PtySize, SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics,
-    TerminalSession,
+    paint, paint_ops, CursorCell, ExitInfo, HostEvents, PtySize, SessionCommand, SessionConfig, SpawnSpec,
+    TerminalColors, TerminalMetrics, TerminalSession,
 };
 use skia_safe::{surfaces, EncodedImageFormat, ISize, Surface};
 use terminal_input::keys::{Key, KeyEvent, ModifiersState, NamedKey};
@@ -58,6 +58,8 @@ pub struct Harness {
     pub session: TerminalSession,
     woken: mpsc::Receiver<()>,
     pub frame: Option<PaintList>,
+    /// The cursor cell the session reported with the latest frame (bottom-terminal phase 2).
+    pub cursor: Option<CursorCell>,
     pub events: HostEvents,
     pub exited: Option<ExitInfo>,
     pub wakes: usize,
@@ -84,6 +86,7 @@ impl Harness {
             session,
             woken,
             frame: None,
+            cursor: None,
             events: HostEvents::default(),
             exited: None,
             wakes: 0,
@@ -93,8 +96,11 @@ impl Harness {
     /// Takes whatever the session published.
     fn absorb(&mut self) {
         let update = self.session.take_update();
+        // The cursor rides with its frame, as the pane takes it (`State::take_cursor`): a frame
+        // without one makes it unknown rather than keeping the last one.
         if let Some(frame) = update.frame {
             self.frame = Some(frame);
+            self.cursor = update.cursor;
         }
         if update.events.title.is_some() {
             self.events.title = update.events.title;
@@ -102,6 +108,9 @@ impl Harness {
         self.events.bell |= update.events.bell;
         if update.events.clipboard.is_some() {
             self.events.clipboard = update.events.clipboard;
+        }
+        if update.events.primary.is_some() {
+            self.events.primary = update.events.primary;
         }
         if update.exited.is_some() {
             self.exited = update.exited;
@@ -199,10 +208,17 @@ pub struct Raster {
 }
 
 fn painted(list: &PaintList, metrics: &TerminalMetrics) -> Surface {
+    painted_with(list, &[], metrics)
+}
+
+/// `list` painted by `paint`, then `overlay` by `paint_ops` on top of it, as the host paints an
+/// input method's preedit (bottom-terminal phase 2).
+fn painted_with(list: &PaintList, overlay: &[PaintOp], metrics: &TerminalMetrics) -> Surface {
     let width = ((list.cols as f32 * metrics.cell_width()).ceil() as i32).max(1);
     let height = ((list.rows as f32 * metrics.cell_height()).ceil() as i32).max(1);
     let mut surface = surfaces::raster_n32_premul(ISize::new(width, height)).expect("raster surface");
     paint(surface.canvas(), list, metrics);
+    paint_ops(surface.canvas(), overlay, metrics);
     surface
 }
 
@@ -218,7 +234,12 @@ pub fn png(list: &PaintList, metrics: &TerminalMetrics) -> Vec<u8> {
 
 impl Raster {
     pub fn of(list: &PaintList, metrics: &TerminalMetrics) -> Self {
-        let mut surface = painted(list, metrics);
+        Self::of_with(list, &[], metrics)
+    }
+
+    /// The frame with `overlay` painted over it (`painted_with`).
+    pub fn of_with(list: &PaintList, overlay: &[PaintOp], metrics: &TerminalMetrics) -> Self {
+        let mut surface = painted_with(list, overlay, metrics);
         let (width, height) = (surface.width(), surface.height());
         let info = surface.image_info();
         let row_bytes = info.min_row_bytes();
@@ -231,6 +252,18 @@ impl Raster {
     pub fn at(&self, x: i32, y: i32) -> (u8, u8, u8) {
         let i = (y as usize * self.width as usize + x as usize) * 4;
         (self.pixels[i + 2], self.pixels[i + 1], self.pixels[i])
+    }
+
+    /// Every pixel of cells `col..col+cols` of `row`, row by row: for comparing two rasters.
+    pub fn cells(&self, metrics: &TerminalMetrics, row: u16, col: u16, cols: u16) -> Vec<(u8, u8, u8)> {
+        let rect = metrics.cell_rect(row, col, cols);
+        let mut out = Vec::new();
+        for y in (rect.top as i32).max(0)..(rect.bottom as i32).min(self.height) {
+            for x in (rect.left as i32).max(0)..(rect.right as i32).min(self.width) {
+                out.push(self.at(x, y));
+            }
+        }
+        out
     }
 
     /// Pixels in cells `col..col+cols` of `row` that are not `bg`.

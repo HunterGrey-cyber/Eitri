@@ -184,7 +184,6 @@ pub fn normalize_key(raw: RawKey) -> Option<NormalizedInput> {
 /// `bracketed: true` is a *request*, not a guarantee -- [`terminal_input::encode_paste`] honours it
 /// only when the terminal has `BRACKETED_PASTE` set, and otherwise collapses newlines to `\r` so
 /// the paste types like a human. Both behaviours belong to the encoder.
-#[allow(dead_code)] // phase 2: Ctrl+Shift+V paste and the IME commit (bottom-terminal spec, phase 2)
 pub fn normalize_paste(text: impl Into<String>) -> NormalizedInput {
     NormalizedInput::Paste {
         text: text.into(),
@@ -197,7 +196,6 @@ pub fn normalize_paste(text: impl Into<String>) -> NormalizedInput {
 /// Sent with `bracketed: false`, which the encoder passes through byte for byte. That is the
 /// correct shape for a commit and not a shortcut: a committed string is what the user typed, so
 /// wrapping it in paste brackets would tell the application a human did not type it.
-#[allow(dead_code)] // phase 2: Ctrl+Shift+V paste and the IME commit (bottom-terminal spec, phase 2)
 pub fn normalize_commit(text: impl Into<String>) -> NormalizedInput {
     NormalizedInput::Paste {
         text: text.into(),
@@ -623,14 +621,35 @@ mod tests {
 
 // ---- neovibe additions (2026-09-23): what the bottom terminal needs beyond the frozen module ----
 
+/// Which of foot's two clipboard chords a key is ([`clipboard_chord`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardChord {
+    /// `Ctrl+Shift+C`. Still held back in phase 2: there is no selection to copy until phase 3.
+    Copy,
+    /// `Ctrl+Shift+V`: the clipboard's text, as a paste (phase 2).
+    Paste,
+}
+
 /// Recognises `Ctrl+Shift+C` and `Ctrl+Shift+V` as clipboard chords.
 /// The pane keeps both from the child: the encoder would turn them into 0x03
-/// (SIGINT) and 0x16 respectively. Both chords are swallowed.
-pub(crate) fn clipboard_chord(keyval: GdkKey, state: ModifierType) -> bool {
+/// (SIGINT) and 0x16 respectively. `Paste` pastes clipboard text;
+/// `Copy` is swallowed until there is a selection to copy.
+pub(crate) fn clipboard_chord(keyval: GdkKey, state: ModifierType) -> Option<ClipboardChord> {
     let others = ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
-    state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK)
-        && !state.intersects(others)
-        && matches!(keyval.to_lower(), GdkKey::c | GdkKey::v)
+    if !state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) || state.intersects(others) {
+        return None;
+    }
+    match keyval.to_lower() {
+        GdkKey::c => Some(ClipboardChord::Copy),
+        GdkKey::v => Some(ClipboardChord::Paste),
+        _ => None,
+    }
+}
+
+/// What `Ctrl+Shift+V` hands the shell for the clipboard's `text`: a paste, bracketed if the program
+/// asked for bracketing ([`normalize_paste`]). `None` for an empty clipboard, which sends nothing.
+pub(crate) fn paste(text: &str) -> Option<NormalizedInput> {
+    (!text.is_empty()).then(|| normalize_paste(text))
 }
 
 /// `Ctrl+letter` pressed then released, exactly as [`normalize_key`] turns a real one. What
@@ -694,17 +713,25 @@ mod neovibe_tests {
         );
     }
 
+    /// Bottom-terminal phase 2: the two chords are told apart, since `Ctrl+Shift+V` now pastes and
+    /// `Ctrl+Shift+C` is still held back (there is nothing to copy until phase 3's selection).
     #[test]
-    fn ctrl_shift_c_and_v_are_held_back_and_ctrl_c_is_not() {
+    fn ctrl_shift_c_is_copy_and_ctrl_shift_v_is_paste_and_ctrl_c_is_neither() {
         let ctrl_shift = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
-        assert!(clipboard_chord(GdkKey::C, ctrl_shift));
-        assert!(clipboard_chord(GdkKey::V, ctrl_shift));
-        assert!(
-            !clipboard_chord(GdkKey::c, ModifierType::CONTROL_MASK),
+        assert_eq!(clipboard_chord(GdkKey::C, ctrl_shift), Some(ClipboardChord::Copy));
+        assert_eq!(clipboard_chord(GdkKey::V, ctrl_shift), Some(ClipboardChord::Paste));
+        assert_eq!(
+            clipboard_chord(GdkKey::v, ctrl_shift | ModifierType::LOCK_MASK),
+            Some(ClipboardChord::Paste),
+            "CapsLock is not a different chord"
+        );
+        assert_eq!(
+            clipboard_chord(GdkKey::c, ModifierType::CONTROL_MASK),
+            None,
             "Ctrl+C is the shell's interrupt"
         );
-        assert!(!clipboard_chord(GdkKey::C, ctrl_shift | ModifierType::ALT_MASK));
-        assert!(!clipboard_chord(GdkKey::X, ctrl_shift));
+        assert_eq!(clipboard_chord(GdkKey::C, ctrl_shift | ModifierType::ALT_MASK), None);
+        assert_eq!(clipboard_chord(GdkKey::X, ctrl_shift), None);
         // What reaches the shell if the pane passed it on: the interrupt character.
         let raw = RawKey {
             keyval: GdkKey::C,
@@ -716,6 +743,38 @@ mod neovibe_tests {
         };
         let input = normalize_key(raw).unwrap();
         assert_eq!(terminal_input::encode(&input, Default::default()), vec![0x03]);
+    }
+
+    /// Bottom-terminal phase 2: `Ctrl+Shift+V` hands the shell the clipboard as a paste. Bracketed
+    /// (`ESC[200~` ... `ESC[201~`) only when the program asked with `ESC[?2004h` -- zsh does --
+    /// and then with every ESC and ^C taken out of the text, so a pasted `ESC[201~` cannot end the
+    /// bracket early and run what follows it (the encoder's own rule, `terminal-input`'s
+    /// `regime.rs`). Unbracketed, a newline becomes Enter (`\r`), as typing it would. An empty
+    /// clipboard sends nothing at all.
+    #[test]
+    fn a_paste_is_bracketed_only_when_the_program_asked_and_an_empty_one_sends_nothing() {
+        use alacritty_terminal::term::TermMode;
+        let pasted = paste("echo a\necho b").expect("there is text");
+        assert_eq!(
+            terminal_input::encode(&pasted, TermMode::BRACKETED_PASTE),
+            b"\x1b[200~echo a\necho b\x1b[201~".to_vec()
+        );
+        assert_eq!(
+            terminal_input::encode(&pasted, TermMode::empty()),
+            b"echo a\recho b".to_vec()
+        );
+        let windows = paste("echo a\r\necho b").expect("there is text");
+        assert_eq!(
+            terminal_input::encode(&windows, TermMode::empty()),
+            b"echo a\recho b".to_vec(),
+            "a CRLF is one Enter, not two"
+        );
+        let hostile = paste("ls\x1b[201~rm -rf x\x03").expect("there is text");
+        assert_eq!(
+            terminal_input::encode(&hostile, TermMode::BRACKETED_PASTE),
+            b"\x1b[200~ls[201~rm -rf x\x1b[201~".to_vec()
+        );
+        assert_eq!(paste(""), None);
     }
 
     /// GUI pass 2026-09-23, defect 2: under kitty flag 8 (`REPORT_ALL_KEYS_AS_ESC`), a bare left

@@ -25,6 +25,10 @@ rustix = { version = "1", features = ["std", "termios"] }
 # `setsid`/`TIOCSCTTY`/`signal` in the child's `pre_exec`, `poll`, `kill`, `waitpid`, `getpwuid_r`.
 libc = "0.2"
 skia-safe = "0.153.3"
+# How many cells an input method's preedit character takes (`src/preedit.rs`): the same crate and
+# version `alacritty_terminal` measures printed characters with, so a committed `你好` lands in the
+# cells its preedit showed. Already in the graph; this adds no crate.
+unicode-width = "0.2"
 
 [dev-dependencies]
 # The replay test counts vte's own "[unhandled ...]" debug records.

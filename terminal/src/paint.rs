@@ -6,6 +6,8 @@
 //!
 //! Every visible cell is repainted each frame. There is no damage tracking, partial redraw, or
 //! glyph atlas here, keeping drawing errors confined to operations, metrics, drawing, or clipping.
+//! [`paint_ops`] draws operations without clearing the canvas, so the host can draw input-method
+//! preedit over a finished frame.
 
 use crate::metrics::TerminalMetrics;
 use skia_safe::{Canvas, Color, Paint, Rect, TextBlob};
@@ -50,10 +52,16 @@ pub fn paint(canvas: &Canvas, list: &PaintList, metrics: &TerminalMetrics) {
     // has to come from somewhere -- this is that colour, and skipping it leaves the previous frame
     // showing through in the margin.
     canvas.clear(to_skia(list.surface_background));
+    paint_ops(canvas, &list.ops, metrics);
+}
 
+/// Executes `ops` on top of whatever the canvas already holds, without clearing it: [`paint`]'s own
+/// loop, and how the host paints something over a finished frame -- an input method's preedit
+/// (`crate::preedit`). The same lattice, the same fonts, the same rules; nothing is interpreted.
+pub fn paint_ops(canvas: &Canvas, ops: &[PaintOp], metrics: &TerminalMetrics) {
     // Front to back, in the order given. `ops` is guaranteed non-decreasing in PaintLayer, so
     // honouring the given order IS honouring z-order -- this loop must never sort or batch by type.
-    for op in &list.ops {
+    for op in ops {
         match op {
             PaintOp::FillCells { row, col, cols, color } => {
                 canvas.draw_rect(metrics.cell_rect(*row, *col, *cols), &fill_paint(*color));
