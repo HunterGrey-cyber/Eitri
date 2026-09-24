@@ -35,3 +35,7 @@ harness = false
 [[test]]
 name = "scale_factor_setting"
 harness = false
+
+[[test]]
+name = "cursor_animation"
+harness = false

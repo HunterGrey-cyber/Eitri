@@ -16,6 +16,7 @@
 //! `connect_close_request` handler (which calls `LiveHarness::shutdown()` and logs the result)
 //! becomes the public `shutdown()` method, for the host's own close-request handler to call.
 
+mod frame_clock;
 mod gl_interop;
 mod keyboard;
 mod mouse;
@@ -34,11 +35,12 @@ use gtk4::{
 };
 
 use skia_safe::gpu::direct_contexts;
-use skia_safe::Color4f;
+use skia_safe::{BlendMode, Color4f, Paint, SamplingOptions};
 
 use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::GridSize;
 
+use frame_clock::AnimationClock;
 use gl_interop::{
     compute_content_region, fill_content_region, grid_size_for_content_region, make_gl_interface, snap_region_to_grid,
     SkiaState,
@@ -122,6 +124,7 @@ pub struct LiveSession {
     pub(crate) harness: LiveHarness,
     start: Instant,
     last_frame: Instant,
+    animation_clock: AnimationClock,
     frame_count: u64,
     logged_ready: bool,
     /// `render_frame`'s own returned `animating` value, set after every render callback
@@ -192,6 +195,7 @@ impl LiveSession {
             harness,
             start: now,
             last_frame: now,
+            animation_clock: AnimationClock::default(),
             frame_count: 0,
             logged_ready: false,
             last_animating: Cell::new(true),
@@ -573,6 +577,24 @@ impl NeovideEditorPane {
         let scale_factor_callback: ScaleFactorCallbackSlot = Rc::new(RefCell::new(None));
         let scale_watch: Rc<ScaleWatch> = Rc::new(ScaleWatch::new(1.0));
 
+        // GtkWidget::unrealize is RUN_LAST: this normal handler runs before GtkGLArea deletes
+        // its framebuffer and clears its GL context. Keep the nvim session across re-realization,
+        // but let the next render create fresh Skia state for the new context.
+        {
+            let skia_state = skia_state.clone();
+            gl_area.connect_unrealize(move |widget| {
+                let Some(state) = skia_state.borrow_mut().take() else {
+                    return;
+                };
+                widget.make_current();
+                let context_is_current = widget.error().is_none()
+                    && widget
+                        .context()
+                        .is_some_and(|context| gtk4::gdk::GLContext::current().as_ref() == Some(&context));
+                state.release(context_is_current);
+            });
+        }
+
         // --- resize: GtkGLArea's FBO can be resized/recreated under us, so drop the cached
         // Surface and let the next render() rebuild it against the new framebuffer dimensions
         // (device pixels, not logical widget units). Also the P2 frozen-scroll-bug fix:
@@ -617,7 +639,10 @@ impl NeovideEditorPane {
                     Some(state) => {
                         state.fb_width = width;
                         state.fb_height = height;
-                        state.surface = None; // force rebuild on next render
+                        // Force rebuild against GTK's resized framebuffer.
+                        state.gtk_surface = None;
+                        // The render target is reallocated only if its pixel size changed. GTK can
+                        // emit resize after an allocation whose dimensions stayed exactly the same.
                     }
                     None => {
                         // GrContext not created yet; render() will pick up the GLArea's current
@@ -633,6 +658,11 @@ impl NeovideEditorPane {
             let live_state = live_state.clone();
             let kick = RemapKick::new();
             gl_area.connect_map(move |widget| {
+                // A pane hidden mid-animation must not simulate the entire hidden interval on
+                // its first visible frame. A new monitor may also supply a different clock.
+                if let LiveState::Ready(session) = &mut *live_state.borrow_mut() {
+                    session.animation_clock.reset();
+                }
                 let widget = widget.downgrade();
                 let live_state = live_state.clone();
                 kick.schedule(REMAP_RENDER_DELAY, move || {
@@ -736,12 +766,7 @@ impl NeovideEditorPane {
                         height,
                         widget.scale_factor()
                     );
-                    *state_slot = Some(SkiaState {
-                        gr_context,
-                        surface: None,
-                        fb_width: width,
-                        fb_height: height,
-                    });
+                    *state_slot = Some(SkiaState::new(gr_context, width, height));
                 }
 
                 let state = state_slot.as_mut().unwrap();
@@ -752,15 +777,21 @@ impl NeovideEditorPane {
                 // record and the measurements behind doing this every frame rather than only on
                 // resize frames.
                 state.invalidate_cached_gl_state();
-                state.ensure_surface();
+                state.ensure_gtk_surface();
+                state.ensure_render_surface();
 
-                let Some(surface) = state.surface.as_mut() else {
+                let Some(gtk_surface) = state.gtk_surface.as_mut() else {
                     return glib::Propagation::Stop;
                 };
 
                 let (fb_w, fb_h) = (state.fb_width, state.fb_height);
                 let content_region = compute_content_region(fb_w, fb_h);
-                let canvas = surface.canvas();
+                // All content, including placeholders, uses the owned target when available.
+                // Target creation failure uses the original direct path.
+                let canvas = match state.render_surface.as_mut() {
+                    Some(surface) => surface.canvas(),
+                    None => gtk_surface.canvas(),
+                };
 
                 // Cheap defensive clear, predating this work. Paint the entire framebuffer
                 // `OUTSIDE_COLOR` first, then hand only `content_region` to whatever's actually
@@ -885,7 +916,21 @@ impl NeovideEditorPane {
                         }
                     }
                     LiveState::Ready(session) => {
-                        let (dt, fps) = session.tick();
+                        // Keep diagnostics on wall time, but animate on GDK's stable frame time.
+                        // After idle, `last_frame` can be seconds old: feeding that gap into a
+                        // newly arrived cursor movement completes its spring in the first frame.
+                        let (frame_dt, fps) = session.tick();
+                        let (frame_time, refresh_interval) = widget
+                            .frame_clock()
+                            .map(|clock| {
+                                let time = clock.frame_time();
+                                (time, clock.refresh_info(time).0)
+                            })
+                            .unwrap_or_else(|| (glib::monotonic_time(), 16_667));
+                        let dt =
+                            session
+                                .animation_clock
+                                .advance(frame_time, refresh_interval, session.last_animating.get());
                         // Snapped HERE rather than where `content_region` is computed above,
                         // because the two users want different rects. The grid must sit on whole
                         // cells (see `snap_region_to_grid`), while the placeholder arms below have
@@ -918,7 +963,7 @@ impl NeovideEditorPane {
                                  nvim_exited={}",
                                 session.frame_count,
                                 elapsed,
-                                dt * 1000.0,
+                                frame_dt * 1000.0,
                                 fps,
                                 session.frame_count as f32 / elapsed.max(0.0001),
                                 fb_w,
@@ -941,6 +986,19 @@ impl NeovideEditorPane {
                 }
                 drop(live);
 
+                if let Some(render_surface) = state.render_surface.as_mut() {
+                    // Same pixels, origin and extent: one Src copy into GTK's wrapped target.
+                    // Surface::draw records into the same context; the existing single flush below
+                    // submits both the offscreen rendering and this copy.
+                    let mut paint = Paint::default();
+                    paint.set_blend_mode(BlendMode::Src);
+                    render_surface.draw(
+                        gtk_surface.canvas(),
+                        (0.0, 0.0),
+                        SamplingOptions::default(),
+                        Some(&paint),
+                    );
+                }
                 state.gr_context.flush_and_submit();
 
                 glib::Propagation::Stop
@@ -1032,7 +1090,11 @@ impl NeovideEditorPane {
                         let content_region =
                             snap_region_to_grid(&compute_content_region(width, height), session.harness.grid_scale());
                         let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
-                        let grid_resynced = if new_grid_size != session.last_grid_size.get() {
+                        // A freshly re-realized widget can tick before its first allocation.
+                        // A transient 0x0 is not a one-cell editor: resizing nvim then would
+                        // disturb its viewport/cursor before the real allocation arrives.
+                        let grid_resynced = if width > 0 && height > 0 && new_grid_size != session.last_grid_size.get()
+                        {
                             session.harness.resize_grid(new_grid_size);
                             session.last_grid_size.set(new_grid_size);
                             println!(

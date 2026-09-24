@@ -7,8 +7,8 @@ use gtk4::prelude::*;
 use gtk4::GLArea;
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
-use skia_safe::gpu::{backend_render_targets, surfaces, DirectContext, SurfaceOrigin};
-use skia_safe::{Canvas, Color4f, Paint, Rect, Surface};
+use skia_safe::gpu::{backend_render_targets, surfaces, Budgeted, DirectContext, SurfaceOrigin};
+use skia_safe::{AlphaType, Canvas, Color4f, ColorType, ImageInfo, Paint, Rect, Surface};
 
 use neovide::live_harness::LiveHarness;
 use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
@@ -26,17 +26,30 @@ use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
 /// geometry tests name, and the frozen `poc/` crates (ADR §6) still carry their own copies.
 pub(crate) const CONTENT_MARGIN: f32 = 0.0;
 
-/// GL-context-bound Skia state. Identical in spirit/implementation to
-/// `neovide_embed::SkiaState` -- see that crate's own doc comment for the full rationale; nothing
-/// about Skia/GL wrapping changes for a live nvim connection vs. the demo harness.
+/// GL-context-bound Skia state. Complex drawing uses a Skia-owned GPU target, then one Src copy
+/// presents it through GTK's framebuffer. GTK's exported buffer can have a linear layout that is
+/// expensive for the glyph workload; keeping the render target separate lets Skia choose its own.
 pub(crate) struct SkiaState {
     pub(crate) gr_context: DirectContext,
-    pub(crate) surface: Option<Surface>,
+    pub(crate) gtk_surface: Option<Surface>,
+    pub(crate) render_surface: Option<Surface>,
+    render_surface_failed_size: Option<(i32, i32)>,
     pub(crate) fb_width: i32,
     pub(crate) fb_height: i32,
 }
 
 impl SkiaState {
+    pub(crate) fn new(gr_context: DirectContext, fb_width: i32, fb_height: i32) -> Self {
+        Self {
+            gr_context,
+            gtk_surface: None,
+            render_surface: None,
+            render_surface_failed_size: None,
+            fb_width,
+            fb_height,
+        }
+    }
+
     /// Tell Skia that the GL context's state was changed by someone else since the last frame, so
     /// it must re-emit its own state instead of trusting its cache. **Call this at the top of
     /// every render callback, before any drawing.**
@@ -72,8 +85,8 @@ impl SkiaState {
         self.gr_context.reset(None);
     }
 
-    pub(crate) fn ensure_surface(&mut self) {
-        if self.surface.is_some() {
+    pub(crate) fn ensure_gtk_surface(&mut self) {
+        if self.gtk_surface.is_some() {
             return;
         }
         if self.fb_width <= 0 || self.fb_height <= 0 {
@@ -104,7 +117,65 @@ impl SkiaState {
         )
         .expect("failed to wrap GtkGLArea framebuffer as a Skia Surface");
 
-        self.surface = Some(surface);
+        self.gtk_surface = Some(surface);
+    }
+
+    /// Retain GTK's physical-pixel size and colour format. If Skia cannot create the target,
+    /// draw into GTK directly; retry only at a different size or with a new GL context.
+    /// Skia can defer GPU allocation until submission: a later device/OOM failure is not
+    /// reported by this constructor and is not covered by this fallback.
+    pub(crate) fn ensure_render_surface(&mut self) {
+        if self.fb_width <= 0 || self.fb_height <= 0 {
+            self.render_surface = None;
+            return;
+        }
+        if self
+            .render_surface
+            .as_ref()
+            .is_some_and(|surface| surface.width() == self.fb_width && surface.height() == self.fb_height)
+        {
+            return;
+        }
+        // Called from render with the GL context current, including when releasing a stale size.
+        self.render_surface = None;
+        let size = (self.fb_width, self.fb_height);
+        if self.render_surface_failed_size == Some(size) {
+            return;
+        }
+        let info = ImageInfo::new(size, ColorType::RGBA8888, AlphaType::Premul, None);
+        self.render_surface = surfaces::render_target(
+            &mut self.gr_context,
+            Budgeted::Yes,
+            &info,
+            0usize,
+            SurfaceOrigin::BottomLeft,
+            None,
+            false,
+            false,
+        );
+        if self.render_surface.is_none() {
+            self.render_surface_failed_size = Some(size);
+            eprintln!(
+                "[editor] could not create a {}x{} GPU render target; drawing directly into GTK",
+                self.fb_width, self.fb_height
+            );
+        } else {
+            self.render_surface_failed_size = None;
+        }
+    }
+
+    /// The ordinary unrealize handler runs before GTK destroys its GL context. With that context
+    /// current, release surfaces first and then Skia's caches. If the context is already lost,
+    /// abandon FIRST so dropping GPU objects cannot issue GL calls against some other context.
+    pub(crate) fn release(mut self, context_is_current: bool) {
+        if !context_is_current {
+            self.gr_context.abandon();
+        }
+        self.render_surface = None;
+        self.gtk_surface = None;
+        if context_is_current {
+            self.gr_context.release_resources_and_abandon();
+        }
     }
 }
 
@@ -327,7 +398,7 @@ mod tests {
     /// tests the coordinate math rather than this constant.
     ///
     /// It is also the reason `lib.rs`'s per-frame `canvas.clear` is currently invisible: the Skia
-    /// surface is wrapped at exactly `fb_width x fb_height` (`ensure_surface`), so a content region
+    /// surface is wrapped at exactly `fb_width x fb_height` (`ensure_gtk_surface`), so a content region
     /// equal to the framebuffer means whatever draws the frame covers every pixel the clear wrote.
     /// See `OUTSIDE_COLOR`'s doc in `lib.rs`.
     #[test]
