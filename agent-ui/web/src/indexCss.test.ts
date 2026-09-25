@@ -6,6 +6,12 @@ import css from "./index.css?raw";
 // "every --nv-* this stylesheet reads is one Rust actually emits" at the bottom of this file for
 // why the allowed names are derived from this source rather than written down here.
 import tokensRs from "../../../core/src/theme/tokens.rs?raw";
+// The sideways guard below renders the panel's real `<pre>`s (the GUI pass, 2026-09-24).
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { renderToolCall } from "./toolRegistry";
+import { renderMarkdown } from "./markdown";
+import { PermissionCard } from "./components/PermissionCard";
 
 /** Strip CSS comments while preserving comment markers inside strings.
  *
@@ -130,6 +136,7 @@ function rootCustomProperties(sheet: string): Map<string, string> {
 }
 
 const ROOT_TOKENS = rootCustomProperties(withoutComments);
+const ROW_TOKENS = rowCustomProperties(withoutComments);
 
 /** Expands every `var(--name)` in `expr` against the real `:root` declarations above, recursively,
  *  so a chain like `--row-gutter` (itself built from two other tokens) fully unrolls into numbers.
@@ -178,33 +185,68 @@ function rulesMatching(sheet: string, needle: string): { selector: string; body:
   return matches;
 }
 
-/** Every `calc(100cqw ...)` expression in `sheet`, found by counting parens rather than by a naive
- *  regex -- `var(--row-gutter)` nests its own closing paren inside the calc, so `[^)]*\)` would stop
- *  at the wrong one. Used to prove every one of them spends `var(--row-gutter)` rather than its own
- *  copy of the sign column's width (the panel-width invariants below). */
-function calc100cqwExpressions(sheet: string): string[] {
+/** Every `width` escape in `sheet`: a `width:` declaration that spends the row's own width,
+ *  `var(--row-inline-size)`. Until 2026-09-24 these were `calc(100cqw ...)` expressions, found by
+ *  paren counting; the escapes are whole declarations now, so a declaration split is enough. Used
+ *  to prove every one of them spends `var(--row-gutter)` rather than its own copy of the sign
+ *  column's width, and falls back to "no escape" (the panel-width invariants below). */
+function rowEscapeWidths(sheet: string): string[] {
   const found: string[] = [];
-  const marker = "calc(100cqw";
-  let from = 0;
-  for (;;) {
-    const start = sheet.indexOf(marker, from);
-    if (start === -1) break;
-    let depth = 0;
-    let end = start;
-    for (let i = start; i < sheet.length; i += 1) {
-      if (sheet[i] === "(") depth += 1;
-      else if (sheet[i] === ")") {
-        depth -= 1;
-        if (depth === 0) {
-          end = i;
-          break;
-        }
-      }
+  for (const rule of splitRules(stripComments(sheet))) {
+    for (const raw of rule.declarations.split(";")) {
+      const m = raw.match(/^\s*width\s*:\s*(.+?)\s*$/s);
+      if (m !== null && m[1].includes("var(--row-inline-size)")) found.push(m[1]);
     }
-    found.push(sheet.slice(start, end + 1));
-    from = end + 1;
   }
   return found;
+}
+
+/** Custom properties declared on exactly `.row` -- today only `--row-inline-size`, which has to be
+ *  declared on the row rather than on `:root` because it resolves against the list's measured
+ *  width, a value that exists only on `.message-list` (`MessageList.tsx` writes it). Read from the
+ *  stylesheet's own source, like `ROOT_TOKENS`. */
+function rowCustomProperties(sheet: string): Map<string, string> {
+  const tokens = new Map<string, string>();
+  for (const rule of splitRules(stripComments(sheet))) {
+    if (rule.selector !== ".row") continue;
+    for (const decl of rule.declarations.split(";")) {
+      const m = decl.match(/^\s*(--[\w-]+)\s*:\s*(.+?)\s*$/s);
+      if (m) tokens.set(m[1], m[2]);
+    }
+  }
+  return tokens;
+}
+
+/** `expandVars`, with `.row`'s own derived properties in scope as well as `:root`'s -- which is what
+ *  a browser resolves for anything inside a row. `var(--list-inline-size, 0px)` is left as written:
+ *  it is the one runtime input, the list's measured width, and carries its fallback inline. */
+function expandRowVars(expr: string, depth = 0): string {
+  if (depth > 10) throw new Error(`var() did not resolve after 10 rounds: ${expr}`);
+  return expr.replace(/var\((--[\w-]+)\)/g, (_, name: string) => {
+    const value = ROW_TOKENS.get(name) ?? ROOT_TOKENS.get(name);
+    if (value === undefined) throw new Error(`no :root or .row declaration for ${name}`);
+    return expandRowVars(value, depth + 1);
+  });
+}
+
+/** Evaluates a length expression from this stylesheet to px, for a list whose content box is
+ *  `listInlineSize` px wide (`null`: not measured yet, so the `0px` fallback applies) and an element
+ *  whose containing block is `percentBasis` px wide. Enough CSS math for this file's own escapes
+ *  and the prompt's inset -- `calc`, `max`, `min`, `clamp`, `+ - * /`, px, unitless and `%` -- and
+ *  it throws on anything else rather than guess. jsdom lays nothing out, so this is how a test here
+ *  can say "the escape lands on the row's right edge" as a number rather than as a spelling. */
+function evaluatePx(expr: string, listInlineSize: number | null, percentBasis: number): number {
+  const js = expandRowVars(expr)
+    .replace(/var\(--list-inline-size,\s*0px\)/g, listInlineSize === null ? "0px" : `${listInlineSize}px`)
+    .replace(/(\d+(?:\.\d+)?)%/g, (_, n: string) => `(${n} * ${percentBasis} / 100)`)
+    .replace(/(\d+(?:\.\d+)?)px\b/g, "$1")
+    .replace(/\bcalc\(/g, "(")
+    .replace(/\bmax\(/g, "Math.max(")
+    .replace(/\bmin\(/g, "Math.min(");
+  const leftover = js.replace(/Math\.max|Math\.min|clamp/g, "");
+  if (/[A-Za-z_$]/.test(leftover)) throw new Error(`cannot evaluate: ${js}`);
+  const clamp = (lo: number, value: number, hi: number) => Math.max(lo, Math.min(value, hi));
+  return new Function("clamp", `return (${js});`)(clamp) as number;
 }
 
 /** One CSS block: its prelude, its OWN declarations (a nested block's text belongs to that block,
@@ -266,6 +308,24 @@ function splitRules(sheet: string): CssRule[] {
   }
   if (open.length > 0) throw new Error(`unbalanced CSS: ${open.length} block(s) never closed`);
   return rules;
+}
+
+/** Every declaration in `sheet` that makes an element a size query container: `container-type` with
+ *  any value but `normal`, or the `container` shorthand (whose second half is a `container-type`),
+ *  at any nesting depth. Property names are matched case-insensitively, as CSS reads them. See the
+ *  "declares no size query container" test for why this file must have none. */
+function sizeContainerDeclarations(sheet: string): { selector: string; declaration: string }[] {
+  const out: { selector: string; declaration: string }[] = [];
+  for (const rule of splitRules(stripComments(sheet))) {
+    for (const raw of rule.declarations.split(";")) {
+      const declaration = raw.trim();
+      const m = declaration.match(/^(container-type|container)\s*:\s*(.*)$/is);
+      if (m === null) continue;
+      if (m[1].toLowerCase() === "container-type" && m[2].trim().toLowerCase() === "normal") continue;
+      out.push({ selector: rule.selector, declaration });
+    }
+  }
+  return out;
 }
 
 /** Matches `animation`, `transition`, their longhands and vendor-prefixed forms in declarations.
@@ -415,6 +475,13 @@ function winningDeclaration(html: string, elementSelector: string, property: str
   document.body.innerHTML = html;
   const el = document.body.querySelector(elementSelector);
   if (el === null) throw new Error(`no element matches ${elementSelector}`);
+  return winningDeclarationOn(el, property);
+}
+
+/** `winningDeclaration`'s cascade for an element already in the document, against the stylesheet
+ *  already mounted as `document.styleSheets[0]` -- for a check over every element of a kind rather
+ *  than the first one a selector finds (the sideways guard, the GUI pass of 2026-09-24). */
+function winningDeclarationOn(el: Element, property: string): string | null {
   const sheet = document.styleSheets[0];
   const candidateProperties = [property, ...(SHORTHAND_LONGHANDS[property] ?? [])];
   let winner: { important: boolean; spec: [number, number, number]; order: number; prop: string; value: string } | null =
@@ -687,6 +754,40 @@ describe("index.css", () => {
     expect(() => splitRules(".a { color: red; } }")).toThrow(/closed no block/);
   });
 
+  /* Size query containers made WebKitGTK 2.52.6 reset .message-list's scrollTop to a stale
+     value whenever the elapsed counter ticked, interrupting follow during streaming. Moving the
+     container to .row-body, .message-list or assistant rows also caused the problem. This
+     stylesheet check catches the measured cause without requiring a display. The WebKitGTK test
+     in shell/tests/panel_stream_scroll.rs checks the scrolling behaviour. Its parked-reader
+     scenario still detects a restored container; the follow effect re-snaps before paint in the
+     other follow scenarios. Only index.css is scanned here. Component inline styles are outside
+     this check, and contain/content-visibility are allowed because they were not measured
+     separately. */
+  it("declares no size query container anywhere: container-type is normal or absent, and the container shorthand is unused", () => {
+    const offending = sizeContainerDeclarations(withoutComments);
+    expect(offending, offending.map((d) => `${d.selector} { ${d.declaration} }`).join("\n")).toEqual([]);
+    // Positive controls: the scanner does see each shape it forbids -- the exact rule that broke
+    // the panel, the shorthand, a case-changed spelling, and one inside `@media` -- and it does not
+    // mistake the unrelated `contain` property, or an explicit `normal`, for one.
+    const shapes = [
+      ".row { container-type: inline-size; }",
+      ".row-body { container: body / inline-size; }",
+      ".message-list { CONTAINER-TYPE: size; }",
+      "@media (min-width: 1px) { .row-assistant { container-type: inline-size; } }",
+    ];
+    for (const shape of shapes) {
+      expect(sizeContainerDeclarations(shape), shape).toHaveLength(1);
+    }
+    expect(sizeContainerDeclarations(".status-line { contain: strict; } .row { container-type: normal; }")).toEqual([]);
+    // And no container-query unit either: with no container to resolve against, a `cqw` silently
+    // falls back to the small viewport -- a wrong width with nothing to say so. The escapes spend
+    // `var(--row-inline-size)` instead (see index.css's `.row` rule).
+    const CONTAINER_UNIT = /\d(?:\.\d+)?cq(?:w|h|i|b|min|max)\b/i;
+    expect(withoutComments).not.toMatch(CONTAINER_UNIT);
+    expect("width: calc(100cqw - var(--row-gutter));").toMatch(CONTAINER_UNIT);
+    expect("min(8 * 1CQI, 120px)").toMatch(CONTAINER_UNIT);
+  });
+
   it("puts every animation OR transition declaration on .turn-activity .meter-fill, with exactly one @keyframes", () => {
     const moving = movingSelectorsIn(css);
     expect(moving.length).toBeGreaterThan(0);
@@ -920,10 +1021,11 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   /* Wide code blocks, permission diffs and tool results must escape the prose measure to use
-     the row's available width. jsdom does not perform Grid layout, so these tests check that
-     cqw-based width declarations reach the intended elements. The units use .row's
-     container-type: inline-size and reach through plain wrappers without removing their
-     backgrounds, borders or padding. */
+     the row's available width. .row derives --row-inline-size from the list's measured width.
+     The custom property reaches through plain wrappers without size query containers, which
+     made WebKitGTK reset the list's scroll position during streaming. jsdom has no Grid layout.
+     These tests check which elements receive the width declarations, and evaluatePx checks the
+     right-edge arithmetic numerically. */
   it("lets a fenced code block ignore the prose measure, unlike a paragraph in the very same row", () => {
     // Real defect reproduced: before this task, `.code-block` had no `width` rule at all, so it
     // was exactly as capped by `.row-body`'s grid track as the paragraph beside it.
@@ -932,11 +1034,11 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<p>prose</p><pre class="code-block"><code>x</code></pre></div></div></div>`;
     const prose = computed(html, "p");
     const code = computed(html, "pre.code-block");
-    expect(code.width).toMatch(/cqw/);
-    expect(prose.width).not.toMatch(/cqw/);
+    expect(code.width).toMatch(/var\(--row-inline-size\)/);
+    expect(prose.width).not.toMatch(/--row-inline-size/);
     // Negative control: without the rule this task adds, a code block is exactly as capped as the
     // paragraph next to it -- there is nothing else in this file that would widen it.
-    expect(computed(html, "pre.code-block", ".code-block { width: auto; }").width).not.toMatch(/cqw/);
+    expect(computed(html, "pre.code-block", ".code-block { width: auto; }").width).not.toMatch(/--row-inline-size/);
   });
 
   it("lets a tool result ignore the prose measure through two plain, unstyled wrapper elements", () => {
@@ -944,14 +1046,16 @@ describe("index.css cascade (which rule actually wins)", () => {
     // `.tool-result` -- MessageList.tsx and toolRegistry.tsx's real nesting -- and NONE of those
     // three carries a rule in this file. A fix that (wrongly) targeted `.row-body` itself, rather
     // than the leaf, would not be exercised by a fixture this shallow; this one is exactly as deep
-    // as the real DOM to make sure the `cqw` unit really does reach through, not just past a
+    // as the real DOM to make sure the row's width really does reach through, not just past a
     // fixture shortcut.
     const html =
       `<div class="message-list"><div class="row row-tool"><div class="row-body">` +
       `<div data-awaiting-permission><div class="tool-call"><div class="tool-result">` +
       `<pre class="tool-result-body">out</pre></div></div></div></div></div></div>`;
-    expect(computed(html, "pre.tool-result-body").width).toMatch(/cqw/);
-    expect(computed(html, "pre.tool-result-body", ".tool-result-body { width: auto; }").width).not.toMatch(/cqw/);
+    expect(computed(html, "pre.tool-result-body").width).toMatch(/var\(--row-inline-size\)/);
+    expect(computed(html, "pre.tool-result-body", ".tool-result-body { width: auto; }").width).not.toMatch(
+      /--row-inline-size/,
+    );
   });
 
   it("widens the permission-card diff's own bordered box, not just the text inside it", () => {
@@ -963,7 +1067,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="permission-card"><div class="permission-card-edit"><div class="permission-card-edit-head">h</div>` +
       `<pre class="permission-card-diff"><div class="diff-line diff-added"><span class="diff-gutter">+</span></div></pre></div></div>`;
     const edit = computed(html, ".permission-card-edit");
-    expect(edit.width).toMatch(/cqw/);
+    expect(edit.width).toMatch(/var\(--row-inline-size\)/);
     // It also has to climb back out of `.permission-card`'s own box first, or the widened box
     // would start further right than a code block or a tool result does. **-11px, not -10px**
     //: with the global `box-sizing: border-box` the card's
@@ -975,7 +1079,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(computed(html, ".permission-card").paddingLeft).toBe("10px");
     expect(edit.marginLeft).toBe("-11px");
     expect(computed(html, ".permission-card-edit", ".permission-card-edit { width: auto; margin-left: 0; }").width).not.toMatch(
-      /cqw/,
+      /--row-inline-size/,
     );
   });
 
@@ -988,7 +1092,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="permission-card"><pre class="permission-card-input">{"command":"..."}</pre></div>` +
       `</div></div></div>`;
     const input = computed(html, ".permission-card-input");
-    expect(input.width).toMatch(/cqw/);
+    expect(input.width).toMatch(/var\(--row-inline-size\)/);
     // The same -11px as the diff box above, and for the same reason: both sit inside
     // `.permission-card`'s border + padding, so both have to climb back out by the same amount or
     // the two would not line up with each other, let alone with a code block.
@@ -996,40 +1100,51 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(input.marginLeft).toBe(computed(html, ".permission-card-input").marginLeft);
     // Negative control: without this rule it is exactly as capped as it was.
     expect(computed(html, ".permission-card-input", ".permission-card-input { width: auto; margin-left: 0; }").width).not.toMatch(
-      /cqw/,
+      /--row-inline-size/,
     );
   });
 
   /* Failed tool results add a 2px left border and 6px left padding. The body must subtract this
      extra 8px as well as --row-gutter so its right edge matches a passing result. jsdom leaves
-     var() unresolved in computed widths. expandVars reads --row-gutter from the real :root
-     declaration so the test checks the subtraction derived from the sign-column tokens rather
-     than merely checking a token name. */
+     var() unresolved in computed widths. expandRowVars resolves --row-inline-size through
+     .row's declaration and expands the gutter tokens. evaluatePx checks the resulting
+     arithmetic numerically without a size query container. */
   it("narrows a tool result by its error gutter, so a FAILED tool lands on the same right edge as a passing one", () => {
     const row = (errorClass: string) =>
       `<div class="message-list"><div class="row row-tool"><div class="row-body">` +
       `<div class="tool-call"><div class="tool-result${errorClass}">` +
       `<pre class="tool-result-body">out</pre></div></div></div></div></div>`;
-    // `--row-gutter` is `calc(var(--row-sign-w) + var(--row-gap))` = `calc(22px + 8px)`, so the
-    // base escape expands to subtracting exactly that from `100cqw`.
-    expect(expandVars(computed(row(""), "pre.tool-result-body").width)).toBe("calc(100cqw - calc(22px + 8px))");
+    // `--row-gutter` is `calc(var(--row-sign-w) + var(--row-gap))` = `calc(22px + 8px)`, and
+    // `--row-inline-size` is `.row`'s own `calc(var(--list-inline-size, 0px) - 2px)`, so the base
+    // escape expands to exactly the row's width minus the gutter, inside the "no escape" floor.
+    const base = computed(row(""), "pre.tool-result-body").width;
+    const failed = computed(row(" tool-result-error"), "pre.tool-result-body").width;
+    expect(expandRowVars(base)).toBe("max(100%, calc(calc(var(--list-inline-size, 0px) - 2px) - calc(22px + 8px)))");
     // 2px border-left + 6px padding-left = 8px, so the error state subtracts the gutter AND that
     // 8px, and the two right edges coincide.
-    expect(expandVars(computed(row(" tool-result-error"), "pre.tool-result-body").width)).toBe(
-      "calc(100cqw - calc(22px + 8px) - 8px)",
+    expect(expandRowVars(failed)).toBe(
+      "max(100%, calc(calc(var(--list-inline-size, 0px) - 2px) - calc(22px + 8px) - 8px))",
     );
+    // As numbers, for a 600px list whose body track is capped narrower (the `62ch` opt-in): the
+    // passing body is the row's 598px minus the 30px gutter, the failed one 8px less, and each ends
+    // on the row's right edge because each starts 8px apart. With no measurement yet, both fall back
+    // to their containing block (`100%`), never to a negative width.
+    expect(evaluatePx(base, 600, 400)).toBe(568);
+    expect(evaluatePx(failed, 600, 392)).toBe(560);
+    expect(evaluatePx(base, null, 400)).toBe(400);
+    expect(evaluatePx(failed, null, 392)).toBe(392);
     // Negative control: this is a real specificity win, not an accident of the fixture. Deleting
     // the narrower rule (simulated by re-declaring the base one after it, at higher specificity)
     // puts the overhanging (gutter-only) width back.
     expect(
-      expandVars(
+      expandRowVars(
         computed(
           row(" tool-result-error"),
           "pre.tool-result-body",
-          ".tool-result-error .tool-result-body { width: calc(100cqw - var(--row-gutter)); }",
+          ".tool-result-error .tool-result-body { width: max(100%, calc(var(--row-inline-size) - var(--row-gutter))); }",
         ).width,
       ),
-    ).toBe("calc(100cqw - calc(22px + 8px))");
+    ).toBe("max(100%, calc(calc(var(--list-inline-size, 0px) - 2px) - calc(22px + 8px)))");
   });
 
   /* --- the in-flight indicator's own layout ------------------
@@ -1079,7 +1194,18 @@ describe("index.css cascade (which rule actually wins)", () => {
 
     const sites = new Map<string, string[]>();
     for (const d of declared) sites.set(d.name, [...(sites.get(d.name) ?? []), d.selector.trim()]);
+    // The one exception, by name (2026-09-24): `--row-inline-size` is not a knob but the row's own
+    // width, derived from the list's measured one, so it can only be declared where it resolves --
+    // on `.row` (a declaration on `:root` would resolve its `var(--list-inline-size)` there, where
+    // nothing sets it). Pinned to exactly that one site, visible to `ROW_TOKENS`, so this is not a
+    // door for a second place to declare anything else.
+    const DECLARED_ON_ROW = new Set(["--row-inline-size"]);
+    for (const name of DECLARED_ON_ROW) {
+      expect(sites.get(name), `${name} must be declared exactly once, on .row`).toEqual([".row"]);
+      expect(ROW_TOKENS.has(name), `${name} is declared but invisible to ROW_TOKENS`).toBe(true);
+    }
     for (const [name, selectors] of sites) {
+      if (DECLARED_ON_ROW.has(name)) continue;
       expect(
         selectors,
         `${name} is declared ${selectors.length} times (${selectors.join(" | ")}) -- a second declaration ` +
@@ -1091,6 +1217,8 @@ describe("index.css cascade (which rule actually wins)", () => {
       ).toBe(":root");
       expect(ROOT_TOKENS.has(name), `${name} is declared but invisible to ROOT_TOKENS`).toBe(true);
     }
+    // ...and `.row` declares nothing else a guard here would have to know about.
+    expect([...ROW_TOKENS.keys()]).toEqual([...DECLARED_ON_ROW]);
   });
 
   /* --- the text scale is one number and five ratios of it (2026-09-21) -------------------------
@@ -1265,11 +1393,11 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<details class="tool-card tool-card-generic"><summary>s</summary><pre>{}</pre></details>` +
       `</div></div></div></div></div>`;
     const card = computed(html, ".tool-card-generic");
-    expect(card.width).toMatch(/cqw/);
+    expect(card.width).toMatch(/var\(--row-inline-size\)/);
     expect(card.marginLeft).not.toBe("-10px");
     // Negative control: without the rule this fix adds, it is exactly as capped as everything else
     // in `.row-body`.
-    expect(computed(html, ".tool-card-generic", ".tool-card-generic { width: auto; }").width).not.toMatch(/cqw/);
+    expect(computed(html, ".tool-card-generic", ".tool-card-generic { width: auto; }").width).not.toMatch(/--row-inline-size/);
   });
 
   it("keeps the sign column on the same track whether the row's body is prose or a wide code block", () => {
@@ -1303,15 +1431,25 @@ describe("index.css cascade (which rule actually wins)", () => {
     ).not.toBe(proseColumns);
   });
 
-  it("gives `.row` a size query container without disturbing its own grid tracks", () => {
-    // The mechanism the four tests above all rely on: `container-type: inline-size` has to be on
-    // by the time any of them run, or every `cqw`-based width above would be checking a unit that
-    // resolves against nothing. Pinned on its own so a regression here explains itself instead of
-    // surfacing as four unrelated-looking failures above.
+  it("derives `.row`'s own width from the list's measured one, with no size container and its grid tracks untouched", () => {
+    // The mechanism the escape tests above all rely on, pinned on its own so a regression here
+    // explains itself instead of surfacing as several unrelated-looking failures above. Until
+    // 2026-09-24 this test asserted the opposite -- `container-type: inline-size` -- and that
+    // container is what made WebKitGTK drop the reader while a reply streamed.
     const row = computed(CODE_BLOCK, ".row");
-    expect(row.getPropertyValue("container-type")).toBe("inline-size");
+    expect(row.getPropertyValue("container-type")).toBe("normal");
+    // `--row-inline-size` is the list's content-box width minus THIS rule's own 2px `border-left`
+    // (taken out of the content box by the global `box-sizing: border-box`) -- which is what `100cqw`
+    // measured. The 2px is read back from the border, not trusted from the formula.
+    expect(ROW_TOKENS.get("--row-inline-size")).toBe("calc(var(--list-inline-size, 0px) - 2px)");
+    expect(row.borderLeftWidth).toBe("2px");
+    expect(row.boxSizing).toBe("border-box");
     expect(row.display).toBe("grid");
     expect(expandVars(row.gridTemplateColumns)).toBe("22px minmax(0, 1fr)");
+    // Negative control: the container put back is exactly what this and the tripwire refuse.
+    expect(computed(CODE_BLOCK, ".row", ".row { container-type: inline-size; }").getPropertyValue("container-type")).toBe(
+      "inline-size",
+    );
   });
 
   it("leaves a choice row on the sign-column grid, not on the boxed-button padding", () => {
@@ -1342,17 +1480,27 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(gutter).toBeDefined();
     expect(gutter).toMatch(/var\(--row-sign-w\)/);
     expect(gutter).toMatch(/var\(--row-gap\)/);
-    // Half 2: a correct formula sitting unused proves nothing -- every `calc(100cqw ...)` escape in
-    // the real file has to actually spend it, or a rule could still subtract its own literal right
-    // beside a perfectly good token.
-    const escapes = calc100cqwExpressions(withoutComments);
-    expect(escapes.length).toBeGreaterThan(0);
+    // Half 2: a correct formula sitting unused proves nothing -- every escape in the real file (a
+    // `width` spending `var(--row-inline-size)`; `calc(100cqw ...)` until 2026-09-24) has to actually
+    // spend it, or a rule could still subtract its own literal right beside a perfectly good token.
+    // Four: the code block / tool result / generic card group, the failed tool result, and the
+    // permission card's input and diff box.
+    const escapes = rowEscapeWidths(withoutComments);
+    expect(escapes.length).toBe(4);
     for (const escape of escapes) {
       expect(escape, escape).toMatch(/var\(--row-gutter\)/);
+      // ...and each one degrades to its own containing block before the list has been measured,
+      // never below it (`max(100%, ...)`; see index.css's `.row` rule).
+      expect(escape, escape).toMatch(/^max\(100%,/);
     }
   });
 
   it("keeps a container-query unit out of every custom property declaration (WebKitGTK guard)", () => {
+    // Since 2026-09-24 there is no container-query unit anywhere in the file (the tripwire near the
+    // top of the `index.css` block: with no container, a `cq*` unit would silently resolve against
+    // the viewport). This guard is kept for what it pins about custom properties specifically, and
+    // because its bypasses are still real ones. What follows is its original rationale.
+    //
     // Spelled out in index.css's own comment: a `var()` substitutes as raw tokens, so a `cqw` unit
     // written INSIDE a custom property's value would still resolve correctly by spec -- but
     // container units inside custom properties are exactly the corner where an engine has shipped
@@ -1401,13 +1549,13 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect("\n  --bypass: calc(\n    100cqw\n  )\n".match(preFixRegex)).toBeNull();
   });
 
-  it("never lets a literal number sneak back into a calc(100cqw - ...) escape", () => {
-    // Scan the source directly, independently of `calc100cqwExpressions`, so a defect in that
-    // helper cannot hide a repeated literal sign-column width from both checks. Match a number
-    // immediately after the first minus, leaving the error result's separate `- 8px` gutter alone.
-    // Require `100cqw` to exist too, so an empty stylesheet cannot pass the negative assertion.
-    expect(withoutComments).toMatch(/100cqw/);
-    expect(withoutComments).not.toMatch(/calc\(\s*100cqw\s*-\s*\d/);
+  it("never lets a literal number sneak back into a row-width escape", () => {
+    // Scan the source directly, independently of `rowEscapeWidths`, so a defect in that helper
+    // cannot hide a repeated literal sign-column width from both checks. Match a number after
+    // the row-width subtraction, leaving the error result's separate `- 8px` gutter alone.
+    // Require `var(--row-inline-size)` to exist too, so an empty stylesheet cannot pass.
+    expect(withoutComments).toMatch(/var\(--row-inline-size\)/);
+    expect(withoutComments).not.toMatch(/var\(--row-inline-size\)\s*-\s*\d/);
   });
 
   /* --- the user's own message is an indent, not a bubble (2026-09-21) --------------------------
@@ -1650,8 +1798,8 @@ describe("index.css cascade (which rule actually wins)", () => {
         /^clamp\(/,
       );
       expect(
-        expandVars(d.value),
-        `${d.selector} resolves to ${expandVars(d.value)}, which measures a PERCENTAGE of the grid area`,
+        expandRowVars(d.value),
+        `${d.selector} resolves to ${expandRowVars(d.value)}, which measures a PERCENTAGE of the grid area`,
       ).not.toMatch(/%/);
     }
     const clamp = displacements[0].value;
@@ -1667,34 +1815,49 @@ describe("index.css cascade (which rule actually wins)", () => {
     for (const token of ["--prompt-inset-knee", "--prompt-inset-slope", "--prompt-inset-cap", "--prompt-inset-cap-max"]) {
       expect(clamp, `${clamp} does not spend var(${token})`).toContain(`var(${token})`);
     }
-    // Base the inset on the row's `100cqw`, not a percentage of `.row-body`'s grid track.
-    // That track depends on `--prose-measure`, so a percentage inset changes with prose width
-    // and can vanish below the knee even when the row is wide.
-    // A token can hide a percentage while a dead `100cqw * 0` term satisfies a text check.
-    // Expand `var()` from the real `:root` declarations before checking the basis, since jsdom
-    // does not resolve those substitutions.
-    const expandedClamp = expandVars(clamp);
-    expect(expandedClamp).toMatch(/100cqw/);
+    // Base the inset on `var(--row-inline-size)`, derived from the measured list width, not a
+    // percentage of `.row-body`'s grid track. That track depends on `--prose-measure`, so a
+    // percentage inset changes with prose width and can vanish below the knee on a wide row.
+    // A token can hide a percentage while a dead row-width term satisfies a text check.
+    // Use `expandRowVars` to expand `:root` tokens and the row's derived width before checking
+    // the basis, since jsdom does not resolve those substitutions.
+    const expandedClamp = expandRowVars(clamp);
+    expect(expandedClamp).toMatch(/var\(--list-inline-size, 0px\)/);
     expect(expandedClamp).not.toMatch(/%/);
-    expect(expandedClamp).not.toMatch(/cq(h|i|b|min|max)\b/i); // only cqw, the WebKitGTK-safe axis for this row
+    expect(expandedClamp).not.toMatch(/\dcq(w|h|i|b|min|max)\b/i);
+
+    // As numbers, which is the claim itself: nothing until the ROW is past the 560px knee, three
+    // tenths of the surplus after it, capped at 8% of the row and never above 120px, and 0 before
+    // the list has been measured at all. The percent basis is passed as something absurd on
+    // purpose -- the grid area must not enter, so it must not matter.
+    const inset = (listInlineSize: number | null) => evaluatePx(clamp, listInlineSize, 99999);
+    expect(inset(null)).toBe(0);
+    expect(inset(400)).toBe(0); // row 398px, under the knee
+    expect(inset(562)).toBe(0); // row 560px, exactly at the knee
+    expect(inset(700)).toBeCloseTo(41.4, 6); // row 698px: min((698 - 560) * 0.3, 8% of 698) = 41.4
+    expect(inset(1000)).toBeCloseTo(79.84, 6); // row 998px: the 8% cap (79.84) beats 131.4
+    expect(inset(2000)).toBe(120); // row 1998px: the absolute cap
+    expect(evaluatePx(clamp, 700, 1)).toBe(inset(700)); // ...and the grid area really does not enter
 
     // Negative control, the reviewer's own bypass: `clamp(0px,(100% - 5000px)*3,80%)` still LOOKS
     // plausible -- a 0 floor, a clamp shape -- but is expressed in percentages of the grid area
-    // rather than `cqw` of the row, which is exactly the defect the basis correction above fixed.
+    // rather than the row's width, which is exactly the defect the basis correction above fixed.
     // A guard that only checked "floors at 0" and "has a % somewhere" (the pre-fix version) let
-    // this straight through; this one fails it on both the missing tokens and the missing `100cqw`.
+    // this straight through; this one fails it on the missing tokens, the missing row basis, and
+    // the grid area entering the number.
     const bypass = "clamp(0px,(100% - 5000px)*3,80%)";
-    expect(bypass).not.toMatch(/100cqw/);
+    expect(expandRowVars(bypass)).not.toMatch(/--list-inline-size/);
     for (const token of ["--prompt-inset-knee", "--prompt-inset-slope", "--prompt-inset-cap", "--prompt-inset-cap-max"]) {
       expect(bypass).not.toContain(`var(${token})`);
     }
+    expect(evaluatePx(bypass, 700, 10000)).not.toBe(evaluatePx(bypass, 700, 20000));
 
-    // Hide the percentage behind a token and add a dead `100cqw * 0` term. Raw text checks accept
+    // Hide the percentage behind a token and add a dead row-width term. Raw text checks accept
     // this, but expansion exposes the percentage. Inline the substitution here because the
-    // fixture's `--prompt-basis` token has no declaration in the real `:root`.
-    const hiddenPercentBypass = "clamp(0px, (100cqw * 0) + (var(--prompt-basis) - 5000px) * 3, 120px)";
+    // fixture's `--prompt-basis` token has no real declaration for `expandRowVars` to use.
+    const hiddenPercentBypass = "clamp(0px, (var(--row-inline-size) * 0) + (var(--prompt-basis) - 5000px) * 3, 120px)";
     const hiddenPercentBypassExpanded = hiddenPercentBypass.replace("var(--prompt-basis)", "100%");
-    expect(hiddenPercentBypass).toMatch(/100cqw/); // <- the OLD "has 100cqw" check, satisfied wrongly
+    expect(hiddenPercentBypass).toMatch(/var\(--row-inline-size\)/); // <- the OLD "has the row basis" check, satisfied wrongly
     expect(hiddenPercentBypass).not.toMatch(/%/); // <- the OLD "has no %" check, ALSO satisfied wrongly
     expect(hiddenPercentBypassExpanded).toMatch(/%/); // <- expanding first is what actually catches it
   });
@@ -1855,6 +2018,90 @@ describe("index.css cascade (which rule actually wins)", () => {
  * is the accepted cost and the reason the parse asserts its own sentinels before it is used: a
  * refactor that breaks the parse fails here loudly rather than quietly admitting everything.
  */
+/* Long Bash commands, unbroken paths, URLs and patterns can push the conversation sideways when
+   their <pre> keeps white-space: pre. Prose URLs and markdown tables need overflow handling
+   too. jsdom has no layout, so these tests check that list text can break and every rendered
+   <pre> wraps or scrolls within its own box. shell/tests/panel_stream_scroll.rs measures the
+   result in WebKitGTK. */
+describe("index.css: nothing in the conversation scrolls it sideways", () => {
+  afterEach(() => {
+    document.head.innerHTML = "";
+    document.body.innerHTML = "";
+  });
+
+  it("lets any line in the list break where it has to, inherited from .message-list", () => {
+    const html = `<div class="message-list"><div class="row row-assistant"><div class="row-body"><p>x</p></div></div></div>`;
+    expect(winningDeclaration(html, ".message-list", "overflow-wrap")).toBe("anywhere");
+    // Negative control: the declaration can lose, and this reads the loser as such.
+    expect(winningDeclaration(html, ".message-list", "overflow-wrap", ".message-list { overflow-wrap: normal; }")).toBe(
+      "normal",
+    );
+    // And nothing between the list and a paragraph takes it back.
+    for (const selector of [".row", ".row-body", "p"]) {
+      expect(winningDeclaration(html, selector, "overflow-wrap")).toBeNull();
+    }
+  });
+
+  /** Every `<pre>` the panel's own renderers put in a row: a `Bash` call with its result, an
+   *  unrecognized tool's JSON dump, a fenced code block, and a permission card's input and diff. */
+  function panelPres(extraCss = ""): HTMLElement[] {
+    const bash = renderToolCall({
+      seq: 1,
+      toolUseId: "t1",
+      name: "Bash",
+      input: { command: "cargo test" },
+      result: { content: "ok", isError: false },
+    });
+    const generic = renderToolCall({ seq: 2, toolUseId: "t2", name: "mcp__demo__lookup", input: { k: "v" }, result: null });
+    const card = (toolName: string, input: unknown) =>
+      createElement(PermissionCard, {
+        request: { seq: 3, permissionId: `p-${toolName}`, toolUseId: null, toolName, input },
+        sessionEnded: false,
+        onAnswer: () => {},
+      });
+    const rows = [
+      renderToStaticMarkup(createElement("div", null, bash)),
+      renderToStaticMarkup(createElement("div", null, generic)),
+      renderMarkdown("```rust\nfn main() {}\n```"),
+      renderToStaticMarkup(card("Bash", { command: "cargo test" })),
+      renderToStaticMarkup(card("Edit", { file_path: "/p/a.rs", old_string: "a\n", new_string: "b\n" })),
+    ];
+    document.head.innerHTML = `<style>${css}${extraCss}</style>`;
+    document.body.innerHTML =
+      `<div class="message-list">` +
+      rows.map((row) => `<div class="row"><span class="row-sign"></span><div class="row-body">${row}</div></div>`).join("") +
+      `</div>`;
+    return Array.from(document.querySelectorAll<HTMLElement>(".message-list pre"));
+  }
+
+  /** Why a `<pre>` cannot push the list sideways, or `null` when nothing stops it. No winning
+   *  `white-space` means the UA's own `pre`. */
+  function containment(pre: HTMLElement): string | null {
+    const whiteSpace = winningDeclarationOn(pre, "white-space");
+    if (whiteSpace !== null && whiteSpace !== "pre" && whiteSpace !== "nowrap") return `wraps (white-space: ${whiteSpace})`;
+    for (const property of ["overflow-x", "overflow"]) {
+      const value = winningDeclarationOn(pre, property);
+      if (value !== null && /\b(?:auto|scroll|hidden|clip)\b/.test(value)) return `scrolls in its own box (${property}: ${value})`;
+    }
+    return null;
+  }
+
+  it("wraps or scrolls every <pre> the panel renders in a row, never leaving one at the UA's white-space: pre", () => {
+    const pres = panelPres();
+    // The fixture really holds all six, so a renderer that stopped emitting one cannot pass by absence.
+    const kinds = pres.map((pre) => pre.className || "(no class)").sort();
+    expect(kinds).toEqual(
+      ["(no class)", "code-block", "permission-card-diff", "permission-card-input", "tool-card tool-card-bash", "tool-result-body"].sort(),
+    );
+    for (const pre of pres) {
+      expect({ pre: pre.className || pre.parentElement?.className, how: containment(pre) }).not.toMatchObject({ how: null });
+    }
+    // Negative control: the `Bash` command's own rule taken away is exactly the GUI pass's defect.
+    const bash = panelPres(".tool-card-bash { white-space: pre; }").find((pre) => pre.classList.contains("tool-card-bash"))!;
+    expect(containment(bash)).toBeNull();
+  });
+});
+
 describe("--nv-* names", () => {
   /** What `ThemeTokens::css_vars` puts on the document, reconstructed from `tokens.rs`'s source. */
   const emitted = new Set<string>([

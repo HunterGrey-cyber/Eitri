@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { MessageList } from "./MessageList";
+import { noteUserScroll } from "../follow";
 import { initialState } from "../reducer";
 import type { AgentUiState } from "../types";
 
@@ -426,66 +427,90 @@ function setScroll(list: HTMLElement, dims: { scrollHeight: number; clientHeight
   Object.defineProperty(list, "scrollTop", { value: dims.scrollTop, configurable: true, writable: true });
 }
 
+/* Following snaps to the end for new rows and growing rows. A smooth scroll leaves a new row
+   below the edge while it animates, so these tests assert the final list position instead of
+   checking for a `scrollIntoView` call. */
 describe("MessageList auto-follow", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
   it("still follows a new item to the bottom when the viewport was already near it", () => {
-    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    const { rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
-    scrollIntoView.mockClear();
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    dims.grow(2080);
 
     rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
 
-    expect(scrollIntoView).toHaveBeenCalled();
+    expect(list.scrollTop).toBe(1680);
   });
 
   /* Measuring after a new row mounts can make a reader at the bottom look scrolled away when the
      row exceeds the 24px threshold. Grow the list by 600px without a scroll event to check that
      content growth keeps following active. */
   it("still follows when the new row alone is taller than the threshold", () => {
-    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
-    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
-    setScroll(list, { scrollHeight: 2600, clientHeight: 400, scrollTop: 1600 });
-    scrollIntoView.mockClear();
+    dims.grow(2600);
 
     rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
 
-    expect(scrollIntoView).toHaveBeenCalled();
+    expect(list.scrollTop).toBe(2200);
   });
 
-  it("does not fight a user reading further up: skips the follow once the user scrolled toward the top", () => {
+  /* Bring the new row to the end in the same render commit, before paint. Waiting for a smooth
+     scroll leaves the user prompt as the last visible text while the reply's first row mounts. */
+  it("brings a new row into view in the same commit, by a snap and never a smooth scroll", () => {
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
-    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const { container, rerender } = render(<MessageList state={state({ userPrompts: texts("why?") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
-    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
-    fireEvent.scroll(list);
-    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
     scrollIntoView.mockClear();
+    dims.grow(2044); // the reply's first row mounts below the edge
 
-    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
+    rerender(<MessageList state={state({ userPrompts: texts("why?"), transcript: [{ seq: 1, text: "Because" }] })} {...props} />);
 
+    expect(list.scrollTop).toBe(1644);
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
 
-  it("resumes following once the user scrolls back to the bottom", () => {
-    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+  it("does not fight a user reading further up: skips the follow once the user scrolled toward the top", () => {
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
     fireEvent.scroll(list);
+    // A real wheel: the `wheel` event, then the scroll it causes (2026-09-24: the intent is what
+    // counts, not the direction of the scroll alone).
+    fireEvent.wheel(list, { deltaY: -100 });
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
     fireEvent.scroll(list);
-    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1590 });
-    fireEvent.scroll(list);
-    scrollIntoView.mockClear();
+    setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 800 });
 
     rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
 
-    expect(scrollIntoView).toHaveBeenCalled();
+    expect(list.scrollTop).toBe(800);
+  });
+
+  it("resumes following once the user scrolls back to the bottom", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    fireEvent.wheel(list, { deltaY: -100 });
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
+    fireEvent.scroll(list);
+    fireEvent.wheel(list, { deltaY: 100 });
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1590 });
+    fireEvent.scroll(list);
+    setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 1590 });
+
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
+
+    // `setScroll`'s `scrollTop` does not clamp, so the snap reads as `scrollHeight` itself.
+    expect(list.scrollTop).toBe(2300);
   });
 });
 
@@ -513,6 +538,7 @@ describe("MessageList follows a reply growing while it streams", () => {
     const list = container.querySelector(".message-list") as HTMLElement;
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
     fireEvent.scroll(list);
+    fireEvent.wheel(list, { deltaY: -100 });
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
     fireEvent.scroll(list);
     setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 800 });
@@ -523,14 +549,15 @@ describe("MessageList follows a reply growing while it streams", () => {
   });
 
   /* A browser delivers `scroll` at the next frame, so a `k` that scrolled up can still be
-     unannounced when the next delta arrives. The effect reads the position itself first; without
-     that, this delta would snap the user straight back down. */
+     unannounced when the next delta arrives. Since 2026-09-24 `k` announces itself first
+     (`noteUserScroll`, as `App.tsx` does); the effect also still reads the position itself. */
   it("honours a scroll up whose scroll event has not arrived yet", () => {
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("par") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
     fireEvent.scroll(list);
-    // Scrolled up, no event dispatched; the content then grows.
+    // Scrolled up by `k`, no scroll event dispatched; the content then grows.
+    noteUserScroll(list, "up");
     setScroll(list, { scrollHeight: 2300, clientHeight: 400, scrollTop: 1540 });
 
     rerender(<MessageList state={state({ transcript: texts("partial reply, longer now") })} {...props} />);
@@ -568,6 +595,7 @@ describe("MessageList follow guard: a scroll up always wins", () => {
     const list = container.querySelector(".message-list") as HTMLElement;
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
+    noteUserScroll(list, "up");
     list.scrollTop = 1590; // a 10px `k`: the rest of the row above was only 10px
     fireEvent.scroll(list);
     dims.grow(2300);
@@ -582,6 +610,7 @@ describe("MessageList follow guard: a scroll up always wins", () => {
     const list = container.querySelector(".message-list") as HTMLElement;
     clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
+    noteUserScroll(list, "up");
     list.scrollTop = 1590;
     fireEvent.scroll(list);
 
@@ -600,6 +629,7 @@ describe("MessageList follow guard: a scroll up always wins", () => {
     dims.grow(2300);
     rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
     expect(list.scrollTop).toBe(1900); // snapped
+    noteUserScroll(list, "up");
     list.scrollTop -= 60; // `k`, with no scroll event yet for either scroll
     dims.grow(2400);
 
@@ -609,18 +639,575 @@ describe("MessageList follow guard: a scroll up always wins", () => {
   });
 
   it("content shrinking under a user at the bottom (scrollTop clamped down) keeps following", () => {
-    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
     dims.grow(1900); // a row went away: the browser clamps scrollTop to 1500 and fires scroll
     fireEvent.scroll(list);
-    scrollIntoView.mockClear();
+    dims.grow(2200);
 
     rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
 
-    expect(scrollIntoView).toHaveBeenCalled();
+    expect(list.scrollTop).toBe(1800);
+  });
+});
+
+/* Change B of the 2026-09-24 fix: leaving the bottom takes something the USER did. WebKitGTK once
+   dropped `scrollTop` by itself on every clock tick mid-reply, and the old
+   rule -- "a scroll event saw scrollTop go down" -- read each drop as the reader leaving. */
+describe("MessageList follows by intent, not by the direction of a scroll", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("keeps following through a drop nobody asked for, and the next delta puts the view back", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    // The engine moves the view up by itself: no wheel, no pointer, no key.
+    list.scrollTop = 1100;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("follows a new row even after such a drop", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    list.scrollTop = 1100;
+    fireEvent.scroll(list);
+    dims.grow(2080);
+
+    rerender(<MessageList state={state({ transcript: texts("first", "second") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1680);
+  });
+
+  // Stop following for any upward wheel scroll the list can take. Gestures that move nothing are
+  // covered separately below.
+  it("stops following on any wheel up the list can take, however small (deliberately, since 2026-09-24)", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    // The wheel's own scroll has not arrived when the next delta does.
+    fireEvent.wheel(list, { deltaY: -2 });
+    dims.grow(2300);
+
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1600);
+  });
+
+  it("takes a scroll made while a pointer is held on the list (its scrollbar) as the user's", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    fireEvent.pointerDown(list);
+    list.scrollTop = 900;
+    fireEvent.scroll(list);
+    fireEvent.pointerUp(window);
+    dims.grow(2300);
+
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+
+    expect(list.scrollTop).toBe(900);
+  });
+
+  it("does not take a drop long after the last wheel for the user's", () => {
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    fireEvent.wheel(list, { deltaY: 100 }); // a wheel DOWN at the bottom: steering, nothing to scroll
+    now += 5000; // ...and a drop five seconds later, with nothing in between
+    list.scrollTop = 1100;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("re-arms when the panel's own scroll down (G, j, Ctrl+d) ends near the bottom", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    noteUserScroll(list, "up");
+    list.scrollTop = 800;
+    fireEvent.scroll(list);
+    noteUserScroll(list, "down");
+    list.scrollTop = 1590; // 10px short: inside the follow threshold, going down
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+
+    expect(list.scrollTop).toBe(1900);
+  });
+});
+
+/* Distinguish wheel intent from actual scrolling. An upward scroll through any route, including
+   browser keys or a Tab reveal, must stop following. A negative `deltaY` that moves nothing must
+   not stop it permanently: a sideways swipe may jitter vertically, a nested tool-result box may
+   consume the wheel, or the list may already be at the top. */
+describe("MessageList: every route a user scrolls by is theirs, and a gesture that moves nothing ends nothing", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A clock the steering window reads, advanced by hand so no test depends on how fast it runs. */
+  function fakeClock() {
+    const clock = { now: 1000 };
+    vi.spyOn(performance, "now").mockImplementation(() => clock.now);
+    return clock;
+  }
+
+  function mount(start: { scrollHeight: number; scrollTop: number }) {
+    const view = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = view.container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, start);
+    fireEvent.scroll(list);
+    const row = list.querySelector(".row") as HTMLElement;
+    const delta = (text: string) => view.rerender(<MessageList state={state({ transcript: texts(text) })} {...props} />);
+    return { list, dims, row, delta };
+  }
+
+  // --- (a) routes the panel does not own ------------------------------------------------------
+
+  it("keeps a reader who scrolled up with the browser's own PageUp, a control inside the list focused", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.keyDown(row, { key: "PageUp" });
+    list.scrollTop = 1240; // the key's default action: `resolveKey` has none, so the browser scrolls
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1240);
+  });
+
+  it("does not snap over a PageUp whose (animated) scroll has not moved the list yet", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.keyDown(row, { key: "PageUp" });
+    dims.grow(2300);
+
+    delta("pa");
+
+    // 1900 would be a snap, which cancels the scroll the key just started.
+    expect(list.scrollTop).toBe(1600);
+  });
+
+  it("takes an arrow-key scroll up the same way, and Shift+Space", () => {
+    const clock = fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.keyDown(row, { key: "ArrowUp" });
+    list.scrollTop = 1560;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+    delta("pa");
+    expect(list.scrollTop).toBe(1560);
+
+    // Back to the bottom, then Shift+Space.
+    clock.now += 1000;
+    fireEvent.keyDown(row, { key: "End" });
+    list.scrollTop = 1900;
+    fireEvent.scroll(list);
+    fireEvent.keyDown(row, { key: " ", shiftKey: true });
+    list.scrollTop = 1540;
+    fireEvent.scroll(list);
+    dims.grow(2600);
+    delta("par");
+    expect(list.scrollTop).toBe(1540);
+  });
+
+  it("takes a scroll that focus landing inside the list causes (a Tab reveal) as the user's", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.focusIn(row);
+    list.scrollTop = 900;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(900);
+  });
+
+  it("guard: a key that scrolls nothing (a letter) is no licence for the engine to move the reader", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.keyDown(row, { key: "x" });
+    list.scrollTop = 1100;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("guard: an arrow key typed in a text box inside the list (a permission's reason) does not stop following", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    const box = document.createElement("input");
+    row.appendChild(box);
+    fireEvent.keyDown(box, { key: "ArrowUp" });
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  // --- (b) a wheel that never moves the list ----------------------------------------------------
+
+  it("keeps following through a sideways swipe that carries a sub-pixel vertical jitter", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(row, { deltaX: -40, deltaY: -0.5 });
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("keeps following through a wheel up that a box inside the list (an expanded tool result) takes", () => {
+    fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    const box = document.createElement("div");
+    box.style.overflowY = "auto";
+    row.appendChild(box);
+    const inner = document.createElement("pre");
+    box.appendChild(inner);
+    Object.defineProperty(box, "scrollTop", { value: 120, configurable: true, writable: true });
+    fireEvent.wheel(inner, { deltaY: -100 });
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("keeps following through a wheel up while the list has nothing above to scroll to", () => {
+    fakeClock();
+    const { list, dims, delta } = mount({ scrollHeight: 400, scrollTop: 0 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    dims.grow(700);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(300);
+  });
+
+  it("takes back a wheel's stop once the gesture is over and the list never went up", () => {
+    const clock = fakeClock();
+    const { list, dims, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    // A wheel the list could have taken but did not (the engine latched the gesture elsewhere).
+    fireEvent.wheel(list, { deltaY: -100 });
+    dims.grow(2300);
+    delta("pa");
+    expect(list.scrollTop).toBe(1600); // inside the gesture: its scroll may still be on the way
+
+    clock.now += 400;
+    dims.grow(2600);
+    delta("par");
+
+    expect(list.scrollTop).toBe(2200);
+  });
+
+  it("guard: takes back a PageUp's stop the same way when the key moved nothing", () => {
+    const clock = fakeClock();
+    const { list, dims, row, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.keyDown(row, { key: "PageUp" });
+    clock.now += 400;
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("guard: does not take back a wheel's stop when the list did go up", () => {
+    const clock = fakeClock();
+    const { list, dims, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    list.scrollTop = 1200;
+    fireEvent.scroll(list);
+    clock.now += 5000;
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1200);
+  });
+
+  it("guard: does not take it back when the list went up but its scroll event never came", () => {
+    const clock = fakeClock();
+    const { list, dims, delta } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    list.scrollTop = 1200; // no scroll event
+    clock.now += 5000;
+    dims.grow(2300);
+
+    delta("pa");
+
+    expect(list.scrollTop).toBe(1200);
+  });
+});
+
+/* A provisional stop must be settled when the gesture window expires, even if no state change
+   follows. A wheel routed elsewhere can otherwise leave a new permission row below the view
+   indefinitely while the turn waits. Catch up with a snap, and check `scrollTop`; the unmount
+   guard also checks cleanup of the timer. */
+describe("MessageList: a stop on a gesture that moved nothing is settled when the gesture ends", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+  const scrollIntoView = () => Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** The steering window reads `performance.now`; the take-back timer runs on `setTimeout`. One clock
+   *  drives both, so a test never depends on how fast it runs. */
+  function fakeTime() {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const clock = { now: 1000 };
+    vi.spyOn(performance, "now").mockImplementation(() => clock.now);
+    return (ms: number) => {
+      clock.now += ms;
+      act(() => {
+        vi.advanceTimersByTime(ms);
+      });
+    };
+  }
+
+  function mount(start: { scrollHeight: number; scrollTop: number }) {
+    const view = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = view.container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, start);
+    fireEvent.scroll(list);
+    const show = (...values: string[]) =>
+      view.rerender(<MessageList state={state({ transcript: texts(...values) })} {...props} />);
+    return { view, list, dims, show };
+  }
+
+  it("scrolls to a new row that arrived inside the gesture once it is over, with nothing after it", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 }); // the list could take it; the engine moved nothing
+    pass(100);
+    dims.grow(2300);
+    show("p", "a new row"); // e.g. a permission card; the turn now waits for it
+    expect(list.scrollTop).toBe(1600); // inside the gesture: its scroll may still come
+
+    pass(5000); // silence: no state change at all
+
+    expect(list.scrollTop).toBe(1900);
+    expect(scrollIntoView()).not.toHaveBeenCalled();
+  });
+
+  it("snaps to the end of text that grew inside the gesture once it is over, with nothing after it", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    pass(100);
+    dims.grow(2300);
+    show("pa");
+    expect(list.scrollTop).toBe(1600);
+
+    pass(5000);
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("does the same for a PageUp from a focused control that moved nothing", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.keyDown(list.querySelector(".row") as HTMLElement, { key: "PageUp" });
+    pass(100);
+    dims.grow(2300);
+    show("pa");
+
+    pass(5000);
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("waits for a later wheel in the same gesture before it settles", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    pass(200);
+    fireEvent.wheel(list, { deltaY: -100 }); // the window now runs to 300ms after THIS one
+    dims.grow(2300);
+    show("pa");
+
+    pass(250); // past the first wheel's window, inside the second's
+    expect(list.scrollTop).toBe(1600);
+
+    pass(100);
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("waits while a pointer is held on the list, and settles once it is released and the window is over", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    fireEvent.pointerDown(list);
+    dims.grow(2300);
+    show("pa");
+
+    pass(5000);
+    expect(list.scrollTop).toBe(1600); // held: the user may be about to drag
+    expect(vi.getTimerCount()).toBe(0); // and nothing polls while it is held; the release re-arms
+
+    fireEvent.pointerUp(window);
+    pass(250);
+    expect(list.scrollTop).toBe(1600); // released, but scroll events from the drag may still land
+    pass(100);
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("guard: leaves a reader whose wheel did move the list up where they are", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    list.scrollTop = 1200;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+    show("p", "a new row");
+
+    pass(5000);
+
+    expect(list.scrollTop).toBe(1200);
+  });
+
+  it("guard: leaves a reader whose wheel moved the list up with no scroll event yet where they are", () => {
+    const pass = fakeTime();
+    const { list } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    list.scrollTop = 1200; // its scroll event is late, and no state change reads it first
+
+    pass(5000);
+
+    expect(list.scrollTop).toBe(1200);
+  });
+
+  it("guard: the panel's own k during the gesture is a stop for good, not a provisional one", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    noteUserScroll(list, "up"); // `k`, whose own scroll has not landed yet
+    dims.grow(2300);
+    show("pa");
+
+    pass(5000);
+
+    expect(list.scrollTop).toBe(1600);
+  });
+
+  /* WebKitGTK animates a wheel scroll over about 200ms. Its first scroll event can report the
+     unchanged position. At the bottom, that event must not re-arm following or clear the
+     provisional stop, or the next delta or new row could cancel the wheel's scroll. */
+  it("keeps a wheel's stop through the wheel's own first scroll event when it reports no movement", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    fireEvent.scroll(list); // the wheel's first event: the list has not moved yet
+    pass(10);
+    dims.grow(2300);
+    show("pa"); // the next delta, before the wheel's animation has moved anything
+
+    // 1900 is the snap that cancels the wheel's scroll.
+    expect(list.scrollTop).toBe(1600);
+  });
+
+  it("does the same when the next thing is a new row", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    fireEvent.scroll(list);
+    pass(10);
+    dims.grow(2300);
+    show("p", "a new row");
+
+    expect(list.scrollTop).toBe(1600);
+  });
+
+  it("guard: then lets the wheel's scroll, once it lands, stop following for good", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    fireEvent.scroll(list);
+    pass(16);
+    list.scrollTop = 1540; // the animation's first real step
+    fireEvent.scroll(list);
+    pass(5000);
+    dims.grow(2300);
+    show("pa");
+
+    expect(list.scrollTop).toBe(1540);
+  });
+
+  it("guard: a wheel whose first event reports no movement and that then moves nothing is still taken back", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    fireEvent.scroll(list);
+    dims.grow(2300);
+    show("pa");
+
+    pass(5000);
+
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("guard: content shrinking under a pending stop (the browser clamps scrollTop) still re-arms at the bottom", () => {
+    const pass = fakeTime();
+    const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    dims.grow(1900); // a row went away: scrollTop clamps from 1600 to 1500, and a scroll event says so
+    fireEvent.scroll(list);
+    pass(10);
+    dims.grow(2200);
+    show("p", "a new row");
+
+    expect(list.scrollTop).toBe(1800);
+  });
+
+  it("guard: unmounting cancels the gesture's timer", () => {
+    const pass = fakeTime();
+    const { view, list, dims } = mount({ scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.wheel(list, { deltaY: -100 });
+    expect(vi.getTimerCount()).toBe(1); // the gesture's own settle timer, and nothing else
+
+    view.unmount();
+    dims.grow(2300);
+
+    expect(vi.getTimerCount()).toBe(0);
+    pass(5000);
+    expect(list.scrollTop).toBe(1600);
   });
 });
 
@@ -701,5 +1288,231 @@ describe("the restored-history notice", () => {
     const without = renderList(null).querySelectorAll('[data-nav-stop="row"]').length;
     expect(withNotice).toBe(without);
     expect(without).toBe(2);
+  });
+});
+
+/** A `ResizeObserver` jsdom lacks: records what it observes, and `resize` delivers an entry to its
+ *  callback the way the engine would after layout. */
+type FakeObserver = { callback: ResizeObserverCallback; observed: Element[]; unobserved: Element[]; disconnected: boolean };
+function stubResizeObserver(): FakeObserver[] {
+  const observers: FakeObserver[] = [];
+  class FakeResizeObserver {
+    private record: FakeObserver;
+    constructor(callback: ResizeObserverCallback) {
+      this.record = { callback, observed: [], unobserved: [], disconnected: false };
+      observers.push(this.record);
+    }
+    observe(el: Element) {
+      this.record.observed.push(el);
+    }
+    unobserve(el: Element) {
+      this.record.observed = this.record.observed.filter((o) => o !== el);
+      this.record.unobserved.push(el);
+    }
+    disconnect() {
+      this.record.disconnected = true;
+    }
+  }
+  vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+  return observers;
+}
+const resize = (observer: FakeObserver, target: Element, width: number) =>
+  observer.callback([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
+
+/* The rows' width comes from here, not from a CSS size container (2026-09-24). `.row` used to be
+   `container-type: inline-size`, which in WebKitGTK made the list lose its reader whenever the
+   status line's clock ticked during a streamed reply (`shell/tests/panel_stream_scroll.rs` is the
+   real-engine test). The replacement writes the list's content-box width to `--list-inline-size`,
+   and its whole safety argument is WHEN it writes: before the first paint, then only on a resize --
+   never on a streamed delta, which would restyle the conversation 30 times a second. */
+describe("MessageList measures its own width for the rows' escapes", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("writes --list-inline-size on the list before anything else reads it", () => {
+    // jsdom lays nothing out, so the content box measures 0 -- which the stylesheet turns into "no
+    // escape" (see index.css's `.row` rule). The point is that the property is there from the start.
+    const { container } = render(<MessageList state={state({ transcript: texts("hi") })} {...props} />);
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    expect(list.style.getPropertyValue("--list-inline-size")).toBe("0px");
+  });
+
+  it("re-measures on a resize, and writes nothing while a reply streams", () => {
+    const observers = stubResizeObserver();
+    const { container, rerender, unmount } = render(
+      <MessageList state={state({ transcript: texts("the reply so far") })} {...props} />,
+    );
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    expect(observers).toHaveLength(1);
+    // The list itself, and (since the GUI pass, 2026-09-24) the one row in it -- see the next block.
+    expect(observers[0].observed).toEqual([list, list.querySelector(".row")]);
+    const setProperty = vi.spyOn(list.style, "setProperty");
+
+    // A resize reaches the rows, as the content box the observer reports.
+    resize(observers[0], list, 537.5);
+    expect(list.style.getPropertyValue("--list-inline-size")).toBe("537.5px");
+    expect(setProperty).toHaveBeenCalledTimes(1);
+    // The same size again changes nothing, so it costs no restyle.
+    resize(observers[0], list, 537.5);
+    expect(setProperty).toHaveBeenCalledTimes(1);
+    // A ROW's entry is not the list's width, whatever its content box says.
+    resize(observers[0], list.querySelector(".row")!, 120);
+    expect(list.style.getPropertyValue("--list-inline-size")).toBe("537.5px");
+
+    // Streaming: the open message grows on every delta (a new `state` each time). No write, no
+    // second observer, and the growing row is not observed again.
+    for (const text of ["the reply so far, and", "the reply so far, and more", "the reply so far, and more text"]) {
+      rerender(<MessageList state={state({ transcript: texts(text) })} {...props} />);
+    }
+    expect(setProperty).toHaveBeenCalledTimes(1);
+    expect(observers).toHaveLength(1);
+    expect(observers[0].observed).toHaveLength(2);
+
+    unmount();
+    expect(observers[0].disconnected).toBe(true);
+  });
+});
+
+/* A following view must stay at the end when the list or a row changes size, even without a
+   state change. Divider drags, zoom, the terminal, or composer growth can resize the list while
+   a turn waits. Row wrapping or font changes can resize content independently. Observe both the
+   list and every row with `ResizeObserver`, then snap a following view to its end. */
+describe("MessageList keeps a following view at its end when the list or a row changes size", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** A list whose height and content both change on command, `scrollTop` clamped as a browser clamps it. */
+  function resizableList(list: HTMLElement, start: { clientHeight: number; scrollHeight: number; scrollTop: number }) {
+    let { clientHeight, scrollHeight, scrollTop } = start;
+    const clamp = () => {
+      scrollTop = Math.max(0, Math.min(scrollHeight - clientHeight, scrollTop));
+    };
+    Object.defineProperty(list, "clientHeight", { configurable: true, get: () => clientHeight });
+    Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => scrollHeight });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+        clamp();
+      },
+    });
+    return {
+      /** Content reflowed or restyled; the view stays where it was, as it does in a browser. */
+      content(to: number) {
+        scrollHeight = to;
+        clamp();
+      },
+      /** The list's own box got taller or shorter. */
+      height(to: number) {
+        clientHeight = to;
+        clamp();
+      },
+    };
+  }
+
+  function mount() {
+    const observers = stubResizeObserver();
+    const view = render(<MessageList state={state({ transcript: texts("the reply, finished") })} {...props} />);
+    const list = view.container.querySelector<HTMLElement>(".message-list")!;
+    const dims = resizableList(list, { clientHeight: 400, scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    return { view, list, dims, observer: observers[0], row: list.querySelector(".row")! };
+  }
+
+  it("snaps to the end when the list narrows and its reply reflows taller, with nothing streaming", () => {
+    const { list, dims, observer } = mount();
+    dims.content(2482); // the GUI pass's divider drag: 482px of reflow below the view
+
+    resize(observer, list, 330);
+
+    expect(list.scrollTop).toBe(2082);
+  });
+
+  it("snaps to the end when the list's own box gets shorter (the bottom terminal, a growing composer)", () => {
+    const { list, dims, observer } = mount();
+    dims.height(250);
+
+    resize(observer, list, 536);
+
+    expect(list.scrollTop).toBe(1750);
+  });
+
+  it("snaps to the end when a row changes size and the list's box does not (the prose measure)", () => {
+    const { list, dims, observer, row } = mount();
+    expect(observer.observed).toContain(row);
+    dims.content(2600);
+
+    resize(observer, row, 480);
+
+    expect(list.scrollTop).toBe(2200);
+  });
+
+  it("guard: leaves a reader who scrolled up where they are", () => {
+    const { list, dims, observer, row } = mount();
+    fireEvent.wheel(list, { deltaY: -100 });
+    list.scrollTop = 900;
+    fireEvent.scroll(list);
+    dims.content(2600);
+
+    resize(observer, list, 330);
+    resize(observer, row, 300);
+
+    expect(list.scrollTop).toBe(900);
+  });
+
+  /* The follow effect's own reason for reading the position first holds here too: a scroll made with
+     the pointer held on the list (its scrollbar) whose event has not been dispatched yet. Without that
+     read, a resize in between would snap the drag away. */
+  it("guard: honours a scrollbar drag whose scroll event has not arrived yet", () => {
+    const { list, dims, observer } = mount();
+    fireEvent.pointerDown(list);
+    list.scrollTop = 900; // no scroll event yet
+    dims.content(2600);
+
+    resize(observer, list, 330);
+
+    expect(list.scrollTop).toBe(900);
+  });
+
+  it("guard: leaves a pending provisional stop alone, and its gesture's end still catches up", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const clock = { now: 1000 };
+    vi.spyOn(performance, "now").mockImplementation(() => clock.now);
+    const { list, dims, observer } = mount();
+    fireEvent.wheel(list, { deltaY: -100 }); // its scroll may still be on the way
+    dims.content(2300);
+
+    resize(observer, list, 330);
+    expect(list.scrollTop).toBe(1600);
+
+    clock.now += 5000;
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(list.scrollTop).toBe(1900);
+  });
+
+  it("observes each row as it mounts, and lets go of one that leaves", () => {
+    const { view, list, observer } = mount();
+    const card = { seq: 2, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "ls" } };
+    view.rerender(
+      <MessageList state={state({ transcript: texts("the reply, finished"), pendingPermissions: [card] })} {...props} />,
+    );
+    const permissionRow = list.querySelector(".row-permission")!;
+    expect(observer.observed).toContain(permissionRow);
+
+    view.rerender(<MessageList state={state({ transcript: texts("the reply, finished") })} {...props} />);
+
+    expect(observer.unobserved).toEqual([permissionRow]);
+    expect(observer.observed).toEqual([list, list.querySelector(".row")]);
   });
 });

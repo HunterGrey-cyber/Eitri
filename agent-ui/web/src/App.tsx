@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { applyEvent, applySnapshot, initialState, resetToStartScreen, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
+import { noteUserScroll } from "./follow";
 import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
 import type { KeyLike, PanelMode } from "./keymap";
@@ -464,6 +465,10 @@ export default function App() {
       return;
     }
     setMode("browse");
+    // Landing moves the cursor, and the `[cursor]` effect reveals its row. Announce this as a
+    // user scroll through `./follow.ts`, as for a HINT landing. Otherwise `MessageList` keeps
+    // following and the next delta or resize can scroll the older card out of view.
+    noteUserScroll(containerRef.current?.querySelector(".message-list"), "unknown");
     setCursor(index);
     containerRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -780,6 +785,9 @@ export default function App() {
     copyCodeRef.current = null;
     if (target === undefined || !target.el.isConnected) return;
     const root = containerRef.current;
+    // Landing can scroll the conversation (a focused control, the cursor's row revealed), and that
+    // scroll is the user's -- see the note on `noteUserScroll` in `onKeyDown`.
+    noteUserScroll(root?.querySelector(".message-list"), "unknown");
     if (target.kind === "composer") {
       // The same route `Ctrl+l` takes (`inputRequest`): INPUT, with the caret in the box. Entering a
       // text box is what landing on one means; nothing is typed or sent.
@@ -1071,6 +1079,20 @@ export default function App() {
     if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
     const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, { sessionEnded, pendingG });
     if (action === null) return;
+    // Every key below that can move the conversation says so first, on the list itself, so
+    // `MessageList` knows the scroll that follows is the user's (`./follow.ts`, 2026-09-24): it no
+    // longer takes an unexplained drop in `scrollTop` for the reader leaving the bottom, because
+    // WebKitGTK once produced such drops by itself mid-reply. `k`, `Ctrl+u` and `gg` end following at
+    // once, as they always did; `j`, `Ctrl+d` and `G` let the scroll decide (reaching the bottom
+    // re-arms it); `h`/`l` can focus a control that scrolls itself into view, either way.
+    const messageList = root?.querySelector<HTMLElement>(".message-list") ?? null;
+    if (action.kind === "move" || action.kind === "half-page") {
+      noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
+    } else if (action.kind === "jump") {
+      noteUserScroll(messageList, action.to === "first" ? "up" : "down");
+    } else if (action.kind === "control") {
+      noteUserScroll(messageList, "unknown");
+    }
     // A code block HINT landed on is "the item" for exactly the next `y`; any other key moves on.
     const landedCode = copyCodeRef.current;
     copyCodeRef.current = null;
