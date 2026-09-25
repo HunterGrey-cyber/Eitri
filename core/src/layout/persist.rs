@@ -156,6 +156,18 @@ impl NodeFile {
     }
 }
 
+/// `<state home>/neovibe/<sub>`: the rule `state_dir` states, for any of neovibe's state
+/// directories (`layout`, and the session tabs' `agent`).
+pub fn state_subdir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>, sub: &str) -> Option<PathBuf> {
+    match (xdg_state_home, home) {
+        (Some(state), _) if Path::new(state).is_absolute() => Some(PathBuf::from(state).join("neovibe").join(sub)),
+        (_, Some(home)) if Path::new(home).is_absolute() => {
+            Some(PathBuf::from(home).join(".local/state/neovibe").join(sub))
+        }
+        _ => None,
+    }
+}
+
 /// `<state home>/neovibe/layout`, from the two variables that decide it: `XDG_STATE_HOME`, else
 /// `$HOME/.local/state` (the XDG spec's own default). An `XDG_STATE_HOME` that is empty or not an
 /// absolute path is ignored, as the XDG spec says to. A `HOME` that is empty or not absolute is
@@ -163,13 +175,7 @@ impl NodeFile {
 /// against the process's cwd, which for a window started with no project argument IS the project --
 /// and nothing is written into the project. `None` when neither gives a directory.
 pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    match (xdg_state_home, home) {
-        (Some(state), _) if Path::new(state).is_absolute() => Some(PathBuf::from(state).join("neovibe/layout")),
-        (_, Some(home)) if Path::new(home).is_absolute() => {
-            Some(PathBuf::from(home).join(".local/state/neovibe/layout"))
-        }
-        _ => None,
-    }
+    state_subdir(xdg_state_home, home, "layout")
 }
 
 /// The file's name for this canonical project root: 16 hex digits of its SHA-256, `.json`.

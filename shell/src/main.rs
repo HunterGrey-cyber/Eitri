@@ -6,6 +6,7 @@
 
 mod agent_panel;
 mod chrome;
+mod close_prompt;
 mod editor_context;
 mod hint;
 mod layout;
@@ -17,6 +18,7 @@ mod pane_switch;
 mod prefix;
 mod prefix_strip;
 mod supervisor_client;
+mod tab_verbs;
 mod terminal;
 mod terminal_handoff;
 mod text_size;
@@ -694,15 +696,14 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     };
 
     // Where the keys land after a module key or a tray chip. Into the agent: on its oldest pending
-    // card if one waits (spec §3.3, `focus_permission`), else "I want to type" (owner, 2026-09-19),
+    // card if one waits (spec §3.3, `focus_oldest_card`), else "I want to type" (owner, 2026-09-19),
     // as every keyboard arrival there does (`move_focus`).
     let arrive: Rc<dyn Fn(&ModuleId)> = {
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |id| {
             if id.kind() == ModuleKind::Agent {
-                if agent_panel_handle.attention().pending > 0 {
-                    agent_panel_handle.focus_permission();
-                } else {
+                // The oldest card across every tab: its tab is switched to first (session tabs).
+                if !agent_panel_handle.focus_oldest_card() {
                     agent_panel_handle.enter_input();
                 }
             }
@@ -723,6 +724,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let toast = toast.clone();
         let tray = tray.clone();
         let way_back = way_back.clone();
+        // Cloned so the closure can call back into the handle for the tab that holds the newest
+        // card: the hook fires from the pump (`report_attention`) after its own state borrow is
+        // already dropped, so this is safe and never re-enters a held `RefCell`.
+        let agent_panel_handle_for_toast = agent_panel_handle.clone();
         agent_panel_handle.on_attention(move |before, after| {
             let place = neovibe_core::layout::agent_place(&module_layout.borrow());
             let reaction = neovibe_core::attention::react(on_permission, before, after, place);
@@ -734,7 +739,14 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 }
             }
             if reaction.toast {
-                toast.show(&toast::permission_toast_text(after, way_back.as_deref()));
+                toast.show(&toast::permission_toast_text(
+                    after,
+                    agent_panel_handle_for_toast
+                        .newest_card_label()
+                        .as_ref()
+                        .map(|(n, name)| (*n, name.as_str())),
+                    way_back.as_deref(),
+                ));
             }
         });
     }
@@ -1032,10 +1044,62 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         agent.open_keymap();
                     }
                     Action::WindowImmersive => window_modes.toggle_immersive(),
-                    Action::Tab(_) => {
-                        // Ruling 1: bound now, run by phase 2 (session tabs).
-                        println!("[prefix] {}: session tabs arrive in phase 2", action.name());
-                        flash(&refused_name);
+                    Action::Tab(tab_action) => {
+                        let chat = ModuleId::agent();
+                        let keys_in = focused().as_ref().map(ModuleId::kind);
+                        // One terminal today; `n`/`p` there are swallowed (spec §3.4, D8).
+                        let plan = tab_verbs::plan(tab_action, keys_in, 1);
+                        if plan.takes_the_keys {
+                            if let Err(err) = show_on_screen(&chat) {
+                                refuse(&refused_name, &err);
+                                return;
+                            }
+                            focus_module(&chat);
+                        }
+                        let switched = match plan.verb {
+                            tab_verbs::TabVerb::New => {
+                                agent.new_tab();
+                                agent.enter_input();
+                                true
+                            }
+                            tab_verbs::TabVerb::Step(delta) => agent.step(delta),
+                            tab_verbs::TabVerb::Last => agent.select_last(),
+                            tab_verbs::TabVerb::Select(n) => agent.select_number(n),
+                            tab_verbs::TabVerb::Rename => {
+                                agent.begin_rename();
+                                true
+                            }
+                            tab_verbs::TabVerb::Close => {
+                                agent.confirm_close();
+                                true
+                            }
+                            tab_verbs::TabVerb::Choose => {
+                                agent.open_chooser(false);
+                                true
+                            }
+                            tab_verbs::TabVerb::Info => {
+                                agent.open_detail();
+                                true
+                            }
+                            tab_verbs::TabVerb::Flash => false,
+                            tab_verbs::TabVerb::Nothing => return,
+                        };
+                        if !switched {
+                            // tmux: "can't find window" (ruling 10).
+                            flash(&refused_name);
+                            return;
+                        }
+                        // A switch from elsewhere shows a hidden chat where it was, keys unmoved;
+                        // under a zoom only the tray chip changes (spec §3.4).
+                        if !plan.takes_the_keys
+                            && neovibe_core::tabs::reveal_on_switch(neovibe_core::layout::agent_place(
+                                &module_layout.borrow(),
+                            ))
+                        {
+                            if let Err(err) = grid.show_module(&chat) {
+                                eprintln!("[tabs] could not reveal the chat: {err}");
+                            }
+                        }
                     }
                     // The prefix never hands a split key back: it waits for a module key instead.
                     Action::Split(_) => {}
@@ -1070,6 +1134,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             },
         );
     }
+
+    // D11 A (spec §3.5): installed after `prefix::install` above, so GTK -- which runs a widget's
+    // controllers most-recently-added first -- gives this one the keys before the prefix's own
+    // capture controller, while the prompt is open.
+    let close_prompt = close_prompt::ClosePrompt::install(&hint_overlay, &window);
 
     // --- From the editor: decided by Neovim itself.
     //
@@ -1234,6 +1303,24 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // would rewrite the layout's `focus` before this line read it. Today a top-bar item (a tray chip,
     // or `↻`) is the first focusable widget, so it never has.
     let first = module_layout.borrow().focus().clone();
+    // D10 (spec §3.6, ruling 16): the chooser opens over tab 1 with the keys when this project has a
+    // record to resume and the chat is on screen; closing it hands the keys to the editor, where a
+    // launch puts them.
+    agent_panel_handle.set_launch_chooser_allowed(module_layout.borrow().is_visible(&ModuleId::agent()));
+    {
+        let focus_module = focus_module.clone();
+        agent_panel_handle.on_launch_chooser(move || {
+            focus_module(&ModuleId::agent());
+        });
+    }
+    {
+        let focus_module = focus_module.clone();
+        agent_panel_handle.on_chooser_closed(move |launch| {
+            if launch {
+                focus_module(&ModuleId::editor());
+            }
+        });
+    }
     window.present();
     // grab_focus() after present(), matching standalone.rs's own
     // `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
@@ -1279,6 +1366,14 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // either way, regardless of whether a clean `NeovimExited` was actually observed.
     let app_for_close = app.clone();
     window.connect_close_request(move |_window| {
+        // D11 A (spec §3.5): a running tab is worth one y/n. `y` calls `close()` again and lands
+        // here with the prompt confirmed.
+        if !close_prompt.confirmed() {
+            if let Some(text) = neovibe_core::tabs::window_close_prompt(agent_panel_handle.running_count(), 0) {
+                close_prompt.ask(&text);
+                return glib::Propagation::Stop;
+            }
+        }
         // First, and synchronously (spec §4.6): the debounce may still be waiting on an arrangement
         // change. With none unwritten this writes nothing -- a click never does (`layout_state`'s
         // module doc says what is written when).

@@ -513,21 +513,26 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
         resumable: Vec::new(),
     };
-    let snapshot = serialize_snapshot_for_js(&SnapshotView {
-        backend: "sidecar",
-        conversation_id: Some("conversation-test"),
-        session_id: Some("sidecar-test"),
-        provider_session_id: Some("claude-test".into()),
-        capabilities: agent::ProviderCapabilities {
-            resume: true,
-            fork: false,
-            interrupt: true,
-            bypass_permission_mode: true,
-            interactive_permission_mode: true,
+    // Interim (session tabs plan Task 4): one tab until Task 6 moves the panel onto TabSet.
+    let sole_tab = neovibe_core::tabs::TabId(1);
+    let snapshot = serialize_snapshot_for_js(
+        sole_tab,
+        &SnapshotView {
+            backend: "sidecar",
+            conversation_id: Some("conversation-test"),
+            session_id: Some("sidecar-test"),
+            provider_session_id: Some("claude-test".into()),
+            capabilities: agent::ProviderCapabilities {
+                resume: true,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
+            provider: None,
+            projection: ProjectionRef::Borrowed(&projection),
         },
-        provider: None,
-        projection: ProjectionRef::Borrowed(&projection),
-    });
+    );
     let on_ready = vec![
         serialize_hello_for_js(&greeting),
         serialize_theme_for_js(&tokens),
@@ -546,6 +551,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
             projection.apply(event);
         }
         steps.push(Step::Dispatch(serialize_events_for_js(
+            sole_tab,
             from,
             projection.last_revision,
             &events,

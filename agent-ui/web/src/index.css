@@ -58,64 +58,119 @@ body,
   min-height: 0;
 }
 
-.mode-selector {
+/* The empty tab (F3, session tabs Task 9): Claude Code's fresh prompt, replacing the old
+   `.mode-selector` start screen. The mode-selector's own boxed Auto/Bypass buttons are gone with
+   it -- there is no second `:not(.row-choice)` rule to keep in step, since this screen never draws
+   a boxed button at all any more. */
+.empty-tab {
   margin: auto;
   padding: 24px;
-  text-align: center;
-}
-/* `:not(.row-choice)`: a `.row-choice` button (panel-as-document task 7) is a row on the
-   sign-column grid, not this screen's own boxed control -- `.row` supplies `display: grid` and
-   `.row-choice` supplies its own `padding`, and both lose to this rule's `display: block`/
-   `padding: 10px` on specificity alone (`.mode-selector button` is one class plus one type,
-   `.row`/`.row-choice` are one class each -- the type selector's extra weight wins regardless of
-   source order). Left unscoped, the sign and body would never actually land in two columns. */
-.mode-selector button:not(.row-choice) {
-  display: block;
   width: 100%;
-  margin: 8px 0;
-  padding: 10px;
+  text-align: center;
+  outline: none;
 }
 
-/* The winbar (identity/model, above the conversation) and the status line (mode/status/position/
-   Stop, directly above the composer) -- panel-as-document task 6 split what used to be one
-   `.session-header` row into these two, the way an editor window separates its winbar from its
-   own command/status line. Painted in nvim's OWN `StatusLine` colours, not the panel body's: `bg`/
-   `fg`/`surface` are Normal-derived, but `chrome`/`chrome-fg` come from `StatusLine` itself
-   (`core/src/theme/tokens.rs`'s `derive`), which is exactly what makes these two bars read as part
-   of the editor window rather than of the WebView document sitting inside it. `chrome-fg` is
-   guarded to `TEXT_CONTRAST` (4.5:1) against `chrome`, not against `bg` -- a reversed StatusLine
-   makes `chrome` Normal's `fg`, so guarding against `bg` would measure the wrong pair. */
-/* No `z-index` here any more (review of the which-key branch): the `?` overlay used to cover this
-   whole container and these two bars had to be lifted back above it, which put the overlay's scroll
-   box under the winbar -- its first heading was unreadable AND unreachable, since `scrollTop` is
-   already 0 there. The overlay is now positioned against `.agent-ui-scroller`, the list's own
-   region, so it cannot reach these bars and nothing has to out-paint it. */
-.winbar,
-.status-line {
+/* tmux's window list (session tabs spec §3.3): one row, shown only with two or more tabs or while
+   a rename is open (`showTabBar`, `tabs.ts`). Above `errorBanner` in the conversation layout and
+   above `EmptyTab` in the empty layout -- `App.tsx`. Scrolls sideways on overflow (`nav.ts`'s
+   `SCROLL_CONTAINERS`), the same idiom the old `.session-choice` list used vertically. */
+.tab-bar {
+  display: flex;
+  overflow-x: auto;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--nv-border);
+  padding: 0 12px;
+  /* No scrollbar: WebKitGTK's sat over the lower half of an overflowing bar and took the clicks
+     meant for the tabs (GUI pass, 2026-09-25). It still scrolls -- see `TabBar`'s scrollIntoView. */
+  scrollbar-width: none;
+}
+.tab-bar::-webkit-scrollbar {
+  display: none;
+}
+/* A text button, not a boxed one -- the fill below is what marks the active tab, not a border. */
+.tab {
+  background: none;
+  border: 0;
+  font: inherit;
+  color: var(--nv-fg);
+  padding: 4px 10px;
+  cursor: pointer;
+  flex: none;
+}
+/* The cursorline fill, same as a conversation row's own cursor (session tabs spec §3.3): the
+   FOCUS signal stays the row cursor elsewhere in the panel, this only marks which tab is showing. */
+.tab-active {
+  background: var(--nv-cursorline);
+}
+.tab-ended {
+  color: var(--nv-muted);
+}
+/* A background tab with a turn running (spec §3.2): a plain, static mark. Deliberately NOT
+   animated -- `.turn-activity .meter-fill` is the one animated element in this stylesheet
+   (`indexCss.test.ts`), and a second, per-tab motion would either duplicate that guarantee or
+   escape it. The active tab's own turn is shown by `ActivityLine` instead. */
+.tab-working::after {
+  content: "…";
+}
+.tab-rename {
+  font: inherit;
+  width: 16ch;
+}
+/* tmux draws its `command-prompt`/`confirm-before` prompts in the status line; this is the same
+   idiom in the footer (ruling 7), replacing the which-key strip while it is open. */
+.confirm-close {
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+
+/* The activity line (only while a turn runs, directly above the composer), the status row
+   (model/backend/position, directly under the composer) and the footer (mode block, mode pill,
+   which-key strip) -- session tabs spec §3.3 (V2), replacing the winbar and the status line
+   panel-as-document task 6 split `.session-header` into. Plain body surface now, not nvim's own
+   `StatusLine` colours: the status row is explicitly `--nv-muted` (Claude Code's own statusLine
+   reads as a dim line under the input, not a bright bar), and the footer already held the
+   which-key strip and the mode pill on the plain surface before this -- putting the mode block
+   there too, and dropping the winbar/status-line's `chrome`/`chrome-fg` pair entirely, keeps every
+   surface in this stack agreeing rather than two of three staying bright chrome while one was dim
+   body text. No `z-index` anywhere here (review of the which-key branch, still true): the `?`
+   overlay and the detail popover are positioned against `.agent-ui-scroller`, the list's own
+   region, so neither can reach this stack and nothing here has to out-paint them. */
+.activity-line,
+.panel-footer {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 0 12px;
   min-height: 28px;
-  background: var(--nv-chrome);
-  color: var(--nv-chrome-fg);
+  border-top: 1px solid var(--nv-border);
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
 }
-.winbar {
-  border-bottom: 1px solid var(--nv-border);
-  flex-wrap: wrap;
+.activity-line {
+  /* Never two lines: see the in-flight indicator's own comment further down. */
+  white-space: nowrap;
 }
-.status-line {
+/* A button styled as a plain text row (session tabs spec §3.3): `Enter` on it, and a click, both
+   open the detail popover -- see `StatusRow.tsx`. Body prose, deliberately not `--nv-font-mono`/
+   `--fs-sm` like the bars above and below it: `font: inherit` keeps it reading as ordinary body
+   text, the way Claude Code's own statusLine reads as a dim line rather than a bar. */
+.status-row {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 0;
   border-top: 1px solid var(--nv-border);
+  padding: 4px 12px;
+  min-height: 22px;
+  font: inherit;
+  color: var(--nv-muted);
+  text-align: left;
+  cursor: pointer;
 }
-/* A Chinese fragment inside a monospace run gets its letter-spacing stretched (spec §1.3, measured
-   on a real mockup). Nothing rendered in either bar today is Chinese, but nothing here should have
-   to remember that fact later -- any text that becomes Chinese switches back to the prose font by
-   adding this class, rather than by a fresh audit of `--nv-font-mono` at that point. */
-.winbar .prose,
-.status-line .prose {
-  font-family: var(--nv-font-prose);
+.status-warning {
+  margin-left: 6px;
+  cursor: help; /* the full diagnostic line is in its title attribute */
 }
 
 .message-list {
@@ -241,7 +296,7 @@ body,
    **Every reference carries the `14px` fallback on purpose.** An undefined `var()` makes the whole
    `calc()` invalid at computed-value time, so without it a panel whose `--nv-*` injection had not
    arrived would lose EVERY font size at once and fall back to the browser's 16px -- not a colour
-   degrading to something, a layout collapsing. jsdom found this immediately: `.status-line`'s
+   degrading to something, a layout collapsing. jsdom found this immediately: `.activity-line`'s
    `4ch` measured 32px instead of 24px. The literal is a second copy of Rust's
    `DEFAULT_PANEL_FONT_SIZE_PX`, and `indexCss.test.ts` holds the two equal.
 
@@ -299,7 +354,7 @@ body,
 }
 /* The cursor `j`/`k` move and `Enter`/`y` act on (panel-as-document task 5, review round 1):
    `--nv-cursorline` is a BACKGROUND (nvim's own `Visual` highlight token, the same one
-   `.mode-selector button:hover` already paints with), not text, so `indexCss.test.ts`'s
+   `.row-choice:hover` already paints with), not text, so `indexCss.test.ts`'s
    text-colour guard does not apply to this rule at all. Kept separate from the signal-colour
    border rules above: a row can be both the current row and, say, an error row at once, and the
    two cues must not fight each other for the same 2px border. */
@@ -671,100 +726,61 @@ body,
 }
 
 /* --- Phase 3: backend-aware start screen, identities, and in-panel errors ------------------- */
+/* --- Session tabs Task 9: the empty tab (F3) replaces the mode-selector start screen -------- */
 
-.mode-selector button {
-  text-align: left;
-}
-.mode-selector button strong {
+/* Moved from `.mode-selector button strong`/`.mode-selector .detail` -- the old resumable-session
+   picker is gone, and the empty tab's own resume rows (`.empty-tab-resume`, below) are the one
+   place this project still stacks a choice row's title above its detail line. */
+.empty-tab-resume strong {
   display: block;
 }
-.mode-selector .detail {
+.empty-tab-resume .detail {
   display: block;
   opacity: 0.75;
   font-size: var(--fs-sm);
   margin-top: 2px;
 }
-.mode-selector .connecting {
+.empty-tab .connecting {
   opacity: 0.85;
 }
-.mode-selector .warning {
-  margin-top: 16px;
-  padding: 10px 12px;
-  border: 1px solid var(--nv-warn);
-  border-left-width: 3px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
-  color: var(--nv-fg);
+.mode-pill {
+  margin-top: 8px;
+  color: var(--nv-muted);
   font-size: var(--fs-sm);
-  text-align: left;
-}
-.mode-selector code {
-  font-family: var(--nv-font-mono);
-  opacity: 0.85;
 }
 
-/* Secondary text on chrome: `--nv-chrome-muted` (guarded to `TEXT_CONTRAST` against `chrome`,
-   `tokens.rs:209-210`), never `opacity` on top of `--nv-chrome-fg` -- opacity multiplies contrast
-   down with it, the same reason `.mode-selector .session-choice` rows are not dimmed that way
-   either (see `indexCss.test.ts`'s "does not dim a conversation-picker row" test). */
-.winbar .identities,
-.winbar .provider,
-.winbar .backend,
-.winbar .permission-mode {
-  color: var(--nv-chrome-muted);
-  cursor: help; /* every one of these has the full value in its title attribute */
-}
-/* The Verdandi skew warning, on the right (`margin-left: auto` pushes it there whether or not it
-   is actually warning -- the CLI badge lives in the same slot either way). Signal colour on a
-   border, never on this text: `--nv-warn` is guarded only to 3:1 (WCAG 1.4.11's border/rule
-   threshold), not the 4.5:1 12px text wants -- see the big comment near `.tool-result-error`. */
-.winbar .provider {
-  margin-left: auto;
-}
-.winbar .provider.provider-warn {
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
-  /* Full-strength chrome text, not the muted secondary tone above: a warning earns more visual
-     weight than ordinary identity metadata, the same way `.tool-result-error` stays `--nv-fg`
-     rather than `--nv-muted` among otherwise-quiet rows. */
-  color: var(--nv-chrome-fg);
-}
-/* The mode block's LABEL is `--nv-chrome-fg` (inherited from `.status-line`, not re-declared here).
-   Its per-mode colour is a border, never `color:` on the text -- and deliberately not
-   `--nv-chrome-accent` either, even though that token names this very block: `tokens.rs` guards it
-   at `UI_CONTRAST` (3.0), the WCAG 1.4.11 non-text threshold, not the 4.5:1 a 12px label needs
-   (`tokens.rs`'s own test only asserts `>= 3.0`). That token's doc comment used to call it "accent
-   TEXT", which is what this paragraph was arguing against; it names its tier now, so the two agree.
-   `--nv-mode-browse`/`--nv-mode-input` are not guarded at all, which is worse -- so both go on a
-   border exactly the way `.composer-browse-hint` already does. */
-.status-line .mode-block {
+/* The mode block's LABEL inherits `--nv-fg` from the plain body surface (no longer chrome -- see
+   `.panel-footer`'s own comment above). Its per-mode colour is a border, never `color:` on the
+   text -- and deliberately not `--nv-chrome-accent` either, even though that token names this very
+   block: `tokens.rs` guards it at `UI_CONTRAST` (3.0), the WCAG 1.4.11 non-text threshold, not the
+   4.5:1 a 12px label needs (`tokens.rs`'s own test only asserts `>= 3.0`). `--nv-mode-browse`/
+   `--nv-mode-input` are not guarded at all, which is worse -- so both go on a border exactly the
+   way `.composer-browse-hint` already does. */
+.panel-footer .mode-block {
   font-weight: 600;
   padding: 1px 6px;
   border-left: 3px solid var(--nv-mode-browse);
 }
-.status-line .mode-block[data-mode="input"] {
+.panel-footer .mode-block[data-mode="input"] {
   border-left-color: var(--nv-mode-input);
 }
-/* The pane does not have keyboard focus, so the block is dim: the label in `--nv-chrome-muted`
-   (guarded for text against chrome, the same as every other secondary text in this bar, and never
-   `opacity`, which would multiply that guarantee down), no weight, and the per-mode colour taken
-   off the rule. The mode name stays, because it is still the mode the panel returns to. Without
-   this the block was equally bright whether or not the panel had focus, so a bright BROWSE sat
-   beside an editor being typed into.
+/* The pane does not have keyboard focus, so the block is dim: `--nv-muted` (the body's own
+   secondary tone, never `opacity`, which would multiply its guarantee down), no weight, and the
+   per-mode colour taken off the rule. The mode name stays, because it is still the mode the panel
+   returns to. Without this the block was equally bright whether or not the panel had focus, so a
+   bright BROWSE sat beside an editor being typed into.
 
    Specificity: this is (0,3,0), the same as the `[data-mode="input"]` rule above, and it has to
    come AFTER that rule to beat its `border-left-color`. The cascade test in `indexCss.test.ts`
    checks that it wins for INPUT. */
-.status-line .mode-block[data-focused="false"] {
-  color: var(--nv-chrome-muted);
+.panel-footer .mode-block[data-focused="false"] {
+  color: var(--nv-muted);
   font-weight: 400;
-  border-left-color: var(--nv-chrome-muted);
+  border-left-color: var(--nv-muted);
 }
-/* In-flight motion (2026-09-20-in-flight-motion-design.md). Per-turn state, so it lives in the
-   status line rather than the sign column (per-item state) or anywhere else -- design §3. Sits
-   between the status word above and `.position` below in DOM order; `.position`'s own
-   `margin-left: auto` still pushes IT and `Stop` to the right, so this grows into the gap between
-   without moving either, and the meter -- leftmost inside it -- never moves as the word's width
+/* In-flight motion (2026-09-20-in-flight-motion-design.md). Per-turn state, so it lives on its own
+   line (V2: `.activity-line`, session tabs spec §3.3) rather than the sign column (per-item state)
+   or anywhere else -- design §3. The meter -- leftmost inside it -- never moves as the word's width
    changes (`running NotebookEdit` is the longest, design §3.2). */
 .turn-activity {
   display: flex;
@@ -772,7 +788,7 @@ body,
   gap: 6px;
 }
 .turn-activity .meter {
-  /* `4ch` in the inherited `--nv-font-mono` (`.status-line`, above): exactly four status-line
+  /* `4ch` in the inherited `--nv-font-mono` (`.activity-line`, above): exactly four activity-line
      characters wide, matching the four discrete steps below (design §4). */
   width: 4ch;
   /* `flex: none`, the same idiom `.diff-gutter` below already uses, and for the same reason. Its
@@ -830,133 +846,68 @@ body,
     transform: scaleX(0.25);
   }
 }
-/* Secondary chrome text, the same pair `.position` uses just below -- selectors begin `.status-line
-   ` so the guard in `indexCss.test.ts` recognises this as the already-sanctioned chrome exemption
-   rather than needing a fifth one. */
-.status-line .turn-activity .turn-state,
-.status-line .turn-activity .turn-elapsed {
-  color: var(--nv-chrome-muted);
+/* Secondary body text, the same tone `.panel-footer .mode-block[data-focused="false"]` uses above.
+   V2 split `StatusLine` into three lines (session tabs spec §3.3): the session status word and the
+   position counter are gone from here (the status word is not shown in V2 at all; the position is
+   folded into `StatusRow`'s own text), which is also what retires the old three-way shrink
+   priority between them and the in-flight indicator -- `.activity-line` holds only the indicator
+   and Stop now, so there is only one thing left that can give. */
+.activity-line .turn-activity .turn-state,
+.activity-line .turn-activity .turn-elapsed {
+  color: var(--nv-muted);
 }
-.status-line .position {
-  margin-left: auto;
-  color: var(--nv-chrome-muted);
-}
-/* --- what the status line sacrifices first as the panel narrows (whole-branch review, 2026-09-20)
-   `.status-line` is a nowrap flex row that could not shrink and never clipped, and the in-flight
+/* --- what the activity line sacrifices first as it narrows (whole-branch review, 2026-09-20;
+   narrowed to this one line by V2, session tabs Task 10) -----------------------------------------
+   `.activity-line` is a nowrap flex row that could not shrink and never clipped, and the in-flight
    indicator roughly DOUBLES its minimum content width: 4ch of meter plus `running NotebookEdit`
-   (design §3.2's own named worst case, 20ch) plus `123s+` plus two more 10px gaps, on a bar that
-   needed about 250px before it. So under pressure the phase word wrapped to a second line --
-   breaking the `min-height: 28px` that design §3.2 calls costless -- and past that `.position` and
-   the Stop button were pushed off the right edge. `App.tsx`'s own comment beside that button says
-   it is the ONLY Stop control for mouse users, so that was the interrupt affordance leaving the
-   screen, which must never happen.
+   (design §3.2's own named worst case, 20ch) plus `123s+` plus a 10px gap, on a bar that needed
+   about 250px before it. So under pressure the phase word wrapped to a second line -- breaking the
+   `min-height: 28px` that design §3.2 calls costless -- and past that the Stop button was pushed
+   off the right edge. `App.tsx`'s own comment beside that button says it is the ONLY Stop control
+   for mouse users, so that was the interrupt affordance leaving the screen, which must never
+   happen.
 
-   **The priority order implemented here, first to give:**
-     1. the PHASE WORD truncates with an ellipsis (`running NotebookEdit` -> `running Note…`);
-     2. then the STATUS word, the same way;
-     3. then the POSITION counter.
-   **Never:** the meter, the elapsed clock, the mode block, and the Stop button. Those are
-   `flex: none`, so a narrow panel spends words and never spends the control that stops a turn.
+   **The priority order: the phase word truncates with an ellipsis** (`running NotebookEdit` ->
+   `running Note…`), and nothing else. **Never:** the meter, the elapsed clock, and the Stop button.
+   Those are `flex: none`, so a narrow panel spends the word and never spends the control that
+   stops a turn. What `flex: none` buys the meter and the clock is that the DISTRIBUTION never
+   spends them -- not that they can never be clipped. Once the phase word is gone there is nothing
+   left inside `.turn-activity` to give, so a deeper squeeze takes the box below its own fixed
+   content; `overflow: hidden` on it is what makes that clip (the clock, then the meter) rather
+   than overflowing onto Stop. The panel width at which any of this begins is a screen question,
+   and design §12 asks a human for it.
 
-   **Correction (2026-09-20, re-review).** The order above is what the declarations produce only
-   after the change described in this paragraph; as first written they could not produce it at all,
-   and the test that claimed to guard it could not fail. `flex-shrink: 100` sat on `.turn-state`
-   and `flex-shrink: 10` on `.status` -- items in DIFFERENT flex containers (`.turn-activity` and
-   `.status-line`), which never compete in one distribution, so comparing the two numbers meant
-   nothing. What actually competed with `.status` was `.turn-activity` at the default 1, and by
-   Flexbox 9.7's `shrink x base size` the status word took ~68% of any deficit: at 12px monospace
-   `.status` = 10 x ~50px = 500 against `.turn-activity` = 1 x ~206px = 206. The STATUS word was
-   the first thing to go, not the phase word -- about 75px of squeeze erased it while the phase
-   word had lost ~21px, 3 of 20 characters. The large factor now sits on `.turn-activity`, the
-   item that really is `.status`'s sibling. There are two independent decisions here, and the
-   comment above is the OUTER one:
-
-   1. **Between the three children of `.status-line` that can give at all** (`.turn-activity`,
-      `.status`, `.position`, at 100 / 10 / 1): the indicator's whole box gives first, then the
-      status word, then the position counter.
-   2. **Inside `.turn-activity`** (`.meter`, `.turn-state`, `.turn-elapsed`): `.turn-state` is the
-      ONLY item there with a non-zero shrink factor, so decision 1 spending the indicator's box is
-      the same event as the phase word truncating -- which is what makes the outer order deliver
-      the documented one. Its own factor is therefore inert today, and is written as the plain
-      default rather than a large number that claims a priority it cannot express; it becomes a
-      real order only if a second shrinkable child is ever added there.
-
-   What `flex: none` buys the meter and the clock is that the DISTRIBUTION never spends them -- not
-   that they can never be clipped. Once the phase word is gone there is nothing left inside
-   `.turn-activity` to give, so a deeper squeeze takes the box below its own fixed content;
-   `overflow: hidden` on it is what makes that clip (rightmost first: the clock, then the meter)
-   instead of overflowing onto `.position`, which neither box clipped before. The panel width at
-   which any of this begins is a screen question, and design §12 asks a human for it.
-
-   Two mechanics worth knowing before editing this:
-   - Shrinking is distributed by `flex-shrink x base-size`, so the factors below are an ORDER
-     rather than a ratio -- the indicator's box absorbs ~97% of a deficit before the status word
-     gives anything, and only once an item has reached its own `min-width: 0` does the remainder
-     move on to the next. The `min-width: 0` on each is required: a flex item's automatic minimum
-     is its min-content size, which for a word is the whole word, and `text-overflow` would never
-     engage without it.
-   - `.winbar` answers the same problem with `flex-wrap: wrap`, and that is deliberately NOT copied
-     here. Line breaking is decided on base sizes BEFORE any shrinking, so a wrapping status line
-     would jump between one and two rows every time the phase word changed width -- the jitter
-     §3.2 promises there is none of, arriving by the other door. `white-space: nowrap` on the bar
-     is the other half of that: it is what stops a word wrapping inside its own box. */
-.status-line {
-  white-space: nowrap;
-}
-.status-line > * {
-  flex: 0 0 auto;
-}
-/* Decision 1, first rank: the indicator's whole box is what competes with the status word, so this
-   is where the large factor has to be. `overflow: hidden` is the floor -- see the correction above. */
-.status-line .turn-activity {
-  flex-shrink: 100;
+   Two mechanics worth knowing before editing this: shrinking is distributed by `flex-shrink x
+   base-size`, so `.turn-activity`'s factor below is what makes IT (rather than Stop) the thing
+   that gives; and `min-width: 0` on the phase word is required, since a flex item's automatic
+   minimum is otherwise its min-content size (the whole word), which `text-overflow` never engages
+   without. `white-space: nowrap` on the bar is what stops the word wrapping inside its own box
+   instead of truncating. */
+.activity-line .turn-activity {
+  flex-shrink: 1;
   min-width: 0;
   overflow: hidden;
 }
-.status-line .turn-activity .turn-elapsed {
+.activity-line .turn-activity .turn-elapsed,
+.activity-line .stop {
   flex: none;
 }
-/* Decision 2: the only shrinkable child of `.turn-activity`, which is what turns rank 1 into "the
-   phase word truncates". The plain default, stated rather than inherited so that the day a second
-   shrinkable child appears here, this is a number someone has to choose rather than one nobody
-   noticed. */
-.status-line .turn-activity .turn-state {
+/* The only shrinkable child of `.turn-activity`. The plain default, stated rather than inherited so
+   that the day a second shrinkable child appears here, this is a number someone has to choose
+   rather than one nobody noticed. */
+.activity-line .turn-activity .turn-state {
   flex-shrink: 1;
-}
-/* Decision 1, second rank. */
-.status-line .status {
-  flex-shrink: 10;
-}
-.status-line .position {
-  flex-shrink: 1;
-}
-.status-line .turn-activity .turn-state,
-.status-line .status,
-.status-line .position {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* The status word stays `--nv-chrome-fg`; the error colour is a dot in front of it. */
-.status-line .status-unavailable::before,
-.status-line .status-closed::before {
-  content: "";
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  margin-right: 5px;
-  border-radius: 50%;
-  background: var(--nv-error);
-  vertical-align: middle;
-}
 
-/* The which-key strip (2026-09-19, spec 2026-09-19-which-key-design.md §2): the row directly above
-   the status line, same font and one-line layout, listing the keys the row under the cursor answers
-   to. Only ever in BROWSE (`App.tsx` gates the whole component on that), so it carries the body's
-   `--nv-fg`/`--nv-muted` pair rather than the winbar/status-line's `--nv-chrome-*` one -- it sits on
-   the plain body surface, not on chrome, whatever it visually neighbours. Text is `--nv-muted`
-   throughout: the keys change with the cursor, but they are still a secondary hint, never the main
-   thing on screen. */
+/* The which-key strip (2026-09-19, spec 2026-09-19-which-key-design.md §2): the last part of the
+   footer (V2, session tabs Task 10: mode block, mode pill, then this strip), same font and one-line
+   layout, listing the keys the row under the cursor answers to. Only ever in BROWSE (`App.tsx`
+   gates the whole component on that). Text is `--nv-muted` throughout, the same plain body pair the
+   rest of the footer carries: the keys change with the cursor, but they are still a secondary hint,
+   never the main thing on screen. */
 .which-key {
   display: flex;
   align-items: center;
@@ -977,12 +928,12 @@ body,
 /* The pane does not have the keys, so the strip dims -- the same claim `.mode-block` makes about
    `paneFocused`, and the same reason (spec §2.1: it says what these keys will do when focus comes
    back, so it must stay legible rather than vanish).
-   Adapted, not copied, from `.status-line .mode-block[data-focused="false"]`: that rule steps its
-   text from the brighter `--nv-chrome-fg` down to `--nv-chrome-muted`, deliberately never
-   `opacity` (see its own comment -- opacity multiplies a guarded pair's contrast down with it). This
-   strip's body text is `--nv-muted` already, the dimmer of the body's own two guarded tokens, so
-   there is no third rung to step down to for the label text; what CAN still step down is each
-   keycap's glyph, which is the brighter `--nv-fg` while focused. */
+   Adapted, not copied, from `.panel-footer .mode-block[data-focused="false"]`: that rule steps its
+   text from the brighter `--nv-fg` down to `--nv-muted`, deliberately never `opacity` (see its own
+   comment -- opacity multiplies a guarded pair's contrast down with it). This strip's body text is
+   `--nv-muted` already, the dimmer of the body's own two guarded tokens, so there is no third rung
+   to step down to for the label text; what CAN still step down is each keycap's glyph, which is the
+   brighter `--nv-fg` while focused. */
 .which-key[data-focused="false"] .keycap {
   /* The fill goes with the brightness: `--nv-muted` is guarded to 4.5:1 against `bg`, NOT against
      `cursorline`, so dimming the glyph while keeping the fill would measure a pair nothing checks
@@ -1005,15 +956,16 @@ body,
 /* The `?` keymap overlay (Task 3, spec 2026-09-19-which-key-design.md §3): opened by `?` in
    BROWSE, closed by `?`/Escape/q or a click on its own backdrop (`App.tsx`, `KeymapOverlay.tsx`).
    `position: absolute; inset: 0;` against `.agent-ui-scroller`, the message list's own region --
-   which IS spec §3.1's "会话列表那块区域", and leaves the winbar and the status line outside the
-   overlay's box entirely rather than under it. The first version covered the whole conversation and
-   lifted those two bars back by z-index; that put this scroll box's top under the winbar, where its
-   first heading was both unreadable and unreachable (`scrollTop` is already 0 there) -- found in
-   the whole-branch review. No JS measurement of the winbar's wrapping height is needed either way.
-   A HINT starting while this is open closes it first (`App.tsx`'s `hint_collect` handler), so the
-   two are never both on screen. Body text is the plain surface's own `--nv-fg`/`--nv-muted` pair (this is
-   not chrome), same as `.which-key` above -- `indexCss.test.ts`'s guard admits both with no
-   exemption, per the plan's own note that the spec's colours need none. */
+   which IS spec §3.1's "会话列表那块区域", and leaves the activity line, the status row and the
+   footer outside the overlay's box entirely rather than under it (V2, session tabs Task 10 --
+   formerly the winbar and the status line, same rule). The first version covered the whole
+   conversation and lifted those bars back by z-index; that put this scroll box's top under the
+   winbar, where its first heading was both unreadable and unreachable (`scrollTop` is already 0
+   there) -- found in the whole-branch review. No JS measurement of a bar's wrapping height is
+   needed either way. A HINT starting while this is open closes it first (`App.tsx`'s `hint_collect`
+   handler), so the two are never both on screen. Body text is the plain surface's own
+   `--nv-fg`/`--nv-muted` pair (this is not chrome), same as `.which-key` above -- `indexCss.test.ts`'s
+   guard admits both with no exemption, per the plan's own note that the spec's colours need none. */
 .keymap-overlay {
   position: absolute;
   inset: 0;
@@ -1053,6 +1005,89 @@ body,
   color: var(--nv-muted);
 }
 
+/* This session's details (session tabs spec §3.3), opened by `prefix i` or `Enter` on the status
+   row: shaped exactly like `.keymap-overlay` above (same overlay, same surface, same backdrop
+   rule), a two-column table instead of four sections. `App.tsx` owns `j`/`k`/`y`/`Esc`/`q` while
+   it is open, the way it owns the `?` overlay's -- this component draws only. */
+.detail-popover {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+.detail-popover table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.detail-popover td {
+  padding: 2px 8px 2px 0;
+  vertical-align: top;
+}
+.detail-popover td:first-child {
+  color: var(--nv-muted);
+}
+/* The row `j`/`k` sit on -- the same solid-block cursor idiom the conversation's own rows use
+   (`.row-current .row-sign`), on the whole row rather than a sign cell of its own: this table has
+   none. */
+.detail-popover tr.current {
+  background: var(--nv-cursorline);
+}
+
+/* `prefix w` (spec §3.6, session tabs Task 12) and the launch chooser (D10): shaped exactly like
+   `.keymap-overlay` and `.detail-popover` above -- same overlay, same surface, same positioning --
+   over `.agent-ui-scroller` in the conversation layout and over `.agent-ui-root` (also
+   `position: relative`) in the empty layout, since that screen has no scroller of its own. Body
+   text is the plain surface's own `--nv-fg`/`--nv-muted` pair; `indexCss.test.ts`'s guard admits
+   both with no new exemption. */
+.chooser {
+  position: absolute;
+  inset: 0;
+  overflow-y: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 20px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+.chooser-filter {
+  flex: 0 0 auto;
+  margin-bottom: 8px;
+  padding: 4px 6px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  border: 1px solid var(--nv-border);
+  font: inherit;
+}
+.chooser-list {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.chooser-row {
+  padding: 2px 4px;
+}
+/* The row `j`/`k` sit on, the same idiom as `.detail-popover tr.current`. */
+.chooser-row.current {
+  background: var(--nv-cursorline);
+}
+/* A record another window's lease holds: shown, never chosen (spec §3.6). */
+.chooser-row.unchoosable {
+  color: var(--nv-muted);
+}
+.chooser-empty {
+  color: var(--nv-muted);
+  padding: 2px 4px;
+}
+
 /* Replaces window.alert: copyable, non-blocking, and able to show the sidecar's own multi-line
    startup diagnostics, which is usually where the real cause is. */
 .fatal-error {
@@ -1090,20 +1125,12 @@ body,
    border, so the start screen's one blue-labelled control -- the one whose misclick costs the most,
    since it continues a conversation instead of starting one -- rendered pale-on-pale while every
    other button stayed correctly dark. */
-/* Same `:not(.row-choice)` reason as above: this rule's `border`/`background` are the boxed look
-   for the Auto/Bypass buttons, and at equal-or-higher specificity than `.row-choice`'s own `border:
-   none`/`background: none` they would win and put the box back around a row. `:hover` is left
-   unscoped -- `.row-choice` sets no hover state of its own, and this one's `--nv-cursorline` fill is
-   the same value `.row-choice.selected` uses below, so hovering a row (selected or not) is still a
-   correct, harmless fill rather than a conflict. */
-.mode-selector button:not(.row-choice) {
-  border: 1px solid var(--nv-border);
-  border-radius: 4px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  cursor: pointer;
-}
-.mode-selector button:hover {
+/* The boxed Auto/Bypass buttons (`.mode-selector button:not(.row-choice)`) are gone with the
+   mode-selector start screen -- every button on this screen is a choice row now, so the hover fill
+   moves onto `.row-choice` itself, unscoped: the same `--nv-cursorline` value
+   `.row-choice.selected` uses below, so hovering a row (selected or not) is still a correct,
+   harmless fill rather than a conflict. */
+.row-choice:hover {
   background: var(--nv-cursorline);
 }
 /* `.resume` used to be told apart from "New session" by this border-color alone (`--nv-mode-browse`,
@@ -1138,46 +1165,30 @@ body,
   color: var(--nv-muted);
 }
 
-/* The which-conversation axis, above the permission-mode buttons. Visually grouped so it reads as a
-   choice between conversations rather than as more ways to start one. */
-/* A column, not a row: this list holds one entry per remembered session (up to the Rust side's own
-   retention cap of 16, plus at most one record in the pre-2026-09-15 layout, so 17), and side-by-side
-   columns would get unreadably narrow well before that.
+/* The empty tab's resume rows (spec §3.6: "up to 8"), under the fresh prompt -- moved here from
+   `.mode-selector .session-choice`, the old resumable-session picker's own list. */
+/* A column, not a row: capped at `EMPTY_TAB_RESUME_ROWS` (8), well below the old picker's up-to-17,
+   so the `max-height`/`overflow-y` below is inherited caution rather than a case this screen is
+   known to hit -- kept anyway, since the tab chooser (D10) still lists every record uncapped.
 
-   `max-height` + `overflow-y` caps THE LIST so a long one does not push the permission buttons --
-   the only controls that can start anything -- down the page. It does NOT guarantee they stay on
-   screen, and a comment here used to say it did. The surrounding chrome (the intro paragraph, the
-   note above, both mode buttons, the footer) is uncapped, `.mode-selector` is centred with
+   The surrounding chrome (the composer, the mode pill) is uncapped, `.empty-tab` is centred with
    `margin: auto` inside a `height: 100vh` flex column, and centred overflow in that arrangement
-   splits above and below with the block-start half unreachable by scrolling. In a short agent pane
-   this start screen can therefore exceed the viewport. Never observed -- nobody has looked at this
-   screen with a full 17 rows at any pane height (`shell/MANUAL_VERIFICATION.md` owes it). */
-.mode-selector .session-choice {
+   splits above and below with the block-start half unreachable by scrolling. Never observed --
+   nobody has looked at this screen with a full 8 rows at any pane height
+   (`shell/MANUAL_VERIFICATION.md` owes it). */
+.empty-tab-resume {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  margin-bottom: 12px;
+  margin-top: 12px;
   max-height: 40vh;
   overflow-y: auto;
 }
-.mode-selector .session-choice button {
+.empty-tab-resume button {
   margin: 0;
 }
-/* Not itself an option -- the note explaining why the rows read as ids and timestamps. */
-.mode-selector .session-choice-note {
-  margin: 0 0 4px;
-}
-/* The selected conversation used to be distinguished by a fill declared here (`--nv-mode-browse` at
-   18%) rather than by border alone, because `.resume` carried a blue border unselected and a
-   border-only cue would have made "armed" and "merely available" look the same. Task 7 moved every
-   choice row onto `.row-choice` (above), which every button in this list carries now including
-   "New session", and its own `.row-choice.selected` sets the fill instead -- at higher specificity
-   here (3 classes + a type) this rule would otherwise win and paint the old colour back over it, so
-   it is removed rather than narrowed. Unselected rows are still not dimmed: they were, with
-   `opacity: 0.7`, and opacity takes the text's contrast down with it (fg at 0.7 is 3.34:1 on
-   rose-pine dawn). Every remembered-session row is unselected until clicked (the picker opens on
-   "New session"), so that was every resume row's heading -- `.row-choice.selected`'s fill is what
-   marks the selected one now. */
+/* `.row-choice.selected`'s fill (above) marks a selected row; the empty tab's resume rows have no
+   such state -- clicking one resumes it at once, there is nothing to arm first. */
 
 /* "Continue in a terminal", under the composer. Quiet by default: it is a way out of this panel,
    not one of the things it is for. */
@@ -1448,9 +1459,8 @@ body,
 
    `--nv-bg` text on an `--nv-fg` fill is the body's own guarded pair reversed, so the same
    contrast; `indexCss.test.ts` admits `--nv-bg` as text only in a rule that is entirely these two
-   selectors and paints that fill. LAST in the file on purpose: `.mode-selector
-   button:not(.row-choice)` and its `:hover` have the same (0,2,1) specificity and would otherwise
-   win back the fill, which the cascade test checks. */
+   selectors and paints that fill. LAST in the file on purpose: `.row-choice:hover` sits earlier and
+   would otherwise win back the fill on a focused, hovered row, which the cascade test checks. */
 .agent-ui-root button:focus,
 .agent-ui-root button:focus * {
   background: var(--nv-fg);

@@ -12,8 +12,9 @@ type Props = {
 
 /**
  * The in-flight motion indicator (`2026-09-20-in-flight-motion-design.md`). A caller mounts this
- * only while `StatusLine`'s own `working` predicate is true (§5.1) -- this component does not
- * re-derive that condition, so mounting it at all is the caller's claim that a turn is in flight.
+ * only while `ActivityLine`'s own `working` predicate is true (§5.1; `ActivityLine` moved this out
+ * of `StatusLine`, V2, session tabs Task 10) -- this component does not re-derive that condition,
+ * so mounting it at all is the caller's claim that a turn is in flight.
  *
  * The meter itself (`.meter` / `.meter-fill`) is withheld while `phase.kind === "blocked"`: a
  * pending permission means the AGENT is not working, so animating a claim that it is would be a

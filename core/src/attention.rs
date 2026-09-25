@@ -25,9 +25,19 @@
 //! sign gone (Task 6's review, minor 2). `shell` calls it at every place it takes a session away,
 //! not only on the event that says so: a fatal command, or a session that never opened.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent::AgentDomainEvent;
+
+/// One clock for every tracker in the process, so the oldest card across session tabs is
+/// comparable (session tabs spec §3.4, `prefix a`). Relaxed: only the order of stamps from one
+/// thread (the GTK main loop) is ever compared.
+static ARRIVAL_CLOCK: AtomicU64 = AtomicU64::new(1);
+
+fn next_stamp() -> u64 {
+    ARRIVAL_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
 
 /// What the agent's tray chip shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,28 +47,39 @@ pub struct Attention {
     /// A turn completed, or the session ended, while the chat was not on screen, and it has not
     /// been on screen since.
     pub unread: bool,
-    /// Every card the panel has been handed since the tracker was made (a new session makes a new
-    /// one); it only grows. What [`react`] compares: a card that arrives in the pump that answers
-    /// another leaves `pending` where it was, and is still new.
+    /// Every card the panel has been handed since the tracker was made; it only grows, across a
+    /// new session in the same tab too ([`AttentionTracker::restart`]). What [`react`] compares: a
+    /// card that arrives in the pump that answers another leaves `pending` where it was, and is
+    /// still new.
     pub arrived: u64,
 }
 
 /// The agent panel's running count. See the module doc for why it is fed deliveries.
 #[derive(Debug, Default)]
 pub struct AttentionTracker {
-    cards: BTreeSet<String>,
+    cards: BTreeMap<String, u64>,
     unread: bool,
     arrived: u64,
 }
 
 impl AttentionTracker {
+    /// A new session in the same tab (installed, or `r` reset): no card and nothing unread, but
+    /// `arrived` carries on. A fresh tracker would restart it at 0, and a window's total
+    /// (`tabs::sum_attention`) that dropped in the same tick a card arrived in another tab would
+    /// not rise, so [`react`] would miss that card (the session-tabs whole-branch review).
+    pub fn restart(&mut self) {
+        self.cards.clear();
+        self.unread = false;
+    }
+
     /// One pump's delivery, as the panel got it (after the policy answered what needs no human).
     /// `on_screen`: whether the chat is on screen now.
     pub fn observe(&mut self, delivered: &[AgentDomainEvent], on_screen: bool) {
         for event in delivered {
             match event {
                 AgentDomainEvent::PermissionRequested { permission_id, .. } => {
-                    if self.cards.insert(permission_id.clone()) {
+                    if !self.cards.contains_key(permission_id) {
+                        self.cards.insert(permission_id.clone(), next_stamp());
                         self.arrived += 1;
                     }
                 }
@@ -87,19 +108,39 @@ impl AttentionTracker {
     /// A resync: the panel rebuilds every card from the projection, so the count does too. A card
     /// it holds that the tracker did not is one more arrival.
     pub fn resync(&mut self, pending: impl IntoIterator<Item = String>) {
-        let cards: BTreeSet<String> = pending.into_iter().collect();
-        self.arrived += cards.difference(&self.cards).count() as u64;
+        let ids: BTreeSet<String> = pending.into_iter().collect();
+        let mut cards = BTreeMap::new();
+        for id in ids {
+            let stamp = match self.cards.get(&id) {
+                Some(stamp) => *stamp,
+                None => {
+                    self.arrived += 1;
+                    next_stamp()
+                }
+            };
+            cards.insert(id, stamp);
+        }
         self.cards = cards;
     }
 
     /// Forgets every card the projection no longer holds.
     pub fn retain_pending(&mut self, still_pending: impl Fn(&str) -> bool) {
-        self.cards.retain(|id| still_pending(id));
+        self.cards.retain(|id, _| still_pending(id));
     }
 
     /// The chat is on screen: what finished while it was away has been seen.
     pub fn seen(&mut self) {
         self.unread = false;
+    }
+
+    /// When the oldest card still pending arrived, on the process-wide clock; `None` with no card.
+    pub fn oldest_pending_stamp(&self) -> Option<u64> {
+        self.cards.values().min().copied()
+    }
+
+    /// When the newest card still pending arrived.
+    pub fn newest_pending_stamp(&self) -> Option<u64> {
+        self.cards.values().max().copied()
     }
 
     pub fn attention(&self) -> Attention {
@@ -390,5 +431,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Ruling 20: one clock across every tab's tracker, so "the oldest card" means the same thing
+    /// in tab 1 and tab 3.
+    #[test]
+    fn cards_carry_one_arrival_clock_across_trackers() {
+        let mut first = AttentionTracker::default();
+        let mut second = AttentionTracker::default();
+        assert_eq!(first.oldest_pending_stamp(), None);
+        second.observe(&[requested("b-1")], true);
+        first.observe(&[requested("a-1")], true);
+        second.observe(&[requested("b-2")], true);
+        let (a, b_old, b_new) = (
+            first.oldest_pending_stamp().unwrap(),
+            second.oldest_pending_stamp().unwrap(),
+            second.newest_pending_stamp().unwrap(),
+        );
+        assert!(b_old < a && a < b_new, "{b_old} < {a} < {b_new}");
+        // A card seen again keeps its stamp; a resync keeps the stamps of cards it already held.
+        second.observe(&[requested("b-1")], true);
+        assert_eq!(second.oldest_pending_stamp(), Some(b_old));
+        second.resync(["b-1".to_string(), "b-2".to_string()]);
+        assert_eq!(second.oldest_pending_stamp(), Some(b_old));
+        second.observe(&[resolved("b-1")], true);
+        assert_eq!(second.oldest_pending_stamp(), Some(b_new));
+        second.session_ended(true);
+        assert_eq!(second.oldest_pending_stamp(), None);
     }
 }

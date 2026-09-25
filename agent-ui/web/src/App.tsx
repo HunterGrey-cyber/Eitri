@@ -1,29 +1,37 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { applyEvent, applySnapshot, initialState, resetToStartScreen, resumeAttached } from "./reducer";
+import { applyEvent, applySnapshot, initialState, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
+import type { OutboundMessage, PermissionDecision } from "./bridge";
 import { noteUserScroll } from "./follow";
-import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelMode } from "./keymap";
 import { buildTimeline, oldestPendingPermission } from "./timeline";
 import { controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
-import { ModeSelector } from "./components/ModeSelector";
+import { acceptsEnvelope, activeTabInfo, forgetClosed, saveView, takeView, withoutHandoff } from "./tabs";
+import type { TabViewState } from "./tabs";
+import { EmptyTab } from "./components/EmptyTab";
 import { Composer } from "./components/Composer";
 import type { RestoredDraft } from "./components/Composer";
+import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
 import { Row } from "./components/Row";
-import { Winbar } from "./components/Winbar";
-import { StatusLine } from "./components/StatusLine";
-import { ContinueInTerminal, HandoffCommandCard } from "./components/TerminalHandoff";
+import { ActivityLine } from "./components/ActivityLine";
+import { StatusRow } from "./components/StatusRow";
+import { Footer } from "./components/Footer";
+import { DetailPopover } from "./components/DetailPopover";
+import { ContinueInTerminal } from "./components/TerminalHandoff";
 import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
 import { WhichKey } from "./components/WhichKey";
 import { KeymapOverlay } from "./components/KeymapOverlay";
+import { Chooser } from "./components/Chooser";
 import { stripEntries } from "./whichKey";
-import type { HandoffCommand, Hello, PermissionModeChoice, TurnClock } from "./types";
+import { modePill, showTabBar } from "./tabs";
+import { statusRowText, statusWarning } from "./statusRow";
+import type { HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope } from "./types";
 import { applyTheme } from "./theme";
 
 /** Whether `el` is an ordinary editable control -- an `<input>`, a `<textarea>`, or anything
@@ -232,40 +240,32 @@ function visibleRows(list: HTMLElement): HTMLElement[] {
 export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
-  const [sessionStarted, setSessionStarted] = useState(false);
+  /** Every tab and which is active, from Rust's `tabs` envelope (session tabs spec §3.1). `null`
+   *  until the first one arrives (before that, this window has not been told which tab exists yet). */
+  const [tabs, setTabs] = useState<TabsEnvelope | null>(null);
+  /** The active tab for the dispatch handler, which is installed once: set synchronously inside the
+   *  handler, so the snapshot that follows a `tabs` envelope in the same batch is accepted
+   *  (`acceptsEnvelope` reads this, not `tabs` state, which would still hold the PREVIOUS render's
+   *  value until React re-renders). */
+  const activeTabRef = useRef<TabId | null>(null);
+  /** What each tab's reader had on screen (cursor, mode, expansions, scroll, draft), keyed by tab
+   *  id and never sent to Rust in phase 2 (ruling 24). Saved just before a switch resets the render
+   *  state below, and handed back through `restoreRef` once the new tab's own `snapshot` arrives. */
+  const viewStore = useRef(new Map<TabId, TabViewState>());
+  /** The view to restore once the switch's `snapshot` (or, for a tab with none, the switch itself)
+   *  is applied. Read and cleared by the `snapshot` arm's layout effect below. */
+  const restoreRef = useRef<TabViewState | null>(null);
+  const activeTab = activeTabInfo(tabs);
+  /** True once the active tab actually holds a session, live or already ended -- a `starting` or
+   *  `failed` tab renders the empty tab too (F3, spec §3.6): it is not "started" until Rust has
+   *  really opened a session for it. Derived, not state -- Rust's `tabs` envelope is the only source
+   *  of a tab's `state`. */
+  const sessionStarted = activeTab !== null && (activeTab.state === "live" || activeTab.state === "ended");
   /** `sessionStarted` for the bridge listener, which is registered once and would otherwise read
    *  its first render's value forever. Assigned during render, so it is current by the time any
    *  later envelope arrives. */
   const sessionStartedRef = useRef(false);
   sessionStartedRef.current = sessionStarted;
-  /** The requestId of an in-flight `start_session`. Backend construction is genuinely slow (the
-   * sidecar path spawns a process and does a real handshake; a cold Verdandi checkout also builds
-   * it), so Rust defers its `command_result` until the worker finishes. This is what lets the start
-   * screen say "starting" instead of appearing to have ignored the click. */
-  const [startingRequestId, setStartingRequestId] = useState<string | null>(null);
-  /** The permission mode the CURRENT session was actually started with, remembered here because
-   *  `AgentUiState` carries no such field: `Hello.permissionModes` is only the pre-session menu of
-   *  choices (gone once a session exists), and `Capabilities.bypassPermissionMode` is a capability
-   *  flag, never the session's active mode. Set the moment `startSession` is called, not from any
-   *  reply -- its authority comes from the provider, not from this component's own memory of a
-   *  click: `ClaudeSidecarProvider::require_permission_mode` REFUSES a mode it cannot honour rather
-   *  than silently substituting another, so a session that went on to actually start really is
-   *  running the mode requested here. If a provider ever started substituting instead of refusing,
-   *  this would have to become a reported fact rather than a remembered request -- it would no
-   *  longer be true by construction.
-   *
-   *  Lives exactly as long as the TRANSCRIPT it describes, not as long as the session is running --
-   *  it is deliberately NOT cleared on `session_unavailable`/`session_closed`. A dead session's
-   *  transcript stays on screen, and the winbar is still describing something real: that
-   *  conversation genuinely ran in this mode, dead or not. Clearing it there would leave the winbar
-   *  describing nothing while the conversation it describes is still visible -- worse than showing
-   *  a fact about a session that has ended. It IS cleared everywhere the transcript itself goes
-   *  away: a failed start's `command_result` (no transcript was ever shown), `handoff`, `error`, and
-   *  `returnToStartScreen` all replace `state` with `initialState()`/`resetToStartScreen`, and this
-   *  goes with it. The one thing that must never happen -- a DIFFERENT session's mode showing -- is
-   *  prevented not by clearing but by overwriting: `startSession` sets this before that session's
-   *  own transcript can exist, so a later session can never render with an earlier one's value. */
-  const [startedPermissionMode, setStartedPermissionMode] = useState<PermissionModeChoice | null>(null);
   /** A fatal, session-ending failure, shown in the panel. Replaces window.alert, which cannot be
    * copied, cannot show the sidecar's own multi-line startup diagnostics, and blocks the WebView. */
   const [fatalError, setFatalError] = useState<string | null>(null);
@@ -278,13 +278,19 @@ export default function App() {
    *  recoverable from nowhere else at all. Cleared here when a real `snapshot` arrives, which is
    *  also when Rust clears its copy: a session that is actually running, not one merely asked for. */
   const [handoff, setHandoff] = useState<HandoffCommand | null>(null);
-  /** The requestId of an in-flight `handoff_to_terminal`, or null.
+  /** The requestId of each tab's in-flight `handoff_to_terminal`, keyed by the tab it closes.
    *
-   *  Non-null means the conversation is CLOSING: Rust has already taken the backend out of its own
-   *  state and a worker thread is running the real `shutdown()`. Nothing is torn down here until the
-   *  `handoff` envelope arrives, so without this the composer would stay live and a typed Enter
-   *  would clear the box into a session that no longer exists. */
-  const [handoffRequestId, setHandoffRequestId] = useState<string | null>(null);
+   *  An entry means that tab's conversation is CLOSING: Rust has already taken the backend out of
+   *  its own state and a worker thread is running the real `shutdown()`. Nothing is torn down here
+   *  until the `handoff` envelope arrives, so without this the composer would stay live and a typed
+   *  Enter would clear the box into a session that no longer exists.
+   *
+   *  **Per tab, not per window** (the session-tabs whole-branch review): one window-wide id locked
+   *  the composer of whichever tab was on screen, so handing off tab 1 and switching to a live tab 2
+   *  left tab 2 refusing input until tab 1's close answered. An entry is removed by its own
+   *  `command_result` (Rust owes one for every handoff, including one whose tab was closed), or by
+   *  a `handoff`/`error` envelope naming its tab. */
+  const [handoffRequests, setHandoffRequests] = useState<ReadonlyMap<TabId, string>>(new Map());
   /** A refused command, in words, on screen. Rust's refusals carry real human-readable reasons
    *  (`HandoffRefusal::message`, `BackendError::message`) and every one of them used to reach a
    *  `console.warn` and nothing else. */
@@ -298,9 +304,17 @@ export default function App() {
    *  permission response has no entry and comes back as `undefined`, which is correct rather than a
    *  gap: its refusal takes the plain "show the reason" path. Every recorded request gets exactly
    *  one `command_result` and is deleted there, so this cannot grow. */
-  const inFlight = useRef<Map<string, { kind: "start" | "send" | "handoff"; text?: string }>>(new Map());
+  const inFlight = useRef<Map<string, { kind: "send" | "handoff"; tab: TabId; text?: string }>>(new Map());
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
+  /** Bumped only when the `snapshot` arm actually applies a saved view's cursor/mode/expanded
+   *  (session tabs Task 11). The scroll-restoring layout effect below keys on THIS, not on `state`
+   *  directly: `state` also changes on the switch's OWN reset (`setState(initialState())`, in the
+   *  `tabs` arm, same render as `restoreRef.current` is first set), and a `[state]` dependency fired
+   *  there too -- before the new tab's real snapshot ever arrived -- consuming `restoreRef.current`
+   *  on an empty transcript and leaving nothing for the real restore. Reproduced by the "keeps each
+   *  tab's cursor across a switch" test failing with this dependency; fixed by decoupling the two. */
+  const [restoreTick, setRestoreTick] = useState(0);
   // Spinner-only, per-requestId in-flight tracking -- never read to answer "is a turn in
   // progress" or "is this permission still pending" (those come only from canonical
   // state.activeTurnId / state.pendingPermissions).
@@ -313,7 +327,8 @@ export default function App() {
    *  a reply's ~400 deltas. */
   const renderReportSent = useRef(false);
   /** How long the current turn has been running -- design doc §8.4. Real `useState`, not a ref: it
-   *  feeds `StatusLine`'s render (the elapsed clock), unlike the trace-only refs above. Set with
+   *  feeds `ActivityLine`'s render (the elapsed clock; V2, session tabs Task 10, formerly
+   *  `StatusLine`), unlike the trace-only refs above. Set with
    *  `exact: true` only from a real `turn_started` inside an `events` envelope; a turn id first
    *  observed inside a `snapshot` (a page reload, or a resync mid-turn) gets `exact: false`, because
    *  this panel cannot know how long the turn had already been running before it first saw it.
@@ -356,6 +371,21 @@ export default function App() {
   const [edgeFocused, setEdgeFocused] = useState(false);
   /** The index into `timeline` that `j`/`k` move and `Enter`/`y` act on. */
   const [cursor, setCursor] = useState(0);
+  /** `cursor`/`mode`/`expanded`/the composer's draft, mirrored into refs for the `tabs` dispatch
+   *  handler (installed once, session tabs Task 11), which cannot read render state directly --
+   *  the same reason `sessionStartedRef` exists above. Assigned during render, so a switch always
+   *  saves what the CURRENT render actually shows, not a stale one from before the last update. */
+  const cursorRef = useRef(cursor);
+  cursorRef.current = cursor;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  /** The composer's own unsent text, kept only so a tab switch can save it (ruling 24) -- never
+   *  read to render anything itself; `restoredDraft` is what actually reaches `Composer`. Updated
+   *  from `Composer`/`EmptyTab`'s `onDraftChange`, which fires on every keystroke and once more
+   *  with `""` after a send. */
+  const draftRef = useRef("");
   /** How the NEXT cursor change should bring its row on screen (`revealRow`): +1/-1 when `j`/`k`
    *  moved it (a tall row shows its top or its bottom), `"keep"` when the key already put the view
    *  exactly where it belongs (`Ctrl+d`/`Ctrl+u` re-homing, `G`, `gg`), 0 otherwise. A ref, read
@@ -390,6 +420,30 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  /** The detail popover's rows (session tabs spec §3.3), or `null` when it is closed. Set by a
+   *  `tab_detail` envelope (the reply to `open_detail`, sent by `StatusRow` and by `prefix i`);
+   *  closed the same places `keymapOpen` is forced shut, since the two are mutually exclusive
+   *  overlays over the same conversation area. */
+  const [detail, setDetail] = useState<DetailRow[] | null>(null);
+  /** The row `j`/`k`/`y` act on inside the popover, reset to 0 every time it opens. */
+  const [detailCursor, setDetailCursor] = useState(0);
+  /** The popover's own scrollable root -- unused today (it has nothing to scroll into view yet),
+   *  kept for parity with `keymapOverlayRef` and because a forwarded ref is part of the component's
+   *  contract. */
+  const detailRef = useRef<HTMLDivElement>(null);
+  /** The inline rename field's tab and prefilled text, or `null` when no rename is open (session
+   *  tabs spec §3.5, ruling 6: the tab bar is shown even with one tab while this is set). Set by a
+   *  `begin_rename` envelope (`prefix ,`); cleared on commit or cancel. */
+  const [renaming, setRenaming] = useState<{ tab: TabId; initial: string } | null>(null);
+  /** The window-close confirmation prompt (spec §3.5, ruling 7, ruling 15), or `null` when closed.
+   *  Drawn in the footer in place of the which-key strip, and takes every key while it is open. Set
+   *  by a `confirm_close` envelope (`prefix &`); answered by `y` (close) or any other key (cancel)
+   *  in `onKeyDown`. */
+  const [confirm, setConfirm] = useState<{ tab: TabId; lines: string[] } | null>(null);
+  /** `prefix w` (spec §3.6) and the launch chooser (D10): the open-tabs-then-records overlay, or
+   *  `null` when closed. Set by a `chooser` envelope; not tab-scoped (`tabs.ts`'s `TAB_SCOPED`
+   *  omits it) since it is a window-wide picker, not a view of the active tab. */
+  const [chooser, setChooser] = useState<ChooserEnvelope | null>(null);
   /** The overlay's last two sections and its heading, from `shell`'s `keymap` envelope (sent on
    *  every `ready`, right after the theme). `prefix` defaults to `Ctrl+b`, the stock tmux default,
    *  until that envelope arrives. */
@@ -507,6 +561,27 @@ export default function App() {
     if (row == null) return;
     revealRow(row.closest<HTMLElement>(".message-list"), row, landing);
   }, [cursor]);
+  /** The scroll half of a tab switch's view restore (session tabs Task 11): cursor and mode are set
+   *  directly in the `snapshot` handler above, but the row the cursor lands on must exist in the DOM
+   *  first, so the scroll position waits for the render that `setState` there causes. A layout
+   *  effect, not the ordinary one, so it runs before the browser paints the restored state at the
+   *  wrong scroll position for even one frame. `noteUserScroll` marks it the same way a HINT landing
+   *  or `focus_permission` does, so `MessageList`'s own follow-the-newest-message effect does not
+   *  fight it or snap back on the very next delta.
+   *
+   *  Keyed on `restoreTick`, not on `state` directly (see that ref's own doc comment): `state` also
+   *  changes on the switch's OWN reset, one render before the real snapshot this is meant to act on,
+   *  and firing there would consume `restoreRef.current` against an empty transcript. */
+  useLayoutEffect(() => {
+    const view = restoreRef.current;
+    if (view === null) return;
+    restoreRef.current = null;
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
+    if (!list) return;
+    noteUserScroll(list, "unknown");
+    list.scrollTop = view.atBottom ? list.scrollHeight : view.scrollTop;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restoreTick]);
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
    *  effect under it is a hook and cannot live after a conditional return. */
   const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
@@ -562,14 +637,16 @@ export default function App() {
     containerRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionRequest]);
-  /** The start screen's own focus target, for the same reason `containerRef` needs one: a keydown
-   *  bubbles from whatever has real focus, and nothing here claims it by default. Only ever used to
-   *  make `y` (copying a handoff command, see `handleStartScreenKeyDown`) reachable without an
-   *  explicit prior click. */
+  /** The start screen's own DOM anchor -- `HintLayer`'s containing block and the `containerRef ??
+   *  startScreenRef` fallback a couple of handlers below use. It used to also be focused whenever
+   *  `!sessionStarted` (so `y`, handled by the now-deleted `handleStartScreenKeyDown`, was reachable
+   *  without a prior click). `EmptyTab` (F3) owns that job for itself now, autofocusing its own live
+   *  composer -- and this effect, left in place, stole that focus right back the moment the tab
+   *  changed state: the composer's `autoFocus` runs at DOM insertion, but this ran on `sessionStarted`
+   *  flipping in a `useEffect`, which fires afterwards and moved focus to the root, blurring the
+   *  textarea into `Composer`'s own BROWSE fallback (found while testing the terminal-handoff flow: a
+   *  fresh empty tab rendered its composer hint instead of a textarea). */
   const startScreenRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!sessionStarted) startScreenRef.current?.focus();
-  }, [sessionStarted]);
 
   /* The panel's half of the global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md).
      `shell` owns the session and every key typed during it -- the panel never sees those keys, so
@@ -637,6 +714,10 @@ export default function App() {
 
   useEffect(() => {
     installDispatch((payload) => {
+      // Every session-scoped envelope names its tab (session tabs spec §3.1); the panel keeps only
+      // the active tab's state, so one for any other tab -- a batch still in flight when the user
+      // switched away -- is dropped here, before any of the arms below can touch `state`.
+      if (!acceptsEnvelope(payload as { kind: string; tab?: number }, activeTabRef.current)) return;
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
       } else if (payload.kind === "pane_focus") {
@@ -652,15 +733,19 @@ export default function App() {
         // leaving it up is how the review reproduced a dead keyboard: come back with `Ctrl+l`,
         // land in INPUT, and every keystroke is swallowed by the overlay's own branch (review).
         setKeymapOpen(false);
+        setDetail(null);
         setPaneFocused(payload.focused);
       } else if (payload.kind === "enter_input") {
         // Same reason, the other half of that reproduction: this puts the caret in the composer, so
         // the overlay must not be left covering it and eating what gets typed.
         setKeymapOpen(false);
+        setDetail(null);
         setInputRequest((n) => n + 1);
       } else if (payload.kind === "focus_permission") {
         // The overlay would cover the card the cursor is about to land on.
         setKeymapOpen(false);
+        setDetail(null);
+        setChooser(null);
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "keymap") {
         setKeymapHelp({ prefix: payload.prefix, window: payload.window, prefixKeys: payload.prefixKeys });
@@ -686,6 +771,8 @@ export default function App() {
         // this and HINT never actually contend for them, but closing here keeps that true by
         // construction rather than by the two features happening not to overlap in practice.
         setKeymapOpen(false);
+        setDetail(null);
+        setChooser(null);
         // ...and the `g` the strip may still be waiting on, for the reason `pane_focus` does it.
         pendingGRef.current = false;
         hideGPrefix();
@@ -718,9 +805,79 @@ export default function App() {
         endHint();
       } else if (payload.kind === "hello") {
         setHello(payload);
+      } else if (payload.kind === "tabs") {
+        // A switch to a DIFFERENT tab clears every piece of per-conversation state the old
+        // start-screen resets used to clear, before the new tab's own `snapshot` (if it has one)
+        // arrives -- the WebView holds only the active tab's state (spec §3.1), so nothing here may
+        // carry over from the tab just left. The first `tabs` this window ever sees (mount) also
+        // takes this branch, since `activeTabRef.current` starts `null`.
+        if (payload.active !== activeTabRef.current) {
+          const previous = activeTabRef.current;
+          // The old tab's view is saved from the live refs -- BEFORE the resets below overwrite
+          // the render state they mirror -- and only when there IS an old tab (not on mount).
+          if (previous !== null) {
+            const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+            saveView(viewStore.current, previous, {
+              cursor: cursorRef.current,
+              mode: modeRef.current,
+              expanded: expandedRef.current,
+              scrollTop: list?.scrollTop ?? 0,
+              atBottom: list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1,
+              draft: draftRef.current,
+            });
+          }
+          restoreRef.current = takeView(viewStore.current, payload.active) ?? null;
+          // The composer always gets the new tab's draft, empty when it has none (ruling 24),
+          // through the existing restoredDraft path. `draftRef` itself is reset here too, not only
+          // through `onDraftChange` -- without this it would still hold the PREVIOUS tab's text
+          // until something typed into the new tab's box fired a change, so switching away again
+          // with nothing typed would save the old tab's draft under the new tab's id.
+          restoreSeq.current += 1;
+          draftRef.current = restoreRef.current?.draft ?? "";
+          setRestoredDraft({ text: draftRef.current, seq: restoreSeq.current });
+          setState(initialState());
+          setCursor(0);
+          setExpanded({});
+          setMode("browse");
+          setKeymapOpen(false);
+          setDetail(null);
+          setChooser(null);
+          setTurnClock(null);
+          setHandoff(null);
+          setFatalError(null);
+          setCommandNotice(null);
+        }
+        activeTabRef.current = payload.active;
+        setTabs({ active: payload.active, tabs: payload.tabs });
+        forgetClosed(
+          viewStore.current,
+          payload.tabs.map((t) => t.id),
+        );
+      } else if (payload.kind === "tab_detail") {
+        // The reply to `open_detail` (`StatusRow`, `prefix i`): opens the popover on this tab's
+        // rows, cursor at the top. Forces BROWSE and closes the `?` overlay the same way
+        // `open_keymap` does -- the two overlays are mutually exclusive over the conversation area.
+        setDetail(payload.rows);
+        setDetailCursor(0);
+        setMode("browse");
+        setKeymapOpen(false);
       } else if (payload.kind === "snapshot") {
         setState((s) => applySnapshot(s, payload.state, payload.throughRevision));
-        setSessionStarted(true);
+        // The view a switch saved for this tab (session tabs Task 11), if it had one -- cursor and
+        // mode apply now; the scroll position is left to the layout effect below, since it needs
+        // the row this cursor lands on to exist in the DOM first. `landingRef` is set BEFORE the
+        // restored `setCursor` so the `[cursor]` reveal effect does not fight this restore with its
+        // own `"nearest"` scroll for a plain +1/-1 move.
+        if (restoreRef.current !== null) {
+          const view = restoreRef.current;
+          landingRef.current = "keep";
+          setCursor(view.cursor);
+          setMode(view.mode);
+          setExpanded(view.expanded);
+          // Tells the scroll-restoring layout effect a real restore landed in THIS render -- see
+          // its own doc comment for why it cannot simply key on `state`.
+          setRestoreTick((n) => n + 1);
+        }
         // A snapshot means a session is genuinely RUNNING, which is also when Rust clears its own
         // copy of the command. Clearing it when a start was merely requested would throw it away on
         // a start that then failed -- and on the legacy backend that is the last reference to a
@@ -775,34 +932,28 @@ export default function App() {
         });
         const record = inFlight.current.get(payload.requestId);
         inFlight.current.delete(payload.requestId);
-        setStartingRequestId((current) => {
-          if (current !== payload.requestId) return current;
-          // The deferred reply to our start_session. On failure, fall back to the start screen so
-          // the user can retry -- an `error` envelope follows with the real cause.
-          if (!payload.ok) {
-            setSessionStarted(false);
-            // The mode `startSession` optimistically remembered belongs to a session that never
-            // actually started -- nothing refused it, it simply never came to exist.
-            setStartedPermissionMode(null);
-          }
-          return null;
-        });
         if (record?.kind === "handoff") {
           // Either the handoff finished (the `handoff` envelope arrived first and already reset
-          // everything) or it was refused and the session is untouched. Both end the closing state.
-          setHandoffRequestId((current) => (current === payload.requestId ? null : current));
+          // everything) or it was refused and the session is untouched. Both end the closing state
+          // -- of the tab it was sent from, which need not be the one on screen now.
+          setHandoffRequests((current) => withoutHandoff(current, record.tab, payload.requestId));
         }
         if (!payload.ok) {
           console.warn("agent-ui: command failed", payload.requestId, payload.error);
           if (record?.kind === "send") {
-            // The composer cleared this optimistically. Rust refused it, so it goes back — a
-            // message that vanishes with no trace is the outcome this exists to prevent.
-            restoreSeq.current += 1;
-            setRestoredDraft({ text: record.text ?? "", seq: restoreSeq.current });
-            setCommandNotice(`That message was not sent (${payload.error}). It is back in the box.`);
-          } else if (record?.kind === "start") {
-            // A failed start already has the start screen and an `error` envelope carrying the real
-            // cause; a second surface for it would just be noise.
+            if (record.tab === activeTabRef.current) {
+              // The composer cleared this optimistically. Rust refused it, so it goes back — a
+              // message that vanishes with no trace is the outcome this exists to prevent.
+              restoreSeq.current += 1;
+              setRestoredDraft({ text: record.text ?? "", seq: restoreSeq.current });
+              setCommandNotice(`That message was not sent (${payload.error}). It is back in the box.`);
+            } else {
+              // The tab this was sent from is no longer the active one (the user switched away
+              // before Rust answered) -- restoring it into a DIFFERENT tab's composer would be
+              // exactly the tab-scoping bug this feature exists to rule out (ruling 3), so the
+              // refusal is reported by name instead, with the full text so it is not lost.
+              setCommandNotice(`A message to tab ${record.tab} was not sent (${payload.error}): ${record.text}`);
+            }
           } else {
             setCommandNotice(payload.error);
           }
@@ -811,12 +962,11 @@ export default function App() {
         // The session is genuinely closed by the time this arrives (Rust dispatches it only after
         // its own `shutdown()` returned), so the conversation goes with it rather than being left
         // on screen looking live -- the same treatment a fatal error gets, for the same reason.
-        setSessionStarted(false);
-        setStartingRequestId(null);
-        setHandoffRequestId(null);
+        // `sessionStarted` follows from `tabs` alone; the `tabs` envelope naming this tab
+        // `not_started` again is what actually drops this render back to the empty tab.
+        setHandoffRequests((current) => withoutHandoff(current, payload.tab));
         setCommandNotice(null);
         setState(initialState());
-        setStartedPermissionMode(null);
         setKeymapOpen(false);
         // Same reason `returnToStartScreen` below clears it: a whole-state reset must leave no
         // record of a turn behind. The next snapshot's `activeTurnId === null` branch usually
@@ -847,29 +997,41 @@ export default function App() {
               },
         );
       } else if (payload.kind === "error") {
-        setSessionStarted(false);
-        setStartingRequestId(null);
-        setHandoffRequestId(null);
+        // Tab-scoped now (ruling 14): Rust sends this only when the failing tab is the active one,
+        // and this tab's own `tabs.failure` carries the reason for when it is shown again. This
+        // window's other tabs are untouched (spec §3.9).
+        setHandoffRequests((current) => withoutHandoff(current, payload.tab));
         setState(initialState());
-        setStartedPermissionMode(null);
         setKeymapOpen(false);
         // The third of the three whole-state resets, now saying the same thing as the other two.
         setTurnClock(null);
         setFatalError(payload.message);
-        /* Re-ask for `hello`, because we are about to show the start screen again and the copy we
-           captured at mount is a snapshot of the conversation records as they were then.
-
-           The session that just died is exactly the one the user is most likely to want back, and
-           it was persisted on adoption (`agent/src/ingestion.rs` -> `conversation::persist_record`)
-           -- so it IS on disk and offerable, and only the in-memory list is stale. Without this the
-           picker's own note, "Previous conversations here, newest first", is a claim the component
-           cannot honour at that moment; the only escape hatch was `prefix r`, which nothing
-           tells the user about.
-
-           Safe to re-post: Rust answers `Ready` from canonical state with a fresh
-           `BackendGreeting::for_kind` and a `command_result`, never with another `error`, so there
-           is no loop here. */
-        requestHello();
+        // No `requestHello()` here (ruling 17): Rust re-sends `hello`, recomputed, whenever the set
+        // of open provider sessions changes -- this tab failing (or ending, or resetting) is exactly
+        // such a change, so the picker's list is already on its way rather than something this side
+        // has to go ask for.
+      } else if (payload.kind === "begin_rename") {
+        // `prefix ,` (spec §3.5): the tab bar stays on screen (ruling 6) with an inline field open
+        // over this tab, prefilled and selected. The two other overlays over the conversation area
+        // must not fight it for the keys.
+        setDetail(null);
+        setKeymapOpen(false);
+        setRenaming({ tab: payload.tab, initial: payload.current ?? "" });
+      } else if (payload.kind === "confirm_close") {
+        // `prefix &` (spec §3.4, ruling 7): drawn in the footer in place of the which-key strip,
+        // and takes every key -- see `onKeyDown`'s dedicated branch, checked before every other
+        // overlay. The other two overlays are closed for the same reason `begin_rename` closes them.
+        setDetail(null);
+        setKeymapOpen(false);
+        setConfirm({ tab: payload.tab, lines: payload.lines });
+      } else if (payload.kind === "chooser") {
+        // `prefix w` (spec §3.6) or the launch chooser (D10): the other two overlays over the
+        // conversation area must not fight it for the keys, the same reason `begin_rename` and
+        // `confirm_close` close them.
+        setDetail(null);
+        setKeymapOpen(false);
+        setRenaming(null);
+        setChooser({ launch: payload.launch, open: payload.open, records: payload.records });
       }
     });
     requestHello();
@@ -947,63 +1109,129 @@ export default function App() {
     if (receivedAt === null || renderReportSent.current) return;
     renderReportSent.current = true;
     requestAnimationFrame(() => {
-      postToRust({
-        type: "turn_rendered",
-        request_id: nextRequestId(),
-        receive_to_frame_ms: performance.now() - receivedAt,
-      });
+      post({ type: "turn_rendered", receive_to_frame_ms: performance.now() - receivedAt });
     });
   }, [state.transcript]);
 
-  /** `resume` carries the Claude provider session id to continue, or nothing for a fresh session.
-   * A resume that fails comes back as a normal fatal error and returns here -- it is never turned
-   * into a fresh session, by this component or by anything below it. */
-  function startSession(mode: PermissionModeChoice, resume?: string) {
-    const requestId = nextRequestId();
-    setPendingCommands((prev) => new Set(prev).add(requestId));
-    setStartingRequestId(requestId);
-    setFatalError(null);
-    // Remembered optimistically, like every other piece of this request -- see
-    // `startedPermissionMode`'s own doc comment for why that is sound here specifically: the
-    // provider refuses a mode it cannot honour rather than substituting one, so a session that
-    // goes on to actually start is running exactly this mode. Cleared again on a failed start,
-    // in the `command_result` handler above.
-    setStartedPermissionMode(mode);
-    inFlight.current.set(requestId, { kind: "start" });
-    postToRust({ type: "start_session", request_id: requestId, mode, resume });
+  /** Adds `request_id` and the active tab to a tab command, and posts nothing when there is no
+   *  active tab yet -- there would be nothing to name it with (ruling 2: an inbound command without
+   *  a tab is a protocol error, and this side must not manufacture the outbound mirror of that). */
+  function post<M extends { type: string }>(message: M) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    postToRust({ ...message, request_id: nextRequestId(), tab } as unknown as OutboundMessage);
   }
 
   function handoffToTerminal() {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
-    inFlight.current.set(requestId, { kind: "handoff" });
+    inFlight.current.set(requestId, { kind: "handoff", tab });
     // Set BEFORE the post, so the composer is disabled from this moment rather than from whenever a
     // reply comes back. Rust takes the session out of its own state inside the handler this message
     // reaches, and every send after that point would be refused.
-    setHandoffRequestId(requestId);
+    setHandoffRequests((current) => new Map(current).set(tab, requestId));
     setCommandNotice(null);
-    postToRust({ type: "handoff_to_terminal", request_id: requestId });
+    postToRust({ type: "handoff_to_terminal", request_id: requestId, tab });
   }
 
+  /** Sends what is typed. On a `NotStarted` tab this is what starts the backend, lazily, with that
+   *  tab's remembered mode (ruling 4) -- there is no separate `start_session` message any more. */
   function sendMessage(text: string) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
     // The text is kept so a refusal can put it back. Dropped again as soon as the reply arrives.
-    inFlight.current.set(requestId, { kind: "send", text });
+    inFlight.current.set(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
-    postToRust({ type: "send_message", request_id: requestId, text });
+    postToRust({ type: "send_message", request_id: requestId, tab, text });
   }
 
   function interrupt() {
-    const requestId = nextRequestId();
-    setPendingCommands((prev) => new Set(prev).add(requestId));
-    postToRust({ type: "interrupt", request_id: requestId });
+    post({ type: "interrupt" });
   }
 
   function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string) {
-    const requestId = nextRequestId();
-    setPendingCommands((prev) => new Set(prev).add(requestId));
-    postToRust({ type: "permission_response", request_id: requestId, permission_id: permissionId, decision, reason });
+    post({ type: "permission_response", permission_id: permissionId, decision, reason });
+  }
+
+  /** Commits (or cancels) an inline rename (spec §3.5). Both return the keys to the root, the same
+   *  as every other overlay closing does. Sends `renaming.tab`, not the active tab: the field can
+   *  stay open across a switch (`n`/`p`/digits/`l` move focus-free, ruling D3 B), so `post`'s
+   *  `activeTabRef.current` would name the wrong tab -- the same reason `answerConfirm` sends
+   *  `confirm.tab` directly instead of going through `post`. */
+  function commitRename(name: string) {
+    if (renaming !== null) {
+      postToRust({ type: "rename_tab", request_id: nextRequestId(), tab: renaming.tab, name });
+    }
+    setRenaming(null);
+    containerRef.current?.focus();
+  }
+  function cancelRename() {
+    setRenaming(null);
+    containerRef.current?.focus();
+  }
+
+  /** Hands the keys back to whichever layout is on screen -- the conversation's own root, or the
+   *  start screen's while no session has started yet. The same fallback `hint_collect` and the
+   *  document-`<body>` replay above already use. */
+  function returnKeysToRoot() {
+    if (containerRef.current !== null) {
+      containerRef.current.focus({ preventScroll: true });
+      return;
+    }
+    // The empty layout: `.agent-ui-root` handles no key, so focusing it strands the keys (GUI pass,
+    // 2026-09-25). The empty tab's live control is its composer, in INPUT -- the same request
+    // `enter_input` makes, which `EmptyTab`'s `Composer` answers by focusing its textarea.
+    startScreenRef.current?.focus({ preventScroll: true });
+    setInputRequest((n) => n + 1);
+  }
+
+  /** `prefix w` (spec §3.6, ruling ordering: open tabs first, then records to resume) and the
+   *  launch chooser (D10). Every callback closes the overlay and returns the keys to the panel
+   *  root, except `onLeave(true)` (Esc/q at launch), where `shell` moves them to the editor instead
+   *  (spec §3.6: "Esc/q 交给编辑器") -- calling `returnKeysToRoot` there would fight that hand-off. */
+  function onChooserSwitch(tab: TabId) {
+    postToRust({ type: "select_tab", request_id: nextRequestId(), tab });
+    setChooser(null);
+    returnKeysToRoot();
+  }
+  function onChooserResume(providerSessionId: string) {
+    post({ type: "resume", provider_session_id: providerSessionId });
+    setChooser(null);
+    returnKeysToRoot();
+  }
+  function onChooserCloseTab(tab: TabId) {
+    // Rust's own close prompt is `prefix &`; this asks the same question tmux's `choose-tree` `x`
+    // does, from the row's own label -- there is no round trip to Rust for this text (ruling 7).
+    const label = chooser?.open.find((t) => t.tab === tab)?.label ?? `tab ${tab}`;
+    setChooser(null);
+    setConfirm({ tab, lines: [`close ${label}? (y/n)`] });
+    returnKeysToRoot();
+  }
+  function onChooserLeave(launch: boolean) {
+    postToRust({ type: "chooser_closed", request_id: nextRequestId(), launch });
+    setChooser(null);
+    if (!launch) returnKeysToRoot();
+  }
+
+  /** The window-close prompt (ruling 7) owns every key ahead of everything else, in BOTH layouts:
+   *  the conversation's own `onKeyDown` below, and `EmptyTab`'s root while the chat is on screen
+   *  with no session yet (spec §3.4: "prefix & 先显示 chat 并给它键位"). Lifted out of either
+   *  handler so both call it first and agree. Returns whether it claimed the key -- only
+   *  `confirm === null` does not. */
+  function answerConfirm(event: KeyboardEvent<HTMLDivElement>): boolean {
+    if (confirm === null) return false;
+    if (!["Shift", "Control", "Alt", "Meta"].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === "y") {
+        postToRust({ type: "close_tab", request_id: nextRequestId(), tab: confirm.tab });
+      }
+      setConfirm(null); // tmux confirm-before: any other key cancels
+    }
+    return true;
   }
 
   /** What `y` puts on the clipboard for the item under the cursor. §4.3: "复制本条（命令、代码块、
@@ -1023,69 +1251,6 @@ export default function App() {
       case "permission":
         return JSON.stringify(item.request.input, null, 2);
     }
-  }
-
-  /** `r` on an ended session. Drops back to the start screen by clearing the session state the same
-   *  way a fresh panel load does -- it starts nothing by itself, because which mode and which
-   *  resumable session to start is the start screen's question to ask. `backend`/`capabilities`/
-   *  `provider` survive (see `resetToStartScreen`) because they came from `hello` and describe the
-   *  bridge, not the session that just ended. A fresh `hello` is asked for the same reason the
-   *  `error` handler above does it: the session that just ended is exactly the one most likely to
-   *  be offered back, and the copy of `hello` captured at mount does not have it yet. */
-  function returnToStartScreen() {
-    setMode("browse");
-    setCursor(0);
-    setExpanded({});
-    setSessionStarted(false);
-    setStartingRequestId(null);
-    setHandoffRequestId(null);
-    setCommandNotice(null);
-    setState(resetToStartScreen);
-    setStartedPermissionMode(null);
-    setKeymapOpen(false);
-    // Belt and braces: only reachable on an ended session, which already cleared this via
-    // session_closed/session_unavailable above, but the start screen must never show a stale clock
-    // for the fresh session about to begin.
-    setTurnClock(null);
-    requestHello();
-  }
-
-  /** The one key the start screen offers: `y`, copying the command `HandoffCommandCard` shows
-   *  ("Press y to copy.", `components/TerminalHandoff.tsx`). Deliberately separate from the
-   *  conversation's own `onKeyDown` rather than one handler branching on `handoff` -- the two never
-   *  run at once (`handoff` is always cleared by the time a real `snapshot` flips `sessionStarted`
-   *  true, in the `installDispatch` handler above), and this screen has no cursor, no modes, and no
-   *  `TimelineItem`s for a cursor to sit on: the handoff command is the only thing here `y` could
-   *  ever mean, because it only exists in a state where the session has already ended and there is
-   *  no live conversation row left to compete with it for the key. */
-  function handleStartScreenKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (isEditableElement(event.target)) return;
-    if (event.nativeEvent.isComposing || event.ctrlKey || event.shiftKey || event.altKey) return;
-    const root = startScreenRef.current;
-    // The same structural reach as the conversation (`./nav`), over the start screen's stops: each
-    // conversation choice and each mode button, top to bottom, plus any banner. There is no row
-    // cursor here, so every stop is reached by focusing it and Enter/Space activate it natively.
-    if (root !== null && (event.key === "j" || event.key === "k")) {
-      event.preventDefault();
-      const target = nextStop(root, null, event.key === "j" ? 1 : -1);
-      if (target !== null) controlsOf(target)[0]?.focus();
-      return;
-    }
-    if (root !== null && (event.key === "h" || event.key === "l")) {
-      event.preventDefault();
-      const stop = currentStop(root, null);
-      const target = stop === null ? null : nextControl(stop, event.key === "l" ? 1 : -1);
-      if (target instanceof HTMLElement) target.focus();
-      return;
-    }
-    if (event.key === "f") {
-      event.preventDefault();
-      requestHint(event.repeat);
-      return;
-    }
-    if (handoff === null || event.key !== "y") return;
-    event.preventDefault();
-    void navigator.clipboard?.writeText(handoff.command);
   }
 
   /* Rendered on both screens. A refused command can return the panel to the start screen (a failed
@@ -1111,12 +1276,56 @@ export default function App() {
     );
 
   if (!sessionStarted) {
+    // `errorBanner` deliberately stays out of this branch: a failed tab shows its own reason inside
+    // `EmptyTab` (`activeTab.failure`), and a fatal error that arrived before any `tabs` envelope
+    // (nothing to blame it on yet) still reaches the reader through `failure` below, as a fallback.
     return (
-      <div className="agent-ui-root" ref={startScreenRef} tabIndex={0} onKeyDown={handleStartScreenKeyDown}>
-        {errorBanner}
+      <div className="agent-ui-root" ref={startScreenRef} tabIndex={-1}>
+        {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
+          <TabBar
+            tabs={tabs.tabs}
+            active={tabs.active}
+            renaming={renaming}
+            onSelect={(tab) => postToRust({ type: "select_tab", request_id: nextRequestId(), tab })}
+            onRenameCommit={commitRename}
+            onRenameCancel={cancelRename}
+          />
+        )}
         {commandNoticeBanner}
-        {handoff !== null && <HandoffCommandCard handoff={handoff} />}
-        <ModeSelector hello={hello} connecting={startingRequestId !== null} onStart={startSession} />
+        {/* No `.panel-footer` on this screen (ruling 7), so the prompt is drawn here instead. */}
+        {confirm !== null && (
+          <span className="confirm-close" role="alertdialog">
+            {confirm.lines.join(" · ")}
+          </span>
+        )}
+        {activeTab === null ? (
+          <div className="empty-tab">
+            <p className="connecting">Connecting to the shell…</p>
+          </div>
+        ) : (
+          <EmptyTab
+            hello={hello}
+            tab={activeTab}
+            handoff={handoff}
+            failure={activeTab.failure ?? fatalError}
+            paneFocused={paneFocused}
+            focusRequest={inputRequest}
+            restoredDraft={restoredDraft}
+            onSend={sendMessage}
+            onResume={(id) => post({ type: "resume", provider_session_id: id })}
+            onCycleMode={() => post({ type: "cycle_mode" })}
+            onReset={() => post({ type: "reset_tab" })}
+            onHint={requestHint}
+            onDraftChange={(text) => (draftRef.current = text)}
+            answerConfirm={answerConfirm}
+          />
+        )}
+        {/* The launch chooser (D10) opens over an empty tab 1, before the chat is given the keys --
+            `.agent-ui-root` is this layout's own positioned ancestor (it has no `.agent-ui-scroller`
+            to nest inside). */}
+        {chooser !== null && (
+          <Chooser envelope={chooser} onSwitch={onChooserSwitch} onResume={onChooserResume} onCloseTab={onChooserCloseTab} onLeave={onChooserLeave} />
+        )}
         <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />
       </div>
     );
@@ -1130,7 +1339,7 @@ export default function App() {
   /* The conversation is on its way out: Rust already owns the backend on a shutdown worker and will
      refuse every command until that finishes. The composer must reflect that rather than accepting
      input it cannot deliver. */
-  const handingOff = handoffRequestId !== null;
+  const handingOff = tabs !== null && handoffRequests.has(tabs.active);
 
   /** The key table's home: mode + key + context in, an action out, applied here. Only claims what
    *  `resolveKey` claims -- an unrecognised key, or one INPUT leaves to the input method (a
@@ -1150,6 +1359,10 @@ export default function App() {
    *  only keyboard route to Approve/Deny/Stop/Dismiss/Cancel. That was a real, reported regression,
    *  not a hypothetical. */
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // The window-close confirmation prompt owns every key, first of all, ahead of the `?` keymap
+    // overlay and everything else below (ruling 7): tmux's own `confirm-before` prompt takes the
+    // keys the same way.
+    if (answerConfirm(event)) return;
     const root = containerRef.current;
     const pendingG = pendingGRef.current;
     pendingGRef.current = false;
@@ -1172,6 +1385,16 @@ export default function App() {
       } else if (event.key === "j" || event.key === "k") {
         scrollKeymapOverlay(keymapOverlayRef.current, event.key === "j" ? 1 : -1);
       }
+      return;
+    }
+    // The detail popover, the same way: it owns every key while it is open, ahead of everything
+    // below (spec §3.3: "j/k move, y copies a line, Esc/q close").
+    if (detail !== null) {
+      event.preventDefault();
+      if (event.key === "Escape" || event.key === "q") setDetail(null);
+      else if (event.key === "j") setDetailCursor((c) => Math.min(c + 1, detail.length - 1));
+      else if (event.key === "k") setDetailCursor((c) => Math.max(c - 1, 0));
+      else if (event.key === "y") void navigator.clipboard?.writeText(detail[detailCursor]?.value ?? "");
       return;
     }
     if (isEditableElement(event.target) && !(event.target as HTMLElement).closest(".composer")) {
@@ -1285,7 +1508,10 @@ export default function App() {
         break;
       }
       case "restart":
-        returnToStartScreen();
+        // `r` on an ended tab resets it to `NotStarted` IN PLACE (ruling 12): the tab keeps its
+        // number and its rename, and the `tabs` envelope that follows is what actually drops this
+        // render back to the empty tab -- there is no local start-screen reset any more.
+        post({ type: "reset_tab" });
         break;
       case "keymap":
         // Only ever reached with the overlay closed -- the `keymapOpen` branch above returns
@@ -1366,13 +1592,13 @@ export default function App() {
       <Row kind="error" sign="✗" role="alert">
         <strong>This session was lost. What is shown above may be incomplete.</strong>
         <pre>{state.status.reason}</pre>
-        {/* `r` is offered only on this banner and the one below, for returning to the start
-            screen -- see `onKeyDown`'s "restart" arm above and `resolveKey`'s `case "r"` in
-            `./keymap`, which is what actually enforces "only where the spec offers it". The mode
-            this hint is read in is always BROWSE: `resolveKey` refuses `i` once the session has
-            ended and the effect near the top of this component forces BROWSE if it died while
-            INPUT was active, so this sentence cannot be on screen in a mode that drops `r`. */}
-        <div className="row-hint">Press r to return to the start screen.</div>
+        {/* `r` is offered only on this banner and the one below, for resetting this tab -- see
+            `onKeyDown`'s "restart" arm above and `resolveKey`'s `case "r"` in `./keymap`, which is
+            what actually enforces "only where the spec offers it". The mode this hint is read in is
+            always BROWSE: `resolveKey` refuses `i` once the session has ended and the effect near
+            the top of this component forces BROWSE if it died while INPUT was active, so this
+            sentence cannot be on screen in a mode that drops `r`. */}
+        <div className="row-hint">Press r to start a new session here.</div>
       </Row>
     ) : state.status.kind === "closed" ? (
       // Deliberately NOT `row-error`/`✗`: an ordinary close (the host closed it, the provider
@@ -1381,7 +1607,7 @@ export default function App() {
       // fuller record of why these two were briefly unified and then split back apart.
       <Row kind="ended" sign="·">
         This session has ended ({state.status.reason}).
-        <div className="row-hint">Press r to return to the start screen.</div>
+        <div className="row-hint">Press r to start a new session here.</div>
       </Row>
     ) : null;
 
@@ -1398,14 +1624,24 @@ export default function App() {
         setEdgeFocused(stop !== null && stop.getAttribute("data-nav-stop") !== "row");
       }}
     >
-      <Winbar state={state} permissionMode={startedPermissionMode} />
+      {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
+        <TabBar
+          tabs={tabs.tabs}
+          active={tabs.active}
+          renaming={renaming}
+          onSelect={(tab) => postToRust({ type: "select_tab", request_id: nextRequestId(), tab })}
+          onRenameCommit={commitRename}
+          onRenameCancel={cancelRename}
+        />
+      )}
       {errorBanner}
       {/* `sessionEnded` makes every pending card inert. The cards themselves are NOT removed: a
           permission that was still open when the session died is real history, and deleting it
           would read as a resolution nobody made. */}
-      {/* The list and the `?` overlay share one positioned region, so the overlay covers the
-          conversation and nothing else -- the winbar and the status line are outside its box
-          rather than lifted back above it (review; see `.agent-ui-scroller` in index.css). */}
+      {/* The list, the `?` overlay and the detail popover share one positioned region, so either
+          overlay covers the conversation and nothing else -- the activity line, the status row and
+          the footer are outside its box rather than lifted back above it (review; see
+          `.agent-ui-scroller` in index.css). The tab bar (Task 11) goes above `errorBanner`. */}
       <div className="agent-ui-scroller">
         <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused && !edgeFocused} onAnswerPermission={answerPermission} />
         {keymapOpen && (
@@ -1417,36 +1653,16 @@ export default function App() {
             prefixLabel={keymapHelp.prefix}
           />
         )}
+        {detail !== null && (
+          <DetailPopover ref={detailRef} rows={detail} current={detailCursor} onClose={() => setDetail(null)} />
+        )}
+        {chooser !== null && (
+          <Chooser envelope={chooser} onSwitch={onChooserSwitch} onResume={onChooserResume} onCloseTab={onChooserCloseTab} onLeave={onChooserLeave} />
+        )}
       </div>
       {sessionEndedBanner}
       {commandNoticeBanner}
-      {/* Only in BROWSE (spec §2.1: INPUT is typing, HINT's labels take over, the start screen has
-          its own text) and only once no HINT labels are on screen -- `hints.length === 0` is the
-          same predicate `HintLayer` itself uses to decide whether it is drawing anything at all, so
-          this and the labels can never both claim the same space. */}
-      {mode === "browse" && hints.length === 0 && (
-        <WhichKey
-          // `edgeFocused` too: `onKeyDown`'s answer arm is gated on it, so with the keys on a
-          // banner or the status line `a`/`d` resolve to nothing and the strip must not offer them
-          // (review). Same argument as the strip's own rule about a dead session.
-          entries={stripEntries(timeline, answerableItems, cursor, sessionEnded || edgeFocused)}
-          focused={paneFocused}
-          prefix={gShown ? "g" : null}
-        />
-      )}
-      <StatusLine
-        mode={mode}
-        paneFocused={paneFocused}
-        state={state}
-        turnClock={turnClock}
-        position={{ index: cursor, total: timeline.length }}
-        // Stop is gated on the capability, never on the backend's name. Spec §3.4's Send/Stop pair
-        // leaving the composer is done in the same change as this StatusLine addition (see
-        // `Composer.tsx`): this is now the ONLY Stop control, for mouse users, since Enter alone
-        // sends from the keyboard and there is no other way to interrupt a turn without a keyboard.
-        canInterrupt={state.capabilities.interrupt}
-        onInterrupt={interrupt}
-      />
+      <ActivityLine state={state} turnClock={turnClock} canInterrupt={state.capabilities.interrupt} onInterrupt={interrupt} />
       <Composer
         // A dead session takes no more turns, and neither does one already being closed for a
         // terminal handoff. Without this, clearing `activeTurnId` on a lost session would have
@@ -1461,7 +1677,40 @@ export default function App() {
         hintTarget={!(turnInProgress || sessionEnded || handingOff)}
         onModeChange={setMode}
         onSend={sendMessage}
+        onDraftChange={(text) => (draftRef.current = text)}
       />
+      <StatusRow
+        text={statusRowText(state, { index: cursor, total: timeline.length })}
+        warning={statusWarning(state.provider, activeTab?.failure ?? null)}
+        onOpenDetail={() => post({ type: "open_detail" })}
+      />
+      <Footer mode={mode} paneFocused={paneFocused} pill={modePill(activeTab?.mode ?? "auto", true)}>
+        {/* The window-close prompt (ruling 7) takes the footer's third slot while it is open, the
+            same way tmux draws `confirm-before` in its status line -- in place of the which-key
+            strip, never alongside it. */}
+        {confirm !== null ? (
+          <span className="confirm-close" role="alertdialog">
+            {confirm.lines.join(" · ")}
+          </span>
+        ) : (
+          // Only in BROWSE (spec §2.1: INPUT is typing, HINT's labels take over, the start screen
+          // has its own text) and only once no HINT labels are on screen -- `hints.length === 0` is
+          // the same predicate `HintLayer` itself uses to decide whether it is drawing anything at
+          // all, so this and the labels can never both claim the same space.
+          mode === "browse" &&
+          hints.length === 0 && (
+            <WhichKey
+              // `edgeFocused` too: `onKeyDown`'s answer arm is gated on it, so with the keys on a
+              // banner or the status row `a`/`d` resolve to nothing and the strip must not offer
+              // them (review). Its own argument, not `sessionEnded`'s: passed as that, a live
+              // session's status row offered `r new session` (GUI pass, 2026-09-25).
+              entries={stripEntries(timeline, answerableItems, cursor, sessionEnded, edgeFocused)}
+              focused={paneFocused}
+              prefix={gShown ? "g" : null}
+            />
+          )
+        )}
+      </Footer>
       {/* Below the composer, deliberately: it is a way OUT of this panel, not one of the things the
           panel is for, and it must not compete with the lost-session banner for the space directly
           above the box. Offered for a session that has ENDED too -- continuing a conversation that

@@ -6,7 +6,7 @@ import { noteUserScroll } from "../follow";
 import { initialState } from "../reducer";
 import type { AgentUiState } from "../types";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
 beforeAll(() => {

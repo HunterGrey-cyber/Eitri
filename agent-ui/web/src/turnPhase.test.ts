@@ -131,7 +131,7 @@ describe("phaseOf", () => {
   it("an INTERRUPTED call does not claim 'running <Tool>' into the next turn", () => {
     // The shape the re-review reproduced. After an interrupt the model emits nothing further, so
     // no text ever lands after the call inside its own turn -- `lastMessageSeq` stays below it for
-    // good, and only the new prompt can displace it. `StatusLine` renders `running` from the
+    // good, and only the new prompt can displace it. `ActivityLine` renders `running` from the
     // instant `turn_started` lands, so without this the meter animates "running NotebookEdit" for
     // the whole round trip between Enter and the model's first delta -- naming a tool the user
     // personally stopped, in exactly the window `sent` exists to name.

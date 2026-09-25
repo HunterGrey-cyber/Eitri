@@ -126,6 +126,8 @@ struct IngestState {
     /// start of the first turn), else into the record once `record_written` says it exists. See
     /// `ConversationIngest::note_title`.
     pending_title: Option<String>,
+    /// A rename not yet written; the outer `Option` says whether there is one.
+    pending_name: Option<Option<String>>,
     /// Whether this session's record is on disk. NOT the same moment as `provider_session_id`
     /// becoming `Some`: adoption sets the id under the lock and writes the record after releasing
     /// it, and a title written into that gap found no record and was lost (review of `7fb787b`,
@@ -263,6 +265,7 @@ impl ConversationIngest {
             resume_outcome: None,
             stats: IngestStats::default(),
             pending_title: None,
+            pending_name: None,
             record_written,
             history_dirty: false,
         }));
@@ -320,6 +323,12 @@ impl ConversationIngest {
         self.state.lock().unwrap().pending_title.get_or_insert(title);
     }
 
+    /// Keeps a rename (`prefix ,`) for the ingestion thread to write. The last one noted wins,
+    /// unlike `note_title`'s first-wins: `None` clears it. Nothing here touches the disk.
+    pub(crate) fn note_name(&self, name: Option<String>) {
+        self.state.lock().unwrap().pending_name = Some(name);
+    }
+
     /// The provider's resume verdict, once it has stated one.
     pub fn resume_outcome(&self) -> Option<ResumeOutcomeRecord> {
         self.state.lock().unwrap().resume_outcome.clone()
@@ -371,6 +380,7 @@ fn ingest_loop(
         let events = provider.pump();
         // Before the idle check, so a title noted while the provider is quiet still gets written.
         flush_title(&state, &context);
+        flush_name(&state, &context);
         // Likewise: the turn whose completion marked the history dirty is usually the last event of
         // a quiet stretch, so waiting for the next non-empty pump would delay every write.
         flush_history(&state, &context);
@@ -383,6 +393,7 @@ fn ingest_loop(
         // duration.
         let mut adopt: Option<String> = None;
         let mut title: Option<String> = None;
+        let mut name: Option<Option<String>> = None;
         {
             let mut guard = state.lock().unwrap();
             for event in events {
@@ -400,6 +411,8 @@ fn ingest_loop(
                         // noted after it waits in `pending_title` until `record_written`, and
                         // `flush_title` writes it then.
                         title = guard.pending_title.take();
+                        // Same shape for a rename noted before adoption.
+                        name = guard.pending_name.take();
                     }
                     guard.provider_session_id = Some(provider_session_id.clone());
                 }
@@ -407,7 +420,7 @@ fn ingest_loop(
             }
         }
         if let Some(provider_session_id) = adopt {
-            let lease = adopt_provider_session(&context, &provider_session_id, title.as_deref());
+            let lease = adopt_provider_session(&context, &provider_session_id, title.as_deref(), name);
             let mut guard = state.lock().unwrap();
             guard.lease = lease;
             guard.record_written = true;
@@ -434,6 +447,27 @@ fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
     };
     if let Err(e) = crate::persistence::set_title_if_missing(&context.conversation_id, &provider_session_id, &title) {
         eprintln!("agent: could not record the title of session {provider_session_id}: {e}");
+    }
+}
+
+/// Writes a rename noted after this session's record was written. The same two gates as
+/// `flush_title`: the record is on disk, and the Claude id is known.
+fn flush_name(state: &Mutex<IngestState>, context: &AdoptionContext) {
+    let (name, provider_session_id) = {
+        let mut guard = state.lock().unwrap();
+        if !guard.record_written {
+            return;
+        }
+        let Some(name) = guard.pending_name.take() else {
+            return;
+        };
+        let Some(id) = guard.provider_session_id.clone() else {
+            return;
+        };
+        (name, id)
+    };
+    if let Err(e) = crate::persistence::set_name(&context.conversation_id, &provider_session_id, name.as_deref()) {
+        eprintln!("agent: could not record the name of session {provider_session_id}: {e}");
     }
 }
 
@@ -502,6 +536,7 @@ fn adopt_provider_session(
     context: &AdoptionContext,
     provider_session_id: &str,
     title: Option<&str>,
+    name: Option<Option<String>>,
 ) -> Option<SessionLease> {
     let lease = match SessionLease::try_acquire(
         crate::conversation::PROVIDER_NAME,
@@ -533,6 +568,9 @@ fn adopt_provider_session(
         provider_session_id,
         context.provider_advertises_resume,
         title,
+        &name
+            .map(crate::persistence::NameUpdate::Set)
+            .unwrap_or(crate::persistence::NameUpdate::Keep),
     );
     lease
 }
@@ -654,6 +692,7 @@ pub(crate) mod tests {
             resume_outcome: None,
             stats: IngestStats::default(),
             pending_title: None,
+            pending_name: None,
             record_written: false,
             history_dirty: false,
         }

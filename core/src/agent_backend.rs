@@ -466,6 +466,14 @@ impl AgentBackend {
         }
     }
 
+    /// A session tab's rename (spec §3.5). Legacy writes no records, so its name lives only in the
+    /// tab (`crate::tab_set`).
+    pub fn note_name(&mut self, name: Option<String>) {
+        if let AgentBackend::Sidecar(conversation) = self {
+            conversation.note_name(name);
+        }
+    }
+
     pub fn interrupt(&mut self) -> Result<Vec<AgentDomainEvent>, BackendError> {
         match self {
             AgentBackend::Legacy(session) => Ok(session.interrupt()?),
@@ -827,6 +835,7 @@ mod tests {
     }
     use super::*;
     use crate::editor_context::{EditorContext, Selection};
+    use crate::test_providers::RecordingProvider;
 
     #[test]
     fn backend_kind_round_trips_its_wire_name() {
@@ -975,6 +984,7 @@ mod tests {
             updated_at: "2000".into(),
             provider_advertised_resume: true,
             title: None,
+            name: None,
         })
         .expect("writing a record into the test state root should succeed");
         dir
@@ -1061,6 +1071,7 @@ mod tests {
             updated_at: "2000".into(),
             provider_advertised_resume: true,
             title: recorded_title.map(str::to_owned),
+            name: None,
         })
         .expect("writing a record into the test state root should succeed");
         if let Some(ai_title) = ai_title {
@@ -1400,59 +1411,45 @@ mod tests {
         assert_eq!(record.title.as_deref(), Some("fix the picker"));
     }
 
+    /// Spec §3.5: a tab renamed before its session existed gets the name into the record adoption
+    /// writes; a rename after that is written into the record by the ingestion thread.
+    #[test]
+    fn a_rename_reaches_the_record_before_and_after_adoption() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("name-before-adoption");
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Bypass).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let conversation_id = backend.conversation_id().unwrap().to_string();
+
+        backend.note_name(Some("docs".into()));
+        provider.queue(AgentDomainEvent::SessionOpened {
+            session_id: "fake-session".into(),
+            provider_session_id: "claude-named".into(),
+            model: "m".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+        });
+        let wait_for = |want: Option<&str>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(record) = agent::persistence::load_conversation_record(&conversation_id, "claude-named") {
+                    if record.name.as_deref() == want {
+                        return;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "the record never said {want:?}");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        wait_for(Some("docs"));
+        backend.note_name(Some("docs v2".into()));
+        wait_for(Some("docs v2"));
+        backend.note_name(None);
+        wait_for(None);
+        backend.shutdown();
+    }
+
     // ---- The permission policy, wired through the one point both backends converge on ---------
-
-    /// A provider that queues whatever events a test wants and records every resolution it is
-    /// handed. The twin of `RejectingProvider` above, for the opposite question: that one exists to
-    /// make a send fail, this one to see what the host answered.
-    #[derive(Default)]
-    struct RecordingProvider {
-        queued: std::sync::Mutex<Vec<AgentDomainEvent>>,
-        resolved: std::sync::Mutex<Vec<(String, bool)>>,
-    }
-
-    impl RecordingProvider {
-        fn queue(&self, event: AgentDomainEvent) {
-            self.queued.lock().unwrap().push(event);
-        }
-        fn resolutions(&self) -> Vec<(String, bool)> {
-            self.resolved.lock().unwrap().clone()
-        }
-    }
-
-    impl agent::AgentProvider for RecordingProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities::default()
-        }
-        fn info(&self) -> ProviderInfo {
-            ProviderInfo::default()
-        }
-        fn create_session(&self, _request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
-            Ok("fake-session".into())
-        }
-        fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
-            Err(agent::ProviderError::UnsupportedCapability("resume"))
-        }
-        fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
-            Ok("turn-1".into())
-        }
-        fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
-            Ok(())
-        }
-        fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
-            self.resolved
-                .lock()
-                .unwrap()
-                .push((request.permission_id, request.decision.allows()));
-            Ok(())
-        }
-        fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
-            Ok(())
-        }
-        fn pump(&self) -> Vec<AgentDomainEvent> {
-            std::mem::take(&mut *self.queued.lock().unwrap())
-        }
-    }
 
     /// A real workspace with a real file in it, because the policy's path branch canonicalizes for
     /// real -- a fabricated root would make "inside the project" and "does not exist" the same

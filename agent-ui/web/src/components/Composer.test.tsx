@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { Composer } from "./Composer";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
 type Overrides = Partial<Parameters<typeof Composer>[0]>;
@@ -93,9 +93,10 @@ describe("Composer sending", () => {
 
 // Send and Stop buttons were removed from the composer entirely (spec §3.4, panel-as-document
 // task 6 fix round 1): Enter still sends and Shift+Enter still inserts a newline (both pinned
-// above), and Stop now lives only in `StatusLine`, for mouse users -- see `StatusLine.test.tsx`'s
-// own "offers a clickable Stop..." test for that half, gated the same way this one used to be, on
-// the provider's advertised `interrupt` capability rather than the backend's name.
+// above), and Stop now lives only in `ActivityLine` (V2, session tabs Task 10; formerly
+// `StatusLine`), for mouse users -- see `ActivityLine.test.tsx`'s own "shows the turn's motion and
+// Stop..." test for that half, gated the same way this one used to be, on the provider's
+// advertised `interrupt` capability rather than the backend's name.
 
 describe("Composer on a session that has ended", () => {
   it("says the session ended rather than inviting a turn that cannot be taken", () => {

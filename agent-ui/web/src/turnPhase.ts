@@ -3,8 +3,8 @@ import type { AgentUiState } from "./types";
 /**
  * What the agent is doing right now, for the in-flight motion indicator
  * (`2026-09-20-in-flight-motion-design.md`). Five phases, read off `AgentUiState` alone -- this is
- * a pure function, called only while `StatusLine`'s own `working` predicate (`status.kind ===
- * "running" && activeTurnId !== null`) is true.
+ * a pure function, called only while `ActivityLine`'s own `working` predicate (`status.kind ===
+ * "running" && activeTurnId !== null`) is true (V2, session tabs Task 10; formerly `StatusLine`).
  *
  * `blocked` is not a variant of "in flight": while a permission card is up the agent is not
  * working, the user is, and the caller must not render the meter for it (design §2, §5.1).
@@ -73,7 +73,7 @@ export type TurnPhase =
  * is the opposite: `toolCalls` is never cleared between turns, and the two shapes that leave
  * `result: null` FOREVER -- an interrupt, and a denial -- would otherwise carry their call into the
  * next turn as "the newest unfinished call" with nothing able to displace it, because a prompt is
- * not text and the interrupted model emits no further delta. `StatusLine` renders `running` from
+ * not text and the interrupted model emits no further delta. `ActivityLine` renders `running` from
  * the instant `turn_started` lands, so that stale call would animate for the whole round trip
  * between Enter and the model's first delta -- naming a tool the user had just stopped or refused,
  * in exactly the window `sent` exists to name. Reproduced by the re-review of 2026-09-20; the

@@ -251,6 +251,7 @@ pub(crate) fn persist_record(
     provider_session_id: &str,
     provider_advertised_resume: bool,
     title: Option<&str>,
+    name: &crate::persistence::NameUpdate,
 ) {
     let now = epoch_millis();
     // Preserve the original `created_at` when a record already exists: this runs again on every
@@ -269,6 +270,10 @@ pub(crate) fn persist_record(
         .as_ref()
         .map(|r| r.created_at.clone())
         .unwrap_or_else(|| now.clone());
+    let name = match name {
+        crate::persistence::NameUpdate::Set(name) => name.clone(),
+        crate::persistence::NameUpdate::Keep => existing.as_ref().and_then(|r| r.name.clone()),
+    };
     let title = existing.and_then(|r| r.title).or_else(|| title.map(str::to_string));
     let record = ConversationRecord {
         conversation_id: conversation_id.to_string(),
@@ -279,6 +284,7 @@ pub(crate) fn persist_record(
         updated_at: now,
         provider_advertised_resume,
         title,
+        name,
     };
     if let Err(e) = save_conversation_record(&record) {
         eprintln!("agent: could not persist the conversation record for {conversation_id}: {e}");
@@ -525,6 +531,7 @@ impl AgentConversation {
             provider_session_id,
             capabilities.resume,
             None,
+            &crate::persistence::NameUpdate::Keep,
         );
         Ok(conversation)
     }
@@ -715,6 +722,13 @@ impl AgentConversation {
         };
         self.title_noted = true;
         self.ingest.note_title(title);
+    }
+
+    /// The session tab was renamed (`prefix ,`). Handed to the ingestion thread, which writes it
+    /// into the record adoption writes, or into the record once it exists (`flush_name`). The last
+    /// one wins; `None` clears it.
+    pub fn note_name(&mut self, name: Option<String>) {
+        self.ingest.note_name(name);
     }
 
     /// Cancels the in-flight turn. Does not end the session -- a real interrupt is followed by a

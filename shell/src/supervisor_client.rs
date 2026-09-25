@@ -12,10 +12,28 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 
+/// One status per window, now that a window holds several sessions (session tabs spec §3.7,
+/// ruling 19): the most urgent tab's. Per-tab rows in the dashboard are a follow-on.
+pub(crate) fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
+    fn rank(status: AgentStatus) -> u8 {
+        match status {
+            AgentStatus::Blocked => 4,
+            AgentStatus::Working => 3,
+            AgentStatus::Idle => 2,
+            AgentStatus::Done => 1,
+            AgentStatus::NoSession => 0,
+        }
+    }
+    statuses
+        .into_iter()
+        .max_by_key(|s| rank(*s))
+        .unwrap_or(AgentStatus::NoSession)
+}
+
 /// The pure mapping from spec §4's table -- checked in the exact stated order. Takes
-/// `Option<&AgentSessionProjection>` rather than the state directly because `shell`'s own
-/// `AgentPanelState.session` is itself an `Option<AgentSession>` before the user leaves the mode
-/// selector; `None` here means exactly that (spec's `no_session` row).
+/// `Option<&AgentSessionProjection>` rather than the state directly because a session tab has no
+/// backend until its first send or resume (and none once it failed); `None` here means exactly
+/// that (spec's `no_session` row). One call per tab; `aggregate_status` picks the window's.
 pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
     let Some(projection) = projection else {
         return AgentStatus::NoSession;
@@ -335,6 +353,17 @@ mod tests {
             status: ProjectionStatus::Running,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_windows_status_is_its_most_urgent_tabs() {
+        use AgentStatus::*;
+        assert_eq!(aggregate_status([Idle, Blocked, Working]), Blocked, "needs input first");
+        assert_eq!(aggregate_status([Idle, Working, Done]), Working);
+        assert_eq!(aggregate_status([Done, Idle]), Idle);
+        assert_eq!(aggregate_status([NoSession, Done]), Done);
+        assert_eq!(aggregate_status([NoSession]), NoSession);
+        assert_eq!(aggregate_status([]), NoSession);
     }
 
     #[test]

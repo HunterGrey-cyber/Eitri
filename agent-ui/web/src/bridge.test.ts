@@ -30,8 +30,8 @@ describe("installDispatch", () => {
     const handler = vi.fn();
     installDispatch(handler);
     const events = [{ type: "turn_started", turn_id: "t1" }];
-    window.__neovibeDispatch!(JSON.stringify({ kind: "events", fromRevision: 3, throughRevision: 4, events }));
-    expect(handler).toHaveBeenCalledWith({ kind: "events", fromRevision: 3, throughRevision: 4, events });
+    window.__neovibeDispatch!(JSON.stringify({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events }));
+    expect(handler).toHaveBeenCalledWith({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events });
   });
 
   it("demuxes a snapshot envelope", () => {
@@ -41,8 +41,8 @@ describe("installDispatch", () => {
       sessionId: "abc", model: "m", cwd: "/tmp", transcript: [], toolCalls: [],
       status: { kind: "running" }, activeTurnId: null, pendingPermissions: [],
     };
-    window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", throughRevision: 7, state }));
-    expect(handler).toHaveBeenCalledWith({ kind: "snapshot", throughRevision: 7, state });
+    window.__neovibeDispatch!(JSON.stringify({ kind: "snapshot", tab: 1, throughRevision: 7, state }));
+    expect(handler).toHaveBeenCalledWith({ kind: "snapshot", tab: 1, throughRevision: 7, state });
   });
 
   /* The `handoff` envelope has to survive the kind whitelist: an envelope kind this build does not
@@ -53,6 +53,7 @@ describe("installDispatch", () => {
     installDispatch(handler);
     const envelope = {
       kind: "handoff",
+      tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
@@ -103,8 +104,17 @@ describe("installDispatch", () => {
   it("demuxes an error envelope", () => {
     const handler = vi.fn();
     installDispatch(handler);
-    window.__neovibeDispatch!(JSON.stringify({ kind: "error", message: "boom" }));
-    expect(handler).toHaveBeenCalledWith({ kind: "error", message: "boom" });
+    window.__neovibeDispatch!(JSON.stringify({ kind: "error", tab: 1, message: "boom" }));
+    expect(handler).toHaveBeenCalledWith({ kind: "error", tab: 1, message: "boom" });
+  });
+
+  it("accepts the five tab envelopes", () => {
+    const seen: string[] = [];
+    installDispatch((p) => seen.push(p.kind));
+    for (const kind of ["tabs", "tab_detail", "chooser", "confirm_close", "begin_rename"]) {
+      window.__neovibeDispatch!(JSON.stringify({ kind, tab: 1, active: 1, tabs: [], rows: [], launch: false, open: [], records: [], lines: [], current: null }));
+    }
+    expect(seen).toEqual(["tabs", "tab_detail", "chooser", "confirm_close", "begin_rename"]);
   });
 
   it("warns and does not throw on an unrecognized envelope kind", () => {

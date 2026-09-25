@@ -1,12 +1,16 @@
 //! The real agent-ui panel: a `WebView` hosting the embedded `agent-ui/web` frontend, a
-//! `UserContentManager` script-message bridge (JS -> Rust), and a fast poll of the backend's
-//! `pump()` pushed to the page via `evaluate_javascript` (Rust -> JS). See
-//! docs/superpowers/specs/2026-09-07-agent-ui-design.md.
+//! `UserContentManager` script-message bridge (JS -> Rust), and a fast poll of every tab's backend
+//! pushed to the page via `evaluate_javascript` (Rust -> JS). See
+//! docs/superpowers/specs/2026-09-07-agent-ui-design.md and, for the tabs,
+//! docs/superpowers/specs/2026-09-25-keymap-tabs-panel-design.md §3.
 //!
-//! Backend construction is lazy: this module starts with `None` and only builds one once the
-//! frontend sends `"start_session"` -- `PermissionMode` is a construction-time-only choice on the
-//! real `agent` API (no live mode-switch exists), so the frontend must choose before any real
-//! subprocess is spawned. Which backend gets built is `neovibe_core::agent_backend`'s decision.
+//! **One backend per tab** (session tabs spec §3.1). The tabs themselves live in
+//! `neovibe_core::tab_set::TabSet`; this module spawns the workers that set only holds receivers
+//! for, drains every tab on one 33 ms tick, and routes each inbound command to the tab it names --
+//! never to "the active one" (spec §3.8 point 2). Backend construction is lazy per tab: an empty
+//! tab starts its backend on its first `send_message` (or a `resume`), with that tab's own mode --
+//! `PermissionMode` is a construction-time-only choice on the real `agent` API (no live mode-switch
+//! exists). Which backend gets built is `neovibe_core::agent_backend`'s decision.
 //!
 //! **State is server-originated.** For the sidecar backend this module folds nothing of its own:
 //! `active_turn_id`, tool calls and permissions all arrive as real events through `pump()`. A
@@ -14,17 +18,21 @@
 //! synthesizes an optimistic `TurnStarted` to make the UI feel faster -- doing so would put the
 //! panel's idea of "a turn is running" ahead of the server's, which is the exact shadow state the
 //! runtime design forbids.
+//!
+//! **The WebView draws only the active tab.** A background tab's events feed its attention and mark
+//! it stale (`TabSet::pump`); a switch always sends the new active tab's full snapshot.
 
-use agent::UiDelivery;
 use gtk4::prelude::*;
 use gtk4::Application;
-use neovibe_core::agent_backend::{AgentBackend, BackendGreeting, BackendKind};
+use neovibe_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
-    serialize_hello_for_js, serialize_snapshot_for_js, InboundMessage, SnapshotView,
+    serialize_hello_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage, SessionModeChoice,
 };
+use neovibe_core::tab_set::{FirstTurn, PendingHandoff, PendingStart, ResumeRoute, StartCollected, Tab, TabBackend};
+use neovibe_core::tabs::TabId;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use webkit6::prelude::*;
@@ -52,7 +60,9 @@ const PUMP_POLL_INTERVAL_MS: u64 = 33;
 /// `AgentPanelHandle::shutdown`'s handoff branch says what expiring costs.
 const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The backstop on a backend this panel is tearing down itself, once the window is gone.
+/// The backstop on a backend this panel is tearing down itself, once the window is gone. Since
+/// session tabs it bounds every tab's teardown at once: they run in parallel, one worker each, under
+/// this one span (`tear_down_all_holding_the_application`).
 ///
 /// **Nothing waits on this. No thread blocks on it at all, and the GTK main loop least of all.**
 /// It is a deadline observed by a `CLOSE_WATCH_POLL` tick on the main loop (`close_watch_step`),
@@ -231,6 +241,162 @@ fn tear_down_holding_the_application(app: &Application, what: &'static str, mut 
     watch_off_the_main_loop(app, what, closed_rx, SESSION_CLOSE_BACKSTOP, |()| {});
 }
 
+/// Every tab's backend at once, one worker each, under ONE backstop (spec §3.5 risk): serial
+/// sidecar `CloseSession`s are bounded at 10 s each, so N tabs torn down in turn could outlive any
+/// backstop. The workers report to a collector, which reports once to the watch.
+///
+/// Each worker drops its backend before it reports, for the reason
+/// `tear_down_holding_the_application` gives: on the sidecar path the drop is where the child dies.
+fn tear_down_all_holding_the_application(app: &Application, what: &'static str, backends: Vec<AgentBackend>) {
+    if backends.is_empty() {
+        return;
+    }
+    let expected = backends.len();
+    let (each_tx, each_rx) = mpsc::channel();
+    for mut backend in backends {
+        let tx = each_tx.clone();
+        std::thread::spawn(move || {
+            backend.shutdown();
+            drop(backend);
+            let _ = tx.send(());
+        });
+    }
+    drop(each_tx);
+    let (all_tx, all_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = all_tx.send(collect_reports(each_rx, expected));
+    });
+    watch_off_the_main_loop(app, what, all_rx, SESSION_CLOSE_BACKSTOP, move |finished| {
+        if finished < expected {
+            eprintln!(
+                "[agent_panel] {what}: {} of {expected} workers died without reporting",
+                expected - finished
+            );
+        }
+    });
+}
+
+/// A connect still running when the window closed -- a tab's, or a closed tab's (`Retiring`). A
+/// connect, not a teardown: see `CONNECT_CLOSE_BACKSTOP`. A backend that finishes after the process
+/// is gone is exactly the orphan `AgentPanelHandle::shutdown` exists to prevent, so one that
+/// finishes inside the backstop is torn down, held and bounded like the installed sessions: its
+/// shutdown reaches the same ingestion-thread join.
+fn watch_connect_holding_the_application(app: &Application, rx: mpsc::Receiver<Result<AgentBackend, BackendError>>) {
+    let app_for_teardown = app.clone();
+    watch_off_the_main_loop(
+        app,
+        "a connect that was still running",
+        rx,
+        CONNECT_CLOSE_BACKSTOP,
+        move |result| match result {
+            Ok(backend) => {
+                eprintln!("[agent_panel] window closed mid-connect; shutting down the backend that finished anyway");
+                tear_down_holding_the_application(&app_for_teardown, "a backend that finished mid-connect", backend);
+            }
+            Err(e) => eprintln!(
+                "[agent_panel] window closed mid-connect; the backend had already failed: {}",
+                e.message
+            ),
+        },
+    );
+}
+
+/// Waits for `expected` teardown workers' reports and says how many arrived. A worker that died
+/// drops its sender without one; once every sender is gone `recv` fails and this returns.
+fn collect_reports(rx: mpsc::Receiver<()>, expected: usize) -> usize {
+    let mut finished = 0;
+    while finished < expected {
+        match rx.recv() {
+            Ok(()) => finished += 1,
+            Err(_) => break,
+        }
+    }
+    finished
+}
+
+/// What tabs that left while the window stays open are still doing: a backend being shut down on
+/// a worker, or a connect that has not finished (a closed tab, `r` reset, a fatal command, a
+/// session that never opened).
+///
+/// **Held in panel state so the window-close backstop sees it** (the session-tabs whole-branch
+/// review). These used to run on bare threads nobody recorded, so a window closed a few seconds
+/// after `prefix &` y let `Application::run` return with the worker halfway through `shutdown()`:
+/// `SpawnedSidecar::drop` never ran and the sidecar outlived the process, and a connect finishing
+/// later was never shut down at all. `AgentPanelHandle::shutdown` now watches every entry here under
+/// the same holds and backstops as the tabs it takes; the pump forgets an entry once it finishes.
+#[derive(Default)]
+struct Retiring {
+    /// Connects of tabs that are gone. Whatever one produces is shut down (`poll`).
+    connects: Vec<mpsc::Receiver<Result<AgentBackend, BackendError>>>,
+    /// One per teardown worker, sent after the backend was shut down AND dropped -- the drop is
+    /// where the sidecar child actually dies. A worker that panicked drops its sender instead.
+    teardowns: Vec<mpsc::Receiver<()>>,
+}
+
+impl Retiring {
+    /// One backend, shut down and dropped on a worker thread, never on the GTK main loop (the same
+    /// reasons as `tear_down_holding_the_application`).
+    fn backend(&mut self, mut backend: AgentBackend) {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            backend.shutdown();
+            drop(backend);
+            let _ = done_tx.send(());
+        });
+        self.teardowns.push(done_rx);
+    }
+
+    /// A tab removed from the set: its backend is shut down, its connect is waited for, and a
+    /// handoff's own worker (which already owns that backend) is waited for too. Returns the
+    /// requests the tab still owed a `command_result`, for the caller to refuse -- a connect's
+    /// `send_message`/`resume`, and a handoff's `handoff_to_terminal`. The record is never deleted
+    /// (spec §3.5).
+    fn tab(&mut self, tab: Tab) -> Vec<String> {
+        let mut owed = Vec::new();
+        if let Some(handoff) = tab.pending_handoff {
+            owed.push(handoff.request_id);
+            self.teardowns.push(handoff.dropped_rx);
+        }
+        match tab.backend {
+            TabBackend::Live(backend) => self.backend(backend),
+            TabBackend::Starting(pending) => {
+                owed.push(pending.request_id);
+                self.connects.push(pending.result_rx);
+            }
+            TabBackend::NotStarted | TabBackend::Failed { .. } => {}
+        }
+        owed
+    }
+
+    /// Each tick: a connect that finished has its backend shut down; a teardown that reported, or
+    /// whose worker died, is forgotten. `try_recv` only -- this runs on the GTK main loop.
+    fn poll(&mut self) {
+        let mut finished = Vec::new();
+        self.connects.retain(|rx| match rx.try_recv() {
+            Ok(Ok(backend)) => {
+                finished.push(backend);
+                false
+            }
+            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Empty) => true,
+        });
+        for backend in finished {
+            eprintln!("[agent_panel] a closed tab's connect finished; shutting its backend down");
+            self.backend(backend);
+        }
+        self.teardowns
+            .retain(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.connects.is_empty() && self.teardowns.is_empty()
+    }
+}
+
+/// What a command still owed by a tab that was closed is answered with.
+const TAB_CLOSED_MESSAGE: &str = "the tab was closed before this finished";
+
 /// What the frontend is told when the close worker died inside `shutdown()`. One constant because
 /// it is both logged and dispatched, and the two drifting apart would make a log line unmatchable
 /// to what the user saw.
@@ -249,9 +415,17 @@ pub(crate) enum HintInbound {
 }
 
 struct AgentPanelState {
-    session: Option<AgentBackend>,
+    /// Every tab and which is active (session tabs spec §3.1). Rust owns the tabs; the WebView
+    /// draws the active one.
+    tabs: neovibe_core::tab_set::TabSet,
     backend_kind: BackendKind,
     project_dir: PathBuf,
+    /// `project_dir.canonicalize()`, read once: the `canonical_cwd` a session lease is keyed on
+    /// (`agent::lease::SessionLease::is_held`), for resume routing and the chooser.
+    canonical_project_dir: String,
+    /// `$XDG_STATE_HOME/neovibe/agent`, where the remembered mode is written (Task 3). `None`
+    /// with no state directory.
+    prefs_dir: Option<PathBuf>,
     /// Where the user is, asked for at send time. Never stored across turns: what the editor was
     /// showing when the LAST turn went out is not context, it is a stale claim, and the composer
     /// has no way to tell the model which it is.
@@ -261,9 +435,6 @@ struct AgentPanelState {
     /// it into `supervisor` above. A window that spawns the supervisor cannot connect to it
     /// synchronously -- see `PendingSupervisor` for the failure that taught us that.
     supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
-    /// Set once a start-failure has been reported, so the 33ms tick reports it exactly once rather
-    /// than every tick for as long as the dead session is installed.
-    reported_start_failure: bool,
     /// Set by `AgentPanelHandle::shutdown`, i.e. only on the window-close path, and never cleared.
     ///
     /// **It exists because the main loop now outlives the window.** `shutdown` holds the
@@ -272,32 +443,10 @@ struct AgentPanelState {
     /// afterwards -- against a destroyed window and a `WebView` that is no longer in a widget
     /// tree. The pump reads this and stops; `poll_activate` reads it and stops answering, because
     /// its caller's reaction is `window.present()` on a window GTK has already destroyed.
+    ///
+    /// **Also the guard on the tab set:** `shutdown` empties it with `TabSet::take_all`, after which
+    /// `active_tab()` would panic, so every path that reaches the set checks this first.
     shutting_down: bool,
-    /// Set while a backend is being constructed on a worker thread. Holds the requestId whose
-    /// `command_result` is owed once that finishes -- the reply is deferred, not dropped, which is
-    /// exactly what a requestId-addressed protocol is for.
-    pending_start: Option<PendingStart>,
-    /// Set while a "continue in a terminal" handoff is closing the session on a worker thread.
-    /// Holds the command that is owed to the frontend once that close has actually finished.
-    pending_handoff: Option<PendingHandoff>,
-    /// The last handoff command this panel produced, kept in the Rust host rather than only in the
-    /// WebView's React state.
-    ///
-    /// **This is the reason a reload cannot destroy it.** The panel ships a real reload affordance
-    /// (`app.reload-agent-panel`, `prefix r` and the top bar's `⟳`) that throws the document
-    /// away on purpose, and the frontend's copy goes with it. On the default `legacy` backend the
-    /// provider session id is then recoverable from nowhere at all: no `ConversationRecord` is
-    /// written for that backend and `BackendGreeting::for_kind` returns `resumable: None` for it, so
-    /// the only surviving copy of the id would have been a React `useState`. Holding it here is the
-    /// project's own stated invariant -- agent state lives in the Rust host so the WebView can
-    /// reload or crash without losing it -- applied to the one value this feature produces.
-    ///
-    /// Cleared when a new session is actually installed, not when one is merely requested: a start
-    /// that fails must leave the previous conversation's command still recoverable.
-    last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
-    /// The in-flight turn's latency marks, when `NEOVIBE_AGENT_TRACE=1`. `None` the rest of the
-    /// time, which is every normal run -- this is a diagnostic, not a metrics pipeline.
-    turn_trace: Option<neovibe_core::turn_trace::TurnTrace>,
     /// The panel's current theme. Starts on `ThemeTokens::fallback()` and is replaced by
     /// `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
@@ -316,50 +465,26 @@ struct AgentPanelState {
     /// rather than a plain closure field because the hook must be cloned out of the borrow before
     /// being called -- see `handle_inbound_message`'s HintRequest/HintTargets arms for why.
     hint_hook: Option<Rc<dyn Fn(HintInbound)>>,
-    /// What the chat owes the user while it is not on screen (modules P2): the permission cards it
-    /// holds and whether a turn finished unseen. Fed by the pump, which runs whether or not the
-    /// panel is on screen; see `neovibe_core::attention` for why it counts deliveries.
-    attention: neovibe_core::attention::AttentionTracker,
-    /// Told whenever `attention` changes, with the value before and after: the tray's `agent ⚑N`,
-    /// the toast, `on_permission`.
+    /// Told whenever the window's attention (every tab's, summed: `TabSet::attention`) changes,
+    /// with the value before and after: the tray's `agent ⚑N`, the toast, `on_permission`.
     attention_hook: Option<AttentionHook>,
+    /// The last `tabs` envelope sent, so the tick sends one only when it changed.
+    last_tabs_payload: Option<String>,
+    /// The open provider sessions `hello` was last computed against (ruling 17).
+    last_open_ids: Vec<String>,
+    /// D10 / ruling 16: `main.rs` says whether the chat is on screen at launch; consumed by the
+    /// first `ready` of the process.
+    launch_chooser_allowed: bool,
+    launch_chooser_done: bool,
+    launch_chooser_hook: Option<Rc<dyn Fn()>>,
+    chooser_closed_hook: Option<Rc<dyn Fn(bool)>>,
+    /// Teardowns and connects of tabs that left while the window stays open, so the window-close
+    /// backstop covers them too. See [`Retiring`].
+    retiring: Retiring,
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
 type AttentionHook = Rc<dyn Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention)>;
-
-/// An in-flight backend construction. Constructing a sidecar backend spawns a real process, does a
-/// real gRPC handshake, and on a cold Verdandi checkout runs `npm ci` + `npm run build` -- minutes
-/// of blocking work. Doing that on the GTK main loop would freeze the whole editor, so it happens
-/// on a worker thread and the result is collected by a poll on the main loop.
-struct PendingStart {
-    request_id: String,
-    result_rx: mpsc::Receiver<Result<AgentBackend, neovibe_core::agent_backend::BackendError>>,
-}
-
-/// A handoff whose session close is still running on a worker thread.
-///
-/// The command is built BEFORE the session is taken -- it is derived from the session's own state,
-/// which stops being readable the moment ownership moves to the worker -- and dispatched only after
-/// `closed_rx` reports. That ordering is the whole reason this struct exists rather than a straight
-/// reply: design doc §8.3 requires the session to be closed and flushed before the CLI starts, and
-/// the user cannot start it before they have seen the command.
-///
-/// Closing runs off the GTK main loop for the same reason every other teardown here does: the
-/// sidecar path's `close_session` is a unary RPC bounded at 10s, and blocking the main loop on it
-/// would freeze the editor pane too.
-struct PendingHandoff {
-    request_id: String,
-    command: agent::handoff::ClaudeResumeCommand,
-    /// Reports when `AgentBackend::shutdown()` RETURNED, which is what the command waits on.
-    closed_rx: mpsc::Receiver<()>,
-    /// Reports when the backend has also been DROPPED -- on the sidecar path that is the child's
-    /// actual death (`SpawnedSidecar::drop`), which `shutdown()` does not perform. Read only by
-    /// `AgentPanelHandle::shutdown`, which holds the application until it arrives; the ordinary
-    /// path ignores it and it is dropped with the rest of this struct when the command is
-    /// dispatched, at which point the worker's send simply fails.
-    dropped_rx: mpsc::Receiver<()>,
-}
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
 /// so a real window close can shut down whatever `AgentSession` exists -- without this, the
@@ -376,23 +501,26 @@ pub(crate) struct AgentPanelHandle {
 }
 
 impl AgentPanelHandle {
-    /// Shuts down whatever backend exists, INCLUDING one still being constructed on a worker thread.
+    /// Shuts down every tab's backend, INCLUDING one still being constructed on a worker thread,
+    /// all of them in parallel under one backstop.
     ///
     /// The in-flight case is not hypothetical: since construction moved off the GTK main loop, a
-    /// window closed during the connect leaves a fully-built backend -- a live sidecar process and a
-    /// Tokio runtime thread -- owned by nothing but a channel nobody will ever read. Before that
-    /// move, GTK's single thread made the window impossible to close while a backend existed outside
-    /// `state.session`.
+    /// window closed during a connect leaves a fully-built backend -- a live sidecar process and a
+    /// Tokio runtime thread -- owned by nothing but a channel nobody will ever read.
     ///
-    /// Taking `pending_start` is load-bearing twice over: it lets a backend that already finished be
-    /// shut down properly, and it makes any later `collect_pending_start` tick early-return instead
-    /// of installing a session into a panel that has already torn down.
+    /// Taking every tab (`TabSet::take_all`) is load-bearing twice over: it lets a backend that
+    /// already finished be shut down properly, and it leaves nothing for a later tick to install a
+    /// session into -- the pump stops on `shutting_down` anyway.
+    ///
+    /// **Every live backend is torn down at once** (`tear_down_all_holding_the_application`): one
+    /// worker per tab, one collector, one backstop. Serial sidecar closes are bounded at 10 s each,
+    /// so N tabs torn down in turn could outlive any backstop (spec §3.5).
     ///
     /// **This function does not wait for anything, and that is its most important property.** It
     /// runs from `window.connect_close_request` on the GTK main thread, where a wait keeps the
     /// window mapped and frozen until it returns; two previous versions of this code waited there
-    /// (3s, then 15s) while describing themselves as not doing so. All three branches below instead
-    /// hand their receiver to `watch_off_the_main_loop`, which holds the application and polls.
+    /// (3s, then 15s) while describing themselves as not doing so. Every branch below instead hands
+    /// its receiver to `watch_off_the_main_loop`, which holds the application and polls.
     /// **This function** returns immediately and the process stays alive -- with no window on
     /// screen -- until the teardowns report or their backstops expire.
     ///
@@ -402,97 +530,52 @@ impl AgentPanelHandle {
     /// `pane.shutdown()` first, on the GTK thread, and that spins until nvim exits
     /// (`LiveHarness::shutdown` in the fork). So "the window disappears at once" is a claim about
     /// this half only, and a slow `:qa!` -- a hung plugin, a slow `BufWritePre` -- still delays the
-    /// close with nothing here involved. That is pre-existing and out of this branch's scope; it is
-    /// named so a verifier who sees a lingering window does not come looking here first.
+    /// close with nothing here involved.
+    ///
+    /// **A handoff's close** is already running on its own worker, which owns that backend: there
+    /// is nothing to start, only a reason to keep the process alive. It is held on `dropped_rx`,
+    /// not `closed_rx` -- `closed_rx` reports when `shutdown()` returned, while on the sidecar path
+    /// the child dies in the backend's drop afterwards. `HANDOFF_CLOSE_BACKSTOP` is generous for
+    /// the legacy backend and knowingly short of the sidecar's worst case; see its own doc.
     ///
     /// `app` is a parameter rather than a field for the same reason `install_reload_action` takes
     /// one: this handle is per-window, and the hold belongs to the application that owns the loop
     /// this panel's timers run on.
     pub(crate) fn shutdown(&self, app: &Application) {
-        {
+        let tabs = {
             let mut state = self.state.borrow_mut();
-            // Read by the 33ms pump and by `poll_activate`, both of which keep ticking now that the
-            // loop outlives the window. See the field's own doc.
+            // Read by the 33ms pump, by `poll_activate` and by every path into the tab set, all of
+            // which keep running now that the loop outlives the window. See the field's own doc.
             state.shutting_down = true;
+            state.tabs.take_all()
+        };
+        let mut backends = Vec::new();
+        for tab in tabs {
+            if let Some(handoff) = tab.pending_handoff {
+                watch_off_the_main_loop(
+                    app,
+                    "a terminal handoff's close",
+                    handoff.dropped_rx,
+                    HANDOFF_CLOSE_BACKSTOP,
+                    |()| {},
+                );
+            }
+            match tab.backend {
+                TabBackend::Live(backend) => backends.push(backend),
+                TabBackend::Starting(pending) => watch_connect_holding_the_application(app, pending.result_rx),
+                TabBackend::NotStarted | TabBackend::Failed { .. } => {}
+            }
         }
-        let pending = self.state.borrow_mut().pending_start.take();
-        let pending_handoff = self.state.borrow_mut().pending_handoff.take();
-        // Taken out in its own statement, like the two above it, so the `RefMut` is dropped before
-        // anything else runs. In edition 2021 an `if let` scrutinee's temporary lives to the end of
-        // the block, which would have meant holding a `RefCell` borrow across the calls below --
-        // and one of them (`tear_down_holding_the_application`) installs a main-loop source.
-        let session = self.state.borrow_mut().session.take();
-        if let Some(session) = session {
-            // On a worker, held rather than waited for. The reasoning, and the other caller it is
-            // shared with, are in `tear_down_holding_the_application`.
-            tear_down_holding_the_application(app, "the session's teardown", session);
+        tear_down_all_holding_the_application(app, "every session tab's teardown", backends);
+        // Tabs that left earlier, while the window stayed open: their teardowns and connects are
+        // still running on workers nothing else would keep alive (the session-tabs whole-branch
+        // review). Same holds and backstops as the tabs just taken.
+        let retiring = std::mem::take(&mut self.state.borrow_mut().retiring);
+        for rx in retiring.connects {
+            watch_connect_holding_the_application(app, rx);
         }
-        if let Some(handoff) = pending_handoff {
-            // The worker already owns the backend and is already shutting it down -- there is
-            // nothing to start here, only a reason to keep the process alive. Exiting first would
-            // leave the `claude` child mid-close.
-            //
-            // **`dropped_rx`, not `closed_rx`.** The worker reports on `closed_rx` as soon as
-            // `shutdown()` returns, because that is when the handoff command becomes true and may
-            // be dispatched; on the sidecar path the child is still alive at that moment and is
-            // killed by the backend's drop afterwards (`SpawnedSidecar::drop`: close stdin, poll up
-            // to 3s, SIGKILL). `dropped_rx` reports after that drop, so what is held here is the
-            // whole teardown rather than its first half.
-            //
-            // **The backstop is only generous for the default backend, and says so.** On `legacy`,
-            // `AgentBackend::shutdown()` is ~0.8s of grace periods (`NATURAL_EXIT_GRACE_PERIOD`
-            // 500ms + `GRACE_PERIOD` 300ms, agent/src/process.rs) plus three thread joins, so
-            // `HANDOFF_CLOSE_BACKSTOP` covers it with room to spare. On `sidecar` it does not:
-            // `close_session` alone is bounded at 10s, so this can expire with the close in flight
-            // and leave the orphan class this repository keeps chasing with pid diffs. It is left
-            // at 3s rather than raised to `SESSION_CLOSE_BACKSTOP` because nothing here has ever
-            // measured this path -- the window has to be closed inside the second between
-            // confirming a handoff and the card appearing -- and inventing a number for it would
-            // read as evidence. See shell/MANUAL_VERIFICATION.md's owed check for this path.
-            watch_off_the_main_loop(
-                app,
-                "the terminal handoff's close",
-                handoff.dropped_rx,
-                HANDOFF_CLOSE_BACKSTOP,
-                |()| {},
-            );
-        }
-        if let Some(pending) = pending {
-            // A connect, not a teardown -- see `CONNECT_CLOSE_BACKSTOP`. The reason to hold the
-            // process open for it at all is that a backend which finishes after the process is
-            // gone is exactly the orphan described at the top of this function.
-            let app_for_teardown = app.clone();
-            watch_off_the_main_loop(
-                app,
-                "the connect that was still running",
-                pending.result_rx,
-                CONNECT_CLOSE_BACKSTOP,
-                move |result| match result {
-                    Ok(backend) => {
-                        eprintln!(
-                            "[agent_panel] window closed mid-connect; shutting down the backend that finished anyway"
-                        );
-                        // Held and bounded, exactly like the installed session above. This branch
-                        // used to call `backend.shutdown()` inline and unbounded, which a review
-                        // caught: it reaches the same `ConversationIngest::stop` thread join, and
-                        // `fold` marks `history_dirty` on `SessionUnavailable` and `SessionClosed`
-                        // as well as `TurnCompleted`, both of which can arrive before the panel ever
-                        // installs the session -- so nothing here makes it safe. Narrow in practice
-                        // (it also needs `record_written`), but the point of the declaration in
-                        // `tear_down_holding_the_application` is that it holds without a caller-side
-                        // argument.
-                        tear_down_holding_the_application(
-                            &app_for_teardown,
-                            "the backend that finished mid-connect",
-                            backend,
-                        );
-                    }
-                    Err(e) => eprintln!(
-                        "[agent_panel] window closed mid-connect; the backend had already failed: {}",
-                        e.message
-                    ),
-                },
-            );
+        for rx in retiring.teardowns {
+            watch_off_the_main_loop(app, "a closed tab's teardown", rx, SESSION_CLOSE_BACKSTOP, |()| {});
         }
     }
 
@@ -521,7 +604,7 @@ impl AgentPanelHandle {
     pub(crate) fn reload_document(&self) {
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
         let vars = self.state.borrow().theme.css_vars();
-        self.webview.load_html(&themed_document(&vars), None);
+        self.webview.load_html(&themed_document(&vars), Some(PANEL_BASE_URI));
     }
 
     /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
@@ -678,12 +761,6 @@ impl AgentPanelHandle {
         self.state.borrow_mut().hint_hook = Some(Rc::new(hook));
     }
 
-    /// What the chat owes the user now (modules spec §3.3): its pending permission cards, and
-    /// whether a turn finished while it was off screen.
-    pub(crate) fn attention(&self) -> neovibe_core::attention::Attention {
-        self.state.borrow().attention.attention()
-    }
-
     /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes --
     /// the one place that knows both, so `main.rs` keeps no copy of its own to drift (Task 10's
     /// review, minor 4). `main.rs` installs this once.
@@ -693,14 +770,171 @@ impl AgentPanelHandle {
     ) {
         self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
     }
+}
 
-    /// The chat was brought back to answer a card (its tray chip, `Ctrl+a a`): BROWSE, with the
-    /// cursor on the oldest pending card. See `serialize_focus_permission_for_js`.
-    pub(crate) fn focus_permission(&self) {
+/// The session-tab verbs `main.rs` binds (session tabs plan Tasks 7 and 8). Each borrows, changes
+/// the set, drops the borrow, then dispatches. Every one of them does nothing once the window is
+/// closing (`AgentPanelState::shutting_down`: the set is empty then).
+// Tasks 7 and 8 wire these to the keymap and the window close; until then some have no caller.
+#[allow(dead_code)]
+impl AgentPanelHandle {
+    fn closing(&self) -> bool {
+        self.state.borrow().shutting_down
+    }
+
+    /// Where the launch chooser's opening is reported (D10): `main.rs` gives it the keys.
+    pub(crate) fn on_launch_chooser(&self, hook: impl Fn() + 'static) {
+        self.state.borrow_mut().launch_chooser_hook = Some(Rc::new(hook));
+    }
+
+    /// Where a chooser's dismissal is reported, with its `launch` flag: dismissing the launch
+    /// chooser hands the keys to the editor (D10).
+    pub(crate) fn on_chooser_closed(&self, hook: impl Fn(bool) + 'static) {
+        self.state.borrow_mut().chooser_closed_hook = Some(Rc::new(hook));
+    }
+
+    /// Whether the chat is on screen at launch (ruling 16). Read once, by the first `ready`.
+    pub(crate) fn set_launch_chooser_allowed(&self, allowed: bool) {
+        self.state.borrow_mut().launch_chooser_allowed = allowed;
+    }
+
+    /// `prefix c`: opens a tab, selects it, and sends `tabs` -- nothing else: an empty tab has no
+    /// state yet.
+    pub(crate) fn new_tab(&self) {
+        if self.closing() {
+            return;
+        }
+        self.state.borrow_mut().tabs.open();
+        send_tabs(&self.state, &self.webview);
+    }
+
+    /// `prefix <digit>`. `false` when no tab has that number (the caller flashes, ruling 10).
+    pub(crate) fn select_number(&self, n: u16) -> bool {
+        self.switch_with(|tabs| tabs.select_number(n))
+    }
+
+    /// `prefix n` (+1) / `p` (-1), wrapping.
+    pub(crate) fn step(&self, delta: i32) -> bool {
+        self.switch_with(|tabs| tabs.step(delta))
+    }
+
+    /// `prefix l`: the previously active tab.
+    pub(crate) fn select_last(&self) -> bool {
+        self.switch_with(|tabs| tabs.select_last())
+    }
+
+    fn switch_with(&self, select: impl FnOnce(&mut neovibe_core::tab_set::TabSet) -> Option<TabId>) -> bool {
+        if self.closing() {
+            return false;
+        }
+        let selected = select(&mut self.state.borrow_mut().tabs);
+        if selected.is_none() {
+            return false;
+        }
+        send_switch(&self.state, &self.webview);
+        true
+    }
+
+    /// `prefix ,`: the inline rename field on the active tab's label.
+    pub(crate) fn begin_rename(&self) {
+        if self.closing() {
+            return;
+        }
+        let payload = {
+            let state = self.state.borrow();
+            let tab = state.tabs.active_tab();
+            neovibe_core::agent_bridge::serialize_begin_rename_for_js(tab.id, tab.name.as_deref())
+        };
+        self.dispatch(payload, "begin-rename");
+    }
+
+    /// `prefix &`: the footer's y/n prompt for the active tab.
+    pub(crate) fn confirm_close(&self) {
+        if self.closing() {
+            return;
+        }
+        let payload = {
+            let state = self.state.borrow();
+            let active = state.tabs.active();
+            let facts = state.tabs.close_facts(active).expect("the active tab exists");
+            neovibe_core::agent_bridge::serialize_confirm_close_for_js(
+                active,
+                &neovibe_core::tabs::close_prompt(&facts),
+            )
+        };
+        self.dispatch(payload, "confirm-close");
+    }
+
+    /// `prefix w` (and D10's launch chooser, `launch: true`).
+    pub(crate) fn open_chooser(&self, launch: bool) {
+        if self.closing() {
+            return;
+        }
+        let payload = chooser_payload(&self.state.borrow(), launch);
+        self.dispatch(payload, "chooser");
+    }
+
+    /// `prefix i`: the active tab's detail popover.
+    pub(crate) fn open_detail(&self) {
+        if self.closing() {
+            return;
+        }
+        let payload = {
+            let state = self.state.borrow();
+            detail_payload(&state, state.tabs.active())
+        };
+        self.dispatch(payload, "tab-detail");
+    }
+
+    /// The tray chip, `prefix a`: switches to the tab holding the oldest pending card and puts the
+    /// panel's cursor on it. `false` when no tab holds a card.
+    pub(crate) fn focus_oldest_card(&self) -> bool {
+        if self.closing() {
+            return false;
+        }
+        let target = {
+            let mut state = self.state.borrow_mut();
+            let Some(target) = state.tabs.oldest_card_tab() else {
+                return false;
+            };
+            state.tabs.select(target);
+            target
+        };
+        send_switch(&self.state, &self.webview);
         self.dispatch(
-            neovibe_core::agent_bridge::serialize_focus_permission_for_js(),
+            neovibe_core::agent_bridge::serialize_focus_permission_for_js(target),
             "focus-permission",
         );
+        true
+    }
+
+    /// What the chat owes the user now, summed over every tab (spec §3.7): its pending permission
+    /// cards, and whether a turn finished while it was off screen.
+    pub(crate) fn attention(&self) -> neovibe_core::attention::Attention {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return Default::default();
+        }
+        state.tabs.attention()
+    }
+
+    /// The tab holding the newest pending card, as `(number, label name)`: the toast names it.
+    pub(crate) fn newest_card_label(&self) -> Option<(u16, String)> {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return None;
+        }
+        let id = state.tabs.newest_card_tab()?;
+        state.tabs.get(id).map(|t| (t.number, t.label_name()))
+    }
+
+    /// Ruling 15: tabs whose turn is running or whose session is still connecting.
+    pub(crate) fn running_count(&self) -> usize {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return 0;
+        }
+        state.tabs.running_count()
     }
 }
 
@@ -709,7 +943,10 @@ impl AgentPanelHandle {
 fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::attention::Attention) {
     let (after, hook) = {
         let state = state.borrow();
-        (state.attention.attention(), state.attention_hook.clone())
+        if state.shutting_down {
+            return;
+        }
+        (state.tabs.attention(), state.attention_hook.clone())
     };
     if after != before {
         if let Some(hook) = hook {
@@ -785,25 +1022,44 @@ pub(crate) fn build_agent_panel(
         };
     let backend_kind = BackendKind::from_env();
     println!("[agent_panel] backend: {}", backend_kind.as_str());
+    let prefs_dir = neovibe_core::agent_prefs::state_dir(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    let (mode, notes) = neovibe_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
+    let tabs = neovibe_core::tab_set::TabSet::new(backend_kind, mode);
+    // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
+    // way). `main.rs` already canonicalized the root; this only makes the string explicit.
+    let canonical_project_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.clone())
+        .to_string_lossy()
+        .into_owned();
     let state = Rc::new(RefCell::new(AgentPanelState {
-        session: None,
+        tabs,
         editor_context,
         backend_kind,
         project_dir,
+        canonical_project_dir,
+        prefs_dir,
         supervisor,
         supervisor_pending,
-        pending_start: None,
-        pending_handoff: None,
-        last_handoff: None,
-        reported_start_failure: false,
         shutting_down: false,
-        turn_trace: None,
         theme: neovibe_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
         pane_focused: false,
         hint_hook: None,
-        attention: Default::default(),
         attention_hook: None,
+        last_tabs_payload: None,
+        last_open_ids: Vec::new(),
+        launch_chooser_allowed: false,
+        launch_chooser_done: false,
+        launch_chooser_hook: None,
+        chooser_closed_hook: None,
+        retiring: Retiring::default(),
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -819,23 +1075,27 @@ pub(crate) fn build_agent_panel(
     {
         let tokens = state.borrow().theme.clone();
         paint_webview_background(&webview, &tokens);
-        webview.load_html(&themed_document(&tokens.css_vars()), None);
+        webview.load_html(&themed_document(&tokens.css_vars()), Some(PANEL_BASE_URI));
     }
 
-    // Back on screen: whatever finished while the chat was away has been seen (the tray's `agent •`).
+    // Back on screen: whatever finished in the active tab while the chat was away has been seen
+    // (the tray's `agent •`).
     {
         let state = state.clone();
         webview.connect_map(move |_| {
-            let before = state.borrow().attention.attention();
-            state.borrow_mut().attention.seen();
+            if state.borrow().shutting_down {
+                return;
+            }
+            let before = state.borrow().tabs.attention();
+            state.borrow_mut().tabs.mark_seen();
             report_attention(&state, before);
         });
     }
 
     // Started once, at construction, rather than when a session starts: it is also what collects a
-    // finished background connect. Previously it was started inside the start_session handler,
-    // which meant a second start attempt after a failure installed a SECOND timer on the same
-    // state -- every later event would then be dispatched twice.
+    // finished background connect. Previously it was started inside the handler that constructs the
+    // backend, which meant a second start attempt after a failure installed a SECOND timer on the
+    // same state -- every later event would then be dispatched twice.
     start_pump_timer(state.clone(), webview.clone());
 
     let handle = AgentPanelHandle {
@@ -845,127 +1105,85 @@ pub(crate) fn build_agent_panel(
     (webview.upcast(), handle)
 }
 
-/// The panel's single main-loop tick. Three jobs, in order:
+/// The panel's single main-loop tick, over EVERY tab (spec §3.1). Three jobs, in order:
 ///
-/// 1. collect a backend that finished constructing on a worker thread, and answer the
-///    `start_session` command that has been waiting on it;
-/// 2. drain the backend's events and dispatch them as one batched
-///    `events{fromRevision,throughRevision,events[]}` envelope (not one per event);
-/// 3. report derived status to `neovibe-supervisor`.
+/// 1. collect every backend that finished constructing on a worker thread (and every handoff whose
+///    close finished), and answer the command that has been waiting on it;
+/// 2. drain every tab's backend (`TabSet::pump`): `take_ui_delivery` is where the permission policy
+///    answers what needs no human, so a tab that was not pumped would stall. The active tab's batch
+///    goes to the panel as one `events{tab,fromRevision,throughRevision,events[]}` envelope; a
+///    background tab's feeds its attention and marks it stale;
+/// 3. report the window's aggregated status to `neovibe-supervisor` (ruling 19).
 ///
-/// `fromRevision`/`throughRevision` are read off the projection immediately before and after the
-/// batch, since `pump()` folds each event into the projection before returning. An empty batch
-/// sends nothing.
+/// Then the `tabs` envelope and `hello` go out if what they describe changed.
 fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(PUMP_POLL_INTERVAL_MS), move || {
-        // The window has been closed and its session taken; everything below would be a no-op
+        // The window has been closed and its tabs taken; everything below would be a no-op
         // against a destroyed window for as long as the close watch holds the application. Stop
         // instead of ticking 30 times a second at nothing. See `AgentPanelState::shutting_down`.
         if state.borrow().shutting_down {
             return gtk4::glib::ControlFlow::Break;
         }
-        // Read before anything below changes it: a session installed this tick resets the count.
-        let attention_before = state.borrow().attention.attention();
-        collect_pending_start(&state, &webview);
-        collect_pending_handoff(&state, &webview);
+        // The chat's own host: unmapped while it is hidden or zoomed away.
+        let panel_mapped = webview.is_mapped();
+        // Read before anything below changes it: a session installed this tick resets its count.
+        let attention_before = state.borrow().tabs.attention();
+        collect_pending_starts(&state, &webview);
+        collect_pending_handoffs(&state, &webview);
+        report_sessions_that_never_opened(&state, &webview);
+        state.borrow_mut().retiring.poll();
 
         // The payload is built under the borrow and dispatched OUTSIDE it. Calling into WebKit while
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
-        // dispatch would panic on an already-borrowed cell rather than fail gracefully. Nothing
-        // today re-enters, which is exactly why it would stay latent until it didn't.
-        report_a_session_that_never_opened(&state, &webview);
-
-        // The chat's own host: unmapped while it is hidden or zoomed away.
-        let on_screen = webview.is_mapped();
-        let (payload, first_text_in_this_batch) = {
+        // dispatch would panic on an already-borrowed cell rather than fail gracefully.
+        let (payload, first_text) = {
             let mut state_ref = state.borrow_mut();
-            let AgentPanelState {
-                session,
-                turn_trace,
-                supervisor,
-                supervisor_pending,
-                project_dir,
-                attention,
-                ..
-            } = &mut *state_ref;
+            let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
             // during `build_ui`, where waiting for it would have delayed the window appearing.
-            if supervisor.is_none() {
-                if let Some(rx) = supervisor_pending.as_ref() {
+            if state_ref.supervisor.is_none() {
+                if let Some(rx) = state_ref.supervisor_pending.as_ref() {
                     match rx.try_recv() {
                         Ok(client) => {
-                            *supervisor = client;
-                            *supervisor_pending = None;
+                            state_ref.supervisor = client;
+                            state_ref.supervisor_pending = None;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            *supervisor_pending = None;
+                            state_ref.supervisor_pending = None;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     }
                 }
             }
-            // Folded from the SAME slice the bridge is about to serialize, so the trace describes
-            // the events the user is actually about to see rather than a parallel accounting.
-            let mut first_text_in_this_batch = false;
-            let payload = session.as_mut().and_then(|session| {
-                let from_revision = session.projection().last_revision;
-                // The project root travels in because the permission policy judges
-                // `Read`/`Grep`/`Glob` paths against it -- see
-                // `AgentBackend::answer_what_needs_no_human`.
-                let payload = match session.take_ui_delivery(project_dir) {
-                    UiDelivery::Nothing => None,
-                    UiDelivery::Events(events) => {
-                        if let Some(trace) = turn_trace.as_mut() {
-                            first_text_in_this_batch = trace.observe(&events);
-                        }
-                        // What the panel is handed is what it draws cards for (modules P2).
-                        attention.observe(&events, on_screen);
-                        let through_revision = session.projection().last_revision;
-                        Some(serialize_events_for_js(from_revision, through_revision, &events))
-                    }
-                    // More happened than was worth queueing as individual events -- the UI was away
-                    // long enough that the bounded queue overflowed. It reloads from canonical state
-                    // instead, which is complete by construction rather than a degraded fallback:
-                    // the projection saw every event, in order, while nobody was watching.
-                    //
-                    // The turn trace deliberately observes nothing here. Its "first presentation
-                    // delta" mark is about how fast text reaches a LIVE reader; a window that was not
-                    // being repainted has no such measurement to contribute, and recording one would
-                    // report the stall as latency.
-                    UiDelivery::Resync => {
-                        attention.resync(session.projection().pending_permissions.keys().cloned());
-                        let view = SnapshotView::of(session);
-                        Some(serialize_snapshot_for_js(&view))
-                    }
-                };
-                // A card answered from the panel is gone from the projection; on legacy no
-                // delivery says so (`respond_permission` returns its resolution to the command).
-                let projection = session.projection();
-                attention.retain_pending(|id| projection.pending_permissions.contains_key(id));
-                payload
-            });
-            // No session holds no card. Every place that takes one says so itself
-            // (`AttentionTracker::session_ended`); this is the backstop for the next one that
-            // does not (the whole-branch review's finding 2).
-            if session.is_none() {
-                attention.retain_pending(|_| false);
-            }
-            // Bound first: `projection()` returns a guard on the sidecar path, and passing it
-            // inline would drop the ingestion lock before `derive_status` had read through it.
-            let projection = session.as_ref().map(|s| s.projection());
-            let status = crate::supervisor_client::derive_status(projection.as_deref());
-            if let Some(supervisor) = supervisor.as_mut() {
+            // The project root travels in because the permission policy judges `Read`/`Grep`/`Glob`
+            // paths against it -- see `AgentBackend::answer_what_needs_no_human`.
+            let project_dir = state_ref.project_dir.clone();
+            let out = state_ref.tabs.pump(&project_dir, panel_mapped);
+            let statuses: Vec<supervisor::AgentStatus> = state_ref
+                .tabs
+                .tabs()
+                .iter()
+                .map(|t| {
+                    // Bound first: `projection()` returns a guard on the sidecar path, and passing
+                    // it inline would drop the ingestion lock before `derive_status` had read
+                    // through it.
+                    let projection = t.live().map(|b| b.projection());
+                    crate::supervisor_client::derive_status(projection.as_deref())
+                })
+                .collect();
+            let status = crate::supervisor_client::aggregate_status(statuses);
+            if let Some(supervisor) = state_ref.supervisor.as_mut() {
                 supervisor.send_status(status);
             }
-            (payload, first_text_in_this_batch)
+            (out.active_payload, out.first_text)
         };
         if let Some(payload) = payload {
             evaluate_js_dispatch(&webview, &payload);
             // Stamped after the dispatch call, which is where the WebView's own clock starts.
             let mut state_ref = state.borrow_mut();
-            if let Some(trace) = state_ref.turn_trace.as_mut() {
-                if first_text_in_this_batch {
+            if let Some(trace) = state_ref.tabs.active_tab_mut().turn_trace.as_mut() {
+                if first_text {
                     trace.mark_first_text_dispatched();
                 }
                 if trace.is_complete() {
@@ -973,6 +1191,8 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 }
             }
         }
+        send_tabs_if_changed(&state, &webview);
+        send_hello_if_open_sessions_changed(&state, &webview);
         // After the payload, not before it: a reaction that sends the panel an envelope -- one
         // that lands on a card, say -- must find the card it names already there (Task 10's
         // review, minor 3).
@@ -981,14 +1201,257 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
     });
 }
 
+/// Dispatches each payload, in order.
+fn dispatch_all(webview: &WebView, payloads: Vec<String>) {
+    for payload in payloads {
+        evaluate_js_dispatch(webview, &payload);
+    }
+}
+
+/// The `tabs` envelope, recorded as the last one sent.
+fn tabs_payload_recorded(state: &mut AgentPanelState) -> String {
+    let payload = state.tabs.tabs_payload();
+    state.last_tabs_payload = Some(payload.clone());
+    payload
+}
+
+/// Sends `tabs` now: the set changed in a way the panel must see at once.
+fn send_tabs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let payload = tabs_payload_recorded(&mut state.borrow_mut());
+    evaluate_js_dispatch(webview, &payload);
+}
+
+/// The tick's `tabs` envelope: sent only when it differs from the last one sent (a marker, a
+/// label, a state -- whatever `TabSet::tabs_payload` says).
+fn send_tabs_if_changed(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let payload = {
+        let mut state_ref = state.borrow_mut();
+        let payload = state_ref.tabs.tabs_payload();
+        if state_ref.last_tabs_payload.as_deref() == Some(payload.as_str()) {
+            return;
+        }
+        state_ref.last_tabs_payload = Some(payload.clone());
+        payload
+    };
+    evaluate_js_dispatch(webview, &payload);
+}
+
+/// `tabs`, then the active tab's own state (ruling 18: always, not only when stale).
+fn switch_payloads(state: &mut AgentPanelState) -> Vec<String> {
+    let mut payloads = vec![tabs_payload_recorded(state)];
+    payloads.extend(state.tabs.active_state_payloads());
+    payloads
+}
+
+/// After the active tab changed: `mark_seen` if the panel is on screen, then `tabs` and the new
+/// active tab's state.
+fn send_switch(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let before = state.borrow().tabs.attention();
+    let payloads = {
+        let mut state_ref = state.borrow_mut();
+        if webview.is_mapped() {
+            state_ref.tabs.mark_seen();
+        }
+        switch_payloads(&mut state_ref)
+    };
+    dispatch_all(webview, payloads);
+    report_attention(state, before);
+}
+
+/// Ruling 17: `hello` is window-level and re-sent, recomputed, whenever the set of open provider
+/// sessions changes -- a session adopted, a resume installed, a tab closed or reset.
+fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let payload = {
+        let mut state_ref = state.borrow_mut();
+        let open = state_ref.tabs.open_session_ids();
+        if open == state_ref.last_open_ids {
+            return;
+        }
+        let mut greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
+        greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
+        state_ref.last_open_ids = open;
+        serialize_hello_for_js(&greeting)
+    };
+    evaluate_js_dispatch(webview, &payload);
+}
+
+/// The chooser's envelope (`prefix w`, D10): the open tabs in number order, then every record open
+/// in no tab, each marked if another window holds its lease.
+fn chooser_payload(state: &AgentPanelState, launch: bool) -> String {
+    let greeting = BackendGreeting::for_kind(state.backend_kind, state.project_dir.clone());
+    let resumable = state.backend_kind == BackendKind::Sidecar;
+    let open: Vec<ChooserTab> = state
+        .tabs
+        .tabs()
+        .iter()
+        .map(|t| {
+            let facts = t.facts();
+            ChooserTab {
+                tab: t.id,
+                label: neovibe_core::tabs::label(t.number, &t.label_name()),
+                marker: neovibe_core::tabs::marker(facts),
+                pending: facts.pending,
+                resumable,
+            }
+        })
+        .collect();
+    let canonical = state.canonical_project_dir.as_str();
+    let records = chooser_records(&greeting.resumable, &state.tabs.open_session_ids(), |id| {
+        agent::lease::SessionLease::is_held("claude", canonical, id).unwrap_or(false)
+    });
+    neovibe_core::agent_bridge::serialize_chooser_for_js(launch, &open, &records)
+}
+
+/// The detail popover's envelope for `tab` (`prefix i`, `open_detail{tab}`).
+fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
+    let rows = match state.tabs.get(tab) {
+        Some(t) => detail_rows(
+            t,
+            state.backend_kind,
+            agent::account::configured().map(|a| a.name()),
+            &state.project_dir,
+        ),
+        None => Vec::new(),
+    };
+    neovibe_core::agent_bridge::serialize_tab_detail_for_js(tab, &rows)
+}
+
+/// The backend a tab command acts on, or the benign "no active session" refusal (an empty,
+/// starting or failed tab). Never another tab's.
+fn backend_for(
+    tabs: &mut neovibe_core::tab_set::TabSet,
+    tab: TabId,
+) -> Result<&mut AgentBackend, neovibe_core::agent_backend::BackendError> {
+    tabs.get_mut(tab)
+        .and_then(|t| t.live_mut())
+        .ok_or_else(no_session_error)
+}
+
+/// The chooser's records: every resumable session open in no tab, newest first as `hello` ranks
+/// them, each marked if another window holds its lease.
+fn chooser_records(
+    sessions: &[agent::ResumableSession],
+    open: &[String],
+    held: impl Fn(&str) -> bool,
+) -> Vec<ChooserRecord> {
+    sessions
+        .iter()
+        .filter(|s| !open.contains(&s.provider_session_id))
+        .map(|s| ChooserRecord {
+            provider_session_id: s.provider_session_id.clone(),
+            name: s.name.clone(),
+            title: s.title.clone(),
+            created_at: s.created_at.clone(),
+            updated_at: s.updated_at.clone(),
+            held_elsewhere: held(&s.provider_session_id),
+        })
+        .collect()
+}
+
+/// `prefix i`'s rows for one tab, in spec §3.3's order, `—` for anything unknown.
+///
+/// `provider_session_id()` is read into a local BEFORE `projection()` is taken: on the sidecar path
+/// both lock the same ingestion mutex (the 2026-09-15 GTK freeze; `tab_set`'s module doc).
+fn detail_rows(tab: &Tab, kind: BackendKind, account: Option<&str>, project_dir: &Path) -> Vec<DetailRow> {
+    const UNKNOWN: &str = "—";
+    let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
+    let backend = tab.live();
+    let provider_session_id = backend.and_then(|b| b.provider_session_id());
+    let (model, cwd) = match backend {
+        Some(b) => {
+            let projection = b.projection();
+            (projection.model.clone(), projection.cwd.clone())
+        }
+        None => (None, None),
+    };
+    let conversation_id = backend.and_then(|b| b.conversation_id().map(str::to_string));
+    let session_id = backend.and_then(|b| b.session_id().map(str::to_string));
+    let info = backend.and_then(|b| b.provider_info());
+    let cli = info.map(|i| {
+        let mut line = if i.actual_claude_code_version.is_empty() {
+            UNKNOWN.to_string()
+        } else {
+            i.actual_claude_code_version.clone()
+        };
+        for diagnostic in &i.startup_diagnostics {
+            line.push_str(" · ");
+            line.push_str(diagnostic);
+        }
+        line
+    });
+    let revision = info.map(|i| {
+        format!(
+            "{} · expected {}",
+            i.build_description.as_deref().unwrap_or(UNKNOWN),
+            agent::EXPECTED_VERDANDI_REVISION
+        )
+    });
+    let record = match (&conversation_id, &provider_session_id) {
+        (Some(conversation), Some(session)) => agent::persistence::load_conversation_record(conversation, session).ok(),
+        _ => None,
+    };
+    let resumable = match kind {
+        BackendKind::Sidecar => "yes",
+        BackendKind::Legacy => "no (legacy backend)",
+    };
+    let rows: [(&str, String); 17] = [
+        ("name", known(tab.name.clone())),
+        ("title", known(tab.title.clone())),
+        ("state", tab.wire_state().as_str().to_string()),
+        ("mode", tab.mode.as_str().to_string()),
+        ("model", known(model)),
+        ("backend", kind.as_str().to_string()),
+        ("account", known(account.map(str::to_string))),
+        (
+            "cwd",
+            known(cwd.or_else(|| Some(project_dir.to_string_lossy().into_owned()))),
+        ),
+        ("conversation", known(conversation_id)),
+        ("verdandi session", known(session_id)),
+        ("claude session", known(provider_session_id)),
+        ("CLI", known(cli)),
+        ("Verdandi revision", known(revision)),
+        ("resumable", resumable.to_string()),
+        ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
+        ("updated", known(record.as_ref().map(|r| r.updated_at.clone()))),
+        ("queued", "0".to_string()),
+    ];
+    rows.into_iter()
+        .map(|(label, value)| DetailRow {
+            label: label.to_string(),
+            value,
+        })
+        .collect()
+}
+
+/// The connect worker, shared by `send_message` on an empty tab and `resume`. Off the GTK main
+/// loop: constructing the sidecar backend spawns a real process, does a real gRPC handshake, and on
+/// a cold Verdandi checkout runs `npm ci` + `npm run build` -- minutes, in the cold case.
+fn spawn_connect(
+    kind: BackendKind,
+    project_dir: PathBuf,
+    mode: SessionModeChoice,
+    resume: Option<String>,
+) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
+    let (result_tx, result_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = AgentBackend::start(kind, &project_dir, mode.into(), resume.as_deref());
+        // The receiver is gone only if the tab or the panel was torn down mid-connect; dropping
+        // the backend here is then the cleanup (`Retiring` normally holds the receiver instead).
+        let _ = result_tx.send(result);
+    });
+    result_rx
+}
+
 /// A session that reached a terminal state without ever opening never worked, and must not be
-/// left on screen as an empty conversation the user cannot act on.
+/// left on screen as an empty conversation the user cannot act on. Checked for every tab.
 ///
 /// `AgentConversation::resume` catches the common case synchronously, within its own short window.
 /// This is the backstop for everything slower than that window and for fresh sessions, which have
-/// no equivalent check: either way the user is returned to the start screen with the provider's own
-/// reason, where "start a new session" is available. It is never turned into a fresh session
-/// automatically.
+/// no equivalent check: either way the tab becomes `Failed` with the provider's own reason (ruling
+/// 14), where `r` starts it over. It is never turned into a fresh session automatically. The
+/// `error{tab}` envelope goes out only if that tab is active; the tab keeps the reason for when it
+/// is shown, and no other tab is touched.
 ///
 /// **`reason` used to be a fixed, generic string on the legacy backend** ("provider process
 /// exited unexpectedly") for every non-zero exit, regardless of cause -- and that generic text
@@ -997,141 +1460,184 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
 /// `--settings` flag outright, and the launcher's own one-line explanation had already gone past
 /// on stderr with nowhere for this banner to recover it from. `agent::session`'s translation of
 /// `AgentEvent::ProcessExited` now folds the child's own retained stderr tail into
-/// `SessionUnavailable.reason` itself (see `agent/src/session.rs`), so this function needed no
-/// change to benefit: `reason` below is already the specific one when the provider produced any
-/// stderr at all before dying, and only falls back to the generic text when it produced none.
-fn report_a_session_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
-    let failure = {
+/// `SessionUnavailable.reason` itself (see `agent/src/session.rs`), so `reason` below is already
+/// the specific one when the provider produced any stderr at all before dying.
+fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let failed: Vec<(TabId, String)> = {
         let state_ref = state.borrow();
-        if state_ref.reported_start_failure {
-            return;
-        }
-        state_ref.session.as_ref().and_then(|s| s.terminated_before_opening())
+        state_ref
+            .tabs
+            .tabs()
+            .iter()
+            .filter(|t| !t.reported_start_failure)
+            .filter_map(|t| t.live().and_then(|b| b.terminated_before_opening()).map(|r| (t.id, r)))
+            .collect()
     };
-    let Some(reason) = failure else { return };
-
-    let message = format!(
-        "the session ended before it started ({reason}). If you were continuing a previous \
-         conversation, it most likely no longer exists -- start a new session instead."
-    );
-    eprintln!("[agent_panel] {message}");
-    let on_screen = webview.is_mapped();
-    let dead = {
-        let mut state_ref = state.borrow_mut();
-        state_ref.reported_start_failure = true;
-        // Its cards go with it (the pump reports the change).
-        state_ref.attention.session_ended(on_screen);
-        state_ref.session.take()
-    };
-    if let Some(mut backend) = dead {
-        std::thread::spawn(move || backend.shutdown());
-    }
-    evaluate_js_dispatch(webview, &serialize_error_for_js(&message));
-}
-
-/// Non-blocking check on an in-flight backend construction. `try_recv`, never `recv`: this runs on
-/// the GTK main loop 30 times a second and must never block it -- which is the entire reason the
-/// construction was moved off this thread in the first place.
-fn collect_pending_start(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
-    let finished = {
-        let mut state_ref = state.borrow_mut();
-        let Some(pending) = state_ref.pending_start.as_ref() else {
-            return;
-        };
-        match pending.result_rx.try_recv() {
-            Ok(result) => {
-                let request_id = pending.request_id.clone();
-                state_ref.pending_start = None;
-                Some((request_id, result))
-            }
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                // The worker died without sending anything -- a panic in backend construction. The
-                // command would otherwise wait forever for a reply that is never coming.
-                let request_id = pending.request_id.clone();
-                state_ref.pending_start = None;
-                Some((
-                    request_id,
-                    Err(neovibe_core::agent_backend::BackendError {
-                        message: "the backend connect worker stopped without reporting a result".to_string(),
-                        benign: false,
-                        // Nothing was ever folded: this failure is the ABSENCE of a backend, so
-                        // there is no projection it could have written into. See
-                        // `BackendError::folded_events`.
-                        folded_events: Vec::new(),
-                    }),
-                ))
-            }
-        }
-    };
-
-    let Some((request_id, result)) = finished else { return };
-    match result {
-        Ok(backend) => {
-            let snapshot = {
-                let mut state_ref = state.borrow_mut();
-                state_ref.reported_start_failure = false;
-                // The previous conversation's handoff command belongs to the previous conversation;
-                // a reload from here must not put it above a live one. Cleared on a session
-                // actually being INSTALLED, never on one merely being requested -- a start that
-                // fails has to leave the command still recoverable, since on the legacy backend it
-                // is the only surviving reference to that conversation.
-                state_ref.last_handoff = None;
-                // A new conversation holds no card yet; the old one's are gone with it.
-                state_ref.attention = Default::default();
-                state_ref.session = Some(backend);
-                // The frontend has been showing a connecting state since it sent start_session; give
-                // it the real projection immediately rather than making it wait for the first event.
-                let view = SnapshotView::of(state_ref.session.as_ref().unwrap());
-                serialize_snapshot_for_js(&view)
-            };
-            evaluate_js_dispatch(webview, &snapshot);
-            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
-        }
-        Err(error) => {
-            eprintln!("[agent_panel] backend failed to start: {}", error.message);
-            evaluate_js_dispatch(
-                webview,
-                &serialize_command_result_for_js(&request_id, Err(&error.message)),
+    for (tab, reason) in failed {
+        let message = format!(
+            "the session ended before it started ({reason}). If you were continuing a previous \
+             conversation, it most likely no longer exists -- start a new session instead."
+        );
+        eprintln!("[agent_panel] tab {}: {message}", tab.0);
+        let (dead, active) = {
+            let mut state_ref = state.borrow_mut();
+            let active = state_ref.tabs.active() == tab;
+            let on_screen = active && webview.is_mapped();
+            let Some(t) = state_ref.tabs.get_mut(tab) else { continue };
+            t.reported_start_failure = true;
+            // Its cards go with it (the tick reports the change).
+            t.attention.session_ended(on_screen);
+            let dead = std::mem::replace(
+                &mut t.backend,
+                TabBackend::Failed {
+                    reason: message.clone(),
+                },
             );
-            evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
+            (dead, active)
+        };
+        if let TabBackend::Live(backend) = dead {
+            state.borrow_mut().retiring.backend(backend);
+        }
+        if active {
+            evaluate_js_dispatch(webview, &serialize_error_for_js(tab, &message));
         }
     }
 }
 
-/// Non-blocking check on an in-flight terminal handoff, mirroring `collect_pending_start`.
+/// Every connect that finished since the last tick (`TabSet::collect_starts`), answered. `try_recv`
+/// only, inside the set: this runs on the GTK main loop 30 times a second and must never block it --
+/// which is the entire reason construction was moved off this thread in the first place.
+fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let collected = state.borrow_mut().tabs.collect_starts();
+    for result in collected {
+        match result {
+            StartCollected::Installed {
+                tab,
+                request_id,
+                first_turn,
+            } => {
+                // The panel has been showing this tab as starting; give it the real projection at
+                // once rather than making it wait for the first event.
+                let payloads = {
+                    let mut state_ref = state.borrow_mut();
+                    if state_ref.tabs.active() == tab {
+                        switch_payloads(&mut state_ref)
+                    } else {
+                        Vec::new()
+                    }
+                };
+                dispatch_all(webview, payloads);
+                match first_turn {
+                    Some(turn) => send_first_turn(state, webview, tab, &request_id, turn),
+                    None => evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(()))),
+                }
+            }
+            StartCollected::Failed { tab, request_id, error } => {
+                eprintln!(
+                    "[agent_panel] tab {}: backend failed to start: {}",
+                    tab.0, error.message
+                );
+                evaluate_js_dispatch(
+                    webview,
+                    &serialize_command_result_for_js(&request_id, Err(&error.message)),
+                );
+                // Ruling 14: only if that tab is on screen; it keeps the reason for later.
+                if state.borrow().tabs.active() == tab {
+                    evaluate_js_dispatch(webview, &serialize_error_for_js(tab, &error.message));
+                }
+            }
+        }
+    }
+}
+
+/// The first turn of a session started by it (ruling 4), sent once its backend is installed. Its
+/// `command_result` is the one the `send_message` that started the session was owed.
+fn send_first_turn(
+    state: &Rc<RefCell<AgentPanelState>>,
+    webview: &WebView,
+    tab: TabId,
+    request_id: &str,
+    turn: FirstTurn,
+) {
+    let outcome = {
+        let mut state_ref = state.borrow_mut();
+        if let Some(t) = state_ref.tabs.get_mut(tab) {
+            t.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
+        }
+        backend_for(&mut state_ref.tabs, tab).and_then(|backend| backend.send_turn(&turn.wire, &turn.typed))
+    };
+    if outcome.is_ok() {
+        title_from_first_prompt(state, tab, &turn.typed);
+    }
+    apply_command_outcome(state, webview, tab, request_id, outcome);
+}
+
+/// A tab with no title takes its first prompt's (`agent::persistence::title_from_prompt`, the rule
+/// the sidecar's record uses too).
+fn title_from_first_prompt(state: &Rc<RefCell<AgentPanelState>>, tab: TabId, typed: &str) {
+    let mut state_ref = state.borrow_mut();
+    if let Some(t) = state_ref.tabs.get_mut(tab) {
+        if t.title.is_none() {
+            t.title = agent::persistence::title_from_prompt(typed);
+        }
+    }
+}
+
+/// Every tab's in-flight terminal handoff, checked without blocking.
 ///
 /// The command is dispatched here and nowhere else, which is what makes the §8.3 ordering real: by
 /// the time the frontend can show a user the line to run, the session's own `shutdown()` has
-/// already returned on the worker thread.
-fn collect_pending_handoff(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
-    let finished = {
-        let mut state_ref = state.borrow_mut();
-        let Some(pending) = state_ref.pending_handoff.as_ref() else {
-            return;
+/// already returned on the worker thread. The handoff card goes out only if its tab is active
+/// (the tab keeps it in `last_handoff` for when it is shown, ruling 13); the `command_result` is
+/// owed either way, and the tick's `tabs` envelope reports the state change.
+fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let handing_off: Vec<TabId> = state
+        .borrow()
+        .tabs
+        .tabs()
+        .iter()
+        .filter(|t| t.pending_handoff.is_some())
+        .map(|t| t.id)
+        .collect();
+    for tab in handing_off {
+        let finished = {
+            let mut state_ref = state.borrow_mut();
+            let active = state_ref.tabs.active() == tab;
+            let Some(t) = state_ref.tabs.get_mut(tab) else { continue };
+            let Some(pending) = t.pending_handoff.as_ref() else {
+                continue;
+            };
+            let outcome = classify_close_signal(&pending.closed_rx);
+            if outcome == HandoffCloseOutcome::StillClosing {
+                continue;
+            }
+            let pending = t.pending_handoff.take().expect("checked Some above");
+            t.reported_start_failure = false;
+            t.turn_trace = None;
+            if outcome == HandoffCloseOutcome::Closed {
+                // Into the Rust host, not only down the wire: the panel's own reload affordance
+                // would otherwise destroy the only copy, and on the default legacy backend nothing
+                // else anywhere remembers this session id.
+                t.last_handoff = Some(pending.command.clone());
+            }
+            (pending, outcome, active)
         };
-        let outcome = classify_close_signal(&pending.closed_rx);
-        if outcome == HandoffCloseOutcome::StillClosing {
-            return;
+        let (pending, outcome, active) = finished;
+        if outcome == HandoffCloseOutcome::CloseFailed {
+            eprintln!("[agent_panel] tab {}: {HANDOFF_CLOSE_FAILED_MESSAGE}", tab.0);
         }
-        let pending = state_ref.pending_handoff.take().expect("checked Some above");
-        state_ref.reported_start_failure = false;
-        state_ref.turn_trace = None;
-        if outcome == HandoffCloseOutcome::Closed {
-            // Into the Rust host, not only down the wire. See `AgentPanelState::last_handoff` for
-            // why: the panel's own reload affordance would otherwise destroy the only copy, and on
-            // the default legacy backend nothing else anywhere remembers this session id.
-            state_ref.last_handoff = Some(pending.command.clone());
+        if active {
+            dispatch_all(
+                webview,
+                handoff_payloads(tab, &outcome, &pending.request_id, &pending.command),
+            );
+        } else {
+            let result = match outcome {
+                HandoffCloseOutcome::CloseFailed => Err(HANDOFF_CLOSE_FAILED_MESSAGE),
+                _ => Ok(()),
+            };
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&pending.request_id, result));
         }
-        Some((pending, outcome))
-    };
-
-    let Some((pending, outcome)) = finished else { return };
-    if outcome == HandoffCloseOutcome::CloseFailed {
-        eprintln!("[agent_panel] {HANDOFF_CLOSE_FAILED_MESSAGE}");
-    }
-    for payload in handoff_payloads(&outcome, &pending.request_id, &pending.command) {
-        evaluate_js_dispatch(webview, &payload);
     }
 }
 
@@ -1159,12 +1665,14 @@ fn classify_close_signal(closed_rx: &mpsc::Receiver<()>) -> HandoffCloseOutcome 
     }
 }
 
-/// The envelopes owed for a handoff whose close reached `outcome`, in dispatch order.
+/// The envelopes owed for a handoff whose close reached `outcome`, in dispatch order, when its tab
+/// is on screen.
 ///
 /// The property worth stating: only `Closed` ever produces a `handoff` envelope. A close that is
 /// still running, or one that died partway, must not be followed by a card whose first line claims
 /// the conversation is closed.
 fn handoff_payloads(
+    tab: TabId,
     outcome: &HandoffCloseOutcome,
     request_id: &str,
     command: &agent::handoff::ClaudeResumeCommand,
@@ -1172,16 +1680,15 @@ fn handoff_payloads(
     match outcome {
         HandoffCloseOutcome::StillClosing => Vec::new(),
         HandoffCloseOutcome::Closed => vec![
-            neovibe_core::agent_bridge::serialize_handoff_for_js(command),
+            neovibe_core::agent_bridge::serialize_handoff_for_js(tab, command),
             serialize_command_result_for_js(request_id, Ok(())),
         ],
         // The session is gone regardless -- it was handed to the worker before this. Saying so is
-        // the only honest option: an `error` envelope returns the frontend to the start screen,
-        // where a failed handoff reads as a dead session rather than as a conversation that is
-        // still there.
+        // the only honest option: an `error` envelope returns the tab to its empty screen, where a
+        // failed handoff reads as a dead session rather than as a conversation that is still there.
         HandoffCloseOutcome::CloseFailed => vec![
             serialize_command_result_for_js(request_id, Err(HANDOFF_CLOSE_FAILED_MESSAGE)),
-            serialize_error_for_js(HANDOFF_CLOSE_FAILED_MESSAGE),
+            serialize_error_for_js(tab, HANDOFF_CLOSE_FAILED_MESSAGE),
         ],
     }
 }
@@ -1192,53 +1699,25 @@ fn handoff_payloads(
 /// no `WebView`-free test otherwise, and "what does a reloaded panel get back" is exactly the list
 /// a later change loses something from without any test noticing.
 ///
-/// `hello` comes first: it tells the frontend which backend it is talking to and what that backend
-/// genuinely offers, which is what the start screen renders. `theme`, when given, comes second --
-/// before the snapshot or handoff card that would be drawn with it. The `Ready` handler always
-/// gives one, built from the panel's recorded tokens.
+/// `hello` first, then the theme and the keymap (colours before anything drawn with them), then the
+/// `tabs` envelope, then the active tab's own state. The handoff card is now one of the active
+/// tab's own payloads (`TabSet::active_state_payloads`), as its snapshot is.
 fn ready_payloads(
     mut greeting: BackendGreeting,
-    snapshot: Option<String>,
-    last_handoff: Option<&agent::handoff::ClaudeResumeCommand>,
+    open: &[String],
+    tabs: String,
+    active: Vec<String>,
     theme: Option<&str>,
     keymap: Option<&str>,
 ) -> Vec<String> {
-    // A session this panel just handed to a terminal must not also be offered for resume on the
-    // start screen: nothing holds a lock on it, so taking the offer would put two writers on one
-    // transcript -- which is the exact hazard the handoff card warns about. This has to happen here
-    // rather than only in the frontend, because `hello` is recomputed on every mount and the
-    // handed-over session has the greatest `updated_at`, so it would otherwise head the list.
-    //
-    // It removes exactly that one row. Clearing the whole offer would hide every other session the
-    // workspace remembers, which is a different and worse bug than the one this prevents.
-    if let Some(command) = last_handoff {
-        greeting
-            .resumable
-            .retain(|r| r.provider_session_id != command.provider_session_id());
-    }
-
+    // Ruling 17: no session open in any tab, or handed off from one, is offered for resume -- the
+    // lease refuses a second driver, and a handed-off one has a CLI writing it.
+    greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
     let mut payloads = vec![serialize_hello_for_js(&greeting)];
-    // Colours before anything drawn with them.
-    if let Some(theme) = theme {
-        payloads.push(theme.to_string());
-    }
-    if let Some(keymap) = keymap {
-        payloads.push(keymap.to_string());
-    }
-    match snapshot {
-        // A live session wins. `collect_pending_start` clears `last_handoff` when one is installed,
-        // so a stale card and a live conversation cannot both be current -- but this ordering does
-        // not depend on that being right, which is the point of writing it as an either/or.
-        Some(snapshot) => payloads.push(snapshot),
-        // No session yet is not an error: the frontend shows its start screen. If this panel closed
-        // a conversation into a terminal, the command for it belongs on that screen -- including
-        // after a reload, which is the case this whole path exists for.
-        None => {
-            if let Some(command) = last_handoff {
-                payloads.push(neovibe_core::agent_bridge::serialize_handoff_for_js(command));
-            }
-        }
-    }
+    payloads.extend(theme.map(str::to_string));
+    payloads.extend(keymap.map(str::to_string));
+    payloads.push(tabs);
+    payloads.extend(active);
     payloads
 }
 
@@ -1263,34 +1742,41 @@ fn events_owed(
     }
 }
 
-/// Applies one command's outcome to the panel and the frontend, uniformly.
+/// Applies one command's outcome to its tab and the frontend, uniformly.
 ///
 /// The benign/fatal split is the whole point: a benign failure (a turn sent while one was running,
 /// a permission answered twice) reports itself and leaves the session alone, while a fatal one
-/// tears the session down and tells the frontend the whole session is gone. Before this existed the
-/// same three-branch shape was copy-pasted at every call site, which is how the two classes drifted.
+/// retires the tab's backend and marks the tab `Failed` (ruling 14). Events and the `error`
+/// envelope go out only if `tab` is the active one -- the WebView draws only that tab, and a
+/// background tab catches up with a snapshot when it is switched to. The `command_result` is owed
+/// either way.
 fn apply_command_outcome(
     state: &Rc<RefCell<AgentPanelState>>,
     webview: &WebView,
+    tab: TabId,
     request_id: &str,
-    outcome: Result<Vec<agent::AgentDomainEvent>, neovibe_core::agent_backend::BackendError>,
+    outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
 ) {
     let events = events_owed(&outcome);
-    if !events.is_empty() {
+    let active = state.borrow().tabs.active() == tab;
+    if !events.is_empty() && active {
         // Only the legacy backend ever gets here with a non-empty batch: it synthesizes events its
         // own wire protocol cannot provide. The sidecar backend returns an empty vec and its state
         // arrives through the pump, from the server.
-        let state_ref = state.borrow();
-        let through_revision = state_ref
-            .session
-            .as_ref()
-            .map(|s| s.projection().last_revision)
-            .unwrap_or(0);
+        let through_revision = {
+            let state_ref = state.borrow();
+            let revision = state_ref
+                .tabs
+                .get(tab)
+                .and_then(|t| t.live())
+                .map(|b| b.projection().last_revision)
+                .unwrap_or(0);
+            revision
+        };
         let from_revision = through_revision.saturating_sub(events.len() as u64);
-        drop(state_ref);
         evaluate_js_dispatch(
             webview,
-            &serialize_events_for_js(from_revision, through_revision, events),
+            &serialize_events_for_js(tab, from_revision, through_revision, events),
         );
     }
     match outcome {
@@ -1299,8 +1785,8 @@ fn apply_command_outcome(
         }
         Err(error) if error.benign => {
             eprintln!(
-                "[agent_panel] command rejected (session stays alive): {}",
-                error.message
+                "[agent_panel] tab {}: command rejected (session stays alive): {}",
+                tab.0, error.message
             );
             evaluate_js_dispatch(
                 webview,
@@ -1308,38 +1794,38 @@ fn apply_command_outcome(
             );
         }
         Err(error) => {
-            eprintln!("[agent_panel] command failed fatally: {}", error.message);
+            eprintln!("[agent_panel] tab {}: command failed fatally: {}", tab.0, error.message);
             // Retired on a worker thread, for the same reason construction runs on one. Two separate
-            // problems with doing it here: `AgentConversation` has no `Drop`, so a bare
-            // `session = None` never sends `close_session` at all and the sidecar is left holding a
-            // session it thinks is live; and the drop chain that DOES run (SpawnedSidecar polls for
-            // up to 3s before escalating to SIGKILL, then RuntimeThread joins its Tokio thread)
-            // would block the whole shell -- editor pane included -- on the GTK main loop.
-            //
-            // Calling `shutdown()` inline instead would be worse, not better: it issues
-            // `close_session` through a unary RPC bounded at 10s, which is precisely the timeout
-            // case that gets here in the first place.
-            //
-            // Two statements, not `if let Some(..) = state.borrow_mut().session.take()`: the latter
-            // keeps the `RefMut` alive across the whole body.
-            let attention_before = state.borrow().attention.attention();
-            let on_screen = webview.is_mapped();
+            // problems with doing it here: `AgentConversation` has no `Drop`, so a bare drop never
+            // sends `close_session` at all and the sidecar is left holding a session it thinks is
+            // live; and the drop chain that DOES run (SpawnedSidecar polls for up to 3s before
+            // escalating to SIGKILL, then RuntimeThread joins its Tokio thread) would block the
+            // whole shell -- editor pane included -- on the GTK main loop.
+            let attention_before = state.borrow().tabs.attention();
+            let on_screen = active && webview.is_mapped();
             let dead = {
                 let mut state_ref = state.borrow_mut();
-                // The cards of a session that is gone can no longer be answered (the whole-branch
-                // review's finding 2: a hidden chat kept reading `agent ⚑N`, and `Ctrl+a a` landed
-                // on a card nobody could answer).
-                state_ref.attention.session_ended(on_screen);
-                state_ref.session.take()
+                state_ref.tabs.get_mut(tab).map(|t| {
+                    // The cards of a session that is gone can no longer be answered.
+                    t.attention.session_ended(on_screen);
+                    std::mem::replace(
+                        &mut t.backend,
+                        TabBackend::Failed {
+                            reason: error.message.clone(),
+                        },
+                    )
+                })
             };
-            if let Some(mut backend) = dead {
-                std::thread::spawn(move || backend.shutdown());
+            if let Some(TabBackend::Live(backend)) = dead {
+                state.borrow_mut().retiring.backend(backend);
             }
             evaluate_js_dispatch(
                 webview,
                 &serialize_command_result_for_js(request_id, Err(&error.message)),
             );
-            evaluate_js_dispatch(webview, &serialize_error_for_js(&error.message));
+            if active {
+                evaluate_js_dispatch(webview, &serialize_error_for_js(tab, &error.message));
+            }
             report_attention(state, attention_before);
         }
     }
@@ -1352,24 +1838,49 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         // no command_result is possible (see parse_inbound_message's own doc).
         return;
     };
+    // The window is closing and its tabs are gone; a document still posting has nothing to reach.
+    if state.borrow().shutting_down {
+        return;
+    }
     let request_id = message.request_id().to_string();
+    // Spec §3.8 point 2 and ruling 2: a tab command names its tab, or it is refused. Never "the
+    // active one" -- a permission answered just after a switch must reach the tab that asked.
+    let target = match state.borrow().tabs.resolve(message.tab_ref()) {
+        Ok(target) => target,
+        Err(protocol) => {
+            eprintln!("[agent_panel] refused {request_id}: {protocol}");
+            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(&protocol)));
+            return;
+        }
+    };
+    let tab_of = |target: Option<TabId>| target.expect("a tab-scoped message resolved to a tab");
+    let ok = |webview: &WebView| evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
+    let refuse = |webview: &WebView, why: &str| {
+        evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Err(why)));
+    };
 
     match message {
         InboundMessage::Ready { .. } => {
             // Everything a fresh document is owed is decided by one pure function, so the reload
             // path is testable without a WebView -- see `ready_payloads`.
-            let payloads = {
-                let state_ref = state.borrow();
+            let (payloads, launch_chooser) = {
+                let mut state_ref = state.borrow_mut();
+                let state_ref = &mut *state_ref;
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
-                let snapshot = state_ref
-                    .session
-                    .as_ref()
-                    .map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
+                let open = state_ref.tabs.open_session_ids();
+                let offerable = greeting
+                    .resumable
+                    .iter()
+                    .filter(|r| !open.contains(&r.provider_session_id))
+                    .count();
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
+                let tabs = tabs_payload_recorded(state_ref);
+                let active = state_ref.tabs.active_state_payloads();
                 let mut payloads = ready_payloads(
                     greeting,
-                    snapshot,
-                    state_ref.last_handoff.as_ref(),
+                    &open,
+                    tabs,
+                    active,
                     Some(&theme),
                     state_ref.keymap_help.as_deref(),
                 );
@@ -1377,98 +1888,170 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 payloads.push(neovibe_core::agent_bridge::serialize_pane_focus_for_js(
                     state_ref.pane_focused,
                 ));
-                payloads
+                state_ref.last_open_ids = open;
+                // D10 / ruling 16: decided on the process's FIRST `ready` only, never on a reload.
+                let launch_chooser = !state_ref.launch_chooser_done
+                    && state_ref.launch_chooser_allowed
+                    && neovibe_core::tabs::launch_opens_chooser(offerable, true);
+                state_ref.launch_chooser_done = true;
+                (payloads, launch_chooser)
             };
-            for payload in payloads {
+            dispatch_all(webview, payloads);
+            ok(webview);
+            if launch_chooser {
+                let (payload, hook) = {
+                    let state_ref = state.borrow();
+                    (chooser_payload(&state_ref, true), state_ref.launch_chooser_hook.clone())
+                };
                 evaluate_js_dispatch(webview, &payload);
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
-            evaluate_js_dispatch(webview, &serialize_command_result_for_js(&request_id, Ok(())));
-        }
-        InboundMessage::StartSession { mode, resume, .. } => {
-            let mut state_ref = state.borrow_mut();
-            if state_ref.session.is_some() {
-                drop(state_ref);
-                evaluate_js_dispatch(
-                    webview,
-                    &serialize_command_result_for_js(&request_id, Err("a session already exists")),
-                );
-                return;
-            }
-            if state_ref.pending_start.is_some() {
-                // A second start while one is already connecting. Rejecting is right: accepting
-                // would spawn a second sidecar process whose result would overwrite the first,
-                // leaking it.
-                drop(state_ref);
-                evaluate_js_dispatch(
-                    webview,
-                    &serialize_command_result_for_js(&request_id, Err("a session is already starting")),
-                );
-                return;
-            }
-            if state_ref.pending_handoff.is_some() {
-                // `session` is already `None` at this point (the handoff took it), so nothing above
-                // catches this. Starting here would spawn a second `claude` alongside the one still
-                // being closed, in the same project.
-                drop(state_ref);
-                evaluate_js_dispatch(
-                    webview,
-                    &serialize_command_result_for_js(
-                        &request_id,
-                        Err("the previous session is still being handed off to a terminal"),
-                    ),
-                );
-                return;
-            }
-
-            let backend_kind = state_ref.backend_kind;
-            let project_dir = state_ref.project_dir.clone();
-            let permission_mode: agent::PermissionMode = mode.into();
-
-            // Off the GTK main loop. Constructing the sidecar backend spawns a real process, does a
-            // real gRPC handshake, and on a cold Verdandi checkout runs `npm ci` + `npm run build`.
-            // Doing that here would freeze the editor -- for minutes, in the cold case.
-            let (result_tx, result_rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = AgentBackend::start(backend_kind, &project_dir, permission_mode, resume.as_deref());
-                // The receiver is gone only if the panel was torn down mid-connect; dropping the
-                // backend here is then the correct cleanup (its Drop shuts the sidecar down).
-                let _ = result_tx.send(result);
-            });
-            state_ref.pending_start = Some(PendingStart { request_id, result_rx });
-            // No command_result yet -- it is owed once the worker reports, and `collect_pending_start`
-            // on the next tick is what pays it.
         }
         InboundMessage::SendMessage { text, .. } => {
-            let outcome = {
+            let tab = tab_of(target);
+            enum Plan {
+                Sent(Result<Vec<agent::AgentDomainEvent>, BackendError>),
+                Starting,
+                Refused(&'static str),
+            }
+            let plan = {
                 let mut state_ref = state.borrow_mut();
-                // wire 1's one composition point. Above both backends on purpose: the turn's String
-                // travels unmodified from here to `send_turn` on either path, so composing here
-                // gives legacy the feature for free and changes no wire format. The context is read
-                // NOW rather than remembered, and a `None` means the turn goes out exactly as the
-                // user typed it.
+                let state_ref = &mut *state_ref;
+                // wire 1's one composition point, read when Enter is pressed (ruling 4). Above both
+                // backends on purpose: the turn's String travels unmodified from here to
+                // `send_turn` on either path. A `None` context means the turn goes out exactly as
+                // the user typed it.
                 let composed =
                     neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
-                // Stamped before the call, so the trace's zero is the user's action rather than the
-                // moment the backend got around to accepting it.
-                state_ref.turn_trace = neovibe_core::turn_trace::TurnTrace::start();
-                match state_ref.session.as_mut() {
-                    // `&text` second, and it is the user's own: the panel shows what was typed,
-                    // never the composed wire text.
-                    Some(session) => session.send_turn(&composed, &text),
-                    None => Err(no_session_error()),
+                let kind = state_ref.backend_kind;
+                let project_dir = state_ref.project_dir.clone();
+                let t = state_ref.tabs.get_mut(tab).expect("resolved above");
+                if t.pending_handoff.is_some() {
+                    // Starting here would spawn a second `claude` alongside the one still being
+                    // closed, in the same project.
+                    Plan::Refused("the previous session is still being handed off to a terminal")
+                } else {
+                    match &mut t.backend {
+                        TabBackend::Live(backend) => {
+                            // Stamped before the call, so the trace's zero is the user's action
+                            // rather than the moment the backend got around to accepting it.
+                            let trace = neovibe_core::turn_trace::TurnTrace::start();
+                            // `&text` second, and it is the user's own: the panel shows what was
+                            // typed, never the composed wire text.
+                            let outcome = backend.send_turn(&composed, &text);
+                            t.turn_trace = trace;
+                            Plan::Sent(outcome)
+                        }
+                        TabBackend::NotStarted => {
+                            let result_rx = spawn_connect(kind, project_dir, t.mode, None);
+                            t.backend = TabBackend::Starting(PendingStart {
+                                request_id: request_id.clone(),
+                                result_rx,
+                                first_turn: Some(FirstTurn {
+                                    wire: composed,
+                                    typed: text.clone(),
+                                }),
+                                resume: None,
+                                resumed_title: None,
+                                resumed_name: None,
+                            });
+                            Plan::Starting
+                        }
+                        TabBackend::Starting(_) => Plan::Refused("the session is still starting"),
+                        TabBackend::Failed { .. } => Plan::Refused("this tab's session failed; press r to start over"),
+                    }
                 }
             };
-            apply_command_outcome(state, webview, &request_id, outcome);
+            match plan {
+                Plan::Sent(outcome) => {
+                    if outcome.is_ok() {
+                        title_from_first_prompt(state, tab, &text);
+                    }
+                    apply_command_outcome(state, webview, tab, &request_id, outcome);
+                }
+                // The `command_result` is owed once the connect finishes and the first turn is
+                // sent (`collect_pending_starts`).
+                Plan::Starting => send_tabs(state, webview),
+                Plan::Refused(why) => refuse(webview, why),
+            }
+        }
+        InboundMessage::Resume {
+            provider_session_id, ..
+        } => {
+            let tab = tab_of(target);
+            if state
+                .borrow()
+                .tabs
+                .get(tab)
+                .is_some_and(|t| t.pending_handoff.is_some())
+            {
+                refuse(webview, "the previous session is still being handed off to a terminal");
+                return;
+            }
+            let canonical = state.borrow().canonical_project_dir.clone();
+            let held = agent::lease::SessionLease::is_held("claude", &canonical, &provider_session_id).unwrap_or(false);
+            let route = state.borrow_mut().tabs.route_resume(tab, &provider_session_id, held);
+            match route {
+                ResumeRoute::SwitchTo(_) => {
+                    send_switch(state, webview);
+                    ok(webview);
+                }
+                ResumeRoute::Refuse(why) => refuse(webview, &why),
+                ResumeRoute::StartIn(target_tab) => {
+                    {
+                        let mut state_ref = state.borrow_mut();
+                        let state_ref = &mut *state_ref;
+                        let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
+                        // The rename and the title separately (the whole-branch review): the
+                        // label puts a rename first (spec §3.2), and folding the two into the
+                        // title lost the rename whenever the record had both.
+                        let (resumed_title, resumed_name) = greeting
+                            .resumable
+                            .iter()
+                            .find(|r| r.provider_session_id == provider_session_id)
+                            .map(|r| (r.title.clone(), r.name.clone()))
+                            .unwrap_or_default();
+                        let kind = state_ref.backend_kind;
+                        let project_dir = state_ref.project_dir.clone();
+                        let t = state_ref
+                            .tabs
+                            .get_mut(target_tab)
+                            .expect("route_resume names a tab it has");
+                        let result_rx = spawn_connect(kind, project_dir, t.mode, Some(provider_session_id.clone()));
+                        t.backend = TabBackend::Starting(PendingStart {
+                            request_id: request_id.clone(),
+                            result_rx,
+                            first_turn: None,
+                            resume: Some(provider_session_id),
+                            resumed_title,
+                            resumed_name,
+                        });
+                        // A new tab is already selected by `route_resume`; this is for the record.
+                        state_ref.tabs.select(target_tab);
+                    }
+                    // The command_result is owed once the connect finishes.
+                    send_switch(state, webview);
+                }
+            }
         }
         InboundMessage::Interrupt { .. } => {
-            let outcome = {
-                let mut state_ref = state.borrow_mut();
-                match state_ref.session.as_mut() {
-                    Some(session) => session.interrupt(),
-                    None => Err(no_session_error()),
-                }
-            };
-            apply_command_outcome(state, webview, &request_id, outcome);
+            let tab = tab_of(target);
+            let outcome = backend_for(&mut state.borrow_mut().tabs, tab).and_then(|backend| backend.interrupt());
+            apply_command_outcome(state, webview, tab, &request_id, outcome);
+        }
+        InboundMessage::PermissionResponse {
+            permission_id,
+            decision,
+            reason,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let decision = decision.into_decision(reason);
+            let outcome = backend_for(&mut state.borrow_mut().tabs, tab)
+                .and_then(|backend| backend.respond_permission(&permission_id, decision));
+            apply_command_outcome(state, webview, tab, &request_id, outcome);
         }
         InboundMessage::HintRequest { .. } => {
             // Cloned out of the borrow before calling: the hook calls back into this handle,
@@ -1490,8 +2073,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         } => {
             // Purely a diagnostic: no command_result, and nothing downstream reads it. A WebView
             // that never sends one costs only a missing column in a trace line.
+            let tab = tab_of(target);
             let mut state_ref = state.borrow_mut();
-            if let Some(trace) = state_ref.turn_trace.as_mut() {
+            if let Some(trace) = state_ref.tabs.get_mut(tab).and_then(|t| t.turn_trace.as_mut()) {
                 trace.mark_painted(receive_to_frame_ms);
                 if trace.is_complete() {
                     trace.emit();
@@ -1499,13 +2083,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
         }
         InboundMessage::HandoffToTerminal { .. } => {
+            let tab = tab_of(target);
             // The command is built from canonical state FIRST, while the session is still readable
             // -- ownership moves to the shutdown worker below and nothing here can read it after
             // that. Owned values rather than borrows because `prepare_handoff` is a pure function
             // and the `RefCell` borrow must not outlive this block.
             let (project_dir, session_facts, already_handing_off) = {
                 let state_ref = state.borrow();
-                let facts = state_ref.session.as_ref().map(|backend| {
+                let t = state_ref.tabs.get(tab).expect("resolved above");
+                let facts = t.live().map(|backend| {
                     // `provider_session_id()` BEFORE `projection()`, and the order is load-bearing
                     // rather than stylistic. On the sidecar path both reach for the SAME
                     // `Mutex<IngestState>` -- `projection()` returns a guard that holds it, and
@@ -1513,8 +2099,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     // so calling the second inside the first's scope deadlocks the GTK main loop
                     // outright: no clicks, no keys, not even a compositor close request, with the
                     // last frame still painted so it looks alive. Reproduced 3/3 on 2026-09-15 and
-                    // confirmed by backtrace; the legacy path never showed it because its
-                    // `projection()` borrows a plain field and takes no lock at all.
+                    // confirmed by backtrace.
                     let provider_session_id = backend.provider_session_id();
                     let projection = backend.projection();
                     (
@@ -1524,17 +2109,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                         crate::terminal_handoff::ConversationLiveness::of(&projection.status),
                     )
                 });
-                (
-                    state_ref.project_dir.clone(),
-                    facts,
-                    state_ref.pending_handoff.is_some(),
-                )
+                (state_ref.project_dir.clone(), facts, t.pending_handoff.is_some())
             };
             if already_handing_off {
-                evaluate_js_dispatch(
-                    webview,
-                    &serialize_command_result_for_js(&request_id, Err("this conversation is already being handed off")),
-                );
+                refuse(webview, "this conversation is already being handed off");
                 return;
             }
             let prepared = crate::terminal_handoff::prepare_handoff(
@@ -1556,32 +2134,31 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     // The frontend disables the control for exactly these states, so reaching here
                     // means its view was stale (a turn started between the render and the click).
                     // The session is untouched.
-                    evaluate_js_dispatch(
-                        webview,
-                        &serialize_command_result_for_js(&request_id, Err(&refusal.message())),
-                    );
+                    refuse(webview, &refusal.message());
                     return;
                 }
             };
 
-            // Design doc §8.3 steps 1-5, in the only order that is safe: from here on this panel
-            // holds no session, so no further turn can be sent, and `shutdown()` itself cancels
-            // every pending permission (fail-closed) and closes the provider's session.
-            // Two statements, not one `let ... else`: the same reason `apply_command_outcome`'s
-            // fatal branch is written this way -- it keeps the `RefMut` from being alive during
-            // whatever the failure branch does.
-            let taken = state.borrow_mut().session.take();
+            // Design doc §8.3 steps 1-5, in the only order that is safe: from here on this tab
+            // holds no session (`NotStarted` at once, ruling 13), so no further turn can be sent,
+            // and `shutdown()` itself cancels every pending permission (fail-closed) and closes the
+            // provider's session.
+            let taken = {
+                let mut state_ref = state.borrow_mut();
+                let t = state_ref.tabs.get_mut(tab).expect("resolved above");
+                match std::mem::replace(&mut t.backend, TabBackend::NotStarted) {
+                    TabBackend::Live(backend) => Some(backend),
+                    other => {
+                        t.backend = other;
+                        None
+                    }
+                }
+            };
             let Some(mut backend) = taken else {
                 // `prepare_handoff` already returned `NoSession` for this, so it is unreachable
                 // unless something took the session between that call and this line -- both run on
                 // the GTK main loop, so nothing can. Reported rather than unwrapped anyway.
-                evaluate_js_dispatch(
-                    webview,
-                    &serialize_command_result_for_js(
-                        &request_id,
-                        Err("the conversation ended before it could be handed off"),
-                    ),
-                );
+                refuse(webview, "the conversation ended before it could be handed off");
                 return;
             };
             let (closed_tx, closed_rx) = mpsc::channel();
@@ -1590,41 +2167,173 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 backend.shutdown();
                 // Sent after `shutdown()` returns, which is the whole signal: the command is not
                 // dispatched until this arrives. A panic inside `shutdown()` drops the sender
-                // instead, which `collect_pending_handoff` reads as a failed close.
+                // instead, which `collect_pending_handoffs` reads as a failed close.
                 let _ = closed_tx.send(());
                 // Then the drop, which is a separate and later event: `shutdown()` issues
                 // `close_session` and joins ingestion, while it is `SpawnedSidecar::drop` that ends
-                // the child. The command is deliberately NOT made to wait for it -- the user has
-                // been told the conversation is closed in Neovibe, which `close_session` makes
-                // true -- but a window closing at this moment is, so it gets its own signal.
+                // the child. The command is deliberately NOT made to wait for it, but a window
+                // closing at this moment is, so it gets its own signal.
                 drop(backend);
                 let _ = dropped_tx.send(());
             });
-            state.borrow_mut().pending_handoff = Some(PendingHandoff {
-                request_id,
-                command,
-                closed_rx,
-                dropped_rx,
-            });
-            // No command_result yet -- `collect_pending_handoff` owes it once the close finishes.
+            if let Some(t) = state.borrow_mut().tabs.get_mut(tab) {
+                t.pending_handoff = Some(PendingHandoff {
+                    request_id,
+                    command,
+                    closed_rx,
+                    dropped_rx,
+                });
+            }
+            // No command_result yet -- `collect_pending_handoffs` owes it once the close finishes.
+            send_tabs(state, webview);
         }
-        InboundMessage::PermissionResponse {
-            permission_id,
-            decision,
-            reason,
-            ..
-        } => {
-            let decision = decision.into_decision(reason);
-            let outcome = {
-                let mut state_ref = state.borrow_mut();
-                match state_ref.session.as_mut() {
-                    Some(session) => session.respond_permission(&permission_id, decision),
-                    None => Err(no_session_error()),
+        InboundMessage::SelectTab { .. } => {
+            let tab = tab_of(target);
+            state.borrow_mut().tabs.select(tab);
+            send_switch(state, webview);
+            ok(webview);
+        }
+        InboundMessage::RenameTab { name, .. } => {
+            let tab = tab_of(target);
+            state.borrow_mut().tabs.rename(tab, &name);
+            send_tabs(state, webview);
+            ok(webview);
+        }
+        InboundMessage::CloseTab { .. } => {
+            let tab = tab_of(target);
+            match close_tab(state, webview, tab) {
+                Ok(()) => ok(webview),
+                Err(why) => refuse(webview, why),
+            }
+        }
+        InboundMessage::ResetTab { .. } => {
+            let tab = tab_of(target);
+            let before = state.borrow().tabs.attention();
+            let reset = state.borrow_mut().tabs.reset(tab);
+            match reset {
+                Ok(old) => {
+                    if let Some(old) = old {
+                        state.borrow_mut().retiring.backend(old);
+                    }
+                    let payloads = {
+                        let mut state_ref = state.borrow_mut();
+                        if state_ref.tabs.active() == tab {
+                            // `tabs` and the (empty) tab's own state.
+                            switch_payloads(&mut state_ref)
+                        } else {
+                            vec![tabs_payload_recorded(&mut state_ref)]
+                        }
+                    };
+                    dispatch_all(webview, payloads);
+                    send_hello_if_open_sessions_changed(state, webview);
+                    report_attention(state, before);
+                    ok(webview);
                 }
-            };
-            apply_command_outcome(state, webview, &request_id, outcome);
+                Err(why) => refuse(webview, &why),
+            }
+        }
+        InboundMessage::CycleMode { .. } => {
+            let tab = tab_of(target);
+            let cycled = state.borrow_mut().tabs.cycle_mode(tab);
+            match cycled {
+                Some(mode) => {
+                    let (prefs_dir, project_dir) = {
+                        let state_ref = state.borrow();
+                        (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
+                    };
+                    // Remembered for the next empty tab and the next launch (ruling 5). A failure
+                    // to write is logged, not refused: the mode itself did change.
+                    if let Some(dir) = prefs_dir {
+                        if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
+                            eprintln!("[agent_panel] could not remember the permission mode: {e}");
+                        }
+                    }
+                    send_tabs(state, webview);
+                    ok(webview);
+                }
+                None => refuse(webview, "the mode is fixed for this session"),
+            }
+        }
+        InboundMessage::OpenDetail { .. } => {
+            let tab = tab_of(target);
+            let payload = detail_payload(&state.borrow(), tab);
+            evaluate_js_dispatch(webview, &payload);
+            ok(webview);
+        }
+        InboundMessage::ChooserClosed { launch, .. } => {
+            let hook = state.borrow().chooser_closed_hook.clone();
+            if let Some(hook) = hook {
+                hook(launch);
+            }
+            ok(webview);
         }
     }
+}
+
+/// `y` to `prefix &` (spec §3.5): `tabs::close_steps`, in order. The record is never deleted.
+///
+/// **Refused while the tab is handing off** (the session-tabs whole-branch review): the close takes
+/// at most the sidecar's 10 s `close_session`, and the only thing it produces is the command the
+/// user asked to be shown. Closing the tab under it would drop the command and the
+/// `command_result` the panel is still waiting on.
+///
+/// A tab closed while it is still connecting has its `send_message`/`resume` answered with an
+/// error here, so the panel's in-flight record is closed and a first message comes back with its
+/// text (ruling 3); its connect is kept in `Retiring` and shut down when it finishes.
+fn close_tab(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId) -> Result<(), &'static str> {
+    let before = state.borrow().tabs.attention();
+    let Some(facts) = state.borrow().tabs.close_facts(tab) else {
+        return Ok(());
+    };
+    if state
+        .borrow()
+        .tabs
+        .get(tab)
+        .is_some_and(|t| t.pending_handoff.is_some())
+    {
+        return Err("this tab is still being handed off to a terminal; close it once that finishes");
+    }
+    let mut owed = Vec::new();
+    for step in neovibe_core::tabs::close_steps(&facts) {
+        match step {
+            neovibe_core::tabs::CloseStep::Interrupt => {
+                let interrupted = backend_for(&mut state.borrow_mut().tabs, tab).and_then(|b| b.interrupt());
+                if let Err(e) = interrupted {
+                    // The close goes on: the shutdown below ends the turn anyway.
+                    eprintln!(
+                        "[agent_panel] tab {}: interrupt before close failed: {}",
+                        tab.0, e.message
+                    );
+                }
+            }
+            // Always 0 queued in phase 2.
+            neovibe_core::tabs::CloseStep::QueueToHistory => {}
+            // Folded into `Remove`: `Retiring::tab` shuts the removed tab's backend down.
+            neovibe_core::tabs::CloseStep::Shutdown => {}
+            neovibe_core::tabs::CloseStep::Remove => {
+                let mut state_ref = state.borrow_mut();
+                let state_ref = &mut *state_ref;
+                if let Some(removed) = state_ref.tabs.remove(tab) {
+                    owed = state_ref.retiring.tab(removed);
+                }
+            }
+        }
+    }
+    let payloads = switch_payloads(&mut state.borrow_mut());
+    dispatch_all(webview, payloads);
+    // After the switch, not before: the panel restores a refused send into the composer only while
+    // its tab is the active one, and the switch that follows would then replace it with the next
+    // tab's draft. Answered once the closed tab is no longer active, the refusal is reported with
+    // the message's full text instead (ruling 3), and the switch cannot clear that notice.
+    for request_id in owed {
+        evaluate_js_dispatch(
+            webview,
+            &serialize_command_result_for_js(&request_id, Err(TAB_CLOSED_MESSAGE)),
+        );
+    }
+    send_hello_if_open_sessions_changed(state, webview);
+    report_attention(state, before);
+    Ok(())
 }
 
 /// A command arriving with no session. Benign: the frontend's start screen is showing, or the
@@ -1673,6 +2382,12 @@ fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::The
         1.0,
     ));
 }
+
+/// The panel document's base URI. A secure context, so `navigator.clipboard` exists and every `y`
+/// reaches the clipboard -- with no base the document's origin is opaque and it does not (GUI pass,
+/// 2026-09-25). `.invalid` never resolves (RFC 2606): nothing is ever fetched from it, and a
+/// relative link is still a `LinkClicked` that `connect_decide_policy` hands to the browser.
+const PANEL_BASE_URI: &str = "https://neovibe.invalid/";
 
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!(
@@ -1729,6 +2444,294 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use neovibe_core::tab_set::{TabBackend, TabSet};
+    use neovibe_core::tabs::TabId;
+    use neovibe_core::test_providers::RecordingProvider;
+
+    /// GUI pass, 2026-09-25: every `y` in the panel (a row, a code block, the handoff command, the
+    /// `prefix i` popover's line) calls `navigator.clipboard.writeText`, and none of them ever
+    /// reached the clipboard. `load_html(.., None)` gives the document an opaque origin, which is not
+    /// a secure context, so WebKitGTK 2.52.6 has no `navigator.clipboard` and the optional chain
+    /// did nothing. Measured in the sandbox with a bare WebKitGTK view: base `None`, nothing copied;
+    /// base `https://neovibe.invalid/`, `wl-paste` printed the text. Every `load_html` here must
+    /// pass the secure base, and the base must stay one that never resolves (RFC 2606 `.invalid`):
+    /// a relative link is still a `LinkClicked` the navigation guard hands to the browser.
+    #[test]
+    fn the_panel_document_is_loaded_in_a_secure_context_that_never_resolves() {
+        assert!(PANEL_BASE_URI.starts_with("https://"), "{PANEL_BASE_URI}");
+        let host = PANEL_BASE_URI.trim_start_matches("https://").trim_end_matches('/');
+        assert!(host.ends_with(".invalid"), "{host}");
+        let source = include_str!("agent_panel.rs");
+        let calls: Vec<&str> = source
+            // Every product call passes a borrowed document (`&themed_document(..)`); this test's own
+            // needle does not, which is what keeps it out of the list.
+            .match_indices(concat!(".load_html", "(&"))
+            .map(|(i, _)| {
+                let rest = &source[i..];
+                &rest[..rest.find(';').unwrap_or(rest.len())]
+            })
+            .collect();
+        assert!(calls.len() >= 2, "{calls:?}");
+        for call in calls {
+            assert!(call.contains("Some(PANEL_BASE_URI)"), "a load_html without the secure base: {call}");
+        }
+    }
+
+    fn live_backend(dir: &std::path::Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation =
+            agent::AgentConversation::create(provider.clone(), dir, agent::PermissionMode::Auto).unwrap();
+        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+    }
+
+    /// Review focus 1 (spec §3.8 point 2): a permission answered after a switch reaches the tab
+    /// that asked, not the one on screen.
+    #[test]
+    fn a_permission_answer_names_its_own_tab_not_the_active_one() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-permission-tab");
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let asking = set.active();
+        let (asking_provider, backend) = live_backend(&dir);
+        set.get_mut(asking).unwrap().backend = TabBackend::Live(backend);
+        let other = set.open();
+        let (other_provider, backend) = live_backend(&dir);
+        set.get_mut(other).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(set.active(), other, "the user has switched away");
+        // `perm-1` must really be pending on the asking tab: a conversation refuses an answer to a
+        // permission it never asked for. A `Write` needs a human, so the pump leaves it a card.
+        asking_provider.queue(agent::AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while set.get(asking).unwrap().attention.attention().pending != 1 {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for the card");
+            set.pump(&dir, true);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let message = parse_inbound_message(&format!(
+            r#"{{"type":"permission_response","request_id":"r","tab":{},"permission_id":"perm-1","decision":"allow"}}"#,
+            asking.0
+        ))
+        .unwrap();
+        let tab = set.resolve(message.tab_ref()).unwrap().unwrap();
+        let outcome = backend_for(&mut set, tab)
+            .and_then(|backend| backend.respond_permission("perm-1", agent::PermissionDecision::Allow));
+        assert!(outcome.is_ok());
+        assert_eq!(asking_provider.resolutions(), vec![("perm-1".to_string(), true)]);
+        assert!(other_provider.resolutions().is_empty(), "never the active tab");
+        for mut tab in set.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// The whole-branch review: a tab closed while the window stays open is kept in panel state
+    /// until its teardown or connect finishes, so the window-close backstop can see it; and the
+    /// command a connecting tab still owed is handed back to be answered.
+    #[test]
+    fn a_closed_tabs_teardown_and_connect_are_kept_until_they_finish() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-retiring");
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let live = set.active();
+        set.get_mut(live).unwrap().backend = TabBackend::Live(live_backend(&dir).1);
+        let connecting = set.open();
+        let (connect_tx, result_rx) = mpsc::channel();
+        set.get_mut(connecting).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "req-send".into(),
+            result_rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+
+        let mut retiring = Retiring::default();
+        assert!(
+            retiring.tab(set.remove(live).unwrap()).is_empty(),
+            "a live tab owes nothing"
+        );
+        assert_eq!(
+            retiring.tab(set.remove(connecting).unwrap()),
+            vec!["req-send".to_string()]
+        );
+        assert_eq!((retiring.connects.len(), retiring.teardowns.len()), (1, 1));
+
+        // The connect finishes after its tab is gone: what it built is shut down, and held too.
+        connect_tx.send(Ok(live_backend(&dir).1)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !retiring.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the teardowns"
+            );
+            retiring.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_command_to_a_tab_with_no_session_is_a_benign_refusal() {
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        let error = backend_for(&mut set, tab).err().expect("an empty tab has no backend");
+        assert!(error.benign);
+        assert_eq!(error.message, "no active session");
+    }
+
+    /// Review focus 3 (spec §3.5): every worker is counted, and a worker that died (dropped its
+    /// sender without reporting) neither hangs the collector nor counts as finished.
+    #[test]
+    fn the_close_collector_counts_every_worker_and_survives_one_dying() {
+        let (tx, rx) = mpsc::channel();
+        for n in 0..3 {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                if n == 1 {
+                    drop(tx);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20 * n));
+                let _ = tx.send(());
+            });
+        }
+        drop(tx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(collect_reports(rx, 3));
+        });
+        let finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the collector must not hang on a dead worker");
+        assert_eq!(finished, 2);
+    }
+
+    #[test]
+    fn ready_sends_hello_theme_keymap_tabs_then_the_active_tabs_state() {
+        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
+        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js("Ctrl+b", &[], &[]);
+        let snapshot = r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string();
+        let payloads = ready_payloads(
+            legacy_greeting(),
+            &[],
+            r#"{"kind":"tabs","active":1,"tabs":[]}"#.to_string(),
+            vec![snapshot],
+            Some(&theme),
+            Some(&keymap),
+        );
+        assert_eq!(kinds(&payloads), vec!["hello", "theme", "keymap", "tabs", "snapshot"]);
+    }
+
+    /// Ruling 17 and spec §3.8 point 5: `hello` offers no session that is open in a tab, and still
+    /// drops a session a tab handed off (the older rule, now per tab).
+    #[test]
+    fn hello_offers_no_session_that_is_open_in_a_tab() {
+        let mut greeting = legacy_greeting();
+        greeting.resumable = ["open-here", "free"]
+            .iter()
+            .map(|id| agent::ResumableSession {
+                provider: "claude".into(),
+                provider_session_id: id.to_string(),
+                created_at: "1".into(),
+                updated_at: "2".into(),
+                title: None,
+                name: None,
+            })
+            .collect();
+        let payloads = ready_payloads(
+            greeting,
+            &["open-here".to_string()],
+            "{}".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        let offered: Vec<&str> = hello["resumableSessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["providerSessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(offered, vec!["free"]);
+    }
+
+    #[test]
+    fn the_chooser_lists_records_open_in_no_tab_and_marks_those_held_elsewhere() {
+        let sessions: Vec<agent::ResumableSession> = ["open-here", "held", "free"]
+            .iter()
+            .map(|id| agent::ResumableSession {
+                provider: "claude".into(),
+                provider_session_id: id.to_string(),
+                created_at: "1".into(),
+                updated_at: "2".into(),
+                title: Some(format!("about {id}")),
+                name: None,
+            })
+            .collect();
+        let records = chooser_records(&sessions, &["open-here".to_string()], |id| id == "held");
+        let ids: Vec<(&str, bool)> = records
+            .iter()
+            .map(|r| (r.provider_session_id.as_str(), r.held_elsewhere))
+            .collect();
+        assert_eq!(ids, vec![("held", true), ("free", false)]);
+    }
+
+    #[test]
+    fn the_detail_popover_names_every_identity_and_the_account() {
+        let set = TabSet::new(
+            BackendKind::Legacy,
+            neovibe_core::agent_bridge::SessionModeChoice::Bypass,
+        );
+        let rows = detail_rows(
+            set.active_tab(),
+            BackendKind::Legacy,
+            Some("work"),
+            std::path::Path::new("/p"),
+        );
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        for want in [
+            "name",
+            "title",
+            "state",
+            "mode",
+            "model",
+            "backend",
+            "account",
+            "cwd",
+            "conversation",
+            "verdandi session",
+            "claude session",
+            "CLI",
+            "Verdandi revision",
+            "resumable",
+            "created",
+            "updated",
+            "queued",
+        ] {
+            assert!(labels.contains(&want), "missing {want}: {labels:?}");
+        }
+        let resumable = rows.iter().find(|r| r.label == "resumable").unwrap();
+        assert_eq!(resumable.value, "no (legacy backend)");
+        let account = rows.iter().find(|r| r.label == "account").unwrap();
+        assert_eq!(account.value, "work");
+    }
 
     /// What each tick of the close watch decides, including the two orderings that are judgements
     /// rather than mechanics.
@@ -1941,15 +2944,22 @@ mod tests {
     #[test]
     fn a_reloaded_document_is_handed_back_the_command_the_old_one_was_showing() {
         let command = a_command();
-        let payloads = ready_payloads(legacy_greeting(), None, Some(&command), None, None);
+        let payloads = ready_payloads(
+            legacy_greeting(),
+            &[],
+            "{\"kind\":\"tabs\"}".to_string(),
+            vec![neovibe_core::agent_bridge::serialize_handoff_for_js(TabId(1), &command)],
+            None,
+            None,
+        );
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert!(
             hello["resumableSession"].is_null(),
             "legacy has no other record of this session"
         );
 
-        assert_eq!(kinds(&payloads), vec!["hello", "handoff"]);
-        let handoff: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+        assert_eq!(kinds(&payloads), vec!["hello", "tabs", "handoff"]);
+        let handoff: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
         assert_eq!(
             handoff["command"],
             "cd /home/user/project && claude --resume 1857dcd5-973b-46a2"
@@ -1957,12 +2967,19 @@ mod tests {
         assert_eq!(handoff["providerSessionId"], "1857dcd5-973b-46a2");
     }
 
-    /// The ordinary case is unchanged: a panel that never handed anything off sends `hello` alone.
+    /// The ordinary case: a panel that handed nothing off sends `hello` and the tab bar alone.
     #[test]
-    fn a_panel_that_handed_nothing_off_sends_only_the_greeting() {
+    fn a_panel_that_handed_nothing_off_sends_only_the_greeting_and_the_tabs() {
         assert_eq!(
-            kinds(&ready_payloads(legacy_greeting(), None, None, None, None)),
-            vec!["hello"]
+            kinds(&ready_payloads(
+                legacy_greeting(),
+                &[],
+                "{\"kind\":\"tabs\"}".to_string(),
+                vec![],
+                None,
+                None
+            )),
+            vec!["hello", "tabs"]
         );
     }
 
@@ -1971,17 +2988,25 @@ mod tests {
     fn the_theme_follows_the_greeting_and_precedes_everything_else() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
         assert_eq!(
-            kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme), None)),
-            vec!["hello", "theme"]
+            kinds(&ready_payloads(
+                legacy_greeting(),
+                &[],
+                "{\"kind\":\"tabs\"}".to_string(),
+                vec![],
+                Some(&theme),
+                None
+            )),
+            vec!["hello", "theme", "tabs"]
         );
         let payloads = ready_payloads(
             legacy_greeting(),
-            Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
-            None,
+            &[],
+            "{\"kind\":\"tabs\"}".to_string(),
+            vec![r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string()],
             Some(&theme),
             None,
         );
-        assert_eq!(kinds(&payloads), vec!["hello", "theme", "snapshot"]);
+        assert_eq!(kinds(&payloads), vec!["hello", "theme", "tabs", "snapshot"]);
     }
 
     /// The `?` overlay's rows come with every `ready`, right after the colours, so a reloaded
@@ -1993,28 +3018,14 @@ mod tests {
         assert_eq!(
             kinds(&ready_payloads(
                 legacy_greeting(),
-                None,
-                None,
+                &[],
+                "{\"kind\":\"tabs\"}".to_string(),
+                vec![],
                 Some(&theme),
                 Some(&keymap)
             )),
-            vec!["hello", "theme", "keymap"]
+            vec!["hello", "theme", "keymap", "tabs"]
         );
-    }
-
-    /// A live session wins. The card describes a conversation that is over; putting it above a
-    /// running one would read as that one being closed.
-    #[test]
-    fn a_live_session_is_sent_instead_of_a_stale_handoff_card() {
-        let command = a_command();
-        let payloads = ready_payloads(
-            legacy_greeting(),
-            Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
-            Some(&command),
-            None,
-            None,
-        );
-        assert_eq!(kinds(&payloads), vec!["hello", "snapshot"]);
     }
 
     /// A session handed to a terminal must not also be offered for resume on the start screen --
@@ -2040,6 +3051,7 @@ mod tests {
                     created_at: "1757600000000".to_string(),
                     updated_at: "1757700000000".to_string(),
                     title: None,
+                    name: None,
                 },
                 agent::ResumableSession {
                     provider: "claude".to_string(),
@@ -2047,11 +3059,14 @@ mod tests {
                     created_at: "1757500000000".to_string(),
                     updated_at: "1757600000000".to_string(),
                     title: None,
+                    name: None,
                 },
             ],
         };
         let command = a_command();
-        let payloads = ready_payloads(greeting, None, Some(&command), None, None);
+        // The tab set's `open_session_ids` includes a handed-off session (ruling 13).
+        let open = vec![command.provider_session_id().to_string()];
+        let payloads = ready_payloads(greeting, &open, "{}".to_string(), vec![], None, None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
             .as_array()
@@ -2075,12 +3090,17 @@ mod tests {
     fn the_command_is_not_released_until_the_close_worker_has_reported() {
         let (closed_tx, closed_rx) = mpsc::channel();
         assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::StillClosing);
-        assert!(handoff_payloads(&HandoffCloseOutcome::StillClosing, "req-1", &a_command()).is_empty());
+        assert!(handoff_payloads(TabId(1), &HandoffCloseOutcome::StillClosing, "req-1", &a_command()).is_empty());
 
         closed_tx.send(()).unwrap();
         assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::Closed);
         assert_eq!(
-            kinds(&handoff_payloads(&HandoffCloseOutcome::Closed, "req-1", &a_command())),
+            kinds(&handoff_payloads(
+                TabId(1),
+                &HandoffCloseOutcome::Closed,
+                "req-1",
+                &a_command()
+            )),
             vec!["handoff", "command_result"]
         );
     }
@@ -2094,7 +3114,7 @@ mod tests {
         drop(closed_tx);
         assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::CloseFailed);
 
-        let payloads = handoff_payloads(&HandoffCloseOutcome::CloseFailed, "req-2", &a_command());
+        let payloads = handoff_payloads(TabId(1), &HandoffCloseOutcome::CloseFailed, "req-2", &a_command());
         assert_eq!(kinds(&payloads), vec!["command_result", "error"]);
         assert!(
             !payloads.iter().any(|p| p.contains("1857dcd5-973b-46a2")),

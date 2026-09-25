@@ -1,27 +1,34 @@
-import type { AgentDomainEvent, AgentUiSnapshot, HandoffCommand, Hello } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, DetailRow, HandoffCommand, Hello, TabId, TabsEnvelope } from "./types";
 import type { KeymapHelp } from "./keymap";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
-  | { type: "start_session"; request_id: string; mode: "auto" | "bypass"; resume?: string }
-  | { type: "send_message"; request_id: string; text: string }
-  | { type: "interrupt"; request_id: string }
+  | { type: "send_message"; request_id: string; tab: TabId; text: string }
+  | { type: "interrupt"; request_id: string; tab: TabId }
   /** `decision` is a closed set, not a boolean: Rust rejects an unrecognized value at parse time
    *  rather than defaulting it, and the tempting default would be the one that runs the tool.
    *  `reason` is only ever sent with a denial -- there is no field downstream that would show the
    *  model an approval's reason. */
-  | { type: "permission_response"; request_id: string; permission_id: string; decision: PermissionDecision; reason?: string }
+  | { type: "permission_response"; request_id: string; tab: TabId; permission_id: string; decision: PermissionDecision; reason?: string }
   /** How long this WebView took to draw a turn's first assistant text, from its own receipt of the
    *  payload to the animation frame that rendered it. A SPAN, not an instant: `performance.now()`
    *  and Rust's `Instant` have unrelated epochs, so a timestamp crossing this boundary would be a
    *  confident, meaningless number. Diagnostic only -- Rust expects no reply and nothing branches
    *  on it. */
-  | { type: "turn_rendered"; request_id: string; receive_to_frame_ms: number }
+  | { type: "turn_rendered"; request_id: string; tab: TabId; receive_to_frame_ms: number }
   /** "Close this conversation here and give me the command that continues it in a terminal."
    *  Carries nothing else: every input the rule needs is already canonical on the Rust side, and a
    *  session id sent from here would be a second, stale source for the one value that must not be
    *  wrong. The reply is a `handoff` envelope, deferred until the real close has finished. */
-  | { type: "handoff_to_terminal"; request_id: string }
+  | { type: "handoff_to_terminal"; request_id: string; tab: TabId }
+  | { type: "resume"; request_id: string; tab: TabId; provider_session_id: string }
+  | { type: "select_tab"; request_id: string; tab: TabId }
+  | { type: "rename_tab"; request_id: string; tab: TabId; name: string }
+  | { type: "close_tab"; request_id: string; tab: TabId }
+  | { type: "reset_tab"; request_id: string; tab: TabId }
+  | { type: "cycle_mode"; request_id: string; tab: TabId }
+  | { type: "open_detail"; request_id: string; tab: TabId }
+  | { type: "chooser_closed"; request_id: string; launch: boolean }
   /** Global `f` HINT: panel has pressed `f` in BROWSE, asking shell to start a global HINT. */
   | { type: "hint_request"; request_id: string }
   /** Answer to hint_collect: the number of visible targets the panel froze for this sessionId. */
@@ -63,9 +70,9 @@ type InboundHandler = (
     | { kind: "hello" } & Hello
     | { kind: "command_result"; requestId: string; ok: true }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
-    | { kind: "events"; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
-    | { kind: "snapshot"; throughRevision: number; state: AgentUiSnapshot }
-    | ({ kind: "handoff" } & HandoffCommand)
+    | { kind: "events"; tab: TabId; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
+    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot }
+    | ({ kind: "handoff"; tab: TabId } & HandoffCommand)
     | { kind: "theme"; vars: Record<string, string> }
     /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from
      *  GTK's focus widget (`shell/src/pane_focus.rs`). It is not decided from this page's own
@@ -87,7 +94,7 @@ type InboundHandler = (
     /** The chat was brought back to answer a card (its tray chip `agent ⚑N`, or `Ctrl+a a`): BROWSE,
      *  with the cursor on the oldest pending card. See `serialize_focus_permission_for_js` in
      *  `core/src/agent_bridge.rs`. */
-    | { kind: "focus_permission" }
+    | { kind: "focus_permission"; tab: TabId }
     /** Global `f` HINT: shell asking panel to report visible targets and freeze the list. */
     | { kind: "hint_collect"; sessionId: number }
     /** shell showing the frozen targets their labels, ready to start typing. */
@@ -98,8 +105,18 @@ type InboundHandler = (
     | { kind: "hint_land"; sessionId: number; index: number }
     /** shell ending a global HINT: clear the labels and return to normal. */
     | { kind: "hint_end"; sessionId: number }
-    | { kind: "error"; message: string },
+    | { kind: "error"; tab: TabId; message: string }
+    /** Every tab and which is active (session tabs spec §3.1). */
+    | ({ kind: "tabs" } & TabsEnvelope)
+    | { kind: "tab_detail"; tab: TabId; rows: DetailRow[] }
+    | ({ kind: "chooser" } & ChooserEnvelope)
+    | { kind: "confirm_close"; tab: TabId; lines: string[] }
+    | { kind: "begin_rename"; tab: TabId; current: string | null },
 ) => void;
+
+/** The handler's own payload type, exported so callers (`tabs.ts`'s `acceptsEnvelope`, `App.tsx`)
+ *  can name it without re-declaring the union. */
+export type InboundPayload = Parameters<InboundHandler>[0];
 
 export function installDispatch(handler: InboundHandler): void {
   window.__neovibeDispatch = (json: string) => {
@@ -130,7 +147,12 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "hint_prefix" ||
         obj.kind === "hint_land" ||
         obj.kind === "hint_end" ||
-        obj.kind === "error"
+        obj.kind === "error" ||
+        obj.kind === "tabs" ||
+        obj.kind === "tab_detail" ||
+        obj.kind === "chooser" ||
+        obj.kind === "confirm_close" ||
+        obj.kind === "begin_rename"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;

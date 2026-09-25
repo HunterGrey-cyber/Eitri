@@ -70,6 +70,8 @@ export type ResumableSession = {
    *  -- for a session recorded before titles were kept; such a row still shows only its id and time,
    *  and nothing may be made up in its place. */
   title?: string | null;
+  /** The tab's rename, kept on the record (spec §3.5); the chooser shows it ahead of the title. */
+  name?: string | null;
 };
 export type PermissionModeChoice = "auto" | "bypass";
 
@@ -296,3 +298,36 @@ export type AgentDomainEvent =
     }
   | { type: "session_unavailable"; reason: string }
   | { type: "session_closed"; reason: string };
+
+/** A session tab's identity for its whole life, and the bridge's (`neovibe_core::tabs::TabId`). */
+export type TabId = number;
+/** `neovibe_core::agent_bridge::TabStateWire`. */
+export type TabState = "not_started" | "starting" | "live" | "ended" | "failed";
+/** `neovibe_core::tabs::Marker::wire()`. Precedence is Rust's: ⚑ > ✕ > working > •. */
+export type TabMarker = "needs_input" | "ended" | "working" | "unread";
+export type TabInfo = {
+  id: TabId;
+  number: number;
+  /** `<n> <name>`, worded by Rust (`tabs::label`). */
+  label: string;
+  name: string | null;
+  state: TabState;
+  mode: PermissionModeChoice;
+  marker: TabMarker | null;
+  pending: number;
+  /** False on legacy (spec D13 A): "not resumable". */
+  resumable: boolean;
+  failure: string | null;
+};
+export type TabsEnvelope = { active: TabId; tabs: TabInfo[] };
+export type DetailRow = { label: string; value: string };
+export type ChooserTab = { tab: TabId; label: string; marker: TabMarker | null; pending: number; resumable: boolean };
+export type ChooserRecord = {
+  providerSessionId: string;
+  name: string | null;
+  title: string | null;
+  createdAt: string;
+  updatedAt: string;
+  heldElsewhere: boolean;
+};
+export type ChooserEnvelope = { launch: boolean; open: ChooserTab[]; records: ChooserRecord[] };

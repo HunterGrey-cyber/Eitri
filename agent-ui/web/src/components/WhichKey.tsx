@@ -4,9 +4,10 @@ type Props = {
   /** The row's own keys, in the order `stripEntries` returns them. Ignored while `prefix` is set --
    *  a prefix chord's own continuation always wins the line (spec §2.3). */
   entries: StripEntry[];
-  /** Same claim the mode block makes about `paneFocused` (`StatusLine`'s own doc comment): dim,
-   *  never hidden, because a key that would do something irreversible must stay readable even while
-   *  the editor has the keys (spec §2.1). */
+  /** Same claim the mode block makes about `paneFocused` (`Footer`'s own doc comment; the mode
+   *  block moved there from `StatusLine`, V2, session tabs Task 10): dim, never hidden, because a
+   *  key that would do something irreversible must stay readable even while the editor has the
+   *  keys (spec §2.1). */
   focused: boolean;
   /** `"g"` for the 400ms window after a lone `g` in BROWSE (`App.tsx`'s `gShown`), `null` otherwise
    *  (spec §2.3). Nothing else is a prefix today (`]`/`[` are not implemented, so they never page). */

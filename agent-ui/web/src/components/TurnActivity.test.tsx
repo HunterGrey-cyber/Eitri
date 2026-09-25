@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 import { TurnActivity } from "./TurnActivity";
 import type { TurnPhase } from "../turnPhase";

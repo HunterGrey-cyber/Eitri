@@ -429,7 +429,7 @@ function allStyleRules(rules: CSSRuleList): CSSStyleRule[] {
  *  enough for this file's own selectors (plain classes, attribute selectors, `:not()`/`:focus`
  *  pseudo-classes counted at one each, type selectors) and validated below against specificities
  *  this file's own comments already state by hand (`.mode-selector button:not(.row-choice)` is
- *  documented as (0,2,1); `.status-line .mode-block[data-mode="input"]` as (0,3,0)). Not a full
+ *  documented as (0,2,1); `.panel-footer .mode-block[data-mode="input"]` as (0,3,0)). Not a full
  *  implementation of the spec's handling of `:not()`'s own argument, or of `:is()`/`:where()`,
  *  neither of which any selector in this file uses. */
 function specificity(selector: string): [number, number, number] {
@@ -718,10 +718,11 @@ describe("index.css", () => {
     }
   });
 
-  it("does not dim the winbar's identity text with opacity either", () => {
-    // Same defect, same fix, same reason: opacity on top of an already-guarded chrome-muted text
-    // colour would multiply its contrast back down below what tokens.rs actually guaranteed.
-    const rules = withoutComments.match(/\.winbar[^{}]*\{[^}]*\}/g) ?? [];
+  it("does not dim the status row, the activity line or the footer with opacity either", () => {
+    // Same defect, same fix, same reason: opacity on top of an already-guarded muted text colour
+    // would multiply its contrast back down below what tokens.rs actually guaranteed. The winbar
+    // is gone (V2, session tabs Task 10); these three replace it and the old status line.
+    const rules = withoutComments.match(/\.(?:status-row|activity-line|panel-footer)[^{}]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThan(0);
     for (const rule of rules) {
       expect(rule).not.toMatch(/opacity/);
@@ -1085,16 +1086,19 @@ describe("index.css cascade (which rule actually wins)", () => {
   // below, and `.selected` exercises `.row-choice.selected`'s own fill -- neither was reachable
   // when this fixture held only the unselected row.
   const CHOICE_ROW = `<div class="mode-selector"><div class="session-choice"><button type="button" class="row row-choice"><span class="row-sign">›</span><span class="row-body">y</span></button><button type="button" class="row row-choice selected"><span class="row-sign">›</span><span class="row-body">z</span></button></div></div>`;
-  const MODE_BLOCK = `<div class="status-line"><span class="mode-block" data-mode="input">INPUT</span></div>`;
-  const UNFOCUSED_INPUT_BLOCK = `<div class="status-line"><span class="mode-block" data-mode="input" data-focused="false">INPUT</span></div>`;
+  const MODE_BLOCK = `<div class="panel-footer"><span class="mode-block" data-mode="input">INPUT</span></div>`;
+  const UNFOCUSED_INPUT_BLOCK = `<div class="panel-footer"><span class="mode-block" data-mode="input" data-focused="false">INPUT</span></div>`;
 
   // Review (2026-09-19): the conversation used to be `grid-template-rows: auto 1fr auto auto`, which
   // gives the `1fr` to the SECOND child -- the fatal-error banner when it is shown, not the list.
   // The list then took its full content height and never scrolled, so `j`/`k` could not step
   // through a long reply over a dead session. jsdom has no layout, so this pins the rule that
-  // decides it: the list grows by its own class, whatever sits between it and the winbar.
+  // decides it: the list grows by its own class, whatever sits between it and the rest of the
+  // panel (V2, session tabs Task 10: the activity line, the composer, the status row, the footer --
+  // formerly the winbar and the status line).
   const CONVERSATION = (banner: string) =>
-    `<div class="agent-ui-root agent-ui-conversation"><div class="winbar">w</div>${banner}<div class="agent-ui-scroller"><div class="message-list">m</div></div><div class="status-line">s</div><div class="composer">c</div></div>`;
+    `<div class="agent-ui-root agent-ui-conversation">${banner}<div class="agent-ui-scroller"><div class="message-list">m</div></div>` +
+    `<div class="activity-line">a</div><div class="composer">c</div><div class="status-row">s</div><div class="panel-footer">f</div></div>`;
 
   it("gives the free height to the message list, fatal banner or not", () => {
     for (const banner of ["", `<div class="fatal-error">e</div>`]) {
@@ -1111,7 +1115,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       const root = computed(CONVERSATION(banner), ".agent-ui-conversation");
       expect(root.display).toBe("flex");
       expect(root.gridTemplateRows).toBe("none");
-      for (const other of [".winbar", ".status-line", ".composer", ...(banner ? [".fatal-error"] : [])]) {
+      for (const other of [".activity-line", ".composer", ".status-row", ".panel-footer", ...(banner ? [".fatal-error"] : [])]) {
         expect(computed(CONVERSATION(banner), other).flexGrow).toBe("0");
       }
     }
@@ -1124,16 +1128,16 @@ describe("index.css cascade (which rule actually wins)", () => {
   /// block, so the pair that decides it -- the scroller being positioned, the overlay being
   /// absolute -- is the invariant, not the overlay's own rule alone. The first version covered the
   /// whole panel and put its own first heading under the winbar, unreadable and unreachable.
-  it("keeps the ? overlay inside the list's own region, not over the two bars", () => {
+  it("keeps the ? overlay inside the list's own region, not over the bars below it", () => {
     const markup =
-      `<div class="agent-ui-root agent-ui-conversation"><div class="winbar">w</div>` +
+      `<div class="agent-ui-root agent-ui-conversation">` +
       `<div class="agent-ui-scroller"><div class="message-list">m</div>` +
       `<div class="keymap-overlay"><section><h2>This panel</h2></section></div></div>` +
-      `<div class="status-line">s</div></div>`;
+      `<div class="activity-line">a</div><div class="status-row">s</div><div class="panel-footer">f</div></div>`;
     expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
     expect(computed(markup, ".keymap-overlay").position).toBe("absolute");
     // And the bars are back to taking part in normal painting: nothing has to out-stack the overlay.
-    for (const bar of [".winbar", ".status-line"]) {
+    for (const bar of [".activity-line", ".status-row", ".panel-footer"]) {
       expect(computed(markup, bar).zIndex).toBe("auto");
     }
   });
@@ -1325,19 +1329,19 @@ describe("index.css cascade (which rule actually wins)", () => {
      decide the outcome -- which is the same thing every other test in this block does, and is
      exactly why the defects were invisible until someone did the flexbox arithmetic by hand. */
 
-  it("keeps the meter from being the first thing squeezed off a narrow status line", () => {
+  it("keeps the meter from being the first thing squeezed off a narrow activity line", () => {
     // `.meter`'s only child is an EMPTY span, so its min-content size is 0 and flexbox's automatic
     // minimum (§4.5) is min(4ch, 0) = 0. As an ordinary flex item it shrank to nothing -- the one
     // animated element in the product silently gone on the narrow panel where it matters most.
-    const html = `<div class="status-line"><span class="turn-activity" data-phase="thinking"><span class="meter"><span class="meter-fill"></span></span><span class="turn-state">thinking</span></span></div>`;
+    const html = `<div class="activity-line"><span class="turn-activity" data-phase="thinking"><span class="meter"><span class="meter-fill"></span></span><span class="turn-state">thinking</span></span></div>`;
     const meter = computed(html, ".meter");
     expect(meter.flexShrink).toBe("0");
     expect(meter.flexGrow).toBe("0");
     // `4ch` used to be pinned through this engine's own resolution of it -- `ch` at 0.5em against
-    // `.status-line`'s literal `font-size: 12px`, so 24px. **That stopped being testable here on
+    // `.activity-line`'s literal `font-size: 12px`, so 24px. **That stopped being testable here on
     // 2026-09-21**, when every size in this file became a ratio of `--nv-font-size`: jsdom does not
     // resolve `var()` AT ALL (the grid-track assertions elsewhere in this file read back
-    // `var(--row-sign-w) ...` as text, which is the same fact), so `.status-line`'s font-size is
+    // `var(--row-sign-w) ...` as text, which is the same fact), so `.activity-line`'s font-size is
     // unresolvable, `ch` falls back to the inherited 16px, and the number here became 32 -- a
     // measurement of jsdom's fallback, not of this stylesheet.
     //
@@ -1447,13 +1451,14 @@ describe("index.css cascade (which rule actually wins)", () => {
     // string comparison that a differently-spelled but equally wrong fraction could still slip past.
     expect(evaluateFsExpression("calc(var(--nv-font-size, 14px) * 13 / 14)")).not.toBeCloseTo(12, 10);
 
-    // The meter test above splits `4ch @ .status-line` into "the declaration says 4ch" (jsdom can
-    // see that) and "the scale says .status-line's font-size is 12px" (only arithmetic can say
-    // that) because jsdom resolves neither `var()` nor the status line's real font-size at all. This
-    // is where the two halves actually meet: `.status-line` is `font-size: var(--fs-sm)`, `ch` is
-    // 0.5em, and 4 * 0.5 * 12 is the 24px the pre-2026-09-21 file hardcoded directly. If either half
-    // drifts -- the token renamed off `.status-line`, or `--fs-sm`'s ratio changed -- this number
-    // moves and says so; today it still lands on the number the meter test's own comment names.
+    // The meter test above splits `4ch @ .activity-line` into "the declaration says 4ch" (jsdom can
+    // see that) and "the scale says .activity-line's font-size is 12px" (only arithmetic can say
+    // that) because jsdom resolves neither `var()` nor the activity line's real font-size at all.
+    // This is where the two halves actually meet: `.activity-line` is `font-size: var(--fs-sm)`,
+    // `ch` is 0.5em, and 4 * 0.5 * 12 is the 24px the pre-2026-09-21 file hardcoded directly. If
+    // either half drifts -- the token renamed off `.activity-line`, or `--fs-sm`'s ratio changed --
+    // this number moves and says so; today it still lands on the number the meter test's own
+    // comment names.
     expect(4 * 0.5 * evaluateFsExpression(ROOT_TOKENS.get("--fs-sm")!)).toBe(24);
   });
 
@@ -1495,46 +1500,34 @@ describe("index.css cascade (which rule actually wins)", () => {
     ]);
   });
 
-  it("spends the phase word before the Stop button as the status line narrows", () => {
-    // The priority order index.css states in prose, asserted as the TWO independent flex
-    // distributions it really is: the indicator's box gives before the status word and the
-    // position counter (its siblings in `.status-line`), and inside that box the phase word is the
-    // only thing that can give. The meter, the clock, the mode block and Stop are never spent by
-    // either. The Stop button is the one that matters -- App.tsx's own comment says it is the ONLY
-    // Stop control for mouse users, so it going off the right edge is the interrupt affordance
-    // leaving the screen.
+  it("spends the phase word before the Stop button as the activity line narrows", () => {
+    // The priority order index.css states in prose: `.turn-activity` (the indicator's whole box) is
+    // the only child of `.activity-line` that gives, and inside that box the phase word is the only
+    // thing that can give. The meter, the clock and Stop are never spent. The Stop button is the one
+    // that matters -- App.tsx's own comment says it is the ONLY Stop control for mouse users, so it
+    // going off the right edge is the interrupt affordance leaving the screen.
+    //
+    // **V2 (session tabs Task 10) narrowed this from a three-way distribution to this one.** The
+    // mode block, the session status word and the position counter left `.status-line` entirely (the
+    // status word is not shown in V2 at all; the position moved into `StatusRow`'s own text) -- so
+    // there is no longer a second thing in the row that could compete with the indicator for space,
+    // and the two-decision structure the 2026-09-20 re-review pinned collapses into one.
     const html =
-      `<div class="status-line">` +
-      `<span class="mode-block" data-mode="browse">BROWSE</span>` +
-      `<span class="status status-running">working</span>` +
+      `<div class="activity-line">` +
       `<span class="turn-activity" data-phase="tool"><span class="meter"><span class="meter-fill"></span></span>` +
       `<span class="turn-state">running NotebookEdit</span><span class="turn-elapsed">123s+</span></span>` +
-      `<span class="position">12/34</span>` +
       `<button type="button" class="stop">Stop</button></div>`;
     const shrink = (selector: string) => Number(computed(html, selector).flexShrink);
 
-    // **The re-review of 2026-09-20 found the assertion that used to stand here unable to fail.**
-    // It compared `.turn-state` against `.status` -- items in DIFFERENT flex containers, which
-    // never compete in one distribution, so no arrangement of those two numbers could have
-    // implemented or broken the order the comment claimed. The structure is asserted first now, so
-    // that reading is impossible to make again by eye.
     const dom = new DOMParser().parseFromString(html, "text/html");
     expect(dom.querySelector(".turn-state")?.parentElement?.className).toBe("turn-activity");
-    expect(dom.querySelector(".status")?.parentElement?.className).toBe("status-line");
-    expect(dom.querySelector(".position")?.parentElement?.className).toBe("status-line");
 
-    // Decision 1, among the children of `.status-line` that can give at all: the INDICATOR'S BOX
-    // first, by a wide margin -- shrinking is distributed by factor x base size, so these numbers
-    // are an order and not a ratio -- then the status word, then the position counter.
-    expect(shrink(".turn-activity")).toBeGreaterThan(shrink(".status"));
-    expect(shrink(".status")).toBeGreaterThan(shrink(".position"));
-    expect(shrink(".position")).toBeGreaterThan(0);
+    // `.turn-activity` is the only child of `.activity-line` that can give; Stop never does.
+    expect(shrink(".turn-activity")).toBeGreaterThan(0);
+    expect(shrink(".stop")).toBe(0);
 
-    // Decision 2, inside `.turn-activity`: the phase word is the ONLY item there that can give, so
-    // decision 1 spending that box IS the phase word truncating. This is the step that turns the
-    // outer order into the documented one, and it holds because of what is zero here, not because
-    // of how large `.turn-state`'s own factor is -- which is why that factor is now the plain
-    // default rather than a number implying a rank it cannot express.
+    // Inside `.turn-activity`: the phase word is the ONLY item there that can give, so
+    // `.turn-activity` shrinking IS the phase word truncating.
     expect(shrink(".meter")).toBe(0);
     expect(shrink(".turn-elapsed")).toBe(0);
     expect(shrink(".turn-state")).toBeGreaterThan(0);
@@ -1542,34 +1535,23 @@ describe("index.css cascade (which rule actually wins)", () => {
     // ...and what `flex: none` on the meter and the clock actually buys: the DISTRIBUTION never
     // spends them. It does not mean they can never be clipped -- once the word is gone there is
     // nothing left inside the box to give -- so `.turn-activity` clips its own overflow rather
-    // than letting the meter and the clock run out over `.position`.
+    // than letting the meter and the clock run out over Stop.
     expect(computed(html, ".turn-activity").overflow).toBe("hidden");
 
-    // Never spent by either distribution: the two fixed parts of the indicator, the mode block,
-    // and the control that stops the turn.
-    for (const fixed of [".meter", ".turn-elapsed", ".mode-block", ".stop"]) {
-      expect(shrink(fixed)).toBe(0);
-    }
     // A word that shrinks has to be ABLE to: its automatic minimum is its min-content size (the
     // whole word) unless `min-width: 0` says otherwise, and `text-overflow` never engages without
     // an `overflow` that is not `visible`.
-    for (const shrinkable of [".turn-state", ".status", ".position"]) {
-      expect(computed(html, shrinkable).minWidth).toBe("0px");
-      expect(computed(html, shrinkable).overflow).toBe("hidden");
-      expect(computed(html, shrinkable).textOverflow).toBe("ellipsis");
-    }
+    expect(computed(html, ".turn-state").minWidth).toBe("0px");
+    expect(computed(html, ".turn-state").overflow).toBe("hidden");
+    expect(computed(html, ".turn-state").textOverflow).toBe("ellipsis");
     // `.turn-activity` is itself a flex ITEM: its child cannot shrink unless it can.
-    expect(shrink(".turn-activity")).toBeGreaterThan(0);
     expect(computed(html, ".turn-activity").minWidth).toBe("0px");
-    // And the bar never becomes two lines. `.winbar` wraps for this, deliberately not copied here:
-    // line breaking happens on base sizes BEFORE shrinking, so a wrapping status line would jump
-    // between one and two rows every time the phase word changed width.
-    expect(computed(html, ".status-line").flexWrap).not.toBe("wrap");
-    expect(computed(html, ".status-line").whiteSpace).toBe("nowrap");
-    expect(computed(`<div class="winbar">w</div>`, ".winbar").flexWrap).toBe("wrap");
+    // And the bar never becomes two lines.
+    expect(computed(html, ".activity-line").flexWrap).not.toBe("wrap");
+    expect(computed(html, ".activity-line").whiteSpace).toBe("nowrap");
     // Negative control: the state this replaced -- nothing shrinking, nothing clipping -- is what
     // pushed Stop off the edge, and it is one later `flex` declaration away.
-    expect(computed(html, ".turn-state", ".status-line .turn-activity .turn-state { flex: none; }").flexShrink).toBe("0");
+    expect(computed(html, ".turn-state", ".activity-line .turn-activity .turn-state { flex: none; }").flexShrink).toBe("0");
   });
 
   /* Review of Task 1: an unrecognized tool's raw JSON dump is a fourth `<pre>` under the same
@@ -1852,7 +1834,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(specificity(".row-choice")).toEqual([0, 1, 0]);
     expect(specificity(".row-prompt .row-body")).toEqual([0, 2, 0]);
     expect(specificity(".message-list .row-prompt .row-body")).toEqual([0, 3, 0]);
-    expect(specificity('.status-line .mode-block[data-mode="input"]')).toEqual([0, 3, 0]);
+    expect(specificity('.panel-footer .mode-block[data-mode="input"]')).toEqual([0, 3, 0]);
     expect(compareSpecificity([0, 3, 0], [0, 2, 0])).toBeGreaterThan(0);
   });
 
@@ -2130,41 +2112,15 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(hiddenPercentBypassExpanded).toMatch(/%/); // <- expanding first is what actually catches it
   });
 
-  it("keeps a choice row off the boxed-button look", () => {
-    // The line-470 sibling of the line-46 `:not(.row-choice)` guard above -- same specificity
-    // reasoning (`.mode-selector button` still beats `.row-choice` by the type selector alone),
-    // same historical shape, but a SEPARATE rule (border/background, the boxed look, rather than
-    // display/padding) that can regress independently and was not caught by the test above.
-    //
-    // `borderRadius` is the property asserted, not `background` or `border`, and that choice was
-    // forced by a real, separately-verified limitation (full matrix in the big comment above this
-    // describe block): this rule's `background: var(--nv-bg)` (0,1,1) against `.row-choice`'s
-    // `background: none` (0,1,0) is exactly the ONE combination -- higher-specificity `var()` vs.
-    // lower-specificity plain literal -- this jsdom's CSS engine resolves by SOURCE ORDER rather
-    // than specificity. `.row-choice`'s rule sits AFTER this one in the real file, so it keeps
-    // "winning" `background` by order whether or not `:not(.row-choice)` is there to make it lose
-    // by specificity -- reintroducing this exact bug in the real `index.css` and re-running this
-    // file leaves `background` unchanged at `"rgba(0, 0, 0, 0)"` in both cases, so an assertion on
-    // `background` here would silently not guard anything. `border` is separately unobservable
-    // (the shorthand-plus-`var()` limitation documented above). `border-radius: 4px`, by contrast,
-    // has no `var()` and nothing on `.row-choice` competes for it at all, so it is decided by
-    // ordinary specificity: unset while `:not(.row-choice)` excludes the row, `4px` the moment
-    // that exclusion is dropped -- confirmed by the same real-file mutation.
-    //
-    // Positive control, added by the audit for the empty-stylesheet hole: `row.borderRadius` reads
-    // `""` both when `:not(.row-choice)` is correctly excluding the row AND when the whole file is
-    // zero bytes and no `.mode-selector button` rule exists at all to exclude anything FROM -- so
-    // pin that the real, excluding rule actually exists in the file first.
-    expect(withoutComments).toMatch(/\.mode-selector button:not\(\.row-choice\)\s*\{[^}]*border-radius:\s*4px;/);
-    const row = computed(CHOICE_ROW, "button.row-choice:not(.selected)");
-    expect(row.borderRadius).toBe("");
-    const clobbered = computed(
-      CHOICE_ROW,
-      "button.row-choice:not(.selected)",
-      ".mode-selector button { border: 1px solid var(--nv-border); border-radius: 4px; background: var(--nv-bg); color: var(--nv-fg); cursor: pointer; }",
-    );
-    expect(clobbered.borderRadius).toBe("4px");
-  });
+  // "keeps a choice row off the boxed-button look" (the `.mode-selector button:not(.row-choice)`
+  // vs. `.row-choice` specificity regression) was removed here on 2026-09-25, session tabs Task 9:
+  // the mode-selector start screen's boxed Auto/Bypass buttons are gone along with the screen
+  // itself (the empty tab, F3, never draws a boxed button), so `index.css` no longer carries that
+  // rule at all -- there is nothing left for `.row-choice` to lose a specificity fight WITH. The
+  // positive control this test opened with (`.mode-selector button:not(.row-choice)` must exist in
+  // the real file) would now fail correctly, on a feature that was deliberately deleted rather than
+  // regressed. `.row-choice`'s own rules (padding, background: none, the `:hover`/`:selected`
+  // fills) are unaffected and still covered by the tests around this one.
 
   it("paints the selected choice row's own fill, not the old per-list selected rule's", () => {
     // The third historical loss the doc comment above names: `.mode-selector .session-choice
@@ -2185,7 +2141,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     const clobbered = computed(
       MODE_BLOCK,
       ".mode-block",
-      ".status-line .mode-block { border-left: 3px solid var(--nv-mode-browse); }",
+      ".panel-footer .mode-block { border-left: 3px solid var(--nv-mode-browse); }",
     );
     // A later rule at HIGHER specificity than the `[data-mode]` one would be the real defect; this
     // control is the weaker "later, equal-specificity shorthand", which is enough to show the
@@ -2252,18 +2208,18 @@ describe("index.css cascade (which rule actually wins)", () => {
     // and the unfocused rule must come second. Both sides are `var()` longhands, the combination
     // this engine resolves correctly (see the big comment above).
     const block = computed(UNFOCUSED_INPUT_BLOCK, ".mode-block");
-    expect(block.borderLeftColor).toBe("var(--nv-chrome-muted)");
-    expect(block.color).toBe("var(--nv-chrome-muted)");
+    expect(block.borderLeftColor).toBe("var(--nv-muted)");
+    expect(block.color).toBe("var(--nv-muted)");
     // A focused block keeps its per-mode rule and inherits the bright label colour.
     const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".mode-block");
     expect(focused.borderLeftColor).toBe("var(--nv-mode-input)");
-    expect(focused.color).not.toBe("var(--nv-chrome-muted)");
+    expect(focused.color).not.toBe("var(--nv-muted)");
     // Negative control: the INPUT rule re-declared after the unfocused one wins it back. That is
     // what swapping the two rules in index.css would do.
     const clobbered = computed(
       UNFOCUSED_INPUT_BLOCK,
       ".mode-block",
-      '.status-line .mode-block[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
+      '.panel-footer .mode-block[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
     );
     expect(clobbered.borderLeftColor).toBe("var(--nv-mode-input)");
   });
@@ -2435,4 +2391,17 @@ describe("--nv-* names", () => {
     expect(used.size).toBeGreaterThan(20);
     expect(Array.from(used).filter((name) => !emitted.has(name))).toEqual([]);
   });
+});
+
+/** GUI pass, 2026-09-25: with the tab bar overflowing (three tabs in a 520px panel), WebKitGTK's
+ *  horizontal scrollbar sat over the lower 21px of the 41px bar and ate every click there -- half
+ *  of each tab did not select it. The bar still scrolls (the active tab is scrolled into view, and
+ *  `h`/`l` move); it just draws no scrollbar, as tmux's status line has none. */
+it("draws no scrollbar on the tab bar, so a click anywhere on a tab reaches it", () => {
+  const sheet = stripComments(css);
+  const bar = rulesMatching(sheet, ".tab-bar").find((r) => r.selector.trim() === ".tab-bar");
+  expect(bar?.body).toMatch(/overflow-x:\s*auto/);
+  expect(bar?.body).toMatch(/scrollbar-width:\s*none/);
+  const webkit = rulesMatching(sheet, ".tab-bar::-webkit-scrollbar");
+  expect(webkit.map((r) => r.body).join(";")).toMatch(/display:\s*none/);
 });

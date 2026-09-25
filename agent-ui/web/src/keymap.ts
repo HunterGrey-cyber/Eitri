@@ -135,7 +135,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "gg / G", what: "First / last row" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
   { keys: "a / d", what: "Allow / deny the permission under the cursor" },
-  { keys: "Enter", what: "Show or hide a tool's result" },
+  { keys: "Enter", what: "Show or hide a tool's result; on the status row: this session's details" },
   { keys: "y", what: "Copy the row (or the code block HINT landed on)" },
   { keys: "i", what: "Start typing a message" },
   { keys: "f", what: "HINT: jump anywhere in the window" },

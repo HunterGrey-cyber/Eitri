@@ -205,6 +205,38 @@ impl SessionLease {
         &self.path
     }
 
+    /// Whether some descriptor anywhere holds this lease right now, without taking it.
+    ///
+    /// Opens the lock file read-only and tries a shared, non-blocking `flock`, released at once.
+    /// flock is per open file description, so this sees a lease THIS process holds on another
+    /// descriptor too -- which is what the prune and the session chooser need: one window's own
+    /// tabs hold leases. **One cost, accepted (session tabs plan, ruling 21):** a `try_acquire`
+    /// racing this probe on another descriptor can see `AlreadyHeld` for the microseconds the
+    /// shared lock exists. It runs only while pruning past the cap and while building the chooser.
+    pub fn is_held(provider: &str, canonical_cwd: &str, provider_session_id: &str) -> std::io::Result<bool> {
+        let dir = leases_dir()?;
+        let path = dir.join(format!(
+            "{}.lock",
+            lease_key_hash(provider, canonical_cwd, provider_session_id)
+        ));
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        if rc == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return Ok(false);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(true)
+        } else {
+            Err(err)
+        }
+    }
+
     /// Prepares this lease's fd for inheritance across `fork`+`exec` and hands ownership to the
     /// caller as a raw fd number -- clears `FD_CLOEXEC` (Rust's `std::fs::File` sets it by default
     /// on open, which would otherwise close the fd at `exec` time and silently drop the lock) and
@@ -316,5 +348,26 @@ mod tests {
         let _isolated = IsolatedLeasesDir::new();
         let _a = SessionLease::try_acquire("claude", "/tmp/project", "prov-1").unwrap();
         assert!(SessionLease::try_acquire("claude", "/tmp/project", "prov-2").is_ok());
+    }
+
+    /// Ruling 21: the probe sees a lease held by this very process on another descriptor (flock is
+    /// per open file description), forgets it once dropped, and never takes it itself.
+    #[test]
+    fn is_held_sees_a_held_lease_and_takes_nothing() {
+        let _dir = test_override::IsolatedLeasesDir::new();
+        assert!(
+            !SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap(),
+            "no lock file yet"
+        );
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe").unwrap();
+        assert!(SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap());
+        assert!(
+            !SessionLease::is_held("claude", "/tmp/project", "prov-other").unwrap(),
+            "another session's lease is another key"
+        );
+        drop(lease);
+        assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap());
+        let _again = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe")
+            .expect("a probe must leave the lease free to take");
     }
 }

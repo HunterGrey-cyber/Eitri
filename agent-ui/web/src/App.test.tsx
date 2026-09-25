@@ -6,7 +6,7 @@ import { initialState } from "./reducer";
 import { USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
 beforeAll(() => {
@@ -43,6 +43,22 @@ const HELLO: Hello = {
 
 function snapshotState(overrides: Partial<AgentUiState> = {}): AgentUiState {
   return { ...initialState(), status: { kind: "running" }, ...overrides };
+}
+
+/** Tab 1, live, resumable false (legacy has no resume): what almost every test below wants once a
+ *  session is running. Session tabs (Task 9): the panel now learns a tab is live from a `tabs`
+ *  envelope, not from `snapshot` alone. */
+const LIVE_TAB = { id: 1, number: 1, label: "1 new", name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: false, failure: null } as const;
+
+/** What Rust sends for a window whose tab 1 holds a live session: `tabs`, then the snapshot. */
+function dispatchLiveTab(state: AgentUiState, throughRevision = 1) {
+  dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+  dispatch({ kind: "snapshot", tab: 1, throughRevision, state });
+}
+
+/** An empty tab 1, which is how every window starts. */
+function dispatchEmptyTab() {
+  dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
 }
 
 function lastOfType(type: string): Record<string, unknown> | undefined {
@@ -98,7 +114,7 @@ describe("pane focus", () => {
   it("draws the mode block dim until shell says this pane has focus, and follows it both ways", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     // shell focuses the editor at startup, so the panel claims nothing until told otherwise.
     expect(modeBlock(container).dataset.focused).toBe("false");
     dispatch({ kind: "pane_focus", focused: true });
@@ -113,7 +129,7 @@ describe("pane focus", () => {
   it("opens the composer with the caret in it when shell says the user arrived by keyboard", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
     dispatch({ kind: "enter_input" });
     expect(modeBlock(container).textContent).toBe("INPUT");
@@ -124,9 +140,9 @@ describe("pane focus", () => {
   it("does not open the composer on a session that has ended, the same as i", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     dispatch({
-      kind: "events",
+      kind: "events", tab: 1,
       fromRevision: 1,
       throughRevision: 2,
       events: [{ type: "session_closed", reason: "provider exited" }],
@@ -138,7 +154,7 @@ describe("pane focus", () => {
   it("does not change the mode or what i does", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
     enterInputMode(container);
     expect(modeBlock(container).textContent).toBe("INPUT");
@@ -155,7 +171,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
   function withTwoCards() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     const list: AgentDomainEvent[] = [
       { type: "user_prompt_submitted", text: "tidy up" },
       { type: "turn_started", turn_id: "t1" },
@@ -164,14 +180,14 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
       { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_2", name: "Write", input: { file_path: "a" } },
       { type: "permission_requested", permission_id: "perm-2", tool_use_id: "toolu_2", tool_name: "Write", input: {} },
     ];
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
     dispatch({ kind: "pane_focus", focused: true });
     return rendered;
   }
 
   it("lands in BROWSE on the oldest pending card", () => {
     const { container } = withTwoCards();
-    dispatch({ kind: "focus_permission" });
+    dispatch({ kind: "focus_permission", tab: 1 });
     expect(modeBlock(container).textContent).toBe("BROWSE");
     const current = container.querySelector(".row-current")!;
     expect(current.classList.contains("row-permission")).toBe(true);
@@ -182,7 +198,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     const { container } = withTwoCards();
     enterInputMode(container);
     expect(modeBlock(container).textContent).toBe("INPUT");
-    dispatch({ kind: "focus_permission" });
+    dispatch({ kind: "focus_permission", tab: 1 });
     expect(modeBlock(container).textContent).toBe("BROWSE");
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
     expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
@@ -191,9 +207,9 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
   it("takes the composer when the card was answered in between", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
-    dispatch({ kind: "focus_permission" });
+    dispatch({ kind: "focus_permission", tab: 1 });
     expect(modeBlock(container).textContent).toBe("INPUT");
   });
 
@@ -206,7 +222,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     const list = container.querySelector(".message-list")!;
     const seen: unknown[] = [];
     list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
-    dispatch({ kind: "focus_permission" });
+    dispatch({ kind: "focus_permission", tab: 1 });
     expect(seen).toEqual(["unknown"]);
   });
 });
@@ -215,7 +231,7 @@ describe("literal_key C-a (send-prefix from shell's prefix)", () => {
   it("selects all of the composer textarea's text while it has focus", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
     enterInputMode(container);
     const textarea = container.querySelector("textarea")!;
@@ -228,7 +244,7 @@ describe("literal_key C-a (send-prefix from shell's prefix)", () => {
   it("does nothing in BROWSE, where no text field has focus", () => {
     render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 1);
     const before = document.activeElement;
     expect(() => dispatch({ kind: "literal_key", key: "C-a" })).not.toThrow();
     expect(document.activeElement).toBe(before);
@@ -237,7 +253,7 @@ describe("literal_key C-a (send-prefix from shell's prefix)", () => {
   it("ignores a literal key other than C-a", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     enterInputMode(container);
     const box = container.querySelector("textarea")!;
     fireEvent.change(box, { target: { value: "hello" } });
@@ -256,43 +272,53 @@ describe("App handshake", () => {
     expect(typeof posted[0].request_id).toBe("string");
   });
 
-  it("waits for hello rather than guessing what the backend offers", () => {
+  it("waits for a tabs envelope before showing anything but a connecting message", () => {
     const { container } = render(<App />);
     expect(container.textContent).toContain("Connecting to the shell");
     dispatch({ kind: "hello", ...HELLO });
-    expect(container.textContent).toContain("/home/user/project");
+    // `hello` alone names no tab yet -- the empty tab (F3) needs `activeTab`, from `tabs`.
+    expect(container.textContent).toContain("Connecting to the shell");
+    dispatchEmptyTab();
+    expect(container.querySelector("textarea")).not.toBeNull();
   });
 
-  it("starts a session with the mode that was clicked, and shows that it is connecting", () => {
+  it("sends what is typed, which starts the session lazily in Rust (ruling 4), and shows it is connecting once the tab says so", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    fireEvent.click(buttonLabelled(container, "Bypass")!);
-    const start = lastOfType("start_session")!;
-    expect(start.mode).toBe("bypass");
-    // A fresh session sends no resume id at all -- never an empty string, which Rust would parse as
-    // a request to continue a session named "".
-    expect(start.resume).toBeUndefined();
+    dispatchEmptyTab();
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "fix the bug" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    // There is no `start_session` message any more (ruling 4): the tab's mode and the fresh turn's
+    // text travel on `send_message` alone, named by tab.
+    expect(lastOfType("start_session")).toBeUndefined();
+    expect(lastOfType("send_message")).toMatchObject({ tab: 1, text: "fix the bug" });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
     expect(container.textContent).toContain("Starting the agent backend");
   });
 
-  it("remembers the permission mode it started with and shows it in the winbar", () => {
-    // AgentUiState carries no field for this -- App.tsx remembers what it asked for, because the
-    // provider refuses a mode it cannot honour rather than substituting one. See
-    // `startedPermissionMode`'s own doc comment in App.tsx.
+  it("shows the tab's own permission mode in the footer's mode pill once it is live", () => {
+    // AgentUiState carries no field for this: the mode lives on the TAB now (spec §3.1), not
+    // remembered here from a click -- there is no button to click any more. The winbar is gone
+    // (V2, session tabs Task 10); the pill is `Footer`'s, always `started: true` here since this
+    // is the session-started render.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    fireEvent.click(buttonLabelled(container, "Bypass")!);
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
-    expect(container.querySelector(".winbar .permission-mode")?.textContent).toBe("bypass");
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, mode: "bypass" }] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
+    expect(container.querySelector(".panel-footer .mode-pill")?.textContent).toBe("⏵⏵ bypass on");
   });
 
-  it("returns to the start screen when the deferred start_session reply says it failed", () => {
+  it("shows why the tab failed to start, from the tabs envelope alone", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    fireEvent.click(buttonLabelled(container, "Auto")!);
-    const requestId = lastOfType("start_session")!.request_id;
-    dispatch({ kind: "command_result", requestId, ok: false, error: "claude is not on PATH" });
-    expect(container.textContent).toContain("/home/user/project");
+    dispatchEmptyTab();
+    dispatch({
+      kind: "tabs",
+      active: 1,
+      tabs: [{ ...LIVE_TAB, state: "failed", failure: "claude is not on PATH" }],
+    });
+    expect(container.textContent).toContain("claude is not on PATH");
     expect(container.textContent).not.toContain("Starting the agent backend");
   });
 });
@@ -305,13 +331,12 @@ describe("App rehydration from a snapshot", () => {
   it("shows the conversation directly on a snapshot, without a mode selector in between", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({
-      kind: "snapshot",
-      throughRevision: 7,
-      state: snapshotState({ model: "claude-opus-5", transcript: [{ seq: 0, text: "pre-reload marker alpha seven." }] }),
-    });
+    dispatchLiveTab(
+      snapshotState({ model: "claude-opus-5", transcript: [{ seq: 0, text: "pre-reload marker alpha seven." }] }),
+      7,
+    );
     expect(container.querySelector(".agent-ui-conversation")).not.toBeNull();
-    expect(container.querySelector(".mode-selector")).toBeNull();
+    expect(container.querySelector(".empty-tab")).toBeNull();
     expect(container.textContent).toContain("pre-reload marker alpha seven.");
   });
 
@@ -320,10 +345,10 @@ describe("App rehydration from a snapshot", () => {
     // a page that has no record of it. It must not be read as this page's own start failing.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ transcript: [{ seq: 0, text: "still here" }] }) });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 0, text: "still here" }] }), 1);
     dispatch({ kind: "command_result", requestId: "req-from-a-previous-page", ok: true });
     expect(container.textContent).toContain("still here");
-    expect(container.querySelector(".mode-selector")).toBeNull();
+    expect(container.querySelector(".empty-tab")).toBeNull();
   });
 });
 
@@ -331,13 +356,13 @@ describe("App event folding", () => {
   function startedApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     enterInputMode(rendered.container);
     return rendered;
   }
 
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
 
   it("accumulates streamed text into one assistant message, as the reducer does", () => {
@@ -401,7 +426,7 @@ describe("App event folding", () => {
        at all and the composer says which key does work. */
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector(".composer-browse-hint")!.textContent).toContain(
-      "Press r to return to the start screen.",
+      "Press r to start a new session here.",
     );
   });
 
@@ -421,18 +446,18 @@ describe("App event folding", () => {
 
 /* The in-flight motion indicator's elapsed clock (2026-09-20-in-flight-motion-design.md §8.4).
    `turnClock`'s PROVENANCE (a real `turn_started` event vs a turn id first seen inside a snapshot)
-   is exactly the distinction `App.tsx` -- not the reducer, and not `StatusLine`/`TurnActivity` --
-   is positioned to know, since only the raw envelope carries it. Tested here, at the layer that
-   actually decides it. */
+   is exactly the distinction `App.tsx` -- not the reducer, and not `ActivityLine`/`TurnActivity`
+   (V2, session tabs Task 10; formerly `StatusLine`) -- is positioned to know, since only the raw
+   envelope carries it. Tested here, at the layer that actually decides it. */
 describe("the in-flight motion indicator's elapsed clock", () => {
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
 
   it("is exact when the turn id was learned from a real turn_started event", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     events({ type: "turn_started", turn_id: "t1" });
     expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
   });
@@ -440,7 +465,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
   it("is inexact when the turn id first arrives inside a snapshot -- a reload, or a resync mid-turn", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ activeTurnId: "t1" }) });
+    dispatchLiveTab(snapshotState({ activeTurnId: "t1" }), 1);
     expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s+");
   });
 
@@ -449,14 +474,14 @@ describe("the in-flight motion indicator's elapsed clock", () => {
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
-      dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState({ activeTurnId: "t1" }) });
+      dispatchLiveTab(snapshotState({ activeTurnId: "t1" }), 1);
       act(() => {
         vi.advanceTimersByTime(5000);
       });
       expect(container.querySelector(".turn-elapsed")?.textContent).toBe("5s+");
       // The same turn id again, as a resync mid-turn resends it: the clock keeps counting from the
       // original `since` rather than starting over from "now".
-      dispatch({ kind: "snapshot", throughRevision: 2, state: snapshotState({ activeTurnId: "t1" }) });
+      dispatchLiveTab(snapshotState({ activeTurnId: "t1" }), 2);
       expect(container.querySelector(".turn-elapsed")?.textContent).toBe("5s+");
     } finally {
       vi.useRealTimers();
@@ -466,7 +491,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
   it("is cleared by a terminal event, and a later turn starts its own clock from zero", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     events({ type: "turn_started", turn_id: "t1" });
     events({
       type: "turn_completed", turn_id: "t1", outcome: "completed",
@@ -492,7 +517,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
       try {
         const { container } = render(<App />);
         dispatch({ kind: "hello", ...HELLO });
-        dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+        dispatchLiveTab(snapshotState(), 0);
         events({ type: "turn_started", turn_id: "t1" });
         act(() => {
           vi.advanceTimersByTime(60_000);
@@ -500,10 +525,10 @@ describe("the in-flight motion indicator's elapsed clock", () => {
         expect(container.querySelector(".turn-elapsed")?.textContent).toBe("60s");
 
         if (reset === "a fatal error") {
-          dispatch({ kind: "error", message: "the session died" });
+          dispatch({ kind: "error", tab: 1, message: "the session died" });
         } else {
           dispatch({
-            kind: "handoff",
+            kind: "handoff", tab: 1,
             command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
             cwd: "/home/user/project",
             providerSessionId: "1857dcd5-973b-46a2",
@@ -515,7 +540,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
         // observed starting it here, so the only honest reading is "at least 0 seconds" -- the
         // stale record would have said 60s, exactly, with no `+`.
         dispatch({ kind: "hello", ...HELLO });
-        dispatch({ kind: "snapshot", throughRevision: 9, state: snapshotState({ activeTurnId: "t1" }) });
+        dispatchLiveTab(snapshotState({ activeTurnId: "t1" }), 9);
         expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s+");
       } finally {
         vi.useRealTimers();
@@ -529,7 +554,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
     // `initialState()`, and there is no persisted copy of it to restore.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 5, state: snapshotState({ activeTurnId: "already-running" }) });
+    dispatchLiveTab(snapshotState({ activeTurnId: "already-running" }), 5);
     expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s+");
   });
 });
@@ -541,12 +566,12 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
   function startedApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     return rendered;
   }
 
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
 
   function conversationRoot(container: HTMLElement): HTMLElement {
@@ -616,19 +641,22 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     const { container } = startedApp();
     fireEvent.keyDown(conversationRoot(container), { key: "r" });
     expect(container.querySelector(".agent-ui-conversation")).not.toBeNull();
-    expect(container.querySelector(".mode-selector")).toBeNull();
+    expect(container.querySelector(".empty-tab")).toBeNull();
   });
 
-  it("r returns to the start screen once the session has ended, and asks for a fresh hello", () => {
+  it("r posts reset_tab once the session has ended, and the tab going NotStarted brings the empty tab back", () => {
     const { container } = startedApp();
     events({ type: "session_closed", reason: "provider exited" });
-    const readiesBefore = posted.filter((m) => m.type === "ready").length;
 
     fireEvent.keyDown(conversationRoot(container), { key: "r" });
+    expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
 
+    // Rust resets the tab in place (ruling 12) and says so with a fresh `tabs` envelope -- there is
+    // no local start-screen reset here any more, and no `ready` is asked for (ruling 17: Rust
+    // re-sends `hello` on its own whenever the set of open sessions changes).
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
     expect(container.querySelector(".agent-ui-conversation")).toBeNull();
-    expect(container.querySelector(".mode-selector")).not.toBeNull();
-    expect(posted.filter((m) => m.type === "ready").length).toBe(readiesBefore + 1);
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
   });
 
   /* §4.2/the round-1 review note: GTK owns Ctrl+Shift+R (panel reload) in the capture phase, and
@@ -942,7 +970,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(container.querySelector("textarea")).toBeNull();
       const hint = container.querySelector(".composer-browse-hint")!;
       expect(hint.textContent).not.toContain("按 i");
-      expect(hint.textContent).toContain("Press r to return to the start screen.");
+      expect(hint.textContent).toContain("Press r to start a new session here.");
       // Nothing for a Tab to land on either: the hint is a focus route into INPUT while the
       // session lives, and that route is what the `tabIndex` provides.
       expect(hint.hasAttribute("tabindex")).toBe(false);
@@ -958,7 +986,9 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
       // The key the banner promises actually resolves, from wherever focus ended up.
       fireEvent.keyDown(document.activeElement!, { key: "r" });
-      expect(container.querySelector(".mode-selector")).not.toBeNull();
+      expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+      expect(container.querySelector(".empty-tab")).not.toBeNull();
     });
   });
 });
@@ -967,11 +997,11 @@ describe("App: the which-key strip (spec 2026-09-19-which-key-design.md)", () =>
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    dispatchLiveTab(snapshotState(overrides), 0);
     return rendered;
   }
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
   const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
   const press = (key: string) => fireEvent.keyDown(document.activeElement ?? document.body, { key });
@@ -1058,11 +1088,11 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    dispatchLiveTab(snapshotState(overrides), 0);
     return rendered;
   }
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
   const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
   /** Presses `key` wherever focus is, the way a real key arrives. */
@@ -1145,20 +1175,12 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
-  it("walks the start screen's buttons with j and k", () => {
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    const modes = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="mode"]'));
-    expect(modes).toHaveLength(2);
-    press("j");
-    expect(document.activeElement).toBe(modes[0]);
-    press("j");
-    expect(document.activeElement).toBe(modes[1]);
-    press("j");
-    expect(document.activeElement).toBe(modes[1]);
-    press("k");
-    expect(document.activeElement).toBe(modes[0]);
-  });
+  // "walks the start screen's buttons with j and k" was removed here (session tabs Task 9): the
+  // two boxed Auto/Bypass mode buttons this test walked are gone with the mode-selector start
+  // screen, and the empty tab (F3) that replaced it owns its own `j`/`k` handling entirely --
+  // separate from this describe block's `root`/`press`, which only reach the CONVERSATION's
+  // `onKeyDown` once a session is live. The empty tab's own resume-row walking is unit-tested
+  // directly in `components/EmptyTab.test.tsx`.
 });
 
 /* The panel's half of the global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md).
@@ -1169,11 +1191,11 @@ describe("App global HINT: the panel's half", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    dispatchLiveTab(snapshotState(overrides), 0);
     return rendered;
   }
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
   const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
   const press = (key: string) => fireEvent.keyDown(document.activeElement ?? document.body, { key });
@@ -1223,8 +1245,9 @@ describe("App global HINT: the panel's half", () => {
   }
   /** Where each target of `conversation()` sits in the frozen list, i.e. the index `shell` sends:
    *  rows in document order, each followed by its code blocks and then its controls, the card's in
-   *  `data-nav-order` (Approve, Deny, reason), then the status line's Stop. */
-  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
+   *  `data-nav-order` (Approve, Deny, reason), then the activity line's Stop, then the always-present
+   *  status row (its own control -- `data-nav-stop="status-row"` is itself a button). */
+  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8, statusRow: 9 };
 
   it("f in BROWSE asks shell for a HINT, and f in INPUT is just a letter", () => {
     const { container } = conversation();
@@ -1319,9 +1342,9 @@ describe("App global HINT: the panel's half", () => {
 
   it("labels the composer and landing there enters INPUT with the caret in the box", () => {
     const { container } = idle();
-    // The prompt row, then the composer.
-    expect(collect(1)).toBe(2);
-    show(1, 2);
+    // The prompt row, then the composer, then the always-present status row.
+    expect(collect(1)).toBe(3);
+    show(1, 3);
     expect(labels(container)[1].classList.contains("hint-composer")).toBe(true);
     dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
     const textarea = container.querySelector("textarea");
@@ -1337,7 +1360,7 @@ describe("App global HINT: the panel's half", () => {
     expect(collect(1)).toBe(Object.keys(AT).length);
     cleanup();
     const { container } = idle();
-    expect(collect(2)).toBe(2);
+    expect(collect(2)).toBe(3);
     events({ type: "session_closed", reason: "done" });
     layOut(container);
     box(container.querySelector(".composer")!, 900);
@@ -1362,24 +1385,29 @@ describe("App global HINT: the panel's half", () => {
     expect(left.map((l) => l.textContent)).toEqual(LETTERS.slice(1, count));
   });
 
-  it("f on the start screen asks shell for a HINT too", () => {
-    render(<App />);
+  it("f on the empty tab asks shell for a HINT too, once the composer cannot be typed into", () => {
+    // With a live composer (the ordinary NotStarted case) `f` is a character to type, same as any
+    // other key -- the mode-selector screen this test was written for had no composer to compete
+    // with it. A `starting` tab's composer is disabled, so `f` there still means HINT (`EmptyTab`'s
+    // own `onKeyDown`), the same as the ended/lost banners' `r`.
+    const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    press("f");
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "f" });
     expect(lastOfType("hint_request")).toBeDefined();
   });
 
   it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
     const { container } = conversation();
     // 4 rows (prompt, reply, tool call, card) + the reply's code block + Approve + Deny + the
-    // reason box + Stop.
+    // reason box + Stop + the always-present status row.
     const count = collect(1);
     expect(count).toBe(Object.keys(AT).length);
     // Push the card row (and everything in it) below the list's viewport: it is no longer counted.
     const card = container.querySelector(".row-permission")!;
     box(card, 2000);
     for (const el of card.querySelectorAll("button, input")) box(el, 2000);
-    expect(collect(2)).toBe(5);
+    expect(collect(2)).toBe(6);
   });
 
   it("hint_show draws one label per frozen target, a row's over its sign cell", () => {
@@ -1546,19 +1574,31 @@ describe("App global HINT: the panel's half", () => {
     );
   });
 
-  it("labels the start screen's buttons, where there is no conversation yet", () => {
+  it("labels the empty tab's resume rows, where there is no conversation yet", () => {
+    // The mode-selector screen's two boxed buttons are gone; the empty tab's own composer is
+    // marked a HINT target too (`Composer`'s `hintTarget` prop), but jsdom reports it as zero-size
+    // unless `layOut` boxes it, so it drops out of `hintVisible` here the same way an off-screen
+    // control would -- this test is left targeting only the resume rows, which `layOut` does box.
     const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
+    dispatch({
+      kind: "hello",
+      ...HELLO,
+      resumableSessions: [
+        { provider: "claude", providerSessionId: "aaaaaaaa0000000000", createdAt: "1", updatedAt: "2" },
+        { provider: "claude", providerSessionId: "bbbbbbbb0000000000", createdAt: "1", updatedAt: "2" },
+      ],
+    });
+    dispatchEmptyTab();
     layOut(container);
     const count = collect(1);
-    expect(count).toBe(container.querySelectorAll('[data-nav-stop="mode"]').length + container.querySelectorAll('[data-nav-stop="choice"]').length);
+    const rows = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="resume"]'));
+    expect(count).toBe(rows.length);
     show(1, count);
     expect(labels(container)).toHaveLength(count);
-    const mode = container.querySelector<HTMLElement>('[data-nav-stop="mode"]')!;
-    const index = Array.from(container.querySelectorAll<HTMLElement>("[data-nav-stop]")).indexOf(mode);
+    const index = Array.from(container.querySelectorAll<HTMLElement>("[data-nav-stop]")).indexOf(rows[0]);
     dispatch({ kind: "hint_land", sessionId: 1, index });
-    expect(document.activeElement).toBe(mode);
-    expect(lastOfType("start_session")).toBeUndefined();
+    expect(document.activeElement).toBe(rows[0]);
+    expect(lastOfType("send_message")).toBeUndefined();
   });
 });
 
@@ -1574,11 +1614,11 @@ describe("App keyboard: scrolling through the conversation", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    dispatchLiveTab(snapshotState(overrides), 0);
     return rendered;
   }
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
   function prompts(...texts: string[]) {
     events(...texts.map((text): AgentDomainEvent => ({ type: "user_prompt_submitted", text })));
@@ -1868,7 +1908,7 @@ describe("App handoff to a terminal", () => {
   function conversation(overrides: Partial<AgentUiState> = {}, hello: Hello = HELLO) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...hello });
-    dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState(overrides) });
+    dispatchLiveTab(snapshotState(overrides), 1);
     return rendered;
   }
 
@@ -1885,9 +1925,10 @@ describe("App handoff to a terminal", () => {
     fireEvent.click(buttonLabelled(container, "Close it and show me the command")!);
     const posted = lastOfType("handoff_to_terminal")!;
     expect(typeof posted.request_id).toBe("string");
-    // Nothing about WHICH session: Rust reads that from canonical state, and a second source for it
-    // is how a panel eventually prints a command resuming some other conversation.
-    expect(Object.keys(posted).sort()).toEqual(["request_id", "type"]);
+    // Nothing about WHICH session beyond the tab: Rust reads the conversation itself from canonical
+    // state, and a second source for it is how a panel eventually prints a command resuming some
+    // other conversation.
+    expect(Object.keys(posted).sort()).toEqual(["request_id", "tab", "type"]);
   });
 
   /* The envelope arrives only after the real close has finished, so by the time this renders the
@@ -1896,11 +1937,14 @@ describe("App handoff to a terminal", () => {
   it("replaces the conversation with the command once the session really has been closed", () => {
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2", transcript: [{ seq: 1, text: "earlier reply" }] });
     dispatch({
-      kind: "handoff",
+      kind: "handoff", tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     });
+    // Rust's own tab, once really closed, returns to NotStarted (ruling 13) -- that `tabs` envelope
+    // is what actually drops this render back to the empty tab.
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
     expect(container.querySelector("pre.handoff-command")!.textContent).toBe(
       "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
     );
@@ -1909,7 +1953,7 @@ describe("App handoff to a terminal", () => {
     expect(container.querySelector(".agent-ui-conversation")).toBeNull();
     expect(container.textContent).not.toContain("earlier reply");
     // A new conversation is still startable; only this one moved.
-    expect(container.querySelector(".mode-selector")).not.toBeNull();
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
   });
 
   /* The session was just given to a terminal with no lock held. Continuing to offer it here is the
@@ -1925,7 +1969,7 @@ describe("App handoff to a terminal", () => {
     // which reaches the same start screen by the same route and DOES still see the offer.
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" }, resumableHello);
     dispatch({
-      kind: "handoff",
+      kind: "handoff", tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
@@ -1939,14 +1983,16 @@ describe("App handoff to a terminal", () => {
   it("keeps the command on screen when the next session fails to start", () => {
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
     dispatch({
-      kind: "handoff",
+      kind: "handoff", tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     });
-    fireEvent.click(buttonLabelled(container, "Auto")!);
-    const requestId = lastOfType("start_session")!.request_id;
-    dispatch({ kind: "command_result", requestId, ok: false, error: "claude is not on PATH" });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "try again" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "claude is not on PATH" }] });
     expect(container.querySelector("pre.handoff-command")!.textContent).toContain("--resume 1857dcd5-973b-46a2");
   });
 
@@ -1960,13 +2006,18 @@ describe("App handoff to a terminal", () => {
   it("copies the handoff command on y, once the session has been closed for it", () => {
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
     dispatch({
-      kind: "handoff",
+      kind: "handoff", tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
     const clipboard = stubClipboard();
-    fireEvent.keyDown(container.querySelector(".agent-ui-root")!, { key: "y" });
+    // F3's own composer autofocuses first; blur it (as a click elsewhere would) to reach the
+    // handoff card's own promise, "Press y to copy.", the same way `y` in the composer would
+    // otherwise just type the letter.
+    fireEvent.blur(container.querySelector("textarea")!);
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("cd /home/user/project && claude --resume 1857dcd5-973b-46a2");
   });
 
@@ -1977,16 +2028,18 @@ describe("App handoff to a terminal", () => {
   it("clears the command once a real session is running, so a later failure does not resurrect it", () => {
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
     dispatch({
-      kind: "handoff",
+      kind: "handoff", tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
     expect(container.querySelector("pre.handoff-command")).not.toBeNull();
 
-    dispatch({ kind: "snapshot", throughRevision: 9, state: snapshotState() });
-    dispatch({ kind: "error", message: "the second session died" });
-    expect(container.querySelector(".mode-selector")).not.toBeNull();
+    dispatchLiveTab(snapshotState(), 9);
+    dispatch({ kind: "error", tab: 1, message: "the second session died" });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "the second session died" }] });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
     expect(container.querySelector("pre.handoff-command")).toBeNull();
   });
 
@@ -2000,15 +2053,15 @@ describe("App handoff to a terminal", () => {
     };
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" }, resumableHello);
     dispatch({
-      kind: "handoff",
+      kind: "handoff", tab: 1,
       command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
       cwd: "/home/user/project",
       providerSessionId: "1857dcd5-973b-46a2",
     });
-    // The picker renders one radio per remembered session (plus "New session"), so the assertion
-    // is that the unrelated row survived -- not that some singular "continue" control exists. That
-    // control is gone: the offer became a list the same day this suppression was written.
-    const offered = Array.from(container.querySelectorAll(".session-choice button.resume")).map(
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+    // The empty tab renders one row per remembered session, so the assertion is that the unrelated
+    // row survived -- not that some singular "continue" control exists.
+    const offered = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="resume"]')).map(
       (b) => b.textContent ?? "",
     );
     // The picker shows `shortId` -- the first eight characters -- so the expected substrings are
@@ -2025,11 +2078,7 @@ describe("App while a handoff is closing the conversation", () => {
   function closing() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({
-      kind: "snapshot",
-      throughRevision: 1,
-      state: snapshotState({ providerSessionId: "1857dcd5-973b-46a2" }),
-    });
+    dispatchLiveTab(snapshotState({ providerSessionId: "1857dcd5-973b-46a2" }), 1);
     enterInputMode(rendered.container);
     fireEvent.click(buttonLabelled(rendered.container, "Continue in a terminal")!);
     return rendered;
@@ -2059,6 +2108,33 @@ describe("App while a handoff is closing the conversation", () => {
     expect(container.querySelector(".handoff-blocked")!.textContent).toContain("being closed");
   });
 
+  /* The closing state belongs to the tab being handed off (whole-branch review): switching to
+     another live tab while tab 1's close is still running must leave that tab's composer usable,
+     and tab 1's own `command_result` -- answered while tab 2 is on screen -- ends tab 1's state. */
+  it("keeps the closing state on the tab being handed off, not on whichever tab is shown", () => {
+    const { container } = closing();
+    fireEvent.click(buttonLabelled(container, "Close it and show me the command")!);
+    const requestId = lastOfType("handoff_to_terminal")!.request_id;
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
+    enterInputMode(container);
+    expect(container.querySelector("textarea")!.disabled).toBe(false);
+    expect(container.querySelector(".composer-closing")).toBeNull();
+
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ providerSessionId: "1857dcd5-973b-46a2" }) });
+    enterInputMode(container);
+    expect(container.querySelector("textarea")!.disabled).toBe(true);
+
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "command_result", requestId, ok: true });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ providerSessionId: "1857dcd5-973b-46a2" }) });
+    enterInputMode(container);
+    expect(container.querySelector("textarea")!.disabled).toBe(false);
+  });
+
   /* A stale-view refusal (a turn started between the render and the click) leaves the session
      completely untouched on the Rust side, so the panel has to come back to life here too. */
   it("comes back to life, saying why, when Rust refuses the handoff", () => {
@@ -2077,7 +2153,7 @@ describe("App refused commands", () => {
   function startedApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     enterInputMode(rendered.container);
     return rendered;
   }
@@ -2108,70 +2184,48 @@ describe("App refused commands", () => {
     }
   });
 
-  it("does not double-report a failed start, which already has its own banner", () => {
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    fireEvent.click(buttonLabelled(container, "Auto")!);
-    const requestId = lastOfType("start_session")!.request_id;
-    dispatch({ kind: "command_result", requestId, ok: false, error: "claude is not on PATH" });
-    expect(container.querySelector(".command-notice")).toBeNull();
-  });
+  // "does not double-report a failed start, which already has its own banner" was removed here
+  // (session tabs Task 9): it guarded `record?.kind === "start"`, a distinction that existed only
+  // because `start_session` was its own wire message with its own `command_result`. There is no
+  // such message any more (ruling 4) -- a fresh tab's first `send_message` IS the start, and a
+  // refusal of it is refused the same way any other send is, with no separate suppression rule
+  // specified for it by the plan.
 });
 
 describe("App fatal errors", () => {
-  it("shows the whole error text and returns to the start screen", () => {
+  it("shows the whole error text on the empty tab, with the dead session's transcript gone", () => {
+    // `errorBanner` (`.fatal-error`) is deliberately kept out of the empty-tab render (Step 12): a
+    // failed tab shows its own reason inline instead (ruling 14), which is what this now asserts on.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState({ transcript: [{ seq: 0, text: "gone" }] }) });
-    dispatch({ kind: "error", message: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" });
-    const banner = container.querySelector(".fatal-error")!;
-    // <pre>, because the sidecar's diagnostics are multi-line and the exact text is the point.
-    expect(banner.querySelector("pre")!.textContent).toContain("claude CLI 2.1.272 is untested");
-    expect(container.querySelector(".mode-selector")).not.toBeNull();
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 0, text: "gone" }] }), 0);
+    dispatch({ kind: "error", tab: 1, message: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" });
+    // Ruling 14: a fatal command marks the tab Failed, and it is that `tabs` envelope -- not the
+    // `error` alone -- that actually drops this render back to the empty tab.
+    dispatch({
+      kind: "tabs",
+      active: 1,
+      tabs: [{ ...LIVE_TAB, state: "failed", failure: "sidecar handshake failed\nclaude CLI 2.1.272 is untested" }],
+    });
+    expect(container.querySelector(".fatal-error")).toBeNull();
+    const failedRow = container.querySelector(".empty-tab .row-error")!;
+    expect(failedRow.textContent).toContain("claude CLI 2.1.272 is untested");
     // The dead session's transcript is gone with it, rather than left on screen looking live.
     expect(container.textContent).not.toContain("gone");
   });
 
-  /* The start screen's session picker is built from `hello`, which arrives once on mount. A session
-     that dies is persisted BEFORE it dies (`conversation::persist_record` on adoption), so by the
-     time the user is looking at the picker again that session is on disk and offerable -- but the
-     component is still rendering the list it captured at mount, which does not contain it. Asking
-     for `hello` again is what makes the picker's own "Previous conversations here, newest first"
-     true at the moment it is shown. */
-  it("asks for a fresh hello when a fatal error drops it back to the start screen", () => {
-    render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    expect(posted.filter((m) => m.type === "ready")).toHaveLength(1);
+  // "asks for a fresh hello when a fatal error drops it back to the start screen" and "re-asks once
+  // per error rather than compounding" were removed here (session tabs Task 9, ruling 17): `error`
+  // no longer re-requests `hello` itself. Rust re-sends `hello`, recomputed, whenever the set of
+  // open provider sessions changes -- a tab failing is exactly such a change -- so there is no
+  // client-side re-ask left to test; asserting "no extra `ready` is posted" would just restate that
+  // `error`'s handler does not call `requestHello()`, which is visible in `App.tsx` itself.
 
-    dispatch({ kind: "error", message: "the provider exited" });
-
-    const readies = posted.filter((m) => m.type === "ready");
-    expect(readies).toHaveLength(2);
-    // A distinct request id, not the mount one replayed: Rust answers each `ready` with its own
-    // `command_result`, and two replies to one id is a bookkeeping bug waiting to happen.
-    expect(readies[1].request_id).not.toBe(readies[0].request_id);
-  });
-
-  /* The re-ask must not become a loop. Rust answers `Ready` with `hello` + `command_result`, never
-     with another `error`, so a second error can only come from a second real failure -- and each one
-     gets exactly one re-ask. */
-  it("re-asks once per error rather than compounding", () => {
-    render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "error", message: "first" });
-    dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "error", message: "second" });
-    expect(posted.filter((m) => m.type === "ready")).toHaveLength(3);
-  });
-
-  it("can be dismissed without resurrecting the session", () => {
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "error", message: "boom" });
-    fireEvent.click(buttonLabelled(container, "Dismiss")!);
-    expect(container.querySelector(".fatal-error")).toBeNull();
-    expect(container.querySelector(".mode-selector")).not.toBeNull();
-  });
+  // "can be dismissed without resurrecting the session" was removed here too: it exercised
+  // `errorBanner`'s own Dismiss button, over a session that was never started at all -- a scenario
+  // that never reaches the conversation branch `errorBanner` renders in any more, since a bare
+  // `error` before any tab exists goes straight to the empty tab. A failed tab's inline reason has
+  // no separate dismissal; `r` (ruling 12) is what starts over.
 });
 
 /* The `?` keymap overlay (Task 3, spec 2026-09-19-which-key-design.md §3), wired end to end through
@@ -2183,7 +2237,7 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    dispatchLiveTab(snapshotState(overrides), 0);
     dispatch({
       kind: "keymap",
       prefix: "Ctrl+b",
@@ -2193,7 +2247,7 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     return rendered;
   }
   function events(...list: AgentDomainEvent[]) {
-    dispatch({ kind: "events", fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   }
   const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
   const press = (key: string, over: Partial<{ shiftKey: boolean }> = {}) =>
@@ -2235,7 +2289,7 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     dispatch({ kind: "hello", ...HELLO });
     act(() => dispatch({ kind: "open_keymap" }));
     expect(overlay(container)).toBeNull();
-    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    dispatchLiveTab(snapshotState(), 0);
     expect(overlay(container)).toBeNull();
   });
 
@@ -2282,6 +2336,32 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
   });
 });
 
+describe("V2: the activity line, the status row, the footer, and the detail popover (Task 10)", () => {
+  it("puts the activity line above the composer, then the status row, then the footer", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ activeTurnId: "t1", model: "claude-sonnet-5" }));
+    const order = [".activity-line", ".composer", ".status-row", ".panel-footer"].map((s) => container.querySelector(s));
+    expect(order.every((el) => el !== null)).toBe(true);
+    for (let i = 1; i < order.length; i++) {
+      expect(order[i - 1]!.compareDocumentPosition(order[i]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    expect(container.querySelector(".winbar")).toBeNull();
+  });
+
+  it("opens the detail popover from the status row and closes it with Esc", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState());
+    fireEvent.click(container.querySelector(".status-row")!);
+    expect(lastOfType("open_detail")).toMatchObject({ tab: 1 });
+    dispatch({ kind: "tab_detail", tab: 1, rows: [{ label: "account", value: "work" }, { label: "cwd", value: "/p" }] });
+    expect(container.querySelector(".detail-popover")!.textContent).toContain("work");
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "Escape" });
+    expect(container.querySelector(".detail-popover")).toBeNull();
+  });
+});
+
 /* Change B of the 2026-09-24 fix: `MessageList` ends following on what the user did, and for the
    panel's own scroll keys that is this announcement, made on the list before the key scrolls it.
    Without it, `k` would still end following only through the direction of its scroll -- the very
@@ -2290,17 +2370,16 @@ describe("the panel's own scroll keys announce themselves to the message list", 
   function startedApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({
-      kind: "snapshot",
-      throughRevision: 3,
-      state: snapshotState({
+    dispatchLiveTab(
+      snapshotState({
         transcript: [
           { seq: 0, text: "one" },
           { seq: 1, text: "two" },
           { seq: 2, text: "three" },
         ],
       }),
-    });
+      3,
+    );
     return rendered;
   }
 
@@ -2334,5 +2413,174 @@ describe("the panel's own scroll keys announce themselves to the message list", 
     fireEvent.keyDown(root, { key: "j" }); // ...which scrolls the overlay, not the list
     fireEvent.keyDown(root, { key: "Escape" });
     expect(seen).toEqual([]);
+  });
+});
+
+describe("session tabs", () => {
+  it("drops an envelope for a tab that is not active", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "tab one's reply" }] }));
+    dispatch({ kind: "events", tab: 2, fromRevision: 1, throughRevision: 2, events: [{ type: "content_delta", turn_id: "t", kind: "text", text: "tab two's reply" }] });
+    expect(container.textContent).toContain("tab one's reply");
+    expect(container.textContent).not.toContain("tab two's reply");
+  });
+
+  it("names the active tab on every command", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 4, tabs: [{ ...LIVE_TAB, id: 4, state: "not_started" }] });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "hello" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(lastOfType("send_message")).toMatchObject({ tab: 4, text: "hello" });
+  });
+
+  it("a switch clears the previous tab's conversation before the new snapshot", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first tab" }] }));
+    dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] });
+    expect(container.textContent).not.toContain("first tab");
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "second tab" }] }) });
+    expect(container.textContent).toContain("second tab");
+  });
+});
+
+describe("the tab bar", () => {
+  const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 docs" }];
+
+  it("appears with a second tab and goes with it (owner: 两个以上才显示)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState());
+    expect(container.querySelector(".tab-bar")).toBeNull();
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    expect(container.querySelector(".tab-bar")).not.toBeNull();
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    expect(container.querySelector(".tab-bar")).toBeNull();
+  });
+
+  it("is the first nav stop: k from the first row reaches it", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "only row" }] }) });
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "k" });
+    expect(document.activeElement?.getAttribute("role")).toBe("tab");
+  });
+
+  it("keeps each tab's cursor across a switch", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const rows = snapshotState({ transcript: [1, 2, 3].map((seq) => ({ seq, text: `row ${seq}` })) });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: rows });
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyDown(root, { key: "j" });
+    const cursorText = () => container.querySelector(".row-current")?.textContent ?? "";
+    expect(cursorText()).toContain("row 3");
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "other" }] }) });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: rows });
+    expect(cursorText()).toContain("row 3");
+  });
+
+  it("keeps each tab's unsent draft (ruling 24)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const empty = [{ ...LIVE_TAB, state: "not_started" }, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
+    dispatch({ kind: "tabs", active: 1, tabs: empty });
+    fireEvent.change(container.querySelector("textarea")!, { target: { value: "half a thought" } });
+    dispatch({ kind: "tabs", active: 2, tabs: empty });
+    expect(container.querySelector("textarea")!.value).toBe("");
+    dispatch({ kind: "tabs", active: 1, tabs: empty });
+    expect(container.querySelector("textarea")!.value).toBe("half a thought");
+  });
+
+  it("prefix , renames inline and prefix & closes after y, any other key cancels", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "begin_rename", tab: 1, current: null });
+    const input = container.querySelector<HTMLInputElement>(".tab-rename")!;
+    expect(container.querySelector(".tab-bar")).not.toBeNull();
+    fireEvent.change(input, { target: { value: "docs" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(lastOfType("rename_tab")).toMatchObject({ tab: 1, name: "docs" });
+    expect(container.querySelector(".tab-bar")).toBeNull();
+
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ['close 1 "docs"? (y/n)'] });
+    fireEvent.keyDown(root, { key: "n" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ['close 1 "docs"? (y/n)'] });
+    fireEvent.keyDown(root, { key: "Shift" });
+    fireEvent.keyDown(root, { key: "y" });
+    expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
+  });
+
+  /** A rename field opened on one tab stays open across a switch (ruling: n/p/digits/l move without
+   *  moving focus, D3 B) -- nothing here enforces mutual exclusion between renaming and switching.
+   *  Committing must still name the tab the field is open on, never whichever tab is active by then. */
+  it("commits a rename to the tab it was opened on, even after the active tab has changed", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "begin_rename", tab: 1, current: null });
+    const input = container.querySelector<HTMLInputElement>(".tab-rename")!;
+    // The active tab changes while the rename field on tab 1 is still mounted.
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    fireEvent.change(input, { target: { value: "notes" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(lastOfType("rename_tab")).toMatchObject({ tab: 1, name: "notes" });
+  });
+});
+
+describe("the session chooser", () => {
+  const ENV = {
+    kind: "chooser",
+    launch: true,
+    open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }],
+    records: [{ providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
+  };
+
+  it("opens over the empty tab at launch; Enter on a record resumes it in the active tab", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch(ENV);
+    const chooser = container.querySelector<HTMLElement>(".chooser")!;
+    fireEvent.keyDown(chooser, { key: "j" });
+    fireEvent.keyDown(chooser, { key: "Enter" });
+    expect(lastOfType("resume")).toMatchObject({ tab: 1, provider_session_id: "free-0000" });
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+
+  it("Esc at launch tells shell, which hands the keys to the editor", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch(ENV);
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+    expect(lastOfType("chooser_closed")).toMatchObject({ launch: true });
+  });
+
+  /** GUI pass, 2026-09-25: `prefix w` over an empty tab, then `Esc`, left the keys on
+   *  `.agent-ui-root` -- the empty layout's anchor, which handles no key. Typing went nowhere and
+   *  not even `i` recovered it; only a click did. The empty tab's live control is its composer. */
+  it("Esc from prefix w over an empty tab gives the composer the keys, in INPUT", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ ...ENV, launch: false });
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+    expect(lastOfType("chooser_closed")).toMatchObject({ launch: false });
+    expect(container.querySelector(".chooser")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector("textarea"));
   });
 });

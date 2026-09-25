@@ -722,7 +722,7 @@ mod tests {
             .contains("repeats within 500 ms"));
         assert_eq!(
             find("Ctrl+b 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 / 9").what,
-            "Select that session tab (not yet)"
+            "Select that session tab"
         );
         assert!(find("Ctrl+b %").what.contains("(e / a / t)"));
         assert_eq!(

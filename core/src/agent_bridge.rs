@@ -8,10 +8,10 @@
 #[cfg(test)]
 use agent::AgentSessionProjection;
 use agent::{AgentDomainEvent, PermissionMode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionModeChoice {
     Auto,
@@ -27,28 +27,49 @@ impl From<SessionModeChoice> for PermissionMode {
     }
 }
 
+impl SessionModeChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionModeChoice::Auto => "auto",
+            SessionModeChoice::Bypass => "bypass",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "auto" => Some(SessionModeChoice::Auto),
+            "bypass" => Some(SessionModeChoice::Bypass),
+            _ => None,
+        }
+    }
+
+    /// `Shift+Tab` on an empty tab: the next of `offered` (in order), wrapping; a mode not in
+    /// `offered` goes to the first one it can parse.
+    pub fn cycled(self, offered: &[&str]) -> Self {
+        let modes: Vec<Self> = offered.iter().filter_map(|m| Self::parse(m)).collect();
+        match modes.iter().position(|m| *m == self) {
+            Some(at) => modes[(at + 1) % modes.len()],
+            None => modes.first().copied().unwrap_or(self),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
     Ready {
         request_id: String,
     },
-    /// `resume` carries the Claude provider session id to continue. Absent for a fresh session.
-    /// One message rather than two so there is exactly one path into backend construction -- a
-    /// second entry point is how a "resume" would eventually acquire its own subtly different
-    /// failure handling.
-    StartSession {
-        request_id: String,
-        mode: SessionModeChoice,
-        #[serde(default)]
-        resume: Option<String>,
-    },
     SendMessage {
         request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
         text: String,
     },
     Interrupt {
         request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
     },
     /// The WebView reporting how long it took to draw the first assistant text of a turn, measured
     /// from its own receipt of the payload to the animation frame that rendered it.
@@ -58,6 +79,8 @@ pub enum InboundMessage {
     /// nothing branches on it, and it gets no `command_result`.
     TurnRendered {
         request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
         receive_to_frame_ms: f64,
     },
     /// "Continue this conversation in a real terminal." Carries nothing of its own: every input the
@@ -68,9 +91,13 @@ pub enum InboundMessage {
     /// this path does and does not claim, and `agent_panel`'s `PendingHandoff` for the ordering.
     HandoffToTerminal {
         request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
     },
     PermissionResponse {
         request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
         permission_id: String,
         decision: DecisionChoice,
         /// Only meaningful on a denial -- there is no field anywhere downstream that would show an
@@ -78,6 +105,58 @@ pub enum InboundMessage {
         /// `InboundMessage` is already internally tagged on `type`.
         #[serde(default)]
         reason: Option<String>,
+    },
+    /// `resume{tab, provider_session_id}` carries the Claude provider session id to continue on the
+    /// tab the user was in. `start_session` is removed (session tabs spec ruling 4): a fresh session
+    /// on a `NotStarted` tab now starts lazily off `send_message` rather than an explicit message.
+    Resume {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        provider_session_id: String,
+    },
+    /// The tab bar: `n`/`p`/a digit, or a click on a tab's label.
+    SelectTab {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `prefix ,`: commits the inline rename field's text.
+    RenameTab {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        name: String,
+    },
+    /// Sent after the panel's own y/n close confirmation.
+    CloseTab {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `r` on an ended or failed tab: returns it to `NotStarted` in place.
+    ResetTab {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `Shift+Tab` on an empty tab: cycles its remembered permission mode.
+    CycleMode {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `Enter` on the status row (`prefix i` is `shell`'s own): opens the detail popover.
+    OpenDetail {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// A chooser was dismissed; `launch` is the `launch` flag of the chooser that closed: true for
+    /// the launch chooser (D10), whose dismissal hands the keys to the editor.
+    ChooserClosed {
+        request_id: String,
+        launch: bool,
     },
     /// `f` in the panel's BROWSE: ask `shell` to start a global HINT.
     HintRequest {
@@ -89,6 +168,43 @@ pub enum InboundMessage {
         session_id: u64,
         count: usize,
     },
+}
+
+/// Which tab a command is about (session tabs spec §3.8 point 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabRef {
+    /// A message about the whole panel (`ready`, `chooser_closed`, the HINT pair).
+    WindowLevel,
+    /// A tab command that names none: a protocol error, never "the active one" (ruling 2).
+    Missing,
+    Named(crate::tabs::TabId),
+}
+
+impl InboundMessage {
+    pub fn tab_ref(&self) -> TabRef {
+        let tab = match self {
+            InboundMessage::Ready { .. }
+            | InboundMessage::ChooserClosed { .. }
+            | InboundMessage::HintRequest { .. }
+            | InboundMessage::HintTargets { .. } => return TabRef::WindowLevel,
+            InboundMessage::SendMessage { tab, .. }
+            | InboundMessage::Interrupt { tab, .. }
+            | InboundMessage::TurnRendered { tab, .. }
+            | InboundMessage::HandoffToTerminal { tab, .. }
+            | InboundMessage::PermissionResponse { tab, .. }
+            | InboundMessage::Resume { tab, .. }
+            | InboundMessage::SelectTab { tab, .. }
+            | InboundMessage::RenameTab { tab, .. }
+            | InboundMessage::CloseTab { tab, .. }
+            | InboundMessage::ResetTab { tab, .. }
+            | InboundMessage::CycleMode { tab, .. }
+            | InboundMessage::OpenDetail { tab, .. } => *tab,
+        };
+        match tab {
+            Some(id) => TabRef::Named(crate::tabs::TabId(id)),
+            None => TabRef::Missing,
+        }
+    }
 }
 
 /// The decision half of a `permission_response`, as a closed set rather than a bool.
@@ -121,12 +237,19 @@ impl InboundMessage {
     pub fn request_id(&self) -> &str {
         match self {
             InboundMessage::Ready { request_id }
-            | InboundMessage::StartSession { request_id, .. }
             | InboundMessage::SendMessage { request_id, .. }
-            | InboundMessage::Interrupt { request_id }
+            | InboundMessage::Interrupt { request_id, .. }
             | InboundMessage::TurnRendered { request_id, .. }
-            | InboundMessage::HandoffToTerminal { request_id }
+            | InboundMessage::HandoffToTerminal { request_id, .. }
             | InboundMessage::PermissionResponse { request_id, .. }
+            | InboundMessage::Resume { request_id, .. }
+            | InboundMessage::SelectTab { request_id, .. }
+            | InboundMessage::RenameTab { request_id, .. }
+            | InboundMessage::CloseTab { request_id, .. }
+            | InboundMessage::ResetTab { request_id, .. }
+            | InboundMessage::CycleMode { request_id, .. }
+            | InboundMessage::OpenDetail { request_id, .. }
+            | InboundMessage::ChooserClosed { request_id, .. }
             | InboundMessage::HintRequest { request_id }
             | InboundMessage::HintTargets { request_id, .. } => request_id,
         }
@@ -211,6 +334,7 @@ pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) 
             "createdAt": r.created_at,
             "updatedAt": r.updated_at,
             "title": r.title,
+            "name": r.name,
         })).collect::<Vec<_>>(),
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
     })
@@ -251,13 +375,14 @@ pub fn serialize_enter_input_for_js() -> String {
     json!({ "kind": "enter_input" }).to_string()
 }
 
-/// `{"kind":"focus_permission"}`: the chat was brought back to answer a card -- its tray chip
-/// `agent ⚑N` activated, or `Ctrl+a a` with a card waiting (modules spec §3.3). The panel goes to
-/// BROWSE with its cursor on the oldest pending card. `shell` sends it only when the count it
+/// `{"kind":"focus_permission","tab":...}`: the chat was brought back to answer a card -- its tray
+/// chip `agent ⚑N` activated, or `Ctrl+a a` with a card waiting (modules spec §3.3). The panel goes
+/// to BROWSE with its cursor on the oldest pending card. `shell` sends it only when the count it
 /// keeps (`crate::attention`) is above zero; a panel that finds no card takes the composer instead,
-/// as it does for `enter_input`.
-pub fn serialize_focus_permission_for_js() -> String {
-    json!({ "kind": "focus_permission" }).to_string()
+/// as it does for `enter_input`. `tab` names the session tab it is about; the panel drops it unless
+/// that tab is active (session tabs spec §3.1).
+pub fn serialize_focus_permission_for_js(tab: crate::tabs::TabId) -> String {
+    json!({ "kind": "focus_permission", "tab": tab.0 }).to_string()
 }
 
 /// `{"kind":"keymap", ...}`: the `?` overlay's two `shell` sections, generated from
@@ -302,7 +427,7 @@ pub fn serialize_hint_end_for_js(session_id: u64) -> String {
     json!({ "kind": "hint_end", "sessionId": session_id }).to_string()
 }
 
-/// `{"kind":"events","fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
+/// `{"kind":"events","tab":...,"fromRevision":...,"throughRevision":...,"events":[<tagged AgentDomainEvent JSON>, ...]}`.
 /// `AgentDomainEvent`'s own `#[derive(Serialize)]` produces the tagged shape directly for each
 /// element. `from_revision` is the projection's `last_revision` BEFORE this batch was folded;
 /// `through_revision` is `last_revision` AFTER. Both are currently informational only -- this
@@ -311,10 +436,23 @@ pub fn serialize_hint_end_for_js(session_id: u64) -> String {
 /// path that exists today (`shell/MANUAL_VERIFICATION.md`'s "agent-ui verification, protocol v2"
 /// section, check 4) works by re-loading the panel's document from scratch and consuming a fresh
 /// `snapshot`, not by asking for events from a prior revision -- a real revisioned resync
-/// consumer, if one is ever built, is future work, not something already wired up here.
-pub fn serialize_events_for_js(from_revision: u64, through_revision: u64, events: &[AgentDomainEvent]) -> String {
-    json!({ "kind": "events", "fromRevision": from_revision, "throughRevision": through_revision, "events": events })
-        .to_string()
+/// consumer, if one is ever built, is future work, not something already wired up here. `tab` names
+/// the session tab it is about; the panel drops it unless that tab is active (session tabs spec
+/// §3.1).
+pub fn serialize_events_for_js(
+    tab: crate::tabs::TabId,
+    from_revision: u64,
+    through_revision: u64,
+    events: &[AgentDomainEvent],
+) -> String {
+    json!({
+        "kind": "events",
+        "tab": tab.0,
+        "fromRevision": from_revision,
+        "throughRevision": through_revision,
+        "events": events
+    })
+    .to_string()
 }
 
 /// Everything one snapshot needs, gathered from wherever it actually lives.
@@ -353,7 +491,7 @@ impl<'a> SnapshotView<'a> {
     }
 }
 
-/// `{"kind":"snapshot","throughRevision":...,"state":<AgentUiState-shaped JSON>}` -- a
+/// `{"kind":"snapshot","tab":...,"throughRevision":...,"state":<AgentUiState-shaped JSON>}` -- a
 /// hand-written re-shaping of `AgentSessionProjection`'s snake_case Rust fields into the camelCase
 /// shape `agent-ui/web/src/types.ts`'s `AgentUiState` expects (deliberately not a direct
 /// `#[derive(Serialize)]` passthrough -- the TS and Rust naming conventions differ, and this
@@ -363,8 +501,9 @@ impl<'a> SnapshotView<'a> {
 /// live outside it: `conversationId` is Neovibe's own and `providerSessionId` is Claude's, while the
 /// projection's `sessionId` is Verdandi's. Collapsing them would defeat the entire point of keeping
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
-/// answers with SESSION_NOT_FOUND.
-pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
+/// answers with SESSION_NOT_FOUND. `tab` names the session tab it is about; the panel drops it
+/// unless that tab is active (session tabs spec §3.1).
+pub fn serialize_snapshot_for_js(tab: crate::tabs::TabId, view: &SnapshotView<'_>) -> String {
     let projection = &*view.projection;
     // Written out for the same stated reason as `transcript` just below: both field names happen
     // to be single lowercase words today, so the derive would produce the same JSON, but this
@@ -498,11 +637,12 @@ pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
         "provider": provider,
     });
 
-    json!({ "kind": "snapshot", "throughRevision": projection.last_revision, "state": state }).to_string()
+    json!({ "kind": "snapshot", "tab": tab.0, "throughRevision": projection.last_revision, "state": state }).to_string()
 }
 
-/// `{"kind":"handoff","command":...,"cwd":...,"providerSessionId":...}` -- the conversation has
-/// been closed here and this is the command that continues it in the user's own terminal.
+/// `{"kind":"handoff","tab":...,"command":...,"cwd":...,"providerSessionId":...}` -- the
+/// conversation has been closed here and this is the command that continues it in the user's own
+/// terminal.
 ///
 /// Dispatched only AFTER the real session shutdown has completed (`agent_panel`'s
 /// `collect_pending_handoff`), so the ordering design doc §8.3 requires -- close and flush before
@@ -515,10 +655,12 @@ pub fn serialize_snapshot_for_js(view: &SnapshotView<'_>) -> String {
 /// **It carries no claim of exclusivity, because there is none to make.** Nothing was spawned and
 /// no lease was taken; the frontend renders the concurrency warning design doc §8.3's closing
 /// paragraph requires of this path, and §8.5/§17.7 reject a stronger claim even where a lease IS
-/// held.
-pub fn serialize_handoff_for_js(command: &agent::handoff::ClaudeResumeCommand) -> String {
+/// held. `tab` names the session tab it is about; the panel drops it unless that tab is active
+/// (session tabs spec §3.1).
+pub fn serialize_handoff_for_js(tab: crate::tabs::TabId, command: &agent::handoff::ClaudeResumeCommand) -> String {
     json!({
         "kind": "handoff",
+        "tab": tab.0,
         "command": command.shell_command_line(),
         "cwd": command.cwd(),
         // Read back out of the command's own argv by `ClaudeResumeCommand::provider_session_id`,
@@ -529,17 +671,150 @@ pub fn serialize_handoff_for_js(command: &agent::handoff::ClaudeResumeCommand) -
     .to_string()
 }
 
-/// `{"kind":"error","message":<message>}` -- a fatal, session-ending failure the frontend cannot
-/// otherwise detect (e.g. `AgentSession::start` failing because `claude` isn't on `PATH`).
+/// `{"kind":"error","tab":...,"message":<message>}` -- a fatal, session-ending failure the frontend
+/// cannot otherwise detect (e.g. `AgentSession::start` failing because `claude` isn't on `PATH`).
 /// Distinct from `command_result`'s `ok:false` (which reports one command's own failure without
-/// ending the session) -- this envelope means the whole `AgentSession` is gone.
-pub fn serialize_error_for_js(message: &str) -> String {
-    json!({ "kind": "error", "message": message }).to_string()
+/// ending the session) -- this envelope means the whole `AgentSession` is gone. `tab` names the
+/// session tab it is about; the panel drops it unless that tab is active (session tabs spec §3.1).
+pub fn serialize_error_for_js(tab: crate::tabs::TabId, message: &str) -> String {
+    json!({ "kind": "error", "tab": tab.0, "message": message }).to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabStateWire {
+    NotStarted,
+    Starting,
+    Live,
+    Ended,
+    Failed,
+}
+
+impl TabStateWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TabStateWire::NotStarted => "not_started",
+            TabStateWire::Starting => "starting",
+            TabStateWire::Live => "live",
+            TabStateWire::Ended => "ended",
+            TabStateWire::Failed => "failed",
+        }
+    }
+}
+
+/// One tab as the panel draws it (the tab bar, the chooser's open rows, the footer's mode pill).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabView {
+    pub id: crate::tabs::TabId,
+    pub number: u16,
+    pub label: String,
+    pub name: Option<String>,
+    pub state: TabStateWire,
+    pub mode: SessionModeChoice,
+    pub marker: Option<crate::tabs::Marker>,
+    pub pending: usize,
+    /// Whether a record of this tab's session can be resumed later (false on legacy, spec D13 A).
+    pub resumable: bool,
+    /// Why a `failed` tab failed, shown when it is (ruling 14).
+    pub failure: Option<String>,
+}
+
+/// `{"kind":"tabs",...}`: every tab and which one is active. Sent on `ready` and whenever any of it
+/// changes; always BEFORE the active tab's snapshot on a switch, so the panel knows which tab the
+/// snapshot is for.
+pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView]) -> String {
+    let tabs: Vec<Value> = tabs
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id.0,
+                "number": t.number,
+                "label": t.label,
+                "name": t.name,
+                "state": t.state.as_str(),
+                "mode": t.mode.as_str(),
+                "marker": t.marker.map(|m| m.wire()),
+                "pending": t.pending,
+                "resumable": t.resumable,
+                "failure": t.failure,
+            })
+        })
+        .collect();
+    json!({ "kind": "tabs", "active": active.0, "tabs": tabs }).to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailRow {
+    pub label: String,
+    pub value: String,
+}
+
+/// `prefix i`: the detail popover's rows, already worded (spec §3.3). Opens the popover.
+pub fn serialize_tab_detail_for_js(tab: crate::tabs::TabId, rows: &[DetailRow]) -> String {
+    let rows: Vec<Value> = rows
+        .iter()
+        .map(|r| json!({ "label": r.label, "value": r.value }))
+        .collect();
+    json!({ "kind": "tab_detail", "tab": tab.0, "rows": rows }).to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChooserTab {
+    pub tab: crate::tabs::TabId,
+    pub label: String,
+    pub marker: Option<crate::tabs::Marker>,
+    pub pending: usize,
+    pub resumable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChooserRecord {
+    pub provider_session_id: String,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Its lease is held by another window: shown as `open in another window`, not choosable.
+    pub held_elsewhere: bool,
+}
+
+/// `prefix w` (and D10's launch chooser): open tabs first, then the records open in no tab, newest
+/// first. Opens the chooser.
+pub fn serialize_chooser_for_js(launch: bool, open: &[ChooserTab], records: &[ChooserRecord]) -> String {
+    let open: Vec<Value> = open
+        .iter()
+        .map(|t| {
+            json!({
+                "tab": t.tab.0, "label": t.label, "marker": t.marker.map(|m| m.wire()),
+                "pending": t.pending, "resumable": t.resumable,
+            })
+        })
+        .collect();
+    let records: Vec<Value> = records
+        .iter()
+        .map(|r| {
+            json!({
+                "providerSessionId": r.provider_session_id, "name": r.name, "title": r.title,
+                "createdAt": r.created_at, "updatedAt": r.updated_at, "heldElsewhere": r.held_elsewhere,
+            })
+        })
+        .collect();
+    json!({ "kind": "chooser", "launch": launch, "open": open, "records": records }).to_string()
+}
+
+/// `prefix &`: the footer's y/n prompt, first line the question (`tabs::close_prompt`).
+pub fn serialize_confirm_close_for_js(tab: crate::tabs::TabId, lines: &[String]) -> String {
+    json!({ "kind": "confirm_close", "tab": tab.0, "lines": lines }).to_string()
+}
+
+/// `prefix ,`: open the inline rename field on the tab's label, prefilled with `current`.
+pub fn serialize_begin_rename_for_js(tab: crate::tabs::TabId, current: Option<&str>) -> String {
+    json!({ "kind": "begin_rename", "tab": tab.0, "current": current }).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tabs::{Marker, TabId};
     use agent::PermissionOutcome;
 
     #[test]
@@ -569,8 +844,8 @@ mod tests {
 
     #[test]
     fn serializes_focus_permission() {
-        let value: serde_json::Value = serde_json::from_str(&serialize_focus_permission_for_js()).unwrap();
-        assert_eq!(value, serde_json::json!({ "kind": "focus_permission" }));
+        let value: serde_json::Value = serde_json::from_str(&serialize_focus_permission_for_js(TabId(1))).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "focus_permission", "tab": 1 }));
     }
 
     #[test]
@@ -653,18 +928,6 @@ mod tests {
         // reversing this order would partial-move `msg` and fail to borrow-check on the next line.
         assert_eq!(msg.request_id(), "r1");
         assert!(matches!(msg, InboundMessage::Ready { request_id } if request_id == "r1"));
-    }
-
-    #[test]
-    fn parses_start_session_with_auto_mode() {
-        let msg = parse_inbound_message(r#"{"type":"start_session","request_id":"r2","mode":"auto"}"#).unwrap();
-        assert!(matches!(
-            msg,
-            InboundMessage::StartSession {
-                mode: SessionModeChoice::Auto,
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -798,9 +1061,10 @@ mod tests {
             permission_id: "p1".into(),
             outcome: PermissionOutcome::Allowed,
         }];
-        let json_str = serialize_events_for_js(3, 4, &events);
+        let json_str = serialize_events_for_js(TabId(1), 3, 4, &events);
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["kind"], "events");
+        assert_eq!(parsed["tab"], 1);
         assert_eq!(parsed["fromRevision"], 3);
         assert_eq!(parsed["throughRevision"], 4);
         assert_eq!(parsed["events"][0]["type"], "permission_resolved");
@@ -809,9 +1073,10 @@ mod tests {
 
     #[test]
     fn serialize_error_for_js_wraps_in_kind_error_envelope() {
-        let json_str = serialize_error_for_js("failed to start session: no such file or directory");
+        let json_str = serialize_error_for_js(TabId(1), "failed to start session: no such file or directory");
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["kind"], "error");
+        assert_eq!(parsed["tab"], 1);
         assert_eq!(parsed["message"], "failed to start session: no such file or directory");
     }
 
@@ -869,9 +1134,10 @@ mod tests {
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
 
-        let json_str = serialize_snapshot_for_js(&view);
+        let json_str = serialize_snapshot_for_js(TabId(1), &view);
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["kind"], "snapshot");
+        assert_eq!(parsed["tab"], 1);
         assert_eq!(parsed["throughRevision"], 5);
         assert_eq!(parsed["state"]["backend"], "sidecar");
         assert_eq!(parsed["state"]["pendingPermissions"], json!([]));
@@ -938,7 +1204,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert_eq!(pending["permissionId"], "perm-1");
         assert_eq!(pending["toolUseId"], "toolu_01ABC");
@@ -974,7 +1240,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert!(pending["toolUseId"].is_null());
         assert!(
@@ -1017,7 +1283,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         let history = &parsed["state"]["history"];
         assert_eq!(history["source"], "neovibe_copy");
         assert_eq!(history["restoredItems"], 314);
@@ -1053,7 +1319,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         let state = parsed["state"].as_object().unwrap();
         assert!(
             state.contains_key("history"),
@@ -1093,7 +1359,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert_eq!(pending["permissionId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
         assert_eq!(pending["toolUseId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
@@ -1154,7 +1420,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         let state = &parsed["state"];
 
         let mut merged: Vec<(u64, String)> = Vec::new();
@@ -1244,7 +1510,7 @@ mod tests {
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
             };
-            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
             let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
 
             let ids: Vec<&str> = cards.iter().map(|p| p["permissionId"].as_str().unwrap()).collect();
@@ -1287,7 +1553,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let json: serde_json::Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         assert_eq!(json["state"]["userPrompts"][0]["text"], "hello");
         assert_eq!(json["state"]["userPrompts"][0]["seq"], 0);
     }
@@ -1303,7 +1569,7 @@ mod tests {
             tool_name: "Bash".into(),
             input: json!({}),
         }];
-        let parsed: Value = serde_json::from_str(&serialize_events_for_js(0, 1, &events)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_events_for_js(TabId(1), 0, 1, &events)).unwrap();
         assert_eq!(parsed["events"][0]["tool_use_id"], "toolu_01ABC");
     }
 
@@ -1353,7 +1619,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(&view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
         assert_eq!(parsed["state"]["backend"], "legacy");
         assert!(
             parsed["state"]["conversationId"].is_null(),
@@ -1398,6 +1664,7 @@ mod tests {
             created_at: created_at.into(),
             updated_at: updated_at.into(),
             title: None,
+            name: None,
         }
     }
 
@@ -1454,23 +1721,6 @@ mod tests {
     }
 
     #[test]
-    fn start_session_parses_with_and_without_a_resume_id() {
-        let fresh = parse_inbound_message(r#"{"type":"start_session","request_id":"r1","mode":"bypass"}"#).unwrap();
-        match fresh {
-            InboundMessage::StartSession { resume, .. } => assert!(resume.is_none()),
-            other => panic!("expected StartSession, got {other:?}"),
-        }
-        let resumed = parse_inbound_message(
-            r#"{"type":"start_session","request_id":"r2","mode":"bypass","resume":"claude-abc"}"#,
-        )
-        .unwrap();
-        match resumed {
-            InboundMessage::StartSession { resume, .. } => assert_eq!(resume.as_deref(), Some("claude-abc")),
-            other => panic!("expected StartSession, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn parses_handoff_to_terminal() {
         let msg = parse_inbound_message(r#"{"type":"handoff_to_terminal","request_id":"r10"}"#).unwrap();
         assert_eq!(msg.request_id(), "r10");
@@ -1487,8 +1737,9 @@ mod tests {
     fn serialize_handoff_for_js_carries_the_runnable_line_and_its_parts() {
         let command =
             agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2").unwrap();
-        let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(&command)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(TabId(1), &command)).unwrap();
         assert_eq!(parsed["kind"], "handoff");
+        assert_eq!(parsed["tab"], 1);
         assert_eq!(
             parsed["command"],
             "cd /home/user/project && claude --resume 1857dcd5-973b-46a2"
@@ -1503,7 +1754,7 @@ mod tests {
     #[test]
     fn the_envelopes_session_id_is_the_one_the_command_actually_resumes() {
         let command = agent::handoff::ClaudeResumeCommand::for_session("/tmp/p", " padded-id ").unwrap();
-        let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(&command)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_handoff_for_js(TabId(1), &command)).unwrap();
         assert_eq!(parsed["providerSessionId"], "padded-id");
         assert!(parsed["command"]
             .as_str()
@@ -1526,5 +1777,181 @@ mod tests {
             "the legacy backend can never offer a resume"
         );
         assert!(parsed["expectedVerdandiRevision"].is_null());
+    }
+
+    #[test]
+    fn a_tab_command_parses_and_says_which_tab_it_names() {
+        let named = parse_inbound_message(r#"{"type":"send_message","request_id":"r1","tab":3,"text":"hi"}"#).unwrap();
+        assert!(matches!(named.tab_ref(), TabRef::Named(TabId(3))));
+        // Ruling 2: parsed, so its requestId can be answered, and then refused as naming no tab.
+        let missing = parse_inbound_message(r#"{"type":"interrupt","request_id":"r2"}"#).unwrap();
+        assert_eq!(missing.request_id(), "r2");
+        assert!(matches!(missing.tab_ref(), TabRef::Missing));
+        let window = parse_inbound_message(r#"{"type":"ready","request_id":"r3"}"#).unwrap();
+        assert!(matches!(window.tab_ref(), TabRef::WindowLevel));
+        let permission = parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r4","tab":1,"permission_id":"p","decision":"allow"}"#,
+        )
+        .unwrap();
+        assert!(matches!(permission.tab_ref(), TabRef::Named(TabId(1))));
+    }
+
+    #[test]
+    fn the_new_tab_messages_parse() {
+        for (json, want) in [
+            (r#"{"type":"select_tab","request_id":"a","tab":2}"#, "select_tab"),
+            (
+                r#"{"type":"rename_tab","request_id":"a","tab":2,"name":"docs"}"#,
+                "rename_tab",
+            ),
+            (r#"{"type":"close_tab","request_id":"a","tab":2}"#, "close_tab"),
+            (r#"{"type":"reset_tab","request_id":"a","tab":2}"#, "reset_tab"),
+            (r#"{"type":"cycle_mode","request_id":"a","tab":2}"#, "cycle_mode"),
+            (r#"{"type":"open_detail","request_id":"a","tab":2}"#, "open_detail"),
+            (
+                r#"{"type":"resume","request_id":"a","tab":2,"provider_session_id":"c-1"}"#,
+                "resume",
+            ),
+        ] {
+            let message = parse_inbound_message(json).unwrap_or_else(|| panic!("{want} did not parse"));
+            assert!(matches!(message.tab_ref(), TabRef::Named(TabId(2))), "{want}");
+        }
+        let closed = parse_inbound_message(r#"{"type":"chooser_closed","request_id":"a","launch":true}"#).unwrap();
+        assert!(matches!(closed, InboundMessage::ChooserClosed { launch: true, .. }));
+        assert!(matches!(closed.tab_ref(), TabRef::WindowLevel));
+        assert!(
+            parse_inbound_message(r#"{"type":"start_session","request_id":"a","mode":"auto"}"#).is_none(),
+            "ruling 4: start_session is gone"
+        );
+    }
+
+    #[test]
+    fn every_session_envelope_carries_its_tab() {
+        let tab = TabId(7);
+        let events: serde_json::Value = serde_json::from_str(&serialize_events_for_js(tab, 1, 2, &[])).unwrap();
+        assert_eq!(events["tab"], 7);
+        let error: serde_json::Value = serde_json::from_str(&serialize_error_for_js(tab, "gone")).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({ "kind": "error", "tab": 7, "message": "gone" })
+        );
+        let focus: serde_json::Value = serde_json::from_str(&serialize_focus_permission_for_js(tab)).unwrap();
+        assert_eq!(focus, serde_json::json!({ "kind": "focus_permission", "tab": 7 }));
+        let rename: serde_json::Value =
+            serde_json::from_str(&serialize_begin_rename_for_js(tab, Some("docs"))).unwrap();
+        assert_eq!(
+            rename,
+            serde_json::json!({ "kind": "begin_rename", "tab": 7, "current": "docs" })
+        );
+        let confirm: serde_json::Value = serde_json::from_str(&serialize_confirm_close_for_js(
+            tab,
+            &["close 1 \"new\"? (y/n)".to_string()],
+        ))
+        .unwrap();
+        assert_eq!(confirm["lines"][0], "close 1 \"new\"? (y/n)");
+        let command =
+            agent::handoff::ClaudeResumeCommand::for_session("/home/user/project", "1857dcd5-973b-46a2").unwrap();
+        let handoff: serde_json::Value = serde_json::from_str(&serialize_handoff_for_js(tab, &command)).unwrap();
+        assert_eq!(handoff["tab"], 7);
+        assert_eq!(handoff["providerSessionId"], "1857dcd5-973b-46a2");
+    }
+
+    #[test]
+    fn the_tabs_envelope_lists_every_tab_with_its_marker_and_the_active_one() {
+        let tabs = [
+            TabView {
+                id: TabId(1),
+                number: 1,
+                label: "1 fix-parser".into(),
+                name: Some("fix-parser".into()),
+                state: TabStateWire::Live,
+                mode: SessionModeChoice::Auto,
+                marker: Some(Marker::NeedsInput(2)),
+                pending: 2,
+                resumable: true,
+                failure: None,
+            },
+            TabView {
+                id: TabId(4),
+                number: 2,
+                label: "2 new".into(),
+                name: None,
+                state: TabStateWire::Failed,
+                mode: SessionModeChoice::Bypass,
+                marker: Some(Marker::Ended),
+                pending: 0,
+                resumable: false,
+                failure: Some("the gate refused".into()),
+            },
+        ];
+        let value: serde_json::Value = serde_json::from_str(&serialize_tabs_for_js(TabId(4), &tabs)).unwrap();
+        assert_eq!(value["kind"], "tabs");
+        assert_eq!(value["active"], 4);
+        assert_eq!(
+            value["tabs"][0],
+            serde_json::json!({
+                "id": 1, "number": 1, "label": "1 fix-parser", "name": "fix-parser", "state": "live",
+                "mode": "auto", "marker": "needs_input", "pending": 2, "resumable": true, "failure": null
+            })
+        );
+        assert_eq!(value["tabs"][1]["state"], "failed");
+        assert_eq!(value["tabs"][1]["marker"], "ended");
+        assert_eq!(value["tabs"][1]["name"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_chooser_lists_open_tabs_then_records_and_marks_those_held_elsewhere() {
+        let open = [ChooserTab {
+            tab: TabId(1),
+            label: "1 docs".into(),
+            marker: None,
+            pending: 0,
+            resumable: true,
+        }];
+        let records = [ChooserRecord {
+            provider_session_id: "c-9".into(),
+            name: None,
+            title: Some("fix the picker".into()),
+            created_at: "1".into(),
+            updated_at: "2".into(),
+            held_elsewhere: true,
+        }];
+        let value: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(true, &open, &records)).unwrap();
+        assert_eq!(value["kind"], "chooser");
+        assert_eq!(value["launch"], true);
+        assert_eq!(value["open"][0]["tab"], 1);
+        assert_eq!(value["open"][0]["marker"], serde_json::Value::Null);
+        assert_eq!(value["records"][0]["providerSessionId"], "c-9");
+        assert_eq!(value["records"][0]["heldElsewhere"], true);
+        let detail: serde_json::Value = serde_json::from_str(&serialize_tab_detail_for_js(
+            TabId(1),
+            &[DetailRow {
+                label: "account".into(),
+                value: "work".into(),
+            }],
+        ))
+        .unwrap();
+        assert_eq!(
+            detail,
+            serde_json::json!({ "kind": "tab_detail", "tab": 1, "rows": [{ "label": "account", "value": "work" }] })
+        );
+    }
+
+    #[test]
+    fn hello_carries_each_sessions_name_or_null() {
+        let mut greeting = crate::agent_backend::BackendGreeting::for_kind(
+            crate::agent_backend::BackendKind::Legacy,
+            std::path::PathBuf::from("/home/user/project"),
+        );
+        greeting.resumable = vec![agent::ResumableSession {
+            provider: "claude".into(),
+            provider_session_id: "c-1".into(),
+            created_at: "1".into(),
+            updated_at: "2".into(),
+            title: None,
+            name: Some("docs".into()),
+        }];
+        let value: serde_json::Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(value["resumableSessions"][0]["name"], "docs");
     }
 }

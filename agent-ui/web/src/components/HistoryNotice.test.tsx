@@ -5,7 +5,7 @@ import { HistoryNotice } from "./HistoryNotice";
 import { rowIndexOf, stopsIn } from "../nav";
 import type { HistoryNotice as HistoryNoticeData } from "../types";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
 function notice(overrides: Partial<HistoryNoticeData> = {}): HistoryNoticeData {

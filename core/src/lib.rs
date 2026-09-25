@@ -12,6 +12,7 @@
 
 pub mod agent_backend;
 pub mod agent_bridge;
+pub mod agent_prefs;
 pub mod attention;
 pub mod buffer_reload;
 pub mod editor_context;
@@ -22,8 +23,15 @@ pub mod layout;
 pub mod lua;
 pub mod pane_switch;
 pub mod project_root;
+pub mod tab_set;
+pub mod tabs;
 pub mod theme;
 pub mod turn_trace;
+
+/// Test doubles shared across this crate's tests, and with `shell`'s through the `test-support`
+/// feature.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_providers;
 
 /// The crate-wide guard that every socket path here is built through `agent::socket_path`.
 /// Test-only, and in its own file so it can exclude itself from its own walk without excluding

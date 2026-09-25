@@ -20,15 +20,19 @@ export function stripEntries(
   answerable: AnswerableItem[],
   cursor: number,
   sessionEnded: boolean,
+  /** The keys are on a banner, the status row or another control outside the rows: `onKeyDown`'s
+   *  row arms (`a`/`d`, `Enter` on a row) are gated on it, so the row's own keys resolve to nothing
+   *  there. It says nothing about the session, so it never turns on `r`. */
+  atEdge = false,
 ): StripEntry[] {
   const entries: StripEntry[] = [];
   // A dead session's cards are inert (`resolveKey`'s own `a`/`d` refusal) -- offering them here
   // would promise a key that does nothing.
-  if (!sessionEnded && permissionTarget(answerable, cursor) !== null) {
+  if (!sessionEnded && !atEdge && permissionTarget(answerable, cursor) !== null) {
     entries.push({ key: "a", label: "allow" }, { key: "d", label: "deny" }, { key: "l", label: "buttons" });
   }
   const here = timeline[cursor];
-  if (here !== undefined && here.kind === "tool" && here.call.result !== null) {
+  if (!atEdge && here !== undefined && here.kind === "tool" && here.call.result !== null) {
     entries.push({ key: "Enter", label: "result" });
   }
   if (sessionEnded) {

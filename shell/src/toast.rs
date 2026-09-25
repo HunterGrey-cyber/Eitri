@@ -25,16 +25,19 @@ pub(crate) fn toast_top(bar_shown: bool, bar_height: i32) -> i32 {
     TOAST_MARGIN + if bar_shown { bar_height.max(0) } else { 0 }
 }
 
-/// What the toast says when a card arrives for a chat that is not on screen. `way_back` is the key
-/// that brings the chat back, as the effective keymap binds it (`Ctrl+b a` by default); `None` when
-/// the user unbound it, and then the toast promises no key.
-pub(crate) fn permission_toast_text(attention: Attention, way_back: Option<&str>) -> String {
-    let cards = if attention.pending == 1 {
-        "1 permission card".to_string()
-    } else {
-        format!("{} permission cards", attention.pending)
+/// What the toast says when a card arrives for a chat that is not on screen. `tab` is the tab
+/// holding the newest pending card, `(number, label name)` (spec §3.7); `None` when no tab is known
+/// (session tabs not yet wired up, or every tracked card already gone by the time this reads it),
+/// and then the toast falls back to a bare count. `way_back` is the key that brings the chat back,
+/// as the effective keymap binds it (`Ctrl+b a` by default); `None` when the user unbound it, and
+/// then the toast promises no key.
+pub(crate) fn permission_toast_text(attention: Attention, tab: Option<(u16, &str)>, way_back: Option<&str>) -> String {
+    let what = match tab {
+        Some((number, name)) => format!("tab {number} \"{name}\""),
+        None if attention.pending == 1 => "1 permission card waiting".to_string(),
+        None => format!("{} permission cards waiting", attention.pending),
     };
-    let mut text = format!("agent \u{2691}{} \u{2014} {cards} waiting", attention.pending);
+    let mut text = format!("agent \u{2691}{} \u{2014} {what}", attention.pending);
     if let Some(way_back) = way_back {
         text.push_str(&format!(" \u{00b7} {way_back}"));
     }
@@ -92,16 +95,17 @@ impl Toast {
 mod tests {
     use super::*;
 
+    /// Spec §3.7: the toast names the tab that holds the newest card.
     #[test]
-    fn the_toast_names_the_count_and_the_way_back_from_the_keymap() {
+    fn the_toast_names_the_tab_and_the_way_back_from_the_keymap() {
         let one = Attention {
             pending: 1,
             unread: false,
             ..Default::default()
         };
         assert_eq!(
-            permission_toast_text(one, Some("Ctrl+b a")),
-            "agent \u{2691}1 \u{2014} 1 permission card waiting \u{00b7} Ctrl+b a"
+            permission_toast_text(one, Some((2, "docs")), Some("Ctrl+b a")),
+            "agent \u{2691}1 \u{2014} tab 2 \"docs\" \u{00b7} Ctrl+b a"
         );
         let three = Attention {
             pending: 3,
@@ -109,13 +113,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            permission_toast_text(three, Some("Ctrl+a a")),
-            "agent \u{2691}3 \u{2014} 3 permission cards waiting \u{00b7} Ctrl+a a"
+            permission_toast_text(three, Some((1, "new")), Some("Ctrl+a a")),
+            "agent \u{2691}3 \u{2014} tab 1 \"new\" \u{00b7} Ctrl+a a"
         );
         assert_eq!(
-            permission_toast_text(one, None),
+            permission_toast_text(one, None, None),
             "agent \u{2691}1 \u{2014} 1 permission card waiting",
-            "no key is bound to the agent: no way back is promised"
+            "no tab known and no key bound: the count, and no promise"
         );
     }
 

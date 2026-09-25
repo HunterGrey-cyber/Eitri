@@ -52,6 +52,17 @@ describe("stripEntries", () => {
     expect(stripEntries(timeline, [{ kind: "tool", toolUseId: "toolu_1" }], 0, false)).toEqual([]);
   });
 
+  /** GUI pass, 2026-09-25: with the keys on the status row of a LIVE session the strip read
+   *  `r new session`, because the edge was passed as if it were a dead session. `r` does nothing
+   *  there (`resolveKey` is given the real `sessionEnded`). At an edge the row's own keys go, and
+   *  `r` stays exactly as true as the session's end. */
+  it("at an edge, drops the row's own keys but does not offer r on a live session", () => {
+    const answerable: AnswerableItem[] = [{ kind: "permission", toolUseId: "toolu_1" }];
+    const timeline = [toolItem(1, "toolu_1", { content: "ok", isError: false })];
+    expect(stripEntries(timeline, answerable, 0, false, true)).toEqual([]);
+    expect(stripEntries([otherItem(1)], [{ kind: "other" }], 0, true, true)).toEqual([{ key: "r", label: "new session" }]);
+  });
+
   it("offers r new session once the session has ended", () => {
     expect(stripEntries([otherItem(1)], [{ kind: "other" }], 0, true)).toEqual([{ key: "r", label: "new session" }]);
   });

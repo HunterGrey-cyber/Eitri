@@ -187,6 +187,17 @@ window {{
     font-size: 12px;
 }}
 
+/* The window-close y/n (session tabs spec §3.5, D11 A): `.module-toast`'s own colours, `shell::
+   close_prompt`'s own widget. */
+.close-prompt {{
+    background-color: {chrome};
+    color: {chrome_fg};
+    border: 1px solid {border};
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+}}
+
 /* The global f HINT's GTK labels -- top bar items, the editor pane, a bottom plugin pane
    (spec 2026-09-19-global-hint-design.md §3.5). The panel draws its own, in the same pair. They sit
    in the window's hint overlay and never take a click (`can_target(false)`). The fill is in this
@@ -345,6 +356,7 @@ mod tests {
         let css = gtk_css(&t);
         for (selector, colour, min) in [
             (".module-toast", t.chrome_fg, 4.5),
+            (".close-prompt", t.chrome_fg, 4.5),
             (".tray-chip", t.chrome_muted, 4.5),
             (".tray-chip.attention", t.chrome_fg, 4.5),
             (".prefix-strip", t.chrome_fg, 4.5),
