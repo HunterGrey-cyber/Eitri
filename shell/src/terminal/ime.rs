@@ -1,41 +1,43 @@
-//! The terminal's input method: composition, focus gating, and text sent to the shell.
+//! The terminal's input method and the text it sends to the shell.
 //!
-//! A `GtkIMMulticontext` uses the pane as its client widget and is attached to the key controller
-//! with `set_im_context`. GTK runs it before `key-pressed`, so keys consumed by composition never
-//! reach the terminal's key handler. Composed text arrives through `commit`; `preedit-changed`
-//! updates the composition drawn by the pane, and `set_cursor_location` positions the candidates.
-//! GTK wiring lives in `pane.rs`; the pure logic here is tested with synthetic signals.
+//! A `GtkIMMulticontext` uses the pane as its client widget and is attached to the key
+//! controller with `set_im_context`. GTK offers each key to it before `key-pressed`, so
+//! consumed keys never reach the terminal's key path. Composed text arrives through `commit`.
+//! The pane draws unfinished composition through `preedit-changed` and `layout_preedit`,
+//! and positions the candidate window with `set_cursor_location`. GTK wiring lives in
+//! `pane.rs`; this module's logic is pure and tested with synthetic signals.
 //!
-//! A commit reaches the shell only while the terminal has the keys and is not resetting its input
-//! method. The prefix, navigation keys, HINT, and app accelerators run in capture phase and can move
-//! focus before the input method sees a key. GTK focuses the input method out during the focus
-//! change, before notifying focus listeners. fcitx5-gtk can synchronously commit unfinished text
-//! there, so `nihao` followed by `Ctrl+k` can produce a commit of `ni hao`.
+//! A commit reaches the shell only while the terminal has focus and never during a pane reset.
+//! The `Ctrl+a` prefix, `Ctrl+h/j/k/l`, HINT and app accelerators run in capture phase,
+//! so they can interrupt composition before the input method sees them. GTK can focus the
+//! input method out before `pane_focus` learns that focus has left. fcitx5-gtk can commit
+//! unfinished composition synchronously during that focus change. [`ImeGate::commit`] checks
+//! both the last reported pane focus and [`GtkFocus`], the widget's `has_focus` and the
+//! window's `is_active`. If any is false, the commit is dropped so unfinished input cannot
+//! become shell input. A paste or `Ctrl+a` literal also discards composition before being
+//! sent; commits emitted by the input method's `reset` are dropped.
 //!
-//! [`ImeGate::commit`] checks [`GtkFocus`], the widget's `has_focus` and its window's `is_active`,
-//! as well as the last focus report. Any false value drops the commit, preventing unfinished pinyin
-//! or an unchosen candidate from reaching the shell. A reset can also emit a commit, so a paste
-//! or literal `Ctrl+a` discards the composition during reset before sending its own input.
+//! These checks cover focus changes GTK starts, including navigation, clicks and alt-tab.
+//! They cannot detect a server-initiated `NotifyFocusOut` while GTK still reports focus,
+//! or a stale notification arriving just after focus returns and new composition begins.
 //!
-//! GTK state catches focus changes initiated by GTK, including navigation, clicks, and switching
-//! applications. It cannot detect a focus-out initiated by the fcitx5 server while GTK still reports
-//! focus. Such a commit can pass the gate, including a stale focus-out arriving just after focus
-//! returns and new composition begins within one D-Bus exchange.
+//! A single-line commit keeps its bytes through `keys::normalize_commit` and is never bracketed.
+//! A commit with a line break uses `keys::normalize_paste`, just like `Ctrl+Shift+V`:
+//! it is bracketed when requested by the program, and otherwise its line breaks become Enter.
+//! This prevents multiline clipboard-history commits from bypassing bracketed-paste handling.
+//! With an input method attached, printable keys it does not compose also arrive as commits.
+//! They retain text but lose key-only information such as releases and keypad codes.
+//! Keys bound by the input method never reach the shell.
 //!
-//! Commits keep their bytes unchanged and are never bracketed (`keys::normalize_commit`).
-//!
-//! With an input method attached, printable keys it does not compose arrive as text commits even
-//! if fcitx5 is not running. Text commits lose information available only in key events; keys bound
-//! by the input method never reach the shell.
-//!
-//! The pane follows the input method's caret. fcitx5-rime defaults to the first composition cell on
-//! Linux (`PreeditCursorPositionAtBeginning`), keeping the beam and candidate window there while
-//! typing. Pango preedit attributes, including rime's `HighLight` on the converted segment, are not drawn.
+//! The pane follows the input method's caret. On Linux, fcitx5-rime defaults to the first
+//! composition cell through `PreeditCursorPositionAtBeginning`, keeping the candidate window
+//! in place while typing. Preedit Pango attributes, including the converted segment's
+//! `HighLight`, are not drawn.
 
 use gtk4::gdk::Rectangle;
 use terminal_input::NormalizedInput;
 
-use super::keys::normalize_commit;
+use super::keys::{normalize_commit, normalize_paste};
 
 /// The composition the input method is showing: its text and its caret, in characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +128,12 @@ impl ImeGate {
         if text.is_empty() {
             return Commit::Dropped("it was empty");
         }
+        // A line break makes it a paste: a multi-line commit is
+        // text not typed line by line -- fcitx5's clipboard history -- and a shell runs
+        // each unbracketed line as it arrives.
+        if text.contains(['\n', '\r']) {
+            return Commit::Send(normalize_paste(text));
+        }
         Commit::Send(normalize_commit(text))
     }
 
@@ -182,6 +190,7 @@ pub(crate) fn im_cursor_rect(cell: skia_safe::Rect, scale_factor: i32) -> Rectan
 
 #[cfg(test)]
 mod tests {
+    use super::super::keys::normalize_paste;
     use super::*;
     use alacritty_terminal::term::TermMode;
 
@@ -203,6 +212,37 @@ mod tests {
             Commit::Send(input) => input,
             Commit::Dropped(why) => panic!("expected the commit to reach the shell, dropped: {why}"),
         }
+    }
+
+    /// A commit with a line break, such as fcitx5 clipboard history from `Ctrl+;`, is a paste.
+    /// Like `Ctrl+Shift+V`, it is bracketed when requested by the program; otherwise its line
+    /// breaks become Enter. Treating it as typing could execute each line in the shell.
+    /// A single-line commit keeps its bytes and is never bracketed.
+    #[test]
+    fn a_multi_line_commit_is_a_paste_and_a_single_line_one_is_typing() {
+        let mut gate = focused();
+        let input = sent(gate.commit("echo a\necho b", TYPING));
+        assert_eq!(input, normalize_paste("echo a\necho b"));
+        assert_eq!(
+            terminal_input::encode(&input, TermMode::BRACKETED_PASTE),
+            b"\x1b[200~echo a\necho b\x1b[201~".to_vec()
+        );
+        assert_eq!(
+            terminal_input::encode(&input, TermMode::empty()),
+            b"echo a\recho b".to_vec()
+        );
+        assert_eq!(
+            sent(gate.commit("a\rb", TYPING)),
+            normalize_paste("a\rb"),
+            "a lone CR is a line break too"
+        );
+        let one_line = sent(gate.commit("\u{4f60}\u{597d} world", TYPING));
+        assert_eq!(one_line, normalize_commit("\u{4f60}\u{597d} world"));
+        assert_eq!(
+            terminal_input::encode(&one_line, TermMode::BRACKETED_PASTE),
+            "\u{4f60}\u{597d} world".as_bytes().to_vec(),
+            "typing is never bracketed"
+        );
     }
 
     /// A sequence measured in a GUI pass: rime's preedit went `n`, `ni`, `ni h`, `ni ha`, `ni hao`, and

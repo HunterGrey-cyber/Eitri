@@ -8,19 +8,13 @@
 //! `gtk_widget_add_controller` prepends controllers, and dispatch stops at the first non-gesture
 //! controller that handles the event.
 //!
-//! The `Ctrl+Shift+F` accelerator fires from the window's shortcut-manager capture controller,
-//! not directly from `gtk-application-shortcuts`, which has `GTK_SHORTCUT_SCOPE_GLOBAL`.
-//! The manager's controller is installed at widget initialization, before the HINT controller.
-//! Because new controllers are prepended, HINT handles a second `Ctrl+Shift+F` once without
-//! also toggling through `app.hint`.
-//!
 //! `gtk_widget_run_controllers` saves `l->next` before each call, while removing a controller
 //! frees its link. Removing the next controller inside a handler would cause a use-after-free.
 //! A gesture also does not stop dispatch like a handled key controller. `end` therefore detaches
 //! controllers on an idle; until then, they ignore events if their session is no longer active.
 //!
 //! GDK 4 gives repeated presses no distinguishing flag. The key that lands or cancels a HINT,
-//! and `Ctrl+Shift+F` when it starts a session, may still be held when the session ends.
+//! and the key that starts it from `prefix f`, may still be held when the session ends.
 //! The controller remembers the last press in [`Held`] and swallows repeats until release.
 //! After the session ends, it stays attached only until that release.
 
@@ -50,7 +44,7 @@ const PANEL_ANSWER_TIMEOUT: Duration = Duration::from_millis(300);
 /// panel's own key handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HintKey {
-    /// `Esc`, or `Ctrl+Shift+F` again (the trigger is a toggle).
+    /// `Esc`.
     Cancel,
     Backspace,
     /// A plain character, offered to `HintSession::key`. Letters outside the alphabet are
@@ -69,13 +63,7 @@ pub(crate) enum HintKey {
 /// `a`), no label could be typed at all before this, and a HINT only Esc
 /// could leave looked broken.
 pub(crate) fn classify_key(key: Key, state: ModifierType, same_key: &[Key]) -> HintKey {
-    let ctrl = state.contains(ModifierType::CONTROL_MASK);
-    let shift = state.contains(ModifierType::SHIFT_MASK);
     if key == Key::Escape {
-        return HintKey::Cancel;
-    }
-    // With Shift held the keyval arrives as `F`; accept both spellings of the same chord.
-    if ctrl && shift && (key == Key::F || key == Key::f) {
         return HintKey::Cancel;
     }
     if state.intersects(ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK) {
@@ -133,23 +121,19 @@ pub(crate) fn label_markup(label: &str, typed: &str) -> (String, bool) {
 
 /// Tracks the last key the HINT controller saw pressed but not released. Auto-repeat must
 /// not count as a new key: repeats of a landing letter could reach the newly focused pane
-/// and act on it (`a` enters append mode in nvim). Holding `Ctrl+Shift+F` must not toggle
-/// the HINT on and off.
+/// and act on it (`a` enters append mode in nvim). Holding the trigger key (`prefix f`)
+/// must not toggle the HINT again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Held {
     Nothing,
-    /// The `F` of the `Ctrl+Shift+F` that started this HINT. The controller never saw its press
-    /// (the accelerator did), so it is known by key, not by keycode.
-    Trigger,
     /// A key this controller saw pressed, by hardware keycode.
     Key(u32),
 }
 
 impl Held {
-    fn matches(self, keycode: u32, key: Key) -> bool {
+    fn matches(self, keycode: u32, _key: Key) -> bool {
         match self {
             Held::Nothing => false,
-            Held::Trigger => key == Key::f || key == Key::F,
             Held::Key(code) => code == keycode,
         }
     }
@@ -302,9 +286,10 @@ impl HintCoordinator {
         self.toggle_with(Held::Nothing);
     }
 
-    /// The same, from the `Ctrl+Shift+F` accelerator, whose `F` is still down.
-    pub(crate) fn toggle_from_chord(self: &Rc<Self>) {
-        self.toggle_with(Held::Trigger);
+    /// The same, from `prefix f` (or whichever key the keymap binds to `hint`): that key, `keycode`,
+    /// is still down, and its auto-repeat must reach neither a label nor the pane landed on.
+    pub(crate) fn toggle_from_prefix(self: &Rc<Self>, keycode: u32) {
+        self.toggle_with(Held::Key(keycode));
     }
 
     fn toggle_with(self: &Rc<Self>, held: Held) {
@@ -676,12 +661,14 @@ mod tests {
 
     const NONE: ModifierType = ModifierType::empty();
 
+    /// `Esc` cancels. `Ctrl+Shift+F` does not trigger HINT here, so it is treated like other chords
+    /// and does nothing.
     #[test]
-    fn escape_and_the_trigger_chord_cancel() {
+    fn escape_cancels_and_ctrl_shift_f_is_just_a_chord() {
         assert_eq!(classify_key(Key::Escape, NONE, &[]), HintKey::Cancel);
         let chord = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
-        assert_eq!(classify_key(Key::F, chord, &[]), HintKey::Cancel);
-        assert_eq!(classify_key(Key::f, chord, &[]), HintKey::Cancel);
+        assert_eq!(classify_key(Key::F, chord, &[]), HintKey::Nothing);
+        assert_eq!(classify_key(Key::f, chord, &[]), HintKey::Nothing);
     }
 
     #[test]
@@ -769,14 +756,13 @@ mod tests {
         assert_eq!(held, Held::Key(F));
     }
 
-    /// Holding `Ctrl+Shift+F`: the accelerator saw the press, so the HINT starts holding the
-    /// trigger by key. Its repeats do not cancel; after `F` comes up, the chord cancels.
+    /// `prefix f`: the prefix saw the press, so the HINT starts already holding that key by
+    /// keycode. Its repeats reach nobody; after it comes up, it is a key again.
     #[test]
-    fn the_triggers_repeats_do_not_toggle_the_hint() {
-        let mut held = Held::Trigger;
-        assert!(held.press(F, Key::F));
-        assert!(held.press(F, Key::f), "Shift released first: still the same key");
-        held.release(F, Key::F);
-        assert!(!held.press(F, Key::F), "a second chord after release is a key");
+    fn a_hint_from_the_prefix_holds_the_key_that_started_it() {
+        let mut held = Held::Key(F);
+        assert!(held.press(F, Key::f));
+        held.release(F, Key::f);
+        assert!(!held.press(F, Key::f), "pressed again after release, it is a key again");
     }
 }

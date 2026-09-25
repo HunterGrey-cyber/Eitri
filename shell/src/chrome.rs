@@ -73,7 +73,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     // can still increase the minimum width.
     project_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
-    // Reload the agent panel through the same `app.reload-agent-panel` action as Ctrl+Shift+R.
+    // Reload the agent panel through the same `app.reload-agent-panel` action as `prefix r`.
     // The button lives in the window chrome so it remains available when the panel's page hangs.
     // The shortcut enables recovery; the button makes it discoverable.
     //
@@ -82,9 +82,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     let reload_agent = gtk4::Button::with_label("\u{21BB}");
     reload_agent.add_css_class("win-btn");
     reload_agent.set_valign(gtk4::Align::Center);
-    reload_agent.set_tooltip_text(Some(
-        "Reload the agent panel (Ctrl+Shift+R) — the session keeps running",
-    ));
+    reload_agent.set_tooltip_text(Some("Reload the agent panel — the session keeps running"));
     reload_agent.set_action_name(Some("app.reload-agent-panel"));
     reload_agent.add_css_class("topbar-item");
 

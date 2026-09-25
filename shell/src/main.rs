@@ -21,6 +21,7 @@ mod text_size;
 mod theme;
 mod toast;
 mod tray;
+mod wheel_zoom;
 mod window_mode;
 
 use std::cell::RefCell;
@@ -34,6 +35,7 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
+use neovibe_core::keymap::{Action, SwapTarget};
 use neovibe_core::layout::{
     Axis, Direction, KeyAction, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav,
 };
@@ -258,6 +260,38 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         }
     }
 
+    // The keymap: stock tmux's defaults, prefix `Ctrl+b`, with `init.lua`'s
+    // `neovibe.keymap` calls applied. A bad key, an unknown action or option, or a collision is a
+    // startup failure naming both sides, as `agent.font_size` is -- never a keymap nobody wrote.
+    let lua_panel_ids: Vec<String> = lua_engine
+        .panels
+        .borrow()
+        .entries()
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    let keymap = match neovibe_core::keymap::Keymap::apply_user(lua_engine.keymap.borrow().ops(), &lua_panel_ids) {
+        Ok(keymap) => Rc::new(keymap),
+        Err(err) => {
+            eprintln!("neovibe: {err}");
+            std::process::exit(1);
+        }
+    };
+    // Collision rule 4: a Lua command's accelerator that is the prefix or a root chord would never fire.
+    for (id, entry) in lua_engine.commands.borrow().iter() {
+        if let Some(keybinding) = &entry.keybinding {
+            if let Err(err) = neovibe_core::keymap::check_command_keybinding(id, keybinding, &keymap) {
+                eprintln!("neovibe: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    println!(
+        "[keymap] prefix {} ({} bindings)",
+        keymap.prefix(),
+        keymap.bindings().len()
+    );
+
     // The bottom terminal starts hidden on first launch. Its shell starts when it is first shown
     // through any route, via the change hook below. A terminal that is never shown starts no
     // process and touches no font manager. Restoring a layout with the terminal shown starts it at
@@ -294,13 +328,19 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         .iter()
         .map(|entry| (ModuleId::lua(&entry.id), entry.key.clone()))
         .collect();
-    let module_keys = match ModuleKeys::build(&lua_keys) {
+    let module_keys = match ModuleKeys::build(&lua_keys, &keymap) {
         Ok(keys) => Rc::new(keys),
         Err(err) => {
             eprintln!("neovibe: {err}");
             std::process::exit(1);
         }
     };
+    // The `?` overlay's window and prefix sections, generated from the keymap.
+    agent_panel_handle.set_keymap_help(neovibe_core::agent_bridge::serialize_keymap_for_js(
+        &keymap.prefix().human(),
+        &neovibe_core::keymap::root::help_rows(),
+        &keymap.help(&module_keys),
+    ));
     // The layout this window opens with: this project's state file if
     // it can be used, else `init.lua`'s `neovibe.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
@@ -320,18 +360,25 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let loaded = state_dir
         .as_deref()
         .map(|dir| neovibe_core::layout::persist::load(dir, project_root, &decls));
-    let module_layout = match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls) {
-        Ok((layout, notes)) => {
-            for note in notes {
-                println!("[layout] {note}");
+    // The key that shows the editor, as the keymap binds it: named by the note a layout that hides
+    // the editor prints, the way the toast names its own way back.
+    let show_editor: Option<String> = keymap
+        .keys_for(&Action::Module(ModuleId::editor()))
+        .first()
+        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()));
+    let module_layout =
+        match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls, show_editor.as_deref()) {
+            Ok((layout, notes)) => {
+                for note in notes {
+                    println!("[layout] {note}");
+                }
+                Rc::new(RefCell::new(layout))
             }
-            Rc::new(RefCell::new(layout))
-        }
-        Err(message) => {
-            eprintln!("neovibe: {message}");
-            std::process::exit(1);
-        }
-    };
+            Err(message) => {
+                eprintln!("neovibe: {message}");
+                std::process::exit(1);
+            }
+        };
     let layout_saver = layout_state::LayoutSaver::new(state_dir, project_root, module_layout.clone(), decls.clone());
     // Every module's host, added once and never reparented (`module_grid`'s module doc).
     let grid = ModuleGrid::new(module_layout.clone());
@@ -431,7 +478,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
 
-    // `app.reload-agent-panel` + Ctrl+Shift+R; the top bar's own `⟳` button points at the same
+    // `app.reload-agent-panel` + `prefix r`; the top bar's own `⟳` button points at the same
     // action. Everything about it -- why it is an app action, what it costs, what is still
     // unverified -- is in `agent_panel::install_reload_action`'s doc comment. One call rather than
     // an inline block on purpose: `build_ui` is being edited by two other tracks of the same plan.
@@ -505,6 +552,12 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         panel_px,
     );
 
+    // `Ctrl`+wheel over a module: the text size of that pane only. Every host
+    // exists by now -- the editor, the agent, the terminal and each Lua panel were added above.
+    for (id, host) in grid.hosts() {
+        wheel_zoom::install(id, &host, text_size_controller.clone());
+    }
+
     let top_bar = chrome::build_top_bar(&window, project_root);
     root.append(&top_bar.widget);
     root.append(&grid);
@@ -545,11 +598,8 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let toast = toast::Toast::install(&hint_overlay, &top_bar.widget);
 
     // The global `f` HINT. Three
-    // triggers reach the same toggle: `Ctrl+Shift+F` from anywhere (the `app.hint` accelerator,
-    // which GTK fires from the window's capture-phase `gtk-shortcut-manager-capture` controller,
-    // before the editor or the panel see the key -- not from `gtk-application-shortcuts`, which is
-    // GLOBAL-scoped and handles nothing itself; see `hint`'s module doc), `f` on the top bar
-    // (below), and `f` in the panel's BROWSE (the panel's `hint_request`).
+    // triggers reach the same toggle: `prefix f` (the keymap's `hint`, below), `f` on the top bar,
+    // and `f` in the panel's BROWSE (the panel's `hint_request`).
     let hint_coordinator = hint::HintCoordinator::new(hint::HintWidgets {
         window: window.clone(),
         overlay: hint_overlay.clone(),
@@ -566,13 +616,6 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     {
         let coordinator = hint_coordinator.clone();
         agent_panel_handle.on_hint(move |message| coordinator.on_panel(message));
-    }
-    {
-        let action = gtk4::gio::SimpleAction::new("hint", None);
-        let coordinator = hint_coordinator.clone();
-        action.connect_activate(move |_, _| coordinator.toggle_from_chord());
-        app.add_action(&action);
-        app.set_accels_for_action("app.hint", &["<Control><Shift>f"]);
     }
 
     // Which module has the keys. One tracker drives the editor's cursor (solid, or not drawn,
@@ -624,7 +667,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         })
     };
 
-    // F11 fullscreen and Ctrl+Shift+F11 immersive both follow `g:neovide_fullscreen`.
+    // F11 fullscreen and `prefix F11` immersive both follow `g:neovide_fullscreen`.
     // `return_to_pane` restores focus when the top bar hides while focused; `focus_top_bar` can
     // reveal it.
     let window_modes =
@@ -660,11 +703,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // A card that arrives while the chat is not on screen: a toast -- the
     // only sign in Immersive mode -- or, with `modules.chat.on_permission = reveal` and nothing
     // zoomed, the chat back where it was, the keys staying where they are.
+    // The key that brings the chat back, as the keymap binds it: the toast's last words.
+    let way_back: Option<String> = keymap
+        .keys_for(&Action::Module(ModuleId::agent()))
+        .first()
+        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()));
     {
         let module_layout = module_layout.clone();
         let grid = grid.clone();
         let toast = toast.clone();
         let tray = tray.clone();
+        let way_back = way_back.clone();
         agent_panel_handle.on_attention(move |before, after| {
             let place = neovibe_core::layout::agent_place(&module_layout.borrow());
             let reaction = neovibe_core::attention::react(on_permission, before, after, place);
@@ -676,7 +725,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 }
             }
             if reaction.toast {
-                toast.show(&toast::permission_toast_text(after));
+                toast.show(&toast::permission_toast_text(after, way_back.as_deref()));
             }
         });
     }
@@ -792,162 +841,6 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     }
     tray.refresh(&module_layout.borrow(), agent_panel_handle.attention());
 
-    // The tmux-style prefix controller is installed after the other window controllers present at
-    // startup, so it sees keys first. A HINT controller added later still runs before it.
-    {
-        let grid = grid.clone();
-        let module_layout = module_layout.clone();
-        let editor = pane.clone();
-        let agent = agent_panel_handle.clone();
-        let window_for_focus = window.clone();
-        let app_name = top_bar.app_name.clone();
-        let refused_name = top_bar.app_name.clone();
-        let text_size_controller = text_size_controller.clone();
-        let terminal = terminal.clone();
-        let focus_module = focus_module.clone();
-        let open_module = open_module.clone();
-        let place_and_arrive = place_and_arrive.clone();
-        let module_keys = module_keys.clone();
-        let strip_keys = module_keys.clone();
-        let strip_layout = module_layout.clone();
-        let strip_title = module_title.clone();
-        let prefix_strip = prefix_strip.clone();
-        prefix::install(
-            &window,
-            &module_keys.lua_keys(),
-            move |command| match command {
-                // Both act on the module that last held the keys, as the prefix always has.
-                prefix::PrefixCommand::Zoom => {
-                    let target = module_layout.borrow().focus().clone();
-                    grid.toggle_zoom(&target);
-                }
-                prefix::PrefixCommand::Resize(direction) => {
-                    let target = module_layout.borrow().focus().clone();
-                    let cell = editor.cell_size().unwrap_or(layout::FALLBACK_CELL);
-                    grid.resize(&target, direction, layout::resize_px(direction, cell));
-                }
-                // Keyed by the kind of the module that holds the keys (`terminal::literal_target`, a
-                // tested pure function), not re-derived here.
-                prefix::PrefixCommand::SendPrefix => {
-                    let focused = pane_focus::focused_module(&window_for_focus, &grid.hosts());
-                    match terminal::literal_target(focused.as_ref().map(ModuleId::kind)) {
-                        terminal::LiteralTarget::Editor => editor.send_keys("<C-a>"),
-                        terminal::LiteralTarget::Panel => agent.select_all(),
-                        terminal::LiteralTarget::Terminal => {
-                            for input in terminal::keys::control_letter('a') {
-                                terminal.send(input);
-                            }
-                        }
-                        terminal::LiteralTarget::Neither => {}
-                    }
-                }
-                // Only the terminal takes a literal `Ctrl+l`: in nvim `<C-l>` is
-                // vim-tmux-navigator's move-right, and the panel has no use for one. Routed
-                // through `terminal::literal_target`, the same tested pure function `SendPrefix`
-                // uses just above, rather than re-deriving its Terminal arm inline (`main`'s review
-                // 2026-09-23, task-8 minor 2).
-                prefix::PrefixCommand::SendCtrlL => {
-                    let focused = pane_focus::focused_module(&window_for_focus, &grid.hosts());
-                    if terminal::literal_target(focused.as_ref().map(ModuleId::kind))
-                        == terminal::LiteralTarget::Terminal
-                    {
-                        for input in terminal::keys::control_letter('l') {
-                            terminal.send(input);
-                        }
-                    }
-                }
-                // `Ctrl+a t` on the module grid, in the order
-                // `ToggleAction::steps` gives and the terminal's own tests pin: every action unzooms
-                // first. The keys leave before the terminal hides, inside `Hide` (`hide_module`).
-                // Shown or hidden is the layout's (`is_shown`, which a zoom does not change).
-                prefix::PrefixCommand::ToggleTerminal => {
-                    let id = ModuleId::terminal();
-                    let has_keys = pane_focus::focused_module(&window_for_focus, &grid.hosts()).as_ref() == Some(&id);
-                    let shown = module_layout.borrow().is_shown(&id);
-                    for step in terminal::toggle_action(shown, has_keys).steps() {
-                        match step {
-                            terminal::ToggleStep::Unzoom => {
-                                grid.unzoom();
-                            }
-                            terminal::ToggleStep::Show => {
-                                if let Err(err) = grid.show_module(&id) {
-                                    eprintln!("[terminal] not shown: {err}");
-                                }
-                            }
-                            terminal::ToggleStep::Start => terminal.start(),
-                            terminal::ToggleStep::FocusTerminal => {
-                                focus_module(&id);
-                            }
-                            // `hide_module` moves the keys to the layout's chosen adjacent module before unmapping the
-                            // terminal. The target is the most recently focused neighbour, usually the editor or agent
-                            // above it unless a Lua neighbour was more recent. `module_grid::hide_then_unmap` enforces this
-                            // order and is tested. Hiding the last module on screen is refused with the top bar's flash, as with
-                            // `Ctrl+a x`.
-                            terminal::ToggleStep::Hide => {
-                                if let Err(err) = grid.hide_module(&id, &*focus_module) {
-                                    refuse(&refused_name, &err);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Route text sizing by the module that currently holds the keys, using `pane_focus`, rather
-                // than the layout's `focus`. Focus on the top bar or a plugin pane makes this a no-op, as for
-                // `SendPrefix`. `text_size::route_focused_module` keeps the routing covered by its unit test.
-                prefix::PrefixCommand::TextSize(step) => {
-                    let focused = pane_focus::focused_module(&window_for_focus, &grid.hosts());
-                    match text_size::route_focused_module(focused.as_ref()) {
-                        text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(step),
-                        text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(step),
-                        text_size::TextSizeTarget::Neither => {}
-                    }
-                }
-                // `x` hides the module that last held the keys, as `m` zooms it: the layout's focus.
-                prefix::PrefixCommand::Hide => {
-                    let target = module_layout.borrow().focus().clone();
-                    open_module(&target, KeyAction::Hide);
-                }
-                prefix::PrefixCommand::Module(key) => {
-                    let Some(id) = module_keys.module(key).cloned() else {
-                        return;
-                    };
-                    let has_keys = pane_focus::focused_module(&window_for_focus, &grid.hosts()).as_ref() == Some(&id);
-                    let action = neovibe_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
-                    open_module(&id, action);
-                }
-                prefix::PrefixCommand::Place { key, axis } => {
-                    let Some(id) = module_keys.module(key).cloned() else {
-                        return;
-                    };
-                    if let Err(err) = place_and_arrive(&id, axis) {
-                        refuse(&refused_name, &err);
-                    }
-                }
-                prefix::PrefixCommand::Swap(direction) => {
-                    let target = module_layout.borrow().focus().clone();
-                    if grid.swap_modules(&target, direction).is_none() {
-                        println!("[modules] {target}: nothing to swap with {direction:?}");
-                    }
-                }
-                prefix::PrefixCommand::Even(axis) => grid.even_modules(axis),
-            },
-            move |waiting| {
-                if waiting == prefix::Waiting::No {
-                    app_name.remove_css_class("prefix-armed");
-                } else {
-                    app_name.add_css_class("prefix-armed");
-                }
-                // The module keys and the verbs, or after `\`/`"` the module keys alone.
-                let pieces = {
-                    let layout = strip_layout.borrow();
-                    let entries = neovibe_core::layout::strip(&strip_keys, &layout);
-                    prefix_strip::strip_pieces(waiting, &entries, &strip_title(layout.focus()), &*strip_title)
-                };
-                prefix_strip.show(&pieces);
-            },
-        );
-    }
-
     // Ctrl+h/j/k/l navigates between modules by geometry. The editor's shim and each web module's
     // capture controller share this function. A move unzooms first. Up with nothing above goes to
     // the top bar; other directions with no neighbour return `false`, letting the key continue to
@@ -983,6 +876,182 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             }
         })
     };
+
+    // The prefix. Installed after every other window-level controller that exists
+    // at startup, so it sees keys first; HINT's, added when a HINT starts, still comes before it.
+    // Below `move_focus` because `select.*` uses it.
+    {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let editor = pane.clone();
+        let agent = agent_panel_handle.clone();
+        let window_for_focus = window.clone();
+        let app_name = top_bar.app_name.clone();
+        let refused_name = top_bar.app_name.clone();
+        let text_size_controller = text_size_controller.clone();
+        let terminal = terminal.clone();
+        let focus_module = focus_module.clone();
+        let open_module = open_module.clone();
+        let place_and_arrive = place_and_arrive.clone();
+        let show_on_screen = show_on_screen.clone();
+        let move_focus = move_focus.clone();
+        let hint_coordinator = hint_coordinator.clone();
+        let window_modes = window_modes.clone();
+        let keymap_for_send = keymap.clone();
+        let strip_keys = module_keys.clone();
+        let strip_verbs = keymap.strip_verbs();
+        let strip_keymap = keymap.clone();
+        let strip_layout = module_layout.clone();
+        let strip_title = module_title.clone();
+        let prefix_strip = prefix_strip.clone();
+        prefix::install(
+            &window,
+            keymap.clone(),
+            module_keys.clone(),
+            move |command, keycode| {
+                let action = match command {
+                    prefix::PrefixCommand::Place { module, axis } => {
+                        if let Err(err) = place_and_arrive(&module, axis) {
+                            refuse(&refused_name, &err);
+                        }
+                        return;
+                    }
+                    prefix::PrefixCommand::Run(action) => action,
+                };
+                // The module that last held the keys: what zoom, resize, hide and swap act on.
+                let target = || module_layout.borrow().focus().clone();
+                // The module that holds the keys right now (`pane_focus`'s own definition).
+                let focused = || pane_focus::focused_module(&window_for_focus, &grid.hosts());
+                match action {
+                    Action::Zoom => grid.toggle_zoom(&target()),
+                    Action::Resize { dir, cells } => {
+                        let cell = editor.cell_size().unwrap_or(layout::FALLBACK_CELL);
+                        grid.resize(&target(), dir, layout::resize_px(dir, cell, cells));
+                    }
+                    Action::Select(dir) => {
+                        move_focus(&target(), dir);
+                    }
+                    Action::SendPrefix | Action::SendKeys(_) => {
+                        let Some(key) = prefix::literal_for(&action, &keymap_for_send) else {
+                            return;
+                        };
+                        match terminal::literal_target(focused().as_ref().map(ModuleId::kind)) {
+                            terminal::LiteralTarget::Editor => editor.send_keys(&key.to_vim()),
+                            terminal::LiteralTarget::Panel => agent.literal_key(&key),
+                            terminal::LiteralTarget::Terminal => match terminal::keys::literal(&key) {
+                                Some(inputs) => inputs.into_iter().for_each(|input| terminal.send(input)),
+                                None => println!("[prefix] {key}: the terminal takes C-<letter> or one character"),
+                            },
+                            terminal::LiteralTarget::Neither => {}
+                        }
+                    }
+                    // `Ctrl+a t`'s rule since the terminal's phase 1 (`terminal::toggle_action`), in the
+                    // order `ToggleAction::steps` gives and the terminal's own tests pin.
+                    Action::Module(id) if id.kind() == ModuleKind::Terminal => {
+                        let has_keys = focused().as_ref() == Some(&id);
+                        let shown = module_layout.borrow().is_shown(&id);
+                        for step in terminal::toggle_action(shown, has_keys).steps() {
+                            match step {
+                                terminal::ToggleStep::Unzoom => {
+                                    grid.unzoom();
+                                }
+                                terminal::ToggleStep::Show => {
+                                    if let Err(err) = grid.show_module(&id) {
+                                        eprintln!("[terminal] not shown: {err}");
+                                    }
+                                }
+                                terminal::ToggleStep::Start => terminal.start(),
+                                terminal::ToggleStep::FocusTerminal => {
+                                    focus_module(&id);
+                                }
+                                terminal::ToggleStep::Hide => {
+                                    if let Err(err) = grid.hide_module(&id, &*focus_module) {
+                                        refuse(&refused_name, &err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Action::Module(id) => {
+                        // `v` before the canvas exists, or a module this window has not got.
+                        if !grid.hosts().iter().any(|(m, _)| *m == id) {
+                            println!("[prefix] {id}: not in this window yet");
+                            flash(&refused_name);
+                            return;
+                        }
+                        let has_keys = focused().as_ref() == Some(&id);
+                        let action = neovibe_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
+                        open_module(&id, action);
+                    }
+                    Action::ModuleHide => open_module(&target(), KeyAction::Hide),
+                    Action::Swap(SwapTarget::Toward(dir)) => {
+                        let target = target();
+                        if grid.swap_modules(&target, dir).is_none() {
+                            println!("[modules] {target}: nothing to swap with {dir:?}");
+                        }
+                    }
+                    Action::Swap(which) => {
+                        let target = target();
+                        if grid.swap_adjacent(&target, which == SwapTarget::Next).is_none() {
+                            println!("[modules] {target}: nothing to swap with");
+                        }
+                    }
+                    Action::Even(axis) => grid.even_modules(axis),
+                    Action::Text(change) => match text_size::route_focused_module(focused().as_ref()) {
+                        text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(change.into()),
+                        text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(change.into()),
+                        text_size::TextSizeTarget::Neither => {}
+                    },
+                    Action::Hint => hint_coordinator.toggle_from_prefix(keycode),
+                    Action::PanelReload => agent.reload_document(),
+                    Action::PanelKeymap => {
+                        let chat = ModuleId::agent();
+                        if let Err(err) = show_on_screen(&chat) {
+                            refuse(&refused_name, &err);
+                            return;
+                        }
+                        focus_module(&chat);
+                        agent.open_keymap();
+                    }
+                    Action::WindowImmersive => window_modes.toggle_immersive(),
+                    Action::Tab(_) => {
+                        // The tab action is bound but only reports that session tabs are not implemented yet.
+                        println!("[prefix] {}: session tabs arrive in phase 2", action.name());
+                        flash(&refused_name);
+                    }
+                    // The prefix never hands a split key back: it waits for a module key instead.
+                    Action::Split(_) => {}
+                }
+            },
+            move |waiting| {
+                if waiting == prefix::Waiting::No {
+                    app_name.remove_css_class("prefix-armed");
+                } else {
+                    app_name.add_css_class("prefix-armed");
+                }
+                let pieces = {
+                    let layout = strip_layout.borrow();
+                    // Armed, the keys that reach each module as the effective table binds them (a
+                    // `del`ed `e` is not advertised); after a split key, the fixed module keys
+                    //.
+                    let entries = match waiting {
+                        prefix::Waiting::Command => {
+                            neovibe_core::layout::strip_direct(&strip_keys, &strip_keymap, &layout)
+                        }
+                        _ => neovibe_core::layout::strip(&strip_keys, &layout),
+                    };
+                    prefix_strip::strip_pieces(
+                        waiting,
+                        &entries,
+                        &strip_title(layout.focus()),
+                        &*strip_title,
+                        &strip_verbs,
+                    )
+                };
+                prefix_strip.show(&pieces);
+            },
+        );
+    }
 
     // --- From the editor: decided by Neovim itself.
     //
@@ -1257,13 +1326,8 @@ thread_local! {
     static REFUSAL_ENDS: std::cell::RefCell<Option<glib::SourceId>> = const { std::cell::RefCell::new(None) };
 }
 
-/// A layout verb the layout refused -- the last module on screen hidden, a module placed next to
-/// itself: said on stdout, and the top bar's app name shows the prefix indicator's block for
-/// [`REFUSAL_FLASH`]. Its own class, so a prefix armed meanwhile keeps its indicator. A
-/// second refusal inside the flash restarts it rather than being cut short by the first one's timer
-///. One window per process (`NON_UNIQUE`), so one timer per thread.
-fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
-    println!("[modules] refused: {err}");
+/// The top bar's app name shows the prefix indicator's block for [`REFUSAL_FLASH`].
+fn flash(app_name: &gtk4::Label) {
     app_name.add_css_class("refused");
     let app_name = app_name.clone();
     let ends = glib::timeout_add_local_once(REFUSAL_FLASH, move || {
@@ -1273,6 +1337,16 @@ fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
     if let Some(earlier) = REFUSAL_ENDS.with(|slot| slot.borrow_mut().replace(ends)) {
         earlier.remove();
     }
+}
+
+/// A layout verb the layout refused -- the last module on screen hidden, a module placed next to
+/// itself: said on stdout, and the top bar's app name shows the prefix indicator's block for
+/// [`REFUSAL_FLASH`]. Its own class, so a prefix armed meanwhile keeps its indicator. A
+/// second refusal inside the flash restarts it rather than being cut short by the first one's timer
+///. One window per process (`NON_UNIQUE`), so one timer per thread.
+fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
+    println!("[modules] refused: {err}");
+    flash(app_name);
 }
 
 /// Installs Ctrl+h/j/k/l navigation on a web module host, both at startup and for modules added
@@ -1325,39 +1399,6 @@ mod tests {
         assert!(app.flags().contains(gtk4::gio::ApplicationFlags::NON_UNIQUE));
     }
 
-    /// Returns every `keys:` value and each `/`-separated alternative. Shared by the accelerator
-    /// checks so they use the same parsing logic.
-    ///
-    /// `js_keys_value` reads each value with JavaScript escapes, so an escaped backslash becomes
-    /// one backslash and an escaped quote does not end the value early.
-    fn documented_keys(keymap: &str) -> std::collections::HashSet<String> {
-        let mut rows = std::collections::HashSet::new();
-        for value in keymap.lines().filter_map(js_keys_value) {
-            for alternative in value.split(" / ") {
-                rows.insert(alternative.to_string());
-            }
-            rows.insert(value);
-        }
-        rows
-    }
-
-    /// Reads one `keymap.ts` row's `keys:` value, decoding escaped backslashes and quotes.
-    /// Split-key rows need both; splitting the raw line at a quote would truncate an escaped quote.
-    /// The opening `{` may be on an earlier line.
-    fn js_keys_value(line: &str) -> Option<String> {
-        let start = line.find("keys: \"")? + "keys: \"".len();
-        let mut value = String::new();
-        let mut chars = line[start..].chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => value.push(chars.next()?),
-                '"' => return Some(value),
-                _ => value.push(c),
-            }
-        }
-        None
-    }
-
     /// Keysyms named literally (not a single character and not an `Fnn` function key) that
     /// this test knows how to read for a person, and how it spells each one. The zoom-together
     /// design's text-size accelerators (`<Control>equal` and friends) are the first accelerators
@@ -1375,25 +1416,6 @@ mod tests {
         // (2026-09-23).
         ("KP_Insert", "Keypad0 (NumLock off)"),
     ];
-
-    /// A GTK accelerator (`<Control><Shift>f`) as `keymap.ts` spells it (`Ctrl+Shift+F`).
-    fn spell(accel: &str) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let mut rest = accel;
-        while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
-            parts.push(match &rest[1..end + 1] {
-                "Control" | "Primary" => "Ctrl".to_string(),
-                other => other.to_string(),
-            });
-            rest = &rest[end + 2..];
-        }
-        parts.push(match NAMED_KEYSYMS.iter().find(|(keysym, _)| *keysym == rest) {
-            Some((_, spelled)) => spelled.to_string(),
-            None if rest.chars().count() == 1 => rest.to_uppercase(),
-            None => rest.to_string(),
-        });
-        parts.join("+")
-    }
 
     /// `<Mod>…Key`, with at least one modifier or a function key. The shape the sources are
     /// scanned for; anything else in a string literal is not an accelerator.
@@ -1472,180 +1494,38 @@ mod tests {
         found
     }
 
-    /// Checks that every accelerator-shaped string literal in this crate's sources has a matching
-    /// row in the panel's `?` keymap (`agent-ui/web/src/keymap.ts`, `WINDOW_KEYS`). The web side
-    /// cannot read GTK bindings, so the list is maintained by hand.
-    ///
-    /// Scanning literals also covers `window_mode.rs`, where `format!` passes table entries to the
-    /// registration call. Adding a literal in a new source file is checked automatically. Each
-    /// accelerator must match a complete `keys:` value or a complete `/`-separated alternative, so
-    /// `Ctrl+Shift+F11` cannot satisfy `Ctrl+Shift+F`.
-    ///
-    /// The scan only sees complete double-quoted literals. `format!("<Control>{}", "equal")`
-    /// reaches the malformed-key panic guard because `"{}"` is not a supported key. However,
-    /// `format!("{}{}", "<Control>", "Home")` goes unnoticed: neither separate literal looks like
-    /// an accelerator. Bindings assembled from multiple literals therefore need a separate check.
-    /// Lua keybindings supplied by `init.lua` are also outside this source scan because their
-    /// values are only known at runtime.
+    /// Register every accelerator through the core keymap. An accelerator literal in
+    /// `shell/src` bypasses the keymap and its check against `Ctrl+Shift` bindings.
+    /// Exercise `is_accel` directly so a broken scanner cannot make this test pass.
     #[test]
-    fn every_app_accelerator_is_in_the_panel_keymap() {
-        let found = found_accelerators();
-
-        // A floor, not a list: it catches a walk that silently stopped finding anything, without
-        // restating what the sources say.
+    fn shell_src_writes_no_accelerator_literal() {
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
         assert!(
-            found.len() >= 4,
-            "only {} accelerators found -- the source walk is broken",
-            found.len()
+            files.len() >= 20,
+            "only {} source files -- the walk is broken",
+            files.len()
         );
-
-        let documented = documented_keys(include_str!("../../agent-ui/web/src/keymap.ts"));
-        for (file, accel) in found {
-            let spelled = spell(&accel);
-            assert!(
-                documented.contains(&spelled),
-                "{file} binds {accel}, but no keymap.ts row says `keys: \"{spelled}\"`"
-            );
-        }
-    }
-
-    /// Checks the reverse direction of `every_app_accelerator_is_in_the_panel_keymap`: documented
-    /// both-pane text-size keys must still be bound in `text_size::TEXT_SIZE_ACTIONS`. Removing a
-    /// binding must not leave a stale keymap row unnoticed.
-    ///
-    /// This is limited to the three both-pane text-size rows. Most other keymap entries describe
-    /// keys handled without GTK accelerator registrations, so a reverse scan of the whole file
-    /// would compare unrelated sets.
-    #[test]
-    fn every_documented_both_panes_text_size_key_is_still_bound_in_text_size_rs() {
-        let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (_, accels, _) in text_size::TEXT_SIZE_ACTIONS.iter().copied() {
-            for accel in accels {
-                bound.insert(spell(accel));
-            }
-        }
-        let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
-        let mut checked_any = false;
-        for line in keymap
-            .lines()
-            .filter(|l| l.contains("Text size") && l.contains("both panes"))
-        {
-            let Some(value) = line.split("keys: \"").nth(1).and_then(|rest| rest.split('"').next()) else {
-                continue;
-            };
-            for alternative in value.split(" / ") {
-                checked_any = true;
-                assert!(
-                    bound.contains(alternative),
-                    "keymap.ts documents {alternative:?} as a both-panes text-size key, but \
-                     text_size::TEXT_SIZE_ACTIONS no longer binds it"
-                );
-            }
-        }
-        assert!(
-            checked_any,
-            "no both-panes text-size row found in keymap.ts -- the scan is broken"
-        );
-    }
-
-    /// Checks `keymap.ts`'s hand-maintained `PREFIX_KEYS` against the actual characters bound by
-    /// `prefix::command`, through `prefix::bound_keys`. Checking both directions catches missing
-    /// documentation and stale rows without another hand-written list of bindings. Control-letter
-    /// rows are checked against `prefix::bound_control_keys`, which also drives the prefix. A scan
-    /// limited to single characters would miss rows such as `Ctrl+a Ctrl+l`.
-    ///
-    /// Split rows are checked against the keys accepted by the prefix's `AwaitModule` state. Each
-    /// module key after `then` must be exactly one character, so `then editor / agent` cannot pass
-    /// as `then e / a`.
-    #[test]
-    fn prefix_keys_documents_exactly_the_chars_prefix_rs_binds() {
-        let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
-        let mut documented: std::collections::HashSet<char> = std::collections::HashSet::new();
-        let mut documented_control: std::collections::HashSet<char> = std::collections::HashSet::new();
-        // `Ctrl+a \\ then e / a / t`: the split key, and the module keys it is documented to take.
-        let mut documented_then: Vec<(char, Vec<char>)> = Vec::new();
-        for line in keymap.lines() {
-            let Some(value) = js_keys_value(line) else { continue };
-            let Some(value) = value.strip_prefix("Ctrl+a ") else {
-                continue;
-            };
-            if let Some((split, modules)) = value.split_once(" then ") {
-                let mut split = split.chars();
-                let (Some(split), None) = (split.next(), split.next()) else {
-                    panic!("a `then` row names one key before `then`: {value:?}");
-                };
-                documented.insert(split);
-                let mut keys: Vec<char> = modules
-                    .split(" / ")
-                    .map(|token| {
-                        let mut key = token.chars();
-                        match (key.next(), key.next()) {
-                            (Some(key), None) => key,
-                            _ => panic!("a module key after `then` is one character, not {token:?}: {value:?}"),
-                        }
-                    })
-                    .collect();
-                keys.sort_unstable();
-                documented_then.push((split, keys));
-                continue;
-            }
-            for token in value.split(" / ") {
-                let mut chars = token.chars();
-                if let (Some(ch), None) = (chars.next(), chars.next()) {
-                    documented.insert(ch);
-                }
-                let mut letter = token.strip_prefix("Ctrl+").unwrap_or_default().chars();
-                if let (Some(ch), None) = (letter.next(), letter.next()) {
-                    documented_control.insert(ch);
-                }
-            }
-        }
-        let bound_control: std::collections::HashSet<char> = prefix::bound_control_keys().into_iter().collect();
+        assert!(is_accel("<Control><Shift>f") && is_accel("F11") && is_accel("<Control>KP_Add"));
+        assert!(!is_accel("<C-b>") && !is_accel("Ctrl+b"));
         assert_eq!(
-            documented_control, bound_control,
-            "PREFIX_KEYS' Ctrl+a Ctrl+<letter> rows and what prefix.rs binds after Ctrl+a disagree"
-        );
-        let bound: std::collections::HashSet<char> = prefix::bound_keys().into_iter().collect();
-
-        for &ch in &bound {
-            assert!(
-                documented.contains(&ch),
-                "prefix.rs binds {ch:?} after Ctrl+a, but no PREFIX_KEYS row mentions it"
-            );
-        }
-        for &ch in &documented {
-            assert!(
-                bound.contains(&ch),
-                "PREFIX_KEYS documents {ch:?} after Ctrl+a, but prefix::command no longer binds it"
-            );
-        }
-
-        // The split keys, through the prefix's own `AwaitModule` state.
-        let mut taken = prefix::module_keys_after();
-        for (_, keys) in &mut taken {
-            keys.sort_unstable();
-        }
-        documented_then.sort();
-        assert_eq!(
-            documented_then, taken,
-            "PREFIX_KEYS' `Ctrl+a <split> then <keys>` rows and what prefix.rs takes after a split key disagree"
+            found_accelerators(),
+            Vec::<(String, String)>::new(),
+            "register it through neovibe_core::keymap::root instead"
         );
     }
 
-    /// `WINDOW_KEYS` names `Ctrl+h/j/k/l` by hand, and its `Ctrl+j` row exists only because of the
-    /// terminal. Every chord the terminal gives up to neovibe (`terminal::navigation`, asked about
-    /// each letter) must be named there. The reverse is not checked: those rows also describe the
-    /// editor's and the panel's own routes.
+    /// The overlay's "Anywhere in the window" rows come from `neovibe_core::keymap::root`, and its
+    /// `Ctrl+j` row exists only because of the terminal: every chord the terminal gives up to
+    /// neovibe (`terminal::navigation`, asked about each letter) must be named there.
     #[test]
-    fn every_chord_the_terminal_gives_up_is_in_window_keys() {
-        let keymap = include_str!("../../agent-ui/web/src/keymap.ts");
-        let start = keymap.find("export const WINDOW_KEYS").expect("WINDOW_KEYS");
-        let end = start + keymap[start..].find("];").expect("the end of WINDOW_KEYS");
-        let documented: std::collections::HashSet<&str> = keymap[start..end]
-            .lines()
-            .filter_map(|line| line.trim_start().strip_prefix("{ keys: \""))
-            .filter_map(|rest| rest.split('"').next())
-            .flat_map(|value| value.split(" / "))
+    fn every_chord_the_terminal_gives_up_is_in_the_root_help() {
+        let documented: std::collections::HashSet<String> = neovibe_core::keymap::root::help_rows()
+            .into_iter()
+            .flat_map(|row| row.keys.split(" / ").map(str::to_string).collect::<Vec<_>>())
             .collect();
         let mut taken = 0;
         for letter in 'a'..='z' {
@@ -1654,8 +1534,8 @@ mod tests {
                 taken += 1;
                 let name = format!("Ctrl+{letter}");
                 assert!(
-                    documented.contains(name.as_str()),
-                    "the terminal gives up {name}, but no WINDOW_KEYS row names it"
+                    documented.contains(&name),
+                    "the terminal gives up {name}, but no root help row names it"
                 );
             }
         }

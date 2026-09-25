@@ -25,17 +25,20 @@ pub(crate) fn toast_top(bar_shown: bool, bar_height: i32) -> i32 {
     TOAST_MARGIN + if bar_shown { bar_height.max(0) } else { 0 }
 }
 
-/// What the toast says when a card arrives for a chat that is not on screen.
-pub(crate) fn permission_toast_text(attention: Attention) -> String {
+/// What the toast says when a card arrives for a chat that is not on screen. `way_back` is the key
+/// that brings the chat back, as the effective keymap binds it (`Ctrl+b a` by default); `None` when
+/// the user unbound it, and then the toast promises no key.
+pub(crate) fn permission_toast_text(attention: Attention, way_back: Option<&str>) -> String {
     let cards = if attention.pending == 1 {
         "1 permission card".to_string()
     } else {
         format!("{} permission cards", attention.pending)
     };
-    format!(
-        "agent \u{2691}{} \u{2014} {cards} waiting \u{00b7} Ctrl+a a",
-        attention.pending
-    )
+    let mut text = format!("agent \u{2691}{} \u{2014} {cards} waiting", attention.pending);
+    if let Some(way_back) = way_back {
+        text.push_str(&format!(" \u{00b7} {way_back}"));
+    }
+    text
 }
 
 pub(crate) struct Toast {
@@ -90,22 +93,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_toast_names_the_count_and_the_way_back() {
+    fn the_toast_names_the_count_and_the_way_back_from_the_keymap() {
+        let one = Attention {
+            pending: 1,
+            unread: false,
+            ..Default::default()
+        };
         assert_eq!(
-            permission_toast_text(Attention {
-                pending: 1,
-                unread: false,
-                ..Default::default()
-            }),
-            "agent \u{2691}1 \u{2014} 1 permission card waiting \u{00b7} Ctrl+a a"
+            permission_toast_text(one, Some("Ctrl+b a")),
+            "agent \u{2691}1 \u{2014} 1 permission card waiting \u{00b7} Ctrl+b a"
+        );
+        let three = Attention {
+            pending: 3,
+            unread: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            permission_toast_text(three, Some("Ctrl+a a")),
+            "agent \u{2691}3 \u{2014} 3 permission cards waiting \u{00b7} Ctrl+a a"
         );
         assert_eq!(
-            permission_toast_text(Attention {
-                pending: 3,
-                unread: true,
-                ..Default::default()
-            }),
-            "agent \u{2691}3 \u{2014} 3 permission cards waiting \u{00b7} Ctrl+a a"
+            permission_toast_text(one, None),
+            "agent \u{2691}1 \u{2014} 1 permission card waiting",
+            "no key is bound to the agent: no way back is promised"
         );
     }
 

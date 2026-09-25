@@ -279,7 +279,7 @@ struct AgentPanelState {
     /// WebView's React state.
     ///
     /// **This is the reason a reload cannot destroy it.** The panel ships a real reload affordance
-    /// (`app.reload-agent-panel`, Ctrl+Shift+R and the top bar's `⟳`) that throws the document
+    /// (`app.reload-agent-panel`, `prefix r` and the top bar's `⟳`) that throws the document
     /// away on purpose, and the frontend's copy goes with it. On the default `legacy` backend the
     /// provider session id is then recoverable from nowhere at all: no `ConversationRecord` is
     /// written for that backend and `BackendGreeting::for_kind` returns `resumable: None` for it, so
@@ -298,9 +298,12 @@ struct AgentPanelState {
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
     /// own background colour.
     theme: neovibe_core::theme::ThemeTokens,
+    /// The `?` overlay's rows (`serialize_keymap_for_js`), sent with the theme on every `ready` so
+    /// a reloaded document is told the keymap it needs, not the one baked into a hand list.
+    keymap_help: Option<String>,
     /// Whether this panel's pane holds the window's keyboard focus, as `crate::pane_focus` last
     /// reported it. It is held here so that a freshly loaded document (first load or a
-    /// `Ctrl+Shift+R` reload) is told on `ready`. A document is otherwise told only when focus
+    /// `prefix r` reload) is told on `ready`. A document is otherwise told only when focus
     /// changes, and a reload does not change focus.
     pane_focused: bool,
     /// Where the panel's two HINT messages (`hint_request`, `hint_targets`) go. `None` until
@@ -563,9 +566,27 @@ impl AgentPanelHandle {
         );
     }
 
-    /// `Ctrl+a Ctrl+a` with the panel focused; see `serialize_select_all_for_js`.
-    pub(crate) fn select_all(&self) {
-        self.dispatch(neovibe_core::agent_bridge::serialize_select_all_for_js(), "select-all");
+    /// The `?` overlay's rows (`serialize_keymap_for_js`): recorded for every later `ready`, and
+    /// sent now to a document that is already up.
+    pub(crate) fn set_keymap_help(&self, payload: String) {
+        self.state.borrow_mut().keymap_help = Some(payload.clone());
+        self.dispatch(payload, "keymap");
+    }
+
+    /// `send-prefix`/`send-keys` with the panel holding the keys.
+    pub(crate) fn literal_key(&self, key: &neovibe_core::keymap::KeySpec) {
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()),
+            "literal-key",
+        );
+    }
+
+    /// `prefix ?`: open the `?` overlay.
+    pub(crate) fn open_keymap(&self) {
+        self.dispatch(
+            neovibe_core::agent_bridge::serialize_open_keymap_for_js(),
+            "open-keymap",
+        );
     }
 
     /// Global `f` HINT. Each
@@ -724,6 +745,7 @@ pub(crate) fn build_agent_panel(
         shutting_down: false,
         turn_trace: None,
         theme: neovibe_core::theme::ThemeTokens::fallback(),
+        keymap_help: None,
         pane_focused: false,
         hint_hook: None,
         attention: Default::default(),
@@ -1122,6 +1144,7 @@ fn ready_payloads(
     snapshot: Option<String>,
     last_handoff: Option<&agent::handoff::ClaudeResumeCommand>,
     theme: Option<&str>,
+    keymap: Option<&str>,
 ) -> Vec<String> {
     // A session this panel just handed to a terminal must not also be offered for resume on the
     // start screen: nothing holds a lock on it, so taking the offer would put two writers on one
@@ -1141,6 +1164,9 @@ fn ready_payloads(
     // Colours before anything drawn with them.
     if let Some(theme) = theme {
         payloads.push(theme.to_string());
+    }
+    if let Some(keymap) = keymap {
+        payloads.push(keymap.to_string());
     }
     match snapshot {
         // A live session wins. `collect_pending_start` clears `last_handoff` when one is installed,
@@ -1282,7 +1308,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     .as_ref()
                     .map(|b| serialize_snapshot_for_js(&SnapshotView::of(b)));
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
-                let mut payloads = ready_payloads(greeting, snapshot, state_ref.last_handoff.as_ref(), Some(&theme));
+                let mut payloads = ready_payloads(
+                    greeting,
+                    snapshot,
+                    state_ref.last_handoff.as_ref(),
+                    Some(&theme),
+                    state_ref.keymap_help.as_deref(),
+                );
                 // Last, so nothing the document draws from the payloads above can reset it.
                 payloads.push(neovibe_core::agent_bridge::serialize_pane_focus_for_js(
                     state_ref.pane_focused,
@@ -1593,20 +1625,16 @@ fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     });
 }
 
-/// Installs `app.reload-agent-panel` and binds Ctrl+Shift+R for the panel `handle` owns.
+/// Installs `app.reload-agent-panel` for the top bar's reload button and `prefix r`.
 /// The action lives outside the WebView so a wedged page can be recovered without
-/// closing the editor, nvim child and agent session.
-///
-/// The app accelerator runs during capture regardless of pane focus. A harness can
-/// invoke the same path with `app.activate_action("reload-agent-panel", None)`.
-/// The accelerator consumes Ctrl+Shift+R before Neovim can receive it.
+/// closing the editor, nvim child and agent session. It binds no accelerator.
 ///
 /// `main.rs` registers the action before building the top bar. Late registration and
 /// button sensitivity have not been tested here.
 ///
 /// The action is application-wide but the handle belongs to one window. A second window
 /// in the same process would replace the action and redirect the first window's reload
-/// controls to the second panel.
+/// button to the second panel.
 pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle) {
     let action = gtk4::gio::SimpleAction::new("reload-agent-panel", None);
     // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
@@ -1614,7 +1642,6 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
     let handle = handle.clone();
     action.connect_activate(move |_, _| handle.reload_document());
     app.add_action(&action);
-    app.set_accels_for_action("app.reload-agent-panel", &["<Control><Shift>r"]);
 }
 
 #[cfg(test)]
@@ -1821,7 +1848,7 @@ mod tests {
     #[test]
     fn a_reloaded_document_is_handed_back_the_command_the_old_one_was_showing() {
         let command = a_command();
-        let payloads = ready_payloads(legacy_greeting(), None, Some(&command), None);
+        let payloads = ready_payloads(legacy_greeting(), None, Some(&command), None, None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert!(
             hello["resumableSession"].is_null(),
@@ -1841,7 +1868,7 @@ mod tests {
     #[test]
     fn a_panel_that_handed_nothing_off_sends_only_the_greeting() {
         assert_eq!(
-            kinds(&ready_payloads(legacy_greeting(), None, None, None)),
+            kinds(&ready_payloads(legacy_greeting(), None, None, None, None)),
             vec!["hello"]
         );
     }
@@ -1851,7 +1878,7 @@ mod tests {
     fn the_theme_follows_the_greeting_and_precedes_everything_else() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
         assert_eq!(
-            kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme))),
+            kinds(&ready_payloads(legacy_greeting(), None, None, Some(&theme), None)),
             vec!["hello", "theme"]
         );
         let payloads = ready_payloads(
@@ -1859,8 +1886,27 @@ mod tests {
             Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
             None,
             Some(&theme),
+            None,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "theme", "snapshot"]);
+    }
+
+    /// The `?` overlay's rows come with every `ready`, right after the colours, so a reloaded
+    /// document never shows a keymap it was not told.
+    #[test]
+    fn the_keymap_follows_the_theme() {
+        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
+        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js("Ctrl+b", &[], &[]);
+        assert_eq!(
+            kinds(&ready_payloads(
+                legacy_greeting(),
+                None,
+                None,
+                Some(&theme),
+                Some(&keymap)
+            )),
+            vec!["hello", "theme", "keymap"]
+        );
     }
 
     /// A live session wins. The card describes a conversation that is over; putting it above a
@@ -1872,6 +1918,7 @@ mod tests {
             legacy_greeting(),
             Some(r#"{"kind":"snapshot","throughRevision":3,"state":{}}"#.to_string()),
             Some(&command),
+            None,
             None,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "snapshot"]);
@@ -1911,7 +1958,7 @@ mod tests {
             ],
         };
         let command = a_command();
-        let payloads = ready_payloads(greeting, None, Some(&command), None);
+        let payloads = ready_payloads(greeting, None, Some(&command), None, None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
             .as_array()

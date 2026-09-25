@@ -75,11 +75,22 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith({ kind: "enter_input" });
   });
 
-  it("demuxes a select_all envelope", () => {
+  it.each([
+    { kind: "literal_key", key: "C-a" },
+    { kind: "open_keymap" },
+    { kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [] },
+  ])("demuxes a $kind envelope", (payload) => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify(payload));
+    expect(handler).toHaveBeenCalledWith(payload);
+  });
+
+  it("no longer accepts select_all", () => {
     const handler = vi.fn();
     installDispatch(handler);
     window.__neovibeDispatch!(JSON.stringify({ kind: "select_all" }));
-    expect(handler).toHaveBeenCalledWith({ kind: "select_all" });
+    expect(handler).not.toHaveBeenCalledWith({ kind: "select_all" });
   });
 
   it("demuxes a pane_focus envelope", () => {
