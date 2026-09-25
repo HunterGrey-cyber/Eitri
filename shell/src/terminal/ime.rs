@@ -41,7 +41,10 @@
 //! can the gate; neither is expected in practice.
 //!
 //! **What a commit becomes:** its text, byte for byte and never bracketed (`keys::normalize_commit`):
-//! a committed string is what the owner typed. **With an input method attached -- any GTK module,
+//! a committed string is what the owner typed. **A commit with a line break is a paste**
+//! (`keys::normalize_paste`, 2026-09-25, the keymap spec §2.8 and the owner's A): bracketed when the
+//! program asked, its line breaks Enter otherwise, as `Ctrl+Shift+V` sends one; before, fcitx5's
+//! `Ctrl+;` clipboard history arrived unbracketed and zsh ran each line. **With an input method attached -- any GTK module,
 //! fcitx5 running or not -- that is every printable key it does not compose**; see the test
 //! `a_printable_key_arriving_as_a_commit_keeps_its_text_and_loses_what_only_a_key_says` for why, and
 //! for what that costs a program that asked for more than text. And a key the input method binds
@@ -56,7 +59,7 @@
 use gtk4::gdk::Rectangle;
 use terminal_input::NormalizedInput;
 
-use super::keys::normalize_commit;
+use super::keys::{normalize_commit, normalize_paste};
 
 /// The composition the input method is showing: its text and its caret, in characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,12 @@ impl ImeGate {
         if text.is_empty() {
             return Commit::Dropped("it was empty");
         }
+        // A line break makes it a paste (keymap spec §2.8, the owner's A): a multi-line commit is
+        // text the owner did not type line by line -- fcitx5's clipboard history -- and a shell runs
+        // each unbracketed line as it arrives.
+        if text.contains(['\n', '\r']) {
+            return Commit::Send(normalize_paste(text));
+        }
         Commit::Send(normalize_commit(text))
     }
 
@@ -203,6 +212,7 @@ pub(crate) fn im_cursor_rect(cell: skia_safe::Rect, scale_factor: i32) -> Rectan
 
 #[cfg(test)]
 mod tests {
+    use super::super::keys::normalize_paste;
     use super::*;
     use alacritty_terminal::term::TermMode;
 
@@ -224,6 +234,37 @@ mod tests {
             Commit::Send(input) => input,
             Commit::Dropped(why) => panic!("expected the commit to reach the shell, dropped: {why}"),
         }
+    }
+
+    /// Spec §2.8, the owner's A: a commit with a line break -- fcitx5's clipboard history, `Ctrl+;`
+    /// -- is a paste, as `Ctrl+Shift+V` sends one: bracketed when the program asked (his zsh does),
+    /// and otherwise its line breaks become Enter. It used to arrive as typed text, and zsh ran each
+    /// line. A single-line commit is still typing, byte for byte and never bracketed.
+    #[test]
+    fn a_multi_line_commit_is_a_paste_and_a_single_line_one_is_typing() {
+        let mut gate = focused();
+        let input = sent(gate.commit("echo a\necho b", TYPING));
+        assert_eq!(input, normalize_paste("echo a\necho b"));
+        assert_eq!(
+            terminal_input::encode(&input, TermMode::BRACKETED_PASTE),
+            b"\x1b[200~echo a\necho b\x1b[201~".to_vec()
+        );
+        assert_eq!(
+            terminal_input::encode(&input, TermMode::empty()),
+            b"echo a\recho b".to_vec()
+        );
+        assert_eq!(
+            sent(gate.commit("a\rb", TYPING)),
+            normalize_paste("a\rb"),
+            "a lone CR is a line break too"
+        );
+        let one_line = sent(gate.commit("\u{4f60}\u{597d} world", TYPING));
+        assert_eq!(one_line, normalize_commit("\u{4f60}\u{597d} world"));
+        assert_eq!(
+            terminal_input::encode(&one_line, TermMode::BRACKETED_PASTE),
+            "\u{4f60}\u{597d} world".as_bytes().to_vec(),
+            "typing is never bracketed"
+        );
     }
 
     /// The P4 pass's own sequence (`docs/canonical/neovibe_feasibility_status.md`, "P4 结论(续)"):

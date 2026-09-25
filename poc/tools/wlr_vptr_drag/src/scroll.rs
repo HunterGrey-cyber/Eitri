@@ -17,7 +17,7 @@ use wayland_client::{
     delegate_noop,
     globals::{registry_queue_init, GlobalListContents},
     protocol::{wl_pointer, wl_registry, wl_seat},
-    Connection, Dispatch, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
@@ -44,10 +44,13 @@ delegate_noop!(AppState: ignore ZwlrVirtualPointerV1);
 fn usage() -> ! {
     eprintln!(
         "usage: wlr-vptr-scroll <notches> [--axis vertical|horizontal] [--value V] \
-         [--source wheel|finger|continuous]\n\n\
+         [--source wheel|finger|continuous] [--discrete N]\n\n\
          Sends <notches> separate axis_source+axis+frame request sequences (one real \
          'wheel notch' each, matching a real physical wheel's own event shape), unlike \
          `wlrctl pointer scroll` which sends a bare axis+frame with no axis_source at all. \
+         --discrete N sends axis_discrete(value, N) instead of axis(value): what a physical \
+         wheel's click carries, which the compositor forwards as value120, so a toolkit sees \
+         a wheel-unit scroll rather than a pixel one (needs virtual-pointer version 2). \
          Requires $WAYLAND_DISPLAY set explicitly -- refuses to guess a default socket, same \
          safety rule as wlr-vptr-drag."
     );
@@ -68,6 +71,7 @@ fn main() -> ExitCode {
     let mut axis = wl_pointer::Axis::VerticalScroll;
     let mut value = 10.0f64; // libinput's own convention: ~10 units = one wheel click
     let mut source = wl_pointer::AxisSource::Wheel;
+    let mut discrete: Option<i32> = None;
 
     let mut it = env::args().skip(1);
     while let Some(a) = it.next() {
@@ -88,6 +92,7 @@ fn main() -> ExitCode {
                     _ => usage(),
                 };
             }
+            "--discrete" => discrete = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "-h" | "--help" => usage(),
             other => {
                 if notches.is_some() {
@@ -132,10 +137,28 @@ fn main() -> ExitCode {
         let _ = queue.roundtrip(state);
     };
 
-    eprintln!("scroll: {notches} notch(es) axis={axis:?} value={value} source={source:?}");
+    if discrete.is_some() && pointer.version() < 2 {
+        eprintln!(
+            "error: --discrete needs zwlr_virtual_pointer_v1 version 2; the compositor offers {}",
+            pointer.version()
+        );
+        return ExitCode::FAILURE;
+    }
+    eprintln!("scroll: {notches} notch(es) axis={axis:?} value={value} source={source:?} discrete={discrete:?}");
+    // A zero motion first: in a headless sway 1.12 the first axis frame of a freshly created
+    // virtual pointer never reached a GTK 4 client (measured 2026-09-25, keymap GUI pass: every
+    // one-notch invocation scrolled nothing, and an n-notch one scrolled n-1). With this frame
+    // ahead of it, every notch arrives.
+    pointer.motion(now_ms(start), 0.0, 0.0);
+    pointer.frame();
+    flush(&mut queue, &mut state);
+    sleep(Duration::from_millis(50));
     for _ in 0..notches {
         pointer.axis_source(source);
-        pointer.axis(now_ms(start), axis, value);
+        match discrete {
+            Some(d) => pointer.axis_discrete(now_ms(start), axis, value, d),
+            None => pointer.axis(now_ms(start), axis, value),
+        }
         pointer.frame();
         flush(&mut queue, &mut state);
         sleep(Duration::from_millis(50));

@@ -172,6 +172,16 @@ pub(crate) enum TextStep {
     Reset,
 }
 
+impl From<neovibe_core::keymap::TextChange> for TextStep {
+    fn from(change: neovibe_core::keymap::TextChange) -> Self {
+        match change {
+            neovibe_core::keymap::TextChange::Larger => TextStep::Larger,
+            neovibe_core::keymap::TextChange::Smaller => TextStep::Smaller,
+            neovibe_core::keymap::TextChange::Reset => TextStep::Reset,
+        }
+    }
+}
+
 /// S, R, a pending write and the burst it belongs to, and the panel's base size. See this module's
 /// own doc for what each means; every operation here is a pure function of the state alone -- there
 /// is no notion of time anywhere in this type (§4, corrected again 2026-09-23).
@@ -460,34 +470,15 @@ pub(crate) fn live_panel_font_size_px(panel_px: &Cell<f32>) -> f32 {
     panel_px.get()
 }
 
-/// Every `app.text-*` action this module registers: its GTK action name, its accelerators, and
-/// which [`TextStep`] it performs -- one table `TextSizeController::install` iterates rather than
-/// each action being written out by hand, so a name and a step cannot silently drift apart (item
-/// 3g: an earlier revision's three inline tuples had "text-larger" wired to `TextStep::Smaller`
-/// under a review's mutation testing, and nothing noticed).
-///
-/// Both `equal` and `plus` are bound for `text-larger` because GTK matches keyvals and
-/// `Ctrl+=`/`Ctrl+Shift+=` produce different ones (spec §3). `text-reset` additionally binds
-/// `<Control>KP_Insert`: with NumLock off, the keypad's `0` key reports as `KP_Insert`, not `KP_0`
-/// -- neovibe's own bindings take priority over whatever a terminal emulator's convention for that
-/// chord might be (2026-09-23 ruling), so this is bound outright rather than left out to avoid a
-/// hypothetical collision.
-pub(crate) const TEXT_SIZE_ACTIONS: &[(&str, &[&str], TextStep)] = &[
-    (
-        "text-larger",
-        &["<Control>equal", "<Control>plus", "<Control>KP_Add"],
-        TextStep::Larger,
-    ),
-    (
-        "text-smaller",
-        &["<Control>minus", "<Control>KP_Subtract"],
-        TextStep::Smaller,
-    ),
-    (
-        "text-reset",
-        &["<Control>0", "<Control>KP_0", "<Control>KP_Insert"],
-        TextStep::Reset,
-    ),
+/// Every `app.text-*` action this module registers: its GTK action name and which [`TextStep`] it
+/// performs -- one table `TextSizeController::install` iterates, so a name and a step cannot drift
+/// apart (item 3g). The accelerators are `neovibe_core::keymap::root`'s (keymap spec §2.2): `Ctrl+=`,
+/// `Ctrl+-`, `Ctrl+0` and their keypad forms. `<Control>plus` is gone -- on a US layout it is
+/// `Ctrl+Shift+=`, and no root chord holds `Ctrl+Shift`.
+pub(crate) const TEXT_SIZE_ACTIONS: &[(&str, TextStep)] = &[
+    ("text-larger", TextStep::Larger),
+    ("text-smaller", TextStep::Smaller),
+    ("text-reset", TextStep::Reset),
 ];
 
 /// Owns the live [`TextSize`] for one window: the three `app.text-*` accelerators (registered
@@ -537,7 +528,7 @@ impl TextSizeController {
 
         // App-level, so GTK takes them before nvim or the panel sees the key (spec §3; see
         // `TEXT_SIZE_ACTIONS`'s own doc for why each accelerator is bound).
-        for (name, accels, step) in TEXT_SIZE_ACTIONS.iter().copied() {
+        for (name, step) in TEXT_SIZE_ACTIONS.iter().copied() {
             let action = gtk4::gio::SimpleAction::new(name, None);
             let weak = Rc::downgrade(&this);
             action.connect_activate(move |_, _| {
@@ -546,7 +537,7 @@ impl TextSizeController {
                 }
             });
             app.add_action(&action);
-            app.set_accels_for_action(&format!("app.{name}"), accels);
+            app.set_accels_for_action(&format!("app.{name}"), neovibe_core::keymap::root::accels(name));
         }
 
         if let Some(editor) = &this.editor {
@@ -600,7 +591,8 @@ impl TextSizeController {
         );
     }
 
-    /// `Ctrl+a =`/`-`/`0` with the editor focused.
+    /// The keymap's `text.larger`/`text.smaller`/`text.reset` (not bound by default; `Ctrl`+wheel
+    /// over a pane is the default per-pane route, Task 9) with the editor focused.
     pub(crate) fn apply_editor(self: &Rc<Self>, step: TextStep) {
         let Some(editor) = &self.editor else {
             eprintln!("[text-size] {step:?} (editor): no editor pane, ignoring");
@@ -621,7 +613,8 @@ impl TextSizeController {
         );
     }
 
-    /// `Ctrl+a =`/`-`/`0` with the panel focused. Never touches nvim: only R moves.
+    /// The keymap's `text.larger`/`text.smaller`/`text.reset` with the panel focused. Never touches
+    /// nvim: only R moves.
     pub(crate) fn apply_panel(&self, step: TextStep) {
         let next = self.state.borrow().clone().apply_panel_step(step);
         *self.state.borrow_mut() = next;
@@ -654,6 +647,14 @@ fn describe_write(write: Option<f32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keymap_text_change_is_the_same_step() {
+        use neovibe_core::keymap::TextChange;
+        assert_eq!(TextStep::from(TextChange::Larger), TextStep::Larger);
+        assert_eq!(TextStep::from(TextChange::Smaller), TextStep::Smaller);
+        assert_eq!(TextStep::from(TextChange::Reset), TextStep::Reset);
+    }
 
     fn ts(s: f32, r: f32, base: f32) -> TextSize {
         TextSize {
@@ -1314,21 +1315,17 @@ mod tests {
     fn text_size_actions_map_each_name_to_its_own_step_in_order() {
         assert_eq!(TEXT_SIZE_ACTIONS.len(), 3);
         assert_eq!(TEXT_SIZE_ACTIONS[0].0, "text-larger");
-        assert_eq!(TEXT_SIZE_ACTIONS[0].2, TextStep::Larger);
+        assert_eq!(TEXT_SIZE_ACTIONS[0].1, TextStep::Larger);
         assert_eq!(TEXT_SIZE_ACTIONS[1].0, "text-smaller");
-        assert_eq!(TEXT_SIZE_ACTIONS[1].2, TextStep::Smaller);
+        assert_eq!(TEXT_SIZE_ACTIONS[1].1, TextStep::Smaller);
         assert_eq!(TEXT_SIZE_ACTIONS[2].0, "text-reset");
-        assert_eq!(TEXT_SIZE_ACTIONS[2].2, TextStep::Reset);
-    }
-
-    #[test]
-    fn text_reset_binds_kp_insert_alongside_kp_0() {
-        let (_, accels, _) = TEXT_SIZE_ACTIONS[2];
-        assert!(accels.contains(&"<Control>KP_0"));
-        assert!(
-            accels.contains(&"<Control>KP_Insert"),
-            "keypad 0 reports as KP_Insert with NumLock off"
-        );
+        assert_eq!(TEXT_SIZE_ACTIONS[2].1, TextStep::Reset);
+        for (name, _) in TEXT_SIZE_ACTIONS.iter().copied() {
+            assert!(
+                !neovibe_core::keymap::root::accels(name).is_empty(),
+                "{name} has no root accelerator"
+            );
+        }
     }
 
     #[test]

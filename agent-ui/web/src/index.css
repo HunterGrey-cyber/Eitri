@@ -1039,8 +1039,13 @@ body,
   padding: 2px 8px 2px 0;
   vertical-align: top;
 }
-.keymap-overlay td:first-child {
-  white-space: nowrap;
+/* The keys may wrap at their own spaces (`Ctrl+0 / Ctrl+Keypad0 / ...` is wider than a 520px panel);
+   `nowrap` here scrolled the overlay sideways and, beside a Lua side panel, pushed every
+   description off the right edge (the keymap GUI pass, 2026-09-25). A wrapped keycap keeps its fill
+   and padding on each line. */
+.keymap-overlay td:first-child .keycap {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
 }
 /* The description column only -- the keys column keeps the inherited `--nv-fg`, same as the
    keycap's own label text everywhere else on this page. */

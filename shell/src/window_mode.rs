@@ -18,7 +18,7 @@ use crate::chrome::TopBar;
 pub(crate) enum WindowMode {
     Windowed,
     Fullscreen,
-    /// `from_fullscreen` is where `Ctrl+Shift+F11` goes back to: it undoes itself (§2.2).
+    /// `from_fullscreen` is where `prefix F11` goes back to: it undoes itself (§2.2).
     Immersive {
         from_fullscreen: bool,
     },
@@ -28,7 +28,7 @@ pub(crate) enum WindowMode {
 pub(crate) enum ModeEvent {
     /// `F11`: fullscreen on or off. From immersive it is off, straight to windowed.
     ToggleFullscreen,
-    /// `Ctrl+Shift+F11`.
+    /// `prefix F11`.
     ToggleImmersive,
     /// `g:neovide_fullscreen` changed in nvim.
     Setting(bool),
@@ -124,22 +124,17 @@ impl WindowModes {
             pending_echo: Cell::new(None),
         });
 
-        // App-level, so GTK takes them before nvim or the panel sees the key (spec §2.3; the same
-        // capture-phase shortcut manager as HINT's `Ctrl+Shift+F`).
-        for (name, accel, event) in [
-            ("fullscreen", "F11", ModeEvent::ToggleFullscreen),
-            ("immersive", "<Control><Shift>F11", ModeEvent::ToggleImmersive),
-        ] {
-            let action = gtk4::gio::SimpleAction::new(name, None);
-            let weak = Rc::downgrade(&this);
-            action.connect_activate(move |_, _| {
-                if let Some(this) = weak.upgrade() {
-                    this.apply(event);
-                }
-            });
-            app.add_action(&action);
-            app.set_accels_for_action(&format!("app.{name}"), &[accel]);
-        }
+        // App-level, so GTK takes it before nvim or the panel sees the key. Immersive has no
+        // accelerator: it is `prefix F11` (keymap spec §2.1), which calls `toggle_immersive`.
+        let action = gtk4::gio::SimpleAction::new("fullscreen", None);
+        let weak = Rc::downgrade(&this);
+        action.connect_activate(move |_, _| {
+            if let Some(this) = weak.upgrade() {
+                this.apply(ModeEvent::ToggleFullscreen);
+            }
+        });
+        app.add_action(&action);
+        app.set_accels_for_action("app.fullscreen", neovibe_core::keymap::root::accels("fullscreen"));
 
         // The compositor answering. Which of the three things it can mean is `classify_window_notify`'s
         // job; the one that moves the mode is a change nothing here asked for.
@@ -186,6 +181,11 @@ impl WindowModes {
     fn focus_in_top_bar(&self) -> bool {
         gtk4::prelude::GtkWindowExt::focus(&self.window)
             .is_some_and(|w| w == self.top_bar || w.is_ancestor(&self.top_bar))
+    }
+
+    /// `prefix F11` (keymap spec §2.1): immersive on or off.
+    pub(crate) fn toggle_immersive(&self) {
+        self.apply(ModeEvent::ToggleImmersive);
     }
 
     fn apply(&self, event: ModeEvent) {

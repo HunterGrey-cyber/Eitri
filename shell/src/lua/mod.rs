@@ -1,7 +1,7 @@
 //! The shell's embedded Lua extension kernel -- a separate, independent runtime from Neovim's
 //! own internal Lua (see docs/canonical/neovibe_architecture_decisions.md §3). Exposes exactly four v1
 //! extension points under a `neovibe` global table: `panel.register`, `command.register`, `on`,
-//! `config.get`/`config.set`.
+//! `config.get`/`config.set`, plus `keymap.prefix`/`keymap.set`/`keymap.del` (keymap spec §2.3).
 
 mod panel;
 
@@ -25,6 +25,9 @@ pub(crate) struct LuaEngine {
     pub(crate) config: Rc<RefCell<neovibe_core::lua::config::ConfigStore>>,
     /// `neovibe.layout.*` (modules P2): `init.lua`'s default tree, and the requests commands queue.
     pub(crate) layout: Rc<RefCell<neovibe_core::lua::layout::LayoutStore>>,
+    /// `neovibe.keymap.*` (keymap spec §2.3): the calls `init.lua` made, applied by `main()` once it
+    /// has run (`neovibe_core::keymap::Keymap::apply_user`).
+    pub(crate) keymap: Rc<RefCell<neovibe_core::lua::keymap::KeymapStore>>,
 }
 
 impl LuaEngine {
@@ -48,6 +51,8 @@ impl LuaEngine {
         neovibe_core::lua::config::install(&lua, &neovibe, config.clone())?;
         let layout = Rc::new(RefCell::new(neovibe_core::lua::layout::LayoutStore::default()));
         neovibe_core::lua::layout::install(&lua, &neovibe, layout.clone())?;
+        let keymap = Rc::new(RefCell::new(neovibe_core::lua::keymap::KeymapStore::default()));
+        neovibe_core::lua::keymap::install(&lua, &neovibe, keymap.clone())?;
 
         lua.globals().set("neovibe", neovibe)?;
 
@@ -58,6 +63,7 @@ impl LuaEngine {
             events,
             config,
             layout,
+            keymap,
         })
     }
 
@@ -117,5 +123,15 @@ mod tests {
         let engine = LuaEngine::new(PathBuf::from("/tmp/neovibe-test-config")).unwrap();
         let ty: String = engine.lua.load("return type(neovibe)").eval().unwrap();
         assert_eq!(ty, "table");
+    }
+
+    #[test]
+    fn neovibe_keymap_is_installed_and_records_into_the_engines_store() {
+        let engine = LuaEngine::new(PathBuf::from("/tmp/neovibe-test-config")).unwrap();
+        engine.lua.load(r#"neovibe.keymap.prefix("C-a")"#).exec().unwrap();
+        assert_eq!(
+            engine.keymap.borrow().ops(),
+            [neovibe_core::keymap::KeymapOp::Prefix { key: "C-a".into() }]
+        );
     }
 }

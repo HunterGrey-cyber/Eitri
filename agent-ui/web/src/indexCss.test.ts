@@ -12,6 +12,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { renderToolCall } from "./toolRegistry";
 import { renderMarkdown } from "./markdown";
 import { PermissionCard } from "./components/PermissionCard";
+import { KeymapOverlay } from "./components/KeymapOverlay";
 
 /** Strip CSS comments, but never a `/*` that is inside a string.
  *
@@ -2370,6 +2371,41 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     // Negative control: the `Bash` command's own rule taken away is exactly the GUI pass's defect.
     const bash = panelPres(".tool-card-bash { white-space: pre; }").find((pre) => pre.classList.contains("tool-card-bash"))!;
     expect(containment(bash)).toBeNull();
+  });
+});
+
+/* The keymap GUI pass (2026-09-25): at the default 520px panel the `?` overlay scrolled sideways,
+   and at 348px (beside a Lua side panel) every row below the window keys showed its keys and no
+   description at all, pushed off the right edge. The keys column was `white-space: nowrap`, and one
+   key cell -- `Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)`, the same text on `main` -- is
+   wider than the panel. The keys may break at their own spaces; a key name itself never does,
+   because nothing here sets `overflow-wrap` on the overlay. */
+describe("index.css: the ? overlay never scrolls sideways", () => {
+  afterEach(() => {
+    document.head.innerHTML = "";
+    document.body.innerHTML = "";
+  });
+
+  function keyCells(extraCss = ""): HTMLElement[] {
+    const long = { keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)", what: "Text size reset (both panes)" };
+    document.head.innerHTML = `<style>${css}${extraCss}</style>`;
+    document.body.innerHTML = renderToStaticMarkup(
+      createElement(KeymapOverlay, { onClose: () => {}, windowKeys: [long], prefixKeys: [], prefixLabel: "Ctrl+b" }),
+    );
+    return Array.from(document.querySelectorAll<HTMLElement>(".keymap-overlay td:first-child"));
+  }
+
+  it("lets a key cell wrap at its spaces", () => {
+    const cells = keyCells();
+    expect(cells.length).toBeGreaterThan(10);
+    for (const cell of cells) {
+      expect(winningDeclarationOn(cell, "white-space") ?? "normal").toBe("normal");
+      expect(winningDeclarationOn(cell.querySelector(".keycap")!, "white-space") ?? "normal").toBe("normal");
+    }
+    // Negative control: the rule the pass found reads as the defect.
+    expect(winningDeclarationOn(keyCells(".keymap-overlay td:first-child { white-space: nowrap; }")[0], "white-space")).toBe(
+      "nowrap",
+    );
   });
 });
 

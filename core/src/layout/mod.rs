@@ -16,9 +16,9 @@ pub use geometry::{
     arrange, hide, min_size, move_divider, navigate, neighbor, resize, settle_pins, Arrangement, Direction, Divider,
     Frame, Nav, Rect, Size,
 };
-pub use keys::{key_action, strip, KeyAction, KeyError, ModuleKeys, StripEntry};
+pub use keys::{key_action, strip, strip_direct, KeyAction, KeyError, ModuleKeys, StripEntry};
 pub use module::{ModuleDecl, ModuleError, ModuleId, ModuleKind, Placement};
-pub use ops::{even, place, swap};
+pub use ops::{even, place, swap, swap_adjacent};
 pub use reconcile::{reconcile, reconcile_default, ReconcileError, Reconciled};
 pub use tray::{agent_place, chip_label, tray};
 pub use tree::{Axis, Branch, Layout, LayoutError, Node, Pin, SplitPath, ZoomChange};

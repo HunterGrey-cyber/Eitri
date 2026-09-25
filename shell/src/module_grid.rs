@@ -389,6 +389,19 @@ impl ModuleGrid {
         swapped
     }
 
+    /// `swap.prev`/`swap.next` (`neovibe_core::layout::swap_adjacent`).
+    pub(crate) fn swap_adjacent(&self, focused: &ModuleId, forward: bool) -> Option<ModuleId> {
+        let swapped = {
+            let layout = self.layout();
+            let mut layout = layout.borrow_mut();
+            neovibe_core::layout::swap_adjacent(&mut layout, focused, forward)
+        };
+        if swapped.is_some() {
+            self.apply();
+        }
+        swapped
+    }
+
     /// `Ctrl+a |` / `Ctrl+a _` (`neovibe_core::layout::even`).
     pub(crate) fn even_modules(&self, axis: Axis) {
         neovibe_core::layout::even(&mut self.layout().borrow_mut(), axis);

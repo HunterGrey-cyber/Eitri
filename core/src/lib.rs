@@ -17,6 +17,7 @@ pub mod buffer_reload;
 pub mod editor_context;
 pub mod hint;
 pub mod instance_dir;
+pub mod keymap;
 pub mod layout;
 pub mod lua;
 pub mod pane_switch;

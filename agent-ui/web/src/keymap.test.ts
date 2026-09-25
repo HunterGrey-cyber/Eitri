@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BROWSE_KEYS, INPUT_KEYS, PREFIX_KEYS, WINDOW_KEYS, resolveKey } from "./keymap";
+import { BROWSE_KEYS, INPUT_KEYS, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike } from "./keymap";
 
 const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; isComposing: boolean }> = {}) =>
@@ -181,7 +181,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
 
 describe("the ? keymap tables", () => {
   it("are each non-empty and free of duplicate keys", () => {
-    for (const table of [BROWSE_KEYS, INPUT_KEYS, WINDOW_KEYS, PREFIX_KEYS]) {
+    for (const table of [BROWSE_KEYS, INPUT_KEYS]) {
       expect(table.length).toBeGreaterThan(0);
       expect(new Set(table.map((row) => row.keys)).size).toBe(table.length);
     }

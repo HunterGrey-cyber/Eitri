@@ -1,5 +1,5 @@
-//! What the top bar shows while the `Ctrl+a` prefix waits (modules spec §6.5): the module keys --
-//! `e editor · a agent · t terminal · <Lua keys>`, a hidden module dimmed -- then the verbs. After
+//! What the top bar shows while the prefix waits (modules spec §6.5): the module keys --
+//! `e editor · a agent · t terminal · <Lua keys>`, a hidden module dimmed -- then the verbs, as the effective keymap binds them (`Keymap::strip_verbs`). After
 //! `\` or `"`, only the module keys, under where the module will go. Drawn as a row of labels in
 //! the top bar beside the app name, which already turns into a solid block while the prefix waits.
 //!
@@ -13,9 +13,6 @@ use gtk4::prelude::*;
 use neovibe_core::layout::{Axis, ModuleId, StripEntry};
 
 use crate::prefix::Waiting;
-
-/// The prefix's own keys that are not module keys, as the strip names them.
-const VERBS: [&str; 5] = ["x hide", "\\ right", "\" below", "| _ even", "H J K L swap"];
 
 /// The separator between two runs.
 const DOT: &str = "\u{00b7}";
@@ -38,13 +35,16 @@ pub(crate) enum StripPiece {
     Dot,
 }
 
-/// The strip's pieces, left to right. `focus_title` names the module with the keys (where `\`/`"`
+/// The strip's pieces, left to right. `entries` are the module keys for `waiting`: the keys that reach
+/// each module now while armed (`neovibe_core::layout::strip_direct`), the fixed module keys after a
+/// split key (`neovibe_core::layout::strip`). `focus_title` names the module with the keys (where `\`/`"`
 /// put the next module); `title` names any module.
 pub(crate) fn strip_pieces(
     waiting: Waiting,
     entries: &[StripEntry],
     focus_title: &str,
     title: &dyn Fn(&ModuleId) -> String,
+    verbs: &[String],
 ) -> Vec<StripPiece> {
     let modules = entries.iter().map(|entry| StripPiece::Run {
         text: format!("{} {}", entry.key, title(&entry.module)),
@@ -55,8 +55,8 @@ pub(crate) fn strip_pieces(
         Waiting::Command => (
             None,
             modules
-                .chain(VERBS.iter().map(|verb| StripPiece::Run {
-                    text: verb.to_string(),
+                .chain(verbs.iter().map(|verb| StripPiece::Run {
+                    text: verb.clone(),
                     dimmed: false,
                 }))
                 .collect(),
@@ -139,17 +139,17 @@ mod tests {
     fn entries() -> Vec<StripEntry> {
         vec![
             StripEntry {
-                key: 'e',
+                key: "e".into(),
                 module: ModuleId::editor(),
                 dimmed: false,
             },
             StripEntry {
-                key: 'a',
+                key: "a".into(),
                 module: ModuleId::agent(),
                 dimmed: false,
             },
             StripEntry {
-                key: 't',
+                key: "t".into(),
                 module: ModuleId::terminal(),
                 dimmed: true,
             },
@@ -162,6 +162,10 @@ mod tests {
 
     /// The strip as it would read: each piece's text, a heading and a run as themselves, a `·` as
     /// itself, a dimmed run in brackets; joined by one space.
+    fn verbs() -> Vec<String> {
+        neovibe_core::keymap::Keymap::defaults().strip_verbs()
+    }
+
     fn reads(pieces: &[StripPiece]) -> String {
         pieces
             .iter()
@@ -177,25 +181,25 @@ mod tests {
 
     #[test]
     fn armed_it_lists_the_module_keys_then_the_verbs() {
-        let pieces = strip_pieces(Waiting::Command, &entries(), "editor", &title);
+        let pieces = strip_pieces(Waiting::Command, &entries(), "editor", &title, &verbs());
         assert_eq!(
             reads(&pieces),
-            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x hide \u{b7} \\ right \u{b7} \" below \u{b7} \
-             | _ even \u{b7} H J K L swap",
+            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x hide \u{b7} % right \u{b7} \" below \u{b7} \
+             M-1 M-2 even \u{b7} { } swap",
             "a hidden module is dimmed"
         );
     }
 
     #[test]
     fn after_a_split_key_it_lists_only_the_module_keys_under_where_they_go() {
-        let below = strip_pieces(Waiting::Module(Axis::Column), &entries(), "agent", &title);
+        let below = strip_pieces(Waiting::Module(Axis::Column), &entries(), "agent", &title, &verbs());
         assert_eq!(
             reads(&below),
             "below agent: e editor \u{b7} a agent \u{b7} [t terminal]"
         );
-        let right = strip_pieces(Waiting::Module(Axis::Row), &entries(), "agent", &title);
+        let right = strip_pieces(Waiting::Module(Axis::Row), &entries(), "agent", &title, &verbs());
         assert_eq!(right[0], StripPiece::Heading("right of agent:".to_string()));
-        assert!(strip_pieces(Waiting::No, &entries(), "agent", &title).is_empty());
+        assert!(strip_pieces(Waiting::No, &entries(), "agent", &title, &verbs()).is_empty());
     }
 
     /// The GUI pass's C1 (2026-09-24): the build spaced the runs with no `·`, so a run with spaces of
@@ -211,7 +215,7 @@ mod tests {
                 Waiting::Module(Axis::Row),
                 Waiting::Module(Axis::Column),
             ] {
-                let pieces = strip_pieces(waiting, some, "agent", &title);
+                let pieces = strip_pieces(waiting, some, "agent", &title, &verbs());
                 let body: &[StripPiece] = match pieces.first() {
                     Some(StripPiece::Heading(_)) => &pieces[1..],
                     _ => &pieces[..],

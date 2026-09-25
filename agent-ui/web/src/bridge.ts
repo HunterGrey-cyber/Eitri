@@ -1,4 +1,5 @@
 import type { AgentDomainEvent, AgentUiSnapshot, HandoffCommand, Hello } from "./types";
+import type { KeymapHelp } from "./keymap";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -75,11 +76,14 @@ type InboundHandler = (
      *  caret in it. Only the keyboard route sends this; a click on a row still lands in BROWSE on
      *  that row. See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "enter_input" }
-    /** `Ctrl+a Ctrl+a` (shell's `Ctrl+a` prefix) with this panel focused: WebKitGTK has no way to be
-     *  handed the key itself, so this is what `Ctrl+a` does in a text field -- select all of
-     *  whichever one has focus, nothing when none does. See `serialize_select_all_for_js` in
-     *  `core/src/agent_bridge.rs`. */
-    | { kind: "select_all" }
+    /** `shell`'s keys for the `?` overlay (`serialize_keymap_for_js`). */
+    | ({ kind: "keymap" } & KeymapHelp)
+    /** `send-prefix`/`send-keys` with this panel holding the keys: WebKitGTK cannot be handed the
+     *  key itself, so the panel acts on the ones it knows (`C-a`: select all) and ignores the rest.
+     *  `key` is tmux's spelling. See `serialize_literal_key_for_js` in `core/src/agent_bridge.rs`. */
+    | { kind: "literal_key"; key: string }
+    /** `prefix ?`: open the `?` overlay in BROWSE. */
+    | { kind: "open_keymap" }
     /** The chat was brought back to answer a card (its tray chip `agent ⚑N`, or `Ctrl+a a`): BROWSE,
      *  with the cursor on the oldest pending card. See `serialize_focus_permission_for_js` in
      *  `core/src/agent_bridge.rs`. */
@@ -117,7 +121,9 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "theme" ||
         obj.kind === "pane_focus" ||
         obj.kind === "enter_input" ||
-        obj.kind === "select_all" ||
+        obj.kind === "keymap" ||
+        obj.kind === "literal_key" ||
+        obj.kind === "open_keymap" ||
         obj.kind === "focus_permission" ||
         obj.kind === "hint_collect" ||
         obj.kind === "hint_show" ||

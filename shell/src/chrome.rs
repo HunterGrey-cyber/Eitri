@@ -79,8 +79,8 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     // many of them on a narrow bar can still widen it (not seen on a screen either way).
     project_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
-    // Reload the agent panel's frontend -- the same `app.reload-agent-panel` action Ctrl+Shift+R
-    // fires (see `agent_panel::install_reload_action`). It lives in the window chrome rather than in
+    // Reload the agent panel's frontend -- the same action `prefix r` fires (see
+    // `agent_panel::install_reload_action`). It lives in the window chrome rather than in
     // the panel's own page on purpose: the page is the thing that wedges, and a control the page
     // draws would be gone exactly when it is wanted. The accelerator is what makes the recovery
     // possible at all; this button is what makes it discoverable.
@@ -92,9 +92,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     let reload_agent = gtk4::Button::with_label("\u{21BB}");
     reload_agent.add_css_class("win-btn");
     reload_agent.set_valign(gtk4::Align::Center);
-    reload_agent.set_tooltip_text(Some(
-        "Reload the agent panel (Ctrl+Shift+R) — the session keeps running",
-    ));
+    reload_agent.set_tooltip_text(Some("Reload the agent panel — the session keeps running"));
     reload_agent.set_action_name(Some("app.reload-agent-panel"));
     reload_agent.add_css_class("topbar-item");
 

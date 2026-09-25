@@ -91,6 +91,28 @@ pub fn even(layout: &mut Layout, axis: Axis) {
     layout.replace_root(node);
 }
 
+/// `swap.prev` / `swap.next` (keymap spec §2.1, tmux's `swap-pane -U/-D`): `focused` changes places
+/// with the module before or after it among those on screen, in tree order (HINT's order),
+/// wrapping. Every split keeps its axis, ratio and pin, as `swap` does. `None`, and nothing moves,
+/// for a hidden `focused` or one alone on screen.
+pub fn swap_adjacent(layout: &mut Layout, focused: &ModuleId, forward: bool) -> Option<ModuleId> {
+    let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_shown(id)).collect();
+    let at = shown.iter().position(|id| id == focused)?;
+    if shown.len() < 2 {
+        return None;
+    }
+    let other = if forward {
+        shown[(at + 1) % shown.len()].clone()
+    } else {
+        shown[(at + shown.len() - 1) % shown.len()].clone()
+    };
+    let mut root = layout.root().clone();
+    root.swap_leaves(focused, &other);
+    layout.unzoom();
+    layout.replace_root(root);
+    Some(other)
+}
+
 /// A pinned split whose kept side is a hidden module: the row [`even`] leaves where it is.
 struct KeptRow {
     axis: Axis,
@@ -408,5 +430,70 @@ mod tests {
         );
         let heights: Vec<i32> = arrange(&layout, &frame()).modules.iter().map(|(_, r)| r.h).collect();
         assert_eq!(heights, [360, 360]);
+    }
+}
+
+#[cfg(test)]
+mod swap_adjacent_tests {
+    use super::super::geometry::{hide, Frame, Size};
+    use super::super::module::{ModuleDecl, ModuleId, Placement};
+    use super::super::tree::Layout;
+    use super::swap_adjacent;
+
+    fn position(layout: &Layout, id: &ModuleId) -> usize {
+        layout.leaves().iter().position(|m| m == id).unwrap()
+    }
+
+    /// Ruling 9: tmux's `swap-pane -U/-D` wrap, over the modules on screen in tree order.
+    #[test]
+    fn swap_adjacent_wraps_over_the_modules_on_screen_and_skips_a_hidden_one() {
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::BelowRoot,
+        }])
+        .unwrap();
+        hide(&mut layout, &ModuleId::terminal(), &frame).unwrap();
+        let (editor, agent, terminal) = (
+            position(&layout, &ModuleId::editor()),
+            position(&layout, &ModuleId::agent()),
+            position(&layout, &ModuleId::terminal()),
+        );
+        assert_eq!(
+            swap_adjacent(&mut layout, &ModuleId::editor(), true),
+            Some(ModuleId::agent())
+        );
+        assert_eq!(position(&layout, &ModuleId::editor()), agent);
+        assert_eq!(position(&layout, &ModuleId::agent()), editor);
+        assert_eq!(
+            position(&layout, &ModuleId::terminal()),
+            terminal,
+            "the hidden module does not move"
+        );
+        // Two on screen: forward from the last wraps to the first, never to the hidden terminal.
+        assert_eq!(
+            swap_adjacent(&mut layout, &ModuleId::editor(), true),
+            Some(ModuleId::agent())
+        );
+        assert_eq!(
+            swap_adjacent(&mut layout, &ModuleId::editor(), false),
+            Some(ModuleId::agent())
+        );
+    }
+
+    #[test]
+    fn swap_adjacent_does_nothing_for_a_hidden_module_or_a_lone_one() {
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::BelowRoot,
+        }])
+        .unwrap();
+        hide(&mut layout, &ModuleId::terminal(), &frame).unwrap();
+        assert_eq!(swap_adjacent(&mut layout, &ModuleId::terminal(), true), None);
+        hide(&mut layout, &ModuleId::agent(), &frame).unwrap();
+        let before = layout.leaves();
+        assert_eq!(swap_adjacent(&mut layout, &ModuleId::editor(), true), None);
+        assert_eq!(layout.leaves(), before);
     }
 }

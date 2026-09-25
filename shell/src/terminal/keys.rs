@@ -398,6 +398,18 @@ fn named_key_for(keyval: GdkKey) -> Option<NamedKey> {
 mod tests {
     use super::*;
 
+    /// What `send-prefix`/`send-keys` hand the terminal (ruling 3): a Ctrl letter exactly as a typed
+    /// one, one character as text, anything else refused.
+    #[test]
+    fn a_literal_is_a_ctrl_letter_or_one_character() {
+        let k = |s: &str| neovibe_core::keymap::KeySpec::parse(s).unwrap();
+        assert_eq!(literal(&k("C-a")), Some(control_letter('a').to_vec()));
+        assert_eq!(literal(&k("C-b")), Some(control_letter('b').to_vec()));
+        assert_eq!(literal(&k("x")), Some(vec![normalize_commit("x")]));
+        assert_eq!(literal(&k("Up")), None);
+        assert_eq!(literal(&k("M-1")), None);
+    }
+
     fn raw(keyval: GdkKey, state: ModifierType) -> RawKey {
         RawKey {
             keyval,
@@ -703,6 +715,18 @@ pub(crate) fn control_letter(letter: char) -> [NormalizedInput; 2] {
             mods: ModifiersState::CONTROL,
         },
     ]
+}
+
+/// What `send-prefix`/`send-keys` hand the terminal for `key` (keymap spec §2.6, ruling 3): a Ctrl
+/// letter exactly as [`control_letter`] sends a typed one, or one unmodified character as text.
+/// `None` for anything else, which the caller logs.
+pub(crate) fn literal(key: &neovibe_core::keymap::KeySpec) -> Option<Vec<NormalizedInput>> {
+    use neovibe_core::keymap::KeyName;
+    match key.key {
+        KeyName::Char(c) if key.ctrl && !key.meta && c.is_ascii_lowercase() => Some(control_letter(c).to_vec()),
+        KeyName::Char(c) if !key.ctrl && !key.meta => Some(vec![normalize_commit(c.to_string())]),
+        _ => None,
+    }
 }
 
 /// Whether a key press restarts a shell that has exited (spec §4.6: the pane holds the last screen,

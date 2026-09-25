@@ -5,7 +5,7 @@ import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import { noteUserScroll } from "./follow";
 import type { PermissionDecision } from "./bridge";
 import { resolveKey } from "./keymap";
-import type { KeyLike, PanelMode } from "./keymap";
+import type { KeyLike, KeymapHelp, PanelMode } from "./keymap";
 import { buildTimeline, oldestPendingPermission } from "./timeline";
 import { controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
@@ -233,6 +233,11 @@ export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
   const [sessionStarted, setSessionStarted] = useState(false);
+  /** `sessionStarted` for the bridge listener, which is registered once and would otherwise read
+   *  its first render's value forever. Assigned during render, so it is current by the time any
+   *  later envelope arrives. */
+  const sessionStartedRef = useRef(false);
+  sessionStartedRef.current = sessionStarted;
   /** The requestId of an in-flight `start_session`. Backend construction is genuinely slow (the
    * sidecar path spawns a process and does a real handshake; a cold Verdandi checkout also builds
    * it), so Rust defers its `command_result` until the worker finishes. This is what lets the start
@@ -268,7 +273,7 @@ export default function App() {
    *  the `handoff` envelope, which Rust sends only after the real session close finished.
    *
    *  **This is a view of Rust's own `AgentPanelState::last_handoff`, not the only copy.** Rust keeps
-   *  the command and re-sends it in the `ready` handshake, so a panel reload (Ctrl+Shift+R, the top
+   *  the command and re-sends it in the `ready` handshake, so a panel reload (prefix r, the top
    *  bar's ⟳) or a WebView crash gets it back — on the default legacy backend the id in it is
    *  recoverable from nowhere else at all. Cleared here when a real `snapshot` arrives, which is
    *  also when Rust clears its copy: a session that is actually running, not one merely asked for. */
@@ -339,7 +344,7 @@ export default function App() {
    *  is also passed to `Composer` as `focusRequest`, which re-focuses a textarea that is already
    *  mounted, since `setMode("input")` alone does nothing when the mode was already INPUT. */
   const [inputRequest, setInputRequest] = useState(0);
-  /** Bumped by each `focus_permission` envelope (modules P2: the tray's `agent ⚑N` chip, or `Ctrl+a a`
+  /** Bumped by each `focus_permission` envelope (modules P2: the tray's `agent ⚑N` chip, or `prefix a`
    *  with a card waiting). A counter for the reason `inputRequest` is one: the handler is installed
    *  once and reads no state; the effect below finds the card against the current render. */
   const [permissionRequest, setPermissionRequest] = useState(0);
@@ -385,6 +390,10 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  /** The overlay's last two sections and its heading, from `shell`'s `keymap` envelope (sent on
+   *  every `ready`, right after the theme). `prefix` defaults to `Ctrl+b`, the stock tmux default,
+   *  until that envelope arrives. */
+  const [keymapHelp, setKeymapHelp] = useState<KeymapHelp>({ prefix: "Ctrl+b", window: [], prefixKeys: [] });
   /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
    *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
   const keymapOverlayRef = useRef<HTMLDivElement>(null);
@@ -653,16 +662,24 @@ export default function App() {
         // The overlay would cover the card the cursor is about to land on.
         setKeymapOpen(false);
         setPermissionRequest((n) => n + 1);
-      } else if (payload.kind === "select_all") {
-        // `Ctrl+a Ctrl+a` (shell's prefix): what `Ctrl+a` does in a text field, since WebKitGTK
-        // cannot be handed the key itself. Nothing when no text field has focus.
-        // Deliberately NOT `isEditableElement`: that one answers "can a key be typed into this",
-        // which is true of a contentEditable div and of a checkbox, neither of which has `select()`.
-        // This needs "does this have a text selection", which is exactly these two types.
+      } else if (payload.kind === "keymap") {
+        setKeymapHelp({ prefix: payload.prefix, window: payload.window, prefixKeys: payload.prefixKeys });
+      } else if (payload.kind === "literal_key") {
+        // `send-prefix`/`send-keys` from shell: WebKitGTK cannot be handed the key itself. `C-a` is
+        // what a text field does with it -- select all of the focused one; any other key is ignored.
+        // Deliberately NOT `isEditableElement`: this needs "has a text selection", which is exactly
+        // these two types.
+        if (payload.key !== "C-a") return;
         const el = document.activeElement;
         if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
           el.select();
         }
+      } else if (payload.kind === "open_keymap") {
+        // The start screen draws no overlay (ruling 11). Arming it here anyway would pop it up over
+        // the conversation once a session starts, swallowing every key until `?`/Esc/q.
+        if (!sessionStartedRef.current) return;
+        setMode("browse");
+        setKeymapOpen(true);
       } else if (payload.kind === "hint_collect") {
         // A HINT started elsewhere in the window must not label rows hidden under this overlay
         // (spec §3.1). It also frees the keys `hint_collect`'s own reply is about to swallow --
@@ -846,7 +863,7 @@ export default function App() {
            it was persisted on adoption (`agent/src/ingestion.rs` -> `conversation::persist_record`)
            -- so it IS on disk and offerable, and only the in-memory list is stale. Without this the
            picker's own note, "Previous conversations here, newest first", is a claim the component
-           cannot honour at that moment; the only escape hatch was `Ctrl+Shift+R`, which nothing
+           cannot honour at that moment; the only escape hatch was `prefix r`, which nothing
            tells the user about.
 
            Safe to re-post: Rust answers `Ready` from canonical state with a fresh
@@ -1118,7 +1135,7 @@ export default function App() {
   /** The key table's home: mode + key + context in, an action out, applied here. Only claims what
    *  `resolveKey` claims -- an unrecognised key, or one INPUT leaves to the input method (a
    *  composing Escape), falls straight through with no `preventDefault`. That is what keeps
-   *  Ctrl+h/l (pane switch), Ctrl+Shift+R (panel reload) and Ctrl+Shift+O working: GTK takes those
+   *  Ctrl+h/l (pane switch), prefix r (panel reload) and Ctrl+Shift+O working: GTK takes those
    *  in the capture phase and this handler must not fight it for a chord it does not own.
    *
    *  Also stays out of any OTHER editable control in this subtree -- a permission card's
@@ -1391,7 +1408,15 @@ export default function App() {
           rather than lifted back above it (review; see `.agent-ui-scroller` in index.css). */}
       <div className="agent-ui-scroller">
         <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused && !edgeFocused} onAnswerPermission={answerPermission} />
-        {keymapOpen && <KeymapOverlay ref={keymapOverlayRef} onClose={() => setKeymapOpen(false)} />}
+        {keymapOpen && (
+          <KeymapOverlay
+            ref={keymapOverlayRef}
+            onClose={() => setKeymapOpen(false)}
+            windowKeys={keymapHelp.window}
+            prefixKeys={keymapHelp.prefixKeys}
+            prefixLabel={keymapHelp.prefix}
+          />
+        )}
       </div>
       {sessionEndedBanner}
       {commandNoticeBanner}

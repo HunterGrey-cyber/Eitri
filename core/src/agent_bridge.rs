@@ -260,12 +260,28 @@ pub fn serialize_focus_permission_for_js() -> String {
     json!({ "kind": "focus_permission" }).to_string()
 }
 
-/// `{"kind":"select_all"}`: `Ctrl+a Ctrl+a` from `shell`'s prefix while the panel has focus
-/// (spec 2026-09-19-window-modes-design.md §3.2). WebKitGTK has no way to be handed the key itself,
-/// so the panel does what `Ctrl+a` does in a text field: selects all of the one that has focus, and
-/// nothing when none does.
-pub fn serialize_select_all_for_js() -> String {
-    json!({ "kind": "select_all" }).to_string()
+/// `{"kind":"keymap", ...}`: the `?` overlay's two `shell` sections, generated from
+/// `neovibe_core::keymap` (keymap spec §2.9) -- `window` from the root table, `prefixKeys` from the
+/// effective prefix table -- and the prefix as a person reads it, for the heading `After <prefix>`.
+/// Sent on every `ready`.
+pub fn serialize_keymap_for_js(
+    prefix: &str,
+    window: &[crate::keymap::HelpRow],
+    prefix_keys: &[crate::keymap::HelpRow],
+) -> String {
+    json!({ "kind": "keymap", "prefix": prefix, "window": window, "prefixKeys": prefix_keys }).to_string()
+}
+
+/// `{"kind":"literal_key","key":"C-a"}`: `send-prefix`/`send-keys` with the panel holding the keys
+/// (keymap spec §2.6). WebKitGTK cannot be handed a key, so the panel acts on the ones it knows --
+/// `C-a`, select all in a text field -- and ignores the rest. `key` is tmux's spelling.
+pub fn serialize_literal_key_for_js(key: &str) -> String {
+    json!({ "kind": "literal_key", "key": key }).to_string()
+}
+
+/// `{"kind":"open_keymap"}`: `prefix ?` -- open the `?` overlay, in BROWSE.
+pub fn serialize_open_keymap_for_js() -> String {
+    json!({ "kind": "open_keymap" }).to_string()
 }
 
 /// Global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md §3.3). `shell`
@@ -558,9 +574,34 @@ mod tests {
     }
 
     #[test]
-    fn serializes_select_all() {
-        let value: serde_json::Value = serde_json::from_str(&serialize_select_all_for_js()).unwrap();
-        assert_eq!(value, serde_json::json!({ "kind": "select_all" }));
+    fn serializes_the_keymap_help() {
+        let row = |k: &str, w: &str| crate::keymap::HelpRow {
+            keys: k.into(),
+            what: w.into(),
+        };
+        let value: serde_json::Value = serde_json::from_str(&serialize_keymap_for_js(
+            "Ctrl+b",
+            &[row("F11", "Fullscreen")],
+            &[row("Ctrl+b f", "HINT")],
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "keymap",
+                "prefix": "Ctrl+b",
+                "window": [{ "keys": "F11", "what": "Fullscreen" }],
+                "prefixKeys": [{ "keys": "Ctrl+b f", "what": "HINT" }]
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_literal_key_and_open_keymap() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_literal_key_for_js("C-a")).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "literal_key", "key": "C-a" }));
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js()).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "open_keymap" }));
     }
 
     #[test]

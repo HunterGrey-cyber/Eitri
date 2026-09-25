@@ -211,7 +211,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
   });
 });
 
-describe("select_all (Ctrl+a Ctrl+a from shell's prefix)", () => {
+describe("literal_key C-a (send-prefix from shell's prefix)", () => {
   it("selects all of the composer textarea's text while it has focus", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -220,7 +220,7 @@ describe("select_all (Ctrl+a Ctrl+a from shell's prefix)", () => {
     enterInputMode(container);
     const textarea = container.querySelector("textarea")!;
     fireEvent.change(textarea, { target: { value: "hello world" } });
-    dispatch({ kind: "select_all" });
+    dispatch({ kind: "literal_key", key: "C-a" });
     expect(textarea.selectionStart).toBe(0);
     expect(textarea.selectionEnd).toBe(textarea.value.length);
   });
@@ -230,8 +230,21 @@ describe("select_all (Ctrl+a Ctrl+a from shell's prefix)", () => {
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "snapshot", throughRevision: 1, state: snapshotState() });
     const before = document.activeElement;
-    expect(() => dispatch({ kind: "select_all" })).not.toThrow();
+    expect(() => dispatch({ kind: "literal_key", key: "C-a" })).not.toThrow();
     expect(document.activeElement).toBe(before);
+  });
+
+  it("ignores a literal key other than C-a", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    enterInputMode(container);
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "hello" } });
+    box.setSelectionRange(5, 5);
+    act(() => dispatch({ kind: "literal_key", key: "C-b" }));
+    expect(box.selectionStart).toBe(5);
+    expect(box.selectionEnd).toBe(5);
   });
 });
 
@@ -2171,6 +2184,12 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState(overrides) });
+    dispatch({
+      kind: "keymap",
+      prefix: "Ctrl+b",
+      window: [{ keys: "F11", what: "Fullscreen" }],
+      prefixKeys: [{ keys: "Ctrl+b f", what: "HINT: jump anywhere in the window" }],
+    });
     return rendered;
   }
   function events(...list: AgentDomainEvent[]) {
@@ -2191,7 +2210,33 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    expect(titles).toEqual(["This panel", "Typing", "Anywhere in the window", "After Ctrl+a"]);
+    expect(titles).toEqual(["This panel", "Typing", "Anywhere in the window", "After Ctrl+b"]);
+  });
+
+  it("shows the rows shell sent in its keymap envelope", () => {
+    const { container } = started();
+    act(() => root(container).focus());
+    press("?", { shiftKey: true });
+    expect(overlay(container)!.textContent).toContain("Ctrl+b f");
+  });
+
+  it("opens on shell's open_keymap, in BROWSE, even from INPUT", () => {
+    const { container } = started();
+    enterInputMode(container);
+    act(() => dispatch({ kind: "open_keymap" }));
+    expect(overlay(container)).not.toBeNull();
+    expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.textContent).toBe("BROWSE");
+  });
+
+  it("ignores an open_keymap on the start screen -- it does not pop up once a session starts", () => {
+    // The start screen draws no overlay (ruling 11), so a `prefix ?` there must leave nothing
+    // armed: otherwise the overlay appears over the new conversation and swallows every key.
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    act(() => dispatch({ kind: "open_keymap" }));
+    expect(overlay(container)).toBeNull();
+    dispatch({ kind: "snapshot", throughRevision: 0, state: snapshotState() });
+    expect(overlay(container)).toBeNull();
   });
 
   it.each(["?", "Escape", "q"])("closes on %s", (key) => {

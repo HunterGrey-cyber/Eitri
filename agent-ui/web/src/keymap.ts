@@ -149,41 +149,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Esc", what: "Stop typing (back to browsing)" },
 ];
 
-/** `shell`'s keys, not this page's: GTK takes them before the WebView sees them. Nothing here can
- *  check them against the code that binds them; `shell/src/main.rs`'s test
- *  `every_app_accelerator_is_in_the_panel_keymap` checks that each accelerator it registers is
- *  spelled here, which catches a key removed without this list changing, not one added. Bound in
- *  `shell/src/main.rs` (pane switch, top bar, HINT), `shell/src/window_mode.rs` (F11,
- *  Ctrl+Shift+F11) and `shell/src/agent_panel.rs` (Ctrl+Shift+R). */
-export const WINDOW_KEYS: KeyHelp[] = [
-  { keys: "Ctrl+h / Ctrl+l", what: "Editor / this panel" },
-  { keys: "Ctrl+k", what: "Top bar (h / l move, Ctrl+j or Esc go back)" },
-  { keys: "Ctrl+j", what: "Down to the terminal when it is shown, or a panel below (Ctrl+k comes back up)" },
-  { keys: "Ctrl+Shift+F", what: "HINT from anywhere (f in this panel or the top bar)" },
-  { keys: "F11", what: "Fullscreen" },
-  { keys: "Ctrl+Shift+F11", what: "Immersive: fullscreen without the top bar" },
-  { keys: "Ctrl+Shift+R", what: "Reload this panel (the session keeps running)" },
-  { keys: "Ctrl+= / Ctrl++ / Ctrl+Keypad+", what: "Text size larger (both panes)" },
-  { keys: "Ctrl+- / Ctrl+Keypad-", what: "Text size smaller (both panes)" },
-  {
-    keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)",
-    what: "Text size reset (both panes)",
-  },
-];
-
-/** `shell/src/prefix.rs`: tmux's own prefix, as the owner's tmux has it. */
-export const PREFIX_KEYS: KeyHelp[] = [
-  { keys: "Ctrl+a m / z", what: "Zoom this pane, or restore" },
-  { keys: "Ctrl+a h / j / k / l", what: "Move a divider 5 cells (repeat within 500 ms)" },
-  { keys: "Ctrl+a Ctrl+a", what: "Send Ctrl+a itself" },
-  { keys: "Ctrl+a Ctrl+l", what: "Send Ctrl+l itself to the terminal (clear screen)" },
-  { keys: "Ctrl+a t", what: "Terminal: show and focus it, or hide it when it has the keys" },
-  { keys: "Ctrl+a = / -", what: "Text size larger / smaller, this pane only (repeat within 500 ms)" },
-  { keys: "Ctrl+a 0", what: "Text size reset, this pane only" },
-  { keys: "Ctrl+a x", what: "Hide this module; it keeps running (not the last one on screen)" },
-  { keys: "Ctrl+a e / a", what: "Editor / agent: show and focus it, or hide it when it has the keys" },
-  { keys: "Ctrl+a \\ then e / a / t", what: "Open that module right of this one, or move it there" },
-  { keys: "Ctrl+a \" then e / a / t", what: "Open that module below this one, or move it there" },
-  { keys: "Ctrl+a | / _", what: "Every module in one row / one column, at equal sizes" },
-  { keys: "Ctrl+a H / J / K / L", what: "Swap this module with the one left / below / above / right" },
-];
+/** `shell`'s own keys, which nothing on this page can read: sent by `shell` in a `keymap` envelope
+ *  on every `ready`, generated from `neovibe_core::keymap` (the root table and the effective prefix
+ *  table after `init.lua`). `prefix` is the prefix as a person reads it (`Ctrl+b`). */
+export type KeymapHelp = { prefix: string; window: KeyHelp[]; prefixKeys: KeyHelp[] };

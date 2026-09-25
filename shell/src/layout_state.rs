@@ -65,12 +65,15 @@ use neovibe_core::layout::{reconcile_default, Layout, ModuleDecl, ModuleId, Node
 ///
 /// Whichever it is, a layout that hides the editor says so: nvim is started by the editor's first
 /// frame (`neovide-editor`'s render callback builds it), so neither nvim nor the window's colours,
-/// which follow nvim's colorscheme, come until the editor is shown. `Ctrl+a x` in the editor makes
-/// that one keypress and one relaunch away (the plan review's finding 5).
+/// which follow nvim's colorscheme, come until the editor is shown. `prefix x` in the editor makes
+/// that one keypress and one relaunch away (the plan review's finding 5). `show_editor` is the key
+/// that shows it, as the effective keymap binds it (`Ctrl+b e` by default), so the note names it;
+/// `None` when nothing binds one, and the note then names no key rather than a wrong one.
 pub(crate) fn choose_startup_layout(
     default: Option<&Node>,
     loaded: Option<Loaded>,
     lua: &[ModuleDecl],
+    show_editor: Option<&str>,
 ) -> Result<(Layout, Vec<String>), String> {
     let mut notes = Vec::new();
     let first_launch = |notes: &mut Vec<String>| -> Result<Layout, String> {
@@ -103,11 +106,11 @@ pub(crate) fn choose_startup_layout(
         Some(Loaded::Missing) | None => first_launch(&mut notes)?,
     };
     if !layout.is_shown(&ModuleId::editor()) {
-        notes.push(
+        let way_back = show_editor.map(|key| format!(" ({key})")).unwrap_or_default();
+        notes.push(format!(
             "the editor is hidden in this layout: nvim, and the window's colours that follow it, wait until it \
-             is shown (Ctrl+a e)"
-                .to_string(),
-        );
+             is shown{way_back}"
+        ));
     }
     Ok((layout, notes))
 }
@@ -329,7 +332,7 @@ mod tests {
             Node::Leaf(ModuleId::agent()),
             Node::Leaf(ModuleId::editor()),
         );
-        let (layout, notes) = choose_startup_layout(Some(&tree), Some(restored(left.clone())), &[]).unwrap();
+        let (layout, notes) = choose_startup_layout(Some(&tree), Some(restored(left.clone())), &[], None).unwrap();
         assert_eq!(layout, left);
         assert_eq!(
             notes,
@@ -353,7 +356,7 @@ mod tests {
         );
         for loaded in [None, Some(Loaded::Missing), Some(Loaded::Unusable("corrupt".into()))] {
             let unusable = matches!(loaded, Some(Loaded::Unusable(_)));
-            let (layout, notes) = choose_startup_layout(Some(&tree), loaded, &[]).unwrap();
+            let (layout, notes) = choose_startup_layout(Some(&tree), loaded, &[], None).unwrap();
             assert_eq!(layout.visible_leaves(), [ModuleId::agent(), ModuleId::editor()]);
             assert!(layout.contains(&ModuleId::terminal()) && !layout.is_shown(&ModuleId::terminal()));
             assert_eq!(notes.iter().any(|n| n.contains("corrupt")), unusable, "{notes:?}");
@@ -367,12 +370,12 @@ mod tests {
             id: ModuleId::lua("side"),
             placement: Placement::RightOfRoot,
         }];
-        let (layout, notes) = choose_startup_layout(None, Some(Loaded::Missing), &side).unwrap();
+        let (layout, notes) = choose_startup_layout(None, Some(Loaded::Missing), &side, None).unwrap();
         assert_eq!(layout, crate::terminal::initial_layout(&side).unwrap());
         assert!(notes.is_empty());
     }
 
-    /// A layout that reopens with the editor hidden -- `Ctrl+a x` in the editor, then a relaunch --
+    /// A layout that reopens with the editor hidden -- `prefix x` in the editor, then a relaunch --
     /// says what waits for it (the plan review's finding 5): nvim starts on the editor's first frame,
     /// and the window's colours follow nvim. A layout that shows the editor says nothing of the kind.
     #[test]
@@ -385,16 +388,25 @@ mod tests {
             &neovibe_core::layout::Frame::new(neovibe_core::layout::Size { w: 1280, h: 721 }, 1),
         )
         .unwrap();
-        let (layout, notes) = choose_startup_layout(None, Some(restored(left)), &[]).unwrap();
+        let (layout, notes) = choose_startup_layout(None, Some(restored(left.clone())), &[], Some("Ctrl+b e")).unwrap();
         assert!(!layout.is_shown(&ModuleId::editor()));
         assert_eq!(
             notes.last().map(String::as_str),
             Some(
                 "the editor is hidden in this layout: nvim, and the window's colours that follow it, wait until \
-                 it is shown (Ctrl+a e)"
+                 it is shown (Ctrl+b e)"
             )
         );
-        let (_, notes) = choose_startup_layout(None, Some(Loaded::Missing), &[]).unwrap();
+        // With nothing bound to show the editor, the note names no key rather than a wrong one.
+        let (_, notes) = choose_startup_layout(None, Some(restored(left)), &[], None).unwrap();
+        assert_eq!(
+            notes.last().map(String::as_str),
+            Some(
+                "the editor is hidden in this layout: nvim, and the window's colours that follow it, wait until \
+                 it is shown"
+            )
+        );
+        let (_, notes) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
         assert!(notes.iter().all(|n| !n.contains("editor is hidden")), "{notes:?}");
     }
 
@@ -615,7 +627,8 @@ mod tests {
     fn a_length_settled_on_screen_is_not_a_change_and_moving_it_is() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settle");
         let path = dir.join(persist::file_name(root()));
-        let (startup, _) = choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[]).unwrap();
+        let (startup, _) =
+            choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
         let layout = Rc::new(RefCell::new(startup));
         let saver = saver_for(&dir, &layout);
         assert!(neovibe_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()));
@@ -660,7 +673,8 @@ mod tests {
     #[test]
     fn a_length_settled_on_a_restored_file_is_not_a_change_either() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settled-file");
-        let (unsettled, _) = choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[]).unwrap();
+        let (unsettled, _) =
+            choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
         persist::save(&dir, root(), &unsettled).unwrap();
         let before = file_text(&dir);
         assert!(before.contains("\"px\": null"), "{before}");
@@ -1008,7 +1022,7 @@ mod tests {
                 Node::Leaf(ModuleId::lua("gone")),
             ),
         );
-        let (layout, notes) = choose_startup_layout(Some(&tree), None, &[]).unwrap();
+        let (layout, notes) = choose_startup_layout(Some(&tree), None, &[], None).unwrap();
         assert!(!layout.contains(&ModuleId::lua("gone")));
         assert_eq!(
             notes,
