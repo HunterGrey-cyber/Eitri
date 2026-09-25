@@ -139,10 +139,12 @@ export type HintTarget =
  *  reach it. `Composer` sets it only while INPUT can be entered. */
 export const HINT_COMPOSER_ATTR = "data-hint-composer";
 
-/** The elements known to scroll their own content (index.css): the conversation's list, and the
- *  start screen's list of remembered sessions, capped at 40vh. Named here as well as read off the
- *  computed style below, because jsdom loads no stylesheet and the tests must see these two. */
-const SCROLL_CONTAINERS = ".message-list, .session-choice";
+/** The elements known to scroll their own content (index.css): the conversation's list, the tab
+ *  bar, and the launch chooser's list. Named here as
+ *  well as read off the computed style below, because jsdom loads no stylesheet and the tests must
+ *  see these three. `.session-choice` is gone -- the old resumable-session picker it named was
+ *  replaced by `EmptyTab` (F3) and the launch chooser (`.chooser-list`). */
+const SCROLL_CONTAINERS = ".message-list, .tab-bar, .chooser-list";
 
 function clips(el: HTMLElement): boolean {
   if (el.matches(SCROLL_CONTAINERS)) return true;

@@ -19,7 +19,10 @@ pub fn tray(layout: &Layout) -> Vec<ModuleId> {
 /// wait (decision b), `agent •` once a turn finished while it was away.
 pub fn chip_label(title: &str, attention: Option<Attention>) -> String {
     match attention {
-        Some(Attention { pending, .. }) if pending > 0 => format!("{title} \u{2691}{pending}"),
+        Some(Attention { pending, unread, .. }) if pending > 0 => {
+            let dot = if unread { " \u{2022}" } else { "" };
+            format!("{title} \u{2691}{pending}{dot}")
+        }
         Some(Attention { unread: true, .. }) => format!("{title} \u{2022}"),
         _ => title.to_string(),
     }
@@ -80,7 +83,7 @@ mod tests {
                     ..Default::default()
                 })
             ),
-            "agent \u{2691}2"
+            "agent \u{2691}2 \u{2022}"
         );
         assert_eq!(
             chip_label(
@@ -92,6 +95,17 @@ mod tests {
                 })
             ),
             "agent \u{2022}"
+        );
+        assert_eq!(
+            chip_label(
+                "agent",
+                Some(Attention {
+                    pending: 1,
+                    unread: false,
+                    ..Default::default()
+                })
+            ),
+            "agent \u{2691}1"
         );
     }
 

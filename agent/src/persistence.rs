@@ -91,6 +91,11 @@ pub struct ConversationRecord {
     /// when `None`, so a record without one reads exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The session tab's rename: what the chooser shows ahead
+    /// of the title. The last rename wins and an empty one clears it (`set_name`), unlike `title`,
+    /// which is first-one-wins. Absent from the JSON when `None`, so an older record reads as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// The longest title stored, in characters (not bytes: prompts may contain Chinese). A
@@ -144,6 +149,8 @@ pub struct ResumableSession {
     pub updated_at: String,
     /// `ConversationRecord::title`. `None` for a session recorded before titles were kept.
     pub title: Option<String>,
+    /// `ConversationRecord::name`.
+    pub name: Option<String>,
 }
 
 /// Returns resumable sessions in this workspace, newest first, without a live provider.
@@ -174,6 +181,7 @@ pub fn resumable_sessions(conversation_id: &str) -> Vec<ResumableSession> {
             created_at: record.created_at,
             updated_at: record.updated_at,
             title: record.title,
+            name: record.name,
         })
         .collect()
 }
@@ -364,16 +372,18 @@ pub(crate) fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Keeps one conversation's directory bounded: at most `MAX_RECORDS_PER_CONVERSATION` records, plus
-/// a sweep of temp files orphaned by a process that died mid-write.
-///
-/// `keep` is the record just written, which is never a prune candidate however its stamp ranks --
-/// deleting the record a caller just asked to save would be the one genuinely surprising outcome.
-/// Everything here is best-effort and silent on failure: this is housekeeping, and a save that
-/// succeeded must not be reported as failed because a stale file could not be unlinked.
+/// Prunes one conversation's directory toward `MAX_RECORDS_PER_CONVERSATION` records
+/// and removes orphaned temp files. The just-written `keep` record is never a candidate,
+/// regardless of its timestamp. Cleanup is best-effort and silent so an unlink failure
+/// does not turn a successful save into an error.
+/// Records with a held session lease are also protected, including leases in other
+/// windows. They still count toward the cap, so pruning removes the oldest unheld
+/// records instead. This calls `SessionLease::is_held` for each candidate.
+/// A lease probe can briefly make a competing `try_acquire` return `AlreadyHeld`.
 fn prune(dir: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut records: Vec<(Option<u128>, String, PathBuf)> = Vec::new();
+    let mut held_count = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         match path.extension().and_then(|e| e.to_str()) {
@@ -402,18 +412,30 @@ fn prune(dir: &Path, keep: &Path) {
                     continue;
                 };
                 let (stamp, _) = updated_at_rank(&record);
-                records.push((stamp, record.provider_session_id, path));
+                // A session with a held lease, in this window or another, is never a prune candidate.
+                // Its record still counts toward the cap, so prune the oldest unheld record instead.
+                let held = crate::lease::SessionLease::is_held(
+                    &record.provider,
+                    &record.canonical_cwd,
+                    &record.provider_session_id,
+                )
+                .unwrap_or(false);
+                held_count += usize::from(held);
+                if !held {
+                    records.push((stamp, record.provider_session_id, path));
+                }
             }
             _ => {}
         }
     }
-    if records.len() < MAX_RECORDS_PER_CONVERSATION {
+    let total = records.len() + held_count;
+    if total < MAX_RECORDS_PER_CONVERSATION {
         return;
     }
     // Same order `resumable_sessions` ranks by, so what is dropped is exactly what that would have
     // listed last. `keep` is excluded above and occupies one of the cap's slots.
     records.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
-    let over = records.len() + 1 - MAX_RECORDS_PER_CONVERSATION;
+    let over = total + 1 - MAX_RECORDS_PER_CONVERSATION;
     for (_, _, path) in records.into_iter().take(over) {
         let _ = std::fs::remove_file(path);
     }
@@ -475,6 +497,28 @@ pub(crate) fn set_title_if_missing(
     Ok(true)
 }
 
+/// What a record write does with the session's rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameUpdate {
+    /// Keep whatever the record on disk already says (a resume, an adoption with no rename yet).
+    Keep,
+    /// The tab was renamed before the record existed: write this (`None` clears it).
+    Set(Option<String>),
+}
+
+/// Gives this session's directory record `name` (`None` clears it). The last one wins.
+/// `Ok(false)` when there is no directory record. `updated_at` is left alone. Called only from the
+/// ingestion thread, once the record is on disk (`ingestion::flush_name`), for the reason
+/// `set_title_if_missing` gives.
+pub(crate) fn set_name(conversation_id: &str, provider_session_id: &str, name: Option<&str>) -> std::io::Result<bool> {
+    let Ok(mut record) = load_conversation_record(conversation_id, provider_session_id) else {
+        return Ok(false);
+    };
+    record.name = name.map(str::to_string);
+    save_conversation_record(&record)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +574,7 @@ mod tests {
             updated_at: "2026-09-10T00:00:00Z".into(),
             provider_advertised_resume: true,
             title: None,
+            name: None,
         };
         assert!(save_conversation_record(&record).is_err());
         assert!(load_conversation_record("../../../../tmp/pwned", "prov-1").is_err());
@@ -549,6 +594,7 @@ mod tests {
             updated_at: "2".into(),
             provider_advertised_resume: true,
             title: None,
+            name: None,
         };
         let error = save_conversation_record(&record).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -585,6 +631,7 @@ mod tests {
             updated_at: updated_at.into(),
             provider_advertised_resume: true,
             title: None,
+            name: None,
         }
     }
 
@@ -780,6 +827,86 @@ mod tests {
         );
         // And the offer is still the newest of what is left.
         assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, "prov-020");
+    }
+
+    fn named(conversation_id: &str, cwd: &str, id: &str, stamp: u128) -> ConversationRecord {
+        ConversationRecord {
+            conversation_id: conversation_id.to_string(),
+            provider: "claude".to_string(),
+            provider_session_id: id.to_string(),
+            canonical_cwd: cwd.to_string(),
+            created_at: stamp.to_string(),
+            updated_at: stamp.to_string(),
+            provider_advertised_resume: true,
+            title: None,
+            name: None,
+        }
+    }
+
+    /// A long-lived tab can rank oldest while newer tabs write records.
+    /// Pruning must preserve its record while its session lease is held.
+    #[test]
+    fn prune_spares_a_record_whose_lease_is_held() {
+        let conversation_id = unique_conversation_id("prune-lease");
+        let cwd = "/tmp/prune-lease-project";
+        save_conversation_record(&named(&conversation_id, cwd, "held-oldest", 1)).unwrap();
+        let lease = crate::lease::SessionLease::try_acquire("claude", cwd, "held-oldest").unwrap();
+        for n in 0..MAX_RECORDS_PER_CONVERSATION {
+            save_conversation_record(&named(&conversation_id, cwd, &format!("s-{n:02}"), 100 + n as u128)).unwrap();
+        }
+        assert!(
+            load_conversation_record(&conversation_id, "held-oldest").is_ok(),
+            "an open tab's record was pruned"
+        );
+        assert!(
+            load_conversation_record(&conversation_id, "s-00").is_err(),
+            "the oldest record nobody holds goes instead, so the cap still binds"
+        );
+        drop(lease);
+        save_conversation_record(&named(&conversation_id, cwd, "s-last", 1000)).unwrap();
+        assert!(
+            load_conversation_record(&conversation_id, "held-oldest").is_err(),
+            "released, it ages out as before"
+        );
+    }
+
+    #[test]
+    fn a_name_round_trips_and_an_old_record_without_one_still_loads() {
+        let json = r#"{
+            "conversation_id": "old", "provider": "claude", "provider_session_id": "prov-old",
+            "canonical_cwd": "/tmp/project", "created_at": "1", "updated_at": "2"
+        }"#;
+        let old: ConversationRecord = serde_json::from_str(json).expect("an older record must still load");
+        assert_eq!(old.name, None);
+        assert!(
+            !serde_json::to_string(&old).unwrap().contains("\"name\""),
+            "absent, not null"
+        );
+
+        let conversation_id = unique_conversation_id("name");
+        save_conversation_record(&named(&conversation_id, "/tmp/name-project", "prov-n", 5)).unwrap();
+        assert!(set_name(&conversation_id, "prov-n", Some("docs")).unwrap());
+        let record = load_conversation_record(&conversation_id, "prov-n").unwrap();
+        assert_eq!(record.name.as_deref(), Some("docs"));
+        assert_eq!(record.updated_at, "5", "naming is not starting or resuming");
+        assert_eq!(
+            resumable_sessions(&conversation_id)[0].name.as_deref(),
+            Some("docs"),
+            "the chooser shows it"
+        );
+        assert!(
+            set_name(&conversation_id, "prov-n", Some("later")).unwrap(),
+            "the last rename wins"
+        );
+        assert!(
+            set_name(&conversation_id, "prov-n", None).unwrap(),
+            "an empty rename clears it"
+        );
+        assert_eq!(load_conversation_record(&conversation_id, "prov-n").unwrap().name, None);
+        assert!(
+            !set_name(&conversation_id, "prov-missing", Some("x")).unwrap(),
+            "no record, nothing written"
+        );
     }
 
     /// A temp file orphaned by a process killed mid-write is swept; one a concurrent writer may

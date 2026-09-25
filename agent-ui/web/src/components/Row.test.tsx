@@ -4,18 +4,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 import { Row } from "./Row";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
 describe("Row", () => {
-  /* THE PROPERTY THIS COMPONENT EXISTS FOR. The two-cell shape was written six times -- once here
-     and five times by hand (`App.tsx`'s two session-ended rows, `TerminalHandoff`'s command card,
-     `ModeSelector`'s two choice rows) -- and each hand-written copy spelled its glyph out TWICE,
-     once in `data-sign` and once in the visible `.row-sign` span. Tests read `data-sign`; users
-     read the span; nothing compared them, so editing one and not the other drifted straight past a
-     green suite. With one `sign` argument feeding both, that is not a thing a test has to catch --
-     it is unrepresentable. This asserts it anyway for the shape, because the derivation is what a
-     future edit could undo. */
+  /* Derive `data-sign` and the visible `.row-sign` from one `sign` argument.
+     Tests read the data attribute while users read the span, so separate values could drift
+     without failing tests. Check both the div and button shapes to preserve the shared source. */
   it("derives data-sign and the visible glyph from the same argument, on both shapes", () => {
     const { container } = render(
       <>
@@ -81,7 +76,7 @@ describe("Row", () => {
     const product = Object.entries(sources).filter(([path]) => !path.includes(".test."));
     // A glob that silently matched nothing would make the assertion below vacuous. Every component
     // that renders a row must be in here: App and the four that used to write one by hand.
-    for (const name of ["App.tsx", "MessageList.tsx", "ModeSelector.tsx", "TerminalHandoff.tsx", "Row.tsx"]) {
+    for (const name of ["App.tsx", "MessageList.tsx", "EmptyTab.tsx", "TerminalHandoff.tsx", "Row.tsx"]) {
       expect(product.some(([path]) => path.endsWith(`/${name}`)), `${name} not covered`).toBe(true);
     }
     const writers = product.filter(([, source]) => /data-sign=|"row-sign"/.test(source)).map(([path]) => path);

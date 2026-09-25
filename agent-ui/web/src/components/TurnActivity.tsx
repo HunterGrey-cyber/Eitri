@@ -9,13 +9,10 @@ type Props = {
   clock: TurnClock | null;
 };
 
-/**
- * The motion indicator for a running turn. The caller mounts it only while `StatusLine`'s
- * `working` predicate is true; this component does not derive that condition itself.
- *
- * Withhold `.meter` and `.meter-fill` while `phase.kind === "blocked"` because the agent is
- * waiting for permission. The phase word and elapsed clock still render; only the motion stops.
- */
+/** Show activity for a turn while the caller's `ActivityLine.working` predicate is true.
+ * This component relies on the caller to determine whether a turn is in flight.
+ * Withhold `.meter` and `.meter-fill` while `phase.kind === "blocked"` because permission is pending
+ * and the agent is not working. The phase word and elapsed clock still render. */
 export function TurnActivity({ phase, clock }: Props) {
   // Tick once a second in this component so the elapsed clock does not re-render the whole panel
   // on top of streaming updates. The state value is unused; it only forces `elapsed` to be

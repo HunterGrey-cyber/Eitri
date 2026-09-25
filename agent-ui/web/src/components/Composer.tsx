@@ -47,6 +47,10 @@ type Props = {
    *  panel in an INPUT with nothing to type into. */
   hintTarget?: boolean;
   onSend: (text: string) => void;
+  /** Reports every text change and `""` right after sending. The containing component mirrors
+   *  the text into a ref so a tab switch can save the unsent draft.
+   *  Optional so callers and tests that do not save drafts need no callback. */
+  onDraftChange?: (text: string) => void;
 };
 
 export function Composer({
@@ -59,6 +63,7 @@ export function Composer({
   focusRequest = 0,
   hintTarget = false,
   onSend,
+  onDraftChange,
 }: Props) {
   const [text, setText] = useState("");
 
@@ -84,6 +89,7 @@ export function Composer({
     if (!text.trim()) return;
     onSend(text);
     setText("");
+    onDraftChange?.("");
   }
 
   return (
@@ -100,7 +106,10 @@ export function Composer({
           value={text}
           disabled={disabled}
           autoFocus
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            onDraftChange?.(e.target.value);
+          }}
           onFocus={() => onModeChange("input")}
           // Mouse-driven "click away": a keyboard-driven Esc already sets BROWSE at the panel level
           // (`keymap.ts`'s `resolveKey`), and this is what keeps a click OUT of the box agreeing
@@ -131,7 +140,7 @@ export function Composer({
            active. The text names only `r`, the key that actually resolves in the mode the user is
            in. */
         <div className="composer-browse-hint">
-          This session has ended. Press r to return to the start screen.
+          This session has ended. Press r to start a new session here.
         </div>
       ) : (
         // BROWSE's rendering of the same control: not a textarea at all, so there is nothing here
@@ -146,10 +155,9 @@ export function Composer({
           Ask the agent...
         </div>
       )}
-      {/* No Send/Stop buttons here:
-          Enter still sends and Shift+Enter still inserts a newline (both handled above), and Stop
-          survives for mouse users in `StatusLine` instead -- gated the same way this one was, on
-          the provider's advertised `interrupt` capability, never on the backend's name. */}
+      {/* No Send or Stop buttons here: Enter sends and Shift+Enter inserts a newline (both handled
+          above), and the mouse Stop button lives in `ActivityLine`, gated on the provider's advertised
+          `interrupt` capability, never on the backend's name. */}
     </div>
   );
 }

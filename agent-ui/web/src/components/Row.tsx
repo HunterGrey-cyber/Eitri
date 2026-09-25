@@ -1,16 +1,13 @@
 import { createElement } from "react";
 import type { ReactNode } from "react";
 
-/** A shared row on the sign-column grid.
- *
- * The `sign` argument supplies both `data-sign` and the visible `.row-sign` text, so tests and
- * the displayed glyph cannot disagree. The visible copy is `aria-hidden` because the row's
- * text and role already convey its meaning.
- *
- * `current` shows which row `Enter` expands and `y` copies. `--nv-cursorline` is a background
- * highlight, so the guard against signal colours as text does not apply. `App.tsx` clamps the
- * cursor when the timeline shrinks so these keys cannot act on a stale index.
- */
+/** A row on the shared sign-column grid.
+ * Derive both `data-sign` and the visible `.row-sign` from one `sign` argument so they cannot drift.
+ * Tests can inspect the data attribute without reading rendered text. The visible glyph is
+ * `aria-hidden` because the row's text and role already convey its meaning.
+ * `current` marks the conversation cursor so users can see which row `Enter` expands or `y` copies.
+ * `--nv-cursorline` supplies a background highlight, as it does for choice-row hover.
+ * `App.tsx` clamps the cursor when the timeline shrinks so those actions do not use a stale index. */
 type RowProps = {
   /** The row's kind, as the `row-<kind>` class the stylesheet keys on. */
   kind: string;
@@ -28,8 +25,8 @@ type RowProps = {
    *  which has nothing to do with the sign column and must stay on the body rather than replace
    *  the row, so every `.handoff-card p`/`.warning`/`.detail` child selector still matches. */
   bodyClassName?: string;
-  /** `div` (the default) or `button`. The button shape exists for `ModeSelector`'s choice rows,
-   *  which are real controls, and it switches the two cells from `<div>` to `<span>` as well: a
+  /** `div` (the default) or `button`. The button shape exists for `EmptyTab`'s (and formerly
+   *  `ModeSelector`'s) choice rows, which are real controls, and it switches the two cells from `<div>` to `<span>` as well: a
    *  `<button>`'s content model is phrasing content, so block-level children in one are invalid
    *  HTML. That is the whole reason this is an element prop rather than two components. */
   as?: "div" | "button";

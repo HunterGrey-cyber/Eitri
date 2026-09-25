@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Lets `shell`'s tests use `test_providers`' doubles.
+test-support = []
+
 [dependencies]
 agent = { path = "../agent" }
 mlua = { version = "0.12", features = ["lua54", "vendored"] }

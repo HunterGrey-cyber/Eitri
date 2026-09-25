@@ -4,7 +4,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { countCodePoints, formatResultContent, lookupTool, renderToolCall, RESULT_HEAD_CHARS, RESULT_TAIL_CHARS, truncateResult } from "./toolRegistry";
 import type { ToolCallRecord } from "./types";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered. Without
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered. Without
 // this, the second render in a file leaves the first one's DOM in place and `getByText` throws on
 // finding two matches.
 afterEach(cleanup);

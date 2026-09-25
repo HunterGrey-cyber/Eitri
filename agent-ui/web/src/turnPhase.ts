@@ -1,8 +1,11 @@
 import type { AgentUiState } from "./types";
 
-/** What the agent is doing for the in-flight indicator, derived only from `AgentUiState`.
- * The caller evaluates this while `status.kind === "running" && activeTurnId !== null`.
- * While a permission card is waiting, `blocked` means the user must act; the caller must hide the meter. */
+/**
+ * The agent's current phase for the motion indicator, derived only from `AgentUiState`.
+ * The caller uses it while `status.kind === "running" && activeTurnId !== null`.
+ * A pending permission produces `blocked`: the agent is waiting for the user,
+ * so the caller must hide the motion indicator.
+ */
 export type TurnPhase =
   | { kind: "sent" }
   | { kind: "thinking" }

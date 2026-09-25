@@ -399,6 +399,7 @@ mod tests {
             updated_at: "1".into(),
             provider_advertised_resume: true,
             title: None,
+            name: None,
         })
         .unwrap();
     }

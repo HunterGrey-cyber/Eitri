@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { Composer } from "./Composer";
 
-// See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
+// See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
 
 type Overrides = Partial<Parameters<typeof Composer>[0]>;
@@ -91,8 +91,8 @@ describe("Composer sending", () => {
 });
 
 // The composer sends on Enter and inserts a newline on Shift+Enter. The mouse Stop button lives
-// in `StatusLine`, gated by the provider's `interrupt` capability. Its behavior is tested in
-// `StatusLine.test.tsx`.
+// in `ActivityLine`, gated by the provider's `interrupt` capability. Its behavior is tested in
+// `ActivityLine.test.tsx`.
 
 describe("Composer on a session that has ended", () => {
   it("says the session ended rather than inviting a turn that cannot be taken", () => {

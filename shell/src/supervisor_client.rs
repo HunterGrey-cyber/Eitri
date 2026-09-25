@@ -11,9 +11,26 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use supervisor::{AgentStatus, ShellMessage, SupervisorMessage};
 
-/// Maps an optional session projection to dashboard status. `AgentPanelState.session` is absent
-/// before the user leaves the mode selector, so this takes `Option<&AgentSessionProjection>`.
-/// `None` maps to `NoSession`.
+/// One status per window: the most urgent tab's status. The dashboard does not show per-tab rows.
+pub(crate) fn aggregate_status(statuses: impl IntoIterator<Item = AgentStatus>) -> AgentStatus {
+    fn rank(status: AgentStatus) -> u8 {
+        match status {
+            AgentStatus::Blocked => 4,
+            AgentStatus::Working => 3,
+            AgentStatus::Idle => 2,
+            AgentStatus::Done => 1,
+            AgentStatus::NoSession => 0,
+        }
+    }
+    statuses
+        .into_iter()
+        .max_by_key(|s| rank(*s))
+        .unwrap_or(AgentStatus::NoSession)
+}
+
+/// Maps an optional session projection to dashboard status. A tab has no backend until its first
+/// send or resume, or after backend failure; `None` maps to `NoSession`.
+/// Called once per tab; `aggregate_status` picks the window's status.
 pub(crate) fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus {
     let Some(projection) = projection else {
         return AgentStatus::NoSession;
@@ -322,6 +339,17 @@ mod tests {
             status: ProjectionStatus::Running,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_windows_status_is_its_most_urgent_tabs() {
+        use AgentStatus::*;
+        assert_eq!(aggregate_status([Idle, Blocked, Working]), Blocked, "needs input first");
+        assert_eq!(aggregate_status([Idle, Working, Done]), Working);
+        assert_eq!(aggregate_status([Done, Idle]), Idle);
+        assert_eq!(aggregate_status([NoSession, Done]), Done);
+        assert_eq!(aggregate_status([NoSession]), NoSession);
+        assert_eq!(aggregate_status([]), NoSession);
     }
 
     #[test]
