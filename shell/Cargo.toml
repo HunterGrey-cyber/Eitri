@@ -36,6 +36,15 @@ futures-channel = "0.3.32"
 # terminal crates already resolve, so it adds no crate to the graph and ships in no binary.
 alacritty_terminal = "0.26.0"
 
+# The panel keeps a streaming reply where the reader put it, in the real WebKitGTK (2026-09-24).
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs a display
+# of its own, big enough for its windows (`xvfb-run -a -s "-screen 0 1920x1200x24" env GDK_BACKEND=x11
+# ...`; the default 640x480 screen fails every run as "did not exercise the trigger"). See the file's
+# own header.
+[[test]]
+name = "panel_stream_scroll"
+harness = false
+
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
 # server of its own (`xvfb-run -a ... env GDK_BACKEND=x11 ...`, see the file's header). Holds the GUI
 # pass's D1 (2026-09-24): a colorscheme change reaching a widget that first shows after it.

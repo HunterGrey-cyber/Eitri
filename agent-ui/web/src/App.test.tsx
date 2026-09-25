@@ -3,6 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App, { HINT_PENDING_TIMEOUT_MS, WHICH_KEY_G_PREFIX_DELAY_MS } from "./App";
 import { initialState } from "./reducer";
+import { USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
 // See ModeSelector.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
@@ -194,6 +195,19 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     dispatch({ kind: "pane_focus", focused: true });
     dispatch({ kind: "focus_permission" });
     expect(modeBlock(container).textContent).toBe("INPUT");
+  });
+
+  /* The merge of modules P2 with the streaming-scroll fix (2026-09-24): landing on the card moves the
+     cursor, and the `[cursor]` effect reveals its row -- a scroll the user asked for, like a HINT
+     landing's. Unannounced, `MessageList` takes it for nobody's and keeps following, and the next
+     delta or resize snaps an older card straight back out of view. */
+  it("announces the landing to the message list, so revealing an older card is the user's scroll", () => {
+    const { container } = withTwoCards();
+    const list = container.querySelector(".message-list")!;
+    const seen: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+    dispatch({ kind: "focus_permission" });
+    expect(seen).toEqual(["unknown"]);
   });
 });
 
@@ -2220,5 +2234,60 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     expect(overlay(container)).not.toBeNull();
     dispatch({ kind: "hint_collect", sessionId: 1 });
     expect(overlay(container)).toBeNull();
+  });
+});
+
+/* Change B of the 2026-09-24 fix: `MessageList` ends following on what the user did, and for the
+   panel's own scroll keys that is this announcement, made on the list before the key scrolls it.
+   Without it, `k` would still end following only through the direction of its scroll -- the very
+   signal an engine-originated drop once faked (see `./follow.ts`). */
+describe("the panel's own scroll keys announce themselves to the message list", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({
+      kind: "snapshot",
+      throughRevision: 3,
+      state: snapshotState({
+        transcript: [
+          { seq: 0, text: "one" },
+          { seq: 1, text: "two" },
+          { seq: 2, text: "three" },
+        ],
+      }),
+    });
+    return rendered;
+  }
+
+  it("says up for k, Ctrl+u and gg, and down for j, Ctrl+d and G", () => {
+    const { container } = startedApp();
+    const list = container.querySelector(".message-list")!;
+    const seen: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+    const root = container.querySelector(".agent-ui-conversation")!;
+    for (const key of [
+      { key: "j" },
+      { key: "k" },
+      { key: "d", ctrlKey: true },
+      { key: "u", ctrlKey: true },
+      { key: "G", shiftKey: true },
+      { key: "g" }, // the first half of `gg` moves nothing, and says nothing
+      { key: "g" },
+    ]) {
+      fireEvent.keyDown(root, key);
+    }
+    expect(seen).toEqual(["down", "up", "down", "up", "down", "up"]);
+  });
+
+  it("says nothing for a key that cannot move the conversation", () => {
+    const { container } = startedApp();
+    const list = container.querySelector(".message-list")!;
+    const seen: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "?" }); // opens the keymap overlay
+    fireEvent.keyDown(root, { key: "j" }); // ...which scrolls the overlay, not the list
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(seen).toEqual([]);
   });
 });

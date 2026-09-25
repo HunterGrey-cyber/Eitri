@@ -121,6 +121,20 @@ body,
 .message-list {
   overflow-y: auto;
   padding: 12px;
+  /* Nothing in the conversation may scroll it sideways (the sandbox GUI pass, 2026-09-24, its
+     finding F-b). `overflow-y: auto` makes this box scroll on BOTH axes, so any line that cannot
+     wrap -- a path, a URL, a long argument with no space in it -- used to push the whole document,
+     sign column and all, sideways: 517px at a 420px panel for a 116-character `Bash` command, and a
+     WebKitGTK probe found the same for every tool card (a `Read` path, a `WebFetch` URL, a `Grep`
+     pattern, a skill, an unrecognized MCP tool's name), a URL in a reply's prose, and a markdown
+     table. The prompt had fixed this for itself alone (`.row-prompt .row-body`); inheriting it from
+     here covers every text in the list, present and future. `anywhere` rather than `break-word`
+     because it also lets a line break for min-content sizing, which is what lets a table give up
+     width instead of overflowing. It changes only lines that would otherwise have overflowed, and a
+     `<pre>` left at `white-space: pre` -- a code block, a diff, a JSON dump, each with its own
+     `overflow-x: auto` -- is untouched by it: those scroll inside their own box. `indexCss.test.ts`
+     holds every `<pre>` the panel renders to one of those two. */
+  overflow-wrap: anywhere;
 }
 /* `.row-assistant pre` used to style every fenced code block here, back when `renderMarkdown` (then
    inlined in `MessageList.tsx`) used marked's plain default renderer and emitted a bare `<pre>`.
@@ -152,6 +166,16 @@ body,
    everywhere for twenty years. The magic-number problem is solved either way; this way costs one
    `var()` per rule and depends on nothing clever.
 
+   **Correction (2026-09-24): there is no container-query unit anywhere in this file any more.**
+   The WebKitGTK caution above was right about the engine and wrong about the corner: the query
+   container itself, on `.row`, is what broke -- it made WebKitGTK 2.52.6 reset the message list's
+   `scrollTop` on every tick of the status line's elapsed counter while a reply streamed (see the
+   `.row` rule). The row's width is now `--row-inline-size`, derived on `.row` from a px value
+   `MessageList.tsx` measures, so each escape spends `var(--row-inline-size)` where it spent
+   `100cqw` and `var(--row-gutter)` exactly as before. `--row-inline-size` is a custom property
+   carrying a plain px `calc()`, not a container unit, and is declared on `.row` rather than here
+   because it has to resolve against the list's measured width, which lives on the list.
+
    `--prose-measure` is the knob the owner asked for. `1fr` is "use the panel you have": prose fills
    the row the way code and tool output already do. Setting it to `62ch` restores, exactly, the
    readable measure this panel shipped with until today -- one declaration, nothing else to change.
@@ -172,7 +196,8 @@ body,
   --row-sign-w: 22px;
   --row-gap: 8px;
   /* The left gutter every row reserves: the sign column plus the gap beside it. Subtract it from
-     `100cqw` and you are on the row's own right edge -- which is what every escape below does. */
+     the row's own width (`--row-inline-size`, declared on `.row`; it was `100cqw` until 2026-09-24)
+     and you are on the row's own right edge -- which is what every escape below does. */
   --row-gutter: calc(var(--row-sign-w) + var(--row-gap));
   --prose-measure: 1fr;
   /* Your own message's displacement, as a ramp rather than a step: nothing at all until the ROW is
@@ -183,7 +208,8 @@ body,
 
      Each is a plain length, a unitless number and a plain number, so that no custom property here
      carries a container-query unit (see the block above for why). The `cqw` is written once, at the
-     one rule that uses these.
+     one rule that uses these. (2026-09-24: that rule now reads `--row-inline-size` instead of
+     `100cqw`, for the reason the correction above gives; the ramp and its basis are unchanged.)
 
      **The basis is the ROW, not the body's grid area, and that is a correction.** A first revision
      wrote the whole ramp in percentages, which on a grid item resolve against the grid AREA -- so
@@ -247,13 +273,29 @@ body,
      column (this rule's whole reason to exist) was on two different x positions down the page.
      Only the colour differs below; the width must not, or this same misalignment comes back. */
   border-left: 2px solid transparent;
-  /* A size query container for the "escape the 62ch measure" rules far below (fenced code, the
-     permission-card diff, tool output). Purely additive: it does not change how the two tracks
-     above are sized, so the sign column's x position is exactly as unaffected by it as by
-     everything else in this rule -- see the comment on those rules for why a query container,
-     rather than a third grid track or subgrid, is what lets a `cqw` length reach a `<pre>` sitting
-     several plain (non-grid) wrapper elements below `.row-body`. */
-  container-type: inline-size;
+  /* The row's own content-box width, for the "escape the prose measure" rules far below (fenced
+     code, the permission-card diff and input, tool output) and the prompt's inset. A custom
+     property inherits through any number of plain wrapper elements, which is what lets it reach a
+     `<pre>` sitting several of them below `.row-body` -- the job a size query container
+     (`container-type: inline-size`, and `100cqw`) did here from 2026-09-20 to 2026-09-24.
+
+     **That container is gone, and it must not come back** (2026-09-24). In WebKitGTK 2.52.6 it made
+     the engine reset `.message-list`'s `scrollTop` to a stale value every time the status line's
+     elapsed counter ticked while a reply streamed, so the panel stopped following a reply about a
+     second in and "看不到最下面输出" -- measured, root-caused in
+     `.superpowers/panel-scroll/root-cause.md` (not in git; the dated record's 2026-09-24 (later)
+     entry summarises it), and pinned by `shell/tests/panel_stream_scroll.rs` against the real
+     engine plus a display-free tripwire in `indexCss.test.ts`. A container on
+     `.row-body`, on `.message-list`, or on the assistant rows only was each measured to break the
+     same way.
+
+     `--list-inline-size` is the list's content-box width in px, written by `MessageList.tsx` before
+     the first paint and again only when the list is resized (never per streamed delta). The `2px`
+     is this rule's own `border-left`, which the global `box-sizing: border-box` takes out of the
+     content box -- exactly what `100cqw` measured. Before the first write (and in jsdom) the
+     fallback makes every escape degrade to "no escape" (`max(100%, ...)` below) and the prompt's
+     inset to 0, never to an overflow. */
+  --row-inline-size: calc(var(--list-inline-size, 0px) - 2px);
 }
 /* The cursor `j`/`k` move and `Enter`/`y` act on (panel-as-document task 5, review round 1):
    `--nv-cursorline` is a BACKGROUND (nvim's own `Visual` highlight token, the same one
@@ -332,8 +374,8 @@ body,
   white-space: pre-wrap;
   margin-left: clamp(
     0px,
-    (100cqw - var(--prompt-inset-knee)) * var(--prompt-inset-slope),
-    min(var(--prompt-inset-cap) * 1cqw, var(--prompt-inset-cap-max))
+    (var(--row-inline-size) - var(--prompt-inset-knee)) * var(--prompt-inset-slope),
+    min(var(--prompt-inset-cap) * (var(--row-inline-size) / 100), var(--prompt-inset-cap-max))
   );
   border-left: 2px solid var(--nv-muted);
   padding-left: 10px;
@@ -423,6 +465,16 @@ body,
    `minmax(0, ...)` has already given it all of `100cqw - 30px` at that point), so nothing here
    overflows a narrow panel -- see indexCss.test.ts's cascade test for both directions.
 
+   **Correction (2026-09-24): the mechanism changed, the geometry did not.** The query container
+   is gone (see the `.row` rule for why: in WebKitGTK it made the list lose its reader while a
+   reply streamed). The row's content-box width now reaches these rules as `--row-inline-size`, a
+   custom property `.row` derives from the list's measured width, and custom properties inherit
+   through plain elements just as a container query reached through them. So every `100cqw` below
+   is `var(--row-inline-size)`, and the right edge each rule lands on is the same one. Each is also
+   wrapped in `max(100%, ...)`: until `MessageList.tsx` has measured the list, `--row-inline-size`
+   is `-2px`, and the escape degrades to its containing block's own width -- "no escape" -- rather
+   than to a negative or tiny width.
+
    `.tool-card-generic` joined this list in review, alongside `.code-block`/`.tool-result-body`
    rather than the way `.permission-card-edit` does further down: its own left edge already sits
    flush with `.row-body`'s (it is a direct-enough descendant, through `.tool-call` and
@@ -432,7 +484,7 @@ body,
 .code-block,
 .tool-result-body,
 .tool-card-generic {
-  width: calc(100cqw - var(--row-gutter));
+  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
 }
 /* The one state where the `- 30px` above is wrong, found in the whole-branch review (2026-09-20).
    `.tool-result-error` below adds `border-left: 2px` + `padding-left: 6px` to `.tool-result`, the
@@ -446,7 +498,7 @@ body,
 .tool-result-error .tool-result-body {
   /* The 8px is `.tool-result-error`'s own gutter -- its `border-left: 2px` plus `padding-left: 6px`
      -- taken off the escape rather than written as a second magic number. */
-  width: calc(100cqw - var(--row-gutter) - 8px);
+  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter) - 8px));
 }
 /* The JSON dump itself: an ordinary block `<pre>` with no width of its own, so it already fills
    whatever width `.tool-card-generic` above gives its box. `overflow-x: auto` is what keeps ONE
@@ -472,6 +524,13 @@ body,
 .tool-card-skill {
   border-left-color: var(--nv-ok);
   font-style: italic;
+}
+/* A `Bash` call's command is a `<pre>` (`toolRegistry.tsx`), and a `<pre>` keeps the UA's
+   `white-space: pre` -- no wrapping at all, not even at its spaces -- so a long command was the
+   GUI pass's case of the whole conversation scrolling sideways (see `.message-list`). It wraps like
+   the tool's own output below it (`.tool-result-body`); newlines in a multi-line command still show. */
+.tool-card-bash {
+  white-space: pre-wrap;
 }
 /* A tool call's outcome, drawn for every tool. The three states have to be distinguishable at a
    glance and not by colour alone -- "has this already run?" was unanswerable from the panel while
@@ -554,7 +613,7 @@ body,
   padding: 6px;
   border-radius: 4px;
   overflow-x: auto;
-  width: calc(100cqw - var(--row-gutter));
+  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
   margin-left: -11px;
 }
 .permission-card-buttons button {
@@ -1268,7 +1327,9 @@ body,
    guarded at 3:1 for non-text UI, and this file has already once drawn text in them at 2.05-3.84:1.
    `indexCss.test.ts` keeps every `color:` on --nv-fg/--nv-muted. */
 /* Widened the same way `.code-block`/`.tool-result-body` are (see the big comment above them):
-   `calc(100cqw - 30px)` against `.row`'s own query container. The difference here is that this
+   `calc(100cqw - 30px)` against `.row`'s own query container -- since 2026-09-24,
+   `max(100%, calc(var(--row-inline-size) - var(--row-gutter)))`, the same right edge without the
+   container (see that comment's correction). The difference here is that this
    box, unlike those two, does not already sit flush against `.row-body`'s own left edge -- it is
    inside `.permission-card`'s 10px padding AND its 1px border -- so `margin-left: -11px` pulls it
    back out to that edge first (matching where the diff's own text and a plain paragraph both
@@ -1287,7 +1348,7 @@ body,
   border: 1px solid var(--nv-border);
   border-radius: 4px;
   overflow: hidden;
-  width: calc(100cqw - var(--row-gutter));
+  width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
   margin-left: -11px;
 }
 .permission-card-edit-head {
