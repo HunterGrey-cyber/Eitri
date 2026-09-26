@@ -100,6 +100,14 @@ impl ClosePrompt {
         prompt
     }
 
+    /// Closes the window as a `y` to its own question would have: the close handler sees
+    /// [`ClosePrompt::confirmed`] and does not ask. For a question already asked and answered in
+    /// another form (`prefix x` on the last module, `kill_pane`).
+    pub(crate) fn close_window_confirmed(&self) {
+        self.confirmed.set(true);
+        self.window.close();
+    }
+
     pub(crate) fn confirmed(&self) -> bool {
         self.confirmed.get()
     }

@@ -42,7 +42,7 @@ use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
 use neovibe_core::keymap::{Action, SwapTarget};
 use neovibe_core::layout::{
-    Axis, Direction, KeyAction, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
+    Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
 };
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 
@@ -896,14 +896,36 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // `prefix x`, tmux's `kill-pane` (owner, 2026-09-26; `kill_pane`'s module doc has the rulings).
     // `killed` holds the modules killed and not shown since: a show brings each back fresh (the hook
     // below). The editor never is -- it cannot come back (`Reopen::Never`). `editor_quitting` is set
-    // once the editor has been asked to `:confirm qall`, so nvim's exit takes the module rather than
-    // the window; cancelled in nvim, it stays set, and a later `:qa` closes the editor rather than
-    // the window (a known limit, in the dated record). `kill_prompt` is the window's y/n, installed
+    // once the editor has been asked to `:confirm qall`, and says what nvim's exit then does: take
+    // the module (`EditorQuit::Module`) or close the window (`EditorQuit::Window`, the editor was the
+    // last module on screen). Cancelled in nvim, it stays set, and a later `:qa` does what the kill
+    // would have (a known limit, in the dated record). `kill_prompt` is the window's y/n, installed
     // after the prefix below so its controller sees keys first.
     let killed: Rc<RefCell<std::collections::BTreeSet<ModuleId>>> = Rc::default();
-    let editor_quitting: Rc<std::cell::Cell<bool>> = Rc::default();
+    let editor_quitting: Rc<RefCell<Option<kill_pane::EditorQuit>>> = Rc::default();
     let kill_prompt: Rc<std::cell::OnceCell<Rc<close_prompt::ClosePrompt>>> = Rc::default();
-    let kill_now: Rc<dyn Fn(&ModuleId) -> Result<(), String>> = {
+    // The last module's kill, once nothing is left to ask (tmux: the last pane's kill closes the
+    // window): `confirmed` is the window close's prompt as it stood when `x` asked, so the close does
+    // not ask again unless what is running changed (`kill_pane::close_is_confirmed`).
+    let close_after_kill: Rc<dyn Fn(Option<String>)> = {
+        let agent = agent_panel_handle.clone();
+        let kill_prompt = kill_prompt.clone();
+        let window = window.clone();
+        Rc::new(move |confirmed| {
+            let now = neovibe_core::tabs::window_close_prompt(agent.running_count(), agent.queued_count());
+            match kill_prompt.get() {
+                Some(prompt) if kill_pane::close_is_confirmed(confirmed.as_deref(), now.as_deref()) => {
+                    println!("[modules] the last module was killed; closing the window");
+                    prompt.close_window_confirmed();
+                }
+                _ => {
+                    println!("[modules] the last module was killed; closing the window, which asks again");
+                    window.close();
+                }
+            }
+        })
+    };
+    let kill_now: Rc<dyn Fn(&ModuleId, Option<String>) -> Result<(), String>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
@@ -914,8 +936,24 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let decls = decls.clone();
         let killed = killed.clone();
         let editor_quitting = editor_quitting.clone();
-        Rc::new(move |id| {
-            neovibe_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
+        let close_after_kill = close_after_kill.clone();
+        Rc::new(move |id, confirmed| {
+            let scope = neovibe_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
+            if scope == KillScope::Window {
+                if id.kind() == ModuleKind::Editor && pane.is_ready() {
+                    // nvim first, as for any kill of the editor: its exit closes the window.
+                    *editor_quitting.borrow_mut() = Some(kill_pane::EditorQuit::Window { confirmed });
+                    focus_module(id);
+                    pane.send_keys(kill_pane::EDITOR_QUIT_KEYS);
+                    println!(
+                        "[modules] {id}: the last module; asked nvim to {}, then the window closes",
+                        kill_pane::EDITOR_QUIT_KEYS
+                    );
+                } else {
+                    close_after_kill(confirmed);
+                }
+                return Ok(());
+            }
             let reopen = kill_pane::reopen(id, &decls);
             match id.kind() {
                 ModuleKind::Terminal => {
@@ -945,7 +983,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 ModuleKind::Editor if pane.is_ready() => {
                     // nvim decides: its own prompt for unsaved buffers, and only its exit closes the
                     // module (`on_exited_unrequested` below). The keys go to it for that prompt.
-                    editor_quitting.set(true);
+                    *editor_quitting.borrow_mut() = Some(kill_pane::EditorQuit::Module);
                     focus_module(id);
                     pane.send_keys(kill_pane::EDITOR_QUIT_KEYS);
                     println!("[modules] {id}: asked nvim to {}", kill_pane::EDITOR_QUIT_KEYS);
@@ -1195,12 +1233,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     Action::ModuleHide => open_module(&target(), KeyAction::Hide),
                     Action::ModuleKill => {
                         let id = target();
-                        if let Err(err) = neovibe_core::layout::can_kill(&module_layout.borrow(), &id) {
-                            refuse(&refused_name, &err);
-                            return;
-                        }
-                        let text =
-                            kill_pane::prompt(&id, &kill_title(&id), agent.running_count(), agent.queued_count());
+                        let scope = match neovibe_core::layout::can_kill(&module_layout.borrow(), &id) {
+                            Ok(scope) => scope,
+                            Err(err) => {
+                                refuse(&refused_name, &err);
+                                return;
+                            }
+                        };
+                        let (running, queued) = (agent.running_count(), agent.queued_count());
+                        let text = kill_pane::prompt(&id, &kill_title(&id), scope, running, queued);
+                        // What `y` also answers for the window close, if this kill closes it.
+                        let confirmed = neovibe_core::tabs::window_close_prompt(running, queued);
                         let Some(prompt) = kill_prompt.get() else {
                             return;
                         };
@@ -1208,7 +1251,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         let kill_now = kill_now.clone();
                         let kill_refused = kill_refused.clone();
                         prompt.ask(&text, move || {
-                            if let Err(err) = kill_now(&id) {
+                            if let Err(err) = kill_now(&id, confirmed) {
                                 println!("[modules] {id}: not killed: {err}");
                                 flash(&kill_refused);
                             }
@@ -1443,15 +1486,23 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // Unless `prefix x` asked it to quit (`kill_pane`): then the editor closes for the rest of this
     // window (`Reopen::Never`), the keys going to its neighbour, and the pane is released on the next
     // turn of the loop so nothing reaches the closed connection. If the layout refuses (the editor
-    // became the last module on screen meanwhile), the window closes, as it always did.
+    // became the last module on screen meanwhile), the window closes, as it always did. And if the
+    // kill was of the last module on screen (`EditorQuit::Window`), the window closes without asking
+    // what `x` already asked (`close_after_kill`).
     {
         let window = window.clone();
         let grid = grid.downgrade();
         let focus_module = focus_module.clone();
         let editor_quitting = editor_quitting.clone();
         let released = Rc::downgrade(&pane);
+        let close_after_kill = close_after_kill.clone();
         pane.on_exited_unrequested(move || {
-            if editor_quitting.get() {
+            let quit = editor_quitting.borrow().clone();
+            if let Some(kill_pane::EditorQuit::Window { confirmed }) = quit {
+                close_after_kill(confirmed);
+                return;
+            }
+            if quit == Some(kill_pane::EditorQuit::Module) {
                 if let Some(grid) = grid.upgrade() {
                     match grid.kill_module(&ModuleId::editor(), Reopen::Never, &*focus_module) {
                         Ok(()) => {
