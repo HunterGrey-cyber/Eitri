@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use neovibe_terminal::{
-    paint, paint_ops, CursorCell, ExitInfo, HostEvents, PtySize, SessionCommand, SessionConfig, SpawnSpec,
+    paint, paint_ops, CursorCell, ExitInfo, HostEvents, MouseModes, PtySize, SessionCommand, SessionConfig, SpawnSpec,
     TerminalColors, TerminalMetrics, TerminalSession,
 };
 use skia_safe::{surfaces, EncodedImageFormat, ISize, Surface};
@@ -63,6 +63,8 @@ pub struct Harness {
     pub events: HostEvents,
     pub exited: Option<ExitInfo>,
     pub wakes: usize,
+    /// The live mouse-mode summary (bottom-terminal phase 3c), latest-wins.
+    pub mouse: Option<MouseModes>,
 }
 
 impl Harness {
@@ -90,6 +92,7 @@ impl Harness {
             events: HostEvents::default(),
             exited: None,
             wakes: 0,
+            mouse: None,
         }
     }
 
@@ -114,6 +117,9 @@ impl Harness {
         }
         if update.exited.is_some() {
             self.exited = update.exited;
+        }
+        if update.mouse.is_some() {
+            self.mouse = update.mouse;
         }
     }
 

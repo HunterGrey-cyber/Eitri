@@ -38,7 +38,7 @@ export type EmptyTabProps = {
    *  must never leave the keys on `document.body`). Landed on the composer (INPUT) or this screen's
    *  own root (BROWSE), whichever currently has the live control. */
   keysRequest: number;
-  /** Wave 3 Task 1: true while the launch chooser (D10) is drawn over this screen. Guards
+  /** Wave 3 Task 1: true while the `prefix w` chooser is drawn over this screen. Guards
    *  `focusRequest`/`arriveRequest`/`keysRequest` from stealing the keys out from under it -- the
    *  same `overlayOpen` `App.tsx` computes, threaded through since this screen has no
    *  `containerRef` of its own for `App` to check. */
@@ -241,7 +241,7 @@ export function EmptyTab(props: EmptyTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const box: { title: string; entries: BoxEntry[] } | null =
-    seq !== null ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, false) } : null;
+    seq !== null ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, starting || failed) } : null;
   /* A request for the keys (`enter_input`, a chooser closing) is a request for INPUT, not only for
      focus: once anything took focus off the textarea (the chooser, a HINT, a click), `Composer`'s
      blur left this tab in BROWSE with no textarea to focus, and the keys landed on an ancestor that
@@ -356,17 +356,23 @@ export function EmptyTab(props: EmptyTabProps) {
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
     if (isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) return;
-    if (event.key === "Tab" && event.shiftKey && !starting && !failed) {
-      event.preventDefault();
-      props.onCycleMode();
-      return;
-    }
+    // Wave 4 Task 1: Shift+Tab used to be claimed here directly; it is now caught by App.tsx's
+    // document-capture router (`modeKey.ts`) before it ever reaches this handler.
     // Once the composer is disabled (failed) there is nothing left to type into, so `mode` staying
     // "input" must not swallow the keys the disabled screen still offers -- `r` on a failed tab, `f`
     // for HINT, `y` to copy a handoff command -- the same reasoning `Composer`'s own doc comment
     // gives for a dead session's INPUT being an empty mode. A `starting` tab's composer is live now
     // (C1: it queues behind the connect), so it is no longer exempted here.
-    if (mode === "input" && !failed) return;
+    if (mode === "input" && !failed) {
+      // vim's Esc (and the live conversation's, `resolveKey`): back to the menu. The root takes the keys
+      // BEFORE `setMode("browse")` unmounts the textarea, or they would fall to <body> (wave 3 Task 1, defect 4).
+      if (event.key === "Escape" && !event.nativeEvent.isComposing) {
+        event.preventDefault();
+        rootRef.current?.focus({ preventScroll: true });
+        setMode("browse");
+      }
+      return;
+    }
     if (event.key === "r" && failed) {
       event.preventDefault();
       props.onReset();
@@ -382,7 +388,11 @@ export function EmptyTab(props: EmptyTabProps) {
       void navigator.clipboard?.writeText(handoff.command);
       return;
     }
-    if (hello === null || starting || failed) return;
+    if (hello === null) return;
+    // The leader/which-key engine runs on a `starting` or `failed` tab too (whole-branch review):
+    // R4 names `<leader>` `mode.cycle` beside Shift+Tab as flashing `mode is fixed ...` on those
+    // tabs, and returning here first left it doing nothing at all there. Only the dashboard's own
+    // menu keys below stay a `not_started` tab's.
     // The leader/which-key engine (fix round 1, panel round 2 plan Task 12+13; spec §7, "Space
     // starts a leader sequence"): tried first, mirroring `App.tsx`'s own `onKeyDown` ordering, so a
     // table binding on any key not already claimed above (Space itself, or `H`/`L`/... once the
@@ -421,10 +431,17 @@ export function EmptyTab(props: EmptyTabProps) {
         return;
       }
     }
+    if (starting || failed) return;
     const items = dashItems(hello);
-    if (event.key === "j" || event.key === "k") {
+    // R3 (snacks.nvim's dashboard: one column): h/l never change the item, but they are still
+    // claimed here so they never fall through to the composer or leak out as an unhandled key.
+    if (event.key === "h" || event.key === "l") {
       event.preventDefault();
-      const delta = event.key === "j" ? 1 : -1;
+      return;
+    }
+    if (event.key === "j" || event.key === "k" || event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "j" || event.key === "ArrowDown" ? 1 : -1;
       setDashCursor((c) => Math.max(0, Math.min(items.length - 1, c + delta)));
       return;
     }

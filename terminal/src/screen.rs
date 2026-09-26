@@ -68,13 +68,20 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Rgb;
 use terminal_frame::frame::{ColorOverride, Rgb as FrameRgb, PALETTE_LEN};
+use terminal_frame::viewport::project_window;
 use terminal_frame::{Projector, TerminalFrame};
+use terminal_input::NormalizedInput;
 use terminal_render::color::{BACKGROUND, BRIGHT_FOREGROUND, CURSOR, DIM_FOREGROUND, FOREGROUND};
-use terminal_render::{build_paint_list, CursorColoring, PaintList, Palette, RenderInput, RgbColor, ViewMode};
+use terminal_render::{
+    build_paint_list, CursorColoring, PaintList, Palette, RenderInput, RgbColor, SelectionSpan, ViewMode,
+};
 use terminal_sync::SyncDriver;
 
 use crate::listener::{HostEvents, Listener, Reply};
+use crate::paint::indicator_ops;
 use crate::pty::PtySize;
+use crate::scroll::{ScrollRequest, ScrollView};
+use crate::select::{self, SelectCommand};
 
 /// The colours phase 1 takes from the window's theme (spec §Theming): so a light colorscheme does
 /// not get a black box under it. The sixteen ANSI colours stay xterm's until phase 4.
@@ -222,15 +229,29 @@ pub struct Screen {
     size: PtySize,
     dirty: bool,
     /// The frame taken at the last transition into a synchronized update (or the empty grid at
-    /// construction). Read by [`Self::render`] only while an update is open -- outside one,
-    /// `render` projects the live `term` directly instead, since it is then guaranteed quiescent
-    /// (re-review 2026-09-23, finding 1).
+    /// construction). Read by [`Self::render`] only while an update is open AND the view is
+    /// following the live bottom -- outside one, `render` projects the live `term` directly instead,
+    /// since it is then guaranteed quiescent (re-review 2026-09-23, finding 1).
     frame: TerminalFrame,
     /// How many updates `abort_sync` has forced closed. `SyncBarrier` has no counter of its own
     /// for this (only `esu_count`, bumped by a real ESU); added to `esu_count` in [`Self::open_update`]
     /// so the ordinal changes exactly when an update ENDS, by either path (review 2026-09-23,
     /// finding 2).
     abort_count: u64,
+    /// Scrollback (Task 7): how far back the window is, over `term`'s own retained history.
+    scroll: ScrollView,
+    /// The last window `render` computed while pinned or anchor-expired and no update was open --
+    /// [`Self::render`]'s own analogue of `frame` for a scrolled-back view. Read instead of a fresh
+    /// `project_window` while an update is open, for the same reason `frame` exists: some of a
+    /// pinned window's rows can still be the live screen's own (a pin near the bottom), which a
+    /// synchronized update is free to mutate mid-draw.
+    pinned_frame: Option<TerminalFrame>,
+    /// Set by [`Self::select`] on `SelectCommand::Finish`, and taken by [`Self::take_events`] into
+    /// `HostEvents::selection` (Task 8) -- the one selection event is not a `Term` event at all
+    /// (nothing in `alacritty_terminal::event::Event` reports "a selection finished"), so it cannot
+    /// arrive through [`Listener`] the way title/bell/clipboard do, and needs this second slot
+    /// merged in at the one place a caller reads events out.
+    pending_selection: Option<String>,
 }
 
 impl Screen {
@@ -251,6 +272,9 @@ impl Screen {
             dirty: true,
             frame,
             abort_count: 0,
+            scroll: ScrollView::new(),
+            pinned_frame: None,
+            pending_selection: None,
         }
     }
 
@@ -277,6 +301,10 @@ impl Screen {
             }
         }
         self.dirty |= published;
+        // Output can evict or reflow what a pinned view holds; re-align once per call, the same
+        // cadence `RawViewport::observe`'s own doc asks for ("once per wakeup while pinned"). A
+        // no-op while following the bottom (Task 7 design).
+        self.scroll.observe(&self.term);
     }
 
     /// Whether anything visible changed since the last call.
@@ -373,9 +401,15 @@ impl Screen {
         out
     }
 
-    /// Title, bell and clipboard since the last call.
+    /// Title, bell, clipboard and a finished selection since the last call. The first three come
+    /// from `Term`'s own event stream (via [`Listener`]); a finished selection does not (module
+    /// doc, `pending_selection`) and is merged in here, the one place a caller reads events out.
     pub fn take_events(&mut self) -> HostEvents {
-        std::mem::take(&mut self.listener.0.lock().expect("listener mutex").events)
+        let mut events = std::mem::take(&mut self.listener.0.lock().expect("listener mutex").events);
+        if self.pending_selection.is_some() {
+            events.selection = self.pending_selection.take();
+        }
+        events
     }
 
     /// Where the cursor is on the frame the last [`Self::render`] produced, visible or not. Always
@@ -400,28 +434,161 @@ impl Screen {
     /// -- bounded by however often the caller renders, not by the PTY's own read rate. While an
     /// update is open, that would show the update's own half-drawn content, so this reads
     /// `self.frame` instead: the snapshot `Self::feed` took at the exact byte the update opened,
-    /// before any of its content could mutate `term` (re-review 2026-09-23, finding 1).
+    /// before any of its content could mutate `term` (re-review 2026-09-23, finding 1). `self.frame`
+    /// is kept up to date every such call regardless of scroll position -- it is what
+    /// [`Self::cursor_cell`] reports from, and typing always lands on the live screen, never on a
+    /// scrolled-back one.
+    ///
+    /// Scrollback (Task 7): while pinned or anchor-expired, the window painted is
+    /// `terminal_frame::viewport::project_window` at `Self::top_line`, cached in `self.pinned_frame`
+    /// the same way `self.frame` is -- some of a near-bottom pin's rows are still the live screen's
+    /// own, which an open update is free to mutate mid-draw, so reading a fresh projection then would
+    /// show the same torn content this crate's whole snapshot design exists to rule out. **Exception
+    /// (fix round 1):** the very first render of a pin still recomputes even mid-update, because
+    /// `self.pinned_frame` starting `None` has no quiescent snapshot to fall back to, and `self.frame`
+    /// is not a substitute -- its rows are numbered `0..rows-1` (screen-local), never the negative
+    /// absolute lines a pinned `top_line` needs, so falling back to it drew blank or misplaced rows
+    /// instead of a torn-but-correctly-positioned one. The `[N/M]` indicator (owner ruling R6) is
+    /// appended after everything `build_paint_list` drew, only while `ScrollView::indicator` has one
+    /// to show.
     pub fn render(&mut self, focused: bool) -> PaintList {
-        if self.open_update().is_none() {
+        let (top_line, mode) = self.scroll.window(&self.term);
+        let update_open = self.open_update().is_some();
+        if !update_open {
             self.frame = self.projector.full(&self.term);
         }
+        let frame: &TerminalFrame = match mode {
+            ViewMode::FollowBottom => &self.frame,
+            ViewMode::Pinned | ViewMode::AnchorExpired => {
+                // The `unwrap_or(&self.frame)` fallback below only makes sense once
+                // `self.pinned_frame` has been populated at least once: `self.frame`'s own
+                // `RowUpdate::line` values are screen-local (`0..rows-1`, `full_rows`), never
+                // absolute grid lines the way `project_window`'s are, so falling back to it while
+                // `top_line` is negative feeds `build_paint_list` two different line numberings at
+                // once (fix round 1, `docs/superpowers/plans/2026-09-26-wave4.md` review). The very
+                // first render of a pin is therefore recomputed unconditionally even mid-update --
+                // a possibly torn frame for that one call is still strictly better than the wrong
+                // rows entirely, and every later call while the update stays open reuses the
+                // now-populated snapshot exactly as before.
+                if !update_open || self.pinned_frame.is_none() {
+                    self.pinned_frame = Some(project_window(&self.term, top_line, self.term.screen_lines()));
+                }
+                self.pinned_frame.as_ref().unwrap_or(&self.frame)
+            }
+        };
         let mut palette = self.palette.clone();
-        palette.apply_overrides(&self.frame.color_overrides);
-        build_paint_list(&RenderInput {
-            frame: &self.frame,
-            window_top_line: 0,
-            mode: ViewMode::FollowBottom,
-            selection: &[],
+        palette.apply_overrides(&frame.color_overrides);
+        let selection = self.selection_spans(top_line, frame.rows);
+        let mut list = build_paint_list(&RenderInput {
+            frame,
+            window_top_line: top_line,
+            mode,
+            selection: &selection,
             focused,
             palette: &palette,
             cursor_color: self.cursor_coloring,
-        })
+        });
+        if let Some((above, history)) = self.scroll.indicator(&self.term) {
+            list.ops.extend(indicator_ops(above, history, list.cols, &palette));
+        }
+        list
+    }
+
+    /// Applies one host scroll gesture ([`ScrollRequest`]): `Shift+PageUp`/`Shift+PageDown`, a wheel
+    /// notch, `Shift+Home`/`Shift+End`. Always marks the screen dirty -- the window position is part
+    /// of what a frame shows, the same as any other visible change.
+    pub fn scroll(&mut self, req: ScrollRequest) {
+        self.scroll.scroll(&self.term, req);
+        self.dirty = true;
+    }
+
+    /// Applies one host selection gesture (Task 8): starts, extends, finishes or clears
+    /// `term.selection`, the model `alacritty_terminal::selection` already owns
+    /// ([`crate::select`]'s own module doc). Always marks the screen dirty -- the highlight is part
+    /// of what a frame shows. On `Finish`, the text (if any was selected) is kept in
+    /// `pending_selection` for [`Self::take_events`] to publish as `HostEvents::selection`, and
+    /// also returned directly for a caller that wants it without waiting on that round trip.
+    pub fn select(&mut self, cmd: SelectCommand) -> Option<String> {
+        let text = select::apply(&mut self.term, cmd);
+        if matches!(cmd, SelectCommand::Finish) && text.is_some() {
+            self.pending_selection = text.clone();
+        }
+        self.dirty = true;
+        text
+    }
+
+    /// `term.selection`, converted into per-line spans clamped to the window `Self::render` is
+    /// about to draw -- what `RenderInput::selection` needs. Absolute grid lines throughout (module
+    /// doc): a span's `line` can be negative while scrolled back, the same space `Self::top_line`
+    /// reports. `None` selection, or one that resolves to nothing (`Selection::to_range` is `None`
+    /// for an empty drag), yields no spans.
+    fn selection_spans(&self, top: i32, rows: u16) -> Vec<SelectionSpan> {
+        let Some(range) = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term)) else {
+            return Vec::new();
+        };
+        let cols = self.term.columns();
+        let last_col = u16::try_from(cols.saturating_sub(1)).unwrap_or(u16::MAX);
+        let window_end = top.saturating_add(i32::from(rows));
+        let mut spans = Vec::new();
+        let mut line = range.start.line.0;
+        while line <= range.end.line.0 {
+            if line >= top && line < window_end {
+                let start_col = if line == range.start.line.0 {
+                    u16::try_from(range.start.column.0).unwrap_or(last_col).min(last_col)
+                } else {
+                    0
+                };
+                let end_col = if line == range.end.line.0 {
+                    u16::try_from(range.end.column.0).unwrap_or(last_col).min(last_col)
+                } else {
+                    last_col
+                };
+                spans.push(SelectionSpan {
+                    line,
+                    start_col,
+                    end_col,
+                });
+            }
+            line += 1;
+        }
+        spans
+    }
+
+    /// Whether the view is scrolled back at all -- pinned or anchor-expired, never following the
+    /// live bottom.
+    pub fn scrolled(&self) -> bool {
+        self.scroll.scrolled()
+    }
+
+    /// The window's absolute top line, as [`Self::render`] last computed it: `0` while following the
+    /// bottom. What Task 8's pointer -> cell conversion needs to turn a click row into a grid line.
+    pub fn top_line(&self) -> i32 {
+        self.scroll.window(&self.term).0
+    }
+
+    /// A key or paste about to reach the program ([`crate::session::SessionCommand::Input`]):
+    /// typing -- never a bare modifier press or release -- snaps a scrolled-back view to the live
+    /// bottom, the same as alacritty's own `on_terminal_input_start` (`terminal_input::is_modifier_key`'s
+    /// own doc: "a bare modifier press must NOT count as terminal input"), and clears the selection
+    /// (Task 8, owner ruling R6: "typing ... snaps to the bottom and clears the selection", the
+    /// same `on_terminal_input_start` rule alacritty applies to both at once). A paste always
+    /// counts, having no single key to be a bare modifier.
+    pub fn note_input(&mut self, input: &NormalizedInput) {
+        let bare_modifier =
+            matches!(input, NormalizedInput::Key { event, .. } if terminal_input::is_modifier_key(event));
+        if !bare_modifier {
+            self.scroll(ScrollRequest::Bottom);
+            if self.term.selection.take().is_some() {
+                self.dirty = true;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::select::SelectKind;
 
     const SIZE: PtySize = PtySize {
         cols: 20,
@@ -946,5 +1113,377 @@ mod tests {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
         screen.feed(b"\x1b[>1u");
         assert!(screen.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+    }
+
+    // ---- scrollback (Task 7) ----
+
+    /// Feeds `n` numbered lines, one `feed()` call per line -- matching how the module doc above
+    /// describes the shape of a real, slow PTY reader. Used only by the small setup below; the
+    /// eviction test (`f`) feeds thousands of lines in one call instead, because `ScrollView::observe`
+    /// (via `RawViewport::observe`) is `O(history)` while pinned, and thousands of separate one-line
+    /// `feed()` calls each paying that cost would make the test itself minutes slow for no assertion
+    /// it needs -- a real PTY read is one chunk of many lines, not one `feed()` per line.
+    fn feed_numbered_lines(screen: &mut Screen, range: std::ops::Range<i32>) {
+        for i in range {
+            screen.feed(format!("{i}\r\n").as_bytes());
+        }
+    }
+
+    const SCROLL_SIZE: PtySize = PtySize {
+        cols: 20,
+        rows: 5,
+        cell_width_px: 9,
+        cell_height_px: 18,
+    };
+
+    /// (a) Scrolling up 3 lines moves the window's top row 3 lines further into history, and the
+    /// indicator reports 3 lines hidden below the bottom, of the whole retained history.
+    #[test]
+    fn scrolling_up_moves_the_window_and_the_indicator_says_how_far() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        assert_eq!(
+            screen.render(true).row_text(0),
+            "46",
+            "before scrolling: the live top row"
+        );
+        screen.scroll(ScrollRequest::Lines(3));
+        let frame = screen.render(true);
+        assert_eq!(
+            frame.row_text(0),
+            "43",
+            "3 lines further back than the live top row (46)"
+        );
+        assert_eq!(screen.scroll.indicator(&screen.term), Some((3, 46)));
+        assert!(screen.scrolled());
+    }
+
+    /// (b) Review Focus 4: output arriving while scrolled back must not move the pinned view -- the
+    /// anchor holds the same content -- but the indicator's `N` grows by however many new lines
+    /// arrived below it.
+    #[test]
+    fn output_while_pinned_does_not_move_the_view_only_the_indicator_grows() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.scroll(ScrollRequest::Lines(3));
+        assert_eq!(screen.render(true).row_text(0), "43");
+        feed_numbered_lines(&mut screen, 50..60);
+        let frame = screen.render(true);
+        assert_eq!(frame.row_text(0), "43", "the anchor held: same content at the top");
+        assert_eq!(
+            screen.scroll.indicator(&screen.term),
+            Some((13, 56)),
+            "10 more lines arrived below the still-pinned window"
+        );
+    }
+
+    /// Fix round 1 review finding: the first scroll into `Pinned` while a synchronized update is
+    /// already open used to leave `self.pinned_frame` at `None`, and `render`'s
+    /// `unwrap_or(&self.frame)` fell back to the live-screen snapshot -- whose `RowUpdate::line`
+    /// values are screen-local (`0..rows-1`, see `terminal_frame::project::full_rows`), not absolute
+    /// grid lines like `project_window`'s. `build_paint_list`'s `to_row` then subtracted a negative
+    /// `window_top_line` from those screen-local numbers, so the window's top rows drew nothing and
+    /// the rest showed the live screen's own rows shifted into the wrong window rows. `render` must
+    /// still produce a correct pinned window the very first time it is asked for one, even mid-update.
+    #[test]
+    fn scrolling_for_the_first_time_during_an_open_update_still_renders_the_pinned_window() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.feed(b"\x1b[?2026h"); // BSU, deliberately never closed in this test
+        assert!(
+            screen.open_update().is_some(),
+            "the update must still be open at render time"
+        );
+        screen.scroll(ScrollRequest::Lines(3));
+        let frame = screen.render(true);
+        assert_eq!(
+            frame.row_text(0),
+            "43",
+            "the pinned window's top row, not blank or the live screen's own top row"
+        );
+        assert_eq!(frame.row_text(4), "47", "the pinned window's bottom row");
+    }
+
+    /// (c) Typing (never a bare modifier press) snaps a scrolled-back view to the bottom; a bare
+    /// `Shift` press does not (alacritty's own `on_terminal_input_start` rule, reproduced by
+    /// `terminal_input::is_modifier_key`).
+    #[test]
+    fn typing_snaps_to_the_bottom_but_a_bare_modifier_does_not() {
+        use terminal_input::keys::{Key, KeyEvent, ModifiersState, NamedKey};
+        use terminal_input::NormalizedInput;
+
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.scroll(ScrollRequest::Lines(3));
+        assert!(screen.scrolled());
+        let letter = NormalizedInput::Key {
+            event: KeyEvent::press(Key::Character("a".into())),
+            mods: ModifiersState::empty(),
+        };
+        screen.note_input(&letter);
+        assert!(!screen.scrolled(), "a real key snaps back to the bottom");
+
+        screen.scroll(ScrollRequest::Lines(3));
+        assert!(screen.scrolled());
+        let shift = NormalizedInput::Key {
+            event: KeyEvent::press(Key::Named(NamedKey::Shift)),
+            mods: ModifiersState::empty(),
+        };
+        screen.note_input(&shift);
+        assert!(
+            screen.scrolled(),
+            "a bare modifier press must NOT count as terminal input"
+        );
+
+        let paste = NormalizedInput::Paste {
+            text: "x".to_string(),
+            bracketed: false,
+        };
+        screen.note_input(&paste);
+        assert!(
+            !screen.scrolled(),
+            "a paste always counts, having no single key to be a modifier"
+        );
+    }
+
+    /// (d) `Pages(n)` moves a whole screen (`rows` lines) at a time; scrolling past the oldest
+    /// retained line clamps there rather than going further; `Bottom` always unpins.
+    #[test]
+    fn pages_move_a_screen_at_a_time_clamp_at_the_oldest_line_and_bottom_always_unpins() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.scroll(ScrollRequest::Pages(1));
+        assert_eq!(screen.top_line(), -5, "one page is SCROLL_SIZE.rows (5) lines");
+        screen.scroll(ScrollRequest::Pages(100));
+        assert_eq!(
+            screen.top_line(),
+            -46,
+            "clamped at the oldest retained line (history is 46)"
+        );
+        assert_eq!(screen.scroll.indicator(&screen.term), Some((46, 46)));
+        screen.scroll(ScrollRequest::Bottom);
+        assert!(!screen.scrolled());
+        assert_eq!(screen.top_line(), 0);
+    }
+
+    /// (e) The alternate screen keeps no history (`max_scrollback == 0`): every scroll request is a
+    /// no-op there. Task 9 turns the wheel into arrow keys for a program running in it instead.
+    #[test]
+    fn scrolling_in_the_alternate_screen_is_a_no_op() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.feed(b"\x1b[?1049h");
+        screen.scroll(ScrollRequest::Lines(3));
+        assert!(!screen.scrolled());
+        assert_eq!(screen.top_line(), 0);
+    }
+
+    /// (f) An anchor scrolled past its own eviction is reported `AnchorExpired`, not resolved to
+    /// whatever now occupies its old position. Fed in ONE `feed()` call, not one per line -- see
+    /// `feed_numbered_lines`'s own doc: `ScrollView::observe` costs `O(history)` while pinned, and
+    /// thousands of separate calls would multiply that thousands of times over for no reason.
+    #[test]
+    fn a_pinned_anchor_scrolled_past_eviction_is_reported_expired_not_silently_moved() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.scroll(ScrollRequest::Lines(45));
+        assert_eq!(screen.top_line(), -45, "pinned close to the oldest retained line");
+        let mut flood = String::new();
+        for i in 50..11_000 {
+            flood.push_str(&format!("{i}\r\n"));
+        }
+        screen.feed(flood.as_bytes());
+        let frame = screen.render(true);
+        assert!(
+            frame.has_expiry_notice(),
+            "the evicted anchor must say so, not show something else"
+        );
+        assert_eq!(
+            screen.scroll.indicator(&screen.term),
+            None,
+            "the notice is the one announcement"
+        );
+    }
+
+    // ---- selection (Task 8) ----
+
+    /// (a) The half-cell rule (alacritty's own): a plain drag started on the LEFT half of its first
+    /// cell and released on the RIGHT half of its last includes both ends. `Start`'s `right_half`
+    /// stays `false` (the left half of col 1), and `Finish` reads out the inclusive range.
+    #[test]
+    fn a_drag_selects_the_half_cell_inclusive_range() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"hello world");
+        screen.select(SelectCommand::Start {
+            line: 0,
+            col: 1,
+            right_half: false,
+            kind: SelectKind::Simple,
+        });
+        screen.select(SelectCommand::Extend {
+            line: 0,
+            col: 3,
+            right_half: true,
+        });
+        assert_eq!(screen.select(SelectCommand::Finish).as_deref(), Some("ell"));
+    }
+
+    /// (b) A word click (`Semantic`) expands to the nearest `semantic_escape_chars` boundary --
+    /// alacritty's default keeps a space as one, so a click anywhere in "world" reads out the whole
+    /// word with no `Extend` needed. A line click (`Lines`) reads out the whole line with no
+    /// trailing padding from the grid's unused columns -- `Term::line_to_string`'s own
+    /// `line_length()` bound, not this crate's doing.
+    #[test]
+    fn word_and_line_selection_expand_to_their_own_boundary() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"hello world");
+        screen.select(SelectCommand::Start {
+            line: 0,
+            col: 7,
+            right_half: false,
+            kind: SelectKind::Word,
+        });
+        assert_eq!(screen.select(SelectCommand::Finish).as_deref(), Some("world"));
+
+        screen.select(SelectCommand::Start {
+            line: 0,
+            col: 0,
+            right_half: false,
+            kind: SelectKind::Line,
+        });
+        // `Term::selection_to_string` appends its own trailing `\n` for a `Lines` selection
+        // (alacritty-0.26.0 `term/mod.rs`) -- real alacritty behaviour, not this crate's choice.
+        assert_eq!(screen.select(SelectCommand::Finish).as_deref(), Some("hello world\n"));
+    }
+
+    /// (c) A word selection started on the SECOND cell of a wide character (`你`'s own spacer
+    /// column) still reads out the whole word, not half of it -- alacritty's semantic search walks
+    /// grid cells, not selection-side bookkeeping, so a wide char's spacer is not a special case
+    /// here.
+    #[test]
+    fn a_word_selection_on_a_wide_chars_second_cell_reads_the_whole_word() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed("你好 ab".as_bytes());
+        screen.select(SelectCommand::Start {
+            line: 0,
+            col: 1,
+            right_half: false,
+            kind: SelectKind::Word,
+        });
+        assert_eq!(screen.select(SelectCommand::Finish).as_deref(), Some("你好"));
+    }
+
+    /// (d) `Term::line_to_string` only appends `\n` when the row it just read is NOT flagged
+    /// `WRAPLINE` -- so a selection crossing an auto-wrapped row boundary joins with no `\n`, while
+    /// one crossing two really separate lines (`\r\n`) keeps exactly one.
+    #[test]
+    fn a_selection_joins_a_wrapped_line_without_a_newline_but_keeps_one_between_real_lines() {
+        let mut wrapped = Screen::new(SIZE, TerminalColors::default());
+        // 25 letters, no CR/LF: at 20 columns this auto-wraps after "abcdefghijklmnopqrst",
+        // continuing "uvwxy" on the next row with WRAPLINE set on the first row's last cell.
+        wrapped.feed(b"abcdefghijklmnopqrstuvwxy");
+        wrapped.select(SelectCommand::Start {
+            line: 0,
+            col: 0,
+            right_half: false,
+            kind: SelectKind::Simple,
+        });
+        wrapped.select(SelectCommand::Extend {
+            line: 1,
+            col: 4,
+            right_half: true,
+        });
+        assert_eq!(
+            wrapped.select(SelectCommand::Finish).as_deref(),
+            Some("abcdefghijklmnopqrstuvwxy"),
+            "an auto-wrapped row joins with no newline"
+        );
+
+        let mut real_lines = Screen::new(SIZE, TerminalColors::default());
+        real_lines.feed(b"ab\r\ncd");
+        real_lines.select(SelectCommand::Start {
+            line: 0,
+            col: 0,
+            right_half: false,
+            kind: SelectKind::Simple,
+        });
+        real_lines.select(SelectCommand::Extend {
+            line: 1,
+            col: 1,
+            right_half: true,
+        });
+        assert_eq!(
+            real_lines.select(SelectCommand::Finish).as_deref(),
+            Some("ab\ncd"),
+            "two really separate lines keep exactly one newline between them"
+        );
+    }
+
+    /// (e) Review Focus 4 (second half): typing (never a bare modifier) clears the selection, the
+    /// same `on_terminal_input_start` rule that snaps a scrolled-back view to the bottom
+    /// (`note_input`'s own doc).
+    #[test]
+    fn typing_clears_the_selection_but_a_bare_modifier_does_not() {
+        use terminal_input::keys::{Key, KeyEvent, ModifiersState, NamedKey};
+        use terminal_input::NormalizedInput;
+
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"hello world");
+        screen.select(SelectCommand::Start {
+            line: 0,
+            col: 0,
+            right_half: false,
+            kind: SelectKind::Simple,
+        });
+        assert!(screen.term.selection.is_some());
+
+        let shift = NormalizedInput::Key {
+            event: KeyEvent::press(Key::Named(NamedKey::Shift)),
+            mods: ModifiersState::empty(),
+        };
+        screen.note_input(&shift);
+        assert!(
+            screen.term.selection.is_some(),
+            "a bare modifier press must not clear the selection"
+        );
+
+        let letter = NormalizedInput::Key {
+            event: KeyEvent::press(Key::Character("a".into())),
+            mods: ModifiersState::empty(),
+        };
+        screen.note_input(&letter);
+        assert!(screen.term.selection.is_none(), "a real key clears the selection");
+    }
+
+    /// (f) `Self::selection_spans` -- what `render` hands `RenderInput::selection` -- carries
+    /// exactly the selected cells, including while scrolled back: Task 7's `Lines(3)` pins the
+    /// window 3 lines into history, and a selection made on the window's own top row (now the
+    /// absolute line the pin reports, negative) reports that same negative line, not `0`.
+    #[test]
+    fn selection_spans_cover_exactly_the_selected_cells_including_while_scrolled_back() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.scroll(ScrollRequest::Lines(3));
+        let top = screen.top_line();
+        assert!(top < 0, "pinned into history");
+        screen.select(SelectCommand::Start {
+            line: top,
+            col: 0,
+            right_half: false,
+            kind: SelectKind::Simple,
+        });
+        screen.select(SelectCommand::Extend {
+            line: top,
+            col: 1,
+            right_half: true,
+        });
+        assert_eq!(
+            screen.selection_spans(top, 5),
+            vec![SelectionSpan {
+                line: top,
+                start_col: 0,
+                end_col: 1,
+            }]
+        );
     }
 }

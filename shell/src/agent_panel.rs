@@ -473,12 +473,6 @@ struct AgentPanelState {
     last_tabs_payload: Option<String>,
     /// The open provider sessions `hello` was last computed against (ruling 17).
     last_open_ids: Vec<String>,
-    /// D10 / ruling 16: `main.rs` says whether the chat is on screen at launch; consumed by the
-    /// first `ready` of the process.
-    launch_chooser_allowed: bool,
-    launch_chooser_done: bool,
-    launch_chooser_hook: Option<Rc<dyn Fn()>>,
-    chooser_closed_hook: Option<Rc<dyn Fn(bool)>>,
     /// The per-window scratch directory (phase 3 ruling 18), `None` if it could not be made.
     scratch: Option<neovibe_core::scratch::ScratchDir>,
     /// Edits out in nvim, polled by the tick until their marker appears.
@@ -698,6 +692,20 @@ impl AgentPanelHandle {
         };
         self.set_theme(&tokens);
     }
+
+    /// The twin of [`set_panel_font_size_px`](Self::set_panel_font_size_px), for
+    /// `--nv-editor-row` (wave 4, R5): updates only the recorded theme's `editor_row_px` and
+    /// re-sends it, so both a panel reload and a fresh `ready` handshake pick the editor's cell
+    /// height up the same way `font_size_px` already does, with no new envelope. `main.rs` calls
+    /// this from `NeovideEditorPane::connect_cell_size_changed`.
+    pub(crate) fn set_editor_row_px(&self, editor_row_px: f32) {
+        let tokens = {
+            let mut tokens = self.state.borrow().theme.clone();
+            tokens.editor_row_px = Some(editor_row_px);
+            tokens
+        };
+        self.set_theme(&tokens);
+    }
 }
 
 impl AgentPanelHandle {
@@ -851,22 +859,6 @@ impl AgentPanelHandle {
         self.state.borrow().shutting_down
     }
 
-    /// Where the launch chooser's opening is reported (D10): `main.rs` gives it the keys.
-    pub(crate) fn on_launch_chooser(&self, hook: impl Fn() + 'static) {
-        self.state.borrow_mut().launch_chooser_hook = Some(Rc::new(hook));
-    }
-
-    /// Where a chooser's dismissal is reported, with its `launch` flag: dismissing the launch
-    /// chooser hands the keys to the editor (D10).
-    pub(crate) fn on_chooser_closed(&self, hook: impl Fn(bool) + 'static) {
-        self.state.borrow_mut().chooser_closed_hook = Some(Rc::new(hook));
-    }
-
-    /// Whether the chat is on screen at launch (ruling 16). Read once, by the first `ready`.
-    pub(crate) fn set_launch_chooser_allowed(&self, allowed: bool) {
-        self.state.borrow_mut().launch_chooser_allowed = allowed;
-    }
-
     /// `prefix c`: opens a tab, selects it, and sends `tabs` -- nothing else: an empty tab has no
     /// state yet.
     pub(crate) fn new_tab(&self) {
@@ -949,12 +941,12 @@ impl AgentPanelHandle {
         self.dispatch(payload, "confirm-close-others");
     }
 
-    /// `prefix w` (and D10's launch chooser, `launch: true`).
-    pub(crate) fn open_chooser(&self, launch: bool) {
+    /// `prefix w`.
+    pub(crate) fn open_chooser(&self) {
         if self.closing() {
             return;
         }
-        let payload = chooser_payload(&self.state.borrow(), launch);
+        let payload = chooser_payload(&self.state.borrow());
         self.dispatch(payload, "chooser");
     }
 
@@ -1188,10 +1180,6 @@ pub(crate) fn build_agent_panel(
         attention_hook: None,
         last_tabs_payload: None,
         last_open_ids: Vec::new(),
-        launch_chooser_allowed: false,
-        launch_chooser_done: false,
-        launch_chooser_hook: None,
-        chooser_closed_hook: None,
         scratch,
         pending_edits: Vec::new(),
         editor_request_hook: None,
@@ -1566,9 +1554,9 @@ fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, web
     evaluate_js_dispatch(webview, &payload);
 }
 
-/// The chooser's envelope (`prefix w`, D10): the open tabs in number order, then every record open
+/// The chooser's envelope (`prefix w`): the open tabs in number order, then every record open
 /// in no tab, each marked if another window holds its lease.
-fn chooser_payload(state: &AgentPanelState, launch: bool) -> String {
+fn chooser_payload(state: &AgentPanelState) -> String {
     let greeting = BackendGreeting::for_kind(state.backend_kind, state.project_dir.clone());
     let resumable = state.backend_kind == BackendKind::Sidecar;
     let open: Vec<ChooserTab> = state
@@ -1590,7 +1578,7 @@ fn chooser_payload(state: &AgentPanelState, launch: bool) -> String {
     let records = chooser_records(&greeting.resumable, &state.tabs.open_session_ids(), |id| {
         agent::lease::SessionLease::is_held("claude", canonical, id).unwrap_or(false)
     });
-    neovibe_core::agent_bridge::serialize_chooser_for_js(launch, &open, &records)
+    neovibe_core::agent_bridge::serialize_chooser_for_js(&open, &records)
 }
 
 /// The detail popover's envelope for `tab` (`prefix i`, `open_detail{tab}`).
@@ -2219,17 +2207,15 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
     match message {
         InboundMessage::Ready { .. } => {
             // Everything a fresh document is owed is decided by one pure function, so the reload
-            // path is testable without a WebView -- see `ready_payloads`.
-            let (payloads, launch_chooser) = {
+            // path is testable without a WebView -- see `ready_payloads`. Wave 4 R2 (owner: "默认
+            // 界面是new session这个界面，不用默认弹到all session界面"): a `ready` never opens the
+            // chooser any more, on the first one or on a reload -- the empty tab's dashboard is
+            // what a fresh document sees.
+            let payloads = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
                 let open = state_ref.tabs.open_session_ids();
-                let offerable = greeting
-                    .resumable
-                    .iter()
-                    .filter(|r| !open.contains(&r.provider_session_id))
-                    .count();
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
                 let context = neovibe_core::agent_bridge::context_summary(
                     (state_ref.editor_context)().as_ref(),
@@ -2257,32 +2243,19 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     state_ref.pane_focused,
                 ));
                 state_ref.last_open_ids = open;
-                // D10 / ruling 16: decided on the process's FIRST `ready` only, never on a reload.
-                let launch_chooser = !state_ref.launch_chooser_done
-                    && state_ref.launch_chooser_allowed
-                    && neovibe_core::tabs::launch_opens_chooser(offerable, true);
-                state_ref.launch_chooser_done = true;
                 // Ruling 38: from here on the tick may send into this document.
                 state_ref.document_ready = true;
-                (payloads, launch_chooser)
+                payloads
             };
             dispatch_all(webview, payloads);
             ok(webview);
-            if launch_chooser {
-                let (payload, hook) = {
-                    let state_ref = state.borrow();
-                    (chooser_payload(&state_ref, true), state_ref.launch_chooser_hook.clone())
-                };
-                evaluate_js_dispatch(webview, &payload);
-                if let Some(hook) = hook {
-                    hook();
-                }
-            }
         }
         InboundMessage::SendMessage { text, .. } => {
             let tab = tab_of(target);
             // A sent prompt is history whether or not the backend takes it, as in Claude Code.
             remember_prompts(state, webview, std::slice::from_ref(&text));
+            // ...and no longer the tab's draft (a refusal puts it back in the box panel-side).
+            state.borrow_mut().tabs.note_sent(tab);
             enum Plan {
                 Sent(Result<Vec<agent::AgentDomainEvent>, BackendError>),
                 Starting,
@@ -2794,12 +2767,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             );
             ok(webview);
         }
-        InboundMessage::ChooserClosed { launch, .. } => {
-            let hook = state.borrow().chooser_closed_hook.clone();
-            if let Some(hook) = hook {
-                hook(launch);
+        // `<leader>bd` (wave 4, R1): quiet unless `close_needs_confirm`; `prefix &` never comes through here.
+        InboundMessage::TabVerb {
+            verb: TabVerbWire::Close,
+            ..
+        } if !{
+            let state_ref = state.borrow();
+            state_ref.tabs.close_needs_confirm(state_ref.tabs.active())
+        } =>
+        {
+            let active = state.borrow().tabs.active();
+            match close_tab(state, webview, active) {
+                Ok(()) => ok(webview),
+                Err(why) => refuse(webview, why),
             }
-            ok(webview);
         }
         InboundMessage::TabVerb { verb, .. } => match run_tab_verb(state, verb) {
             Ok(()) => ok(webview),
@@ -3237,10 +3218,6 @@ mod tests {
             attention_hook: None,
             last_tabs_payload: None,
             last_open_ids: Vec::new(),
-            launch_chooser_allowed: false,
-            launch_chooser_done: false,
-            launch_chooser_hook: None,
-            chooser_closed_hook: None,
             scratch: None,
             pending_edits: Vec::new(),
             editor_request_hook: None,
@@ -3861,6 +3838,22 @@ mod tests {
             )),
             vec!["hello", "tabs"]
         );
+    }
+
+    /// Wave 4 R2 (owner, 2026-09-26: "默认界面是new session这个界面，不用默认弹到all session界面"): the first
+    /// `ready` draws the empty tab's dashboard, never the chooser -- `ready_payloads` is all a `ready` sends now.
+    #[test]
+    fn a_ready_sends_no_chooser() {
+        assert!(!kinds(&ready_payloads(
+            legacy_greeting(),
+            &[],
+            vec![],
+            "{\"kind\":\"tabs\"}".to_string(),
+            vec![],
+            None,
+            None
+        ))
+        .contains(&"chooser".to_string()));
     }
 
     /// A reloaded document must get its colours back before anything it would draw with them.

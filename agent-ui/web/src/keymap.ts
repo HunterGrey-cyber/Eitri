@@ -347,7 +347,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
-  { keys: "Shift+Tab", what: "Cycle the mode before a session starts" },
+  { keys: "Shift+Tab", what: "Cycle the mode (before the first message; fixed after)" },
   { keys: "Esc", what: "Stop typing (back to browsing)" },
   { keys: "?", what: "This list, from an empty box" },
 ];

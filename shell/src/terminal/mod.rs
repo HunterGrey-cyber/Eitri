@@ -19,6 +19,7 @@ mod ime;
 mod input_queue;
 pub(crate) mod keys;
 mod pane;
+pub(crate) mod pointer;
 
 pub(crate) use pane::TerminalPane;
 

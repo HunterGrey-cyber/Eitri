@@ -7,11 +7,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{ctrl, plain_sh, size, spec, Harness, WAIT};
+use neovibe_terminal::mouse::{Button, MouseInput, MouseKind, MouseMods};
 use neovibe_terminal::pty::HANGUP_GRACE;
 use neovibe_terminal::session::SYNC_UPDATE_TIMEOUT;
 use neovibe_terminal::{CursorCell, SessionCommand, SessionConfig, TerminalColors, REPLY_CAP};
 use terminal_input::NormalizedInput;
 use terminal_render::RgbColor;
+
+fn left_press(line: u16, col: u16) -> MouseInput {
+    MouseInput {
+        kind: MouseKind::Press(Button::Left),
+        line,
+        col,
+        mods: MouseMods::default(),
+    }
+}
 
 #[test]
 fn typed_keys_are_echoed_by_the_shell() {
@@ -566,4 +576,54 @@ fn a_hidden_terminal_renders_nothing_until_it_is_shown() {
     assert_eq!(h.session.renders(), before, "2000 lines went by while hidden");
     h.session.send(SessionCommand::Visible(true));
     h.wait_for(WAIT, |h| h.has_line("2000"));
+}
+
+/// A mouse report reaches the program only while its own mode asks for it, and a dropped report
+/// (the mode having just gone off) never gets read as something else's byte (bottom-terminal phase
+/// 3c). `ready` proves the enabling escape sequence was parsed before anything is sent; `off` proves
+/// the disabling one was too, before the second (dropped) report is sent; `next=x` proves the
+/// dropped report did not leave a stray byte for the child's next read to pick up instead of the key
+/// that follows it.
+#[test]
+fn mouse_reports_reach_the_program_only_while_it_asks() {
+    let script = r#"stty raw -echo; printf '\033[?1000;1006hready'; r=$(dd bs=1 count=9 2>/dev/null); printf '\033[?1000lgot=%s off' "$(printf %s "$r" | od -An -c | tr -s ' ')"; r=$(dd bs=1 count=1 2>/dev/null); printf ' next=%s' "$r""#;
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 10));
+    h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("ready")));
+    h.session.send(SessionCommand::Mouse(left_press(2, 4)));
+    h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("off")));
+    // Dropped: the mode just went off, so this must reach nobody.
+    h.session.send(SessionCommand::Mouse(left_press(2, 4)));
+    h.type_str("x");
+    h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("next=x")));
+    let text = h.text().join(" ");
+    assert!(
+        text.contains("033 [ < 0 ; 5 ; 3 M"),
+        "the SGR press report; screen:\n{text}"
+    );
+}
+
+/// Focus reporting (DECSET 1004) reaches the program through the same door, `CSI I` for gaining the
+/// keys.
+#[test]
+fn a_focus_report_reaches_the_program_with_1004() {
+    let script = r#"stty raw -echo; printf '\033[?1004hready'; r=$(dd bs=1 count=3 2>/dev/null); printf 'got=%s' "$(printf %s "$r" | od -An -c | tr -s ' ')""#;
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 10));
+    h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("ready")));
+    h.session.send(SessionCommand::FocusReport(true));
+    h.wait_for(WAIT, |h| h.text().iter().any(|l| l.contains("got=")));
+    let text = h.text().join(" ");
+    assert!(text.contains("033 [ I"), "the CSI I focus-in report; screen:\n{text}");
+}
+
+/// `Update::mouse` is published (and the host wakes) the moment the live mode changes, not only
+/// with the next frame -- what lets the host route a click correctly even mid-synchronized-update.
+#[test]
+fn mouse_modes_are_published_when_they_change() {
+    let mut h = Harness::start(plain_sh(), size(80, 24));
+    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with('$')));
+    assert_eq!(h.mouse.map(|m| m.report), Some(false), "no mode asked for yet");
+    h.type_str("printf '\\033[?1000h'\n");
+    h.wait_for(WAIT, |h| h.mouse.is_some_and(|m| m.report));
+    h.type_str("printf '\\033[?1000l'\n");
+    h.wait_for(WAIT, |h| h.mouse.is_some_and(|m| !m.report));
 }

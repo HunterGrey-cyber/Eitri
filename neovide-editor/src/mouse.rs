@@ -132,7 +132,7 @@ pub(crate) fn handle_mouse_button(
         return;
     }
 
-    let content_region = current_content_region(gl_area, session.harness.grid_scale());
+    let content_region = current_content_region(session.fb_size.get(), session.harness.grid_scale());
     let position_from_event = pixel_to_grid_pos(
         x,
         y,
@@ -197,7 +197,7 @@ pub(crate) fn handle_mouse_motion(
         return;
     }
 
-    let content_region = current_content_region(gl_area, session.harness.grid_scale());
+    let content_region = current_content_region(session.fb_size.get(), session.harness.grid_scale());
     let grid_pos = pixel_to_grid_pos(
         x,
         y,
@@ -283,7 +283,7 @@ pub(crate) fn handle_mouse_scroll(
         amount_y /= grid_scale.height();
     }
 
-    let content_region = current_content_region(gl_area, session.harness.grid_scale());
+    let content_region = current_content_region(session.fb_size.get(), session.harness.grid_scale());
     // `EventControllerScroll` (unlike `GestureClick`/`EventControllerMotion`) never reports the
     // pointer's own x/y at all -- only deltas -- so the grid cell a scroll targets comes from
     // `last_pointer_pos`, the most recent position `EventControllerMotion` observed. See

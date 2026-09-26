@@ -359,4 +359,4 @@ export type ChooserRecord = {
   updatedAt: string;
   heldElsewhere: boolean;
 };
-export type ChooserEnvelope = { launch: boolean; open: ChooserTab[]; records: ChooserRecord[] };
+export type ChooserEnvelope = { open: ChooserTab[]; records: ChooserRecord[] };

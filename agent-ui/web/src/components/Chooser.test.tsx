@@ -19,7 +19,6 @@ const TAB2: TabInfo = {
 };
 
 const ENVELOPE: ChooserEnvelope = {
-  launch: false,
   open: [
     { tab: 1, label: "1 fix-parser", marker: null, pending: 0, resumable: true },
     { tab: 2, label: "2 legacy", marker: null, pending: 0, resumable: true },
@@ -100,14 +99,14 @@ describe("Chooser", () => {
     expect(props.onLeave).not.toHaveBeenCalled();
     expect(props.onCloseTab).not.toHaveBeenCalled();
   });
-  it("Esc and q leave, saying whether this was the launch chooser", () => {
-    const first = renderChooser({ envelope: { ...ENVELOPE, launch: true } });
+  it("Esc and q leave with no arguments (wave 4 R2: the chooser no longer says which chooser this was)", () => {
+    const first = renderChooser();
     fireEvent.keyDown(first.root, { key: "Escape" });
-    expect(first.props.onLeave).toHaveBeenCalledWith(true);
+    expect(first.props.onLeave).toHaveBeenCalledWith();
     cleanup();
     const second = renderChooser();
     fireEvent.keyDown(second.root, { key: "q" });
-    expect(second.props.onLeave).toHaveBeenCalledWith(false);
+    expect(second.props.onLeave).toHaveBeenCalledWith();
   });
   it("/ opens a filter; typing narrows the rows and Enter returns to the list", () => {
     const { root, container } = renderChooser();
@@ -164,7 +163,6 @@ describe("Chooser", () => {
   it("a record row's line 2 names the sidecar and its short id, or is untitled with neither name nor title", () => {
     const { container } = renderChooser({
       envelope: {
-        launch: false,
         open: [],
         records: [
           { providerSessionId: "aaaa1111bbbb", name: null, title: null, createdAt: "1", updatedAt: "2", heldElsewhere: false },
@@ -220,6 +218,12 @@ describe("Chooser", () => {
     fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
     expect(props.onCycleMode).toHaveBeenCalledTimes(1); // not called again
     expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("mode is fixed for this session");
+  });
+
+  it("Shift+Tab as WebKitGTK delivers it from a real keyboard (key Unidentified, code Tab) cycles too", () => {
+    const { root, props } = renderChooser();
+    fireEvent.keyDown(root, { key: "Unidentified", code: "Tab", keyCode: 9, shiftKey: true });
+    expect(props.onCycleMode).toHaveBeenCalledTimes(1);
   });
 
   it("Ctrl+r on an open tab opens its inline rename, posting rename_tab through onRenameTab on Enter", () => {

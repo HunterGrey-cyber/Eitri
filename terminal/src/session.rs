@@ -41,14 +41,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::term::TermMode;
 use terminal_input::NormalizedInput;
 use terminal_render::PaintList;
 
 use crate::clock::{RenderClock, FRAME_INTERVAL};
 use crate::listener::HostEvents;
+use crate::mouse::{self, MouseModes};
 use crate::outbox::Outbox;
 use crate::pty::{set_nonblocking, PtyChild, PtySize, SpawnSpec, HANGUP_GRACE};
 use crate::screen::{CursorCell, Screen, TerminalColors};
+use crate::scroll::ScrollRequest;
+use crate::select::SelectCommand;
 
 /// One read.
 const READ_CHUNK: usize = 64 * 1024;
@@ -74,13 +78,27 @@ pub enum SessionCommand {
     Input(NormalizedInput),
     /// A new grid: `TIOCSWINSZ` on the PTY and a `Term` resize, together. Below one cell is one cell.
     Resize(PtySize),
-    /// Whether the pane holds the keys: a solid cursor or a hollow one. Nothing else: no focus report
-    /// (`CSI I`/`CSI O`, DECSET 1004) reaches the program before phase 3 adds one (spec §6).
+    /// Whether the pane holds the keys: a solid cursor or a hollow one, and nothing else -- the
+    /// report is [`SessionCommand::FocusReport`], sent through the pane's one door (`submit`) so it
+    /// can never overtake keys still waiting behind a paste (whole-branch review 2026-09-24, window
+    /// minor 6). This command changes only the cursor's shape.
     Focus(bool),
+    /// A mouse press, release, motion or wheel notch, encoded on the session thread against the
+    /// live `TermMode` (bottom-terminal phase 3c). See [`crate::mouse`].
+    Mouse(crate::mouse::MouseInput),
+    /// Focus reporting (`CSI I`/`CSI O`, DECSET 1004), sent through the pane's door, unlike
+    /// [`SessionCommand::Focus`] (see its own doc).
+    FocusReport(bool),
     /// Whether the pane is on screen. Hidden, output is still read, parsed and answered, and nothing
     /// is rendered; shown again, the latest screen is rendered at once.
     Visible(bool),
     SetColors(TerminalColors),
+    /// A host scroll gesture (Task 7): `Shift+PageUp`/`Shift+PageDown`, a wheel notch,
+    /// `Shift+Home`/`Shift+End`. See [`crate::scroll::ScrollView`].
+    Scroll(ScrollRequest),
+    /// A host selection gesture (Task 8): a drag's start/extend/finish, or a clear. See
+    /// [`crate::select`].
+    Select(SelectCommand),
     /// Hang up the child, reap it (killing it after [`HANGUP_GRACE`]), and end the thread.
     Shutdown,
 }
@@ -144,6 +162,11 @@ pub struct Update {
     pub cursor: Option<CursorCell>,
     pub events: HostEvents,
     pub exited: Option<ExitInfo>,
+    /// The live mouse-mode summary (bottom-terminal phase 3c), latest-wins like `cursor`, and
+    /// `Option` for the same reason: `take_update` is `mem::take`, so an update with no mode change
+    /// (a bell, a title) must not overwrite the host's last-known modes with `MouseModes::default()`
+    /// and silently switch reporting off. Applied only when `Some`; see [`Worker::publish_mouse_modes`].
+    pub mouse: Option<MouseModes>,
 }
 
 /// How to start a session.
@@ -244,6 +267,7 @@ impl TerminalSession {
                     outbox: Outbox::new(),
                     sync_deadline: None,
                     events_pending: false,
+                    last_mouse: None,
                 };
                 match panic::catch_unwind(AssertUnwindSafe(move || worker.run())) {
                     Ok(exit) => exit,
@@ -370,6 +394,13 @@ struct Worker<'w> {
     /// for these), so without this flag a stream with events but no other screen change would never
     /// be judged "changed" and its title/bell would wait forever rather than for one frame.
     events_pending: bool,
+    /// The mouse-mode summary last published (bottom-terminal phase 3c): `None` until
+    /// [`Worker::publish_mouse_modes`] first runs, then always `Some`. Compared against the live
+    /// mode every loop turn so a change is published at once rather than waiting for the next frame
+    /// -- a synchronized update can hold a frame back for up to 150ms, and a host still routing
+    /// clicks on stale modes during that window would start a selection in a program that just
+    /// turned mouse reporting on (`htop`).
+    last_mouse: Option<MouseModes>,
 }
 
 enum Flow {
@@ -462,6 +493,7 @@ impl Worker<'_> {
             // In both states: a deadline left armed when the child detached would otherwise stay
             // in the past and turn `poll` into a busy loop.
             self.track_sync(Instant::now());
+            self.publish_mouse_modes();
             self.render_if_due(Instant::now());
         }
     }
@@ -485,6 +517,10 @@ impl Worker<'_> {
         loop {
             match self.commands.try_recv() {
                 Ok(SessionCommand::Input(input)) => {
+                    // Typing (never a bare modifier) and a paste both snap a scrolled-back view to
+                    // the bottom before the byte reaches the program -- alacritty's own
+                    // `on_terminal_input_start` (`Screen::note_input`'s own doc).
+                    self.screen.note_input(&input);
                     let bytes = terminal_input::encode(&input, self.screen.mode());
                     self.outbox.push_input(&bytes);
                     self.flush_outbox();
@@ -514,6 +550,41 @@ impl Worker<'_> {
                     }
                 }
                 Ok(SessionCommand::SetColors(colors)) => self.screen.set_colors(colors),
+                Ok(SessionCommand::Scroll(req)) => self.screen.scroll(req),
+                Ok(SessionCommand::Select(cmd)) => {
+                    self.screen.select(cmd);
+                    // `Finish`'s text has nowhere else to reach the host: unlike a PTY read, a
+                    // command never falls through to the run loop's own `publish_events` call, so
+                    // this command handler is the one place that has to make it (review: a copy
+                    // made with nothing typed afterward would otherwise sit unpublished until the
+                    // next byte of PTY output, which may never come).
+                    self.publish_events(Instant::now());
+                }
+                Ok(SessionCommand::Mouse(m)) => {
+                    // No `note_input`: a report is not typing (`mouse`'s own module doc) -- it must
+                    // not snap a scrolled-back view to the bottom or clear a selection.
+                    let mode = self.screen.mode();
+                    let bytes = match m.kind {
+                        // The wheel with no mouse mode on: the program gets local alternate-scroll
+                        // arrows instead of a report (the host already decided to send `Wheel` here
+                        // rather than a `Scroll` command, but only the live mode -- read on this
+                        // thread, never the host's possibly-stale copy -- may pick between the two).
+                        mouse::MouseKind::Wheel(dir) if !mode.intersects(TermMode::MOUSE_MODE) => {
+                            mouse::alternate_scroll(dir, 1, mode, mode.contains(TermMode::ALT_SCREEN))
+                        }
+                        _ => mouse::encode_mouse(&m, mode),
+                    };
+                    if let Some(bytes) = bytes {
+                        self.outbox.push_input(&bytes);
+                        self.flush_outbox();
+                    }
+                }
+                Ok(SessionCommand::FocusReport(focused)) => {
+                    if let Some(bytes) = mouse::encode_focus(focused, self.screen.mode()) {
+                        self.outbox.push_input(bytes);
+                        self.flush_outbox();
+                    }
+                }
                 Ok(SessionCommand::Shutdown) | Err(TryRecvError::Disconnected) => return true,
                 Err(TryRecvError::Empty) => return false,
             }
@@ -548,20 +619,22 @@ impl Worker<'_> {
 
     /// Title, bell and the two copies from the reads just done, merged into the pending update:
     /// latest title and copy win, bells fold into one.
-    /// Folds title/bell/clipboard into the pending update. Rides the render clock out rather than
-    /// ringing the host itself (engine review 2026-09-23, minor 1): a stream with an event on most
-    /// reads (a bell in a `cat` of a binary, say) used to wake the host once per loop turn instead
-    /// of once per rendered frame, and did so even while hidden, where phase 1's pump does nothing
-    /// with the wake anyway. Clipboard is the one exception: it is the one event this pump already
-    /// acts on, so hidden or not it rings at once rather than waiting for a clock this pane, while
-    /// hidden, never polls. A copy to the primary selection is the same kind of event (phase 2).
+    /// Folds title/bell/clipboard/selection into the pending update. Rides the render clock out
+    /// rather than ringing the host itself (engine review 2026-09-23, minor 1): a stream with an
+    /// event on most reads (a bell in a `cat` of a binary, say) used to wake the host once per loop
+    /// turn instead of once per rendered frame, and did so even while hidden, where phase 1's pump
+    /// does nothing with the wake anyway. Clipboard is the one exception: it is the one event this
+    /// pump already acts on, so hidden or not it rings at once rather than waiting for a clock this
+    /// pane, while hidden, never polls. A copy to the primary selection is the same kind of event
+    /// (phase 2), and so is a finished host selection (Task 8): the owner's clipboard should not
+    /// wait behind a clock for a gesture that already ended.
     fn publish_events(&mut self, now: Instant) {
         let events = self.screen.take_events();
         if events == HostEvents::default() {
             return;
         }
-        // Either copy: the pump puts both on the desktop at once (bottom-terminal phase 2).
-        let has_clipboard = events.clipboard.is_some() || events.primary.is_some();
+        // Any of the three: the pump puts them on the desktop at once (bottom-terminal phases 2/3).
+        let has_clipboard = events.clipboard.is_some() || events.primary.is_some() || events.selection.is_some();
         self.apply_pending(|update| {
             if events.title.is_some() {
                 update.events.title = events.title;
@@ -572,6 +645,9 @@ impl Worker<'_> {
             }
             if events.primary.is_some() {
                 update.events.primary = events.primary;
+            }
+            if events.selection.is_some() {
+                update.events.selection = events.selection;
             }
         });
         if !self.visible {
@@ -631,13 +707,33 @@ impl Worker<'_> {
         if changed || self.clock.is_due(now) {
             let frame = self.screen.render(self.focused);
             let cursor = self.screen.cursor_cell();
+            // Beside `cursor`, not instead of `publish_mouse_modes`'s own change-detected publish:
+            // every frame carries the mode it was rendered under, so a host that only ever reads
+            // `update.mouse` off a frame it took (never off a bare mode-change ring) still sees it.
+            let modes = MouseModes::from_mode(self.screen.mode());
+            self.last_mouse = Some(modes);
             self.clock.rendered(now);
             self.events_pending = false;
             self.shared.renders.fetch_add(1, Ordering::SeqCst);
             self.publish(|update| {
                 update.frame = Some(frame);
                 update.cursor = Some(cursor);
+                update.mouse = Some(modes);
             });
+        }
+    }
+
+    /// The live mouse-mode summary, published (and the host rung) the moment it changes, called
+    /// once per loop turn regardless of whether a frame renders this turn (bottom-terminal phase
+    /// 3c). Change-detected rather than tied to a frame: a synchronized update can hold every frame
+    /// back for up to [`SYNC_UPDATE_TIMEOUT`], and a host still routing a click on stale modes
+    /// during that gap would start a selection in a program (`htop`) that just turned mouse
+    /// reporting on.
+    fn publish_mouse_modes(&mut self) {
+        let modes = MouseModes::from_mode(self.screen.mode());
+        if self.last_mouse != Some(modes) {
+            self.last_mouse = Some(modes);
+            self.publish(|update| update.mouse = Some(modes));
         }
     }
 
@@ -676,11 +772,14 @@ impl Worker<'_> {
             .feed(format!("\r\n\x1b[0;2m{}\x1b[0m", exit.notice()).as_bytes());
         let frame = self.screen.render(self.focused);
         let cursor = self.screen.cursor_cell();
+        let modes = MouseModes::from_mode(self.screen.mode());
+        self.last_mouse = Some(modes);
         self.shared.renders.fetch_add(1, Ordering::SeqCst);
         self.publish(|update| {
             update.frame = Some(frame);
             update.cursor = Some(cursor);
             update.exited = Some(exit);
+            update.mouse = Some(modes);
         });
         exit
     }

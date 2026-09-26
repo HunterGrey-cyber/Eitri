@@ -792,6 +792,27 @@ describe("index.css", () => {
     }
   });
 
+  it("the status band is one editor row high, and never grows (wave 4, R5)", () => {
+    // Owner (issue 3): "agent pane最下面的input >> auto那一行太宽了，最好做到和旁边neovim底下的
+    // status一样宽" -- the band used to be `min-height: 24px`, which grows with whatever its
+    // children need (the `⏵⏵` fallback symbol font in particular). `--nv-editor-row` is the
+    // editor's own cell height (`core/src/theme/tokens.rs`, `ThemeTokens.editor_row_px`); a fixed
+    // `height` plus `overflow: hidden` is what actually stops the grow, not just a bigger min.
+    const [band] = rulesMatching(withoutComments, ".status-band").filter((r) => r.selector.trim() === ".status-band");
+    const decl = (name: string) =>
+      band.body
+        .split(";")
+        .map((d) => d.trim())
+        .find((d) => d.startsWith(`${name}:`))
+        ?.slice(name.length + 1)
+        .trim();
+    expect(decl("height")).toBe("var(--nv-editor-row, 24px)");
+    expect(decl("min-height")).toBeUndefined();
+    expect(decl("box-sizing")).toBe("border-box");
+    expect(decl("overflow")).toBe("hidden");
+    expect(decl("line-height")).toBe("calc(var(--nv-editor-row, 24px) - 1px)");
+  });
+
   /* In-flight motion (2026-09-20-in-flight-motion-design.md) §5.3's two structural assertions: "the
      element is absent" <=> "no animation is running" has to be a property of the FILE, not of this
      document, so a second animated selector or a second @keyframes reusing the idea would be a

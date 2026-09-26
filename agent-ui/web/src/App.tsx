@@ -9,6 +9,7 @@ import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
+import { isModeCycleKey, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -307,6 +308,9 @@ export default function App() {
    *  its first render's value forever. Assigned during render, so it is current by the time any
    *  later envelope arrives. */
   const sessionStartedRef = useRef(false);
+  /** Whether `<leader>` `mode.cycle` can no longer cycle this tab: any state but `not_started`
+   *  (`modeKeyRoute`'s rule, R4), so a `starting` or `failed` tab's box greys the entry too. */
+  const modeFixed = activeTab !== null && activeTab.state !== "not_started";
   sessionStartedRef.current = sessionStarted;
   /** A fatal, session-ending failure, shown in the panel. Replaces window.alert, which cannot be
    * copied, cannot show the sidecar's own multi-line startup diagnostics, and blocks the WebView. */
@@ -719,10 +723,19 @@ export default function App() {
         setHandoffOpen(true);
         break;
       case "mode.cycle":
-        // Disabled in the box once a session has started (`leader.ts`'s own `boxEntries` doc
-        // comment): cycling makes no sense any more, so this flashes rather than posting.
-        if (sessionStarted) showFlash("mode is fixed for this session");
-        else post({ type: "cycle_mode" });
+        // Disabled in the box once the tab is no longer `not_started` (`leader.ts`'s own
+        // `boxEntries` doc comment): cycling makes no sense any more, so this flashes rather than
+        // posting. Routed through `modeKeyRoute`, the same rule Shift+Tab uses (R4), so a
+        // `starting` or `failed` tab flashes here too instead of posting a `cycle_mode` Rust's
+        // `TabSet::cycle_mode` would only refuse.
+        switch (modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: activeTab?.state ?? null })) {
+          case "cycle":
+            post({ type: "cycle_mode" });
+            break;
+          case "fixed":
+            showFlash(modeFixedMessage(keymapHelp.newTabChord));
+            break;
+        }
         break;
     }
   }
@@ -775,9 +788,10 @@ export default function App() {
   const [confirm, setConfirm] = useState<
     { kind: "close"; tab: TabId; lines: string[] } | { kind: "close_others"; lines: string[] } | null
   >(null);
-  /** `prefix w` (spec §3.6) and the launch chooser (D10): the open-tabs-then-records overlay, or
-   *  `null` when closed. Set by a `chooser` envelope; not tab-scoped (`tabs.ts`'s `TAB_SCOPED`
-   *  omits it) since it is a window-wide picker, not a view of the active tab. */
+  /** `prefix w` (spec §3.6): the open-tabs-then-records overlay, or `null` when closed. Set by a
+   *  `chooser` envelope; not tab-scoped (`tabs.ts`'s `TAB_SCOPED` omits it) since it is a
+   *  window-wide picker, not a view of the active tab. Wave 4 R2: no longer opened at launch (D10
+   *  is gone), only by this key. */
   const [chooser, setChooser] = useState<ChooserEnvelope | null>(null);
   /** Wave 3 Task 1 (launch-chooser bug investigation, `~/.cache/launch-chooser-bug/`): true while an
    *  overlay drawn OVER the conversation or the empty tab owns the keys -- the chooser, a tab
@@ -819,6 +833,18 @@ export default function App() {
   /** The panel's own which-key table (panel round 2 plan, Task 8), read off `keymapHelp` -- Task 7's
    *  own note above is this task. */
   const panelTable = keymapHelp.panel;
+  /** Wave 4 Task 1: mirrors of state the document-capture Shift+Tab router (below, `onModeKey`)
+   *  must read live -- refs so that effect, installed once with an empty dependency array, always
+   *  sees this render's values rather than the one from when it was installed. Assigned here in the
+   *  render body, the same pattern `sessionStartedRef` above already uses. */
+  const confirmOpenRef = useRef(false);
+  confirmOpenRef.current = confirm !== null;
+  const chooserOpenRef = useRef(false);
+  chooserOpenRef.current = chooser !== null;
+  const tabsRef = useRef<TabsEnvelope | null>(null);
+  tabsRef.current = tabs;
+  const newTabChordRef = useRef("");
+  newTabChordRef.current = keymapHelp.newTabChord;
   /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
    *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
   const keymapOverlayRef = useRef<HTMLDivElement>(null);
@@ -904,6 +930,29 @@ export default function App() {
     if (isEditableElement(document.activeElement)) return;
     containerRef.current?.focus();
   }, [mode, sessionStarted]);
+  /* Wave 4 Task 1: Shift+Tab is Claude Code's mode key everywhere in the chat, and never focus
+     navigation (owner, 2026-09-26: "在agent pane都要可以直接切换"). Capture phase on `document`: ahead
+     of every React handler (EmptyTab's, Composer's, Chooser's, this component's own `onKeyDown`) and
+     of WebKit's own default backward-focus-navigation handling for Shift+Tab, which is what used to
+     hand the keys to GTK's window `move-focus` once WebKit ran out of focusable elements. */
+  useEffect(() => {
+    function onModeKey(event: globalThis.KeyboardEvent) {
+      if (!isModeCycleKey(event)) return;
+      event.preventDefault();
+      const route = modeKeyRoute({
+        confirmOpen: confirmOpenRef.current,
+        chooserOpen: chooserOpenRef.current,
+        tabState: activeTabInfo(tabsRef.current)?.state ?? null,
+      });
+      if (route === "overlay") return;
+      event.stopPropagation();
+      if (route === "cycle") post({ type: "cycle_mode" });
+      else if (route === "fixed") showFlash(modeFixedMessage(newTabChordRef.current));
+    }
+    document.addEventListener("keydown", onModeKey, true);
+    return () => document.removeEventListener("keydown", onModeKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   /* Keys that land on <body> are handed back to the panel. That happens whenever the focused
      control stops existing or stops being focusable: a Dismiss that removes its own banner, an
      Approve that goes disabled once answered. A browser moves focus to <body> in both cases without
@@ -1783,14 +1832,13 @@ export default function App() {
         // lets bubble can never advance a stale one (the whole-branch review).
         pendingRef.current = null;
         clearSequence();
-        // `prefix w` (spec §3.6) or the launch chooser (D10): the other two overlays over the
-        // conversation area must not fight it for the keys, the same reason `begin_rename` and
-        // `confirm_close` close them.
+        // `prefix w` (spec §3.6): the other two overlays over the conversation area must not fight
+        // it for the keys, the same reason `begin_rename` and `confirm_close` close them.
         setDetail(null);
         setHandoffOpen(false);
         setKeymapOpen(false);
         setRenaming(null);
-        setChooser({ launch: payload.launch, open: payload.open, records: payload.records });
+        setChooser({ open: payload.open, records: payload.records });
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
         setQueueError(payload.error);
@@ -2002,10 +2050,10 @@ export default function App() {
     setInputRequest((n) => n + 1);
   }
 
-  /** `prefix w` (spec §3.6, ruling ordering: open tabs first, then records to resume) and the
-   *  launch chooser (D10). Every callback closes the overlay and returns the keys to the panel
-   *  root, except `onLeave(true)` (Esc/q at launch), where `shell` moves them to the editor instead
-   *  (spec §3.6: "Esc/q 交给编辑器") -- calling `returnKeysToRoot` there would fight that hand-off. */
+  /** `prefix w` (spec §3.6, ruling ordering: open tabs first, then records to resume). Every
+   *  callback closes the overlay and returns the keys to the panel root -- D10's launch chooser is
+   *  gone (wave 4 R2), so there is no `onLeave(true)` case that hands the keys to the editor
+   *  instead any more. */
   function onChooserSwitch(tab: TabId) {
     postToRust({ type: "select_tab", request_id: nextRequestId(), tab });
     setChooser(null);
@@ -2024,10 +2072,9 @@ export default function App() {
     setConfirm({ kind: "close", tab, lines: [`close ${label}? (y/n)`] });
     returnKeysToRoot();
   }
-  function onChooserLeave(launch: boolean) {
-    postToRust({ type: "chooser_closed", request_id: nextRequestId(), launch });
+  function onChooserLeave() {
     setChooser(null);
-    if (!launch) returnKeysToRoot();
+    returnKeysToRoot();
   }
   /** The chooser's own `New session` row (panel round 2 plan, Task 11; spec §6.1/§6.4): the same
    *  window-level `tab_verb new` the `tab.new` action already posts (`handleAction` above),
@@ -2149,8 +2196,8 @@ export default function App() {
             focusRequest={inputRequest}
             arriveRequest={arriveRequest}
             // Wave 3 Task 1: `EmptyTab` bumps `Composer`'s focus itself and lands its own root on a
-            // bare `keysRequest`, so the chooser drawn over an empty tab 1 (D10, launch chooser) and
-            // a `keysRequest` bump both reach it directly rather than through `App`'s own
+            // bare `keysRequest`, so the `prefix w` chooser drawn over an empty tab 1 and a
+            // `keysRequest` bump both reach it directly rather than through `App`'s own
             // `containerRef`, which does not exist on this layout.
             keysRequest={emptyKeysRequest}
             overlayOpen={overlayOpen}
@@ -2221,9 +2268,8 @@ export default function App() {
           }}
           paneFocused={paneFocused}
         />
-        {/* The launch chooser (D10) opens over an empty tab 1, before the chat is given the keys --
-            `.agent-ui-root` is this layout's own positioned ancestor (it has no `.agent-ui-scroller`
-            to nest inside). */}
+        {/* `prefix w`'s chooser can open over an empty tab 1 too -- `.agent-ui-root` is this layout's
+            own positioned ancestor (it has no `.agent-ui-scroller` to nest inside). */}
         {chooser !== null && (
           <Chooser
             envelope={chooser}
@@ -2726,11 +2772,11 @@ export default function App() {
    *  to decide between them. */
   const box: { title: string; entries: BoxEntry[] } | null =
     seq !== null
-      ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, sessionStarted) }
+      ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, modeFixed) }
       : pendingRef.current !== null
         ? {
             title: pendingRef.current,
-            entries: [...FIXED_PENDING_ENTRIES[pendingRef.current], ...boxEntries(panelTable, [pendingRef.current], sessionStarted)],
+            entries: [...FIXED_PENDING_ENTRIES[pendingRef.current], ...boxEntries(panelTable, [pendingRef.current], modeFixed)],
           }
         : null;
 
@@ -2916,9 +2962,6 @@ export default function App() {
         onOpenKeymap={() => {
           setMode("browse");
           setKeymapOpen(true);
-        }}
-        onShiftTab={() => {
-          if (!state.capabilities.modeSwitch) showFlash("mode is fixed for this session");
         }}
       />
       {/* N2/R4: `gf` with several paths, and the open `/` prompt, each still own every key

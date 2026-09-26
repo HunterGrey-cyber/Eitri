@@ -37,7 +37,7 @@ export function choosable(row: ChooserRow): boolean {
   return row.kind !== "record" || !row.record.heldElsewhere;
 }
 
-/** `prefix w` (and D10's launch chooser): `New session` first, then open tabs, then records open
+/** `prefix w`: `New session` first, then open tabs, then records open
  *  in no tab -- Rust's own order (spec §6.1). `tabs` joins each open row to its `TabInfo` for
  *  number/name/title/mode/state (spec §10.1: "The chooser's open rows join the `tabs` entry of the
  *  same id"). `New session` drops out while filtering (it matches nothing typed, and staying would

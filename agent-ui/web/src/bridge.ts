@@ -34,7 +34,6 @@ export type OutboundMessage =
    *  a resume from here would open a fresh one. Cycles `TabSet::default_mode` and re-sends `tabs`. */
   | { type: "cycle_default_mode"; request_id: string }
   | { type: "open_detail"; request_id: string; tab: TabId }
-  | { type: "chooser_closed"; request_id: string; launch: boolean }
   /** Global `f` HINT: panel has pressed `f` in BROWSE, asking shell to start a global HINT. */
   | { type: "hint_request"; request_id: string }
   /** Answer to hint_collect: the number of visible targets the panel froze for this sessionId. */

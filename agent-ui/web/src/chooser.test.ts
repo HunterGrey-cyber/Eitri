@@ -8,7 +8,6 @@ const TAB: TabInfo = {
 };
 
 const ENVELOPE: ChooserEnvelope = {
-  launch: false,
   open: [
     { tab: 1, label: "1 fix-parser", marker: "needs_input", pending: 2, resumable: true },
     { tab: 2, label: "2 legacy one", marker: null, pending: 0, resumable: false },
@@ -51,7 +50,6 @@ describe("chooserRows", () => {
     // record with both fields set was searchable only by `name`, even though the placeholder
     // ("filter by name or title") and the row itself both show the title too.
     const named: ChooserEnvelope = {
-      launch: false,
       open: [],
       records: [{ providerSessionId: "renamed-0000", name: "notes", title: "fix the parser bug", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
     };

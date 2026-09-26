@@ -802,6 +802,14 @@ impl TabSet {
             .count()
     }
 
+    /// `<leader>bd` (wave 4, R1): vim's `:bd` closes a buffer at once unless it has changes to lose (E89); here the
+    /// things to lose are a running turn, a connect in flight, and queued messages -- the facts `close_prompt`
+    /// names. `prefix &` does not ask this: it is tmux's `confirm-before` and always asks.
+    pub fn close_needs_confirm(&self, id: TabId) -> bool {
+        self.get(id)
+            .is_some_and(|t| matches!(t.backend, TabBackend::Starting(_)) || t.turn_running() || !t.queue.is_empty())
+    }
+
     pub fn close_facts(&self, id: TabId) -> Option<tabs::CloseFacts> {
         let tab = self.get(id)?;
         Some(tabs::CloseFacts {
@@ -939,6 +947,18 @@ impl TabSet {
         let Some(tab) = self.get_mut(id) else { return false };
         tab.draft = text.to_string();
         true
+    }
+
+    /// A prompt was sent from `id`'s composer: whatever of it the panel had mirrored here is no
+    /// longer a draft. The composer clears its own box on Enter and mirrors `""` 300 ms later, but a
+    /// tab's state payloads (`active_state_payloads`, sent again when a first turn's connect
+    /// finishes) carry this copy, and the panel adopts it over its own pending `""` -- so the text
+    /// just sent came back into the box of the conversation it had started (wave-4 GUI pass,
+    /// 2026-09-26). Cleared here, at the send, rather than waiting for the mirror.
+    pub fn note_sent(&mut self, id: TabId) {
+        if let Some(tab) = self.get_mut(id) {
+            tab.draft.clear();
+        }
     }
 
     /// The queued texts of one tab, oldest first (the close path reads them before removing it).
@@ -1587,6 +1607,41 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// Wave 4 R1: vim's `:bd` asks only when something would be lost (E89); so does `<leader>bd`.
+    #[test]
+    fn closing_asks_only_for_a_running_turn_a_connect_or_a_queue() {
+        let dir = workspace("tabs-close-needs-confirm");
+        let mut set = set();
+        let empty = set.active();
+        assert!(!set.close_needs_confirm(empty), "an empty tab has nothing to lose");
+        assert!(!set.close_needs_confirm(TabId(999)), "no such tab");
+
+        let connecting = set.open();
+        let (_tx, result_rx) = mpsc::channel();
+        set.get_mut(connecting).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "req-1".into(),
+            result_rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        assert!(
+            set.close_needs_confirm(connecting),
+            "a connect in flight (ruling 15 counts it as running)"
+        );
+
+        let (provider, backend) = live(&dir);
+        set.get_mut(empty).unwrap().backend = TabBackend::Live(backend);
+        assert!(!set.close_needs_confirm(empty), "an idle live tab: nothing to lose");
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, empty, true);
+        assert!(set.close_needs_confirm(empty), "a running turn");
+        assert_eq!(set.queue_message(empty, "later", "later".into(), 1), Ok(1));
+        assert!(set.close_needs_confirm(empty), "a running turn with a queue");
+        shut_down_all(&mut set);
+    }
+
     /// The phase-3 GUI pass (2026-09-25): the elapsed clock read `0s+` after a tab switch, because
     /// the panel holds only the active tab's state and restarted the clock at the snapshot. The tab
     /// now keeps when its running turn started, from the first tick that delivered it, and the
@@ -1925,6 +1980,24 @@ mod tests {
         assert_eq!(live_payloads[1].1["items"][0]["text"], "queued");
         assert_eq!(live_payloads[2].1["text"], "typing");
         shut_down_all(&mut set);
+    }
+
+    /// Wave-4 GUI pass: a first message sent from an empty tab left its mirrored draft here, and the
+    /// state payloads sent once the connect finished put the sent text back into the new
+    /// conversation's composer.
+    #[test]
+    fn a_sent_prompt_is_no_longer_the_tabs_draft() {
+        let mut set = set();
+        let tab = set.active();
+        set.set_draft(tab, "STREAM2 abc");
+        set.note_sent(tab);
+        let draft = set
+            .active_state_payloads()
+            .into_iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(&p).unwrap())
+            .find(|v| v["kind"] == "draft")
+            .expect("a draft payload");
+        assert_eq!(draft["text"], "");
     }
 
     /// Review focus 4: a draft edited in nvim returns to the tab it came from, after a switch too.

@@ -153,6 +153,14 @@ pub struct ThemeTokens {
     pub font_size_px: f32,
     /// `"light"` or `"dark"`, for CSS `color-scheme`.
     pub color_scheme: &'static str,
+    /// The editor's own cell height, in CSS px, set by `shell` from `neovide-editor`'s
+    /// `connect_cell_size_changed` -- `None` until nvim has reported a font (wave 4, R5: "agent
+    /// pane最下面的input >> auto那一行太宽了，最好做到和旁边neovim底下的status一样宽"). Carried
+    /// through the `ready` handshake and a reload the same way `font_size_px` is, with no new
+    /// envelope: `--nv-editor-row` only appears in `css_vars()` when this is `Some`, so a reload
+    /// before the editor's first frame gets `index.css`'s own `24px` fallback rather than a
+    /// missing variable.
+    pub editor_row_px: Option<f32>,
 }
 
 /// The `font-size` `index.css` was written against, and what `--nv-font-size` is unless a host says
@@ -316,6 +324,7 @@ impl ThemeTokens {
             font_mono: mono_font_stack(&payload.options.guifont),
             font_size_px: DEFAULT_PANEL_FONT_SIZE_PX,
             color_scheme: if light { "light" } else { "dark" },
+            editor_row_px: None,
         }
     }
 
@@ -354,6 +363,9 @@ impl ThemeTokens {
         // `{}` on an `f32` prints `14`, not `14.0`, so the common case reads as it was typed.
         vars.push(("--nv-font-size".to_string(), format!("{}px", self.font_size_px)));
         vars.push(("--nv-color-scheme".to_string(), self.color_scheme.to_string()));
+        if let Some(px) = self.editor_row_px {
+            vars.push(("--nv-editor-row".to_string(), format!("{px}px")));
+        }
         vars
     }
 }
@@ -459,6 +471,21 @@ mod tests {
             .map(|((n, _), _)| n.as_str())
             .collect();
         assert_eq!(moved, vec!["--nv-font-size"]);
+    }
+
+    /// Wave 4, R5: absent, the panel keeps `index.css`'s own `24px` fallback; `shell` sets it the
+    /// moment `neovide-editor`'s `connect_cell_size_changed` reports a cell height.
+    #[test]
+    fn the_editor_row_is_a_css_var_only_once_the_editor_reported_it() {
+        let mut t = ThemeTokens::fallback();
+        assert!(
+            t.css_vars().iter().all(|(n, _)| n != "--nv-editor-row"),
+            "absent: the CSS fallback applies"
+        );
+        t.editor_row_px = Some(22.0);
+        assert!(t
+            .css_vars()
+            .contains(&("--nv-editor-row".to_string(), "22px".to_string())));
     }
 
     #[test]

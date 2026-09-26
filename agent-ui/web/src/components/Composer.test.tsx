@@ -239,12 +239,9 @@ describe("Composer in BROWSE (C2)", () => {
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...");
   });
 
-  it("hands Shift+Tab to the host when asked to (D6)", () => {
-    const onShiftTab = vi.fn();
-    const { textarea } = renderComposer({ onShiftTab });
-    fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
-    expect(onShiftTab).toHaveBeenCalledTimes(1);
-  });
+  // Wave 4 Task 1: `onShiftTab` is gone -- App.tsx's document-capture router (`modeKey.ts`) now
+  // claims Shift+Tab ahead of this component entirely, in every mode, not just here (D6 is
+  // superseded; see App.test.tsx's "Shift+Tab anywhere in the chat" describe block).
 });
 
 describe("Composer during a turn (C1, F1)", () => {
@@ -517,10 +514,11 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       });
     },
     "Shift+Tab": () => {
-      const onShiftTab = vi.fn();
-      const { textarea } = renderComposer({ onShiftTab });
-      fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
-      expect(onShiftTab).toHaveBeenCalledTimes(1);
+      // Wave 4 Task 1: `Composer` must leave it to bubble -- App.tsx's document-capture router
+      // (`modeKey.ts`) now claims it ahead of every React handler, in every mode, not just here
+      // (see App.test.tsx's "Shift+Tab anywhere in the chat" describe block).
+      const { textarea } = renderComposer();
+      expect(fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true })).toBe(true);
     },
     Esc: () => {
       const { textarea } = renderComposer();

@@ -313,11 +313,22 @@ body,
    strength, rather than a blend of them -- the mockup's `today` style (a plain surface, the mode
    section marked by its own cursorline fill and a 3px left border), which is exactly what the old
    `.panel-footer .mode-block` already did, carried forward rather than reinvented. */
+/* Wave 4, R5 (owner, issue 3): "agent pane最下面的input >> auto那一行太宽了，最好做到和旁边neovim
+   底下的status一样宽" -- `min-height` grows with whatever the band's children need (the `⏵⏵`
+   fallback symbol font in particular has its own metrics), so the band never actually matched the
+   editor's own statusline beside it. `--nv-editor-row` is the editor's real cell height
+   (`core/src/theme/tokens.rs`, `ThemeTokens.editor_row_px`, `None` until `neovide-editor` reports
+   one -- the `24px` fallback is what a reload before that first report, or `--clean`, still
+   shows). `box-sizing: border-box` folds the 1px `border-top` into that fixed height rather than
+   adding to it, and `overflow: hidden` is what actually stops a child from growing the row instead
+   of clipping to it -- a bigger min-height alone would not have fixed this. */
 .status-band {
   display: flex;
   align-items: center;
-  min-height: 24px;
-  line-height: 24px;
+  height: var(--nv-editor-row, 24px);
+  box-sizing: border-box;
+  overflow: hidden;
+  line-height: calc(var(--nv-editor-row, 24px) - 1px);
   padding: 0 12px;
   border-top: 1px solid var(--nv-border);
   font-family: var(--nv-font-mono);
@@ -1474,7 +1485,7 @@ body,
   background: var(--nv-cursorline);
 }
 
-/* `prefix w` (spec §3.6, session tabs Task 12) and the launch chooser (D10): shaped exactly like
+/* `prefix w` (spec §3.6, session tabs Task 12): shaped exactly like
    `.keymap-overlay` and `.detail-popover` above -- same overlay, same surface, same positioning --
    over `.agent-ui-scroller` in the conversation layout and over `.agent-ui-root` (also
    `position: relative`) in the empty layout, since that screen has no scroller of its own. Body

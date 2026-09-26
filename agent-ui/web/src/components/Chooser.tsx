@@ -4,6 +4,7 @@ import type { BackendKind, ChooserEnvelope, PermissionModeChoice, TabId, TabInfo
 import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
+import { isShiftTab } from "../modeKey";
 
 type Props = {
   envelope: ChooserEnvelope;
@@ -25,7 +26,7 @@ type Props = {
   onCloseTab: (tab: TabId) => void;
   onRenameTab: (tab: TabId, name: string) => void;
   onCycleMode: () => void;
-  onLeave: (launch: boolean) => void;
+  onLeave: () => void;
 };
 
 /** An IME's own Enter/Esc: `isComposing`, or the legacy 229 some WebKit builds still report. */
@@ -223,7 +224,20 @@ export function Chooser({
   // drops it and then does what it does.
   const pendingG = useRef(false);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (filtering || renaming !== null || composing(event)) return;
+    if (composing(event)) return;
+    // Wave 4 Task 1: Shift+Tab is claimed here even while the filter or rename input is focused --
+    // App.tsx's document-capture router (`modeKey.ts`) already routed here (`route === "overlay"`)
+    // because the chooser is open, and this component's own row-dependent choice (`cycleMode`) still
+    // decides between `cycle_mode` and `cycle_default_mode`. Ahead of the filtering/renaming guard,
+    // deliberately: that guard exists to stop navigation keys from fighting a typed value, but
+    // Shift+Tab types nothing into either box.
+    if (isShiftTab(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      cycleMode(current);
+      return;
+    }
+    if (filtering || renaming !== null) return;
     const key = event.key;
     if (key === "g" || key === "G") {
       event.preventDefault();
@@ -240,12 +254,6 @@ export function Chooser({
       if (current?.kind === "tab") setRenaming({ tab: current.tab.tab, value: current.tab.label });
       return;
     }
-    if (event.shiftKey && key === "Tab") {
-      event.preventDefault();
-      event.stopPropagation();
-      cycleMode(current);
-      return;
-    }
     if (!["j", "k", "Enter", "x", "/", "Escape", "q"].includes(key)) return;
     event.preventDefault();
     event.stopPropagation();
@@ -256,7 +264,7 @@ export function Chooser({
       if (current?.kind === "tab") onCloseTab(current.tab.tab);
       // else: `x` is only bound on an open tab's row (the keys line says so); do nothing.
     } else if (key === "/") setFiltering(true);
-    else if (key === "Escape" || key === "q") onLeave(envelope.launch);
+    else if (key === "Escape" || key === "q") onLeave();
   }
 
   const shownCount = rows.filter((r) => r.kind !== "new").length;
