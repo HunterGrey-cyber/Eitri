@@ -647,11 +647,19 @@ export default function App() {
    *  old row at its unchanged index and undo ordinary keyboard navigation. */
   const cursorKeyRef = useRef<string | null>(null);
   const prevTimelineRef = useRef<TimelineItem[] | null>(null);
+  /* Reconcile only when `timeline` changed and `cursor` did not. Streamed deltas create a new
+     timeline object, so reconciling a simultaneous clamp, keyboard move or restore would put the
+     cursor back on its old row. Moving back can reveal a stale row and stop `MessageList`
+     following the end after the intended move consumed the restore's reveal suppression. A
+     cursor moved in this render already has an intended destination. */
+  const prevCursorRef = useRef(cursor);
   useLayoutEffect(() => {
     const timelineChanged = prevTimelineRef.current !== null && prevTimelineRef.current !== timeline;
+    const cursorMoved = prevCursorRef.current !== cursor;
     prevTimelineRef.current = timeline;
+    prevCursorRef.current = cursor;
     const want = cursorKeyRef.current;
-    if (timelineChanged && want !== null && timeline[cursor]?.key !== want) {
+    if (timelineChanged && !cursorMoved && want !== null && timeline[cursor]?.key !== want) {
       const found = indexOfKey(timeline, want);
       if (found !== null && found !== cursor) {
         landingRef.current = "keep";
@@ -702,7 +710,12 @@ export default function App() {
   const landOnPromptRef = useRef(false);
   /** Set by a switch's (or a mount's) first snapshot with no saved view: see the `snapshot` arm. */
   const landOnLastRef = useRef(false);
-  useEffect(() => {
+  /* Use a layout effect to move the cursor before scroll events can clamp it to another visible
+     row. A passive effect runs after the browser dispatches the scroll from `MessageList`
+     snapping to the end. If the new last row is taller than the view, the old last row may be
+     off screen and the clamp can break cursor following. The child's snap layout effect has
+     already run here, so the distance read below reflects it. */
+  useLayoutEffect(() => {
     const previous = lastLengthRef.current;
     lastLengthRef.current = timeline.length;
     if (landOnLastRef.current) {
@@ -751,8 +764,16 @@ export default function App() {
     restoreRef.current = null;
     const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
     if (!list) return;
+    // A tab left while following comes back following (the small-defects GUI pass, 2026-09-25):
+    // said outright, as a send does, rather than as a scroll to the end the list reads a frame later
+    // inside a steering window -- where any other movement above the end counted as the user
+    // scrolling up. A tab left parked comes back exactly where it was.
+    if (view.atBottom) {
+      resumeFollowing(list);
+      return;
+    }
     noteUserScroll(list, "unknown");
-    list.scrollTop = view.atBottom ? list.scrollHeight : view.scrollTop;
+    list.scrollTop = view.scrollTop;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restoreTick]);
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
@@ -1074,9 +1095,13 @@ export default function App() {
           const view = restoreRef.current;
           // Set `"keep"` only when the cursor moves. An unchanged `setCursor` fires no `[cursor]`
           // effect to consume it, so it would suppress the next move's reveal, including a landing
-          // on a card below the restored view.
-          if (view.cursor !== cursorRef.current) landingRef.current = "keep";
-          setCursor(view.cursor);
+          // on a card below the restored view. A view that was following the end returns to the
+          // last row through `landOnLastRef`: rows may have arrived while the tab was away, making
+          // its saved cursor stale.
+          if (!view.atBottom) {
+            if (view.cursor !== cursorRef.current) landingRef.current = "keep";
+            setCursor(view.cursor);
+          }
           setMode(view.mode);
           setExpanded(view.expanded);
           setDetailed(view.detailed);
@@ -1093,7 +1118,7 @@ export default function App() {
           // A tab with no saved view opens at the bottom because `MessageList` follows from mount.
           // Put the cursor on the last row in the `[timeline]` effect once the snapshot's rows
           // exist, so it stays visible. A pending-card landing below takes priority.
-          if (restoreRef.current === null) landOnLastRef.current = true;
+          if (restoreRef.current === null || restoreRef.current.atBottom) landOnLastRef.current = true;
           if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
         }
         // A snapshot means a session is genuinely RUNNING, which is also when Rust clears its own
