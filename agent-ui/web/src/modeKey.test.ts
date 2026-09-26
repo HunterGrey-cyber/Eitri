@@ -26,13 +26,17 @@ describe("isModeCycleKey", () => {
 });
 
 describe("modeKeyRoute", () => {
-  const base = { confirmOpen: false, chooserOpen: false, tabState: "not_started" as const };
+  const base = { confirmOpen: false, chooserOpen: false, tabState: "not_started" as const, canSwitch: false };
   it("cycles an empty tab", () => expect(modeKeyRoute(base)).toBe("cycle"));
-  it("says the mode is fixed once a session exists or is starting", () => {
-    for (const tabState of ["starting", "live", "ended", "failed"] as const) {
+  it("says the mode is fixed once a session exists, without the switch capability", () => {
+    for (const tabState of ["live", "ended", "failed"] as const) {
       expect(modeKeyRoute({ ...base, tabState })).toBe("fixed");
     }
   });
+  // Wave 5: a starting tab always says so (W5) -- the fixed-mode text would be wrong on a
+  // switch-capable sidecar, so it is never shown here regardless of `canSwitch`.
+  it("says a starting session is starting, even without the switch capability", () =>
+    expect(modeKeyRoute({ ...base, tabState: "starting" })).toBe("starting"));
   it("leaves an open prompt or chooser its own key", () => {
     expect(modeKeyRoute({ ...base, confirmOpen: true })).toBe("overlay");
     expect(modeKeyRoute({ ...base, chooserOpen: true, tabState: "live" })).toBe("overlay");
@@ -40,6 +44,20 @@ describe("modeKeyRoute", () => {
   it("does nothing before the first tabs envelope", () => {
     expect(modeKeyRoute({ ...base, tabState: null })).toBe("none");
   });
+});
+
+describe("modeKeyRoute with a switch-capable session (wave 5)", () => {
+  const base = { confirmOpen: false, chooserOpen: false, tabState: "live" as const, canSwitch: true };
+  it("cycles a live tab whose sidecar can switch", () => expect(modeKeyRoute(base)).toBe("cycle"));
+  it("keeps the fixed flash without the capability", () =>
+    expect(modeKeyRoute({ ...base, canSwitch: false })).toBe("fixed"));
+  it("cannot switch an ended or failed session", () => {
+    for (const tabState of ["ended", "failed"] as const) expect(modeKeyRoute({ ...base, tabState })).toBe("fixed");
+  });
+  it("says a starting session is starting", () =>
+    expect(modeKeyRoute({ ...base, tabState: "starting" })).toBe("starting"));
+  it("still leaves an overlay its own key", () =>
+    expect(modeKeyRoute({ ...base, chooserOpen: true })).toBe("overlay"));
 });
 
 it("names the way to a different mode", () => {

@@ -222,6 +222,13 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
       };
+    case "permission_mode_changed":
+      // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
+      // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
+      // switch. Folding a second copy here would just be a value that can drift from it, so this
+      // event is a no-op for the reducer -- `incoming`, not `state`, so it advances neither `nextSeq`
+      // nor `turnThinking`, the same as the repeated-thinking-delta exception above.
+      return incoming;
     default: {
       // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
       // matching TS case lands here at runtime -- observable, never silently dropped.

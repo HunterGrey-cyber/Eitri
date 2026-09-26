@@ -126,33 +126,50 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "fork_session",
         "setting_sources",
         "tool_policy",
+        "session_model",
+        "session_effort",
+        "system_prompt",
+        "output_format",
+        "structured_output",
+        "turn_usage",
+        "account_identity",
+        "init_fingerprint",
+        "tool_allow_list",
+        "set_permission_mode",
+        "text_delta_message_id",
         "executable_host_cli",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
-    // Order and length included for the twelve a PACKAGED build serves, not just set membership:
-    // the fixture is transcribed from the sidecar's own literal, and this is what keeps the
-    // transcription honest.
+    // Order and length included for the 133dc03 list, not just set membership: the fixture is
+    // transcribed from the sidecar's own literal, and this is what keeps the transcription honest.
     //
-    // The one permitted difference is the thirteenth entry: a build running from a Verdandi
-    // CHECKOUT can also serve `executable_sdk_bundled`, and a packaged single-file artifact cannot
-    // (no node_modules for the SDK's own CLI to resolve through). This test spawns whichever the
-    // host has, so it accepts either -- but only that one extra, only in that position. Anything
-    // else means the real list moved and the fixture owes an update.
-    let (common, extra) = info
-        .advertised_capabilities
-        .split_at(expected.len().min(info.advertised_capabilities.len()));
+    // Two permitted differences, each transcribed from Verdandi's own handshake handler at its one
+    // permitted position, stripped out before comparing what remains against `expected` verbatim:
+    // `egress_restricted`, right after `tool_allow_list` (before `set_permission_mode`) when this
+    // sidecar's own configuration restricts egress; and a trailing `executable_sdk_bundled` on a
+    // build running from a Verdandi CHECKOUT, which a packaged single-file artifact cannot serve at
+    // all (no node_modules for the SDK's own CLI to resolve through). This test spawns whichever the
+    // host has, so it accepts either, neither, or both -- but only in their one permitted slot.
+    // Anything else means the real list moved and the fixture owes an update.
+    let mut actual = info.advertised_capabilities.clone();
+    if let Some(pos) = actual.iter().position(|c| c == "egress_restricted") {
+        assert_eq!(
+            pos.checked_sub(1).and_then(|i| actual.get(i)).map(String::as_str),
+            Some("tool_allow_list"),
+            "egress_restricted moved; it must sit right after tool_allow_list, got the list at \
+             this position: {actual:?}"
+        );
+        actual.remove(pos);
+    }
+    if actual.last().map(String::as_str) == Some("executable_sdk_bundled") {
+        actual.pop();
+    }
     assert_eq!(
-        common,
-        expected.as_slice(),
+        actual, expected,
         "the real sidecar's capability list has moved; update real_handshake_today() in \
          agent/src/providers/claude_sidecar/mod.rs to match"
-    );
-    assert!(
-        extra.is_empty() || extra == ["executable_sdk_bundled".to_string()],
-        "the only capability a checkout build may add past the packaged twelve is \
-         executable_sdk_bundled; got {extra:?}"
     );
 
     assert_eq!(

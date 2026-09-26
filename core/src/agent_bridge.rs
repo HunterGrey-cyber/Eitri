@@ -819,7 +819,7 @@ pub fn serialize_snapshot_for_js(
             "fork": capabilities.fork,
             "interrupt": capabilities.interrupt,
             "bypassPermissionMode": capabilities.bypass_permission_mode,
-            "modeSwitch": crate::agent_backend::MODE_SWITCH_AVAILABLE,
+            "modeSwitch": capabilities.set_permission_mode,
         },
         "provider": provider,
     });
@@ -1508,6 +1508,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1579,6 +1580,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1615,6 +1617,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1658,6 +1661,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1694,6 +1698,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1734,6 +1739,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1795,6 +1801,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1885,6 +1892,7 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
+                    set_permission_mode: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1928,6 +1936,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1994,6 +2003,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2503,24 +2513,31 @@ mod tests {
         assert_eq!(context_summary(None, root), None);
     }
 
-    /// D6: the capability the panel gates every mode control on, false until Verdandi has one.
+    /// D6 (wave 5): the capability the panel gates a live tab's Shift+Tab on is this session's own
+    /// `set_permission_mode` -- per snapshot, so per tab's backend, never a window-wide constant.
     #[test]
-    // The constant is asserted deliberately: this test's whole point is to fail loudly the day
-    // `MODE_SWITCH_AVAILABLE` flips, since ruling 35 says the `true` branch has no wire to call yet.
-    #[allow(clippy::assertions_on_constants)]
-    fn a_snapshot_says_the_mode_cannot_change_mid_session() {
+    fn a_snapshot_says_whether_this_session_can_switch() {
         let projection = AgentSessionProjection::default();
-        let view = SnapshotView {
-            backend: "sidecar",
-            conversation_id: None,
-            session_id: None,
-            provider_session_id: None,
-            capabilities: agent::ProviderCapabilities::default(),
-            provider: None,
-            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        let mode_switch = |capabilities: agent::ProviderCapabilities| {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities,
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            parsed["state"]["capabilities"]["modeSwitch"].clone()
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
-        assert_eq!(parsed["state"]["capabilities"]["modeSwitch"], false);
-        assert!(!crate::agent_backend::MODE_SWITCH_AVAILABLE);
+        assert_eq!(
+            mode_switch(agent::ProviderCapabilities {
+                set_permission_mode: true,
+                ..Default::default()
+            }),
+            true
+        );
+        assert_eq!(mode_switch(agent::ProviderCapabilities::default()), false);
     }
 }

@@ -19,9 +19,18 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// How long `SpawnedSidecar::drop` waits, after closing the sidecar's stdin, before escalating to
+/// SIGKILL. Verdandi a1a41ae: the sidecar reaps the `claude` CLI it owns before exiting on its own
+/// -- a 250ms internal grace, then SIGTERM, then SIGKILL 3s later if that CLI hasn't exited, then
+/// gives up 1s after that: ~4.3s worst case. Killing the SIDECAR inside that window orphans the
+/// `claude` process it was in the middle of ending, which is worse than the thing this constant
+/// exists to bound. 6s leaves >1.5s of margin over that worst case; measured ~1.4s mid-turn
+/// (Verdandi's own test).
+pub const SIDECAR_EXIT_GRACE: Duration = Duration::from_secs(6);
 
 /// How many of the sidecar's most recent stderr lines are retained for diagnostics. Bounded on
 /// purpose: a long-lived sidecar can log indefinitely, and this buffer exists to explain a startup
@@ -124,6 +133,9 @@ impl SpawnedSidecar {
 /// stamp from `package.json` at build time -- both already carried on `ProviderInfo`. Until this
 /// client range-checks that version, this constant is what warns about skew, so it is kept
 /// accurate rather than deleted early.
+///
+/// Bumped 2026-09-26 from 28a5e4c for SetPermissionMode, PermissionModeChanged and
+/// TextDelta.message_id; proto diff +288/−2, both deletions comments.
 pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
@@ -707,34 +719,45 @@ fn spawn_log_drain_thread<R: std::io::Read + Send + 'static>(
     });
 }
 
+/// Polls `child` for up to `grace`, then escalates to SIGKILL if it hasn't exited on its own.
+/// Extracted out of `SpawnedSidecar::drop` so the grace/kill/give-up shape is independently
+/// testable against a real child process rather than only through a whole `SpawnedSidecar`.
+///
+/// Genuinely bounded either way: within `grace` if the child exits on its own, or near-instantly
+/// once `grace` elapses and this falls through to `kill()` + `wait()` -- never the unbounded kind
+/// Global Constraints forbids.
+pub(crate) fn stop_child(child: &mut Child, grace: Duration) -> std::io::Result<ExitStatus> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            None => break,
+        }
+    }
+    child.kill()?;
+    child.wait()
+}
+
 impl Drop for SpawnedSidecar {
     /// Graceful-first shutdown: close the held-open stdin (the sidecar's own documented
-    /// parent-death signal, verified for real during this plan's preparation), wait briefly (a
-    /// graceful exit lets the sidecar fail-close any pending permissions server-side before this
-    /// process moves on), then escalate to SIGKILL if it hasn't exited -- matching design doc
-    /// §12.1's shutdown escalation requirement. Deliberately simpler than
+    /// parent-death signal, verified for real during this plan's preparation), wait up to
+    /// `SIDECAR_EXIT_GRACE` (long enough for the sidecar to reap the `claude` CLI it owns before
+    /// exiting -- a graceful exit lets the sidecar fail-close any pending permissions server-side
+    /// before this process moves on), then escalate to SIGKILL if it still hasn't exited --
+    /// matching design doc §12.1's shutdown escalation requirement. Deliberately simpler than
     /// `shell/src/supervisor_client.rs::connect_or_spawn`'s own background-thread reaper: that
     /// pattern exists there because a *detached* supervisor process may run for an unbounded time
     /// after being spawned, so its eventual `wait()` has no natural bound to block on. Here, by the
-    /// time `drop` runs, the sidecar is either already exiting gracefully (bounded by the 3s
-    /// deadline below) or about to be SIGKILLed (which returns near-instantly) -- both paths are
-    /// genuinely bounded, so blocking `Drop` itself for at most ~3s is a deliberate, bounded wait,
-    /// not the unbounded kind Global Constraints forbids.
+    /// time `drop` runs, the sidecar is either already exiting gracefully (bounded by
+    /// `SIDECAR_EXIT_GRACE`) or about to be SIGKILLed (which returns near-instantly) -- both paths
+    /// are genuinely bounded, so blocking `Drop` itself for at most `SIDECAR_EXIT_GRACE` is a
+    /// deliberate, bounded wait, not the unbounded kind Global Constraints forbids.
     fn drop(&mut self) {
         drop(self.stdin_keepalive.take()); // closes the write end -> sidecar sees stdin EOF
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_status)) => return,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => break,
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = stop_child(&mut self.child, SIDECAR_EXIT_GRACE);
     }
 }
 
@@ -825,6 +848,42 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Verdandi a1a41ae: the sidecar reaps its CLIs before exiting -- 250 ms, SIGTERM, SIGKILL 3 s later, give up
+    /// 1 s after that: ~4.3 s worst case. Killing it inside that window orphans the `claude` it was ending.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_grace_covers_the_sidecars_own_reap() {
+        assert!(super::SIDECAR_EXIT_GRACE >= Duration::from_millis(250 + 3000 + 1000 + 500));
+    }
+
+    #[test]
+    fn a_child_that_exits_inside_the_grace_is_not_killed() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read _; sleep 0.3; exit 7"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        let status = super::stop_child(&mut child, Duration::from_secs(2)).unwrap();
+        assert_eq!(status.code(), Some(7), "exited on its own: {status:?}");
+    }
+
+    #[test]
+    fn a_child_still_running_after_the_grace_is_killed() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; read _; sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        let started = std::time::Instant::now();
+        let status = super::stop_child(&mut child, Duration::from_millis(200)).unwrap();
+        assert_eq!(status.signal(), Some(9));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     use super::*;
 
     /// Real, not mocked -- spawns the actual compiled sidecar (building it first if needed) and

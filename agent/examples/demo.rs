@@ -133,5 +133,14 @@ fn print_event(event: &AgentDomainEvent) {
         }
         AgentDomainEvent::SessionUnavailable { reason } => println!("[session unavailable] {reason}"),
         AgentDomainEvent::SessionClosed { reason } => println!("[session closed] {reason}"),
+        AgentDomainEvent::PermissionModeChanged {
+            mode,
+            provider_mode,
+            floor_applied,
+        } => {
+            println!(
+                "[permission mode changed] mode={mode:?} provider_mode={provider_mode} floor_applied={floor_applied}"
+            );
+        }
     }
 }

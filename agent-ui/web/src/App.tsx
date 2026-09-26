@@ -9,7 +9,7 @@ import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
-import { isModeCycleKey, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { isModeCycleKey, MODE_STARTING_MESSAGE, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -308,9 +308,18 @@ export default function App() {
    *  its first render's value forever. Assigned during render, so it is current by the time any
    *  later envelope arrives. */
   const sessionStartedRef = useRef(false);
-  /** Whether `<leader>` `mode.cycle` can no longer cycle this tab: any state but `not_started`
-   *  (`modeKeyRoute`'s rule, R4), so a `starting` or `failed` tab's box greys the entry too. */
-  const modeFixed = activeTab !== null && activeTab.state !== "not_started";
+  /** Wave 5: whether THIS session's sidecar can switch its live permission mode
+   *  (`Capabilities.modeSwitch`, which `agent_bridge.rs` fills from the live handshake's
+   *  `set_permission_mode` capability). `=== true` because the
+   *  field is optional and absent on legacy/older sidecars, which must read as "cannot", not
+   *  "unknown". */
+  const modeSwitch = state.capabilities.modeSwitch === true;
+  /** Whether `<leader>` `mode.cycle` (and, by the same rule, Shift+Tab) would flash rather than post
+   *  -- `modeKeyRoute`'s own routing, so a `starting`/`failed`/`ended` tab still greys the box entry,
+   *  but a `live` tab whose sidecar can switch (`modeSwitch`) does not. */
+  const modeFixed =
+    modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: activeTab?.state ?? null, canSwitch: modeSwitch }) !==
+    "cycle";
   sessionStartedRef.current = sessionStarted;
   /** A fatal, session-ending failure, shown in the panel. Replaces window.alert, which cannot be
    * copied, cannot show the sidecar's own multi-line startup diagnostics, and blocks the WebView. */
@@ -723,14 +732,25 @@ export default function App() {
         setHandoffOpen(true);
         break;
       case "mode.cycle":
-        // Disabled in the box once the tab is no longer `not_started` (`leader.ts`'s own
-        // `boxEntries` doc comment): cycling makes no sense any more, so this flashes rather than
-        // posting. Routed through `modeKeyRoute`, the same rule Shift+Tab uses (R4), so a
-        // `starting` or `failed` tab flashes here too instead of posting a `cycle_mode` Rust's
-        // `TabSet::cycle_mode` would only refuse.
-        switch (modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: activeTab?.state ?? null })) {
+        // Disabled in the box once the tab is fixed (`modeFixed`, `leader.ts`'s own `boxEntries` doc
+        // comment): cycling makes no sense any more, so this flashes rather than posting. Routed
+        // through `modeKeyRoute`, the same rule Shift+Tab uses (R4), so a `starting` or `failed` tab
+        // flashes here too instead of posting a `cycle_mode` Rust's `TabSet::cycle_mode` would only
+        // refuse -- and, since wave 5, a `live` tab whose sidecar can switch (`modeSwitch`) posts
+        // instead of flashing, the which-key box never having greyed it out in the first place.
+        switch (
+          modeKeyRoute({
+            confirmOpen: false,
+            chooserOpen: false,
+            tabState: activeTab?.state ?? null,
+            canSwitch: modeSwitch,
+          })
+        ) {
           case "cycle":
             post({ type: "cycle_mode" });
+            break;
+          case "starting":
+            showFlash(MODE_STARTING_MESSAGE);
             break;
           case "fixed":
             showFlash(modeFixedMessage(keymapHelp.newTabChord));
@@ -845,6 +865,10 @@ export default function App() {
   tabsRef.current = tabs;
   const newTabChordRef = useRef("");
   newTabChordRef.current = keymapHelp.newTabChord;
+  /** Wave 5 Task 5: `modeSwitch` for the same document-capture `onModeKey` effect, which is
+   *  installed once and cannot read render state directly -- the same reason the refs above exist. */
+  const canSwitchRef = useRef(false);
+  canSwitchRef.current = modeSwitch;
   /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
    *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
   const keymapOverlayRef = useRef<HTMLDivElement>(null);
@@ -943,10 +967,12 @@ export default function App() {
         confirmOpen: confirmOpenRef.current,
         chooserOpen: chooserOpenRef.current,
         tabState: activeTabInfo(tabsRef.current)?.state ?? null,
+        canSwitch: canSwitchRef.current,
       });
       if (route === "overlay") return;
       event.stopPropagation();
       if (route === "cycle") post({ type: "cycle_mode" });
+      else if (route === "starting") showFlash(MODE_STARTING_MESSAGE);
       else if (route === "fixed") showFlash(modeFixedMessage(newTabChordRef.current));
     }
     document.addEventListener("keydown", onModeKey, true);

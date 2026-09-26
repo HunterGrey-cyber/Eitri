@@ -529,6 +529,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),

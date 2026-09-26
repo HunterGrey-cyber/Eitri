@@ -23,7 +23,7 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
  *  (`hello.permissionModes`): neovibe's `auto` is not the CLI's. `cycleOffered` names D6's own
  *  capability gate (`state.capabilities.modeSwitch`) before a start it is always offered
  *  (phase 2's own behaviour); once a session is live it is offered only when Verdandi can actually
- *  change a live session's mode, which today is never (ruling 35).
+ *  change a live session's mode (D6/wave 5's `set_permission_mode`).
  *
  *  `short` (panel round 2 plan, Task 10; spec §5.2): the bottom band has no room for "on" or the
  *  cycle hint, so it always reads `short = true` and gets the bare `⏵⏵ <mode>` -- `cycleOffered` is

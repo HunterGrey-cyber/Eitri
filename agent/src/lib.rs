@@ -63,9 +63,9 @@ pub use projection::{
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
-    ResumeSessionRequest, SendTurnRequest, StreamingPreference,
+    ResumeSessionRequest, SendTurnRequest, SetPermissionModeRequest, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
     packaged_sidecar_available, BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME,
-    CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION,
+    CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT,
 };

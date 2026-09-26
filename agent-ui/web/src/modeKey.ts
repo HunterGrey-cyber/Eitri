@@ -29,15 +29,29 @@ export function isShiftTab(e: { key: string; code?: string; shiftKey: boolean })
   return e.key === "Tab" || (e.key === "Unidentified" && e.code === "Tab");
 }
 
-export type ModeKeyState = { confirmOpen: boolean; chooserOpen: boolean; tabState: TabInfo["state"] | null };
+export type ModeKeyState = {
+  confirmOpen: boolean;
+  chooserOpen: boolean;
+  tabState: TabInfo["state"] | null;
+  /** Verdandi `SetPermissionMode` (D6) is live for this tab's sidecar (`capabilities.modeSwitch`), so a live
+   *  session can switch mid-session rather than being fixed after the first message. Wave 5. */
+  canSwitch: boolean;
+};
 
-/** See the table in the wave-4 plan, Task 1. A mode is chosen before a session's first message (ruling 5); after
- *  that it is fixed until Verdandi's `SetPermissionMode` (D6) lands. */
-export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "none" {
+/** See the table in the wave-4 plan, Task 1, extended by wave 5 (ruling W5). A mode is chosen before a session's
+ *  first message (ruling 5) unless the sidecar can switch, in which case a live tab keeps cycling; a starting
+ *  tab says so rather than flashing the (false, on a switch-capable sidecar) fixed-mode text; ended/failed
+ *  sessions are always fixed. */
+export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "starting" | "none" {
   if (s.confirmOpen || s.chooserOpen) return "overlay";
   if (s.tabState === null) return "none";
-  return s.tabState === "not_started" ? "cycle" : "fixed";
+  if (s.tabState === "not_started") return "cycle";
+  if (s.tabState === "live" && s.canSwitch) return "cycle";
+  if (s.tabState === "starting") return "starting";
+  return "fixed";
 }
+
+export const MODE_STARTING_MESSAGE = "session is starting — try again once it is up";
 
 export function modeFixedMessage(newTabChord: string): string {
   return newTabChord === ""

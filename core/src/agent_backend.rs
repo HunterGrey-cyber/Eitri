@@ -38,6 +38,8 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     // Its interactive gate is the `PreToolUse` hook relay, which is this backend's primary,
     // end-to-end-verified permission mechanism -- not the leaky `can_use_tool` it also listens to.
     interactive_permission_mode: true,
+    // The CLI's stream-json has no mid-session switch neovibe drives.
+    set_permission_mode: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -199,6 +201,15 @@ impl BackendError {
         Self {
             message,
             benign: false,
+            folded_events: Vec::new(),
+        }
+    }
+
+    /// A refusal of THIS command by this side, with the session untouched.
+    fn benign(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            benign: true,
             folded_events: Vec::new(),
         }
     }
@@ -505,6 +516,86 @@ impl AgentBackend {
         }
     }
 
+    /// Whether this session's permission mode can change mid-conversation (D6, wave 5): the sidecar
+    /// advertised `set_permission_mode` and this client implements it. Legacy never can -- the CLI's
+    /// stream-json has no switch neovibe drives (`LEGACY_CAPABILITIES`).
+    pub fn can_switch_mode(&self) -> bool {
+        match self {
+            AgentBackend::Legacy(_) => false,
+            AgentBackend::Sidecar(conversation) => conversation.can_switch_mode(),
+        }
+    }
+
+    /// The mode the provider last ACKNOWLEDGED for this session -- `None` on legacy, which has no
+    /// acknowledged mode to report. This, never the tab's `mode` (which a `PermissionModeChanged`
+    /// report also moves), is what decides whether a card is answered in bypass (W4).
+    pub fn permission_mode(&self) -> Option<PermissionMode> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Sidecar(conversation) => Some(conversation.permission_mode()),
+        }
+    }
+
+    /// Switches this live session between auto and bypass (Verdandi `SetPermissionMode`). One unary
+    /// RPC on the caller's thread, as `interrupt` is (W1).
+    ///
+    /// Without the capability the refusal is BENIGN and said here, before the conversation is asked:
+    /// the conversation's own `UnsupportedCapability` is classified fatal, which would contradict
+    /// "the session is fine, its mode is just fixed". A provider's own refusal is classified as
+    /// `interrupt`'s errors are.
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), BackendError> {
+        const FIXED: &str = "the mode is fixed for this session";
+        match self {
+            AgentBackend::Legacy(_) => Err(BackendError::benign(FIXED)),
+            AgentBackend::Sidecar(conversation) if !conversation.can_switch_mode() => Err(BackendError::benign(FIXED)),
+            AgentBackend::Sidecar(conversation) => {
+                conversation.set_permission_mode(mode)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Answers Allow to every card pending on THIS session, returning how many were allowed (W4:
+    /// entering bypass answers the cards already waiting; Verdandi leaves them pending). Each is one
+    /// `[permission] allowed on entering bypass: <tool>` line on stderr, naming the tool only and
+    /// never its input (the policy's own rule, `answer_what_needs_no_human`).
+    ///
+    /// Accepted, not deduplicated: a request the classifier already allowed whose resolution has not
+    /// come back yet, or one folded but not yet delivered (which the bypass branch of
+    /// `answer_what_needs_no_human` answers again on the next pump), gets a second Allow. The
+    /// sidecar refuses that one (`PermissionNotFound`/`AlreadyResolved`) and the card, if drawn,
+    /// clears when the `PermissionResolved` arrives. `AgentBackend` is an enum with nowhere to keep
+    /// dedupe state, and the flash is harmless and self-clearing.
+    pub fn allow_all_pending(&mut self) -> usize {
+        // Collected in its own statement, guard dropped, before any answer: on the sidecar
+        // `projection()` holds the ingestion mutex and `respond_permission` locks it again (the
+        // 2026-09-15 GTK freeze). Sorted by `seq` so the log reads in the order the cards arrived;
+        // the map is a `HashMap`.
+        let mut pending: Vec<(u64, String, String)> = self
+            .projection()
+            .pending_permissions
+            .values()
+            .map(|record| (record.seq, record.permission_id.clone(), record.tool_name.clone()))
+            .collect();
+        pending.sort();
+        let mut allowed = 0;
+        for (_seq, permission_id, tool_name) in pending {
+            match self.respond_permission(&permission_id, PermissionDecision::Allow) {
+                Ok(_resolution) => {
+                    eprintln!("[permission] allowed on entering bypass: {tool_name}");
+                    allowed += 1;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[permission] could not allow {tool_name} on entering bypass: {}",
+                        error.message
+                    );
+                }
+            }
+        }
+        allowed
+    }
+
     /// What the UI should apply next.
     ///
     /// The two backends reach this differently and the difference is the point of the sidecar
@@ -573,6 +664,11 @@ impl AgentBackend {
     /// the projection with no card on screen is a session the user cannot unstick, which is a worse
     /// failure than an extra click.
     ///
+    /// **In bypass (wave 5, W4) every request is answered Allow before the classifier is asked** --
+    /// the user switched this session to bypass, and a request still arriving was raised before the
+    /// switch took effect. Keyed on the provider-acknowledged mode (`permission_mode`) only; legacy
+    /// has none, and in bypass installs no gate, so it raises no cards to answer.
+    ///
     /// Two honest gaps, neither of which any test here covers:
     ///
     /// - The resolution is dropped too, but only the legacy backend's, which is returned
@@ -590,6 +686,9 @@ impl AgentBackend {
         project_root: &Path,
         rules: &agent::PrefixRules,
     ) -> Vec<AgentDomainEvent> {
+        // Read once, and from the conversation's ACKNOWLEDGED mode, never the tab's (W4, Review
+        // Focus 2): a reported `PermissionModeChanged` moves the band but never grants this.
+        let bypass = self.permission_mode() == Some(PermissionMode::Bypass);
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
             let AgentDomainEvent::PermissionRequested {
@@ -602,6 +701,22 @@ impl AgentBackend {
                 kept.push(event);
                 continue;
             };
+            if bypass {
+                // Raised before the switch, delivered after it: the user chose bypass, so it is
+                // answered as `allow_all_pending` answered the cards already drawn (W4).
+                let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+                match self.respond_permission(&permission_id, PermissionDecision::Allow) {
+                    Ok(_resolution) => eprintln!("[permission] allowed on entering bypass: {tool_name}"),
+                    Err(error) => {
+                        eprintln!(
+                            "[permission] could not allow {tool_name} in bypass, showing a card instead: {}",
+                            error.message
+                        );
+                        kept.push(event);
+                    }
+                }
+                continue;
+            }
             let classification = agent::classify_with_rules(tool_name, input, project_root, rules);
             if classification.needs_a_human() {
                 // The other half of the line below, added 2026-09-19 (later) because its absence
@@ -669,13 +784,6 @@ impl AgentBackend {
 /// `verdandi_rules` is absent because it is confirmed to behave identically to `interactive` in the
 /// current sidecar. A third button that does nothing different is a worse lie than a missing one.
 pub const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
-
-/// Whether a session's permission mode can change after it starts (D6, keymap/tabs spec §4.1).
-/// `false` until Verdandi ships a `SetPermissionMode` RPC and a handshake capability for it (filed in
-/// Verdandi's own notes); the pinned protocol (`28a5e4c`) has neither. The
-/// panel reads it as `capabilities.modeSwitch` and hides every mode control while it is `false`.
-/// There is deliberately no reconnect or resume-in-another-mode fallback.
-pub const MODE_SWITCH_AVAILABLE: bool = false;
 
 /// Whether THIS CLIENT can drive a resume for a backend kind, before any provider exists.
 ///
@@ -1720,5 +1828,76 @@ mod tests {
             .with_folded_events(folded());
         assert!(!fatal.benign, "a dead process is still fatal, events or no events");
         assert_eq!(fatal.folded_events.len(), 1);
+    }
+
+    // ---- wave 5, Task 4: a live mode switch and what entering bypass answers ----
+
+    fn a_write_request(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+        }
+    }
+
+    /// Without the capability a switch is refused BENIGNLY -- the session is fine, the mode is just
+    /// fixed -- and nothing reaches the provider. `UnsupportedCapability` alone would be fatal.
+    #[test]
+    fn a_sidecar_without_the_capability_refuses_a_switch_benignly() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        assert!(!backend.can_switch_mode());
+        let refused = backend.set_permission_mode(PermissionMode::Bypass).unwrap_err();
+        assert!(refused.benign, "{refused:?}");
+        assert!(refused.message.contains("fixed"), "{}", refused.message);
+        assert!(provider.modes().is_empty());
+        assert_eq!(backend.permission_mode(), Some(PermissionMode::Auto));
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_switchable_sidecar_reports_the_acknowledged_mode() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::switchable());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        assert!(backend.can_switch_mode());
+        backend.set_permission_mode(PermissionMode::Bypass).unwrap();
+        assert_eq!(backend.permission_mode(), Some(PermissionMode::Bypass));
+        provider.refuse_switches(true);
+        // Classified as `interrupt`'s errors are (`From<ConversationError>`); `TabSet::switch_mode`
+        // only shows the message, so a refusal never tears the tab down either way.
+        assert!(backend.set_permission_mode(PermissionMode::Auto).is_err());
+        assert_eq!(backend.permission_mode(), Some(PermissionMode::Bypass), "unchanged");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn allow_all_pending_answers_each_pending_request_once_and_counts_them() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::switchable());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        provider.queue(a_write_request("a"));
+        provider.queue(a_write_request("b"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.projection().pending_permissions.len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for two cards");
+            let _ = backend.take_ui_delivery(&dir);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(provider.resolutions().is_empty());
+
+        assert_eq!(backend.allow_all_pending(), 2);
+        let mut resolved = provider.resolutions();
+        resolved.sort();
+        assert_eq!(resolved, vec![("a".to_string(), true), ("b".to_string(), true)]);
+        backend.shutdown();
     }
 }

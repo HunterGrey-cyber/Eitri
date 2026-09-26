@@ -463,6 +463,39 @@ impl TabSet {
         Some(mode)
     }
 
+    /// Shift+Tab on a started tab (D6, wave 5): the session switches between auto and bypass when its
+    /// sidecar can (`set_permission_mode`), once the sidecar acknowledged -- never optimistically
+    /// (W1: "a requested permission mode must never silently become a different one", `provider.rs`).
+    /// Entering bypass answers the cards already waiting on THIS tab (owner, 2026-09-26: "能不能做自动
+    /// 放行"; W4); Verdandi leaves them pending. Does not touch `default_mode` (W2): that is chosen on
+    /// an empty tab or the chooser, and Claude Code's own Shift+Tab does not persist either. There is
+    /// deliberately no reconnect or resume-in-another-mode fallback for a session that cannot switch.
+    pub fn switch_mode(&mut self, id: TabId) -> Result<SessionModeChoice, String> {
+        let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
+        let target = tab
+            .mode
+            .cycled(crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES);
+        let ended = matches!(tab.wire_state(), TabStateWire::Ended | TabStateWire::Failed);
+        let backend = match &mut tab.backend {
+            TabBackend::Live(backend) => backend,
+            // W5's text, which the panel flashes itself; said here too for a panel that posts anyway.
+            TabBackend::Starting(_) => return Err("session is starting — try again once it is up".into()),
+            TabBackend::NotStarted | TabBackend::Failed { .. } => return Err("the session has not started yet".into()),
+        };
+        if !backend.can_switch_mode() {
+            return Err("the mode is fixed for this session".into());
+        }
+        if ended {
+            return Err("the session has ended".into());
+        }
+        backend.set_permission_mode(target.into()).map_err(|e| e.message)?;
+        tab.mode = target;
+        if target == SessionModeChoice::Bypass {
+            backend.allow_all_pending();
+        }
+        Ok(target)
+    }
+
     /// `Shift+Tab` on the chooser's `New session` row or a record, once the active tab is not itself
     /// `NotStarted` (spec §6.3, panel round 2 plan Task 5): cycles the window's remembered
     /// `default_mode` -- the mode a fresh tab, or a resume that opens a new tab, takes. Every open
@@ -595,6 +628,9 @@ impl TabSet {
                             AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
                                 tab.was_running = false
                             }
+                            // The sidecar's own report wins over a stale tab (wave 5). It moves the
+                            // band only: auto-approval reads the acknowledged mode, never `tab.mode`.
+                            AgentDomainEvent::PermissionModeChanged { mode, .. } => tab.mode = choice_of(*mode),
                             _ => {}
                         }
                     }
@@ -988,6 +1024,15 @@ impl TabSet {
     /// (`shell::agent_panel` checks `shutting_down` first on every path that reaches the set).
     pub fn take_all(&mut self) -> Vec<Tab> {
         std::mem::take(&mut self.tabs)
+    }
+}
+
+/// The tab's choice for a mode a provider reported. Only the reverse `From` exists
+/// (`agent_bridge`), and this one is needed only by the pump.
+fn choice_of(mode: agent::PermissionMode) -> SessionModeChoice {
+    match mode {
+        agent::PermissionMode::Auto => SessionModeChoice::Auto,
+        agent::PermissionMode::Bypass => SessionModeChoice::Bypass,
     }
 }
 
@@ -2029,5 +2074,219 @@ mod tests {
             .unwrap();
         assert_eq!(draft, None, ":q! changes nothing");
         assert_eq!(set.get(second).unwrap().draft, "second's own");
+    }
+
+    // ---- wave 5, Task 4: Shift+Tab switches a live tab; entering bypass answers its cards ----
+
+    fn live_switchable(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
+        let provider = Arc::new(RecordingProvider::switchable());
+        let conversation = AgentConversation::create(provider.clone(), dir, PermissionMode::Auto).unwrap();
+        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+    }
+
+    /// Pumps until `tab` holds `pending` cards the pump delivered.
+    fn pump_until_pending(set: &mut TabSet, dir: &Path, tab: TabId, pending: usize) {
+        until("the pending cards", || {
+            set.pump(dir, true);
+            set.get(tab).unwrap().attention.attention().pending == pending
+        });
+    }
+
+    #[test]
+    fn a_started_tab_switches_both_ways_when_the_sidecar_can() {
+        let dir = workspace("tabs-switch-both-ways");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live_switchable(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let default_before = set.default_mode();
+
+        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Bypass));
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Bypass);
+        assert_eq!(provider.modes(), vec![PermissionMode::Bypass]);
+        assert!(
+            provider.resolutions().is_empty(),
+            "nothing was pending, so nothing is answered"
+        );
+        assert_eq!(
+            set.default_mode(),
+            default_before,
+            "W2: a live switch is that session's only"
+        );
+
+        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Auto));
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
+        assert_eq!(provider.modes(), vec![PermissionMode::Bypass, PermissionMode::Auto]);
+        assert_eq!(set.default_mode(), default_before);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_started_tab_without_the_capability_stays_fixed() {
+        let dir = workspace("tabs-switch-fixed");
+        let mut set = set();
+
+        // An empty tab is `cycle_mode`'s, not this.
+        let empty = set.active();
+        assert!(set.switch_mode(empty).is_err());
+        assert_eq!(set.get(empty).unwrap().mode, SessionModeChoice::Auto);
+
+        // W5: a starting tab says so, not "fixed" (false on a switch-capable sidecar).
+        let connecting = set.open();
+        let _tx = starting(&mut set, connecting, None, None);
+        let refused = set.switch_mode(connecting).unwrap_err();
+        assert_eq!(refused, "session is starting — try again once it is up");
+
+        let fixed = set.open();
+        let (provider, backend) = live(&dir);
+        set.get_mut(fixed).unwrap().backend = TabBackend::Live(backend);
+        let refused = set.switch_mode(fixed).unwrap_err();
+        assert!(refused.contains("fixed"), "{refused}");
+        assert!(provider.modes().is_empty(), "no call without the capability");
+        assert_eq!(set.get(fixed).unwrap().mode, SessionModeChoice::Auto);
+
+        // Ended, on a switchable tab: the capability check comes first.
+        let ended = set.open();
+        let (provider, backend) = live_switchable(&dir);
+        set.get_mut(ended).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(AgentDomainEvent::SessionClosed { reason: "x".into() });
+        until("the session's end", || {
+            set.pump(&dir, true);
+            set.get(ended).unwrap().wire_state() == TabStateWire::Ended
+        });
+        let refused = set.switch_mode(ended).unwrap_err();
+        assert!(refused.contains("ended"), "{refused}");
+        assert!(provider.modes().is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// Review Focus 1: never a mode nobody chose.
+    #[test]
+    fn a_refused_switch_changes_nothing() {
+        let dir = workspace("tabs-switch-refused");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live_switchable(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.refuse_switches(true);
+
+        assert!(set.switch_mode(tab).is_err());
+        assert_eq!(provider.modes(), vec![PermissionMode::Bypass], "the call was made");
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
+        assert_eq!(
+            set.get(tab).unwrap().live().unwrap().permission_mode(),
+            Some(PermissionMode::Auto)
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// W4: entering bypass answers the cards waiting on THAT tab, and no other's.
+    #[test]
+    fn entering_bypass_answers_this_tabs_waiting_cards_only() {
+        let dir = workspace("tabs-switch-answers-own-cards");
+        let mut set = set();
+        let first = set.active();
+        let (first_provider, backend) = live_switchable(&dir);
+        set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
+        let second = set.open();
+        let (second_provider, backend) = live_switchable(&dir);
+        set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
+
+        first_provider.queue(write("p1"));
+        second_provider.queue(write("p2"));
+        until("both cards", || {
+            set.pump(&dir, true);
+            set.get(first).unwrap().attention.attention().pending == 1
+                && set.get(second).unwrap().attention.attention().pending == 1
+        });
+        assert!(first_provider.resolutions().is_empty(), "a Write is a card in auto");
+
+        assert_eq!(set.switch_mode(first), Ok(SessionModeChoice::Bypass));
+        assert_eq!(first_provider.resolutions(), vec![("p1".to_string(), true)]);
+        assert!(
+            second_provider.resolutions().is_empty(),
+            "another tab's card is untouched"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// W4: raised before the switch, delivered after -- allowed, and no card is drawn.
+    #[test]
+    fn a_card_delivered_after_the_switch_is_allowed() {
+        let dir = workspace("tabs-switch-card-after");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live_switchable(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Bypass));
+
+        provider.queue(write("p3-after"));
+        until("the late card's answer", || {
+            if let Some(payload) = set.pump(&dir, true).active_payload {
+                let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                for event in parsed["events"].as_array().unwrap() {
+                    assert!(
+                        !event.to_string().contains("p3-after"),
+                        "no card is delivered in bypass: {event}"
+                    );
+                }
+            }
+            provider.resolutions().contains(&("p3-after".to_string(), true))
+        });
+        assert_eq!(provider.resolutions(), vec![("p3-after".to_string(), true)]);
+        shut_down_all(&mut set);
+    }
+
+    /// W4: no card is answered on a switch back to auto; the classifier decides again.
+    #[test]
+    fn back_in_auto_the_classifier_decides_again() {
+        let dir = workspace("tabs-switch-back-to-auto");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live_switchable(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Bypass));
+        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Auto));
+
+        provider.queue(write("p4"));
+        pump_until_pending(&mut set, &dir, tab, 1);
+        assert!(provider.resolutions().is_empty(), "a Write is a card again");
+
+        provider.queue(read("p5"));
+        until("the Read's answer", || {
+            set.pump(&dir, true);
+            provider.resolutions().contains(&("p5".to_string(), true))
+        });
+        assert_eq!(provider.resolutions(), vec![("p5".to_string(), true)]);
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 1, "p4 still waits");
+        shut_down_all(&mut set);
+    }
+
+    /// The sidecar's own report moves the band, but never grants auto-approval: only an
+    /// acknowledged switch does (Review Focus 2).
+    #[test]
+    fn a_reported_mode_change_moves_the_tab() {
+        let dir = workspace("tabs-switch-reported");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live_switchable(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let default_before = set.default_mode();
+
+        provider.queue(AgentDomainEvent::PermissionModeChanged {
+            mode: PermissionMode::Bypass,
+            provider_mode: "bypassPermissions".into(),
+            floor_applied: false,
+        });
+        until("the reported mode", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().mode == SessionModeChoice::Bypass
+        });
+        assert_eq!(set.default_mode(), default_before);
+        assert_eq!(
+            set.get(tab).unwrap().live().unwrap().permission_mode(),
+            Some(PermissionMode::Auto)
+        );
+        shut_down_all(&mut set);
     }
 }

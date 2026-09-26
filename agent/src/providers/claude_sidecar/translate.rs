@@ -7,8 +7,9 @@
 use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TurnOutcome};
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
-    PermissionOutcome as ProtoPermissionOutcome, ResumeStatus as ProtoResumeStatus, SessionCloseReason,
-    SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome,
+    PermissionMode as ProtoPermissionMode, PermissionOutcome as ProtoPermissionOutcome,
+    ResumeStatus as ProtoResumeStatus, SessionCloseReason, SessionEvent as ProtoSessionEvent,
+    TurnOutcome as ProtoTurnOutcome,
 };
 
 /// Translates one proto `SessionEvent`'s wire fields into this crate's own domain event. Returns
@@ -154,6 +155,30 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             );
             None
         }
+        // Capability 'set_permission_mode' (Verdandi 133dc03). Emitted once per accepted switch, to every
+        // watcher. INTERACTIVE and VERDANDI_RULES are both neovibe's `Auto` (`capabilities_from_handshake`'s
+        // note on verdandi_rules); UNSPECIFIED is not a mode anybody chose, so it is dropped, loudly.
+        ProtoEvent::PermissionModeChanged(changed) => {
+            let mode = match changed.mode() {
+                ProtoPermissionMode::Bypass => crate::PermissionMode::Bypass,
+                ProtoPermissionMode::Interactive | ProtoPermissionMode::VerdandiRules => crate::PermissionMode::Auto,
+                ProtoPermissionMode::Unspecified => {
+                    eprintln!("agent: ClaudeSidecarProvider: PermissionModeChanged with no mode, dropping it");
+                    return None;
+                }
+            };
+            if changed.bypass_default_deny_applied {
+                // Neovibe states `unrestricted` on every session (owner, 2026-09-20: bypass denies
+                // nothing), so this must never happen. If it does, Verdandi now denies
+                // Bash/Write/Edit/NotebookEdit.
+                eprintln!("agent: ClaudeSidecarProvider: entering bypass applied Verdandi's conservative floor");
+            }
+            Some(AgentDomainEvent::PermissionModeChanged {
+                mode,
+                provider_mode: changed.permission_mode,
+                floor_applied: changed.bypass_default_deny_applied,
+            })
+        }
     }
 }
 
@@ -212,7 +237,57 @@ fn translate_close_reason(reason: SessionCloseReason) -> String {
         SessionCloseReason::ClosedByHost => "closed_by_host".to_string(),
         SessionCloseReason::ProviderExited => "provider_exited".to_string(),
         SessionCloseReason::ProviderFailed => "provider_failed".to_string(),
+        SessionCloseReason::ToolPolicyViolation => "tool_policy_violation".to_string(),
         SessionCloseReason::Unspecified => "unspecified".to_string(),
+    }
+}
+
+/// Splits consecutive sidecar assistant messages at a `TextDelta.message_id` change, the same rule
+/// the legacy backend applies to the CLI's `message.id` (`session.rs`'s `AssistantText` arm).
+/// `ProtoEvent::TextDelta` carries no message identity on the wire until capability
+/// `text_delta_message_id` (Verdandi 133dc03), so `before` is a no-op when `enabled` is `false` --
+/// the capability this provider actually connected against, not a compile-time constant, since an
+/// older sidecar must keep concatenating exactly as it always has.
+///
+/// Called once per raw proto event, before that event's own translation: only a `TextDelta` with
+/// `Some(message_id)` can close the message before it, and only a `TurnStarted` clears the tracked
+/// id (a new turn is already a new message, so there is nothing left to compare against). Every
+/// other event -- `ThinkingDelta` included, despite carrying the same `message_id` field -- leaves
+/// the tracked id untouched and never splits: thinking is not assistant text.
+pub(crate) struct MessageSplit {
+    enabled: bool,
+    last_text: Option<String>,
+}
+
+impl MessageSplit {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            last_text: None,
+        }
+    }
+
+    pub(crate) fn before(&mut self, event: &ProtoSessionEvent) -> Option<AgentDomainEvent> {
+        if !self.enabled {
+            return None;
+        }
+        match event.event.as_ref()? {
+            ProtoEvent::TurnStarted(_) => {
+                self.last_text = None;
+                None
+            }
+            ProtoEvent::TextDelta(delta) => {
+                let id = delta.message_id.as_ref()?;
+                let boundary = self.last_text.as_ref().is_some_and(|last| last != id).then(|| {
+                    AgentDomainEvent::AssistantMessageBoundary {
+                        turn_id: delta.turn_id.clone(),
+                    }
+                });
+                self.last_text = Some(id.clone());
+                boundary
+            }
+            _ => None,
+        }
     }
 }
 
@@ -220,9 +295,9 @@ fn translate_close_reason(reason: SessionCloseReason) -> String {
 mod tests {
     use super::*;
     use claude_runtime_protocol::v1::{
-        PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved, ProviderNotice,
-        SessionCloseReason, SessionClosed, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted, ToolCallStarted,
-        TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
+        PermissionModeChanged, PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved,
+        ProviderNotice, SessionCloseReason, SessionClosed, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted,
+        ToolCallStarted, TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
     };
 
     fn wrap(event: ProtoEvent) -> ProtoSessionEvent {
@@ -251,6 +326,8 @@ mod tests {
             // Nothing on this side reads it yet, so the fixture carries the empty string rather
             // than a value a reader could mistake for an assertion.
             permission_mode: String::new(),
+            // account_identity, init_fingerprint: added at 133dc03, read by nothing in this test.
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -281,6 +358,9 @@ mod tests {
         let event = wrap(ProtoEvent::TextDelta(TextDelta {
             turn_id: "turn-1".into(),
             text: "hi".into(),
+            // message_id: capability 'text_delta_message_id' (133dc03), read by nothing yet --
+            // Task 3 of the wave-5 plan is the message-split consumer.
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -297,6 +377,8 @@ mod tests {
         let event = wrap(ProtoEvent::ThinkingDelta(ThinkingDelta {
             turn_id: "turn-1".into(),
             text: "hmm".into(),
+            // message_id: as TextDelta.message_id, read by nothing yet.
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -462,6 +544,9 @@ mod tests {
                 result_text: "done".into(),
                 is_error: false,
                 stop_reason: Some("end_turn".into()),
+                // api_error_status, errors, result_subtype and the rest: added at 133dc03, read by
+                // nothing this translator maps yet.
+                ..Default::default()
             }));
             assert_eq!(
                 translate(event),
@@ -503,5 +588,101 @@ mod tests {
             subtype: None,
         }));
         assert_eq!(translate(event), None);
+    }
+
+    #[test]
+    fn a_permission_mode_change_is_translated_and_an_unspecified_one_is_dropped() {
+        let event = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged {
+            mode: ProtoPermissionMode::Bypass as i32,
+            permission_mode: "bypassPermissions".into(),
+            bypass_default_deny_applied: false,
+        }));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::PermissionModeChanged {
+                mode: crate::PermissionMode::Bypass,
+                provider_mode: "bypassPermissions".into(),
+                floor_applied: false,
+            })
+        );
+        let interactive = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged {
+            mode: ProtoPermissionMode::Interactive as i32,
+            permission_mode: "default".into(),
+            bypass_default_deny_applied: false,
+        }));
+        assert!(matches!(
+            translate(interactive),
+            Some(AgentDomainEvent::PermissionModeChanged {
+                mode: crate::PermissionMode::Auto,
+                ..
+            })
+        ));
+        let none = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged::default()));
+        assert_eq!(translate(none), None);
+    }
+
+    #[test]
+    fn a_tool_policy_violation_close_has_its_own_reason() {
+        assert_eq!(
+            translate_close_reason(SessionCloseReason::ToolPolicyViolation),
+            "tool_policy_violation"
+        );
+    }
+
+    fn text(turn: &str, id: Option<&str>, text: &str) -> ProtoSessionEvent {
+        wrap(ProtoEvent::TextDelta(TextDelta {
+            turn_id: turn.into(),
+            text: text.into(),
+            message_id: id.map(Into::into),
+        }))
+    }
+
+    fn boundary(turn: &str) -> Option<AgentDomainEvent> {
+        Some(AgentDomainEvent::AssistantMessageBoundary { turn_id: turn.into() })
+    }
+
+    #[test]
+    fn a_new_message_id_closes_the_message_before_it() {
+        let mut split = MessageSplit::new(true);
+        assert_eq!(
+            split.before(&text("t1", Some("msg_a"), "After the table.")),
+            None,
+            "the first text opens"
+        );
+        assert_eq!(
+            split.before(&text("t1", Some("msg_a"), " more")),
+            None,
+            "same message continues"
+        );
+        assert_eq!(split.before(&text("t1", Some("msg_b"), "TURN-1-DONE")), boundary("t1"));
+        assert_eq!(split.before(&text("t1", None, "x")), None, "no id says nothing");
+    }
+
+    #[test]
+    fn a_turn_starts_fresh_and_thinking_never_splits() {
+        let mut split = MessageSplit::new(true);
+        split.before(&text("t1", Some("msg_a"), "a"));
+        assert_eq!(
+            split.before(&wrap(ProtoEvent::TurnStarted(TurnStarted { turn_id: "t2".into() }))),
+            None
+        );
+        assert_eq!(
+            split.before(&text("t2", Some("msg_c"), "b")),
+            None,
+            "a new turn is already a new message"
+        );
+        let thinking = wrap(ProtoEvent::ThinkingDelta(ThinkingDelta {
+            turn_id: "t2".into(),
+            text: "…".into(),
+            message_id: Some("msg_d".into()),
+        }));
+        assert_eq!(split.before(&thinking), None);
+    }
+
+    #[test]
+    fn without_the_capability_nothing_splits() {
+        let mut split = MessageSplit::new(false);
+        split.before(&text("t1", Some("msg_a"), "a"));
+        assert_eq!(split.before(&text("t1", Some("msg_b"), "b")), None);
     }
 }

@@ -38,7 +38,16 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
                     claude_runtime_protocol::v1::SettingSource::Local as i32,
                 ],
             }),
+            // permission_mode_switchable added at 133dc03. `false` is what every session built
+            // before this field existed sends -- this smoke test does not exercise switching.
+            permission_mode_switchable: false,
         }),
+        // model/effort/system_prompt/output_format added at 133dc03, each `optional`/absent =
+        // the CLI's own default -- unexercised by this smoke test.
+        model: None,
+        effort: None,
+        system_prompt: None,
+        output_format: None,
     };
     assert_eq!(request.cwd, "/tmp/example");
     let policy = request.policy.unwrap();

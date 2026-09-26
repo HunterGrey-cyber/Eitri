@@ -96,8 +96,13 @@ function humanKey(table: PanelTable, k: string): string {
 /** The distinct next keys reachable from `typed`, in the order the box should show them: every
  *  direct binding first (in table order), then every group (in `table.groups` order) -- spec §2.5.
  *  A key is a group when some OTHER binding continues past it; its label comes from `table.groups`
- *  if that pair is registered there, else a synthesized `+<key>`. */
-export function boxEntries(table: PanelTable, typed: string[], sessionStarted: boolean): BoxEntry[] {
+ *  if that pair is registered there, else a synthesized `+<key>`.
+ *
+ *  `modeFixed` (App.tsx's own const, wave 5): whether `mode.cycle` would flash rather than post --
+ *  it already means "cycling makes no sense any more", named for what it disables rather than for
+ *  the tab-lifecycle reading `sessionStarted` used to invite (a live, switch-capable tab can still
+ *  cycle; see `modeKey.ts`'s `modeKeyRoute`). */
+export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
   const depth = typed.length;
   const atDepth = table.bindings.filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
   const nextKeys: string[] = [];
@@ -114,7 +119,7 @@ export function boxEntries(table: PanelTable, typed: string[], sessionStarted: b
           ?.label ?? `+${humanKey(table, nextKey)}`)
       : (atDepth.find((b) => b.keys.length === depth + 1 && b.keys[depth] === nextKey)?.desc ?? "");
     const binding = atDepth.find((b) => b.keys.length === depth + 1 && b.keys[depth] === nextKey);
-    const disabled = !isGroup && binding?.action === "mode.cycle" && sessionStarted;
+    const disabled = !isGroup && binding?.action === "mode.cycle" && modeFixed;
     const entry: BoxEntry = { key: humanKey(table, nextKey), label, group: isGroup, disabled: Boolean(disabled) };
     (isGroup ? groups : leaves).push(entry);
   }

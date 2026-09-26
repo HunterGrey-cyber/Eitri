@@ -17,6 +17,11 @@ pub struct RecordingProvider {
     interrupts: AtomicUsize,
     refusing: AtomicBool,
     interrupt_capable: bool,
+    /// Advertises `set_permission_mode` (wave 5, Task 4).
+    switch_capable: bool,
+    refusing_switches: AtomicBool,
+    /// Every `set_permission_mode` call's mode, accepted or refused.
+    modes: std::sync::Mutex<Vec<agent::PermissionMode>>,
 }
 
 impl RecordingProvider {
@@ -34,6 +39,22 @@ impl RecordingProvider {
             ..Default::default()
         }
     }
+    /// A provider that advertises `set_permission_mode` (read by `AgentConversation::create`, so
+    /// choose it before creating the conversation), as `interruptible` does for `interrupt`.
+    pub fn switchable() -> Self {
+        RecordingProvider {
+            switch_capable: true,
+            ..Default::default()
+        }
+    }
+    /// Every mode a `set_permission_mode` reached the provider with, refused ones included.
+    pub fn modes(&self) -> Vec<agent::PermissionMode> {
+        self.modes.lock().unwrap().clone()
+    }
+    /// While on, every mode switch is refused as a provider error.
+    pub fn refuse_switches(&self, on: bool) {
+        self.refusing_switches.store(on, Ordering::SeqCst);
+    }
     pub fn turns(&self) -> Vec<String> {
         self.turns.lock().unwrap().clone()
     }
@@ -50,6 +71,7 @@ impl agent::AgentProvider for RecordingProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             interrupt: self.interrupt_capable,
+            set_permission_mode: self.switch_capable,
             ..ProviderCapabilities::default()
         }
     }
@@ -82,6 +104,21 @@ impl agent::AgentProvider for RecordingProvider {
             .unwrap()
             .push((request.permission_id, request.decision.allows()));
         Ok(())
+    }
+    fn set_permission_mode(&self, request: agent::SetPermissionModeRequest) -> Result<String, agent::ProviderError> {
+        self.modes.lock().unwrap().push(request.mode);
+        if self.refusing_switches.load(Ordering::SeqCst) {
+            return Err(agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::InvalidConfiguration,
+                message: "refused by the test".into(),
+            });
+        }
+        // The provider's own vocabulary, as `SetPermissionModeResponse.permission_mode` carries it.
+        Ok(match request.mode {
+            agent::PermissionMode::Auto => "default",
+            agent::PermissionMode::Bypass => "bypassPermissions",
+        }
+        .into())
     }
     fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
         Ok(())

@@ -136,7 +136,12 @@ pub fn disallowed_tools_for(mode: PermissionMode) -> &'static [&'static str] {
 /// Unix socket) is the primary gate; `CanUseTool` control_requests are a secondary, unreliable
 /// signal (see `PermissionSource`). `Bypass` skips permission gating entirely (no hook settings
 /// are even generated) -- intended only for trusted, non-interactive callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize` (Task 1 of the wave-5 plan): carried on `AgentDomainEvent::PermissionModeChanged`,
+/// which the panel's snapshot serializes as JSON. `rename_all = "snake_case"` matches this crate's
+/// existing convention for wire-facing enums (see `AgentDomainEvent`'s own `#[serde(...)]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     Auto,
     Bypass,

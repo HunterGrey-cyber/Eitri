@@ -57,8 +57,11 @@ const PUMP_POLL_INTERVAL_MS: u64 = 33;
 /// Sharing one number would make the next change to it silently change the other.
 ///
 /// It is the legacy backend's real close time with room to spare (~0.8s of grace periods plus
-/// three thread joins) and is knowingly shorter than the sidecar path's documented worst case;
-/// `AgentPanelHandle::shutdown`'s handoff branch says what expiring costs.
+/// three thread joins) and is knowingly shorter than the sidecar path's documented worst case --
+/// this backstop's expiry only releases the application hold, it does not kill anything, so
+/// "knowingly short" here means neovibe's own process may exit before a still-reaping sidecar
+/// finishes its cleanup, not that anything gets SIGKILLed early; `AgentPanelHandle::shutdown`'s
+/// handoff branch says what expiring costs.
 const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The backstop on a backend this panel is tearing down itself, once the window is gone. Since
@@ -74,18 +77,18 @@ const HANDOFF_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_se
 /// **What is inside the span it bounds:** the whole of `AgentBackend::shutdown()` AND the drop of
 /// the backend afterwards -- `tear_down_holding_the_application` drops it explicitly before the
 /// worker reports. On the sidecar path those are two different waits and only the second one kills
-/// anything: `shutdown()` issues `close_session`, a unary RPC bounded at 10s (`UNARY_RPC_TIMEOUT`,
-/// agent/src/providers/claude_sidecar/mod.rs), and it is `SpawnedSidecar::drop` (close stdin, poll
-/// up to 3s, then SIGKILL) plus `RuntimeThread::drop` that end the child. 15 seconds covers that
-/// ~13s worst case with a little room; a round of this branch's review found an earlier version
-/// deriving 15 from those same two numbers while reporting BEFORE the drop, so the escalation it
-/// was sized for sat outside the window it bounded.
+/// anything: `shutdown()` issues `close_session`, a unary RPC bounded at `agent::UNARY_RPC_TIMEOUT`
+/// (agent/src/providers/claude_sidecar/mod.rs), and it is `SpawnedSidecar::drop` (close stdin, poll
+/// up to `agent::SIDECAR_EXIT_GRACE`, then SIGKILL) plus `RuntimeThread::drop` that end the child.
+/// 18 seconds covers that ~16 s worst case with a little room; a round of this branch's review
+/// found an earlier version deriving 15 from those same two numbers while reporting BEFORE the
+/// drop, so the escalation it was sized for sat outside the window it bounded.
 ///
 /// **What expiring costs**, since it is a bound and not a guarantee: one line on stderr naming what
 /// is still outstanding, then the hold is released anyway, `Application::run` returns, and the
 /// detached worker dies with the process -- i.e. exactly the orphaned `claude`/sidecar/`node` this
 /// file keeps chasing with pid diffs, which is why the number is generous rather than tight.
-const SESSION_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
+const SESSION_CLOSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(18);
 
 /// How long a window close keeps the process alive for a backend that is still CONNECTING.
 ///
@@ -2627,7 +2630,18 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     send_tabs(state, webview);
                     ok(webview);
                 }
-                None => refuse(webview, "the mode is fixed for this session"),
+                None => {
+                    // A started tab: switch it when its sidecar can (wave 5), else the old refusal. The
+                    // borrow ends before `send_tabs`, which borrows again. Nothing is remembered (W2).
+                    let switched = state.borrow_mut().tabs.switch_mode(tab);
+                    match switched {
+                        Ok(_) => {
+                            send_tabs(state, webview);
+                            ok(webview);
+                        }
+                        Err(why) => refuse(webview, &why),
+                    }
+                }
             }
         }
         InboundMessage::OpenDetail { .. } => {
@@ -3078,6 +3092,17 @@ mod tests {
                 "a load_html without the secure base: {call}"
             );
         }
+    }
+
+    /// Ruling W6: `SESSION_CLOSE_BACKSTOP` must cover both the `close_session` unary RPC and the
+    /// sidecar's own reap of the `claude` CLI it owns, with margin -- so the drop normally finishes
+    /// inside this backstop rather than racing it.
+    #[test]
+    fn the_close_backstop_covers_a_close_rpc_and_the_sidecars_reap() {
+        assert!(
+            SESSION_CLOSE_BACKSTOP
+                >= agent::UNARY_RPC_TIMEOUT + agent::SIDECAR_EXIT_GRACE + std::time::Duration::from_secs(1)
+        );
     }
 
     fn live_backend(dir: &std::path::Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {

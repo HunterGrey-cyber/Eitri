@@ -217,6 +217,7 @@ fn setting_sources_project_local_really_excludes_the_user_tier_at_runtime() {
         StreamingPreference::Complete,
         None,
         false,
+        false,
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
@@ -314,6 +315,7 @@ fn tool_policy_deny_really_stops_a_bypass_session_from_running_bash() {
         PermissionMode::Bypass,
         StreamingPreference::Complete,
         None,
+        false,
         false,
     );
     request.policy.as_mut().unwrap().tool_policy = Some(ToolPolicy {

@@ -105,8 +105,12 @@ export type Capabilities = {
   fork: boolean;
   interrupt: boolean;
   bypassPermissionMode: boolean;
-  /** D6: false until Verdandi can change a live session's mode; every mode control is hidden
-   *  while it is false (`agent_backend::MODE_SWITCH_AVAILABLE`). */
+  /** Whether the sidecar can switch THIS live session's permission mode
+   *  (`agent/src/providers/claude_sidecar/mod.rs`'s `set_permission_mode`); `false`/absent on legacy
+   *  and on an older sidecar that never advertised `SetPermissionMode`. Wave 5 flips
+   *  `CLIENT_IMPLEMENTS_SET_PERMISSION_MODE` to `true` once the switch RPC is real, at which point a
+   *  live tab's Shift+Tab (`modeKey.ts`'s `modeKeyRoute`) cycles instead of flashing the fixed-mode
+   *  text -- see the wave-5 correction to the "D6" row this doc comment used to describe alone. */
   modeSwitch?: boolean;
 };
 
@@ -295,8 +299,11 @@ export type AgentDomainEvent =
   | { type: "turn_started"; turn_id: string }
   | { type: "user_prompt_submitted"; text: string }
   | { type: "content_delta"; turn_id: string; kind: "text" | "thinking"; text: string }
-  /** The streaming assistant message is over; the next text starts a new one (legacy only: the
-   *  sidecar's wire carries no message id). Mirrors `AgentDomainEvent::AssistantMessageBoundary`. */
+  /** The streaming assistant message is over; the next text starts a new one. Mirrors
+   *  `AgentDomainEvent::AssistantMessageBoundary`. Reachable on **both** backends: legacy emits it
+   *  directly (`session.rs`), and the sidecar translates a *change* of a present
+   *  `TextDelta.message_id` into one (Task 3) -- no id on the wire still means today's
+   *  concatenation, and a replayed duplicate after a reconnect never re-splits. */
   | { type: "assistant_message_boundary"; turn_id: string }
   | { type: "tool_call_started"; turn_id: string; tool_use_id: string; name: string; input: unknown }
   | { type: "tool_call_completed"; turn_id: string; tool_use_id: string; content: unknown; is_error: boolean }
@@ -315,7 +322,15 @@ export type AgentDomainEvent =
       detail: string | null;
     }
   | { type: "session_unavailable"; reason: string }
-  | { type: "session_closed"; reason: string };
+  | { type: "session_closed"; reason: string }
+  /** Wave 5, Task 1/2: the sidecar's own acknowledgement of a `set_permission_mode` RPC (W1, a
+   *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is neovibe's own
+   *  `PermissionModeChoice`; `provider_mode` is Verdandi's raw string (diagnostics only); `floor_applied`
+   *  is `true` exactly when Verdandi's bypass floor (`usesDefaultBypassDeny`) still restricted
+   *  the session (a deny list) despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores
+   *  this event on purpose**: the mode a tab is in lives on the `tabs` envelope (`TabInfo.mode`), not
+   *  on this per-session projection, so folding it here would just be a second, driftable copy. */
+  | { type: "permission_mode_changed"; mode: PermissionModeChoice; provider_mode: string; floor_applied: boolean };
 
 /** A session tab's identity for its whole life, and the bridge's (`neovibe_core::tabs::TabId`). */
 export type TabId = number;
