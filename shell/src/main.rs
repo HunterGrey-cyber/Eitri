@@ -571,11 +571,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // captured `panel_font_size` so a colorscheme change re-derives every OTHER token but never
     // resets a zoom back to the un-zoomed base.
     let panel_px = Rc::new(std::cell::Cell::new(panel_font_size));
+    // The editor's cell height, reported by `connect_cell_size_changed` below. It is `None` until
+    // nvim reports a font, as is `--nv-editor-row`; `panel_tokens` reads it when building the
+    // theme.
+    let editor_row: Rc<std::cell::Cell<Option<f32>>> = Rc::new(std::cell::Cell::new(None));
     // One helper, so the startup theme and every later one cannot disagree about the size. The
     // editor's clear colour and the GTK chrome do not take it: it is the panel's text, not the
     // window's.
     let panel_tokens = {
         let panel_px = panel_px.clone();
+        let editor_row = editor_row.clone();
         move |payload: Option<&neovibe_core::theme::payload::NvimThemePayload>| {
             let mut tokens = match payload {
                 Some(p) => neovibe_core::theme::ThemeTokens::derive(p),
@@ -585,12 +590,24 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             // `live_panel_font_size_px` is unit-tested in `text_size.rs`, but this GTK closure has no
             // headless test to catch using the captured startup `panel_font_size` instead. Check in the
             // GUI that changing the colorscheme after zooming keeps the panel zoomed.
+            tokens.editor_row_px = editor_row.get();
             tokens
         }
     };
     agent_panel_handle.set_theme(&panel_tokens(None));
     pane.set_clear_color(editor_clear(&neovibe_core::theme::ThemeTokens::fallback()));
     terminal.set_colors(terminal::colors_from(&neovibe_core::theme::ThemeTokens::fallback()));
+    // When the editor reports or changes its cell height, save it for `panel_tokens` so later
+    // colorscheme changes retain it. Push the height into the panel's live theme through the same
+    // `set_theme` path used for font-size zoom.
+    {
+        let editor_row = editor_row.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        pane.connect_cell_size_changed(move |_, h| {
+            editor_row.set(Some(h as f32));
+            agent_panel_handle.set_editor_row_px(h as f32);
+        });
+    }
     if let Some(feed) = theme_feed.as_mut() {
         let theme_css = theme_css.clone();
         // What the stylesheet paints, for the widgets GTK leaves on the old one (`theme::restyle`).
@@ -1086,7 +1103,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 killed.borrow_mut().remove(&id);
                 println!("[modules] {id}: shown again after a kill, starting it fresh");
                 match id.kind() {
-                    ModuleKind::Agent => agent.open_chooser(false),
+                    ModuleKind::Agent => agent.open_chooser(),
                     ModuleKind::LuaWebview => {
                         if let Some((_, widget, url)) = lua_pages.iter().find(|(m, _, _)| *m == id) {
                             if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
@@ -1249,7 +1266,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     true
                 }
                 tab_verbs::TabVerb::Choose => {
-                    agent.open_chooser(false);
+                    agent.open_chooser();
                     true
                 }
                 tab_verbs::TabVerb::Info => {
@@ -1709,29 +1726,6 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // would rewrite the layout's `focus` before this line read it. Today a top-bar item (a tray chip,
     // or `↻`) is the first focusable widget, so it never has.
     let first = module_layout.borrow().focus().clone();
-    // the chooser opens over tab 1 with the keys when this project has a
-    // record to resume and the chat is on screen; closing it hands the keys to the editor, where a
-    // launch puts them.
-    agent_panel_handle.set_launch_chooser_allowed(module_layout.borrow().is_visible(&ModuleId::agent()));
-    {
-        let focus_module = focus_module.clone();
-        agent_panel_handle.on_launch_chooser(move || {
-            focus_module(&ModuleId::agent());
-        });
-    }
-    {
-        let focus_module = focus_module.clone();
-        let arrive = arrive.clone();
-        agent_panel_handle.on_chooser_closed(move |launch| {
-            // Esc/q at launch hands the keys to the editor. `focus_module` refuses a hidden
-            // or killed editor; in that case, use the normal chat arrival path so the keys
-            // stay in the chat instead of being stranded between panes.
-            if launch && !focus_module(&ModuleId::editor()) {
-                println!("[chooser] the editor cannot take the keys; they stay in the chat");
-                arrive(&ModuleId::agent());
-            }
-        });
-    }
     window.present();
     // Call `grab_focus()` after `present()`, since a widget must be shown to take focus.
     // Then call `arrive` as module keys do, so restored chat focus uses the same

@@ -794,6 +794,14 @@ impl TabSet {
             .count()
     }
 
+    /// `<leader>bd` asks before losing a running turn, a connect in flight or queued messages,
+    /// the facts named by `close_prompt`. Like `:bd` with unsaved changes, it asks only when there
+    /// is something to lose. `prefix &` always asks through `confirm-before`.
+    pub fn close_needs_confirm(&self, id: TabId) -> bool {
+        self.get(id)
+            .is_some_and(|t| matches!(t.backend, TabBackend::Starting(_)) || t.turn_running() || !t.queue.is_empty())
+    }
+
     pub fn close_facts(&self, id: TabId) -> Option<tabs::CloseFacts> {
         let tab = self.get(id)?;
         Some(tabs::CloseFacts {
@@ -1576,6 +1584,41 @@ mod tests {
             "one turn, each item with the context captured when it was queued"
         );
         assert!(set.get(tab).unwrap().queue.is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// Like `:bd` with unsaved changes, `<leader>bd` asks only when something would be lost.
+    #[test]
+    fn closing_asks_only_for_a_running_turn_a_connect_or_a_queue() {
+        let dir = workspace("tabs-close-needs-confirm");
+        let mut set = set();
+        let empty = set.active();
+        assert!(!set.close_needs_confirm(empty), "an empty tab has nothing to lose");
+        assert!(!set.close_needs_confirm(TabId(999)), "no such tab");
+
+        let connecting = set.open();
+        let (_tx, result_rx) = mpsc::channel();
+        set.get_mut(connecting).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "req-1".into(),
+            result_rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        assert!(
+            set.close_needs_confirm(connecting),
+            "a connect in flight"
+        );
+
+        let (provider, backend) = live(&dir);
+        set.get_mut(empty).unwrap().backend = TabBackend::Live(backend);
+        assert!(!set.close_needs_confirm(empty), "an idle live tab: nothing to lose");
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, empty, true);
+        assert!(set.close_needs_confirm(empty), "a running turn");
+        assert_eq!(set.queue_message(empty, "later", "later".into(), 1), Ok(1));
+        assert!(set.close_needs_confirm(empty), "a running turn with a queue");
         shut_down_all(&mut set);
     }
 

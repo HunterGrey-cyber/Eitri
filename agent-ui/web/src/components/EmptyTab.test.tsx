@@ -90,14 +90,8 @@ describe("EmptyTab (F3)", () => {
     fireEvent.keyDown(box, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("fix the parser");
   });
-  it("cycles the mode on Shift+Tab, but not while an input method is composing", () => {
-    const { container, props } = renderEmpty();
-    const box = container.querySelector("textarea")!;
-    fireEvent.keyDown(box, { key: "Tab", shiftKey: true, isComposing: true });
-    expect(props.onCycleMode).not.toHaveBeenCalled();
-    fireEvent.keyDown(box, { key: "Tab", shiftKey: true });
-    expect(props.onCycleMode).toHaveBeenCalledTimes(1);
-  });
+  // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab throughout the chat.
+  // App.test.tsx covers that routing.
   it("says it is starting while the session connects, with the box live, queueing", () => {
     const onQueue = vi.fn();
     const { container, getByText } = renderEmpty({ tab: { ...TAB, state: "starting" }, onQueue });
@@ -455,6 +449,55 @@ describe("EmptyTab (F3)", () => {
       expect(container.querySelector("textarea")).toBeNull();
       rendered.rerender(<EmptyTab {...props} arriveRequest={1} overlayOpen={true} focusRequest={1} />);
       expect(container.querySelector("textarea")).toBeNull();
+    });
+  });
+
+  /** Esc in the composer returns to BROWSE and focuses the screen root, making the dashboard's
+   *  navigation and action keys reachable again. */
+  describe("the dashboard's keys", () => {
+    it("Esc in the composer returns to the menu, keys on the screen's root", () => {
+      const onModeChange = vi.fn();
+      const { container } = renderEmpty({ onModeChange });
+      const textarea = container.querySelector("textarea")!;
+      textarea.focus();
+      fireEvent.keyDown(textarea, { key: "Escape" });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(onModeChange).toHaveBeenLastCalledWith("browse");
+      expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
+      expect(container.querySelector('.dash-item[aria-current="true"]')?.textContent).toContain("New session");
+    });
+
+    it("Esc mid-composition belongs to the input method", () => {
+      const { container } = renderEmpty();
+      const textarea = container.querySelector("textarea")!;
+      textarea.focus();
+      fireEvent.keyDown(textarea, { key: "Escape", isComposing: true });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    });
+
+    it("keeps the draft across Esc and i", () => {
+      const { container } = renderEmpty();
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: "half a thought" } });
+      fireEvent.keyDown(textarea, { key: "Escape" });
+      fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "i" });
+      expect(container.querySelector("textarea")!.value).toBe("half a thought");
+    });
+
+    it("j/k and the arrows walk the menu; h/l are claimed and move nothing", () => {
+      const rendered = renderEmpty();
+      const root = toBrowse(rendered, rendered.props);
+      const current = () => rendered.container.querySelector('.dash-item[aria-current="true"]')!.textContent;
+      fireEvent.keyDown(root, { key: "j" });
+      expect(current()).toContain("Resume last");
+      fireEvent.keyDown(root, { key: "ArrowDown" });
+      expect(current()).toContain("All sessions");
+      fireEvent.keyDown(root, { key: "ArrowUp" });
+      expect(current()).toContain("Resume last");
+      const l = new KeyboardEvent("keydown", { key: "l", bubbles: true, cancelable: true });
+      root.dispatchEvent(l);
+      expect(l.defaultPrevented).toBe(true);
+      expect(current()).toContain("Resume last");
     });
   });
 });

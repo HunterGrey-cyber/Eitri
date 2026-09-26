@@ -87,10 +87,6 @@ type Props = {
   editingInNvim?: boolean;
   /** `?` on an empty box opens the `?` keymap overlay. */
   onOpenKeymap?: () => void;
-  /** Handle Shift+Tab after a session starts, when changing its mode requires backend support that
-   *  is not yet available. Undefined leaves the key unclaimed so an ancestor can still change the
-   *  mode before a session starts. */
-  onShiftTab?: () => void;
 };
 
 /** C2: the BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
@@ -123,7 +119,6 @@ export function Composer({
   onEditInNvim = () => {},
   editingInNvim = false,
   onOpenKeymap = () => {},
-  onShiftTab,
 }: Props) {
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
@@ -210,11 +205,8 @@ export function Composer({
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (isImeKey({ isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) return;
     const el = e.currentTarget;
-    if (e.key === "Tab" && e.shiftKey && onShiftTab !== undefined) {
-      e.preventDefault();
-      onShiftTab();
-      return;
-    }
+    // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab before it reaches this
+    // handler.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit(e.ctrlKey);

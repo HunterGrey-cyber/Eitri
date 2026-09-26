@@ -208,12 +208,6 @@ pub enum InboundMessage {
         title: String,
         text: String,
     },
-    /// A chooser was dismissed. `launch` matches the closed chooser's flag; dismissing the
-    /// launch chooser returns keyboard focus to the editor.
-    ChooserClosed {
-        request_id: String,
-        launch: bool,
-    },
     /// `f` in the panel's BROWSE: ask `shell` to start a global HINT.
     HintRequest {
         request_id: String,
@@ -267,7 +261,7 @@ pub enum TabVerbWire {
 /// Which tab a command is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabRef {
-    /// A message about the whole panel (`ready`, `chooser_closed`, the HINT pair).
+    /// A message about the whole panel (`ready`, the HINT pair).
     WindowLevel,
     /// A tab command that names none: a protocol error, never "the active one".
     Missing,
@@ -278,7 +272,6 @@ impl InboundMessage {
     pub fn tab_ref(&self) -> TabRef {
         let tab = match self {
             InboundMessage::Ready { .. }
-            | InboundMessage::ChooserClosed { .. }
             | InboundMessage::HintRequest { .. }
             | InboundMessage::HintTargets { .. }
             | InboundMessage::HistoryPush { .. }
@@ -354,7 +347,6 @@ impl InboundMessage {
             | InboundMessage::ResetTab { request_id, .. }
             | InboundMessage::CycleMode { request_id, .. }
             | InboundMessage::OpenDetail { request_id, .. }
-            | InboundMessage::ChooserClosed { request_id, .. }
             | InboundMessage::HintRequest { request_id }
             | InboundMessage::HintTargets { request_id, .. }
             | InboundMessage::QueueMessage { request_id, .. }
@@ -950,9 +942,8 @@ pub struct ChooserRecord {
     pub held_elsewhere: bool,
 }
 
-/// Opens the chooser for `prefix w` or launch: open tabs first, then sessions open in no tab,
-/// newest first.
-pub fn serialize_chooser_for_js(launch: bool, open: &[ChooserTab], records: &[ChooserRecord]) -> String {
+/// `prefix w`: open tabs first, then the records open in no tab, newest first. Opens the chooser.
+pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord]) -> String {
     let open: Vec<Value> = open
         .iter()
         .map(|t| {
@@ -971,7 +962,7 @@ pub fn serialize_chooser_for_js(launch: bool, open: &[ChooserTab], records: &[Ch
             })
         })
         .collect();
-    json!({ "kind": "chooser", "launch": launch, "open": open, "records": records }).to_string()
+    json!({ "kind": "chooser", "open": open, "records": records }).to_string()
 }
 
 /// `prefix &`: the footer's y/n prompt, first line the question (`tabs::close_prompt`).
@@ -2165,9 +2156,6 @@ mod tests {
             let message = parse_inbound_message(json).unwrap_or_else(|| panic!("{want} did not parse"));
             assert!(matches!(message.tab_ref(), TabRef::Named(TabId(2))), "{want}");
         }
-        let closed = parse_inbound_message(r#"{"type":"chooser_closed","request_id":"a","launch":true}"#).unwrap();
-        assert!(matches!(closed, InboundMessage::ChooserClosed { launch: true, .. }));
-        assert!(matches!(closed.tab_ref(), TabRef::WindowLevel));
         assert!(
             parse_inbound_message(r#"{"type":"start_session","request_id":"a","mode":"auto"}"#).is_none(),
             "start_session is gone"
@@ -2271,9 +2259,8 @@ mod tests {
             updated_at: "2".into(),
             held_elsewhere: true,
         }];
-        let value: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(true, &open, &records)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(&open, &records)).unwrap();
         assert_eq!(value["kind"], "chooser");
-        assert_eq!(value["launch"], true);
         assert_eq!(value["open"][0]["tab"], 1);
         assert_eq!(value["open"][0]["marker"], serde_json::Value::Null);
         assert_eq!(value["records"][0]["providerSessionId"], "c-9");

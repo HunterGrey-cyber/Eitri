@@ -328,17 +328,20 @@ export function EmptyTab(props: EmptyTabProps) {
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
     if (isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) return;
-    if (event.key === "Tab" && event.shiftKey && !starting && !failed) {
-      event.preventDefault();
-      props.onCycleMode();
+    // Shift+Tab is caught by App.tsx's document-capture router (`modeKey.ts`) before this handler.
+    // A failed tab has no live composer, so an "input" mode must still allow `r`, HINT `f`, and
+    // handoff-copy `y`. A starting tab has a live composer that queues behind the connection, so
+    // INPUT still claims its keys.
+    if (mode === "input" && !failed) {
+      // vim's Esc (and the live conversation's, `resolveKey`): back to the menu. The root takes the keys
+      // BEFORE `setMode("browse")` unmounts the textarea, or they would fall to <body>.
+      if (event.key === "Escape" && !event.nativeEvent.isComposing) {
+        event.preventDefault();
+        rootRef.current?.focus({ preventScroll: true });
+        setMode("browse");
+      }
       return;
     }
-    // Once the composer is disabled (failed) there is nothing left to type into, so `mode` staying
-    // "input" must not swallow the keys the disabled screen still offers -- `r` on a failed tab, `f`
-    // for HINT, `y` to copy a handoff command -- the same reasoning `Composer`'s own doc comment
-    // gives for a dead session's INPUT being an empty mode. A `starting` tab's composer is live now
-    // (C1: it queues behind the connect), so it is no longer exempted here.
-    if (mode === "input" && !failed) return;
     if (event.key === "r" && failed) {
       event.preventDefault();
       props.onReset();
@@ -391,9 +394,15 @@ export function EmptyTab(props: EmptyTabProps) {
       }
     }
     const items = dashItems(hello);
-    if (event.key === "j" || event.key === "k") {
+    // The dashboard has one column, so h/l do not change the item. Claim them here so they
+    // do not fall through to the composer or leave as unhandled keys.
+    if (event.key === "h" || event.key === "l") {
       event.preventDefault();
-      const delta = event.key === "j" ? 1 : -1;
+      return;
+    }
+    if (event.key === "j" || event.key === "k" || event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "j" || event.key === "ArrowDown" ? 1 : -1;
       setDashCursor((c) => Math.max(0, Math.min(items.length - 1, c + delta)));
       return;
     }

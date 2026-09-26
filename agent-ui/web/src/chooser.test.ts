@@ -8,7 +8,6 @@ const TAB: TabInfo = {
 };
 
 const ENVELOPE: ChooserEnvelope = {
-  launch: false,
   open: [
     { tab: 1, label: "1 fix-parser", marker: "needs_input", pending: 2, resumable: true },
     { tab: 2, label: "2 legacy one", marker: null, pending: 0, resumable: false },
@@ -50,7 +49,6 @@ describe("chooserRows", () => {
     // Search both `name` and `title` when both are present. Using `recordLead` would search only
     // `name`, hiding matches in the title shown by the row.
     const named: ChooserEnvelope = {
-      launch: false,
       open: [],
       records: [{ providerSessionId: "renamed-0000", name: "notes", title: "fix the parser bug", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
     };

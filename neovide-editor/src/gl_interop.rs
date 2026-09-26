@@ -1,8 +1,5 @@
 //! GL/Skia interop and content-region math for the editor surface.
 
-use gtk4::prelude::*;
-use gtk4::GLArea;
-
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, surfaces, Budgeted, DirectContext, SurfaceOrigin};
 use skia_safe::{AlphaType, Canvas, Color4f, ColorType, ImageInfo, Paint, Rect, Surface};
@@ -271,17 +268,53 @@ pub(crate) fn pixel_to_grid_pos(
     )
 }
 
-/// `content_region` computed from `gl_area`'s own *current* framebuffer size -- the same
-/// `widget.width() * widget.scale_factor()` / `widget.height() * widget.scale_factor()`
-/// device-pixel conversion the render callback's initial `SkiaState` construction and the resize
-/// handler both already use, so a mouse handler reading it between two paints still sees the same
-/// rect the next frame will actually draw into (as opposed to reaching into `SkiaState`'s own
-/// cached `fb_width`/`fb_height`, which is only ever updated from inside `connect_resize`/
-/// `connect_render` and would otherwise need its own borrow here for no benefit).
-pub(crate) fn current_content_region(gl_area: &GLArea, grid_scale: GridScale) -> PixelRect<f32> {
-    let scale_factor = gl_area.scale_factor();
-    let region = compute_content_region(gl_area.width() * scale_factor, gl_area.height() * scale_factor);
-    snap_region_to_grid(&region, grid_scale)
+/// Derives the hit-testing region from the framebuffer size last reported through
+/// `GLArea::resize`, using the same `grid_layout` as rendering. This keeps clicks aligned with
+/// row 0. Recomputing from `widget.width() * scale_factor()` can disagree with GTK's
+/// framebuffer before the widget is drawn at its allocation.
+pub(crate) fn current_content_region(fb: (i32, i32), grid_scale: GridScale) -> PixelRect<f32> {
+    grid_layout(fb.0, fb.1, grid_scale, |_| GridSize::new(1, 1)).region
+}
+
+/// Geometry for one frame derived from one framebuffer size: the snapped drawing region, nvim's
+/// `(cols, rows)`, and the sub-cell remainder above the grid (`band_top_px`). Logging the
+/// remainder distinguishes it from a whole blank cmdline row.
+///
+/// The remainder belongs above the grid so the bottom row reaches the pane's bottom. Sharing
+/// this calculation across rendering, resizing, tick resync, and hit testing keeps their
+/// geometry aligned instead of mixing GTK's framebuffer size with widget allocation dimensions.
+/// neovibe-only.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridLayout {
+    pub region: PixelRect<f32>,
+    pub grid: GridSize<u32>,
+    pub band_top_px: f32,
+}
+
+/// See [`GridLayout`]. `grid_for` does the division (in the product,
+/// `|r| grid_size_for_content_region(&harness, r)`), so the grid is rounded exactly as the size
+/// `resize_grid` is sent; the pure tests pass a plain floor division.
+pub(crate) fn grid_layout(
+    fb_width: i32,
+    fb_height: i32,
+    grid_scale: GridScale,
+    grid_for: impl Fn(&PixelRect<f32>) -> GridSize<u32>,
+) -> GridLayout {
+    let unsnapped = compute_content_region(fb_width, fb_height);
+    let region = snap_region_to_grid(&unsnapped, grid_scale);
+    GridLayout {
+        grid: grid_for(&region),
+        band_top_px: region.min.y - unsnapped.min.y,
+        region,
+    }
+}
+
+/// Compares grid cell dimensions by bits because `GridScale` has no `PartialEq`. Before nvim
+/// reports a font, a cell can be NaN; ordinary float inequality would report a change every
+/// frame and continuously request new frames at idle. Comparing bits treats an unchanged NaN
+/// representation as equal.
+pub(crate) fn same_grid_scale(a: GridScale, b: GridScale) -> bool {
+    (a.width().to_bits(), a.height().to_bits()) == (b.width().to_bits(), b.height().to_bits())
 }
 
 /// Moves the vertical sub-cell remainder of `region` from the bottom edge to the top edge.
@@ -496,5 +529,74 @@ mod snap_tests {
         assert_eq!(pixel_to_grid_pos(0.0, 58.0, 1, &snapped, grid_scale, grid_size).1, 1);
         // And the last pixel of the pane is the last row, with nothing past it.
         assert_eq!(pixel_to_grid_pos(0.0, 1597.0, 1, &snapped, grid_scale, grid_size).1, 35);
+    }
+
+    fn divide(scale: GridScale) -> impl Fn(&PixelRect<f32>) -> GridSize<u32> {
+        move |r| {
+            GridSize::new(
+                ((r.max.x - r.min.x) / scale.width()).floor() as u32,
+                ((r.max.y - r.min.y) / scale.height()).floor() as u32,
+            )
+        }
+    }
+
+    /// The grid's rows fill the snapped region, whose bottom matches the framebuffer's bottom.
+    /// Checks two cell heights to cover a zoom, with the sub-cell remainder placed above the
+    /// grid.
+    #[test]
+    fn the_grid_fills_the_snapped_region_and_ends_at_the_bottom() {
+        for cell in [(20.0_f32, 44.0_f32), (22.0, 49.0)] {
+            let scale = GridScale::new(PixelSize::new(cell.0, cell.1));
+            let layout = grid_layout(1400, 1598, scale, divide(scale));
+            assert_eq!(layout.region.max.y, 1598.0, "flush at the bottom");
+            assert_eq!(
+                layout.grid.height as f32 * cell.1,
+                layout.region.max.y - layout.region.min.y
+            );
+            assert_eq!(layout.band_top_px, 1598.0 % cell.1);
+            assert!(layout.band_top_px < cell.1);
+        }
+    }
+
+    #[test]
+    fn a_framebuffer_that_is_a_whole_number_of_rows_has_no_band() {
+        let scale = GridScale::new(PixelSize::new(20.0, 44.0));
+        let layout = grid_layout(1400, 44 * 30, scale, divide(scale));
+        assert_eq!(
+            (layout.band_top_px, layout.region.min.y, layout.grid.height),
+            (0.0, 0.0, 30)
+        );
+    }
+
+    #[test]
+    fn a_zero_or_unfonted_framebuffer_is_left_alone() {
+        let scale = GridScale::new(PixelSize::new(20.0, 44.0));
+        let layout = grid_layout(0, 0, scale, divide(scale));
+        assert_eq!(layout.band_top_px, 0.0);
+        let nan = GridScale::new(PixelSize::new(f32::NAN, f32::NAN));
+        assert_eq!(grid_layout(100, 100, nan, |_| GridSize::new(1, 1)).band_top_px, 0.0);
+    }
+
+    /// Before nvim reports a font, an unchanged NaN cell must compare equal to itself.
+    /// Otherwise the scale-change check in `render_frame` requests another frame on every
+    /// callback and renders continuously at idle.
+    #[test]
+    fn a_nan_cell_is_the_same_scale_so_an_unfonted_pane_does_not_render_forever() {
+        let nan = GridScale::new(PixelSize::new(f32::NAN, f32::NAN));
+        assert!(same_grid_scale(nan, nan));
+        let s44 = GridScale::new(PixelSize::new(20.0, 44.0));
+        assert!(same_grid_scale(s44, GridScale::new(PixelSize::new(20.0, 44.0))));
+        assert!(!same_grid_scale(s44, GridScale::new(PixelSize::new(22.0, 49.0))));
+    }
+
+    /// Clicks and paint read one region: hit testing's rect is exactly the one the render
+    /// callback hands `render_frame` (the 2026-09-19 lesson: "the snap has to reach hit-testing").
+    #[test]
+    fn the_region_grid_layout_returns_is_the_one_hit_testing_uses() {
+        let s44 = GridScale::new(PixelSize::new(20.0, 44.0));
+        let hit = current_content_region((1400, 1598), s44);
+        let paint = grid_layout(1400, 1598, s44, divide(s44)).region;
+        assert_eq!(hit, paint);
+        assert_eq!((hit.min.y, hit.max.y), (14.0, 1598.0));
     }
 }

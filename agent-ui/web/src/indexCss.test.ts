@@ -742,6 +742,26 @@ describe("index.css", () => {
     }
   });
 
+  it("the status band is one editor row high, and never grows (wave 4, R5)", () => {
+    // The status band must align with the editor's status line. A min-height lets children,
+    // especially the fallback font for the mode glyph, make the band taller. --nv-editor-row
+    // supplies the editor's cell height; fixed height and overflow: hidden keep the band at
+    // that height.
+    const [band] = rulesMatching(withoutComments, ".status-band").filter((r) => r.selector.trim() === ".status-band");
+    const decl = (name: string) =>
+      band.body
+        .split(";")
+        .map((d) => d.trim())
+        .find((d) => d.startsWith(`${name}:`))
+        ?.slice(name.length + 1)
+        .trim();
+    expect(decl("height")).toBe("var(--nv-editor-row, 24px)");
+    expect(decl("min-height")).toBeUndefined();
+    expect(decl("box-sizing")).toBe("border-box");
+    expect(decl("overflow")).toBe("hidden");
+    expect(decl("line-height")).toBe("calc(var(--nv-editor-row, 24px) - 1px)");
+  });
+
   /* Only the activity meter may animate, so removing it must leave no animation running. The
      guards check the whole stylesheet for extra animated selectors, keyframes and transitions.
      Negative controls exercise animation longhands, colour transitions, final declarations

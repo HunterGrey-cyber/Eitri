@@ -234,12 +234,8 @@ describe("Composer in BROWSE (C2)", () => {
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...");
   });
 
-  it("hands Shift+Tab to the host when asked to", () => {
-    const onShiftTab = vi.fn();
-    const { textarea } = renderComposer({ onShiftTab });
-    fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
-    expect(onShiftTab).toHaveBeenCalledTimes(1);
-  });
+  // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab in every mode before this
+  // component. The behavior is tested in App.test.tsx.
 });
 
 describe("Composer during a turn (C1, F1)", () => {
@@ -510,10 +506,10 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       });
     },
     "Shift+Tab": () => {
-      const onShiftTab = vi.fn();
-      const { textarea } = renderComposer({ onShiftTab });
-      fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
-      expect(onShiftTab).toHaveBeenCalledTimes(1);
+      // Leave Shift+Tab unclaimed here. App.tsx's document-capture router (`modeKey.ts`) handles it
+      // before React handlers in every mode; App.test.tsx covers that routing.
+      const { textarea } = renderComposer();
+      expect(fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true })).toBe(true);
     },
     Esc: () => {
       const { textarea } = renderComposer();

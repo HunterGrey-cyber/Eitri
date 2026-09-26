@@ -30,12 +30,12 @@ use skia_safe::gpu::direct_contexts;
 use skia_safe::{BlendMode, Color4f, Paint, SamplingOptions};
 
 use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
-use neovide::units::GridSize;
+use neovide::units::{GridScale, GridSize};
 
 use frame_clock::AnimationClock;
 use gl_interop::{
-    compute_content_region, fill_content_region, grid_size_for_content_region, make_gl_interface, snap_region_to_grid,
-    SkiaState,
+    compute_content_region, fill_content_region, grid_layout, grid_size_for_content_region, make_gl_interface,
+    same_grid_scale, GridLayout, SkiaState,
 };
 use mouse::DragState;
 
@@ -83,6 +83,10 @@ pub enum LiveState {
     /// one per process (`EventLoopError::RecreationAttempt`).
     Exited,
 }
+
+/// `(fb_w, fb_h, cell_w bits, cell_h bits, cols, rows)`: what `LiveSession::log_layout_if_changed`
+/// compares to decide whether the layout changed. Named for `clippy::type_complexity`.
+type LayoutLogKey = (i32, i32, u32, u32, u32, u32);
 
 pub struct LiveSession {
     pub(crate) harness: LiveHarness,
@@ -140,10 +144,18 @@ pub struct LiveSession {
     /// `on_fullscreen_setting` callback fires on a change and not on every tick. Starts at
     /// Neovide's own default (`false`), so a value `init.lua` set is reported on the first tick.
     last_fullscreen_setting: Cell<bool>,
+    /// The framebuffer size in device pixels last reported by `GLArea::resize`.
+    /// Shared by rendering, resizing and the tick so mouse hit testing uses the size actually drawn
+    /// through `gl_interop::current_content_region` and `gl_interop::GridLayout`.
+    pub(crate) fb_size: Rc<Cell<(i32, i32)>>,
+    /// `(fb_w, fb_h, cell_w bits, cell_h bits, cols, rows)` as the `[layout]` line last printed
+    /// it, so the line is printed when the layout changes and never per frame. Bits, not f32, so
+    /// a NaN cell before nvim reports a font does not count as a change every frame.
+    last_logged_layout: Cell<Option<LayoutLogKey>>,
 }
 
 impl LiveSession {
-    fn new(harness: LiveHarness, grid_size: GridSize<u32>) -> Self {
+    fn new(harness: LiveHarness, grid_size: GridSize<u32>, fb_size: Rc<Cell<(i32, i32)>>) -> Self {
         let now = Instant::now();
         Self {
             harness,
@@ -161,6 +173,33 @@ impl LiveSession {
             scroll_position: Cell::new((0.0, 0.0)),
             last_pointer_pos: Cell::new((0.0, 0.0)),
             last_fullscreen_setting: Cell::new(false),
+            fb_size,
+            last_logged_layout: Cell::new(None),
+        }
+    }
+
+    /// Prints `[layout] fb=WxH cell=W×H grid=CxR band_top=Npx` when the layout differs from the
+    /// last one printed. The GUI pass reads it: `band_top` under one cell means the grid ends
+    /// flush at the bottom with the remainder above it; a blank *row* at the bottom with a small
+    /// `band_top` is nvim's own cmdline (`cmdheight`), not this crate's geometry.
+    fn log_layout_if_changed(&self, fb_w: i32, fb_h: i32, grid_scale: GridScale, layout: &GridLayout) {
+        let key = (
+            fb_w,
+            fb_h,
+            grid_scale.width().to_bits(),
+            grid_scale.height().to_bits(),
+            layout.grid.width,
+            layout.grid.height,
+        );
+        if self.last_logged_layout.replace(Some(key)) != Some(key) {
+            println!(
+                "[layout] fb={fb_w}x{fb_h} cell={:.2}×{:.2} grid={}x{} band_top={:.1}px",
+                grid_scale.width(),
+                grid_scale.height(),
+                layout.grid.width,
+                layout.grid.height,
+                layout.band_top_px,
+            );
         }
     }
 
@@ -234,6 +273,7 @@ impl TickStats {
 type ExitedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 type FullscreenCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
 type ScaleFactorCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f32)>>>>;
+type CellSizeCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f64, f64)>>>>;
 
 /// The embeddable Neovide/Skia editor surface. Wraps a single `GtkGLArea` driving a real
 /// `nvim --embed` connection (`neovide::live_harness::LiveHarness`), with resize/IME/keyboard/
@@ -267,6 +307,8 @@ pub struct NeovideEditorPane {
     /// See [`ScaleWatch`]'s own doc for why the per-tick change watch and the pre-`Ready` pending
     /// write live in one unit.
     scale_watch: Rc<ScaleWatch>,
+    /// See [`NeovideEditorPane::connect_cell_size_changed`].
+    cell_size_callback: CellSizeCallbackSlot,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -390,6 +432,14 @@ fn tick_should_render(
     scale_factor_changed_now: bool,
 ) -> bool {
     last_animating || new_content || wants_frame || scale_factor_changed_now
+}
+
+/// Whether `connect_cell_size_changed` should fire this frame. `None` means nvim has not yet
+/// reported a cell size and always counts as a change; otherwise compare the sizes directly.
+/// Kept separate from the render callback so this can be tested without constructing `GLArea`
+/// or `LiveSession`.
+fn cell_size_changed(last: Option<(f64, f64)>, now: (f64, f64)) -> bool {
+    last != Some(now)
 }
 
 /// One tick's [`ScaleWatch::observe`] result: whether `g:neovide_scale_factor` moved since the
@@ -519,6 +569,13 @@ impl NeovideEditorPane {
         let pending_fullscreen: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let scale_factor_callback: ScaleFactorCallbackSlot = Rc::new(RefCell::new(None));
         let scale_watch: Rc<ScaleWatch> = Rc::new(ScaleWatch::new(1.0));
+        let cell_size_callback: CellSizeCallbackSlot = Rc::new(RefCell::new(None));
+        // Only the render closure below ever reads this -- not stored on `Self`, unlike
+        // `cell_size_callback`, which a host registers *after* construction.
+        let last_cell_size: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        // Use the framebuffer size reported by `GLArea::resize`, in device pixels, for the grid,
+        // snapping, tick resync and hit testing. `gl_interop::GridLayout` keeps them consistent.
+        let fb_size: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
 
         // GtkWidget::unrealize is RUN_LAST: this normal handler runs before GtkGLArea deletes
         // its framebuffer and clears its GL context. Keep the nvim session across re-realization,
@@ -545,13 +602,17 @@ impl NeovideEditorPane {
         {
             let skia_state = skia_state.clone();
             let live_state = live_state.clone();
+            let fb_size = fb_size.clone();
             gl_area.connect_resize(move |widget, width, height| {
+                // Outside the `Ready` check, so a resize before nvim exists is kept too.
+                fb_size.set((width, height));
                 let mut live = live_state.borrow_mut();
                 let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                     session.wants_frame.set(true);
-                    let content_region =
-                        snap_region_to_grid(&compute_content_region(width, height), session.harness.grid_scale());
-                    let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
+                    let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
+                        grid_size_for_content_region(&session.harness, r)
+                    })
+                    .grid;
                     let resized_grid = if new_grid_size != session.last_grid_size.get() {
                         session.harness.resize_grid(new_grid_size);
                         session.last_grid_size.set(new_grid_size);
@@ -692,6 +753,9 @@ impl NeovideEditorPane {
             let focused = focused.clone();
             let pending_fullscreen = pending_fullscreen.clone();
             let scale_watch_for_ready = scale_watch.clone();
+            let fb_size = fb_size.clone();
+            let cell_size_callback_for_render = cell_size_callback.clone();
+            let last_cell_size = last_cell_size.clone();
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -708,6 +772,10 @@ impl NeovideEditorPane {
                         widget.scale_factor()
                     );
                     *state_slot = Some(SkiaState::new(gr_context, width, height));
+                    // The same computation GTK 4.22.5 uses for its own buffers and `resize`
+                    // signal (`gtkglarea.c` `gtk_gl_area_snapshot`), so this agrees with the
+                    // `resize` that normally arrived first; it covers one that has not.
+                    fb_size.set((width, height));
                 }
 
                 let state = state_slot.as_mut().unwrap();
@@ -725,7 +793,7 @@ impl NeovideEditorPane {
                     return glib::Propagation::Stop;
                 };
 
-                let (fb_w, fb_h) = (state.fb_width, state.fb_height);
+                let (fb_w, fb_h) = fb_size.get();
                 let content_region = compute_content_region(fb_w, fb_h);
                 // All content, including placeholders, uses the owned target when available.
                 // Target creation failure uses the original direct path.
@@ -742,6 +810,11 @@ impl NeovideEditorPane {
                 // clear writes survives the frame today; see `OUTSIDE_COLOR`'s own doc for the
                 // positive-control evidence.
                 canvas.clear(clear_color.get());
+
+                // Set from inside the `Ready` arm below, then fired only *after* `live` is
+                // dropped -- the same reentrancy rule the tick callback's `fullscreen_callback_for_tick`
+                // follows (a host's handler can call straight back into this pane).
+                let mut cell_size_changed_to: Option<(f64, f64)> = None;
 
                 let mut live = live_state.borrow_mut();
                 match &mut *live {
@@ -816,7 +889,12 @@ impl NeovideEditorPane {
                                 // `LiveHarnessOptions::grid_size` only sets the grid at `nvim_ui_attach` time.
                                 // Leaving it `None` uses `DEFAULT_GRID_SIZE` (100x50), independent of this pane's content region.
                                 // Resize immediately to the grid that fits the actual `content_region`.
-                                let grid_size = grid_size_for_content_region(&harness, &content_region);
+                                // Use the shared `grid_layout` geometry. Snapping preserves the number of rows that fit,
+                                // so it gives the same grid size as the unsnapped region.
+                                let grid_size = grid_layout(fb_w, fb_h, harness.grid_scale(), |r| {
+                                    grid_size_for_content_region(&harness, r)
+                                })
+                                .grid;
                                 println!(
                                     "[live] resizing nvim grid to {}x{} to match initial \
                                      content_region ({}x{}px) -- fixes the P2 frozen-scroll bug \
@@ -844,7 +922,8 @@ impl NeovideEditorPane {
                                 if let Some(scale_factor) = scale_watch_for_ready.take_pending_for_ready() {
                                     harness.set_scale_factor_setting(scale_factor);
                                 }
-                                *live = LiveState::Ready(Box::new(LiveSession::new(harness, grid_size)));
+                                *live =
+                                    LiveState::Ready(Box::new(LiveSession::new(harness, grid_size, fb_size.clone())));
                             }
                             Err(err) => {
                                 let elapsed = t0.elapsed();
@@ -876,8 +955,33 @@ impl NeovideEditorPane {
                         // no grid at all and should cover every pixel they can -- a "starting
                         // nvim..." screen with a band of clear colour along one edge would be a
                         // regression, not a fix.
-                        let grid_region = snap_region_to_grid(&content_region, session.harness.grid_scale());
-                        let animating = session.harness.render_frame(canvas, Some(&grid_region), dt);
+                        let snapped_scale = session.harness.grid_scale();
+                        let layout = grid_layout(fb_w, fb_h, snapped_scale, |r| {
+                            grid_size_for_content_region(&session.harness, r)
+                        });
+                        session.log_layout_if_changed(fb_w, fb_h, snapped_scale, &layout);
+                        let animating = session.harness.render_frame(canvas, Some(&layout.region), dt);
+                        if !same_grid_scale(snapped_scale, session.harness.grid_scale()) {
+                            // `render_frame` pumps nvim and applies `g:neovide_scale_factor` and `guifont` changes before
+                            // reading `grid_scale`. This frame was snapped for the old cell height, so the new rows
+                            // can leave a band at the bottom. Request another frame to snap with the new scale;
+                            // the tick's resync corrects the row count. An idle pane has no other render trigger.
+                            // The next frame sees the scale already applied, so this does not loop.
+                            session.wants_frame.set(true);
+                        }
+                        // The host uses the editor's cell height for `--nv-editor-row` to bound the status band.
+                        // Compute it with the same `grid_scale` and `scale_factor` as `cell_size()`.
+                        // Report only changes; `cell_size_changed` treats the first value as a change too.
+                        let current_scale = session.harness.grid_scale();
+                        let factor = f64::from(widget.scale_factor().max(1));
+                        let new_cell_size = (
+                            f64::from(current_scale.width()) / factor,
+                            f64::from(current_scale.height()) / factor,
+                        );
+                        if cell_size_changed(last_cell_size.get(), new_cell_size) {
+                            last_cell_size.set(Some(new_cell_size));
+                            cell_size_changed_to = Some(new_cell_size);
+                        }
                         // Share this frame's "do we still need more frames" signals with the tick
                         // callback.
                         session.last_animating.set(animating);
@@ -927,6 +1031,12 @@ impl NeovideEditorPane {
                 }
                 drop(live);
 
+                if let Some((width, height)) = cell_size_changed_to {
+                    if let Some(cb) = cell_size_callback_for_render.borrow().as_ref() {
+                        cb(width, height);
+                    }
+                }
+
                 if let Some(render_surface) = state.render_surface.as_mut() {
                     // Same pixels, origin and extent: one Src copy into GTK's wrapped target.
                     // Surface::draw records into the same context; the existing single flush below
@@ -967,6 +1077,9 @@ impl NeovideEditorPane {
             let scale_factor_callback_for_tick = scale_factor_callback.clone();
             let scale_watch_for_tick = scale_watch.clone();
             let tick_stats = Rc::new(TickStats::new());
+            let fb_size = fb_size.clone();
+            // One-shot: `[layout] note:` is printed at most once per pane.
+            let layout_note_logged = Cell::new(false);
             gl_area.add_tick_callback(move |widget, _clock| {
                 let mut live = live_state.borrow_mut();
                 // Set from inside the `Ready` arm below, then acted on only *after* `live` is
@@ -1005,31 +1118,40 @@ impl NeovideEditorPane {
                             session.last_seen_batches.set(batches_now);
                         }
 
-                        // Resize-resync safety net (found 2026-09-07 on real GNOME/Mutter
-                        // hardware, via `shell`, not the headless-sway sandbox every earlier
-                        // resize check ran in): `connect_resize` above is the only other place
-                        // that calls `resize_grid`, and it only fires on a `GtkGLArea` `resize`
-                        // signal. On this real desktop, a window shown already-maximized (or
-                        // resized by the compositor while `LiveHarness::with_options`'s
-                        // synchronous, main-loop-blocking nvim launch was in flight) can settle at
-                        // its final size without ever emitting a *further* `resize` signal after
-                        // the Ready-time snapshot the constructor already takes -- leaving nvim's
-                        // grid permanently sized for a stale, smaller content_region than the
-                        // widget's real one, visible as an undrawn band past the grid's real edge.
-                        // (This comment said "leftover `OUTSIDE_COLOR`" until 2026-09-16; that was
-                        // never right -- `draw_frame` clip-clears the *current* content_region to
-                        // nvim's own background, so the band is that background, not the host's
-                        // clear colour.) Re-deriving the grid size from the widget's *current*
-                        // actual size on every tick (cheap: a handful of integer ops, no
-                        // allocation) and only calling `resize_grid` -- which actually costs --
-                        // when it disagrees with `last_grid_size` makes this self-correcting
-                        // regardless of which exact GTK/Wayland/compositor timing produced the
-                        // staleness, instead of chasing that one root cause.
-                        let width = widget.width() * widget.scale_factor();
-                        let height = widget.height() * widget.scale_factor();
-                        let content_region =
-                            snap_region_to_grid(&compute_content_region(width, height), session.harness.grid_scale());
-                        let new_grid_size = grid_size_for_content_region(&session.harness, &content_region);
+                        // Resync the grid if its size no longer matches the framebuffer. A window can reach its final
+                        // size while `LiveHarness::with_options` blocks the main loop, without another `resize` after
+                        // the initial snapshot. That leaves a stale grid and an undrawn band at its edge.
+                        // `draw_frame` clears the current content region to nvim's background, so the band has that color.
+                        // Recompute the fitting grid each tick and call `resize_grid` only when `last_grid_size` differs.
+                        //
+                        // Use `fb_size` from `GLArea::resize`, matching the framebuffer actually drawn.
+                        // In GTK 4.22.5, buffers and the resize signal use widget dimensions times the scale factor.
+                        // They can lag the allocation while hidden or before a snapshot; the next snapshot updates both.
+                        // Log a note if the dimensions differ on a drawn widget, since its buffer sizing may differ.
+                        let (width, height) = fb_size.get();
+                        let widget_size = (
+                            widget.width() * widget.scale_factor(),
+                            widget.height() * widget.scale_factor(),
+                        );
+                        if !layout_note_logged.get()
+                            && widget.is_drawable()
+                            && width > 0
+                            && height > 0
+                            && widget_size.0 > 0
+                            && widget_size.1 > 0
+                            && widget_size != (width, height)
+                        {
+                            layout_note_logged.set(true);
+                            println!(
+                                "[layout] note: widget*scale ({}x{}) differs from GTK's framebuffer \
+                                 ({width}x{height}); using GTK's",
+                                widget_size.0, widget_size.1,
+                            );
+                        }
+                        let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
+                            grid_size_for_content_region(&session.harness, r)
+                        })
+                        .grid;
                         // A freshly re-realized widget can tick before its first allocation.
                         // A transient 0x0 is not a one-cell editor: resizing nvim then would
                         // disturb its viewport/cursor before the real allocation arrives.
@@ -1124,6 +1246,7 @@ impl NeovideEditorPane {
             pending_fullscreen,
             scale_factor_callback,
             scale_watch,
+            cell_size_callback,
         }
     }
 
@@ -1259,6 +1382,15 @@ impl NeovideEditorPane {
         Some((f64::from(scale.width()) / factor, f64::from(scale.height()) / factor))
     }
 
+    /// Registers `callback` for changes to the logical pixel `(width, height)` returned by
+    /// [`cell_size`](Self::cell_size), including the first observed value. A host can use these
+    /// dimensions to match a panel's status band to the editor's row height.
+    /// The render callback invokes it after `render_frame` and after dropping `live`, so a host
+    /// handler can call back into the pane. Replaces any earlier callback.
+    pub fn connect_cell_size_changed(&self, callback: impl Fn(f64, f64) + 'static) {
+        *self.cell_size_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
     /// Registers a callback fired (at most once) when the tick callback observes that nvim
     /// exited on its own -- i.e. `LiveHarness::has_neovim_exited()` became true without the host
     /// ever having called `shutdown()` first (e.g. `:qa!` typed inside nvim). The reference probe
@@ -1326,7 +1458,7 @@ impl NeovideEditorPane {
 
 #[cfg(test)]
 mod tests {
-    use super::{nvim_args, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY};
+    use super::{cell_size_changed, nvim_args, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY};
     use gtk4::glib;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1405,6 +1537,24 @@ mod tests {
         assert!(tick_should_render(true, false, false, false));
         assert!(tick_should_render(false, true, false, false));
         assert!(tick_should_render(false, false, true, false));
+    }
+
+    // Cell-size notifications fire on the first value and on changes only.
+
+    #[test]
+    fn the_first_report_is_always_a_change() {
+        assert!(cell_size_changed(None, (8.0, 17.0)));
+    }
+
+    #[test]
+    fn the_same_size_again_is_not_a_change() {
+        assert!(!cell_size_changed(Some((8.0, 17.0)), (8.0, 17.0)));
+    }
+
+    #[test]
+    fn a_different_size_is_a_change() {
+        assert!(cell_size_changed(Some((8.0, 17.0)), (8.0, 18.0)));
+        assert!(cell_size_changed(Some((8.0, 17.0)), (9.0, 17.0)));
     }
 
     // --- ScaleWatch: the unit the tick and the Ready-construction arm each call exactly once. ---

@@ -268,11 +268,6 @@ pub fn newest_card(tabs: &[(TabId, Option<u64>)]) -> Option<TabId> {
         .map(|(_, id)| id)
 }
 
-/// Opens the chooser at launch when resumable sessions exist and chat is on screen.
-pub fn launch_opens_chooser(resumable_records: usize, chat_on_screen: bool) -> bool {
-    resumable_records > 0 && chat_on_screen
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,18 +514,5 @@ mod tests {
         assert_eq!(oldest_card(&tabs), Some(TabId(3)));
         assert_eq!(newest_card(&tabs), Some(TabId(1)));
         assert_eq!(oldest_card(&[(TabId(1), None)]), None);
-    }
-
-    #[test]
-    fn the_launch_chooser_opens_iff_there_are_records_and_the_chat_is_on_screen() {
-        assert!(launch_opens_chooser(1, true));
-        assert!(
-            !launch_opens_chooser(0, true),
-            "no records, which is always true on legacy"
-        );
-        assert!(
-            !launch_opens_chooser(3, false),
-            "a hidden chat gets no chooser"
-        );
     }
 }

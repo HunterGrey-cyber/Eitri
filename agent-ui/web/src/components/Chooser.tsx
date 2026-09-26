@@ -23,7 +23,7 @@ type Props = {
   onCloseTab: (tab: TabId) => void;
   onRenameTab: (tab: TabId, name: string) => void;
   onCycleMode: () => void;
-  onLeave: (launch: boolean) => void;
+  onLeave: () => void;
 };
 
 /** An IME's own Enter/Esc: `isComposing`, or the legacy 229 some WebKit builds still report. */
@@ -213,7 +213,17 @@ export function Chooser({
   // normal action.
   const pendingG = useRef(false);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (filtering || renaming !== null || composing(event)) return;
+    if (composing(event)) return;
+    // Claim Shift+Tab even in the filter or rename input. The document-capture router sends it here
+    // while the chooser is open, and `cycleMode` selects the row-dependent action. Handle it
+    // before the text-input guard because Shift+Tab types no text.
+    if (event.shiftKey && event.key === "Tab") {
+      event.preventDefault();
+      event.stopPropagation();
+      cycleMode(current);
+      return;
+    }
+    if (filtering || renaming !== null) return;
     const key = event.key;
     if (key === "g" || key === "G") {
       event.preventDefault();
@@ -230,12 +240,6 @@ export function Chooser({
       if (current?.kind === "tab") setRenaming({ tab: current.tab.tab, value: current.tab.label });
       return;
     }
-    if (event.shiftKey && key === "Tab") {
-      event.preventDefault();
-      event.stopPropagation();
-      cycleMode(current);
-      return;
-    }
     if (!["j", "k", "Enter", "x", "/", "Escape", "q"].includes(key)) return;
     event.preventDefault();
     event.stopPropagation();
@@ -246,7 +250,7 @@ export function Chooser({
       if (current?.kind === "tab") onCloseTab(current.tab.tab);
       // else: `x` is only bound on an open tab's row (the keys line says so); do nothing.
     } else if (key === "/") setFiltering(true);
-    else if (key === "Escape" || key === "q") onLeave(envelope.launch);
+    else if (key === "Escape" || key === "q") onLeave();
   }
 
   const shownCount = rows.filter((r) => r.kind !== "new").length;

@@ -9,6 +9,7 @@ import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
 import { binding, TABLE } from "./testFixtures";
+import { modeFixedMessage } from "./modeKey";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -1497,7 +1498,7 @@ describe("the leader", () => {
   /** An envelope opening an overlay that takes the keys cancels a pending sequence.
    *  A key bubbling from that overlay must not advance stale sequence state. */
   it.each([
-    ["chooser", { kind: "chooser", launch: false, open: [], records: [] }],
+    ["chooser", { kind: "chooser", open: [], records: [] }],
     ["begin_rename", { kind: "begin_rename", tab: 1, current: null }],
     ["focus_permission", { kind: "focus_permission", tab: 1 }],
     ["confirm_close", { kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] }],
@@ -1530,7 +1531,11 @@ describe("the leader", () => {
     act(() => root(container).focus());
     press(" ");
     press("m");
-    expect(container.querySelector(".band-message")!.textContent).toBe("mode is fixed for this session");
+    // `modeFixedMessage` names how to choose a different mode. `sendTable()` supplied `newTabChord:
+    // "Ctrl+b c"`.
+    expect(container.querySelector(".band-message")!.textContent).toBe(
+      "mode is fixed for this session — Ctrl+b c for a new tab",
+    );
     expect(posted.some((p) => p.type === "cycle_mode")).toBe(false);
     vi.unstubAllGlobals();
   });
@@ -3219,12 +3224,11 @@ describe("the tab bar", () => {
 describe("the session chooser", () => {
   const ENV = {
     kind: "chooser",
-    launch: true,
     open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }],
     records: [{ providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
   };
 
-  it("opens over the empty tab at launch; Enter on a record resumes it in the active tab", () => {
+  it("opens over the empty tab; Enter on a record resumes it in the active tab", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -3236,25 +3240,17 @@ describe("the session chooser", () => {
     expect(container.querySelector(".chooser")).toBeNull();
   });
 
-  it("Esc at launch tells shell, which hands the keys to the editor", () => {
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    dispatchEmptyTab();
-    dispatch(ENV);
-    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
-    expect(lastOfType("chooser_closed")).toMatchObject({ launch: true });
-  });
-
-  /** GUI pass, 2026-09-25: `prefix w` over an empty tab, then `Esc`, left the keys on
-   *  `.agent-ui-root` -- the empty layout's anchor, which handles no key. Typing went nowhere and
-   *  not even `i` recovered it; only a click did. The empty tab's live control is its composer. */
+  /** Esc from the chooser over an empty tab returns focus to its composer in INPUT locally.
+   *  Returning it to `.agent-ui-root` would leave the keys on an element that handles no key.
+   *  No request to Rust is needed. */
   it("Esc from prefix w over an empty tab gives the composer the keys, in INPUT", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
-    dispatch({ ...ENV, launch: false });
+    dispatch(ENV);
+    const postsBefore = posted.length;
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
-    expect(lastOfType("chooser_closed")).toMatchObject({ launch: false });
+    expect(posted.length).toBe(postsBefore);
     expect(container.querySelector(".chooser")).toBeNull();
     expect(document.activeElement).toBe(container.querySelector("textarea"));
   });
@@ -3272,7 +3268,11 @@ describe("the mode, queue and context lines, and the band's message/prompt", () 
       expect(container.querySelector(".status-band .mode-pill")!.textContent).toBe("⏵⏵ auto");
       enterInputMode(container);
       fireEvent.keyDown(container.querySelector("textarea")!, { key: "Tab", shiftKey: true });
-      expect(container.querySelector(".band-message")!.textContent).toBe("mode is fixed for this session");
+      // `modeFixedMessage` names how to choose a different mode. No `keymap` envelope was sent here, so
+      // `newTabChord` still has its pre-envelope default.
+      expect(container.querySelector(".band-message")!.textContent).toBe(
+        "mode is fixed for this session — open a new tab to choose",
+      );
       act(() => vi.advanceTimersByTime(2000));
       expect(container.querySelector(".band-message")).toBeNull();
       expect(lastOfType("cycle_mode")).toBeUndefined();
@@ -3914,10 +3914,9 @@ describe("takes the keys", () => {
     act(() => (document.activeElement as HTMLElement | null)?.blur());
     dispatch({ kind: "pane_focus", focused: true });
   }
-  function openChooser(launch = false) {
+  function openChooser() {
     dispatch({
       kind: "chooser",
-      launch,
       // Two rows besides "New session": tab 1 is the active one, so the chooser's own initial
       // cursor already sits there (`Chooser.tsx`'s "starts on the active tab's row") -- a second
       // row (a record) gives `j` somewhere to move to.
@@ -3993,22 +3992,9 @@ describe("takes the keys", () => {
     expect(container.querySelector(".row-current")!.textContent).toContain("first");
   });
 
-  it("e. launch chooser, Esc, then Rust's arrive when the editor cannot take the keys: the dashboard has them", () => {
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    dispatchEmptyTab();
-    openChooser(true);
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
-    expect(lastOfType("chooser_closed")).toMatchObject({ launch: true });
-    expect(container.querySelector(".chooser")).toBeNull();
-    // What `on_chooser_closed` sends when `focus_module(&ModuleId::editor())` refuses (defect 3).
-    dispatch({ kind: "arrive" });
-    expect(container.querySelector(".empty-tab")!.contains(document.activeElement)).toBe(true);
-    const before = container.querySelector('[aria-current="true"]')!.textContent;
-    fireEvent.keyDown(document.activeElement!, { key: "j" });
-    expect(container.querySelector('[aria-current="true"]')!.textContent).not.toBe(before);
-  });
-
+  /** Esc from the chooser returns focus locally without waiting for Rust.
+   *  There is no launch chooser that hands focus to the editor and needs a later `arrive`
+   *  if the editor refuses focus. */
   it("f. empty tab, composer focused: arrive lands the keys on the empty tab root, not body", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -4179,6 +4165,174 @@ describe("A parked tab's unread count includes what arrived while it was away", 
     act(() => widen(container));
 
     expect(container.querySelector(".band-unread")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+});
+
+/** Shift+Tab is handled anywhere in the panel by the document-capture `onModeKey` listener.
+ *  It runs `modeKeyRoute` before React handlers and WebKit's default backward-focus navigation.
+ *  These tests dispatch bubbling `KeyboardEvent`s so gaps in routing can be observed. */
+describe("Shift+Tab anywhere in the chat", () => {
+  /** Dispatches a real, bubbling, cancelable Shift+Tab on `target` and returns the event so a test
+   *  can read `defaultPrevented` off it -- `fireEvent`'s own return value is the inverse of that,
+   *  which reads worse next to the other assertions each test makes on the same event. */
+  function shiftTab(target: EventTarget) {
+    const event = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+    act(() => {
+      target.dispatchEvent(event);
+    });
+    return event;
+  }
+
+  it("a. live tab, BROWSE, focus on the conversation root: no cycle_mode, the band names the way out", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")!;
+    act(() => (root as HTMLElement).focus());
+    const event = shiftTab(root);
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(root);
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+    vi.unstubAllGlobals();
+  });
+
+  it("b. live tab, INPUT, focus in the composer textarea: same flash, textarea keeps focus and its text", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "keep me" } });
+    const event = shiftTab(textarea);
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.value).toBe("keep me");
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+    vi.unstubAllGlobals();
+  });
+
+  it("c. empty tab, event target <body>: one cycle_mode posted with the active tab's id", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    const before = document.activeElement;
+    const event = shiftTab(document.body);
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(before);
+    const posts = posted.filter((m) => m.type === "cycle_mode");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ tab: 1 });
+  });
+
+  it("d. empty tab, focus on the start screen's .agent-ui-root: one cycle_mode", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    const root = container.querySelector(".agent-ui-root")!;
+    act(() => (root as HTMLElement).focus());
+    const event = shiftTab(root);
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(root);
+    const posts = posted.filter((m) => m.type === "cycle_mode");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ tab: 1 });
+  });
+
+  it("e. empty tab, BROWSE on the dashboard: exactly one cycle_mode, not two", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "arrive" });
+    const root = container.querySelector(".empty-tab")!;
+    expect(root.contains(document.activeElement)).toBe(true);
+    const event = shiftTab(document.activeElement!);
+    expect(event.defaultPrevented).toBe(true);
+    const posts = posted.filter((m) => m.type === "cycle_mode");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ tab: 1 });
+  });
+
+  it("f. chooser open, filter input focused: the chooser's own route (cycle_default_mode, active tab live)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    // No "open" row for tab 1: the chooser's cursor default (`findIndex` over `open`) then lands on
+    // "New session", row 0 -- not the "tab" row `cycleMode` flashes locally for -- so this exercises
+    // `onCycleMode`/`onChooserCycleMode`, which reads the real active tab (live) off `tabs`, not the
+    // chooser's own cursor row.
+    dispatch({
+      kind: "chooser",
+      open: [],
+      records: [
+        { providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false },
+      ],
+    });
+    const chooser = container.querySelector(".chooser")!;
+    fireEvent.keyDown(chooser, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    expect(document.activeElement).toBe(filter);
+    // Left empty deliberately: a non-empty needle that matches nothing would drop every row
+    // (`chooserRows`'s own doc comment -- "New session" drops out while filtering, and so does an
+    // unmatched open/record row), which is a different scenario than this test's own.
+    const event = shiftTab(filter);
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(filter);
+    expect(filter.value).toBe("");
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    expect(lastOfType("cycle_default_mode")).toBeDefined();
+  });
+
+  it("g. a starting tab: flash, no post", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    act(() => widen(container));
+    const root = container.querySelector(".empty-tab")!;
+    const event = shiftTab(root);
+    expect(event.defaultPrevented).toBe(true);
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+    vi.unstubAllGlobals();
+  });
+
+  it("h. the close prompt open: it closes (tmux confirm-before, any key cancels), no post", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    expect(container.querySelector(".band-prompt")!.textContent).toBe("close 1? (y/n)");
+    const root = container.querySelector(".agent-ui-conversation")!;
+    const event = shiftTab(root);
+    expect(event.defaultPrevented).toBe(true);
+    expect(container.querySelector(".band-prompt")).toBeNull();
+    expect(lastOfType("close_tab")).toBeUndefined();
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    vi.unstubAllGlobals();
+  });
+
+  it("i. <leader> mode.cycle on a live tab flashes the same modeFixedMessage text", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    const root = container.querySelector(".agent-ui-conversation")!;
+    act(() => (root as HTMLElement).focus());
+    fireEvent.keyDown(root, { key: " " });
+    fireEvent.keyDown(root, { key: "m" });
+    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage("Ctrl+b c"));
+    expect(lastOfType("cycle_mode")).toBeUndefined();
     vi.unstubAllGlobals();
   });
 });
