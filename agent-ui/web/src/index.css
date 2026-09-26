@@ -621,6 +621,17 @@ body,
   line-height: 1.65;
   user-select: none;
 }
+/* In variant C, the prompt row's own `›` reads `--nv-fg`, not the base rule's
+   `--nv-muted` -- the same colour `.row-prompt .row-body` below now uses for the text itself, so
+   the whole row (glyph and words) reads as one speaker cue rather than the sign being a step
+   fainter than the message it marks. Placed BEFORE `.row-current .row-sign` in source order,
+   deliberately: the two rules are equal specificity ((0,2,0) each), so on a row that is both
+   `.row-prompt` and `.row-current` the LATER rule wins the tie -- and the cursor's own colour has
+   to win there (Global Constraint: `--nv-bg` as text only in `.row-current .row-sign`), so this
+   rule must come first. `indexCss.test.ts` pins both the ordering and the live cascade result. */
+.row-prompt .row-sign {
+  color: var(--nv-fg);
+}
 /* The panel's cursor is its current row's sign cell, drawn the way the editor's cursor sits on a
    character: a solid block with the glyph knocked out while the panel has the keys, the same block
    hollow while it does not (2026-09-19). The editor's is Neovide's own hollow-when-unfocused block
@@ -676,7 +687,17 @@ body,
    non-text indicator. Colour on a border, never on the glyph -- the same rule every signal here
    follows. `--nv-fg` replaces `--nv-muted` on the text itself, also a guarded-for-text colour, so
    `indexCss.test.ts`'s colour scan is satisfied by construction rather than by exemption. The sign
-   column does NOT move: it is the spine the whole document lines up on. */
+   column does NOT move: it is the spine the whole document lines up on.
+
+   **Variant C increases the separation between prompts and replies:**
+   the rule moved from `--nv-muted` to `--nv-fg` (the same
+   `.row-sign` change just above), the text itself steps down one size to `--fs-base` (a rung below
+   the reply's own `--fs-prose`), and a turn boundary got its own hairline (`.row-prompt:not
+   (:first-child)`, below), in `--nv-border` rather than this rule's own colour -- a different edge
+   of a different element, so the two signals stay distinguishable from each other the same way this
+   rule was already kept distinguishable from `.tool-card`/`.permission-card`. This variant has not
+   been finalised; it is built as the recommended option and is meant to be
+   overridable, not final. */
 .row-prompt .row-body {
   color: var(--nv-fg);
   white-space: pre-wrap;
@@ -685,8 +706,10 @@ body,
     (var(--row-inline-size) - var(--prompt-inset-knee)) * var(--prompt-inset-slope),
     min(var(--prompt-inset-cap) * (var(--row-inline-size) / 100), var(--prompt-inset-cap-max))
   );
-  border-left: 2px solid var(--nv-muted);
+  border-left: 2px solid var(--nv-fg);
   padding-left: 10px;
+  font-size: var(--fs-base);
+  line-height: 1.6;
   /* A review predicted the inset would newly push an unbreakable token out of the row. Measured
      against the PRISTINE stylesheet, it is not a regression -- it is a live bug, and worse today:
      a 110-char token in a prompt (what pasting a JWT looks like) scrolls the whole conversation
@@ -698,6 +721,37 @@ body,
      min-content sizing, which is what stops the grid being sized by the token in the first
      place. */
   overflow-wrap: anywhere;
+}
+/* A turn boundary: `.row-prompt .row-body`'s own 2px `--nv-fg` rule
+   above already says WHOSE message this is; this hairline says where one turn ends and the next
+   begins, on the row's OWN top edge rather than the body's left one, in `--nv-border` (a line
+   colour, never a fill under text -- "uses --nv-border only for rules" elsewhere in this file) so
+   the two signals cannot be mistaken for each other. `:not(:first-child)` rather than a
+   `.row + .row-prompt` sibling selector: the very first row in the conversation must not carry a
+   separator above it (there is no prior turn), and `:first-child` is the one condition that is true
+   regardless of what row type, if any, precedes it -- `.row + .row-prompt` would draw the line even
+   on that very first row if `HistoryNotice` (a non-`.row` sibling `MessageList.tsx` renders above
+   the timeline on a resumed session) happens to be present, which this selector still gets wrong in
+   that one case and is recorded here rather than silently claimed fixed. */
+.row-prompt:not(:first-child) {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--nv-border);
+}
+/* Two prompts sent back to back, with no reply between them (queued while a turn was running, or
+   sent in a fast burst): they are still one turn's worth of input, so they share ONE hairline
+   above the first of the pair rather than drawing a second one directly under it. */
+.row-prompt + .row-prompt {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+/* The row right after a prompt (the reply, almost always) gets a little more breathing room than
+   the bare 4px two adjacent `.row`s' own `padding: 2px 0` already gives every other row pair --
+   the turn separator above puts 10px above a NEW prompt, and a reply immediately below a prompt
+   reads better with more than the default gap too, even though it carries no rule of its own. */
+.row-prompt + .row:not(.row-prompt) {
+  margin-top: 4px;
 }
 .row-tool .row-body {
   font-family: var(--nv-font-mono);

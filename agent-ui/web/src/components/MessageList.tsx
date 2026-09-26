@@ -47,9 +47,19 @@ type Props = {
   /** Reports the unread pill to the caller so it can appear in the band without covering text.
    *  `label` is `↓N`, `↓ ⚑` for a card below the view, or bare `↓` when shown with nothing counted yet.
    *  `null` hides the pill. `jump` calls `jumpToEnd` and reads `listRef` fresh when invoked.
+   *  `afterSeq` is the largest `seq` on screen when following stopped, or `null` while following.
+   *  The caller can save it in `TabViewState.unseenAfterSeq` across a tab switch and return it as `unseenSeed`.
    *  Called whenever `updatePill` recomputes the pill, including with `null`.
    *  The caller holds the latest value, as `pill`/`setPill` do internally. */
-  onUnreadChange?: (label: string | null, jump: () => void) => void;
+  onUnreadChange?: (label: string | null, jump: () => void, afterSeq: number | null) => void;
+  /** Seeds the unread threshold back in on a tab switch: a tab switch reuses this
+   *  component, so without this the first `updatePill` after a restore falls back to counting from
+   *  the CURRENT timeline length, and a row that arrived while the tab was away is never counted --
+   *  the defect this task fixes. `afterSeq` is the seq threshold to seed (`TabViewState.unseenAfterSeq`
+   *  from the tab just switched TO); `tick` distinguishes one seed from the next so a second switch
+   *  back to the same `afterSeq` still re-fires the effect. `null` for a tab with no saved threshold
+   *  (never parked, or restored at the bottom) -- nothing to seed. */
+  unseenSeed?: { afterSeq: number; tick: number } | null;
 };
 
 /** Whether a finished tool call succeeded, failed, or is still running -- the state a row's sign
@@ -141,6 +151,7 @@ export function MessageList({
   onAnswerPermission,
   onOpenPath,
   onUnreadChange,
+  unseenSeed,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   /** The one `ResizeObserver`, on the list and on every child of it (see "Correction (the GUI pass)"
@@ -264,26 +275,37 @@ export function MessageList({
       lastScrollTopRef.current = list.scrollTop;
     }
   };
-  /** Timeline length when following last stopped; `null` while following. */
-  const unseenFromRef = useRef<number | null>(null);
+  /** The largest `seq` on screen when following stopped, or `null` while following.
+   *  A timeline index is not a reliable unread cutoff. This component survives tab switches, and
+   *  using the restored timeline's length would miss rows that arrived while the tab was away.
+   *  Also, `buildTimeline` places a permission card after its tool call, so a newly arrived card
+   *  can sit before an old length cutoff. A `seq` threshold counts arrivals independently of array position. */
+  const unseenAfterSeqRef = useRef<number | null>(null);
   const [pill, setPill] = useState<string | null>(null);
   const updatePill = () => {
     const list = listRef.current;
     if (list === null) return;
     const following = followingRef.current;
-    if (following) unseenFromRef.current = null;
-    else if (unseenFromRef.current === null) unseenFromRef.current = timeline.length;
+    if (following) unseenAfterSeqRef.current = null;
+    // The largest `seq` anywhere in the timeline, not the last element's `seq`: an anchored card can
+    // sit earlier in the array than an item with a lower `seq` that follows it (the ordering
+    // `buildTimeline` deliberately breaks for anchoring), so the tail is not reliably the max. `-1`
+    // when the timeline is empty, so every real `seq` (>= 0) still counts as fresh once something
+    // does arrive.
+    else if (unseenAfterSeqRef.current === null) {
+      unseenAfterSeqRef.current = timeline.reduce((max, item) => (item.seq > max ? item.seq : max), -1);
+    }
     const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
     const shown = pillShown(pill !== null, following, distance);
-    const from = unseenFromRef.current ?? timeline.length;
-    const fresh = timeline.slice(from);
+    const threshold = unseenAfterSeqRef.current;
+    const fresh = threshold === null ? [] : timeline.filter((item) => item.seq > threshold);
     const label = shown ? pillLabel(fresh.length, fresh.some((item) => item.kind === "permission")) : null;
     if (label !== pill) setPill(label);
     // The band's compact form: a card below wins over a count, a
     // count over the bare arrow -- the same priority `pillLabel` already encodes, just short enough
     // for a monospace band instead of the floating pill's full words.
     const cardBelow = fresh.some((item) => item.kind === "permission");
-    onUnreadChange?.(shown ? (cardBelow ? "↓ ⚑" : fresh.length > 0 ? `↓${fresh.length}` : "↓") : null, jumpToEnd);
+    onUnreadChange?.(shown ? (cardBelow ? "↓ ⚑" : fresh.length > 0 ? `↓${fresh.length}` : "↓") : null, jumpToEnd, threshold);
   };
   const jumpToEnd = () => {
     const list = listRef.current;
@@ -467,6 +489,22 @@ export function MessageList({
     updatePill();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
+
+  /** Restore the unread threshold when `App.tsx` restores a parked tab's view.
+   *  Run after the `[state]` effect so this `updatePill()` replaces any value computed from the previous tab
+   *  or the initial following state. Key on `unseenSeed?.tick` so equal thresholds on later switches still apply.
+   *  Use a layout effect: child layout effects run before the parent's scroll restore.
+   *  Set following to false and seed the threshold before that restore can produce a scroll event,
+   *  so the event retains the saved cutoff instead of computing one from the restored timeline.
+   *  `updatePill` clears the threshold only while following. `jumpToEnd` relies on its scroll event
+   *  reaching `onScroll` and `updatePill` rather than changing the threshold directly. */
+  useLayoutEffect(() => {
+    if (unseenSeed == null) return;
+    followingRef.current = false;
+    unseenAfterSeqRef.current = unseenSeed.afterSeq;
+    updatePill();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unseenSeed?.tick]);
 
   /* Match pending permissions to tool calls by `tool_use_id`, since several calls of the same
      tool can be in flight. Use the shared `isUsableLink` predicate from `../timeline` to exclude

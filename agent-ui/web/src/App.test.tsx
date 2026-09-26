@@ -3973,3 +3973,133 @@ describe("takes the keys", () => {
     expect(document.activeElement).toBe(approve);
   });
 });
+
+/* `MessageList` is reused across tabs, so a timeline-index unread threshold cannot survive a restore.
+   Save the sequence threshold per tab in `TabViewState.unseenAfterSeq` and restore it as `unseenSeed`
+   before content and the `[state]` effect run, so rows arriving while parked remain counted. */
+describe("A parked tab's unread count includes what arrived while it was away", () => {
+  const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+
+  /* jsdom implements no layout, so `.message-list`'s own scroll geometry is whatever these
+     properties are told to be, the same fixture `MessageList.test.tsx`'s own pill tests use. */
+  function setListScroll(list: HTMLElement, dims: { scrollHeight: number; clientHeight: number; scrollTop: number }) {
+    Object.defineProperty(list, "scrollHeight", { value: dims.scrollHeight, configurable: true });
+    Object.defineProperty(list, "clientHeight", { value: dims.clientHeight, configurable: true });
+    Object.defineProperty(list, "scrollTop", { value: dims.scrollTop, configurable: true, writable: true });
+  }
+
+  it("counts the rows a parked tab gained while it was away", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({
+      kind: "snapshot",
+      tab: 1,
+      throughRevision: 3,
+      state: snapshotState({ transcript: [{ seq: 1, text: "a" }, { seq: 2, text: "b" }, { seq: 3, text: "c" }] }),
+    });
+    act(() => widen(container));
+    const list = container.querySelector(".message-list") as HTMLElement;
+    // Scrolling up away from the bottom makes `MessageList` latch the current maximum `seq`
+    // of 3 as its unseen-message threshold.
+    setListScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    fireEvent.wheel(list, { deltaY: -100 });
+    setListScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
+    fireEvent.scroll(list);
+
+    // Switch away. `saveView` reads the DOM synchronously as PART of this dispatch (before dims are
+    // touched again below), so it correctly captures the parked view above: `atBottom: false`,
+    // `unseenAfterSeq: 3`.
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    // Tab 2's own (empty, one-line) conversation: a real browser lays it out much shorter than tab
+    // 1 was -- distance collapses to (about) nothing, which is what actually re-arms `MessageList`'s
+    // own following flag on a switch (`onScroll`'s `distance <= AT_BOTTOM_PX` branch). jsdom lays
+    // nothing out on its own, so this is set by hand to match; without it, this test cannot tell the
+    // fixed code from the broken code it replaces (checked below).
+    setListScroll(list, { scrollHeight: 0, clientHeight: 400, scrollTop: 0 });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
+
+    // Tab 1's real content, laid out at its full (larger) size before the snapshot lands, matching
+    // a real browser measuring new content as it mounts and BEFORE `App.tsx`'s own restore effect
+    // gets a chance to move `scrollTop` back to the parked spot -- `MessageList`'s own `[state]`
+    // effect, seeing `followingRef` still `true` from the tab-2 collapse above, snaps it to this
+    // (wrong, unparked) bottom first.
+    setListScroll(list, { scrollHeight: 5000, clientHeight: 400, scrollTop: 0 });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    // While away, tab 1's own conversation gained 3 more messages (seq 4-6), the same way the
+    // "reply streams" tests above grow a tab's row count across a switch by handing a bigger
+    // snapshot back on return.
+    dispatch({
+      kind: "snapshot",
+      tab: 1,
+      throughRevision: 6,
+      state: snapshotState({
+        transcript: [
+          { seq: 1, text: "a" },
+          { seq: 2, text: "b" },
+          { seq: 3, text: "c" },
+          { seq: 4, text: "d" },
+          { seq: 5, text: "e" },
+          { seq: 6, text: "f" },
+        ],
+      }),
+    });
+    // `App.tsx`'s own restore effect has, by now, really run (`list.scrollTop = view.scrollTop`,
+    // 800 -- this is the product code, not a stub), correcting the snap above.
+    expect(list.scrollTop).toBe(800);
+    // But nothing has told `MessageList` about it yet: a plain `scrollTop` assignment fires no
+    // synchronous `scroll` event, in a real browser or in jsdom. This `fireEvent.scroll` stands in
+    // for the native one that eventually reaches `onScroll` once the browser catches up -- see
+    // `MessageList`'s own seed-effect doc comment for why that ordering is exactly what the fix
+    // relies on: without the seed effect, THIS is the event that would re-latch the threshold from
+    // the just-restored (short) view instead of what was actually saved.
+    act(() => widen(container));
+    fireEvent.scroll(list);
+
+    expect(container.querySelector(".band-unread")?.textContent).toBe("↓3");
+    vi.unstubAllGlobals();
+  });
+
+  it("comes back following, with no unread label, when it was left at the bottom", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({
+      kind: "snapshot",
+      tab: 1,
+      throughRevision: 3,
+      state: snapshotState({ transcript: [{ seq: 1, text: "a" }, { seq: 2, text: "b" }, { seq: 3, text: "c" }] }),
+    });
+    act(() => widen(container));
+    const list = container.querySelector(".message-list") as HTMLElement;
+    // At the bottom: never scrolled up, so `saveView` records `atBottom: true` and no threshold.
+    setListScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
+    fireEvent.scroll(list);
+
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({
+      kind: "snapshot",
+      tab: 1,
+      throughRevision: 6,
+      state: snapshotState({
+        transcript: [
+          { seq: 1, text: "a" },
+          { seq: 2, text: "b" },
+          { seq: 3, text: "c" },
+          { seq: 4, text: "d" },
+          { seq: 5, text: "e" },
+          { seq: 6, text: "f" },
+        ],
+      }),
+    });
+    act(() => widen(container));
+
+    expect(container.querySelector(".band-unread")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+});

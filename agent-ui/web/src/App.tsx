@@ -422,6 +422,18 @@ export default function App() {
    *  a no-op so the band can accept clicks before the first `updatePill`, including before any
    *  scroll on mount. */
   const [unread, setUnread] = useState<{ label: string | null; jump: () => void }>({ label: null, jump: () => {} });
+  /** The unread pill's current `seq` threshold, mirrored from `MessageList`'s `onUnreadChange` third
+   *  argument -- read (not `state`) when a switch saves the departing tab's view, so
+   *  a row that arrives while a tab is away is still counted once the reader comes back to it. A ref,
+   *  not state: nothing here ever renders on it, the same reason `cursorRef`/`modeRef`/etc. above are
+   *  refs. */
+  const unseenAfterSeqRef = useRef<number | null>(null);
+  /** What to seed `MessageList`'s own threshold with on a restore: `tick` changes on
+   *  every restore that has something to seed, so a second switch back to the same threshold still
+   *  re-fires `MessageList`'s seed effect -- see that prop's own doc comment. `null` between restores
+   *  and for a tab that was left following or never had a saved threshold. */
+  const [unseenSeed, setUnseenSeed] = useState<{ afterSeq: number; tick: number } | null>(null);
+  const unseenSeedTick = useRef(0);
   const [scratchEditing, setScratchEditing] = useState(false);
   /** The footer's transient line. `seq` so the same text twice is two flashes. */
   const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
@@ -1320,13 +1332,18 @@ export default function App() {
           // the render state they mirror -- and only when there IS an old tab (not on mount).
           if (previous !== null) {
             const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+            const atBottom = list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1;
             saveView(viewStore.current, previous, {
               cursor: cursorRef.current,
               mode: modeRef.current,
               expanded: expandedRef.current,
               scrollTop: list?.scrollTop ?? 0,
-              atBottom: list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1,
+              atBottom,
               detailed: detailedRef.current,
+              // At the bottom, following is what a restore should resume (see the `snapshot` arm's
+              // restore block below), so no threshold is worth remembering -- and `null` there matches
+              // `MessageList`'s own "while following" reset.
+              unseenAfterSeq: atBottom ? null : unseenAfterSeqRef.current,
             });
           }
           restoreRef.current = takeView(viewStore.current, payload.active) ?? null;
@@ -1356,8 +1373,13 @@ export default function App() {
           setQueue([]);
           setQueueError(null);
           setRuleOffers({});
-          // The OLD tab's unread pill means nothing over a fresh, empty timeline.
+          // The OLD tab's unread pill means nothing over a fresh, empty timeline. A tab with no saved
+          // view (never parked, or a reload's/fresh mount's first snapshot) or one left following
+          // starts with no threshold to remember -- the `snapshot` arm's restore block below sets a
+          // real one back in (via `unseenSeed`) only for a tab whose saved view was actually parked
+          //.
           setUnread({ label: null, jump: () => {} });
+          unseenAfterSeqRef.current = null;
           setScratchEditing(false);
           setQueueTaken(null);
         }
@@ -1397,6 +1419,14 @@ export default function App() {
           // Tells the scroll-restoring layout effect a real restore landed in THIS render -- see
           // its own doc comment for why it cannot simply key on `state`.
           setRestoreTick((n) => n + 1);
+          // Seed `MessageList` with the saved unseen threshold for a parked view. An `atBottom` view has no
+          // saved threshold and resumes following. Increment `unseenSeedTick` separately so a `null
+          // -> value -> null -> value` sequence still triggers seeding on the third switch, even
+          // when the threshold value repeats.
+          if (!view.atBottom && view.unseenAfterSeq !== null) {
+            unseenSeedTick.current += 1;
+            setUnseenSeed({ afterSeq: view.unseenAfterSeq, tick: unseenSeedTick.current });
+          }
         }
         // When switching to a tab with a pending card while the panel has the keys, land on the
         // card as `Ctrl+l` does within one tab. Read `payload.state` because `timeline` still
@@ -2539,7 +2569,11 @@ export default function App() {
           yankedKey={yanked?.key ?? null}
           onAnswerPermission={answerPermission}
           onOpenPath={openPath}
-          onUnreadChange={(label, jump) => setUnread({ label, jump })}
+          onUnreadChange={(label, jump, afterSeq) => {
+            setUnread({ label, jump });
+            unseenAfterSeqRef.current = afterSeq;
+          }}
+          unseenSeed={unseenSeed}
         />
         {keymapOpen && (
           <KeymapOverlay

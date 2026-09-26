@@ -1609,22 +1609,25 @@ describe("index.css cascade (which rule actually wins)", () => {
      quietly turns the indent back into a card. */
 
   it("carries the prompt row's displacement, rule and colour on .row-prompt .row-body, and the cascade lets each win", () => {
-    // `border-left: 2px solid var(--nv-muted)` is a shorthand containing a `var()`, which this
-    // jsdom engine drops from computed style entirely (see the big comment atop this describe
-    // block, and the `--nv-border` test near the top of the file for the same idiom) -- so its
-    // TEXT is checked here and its CASCADE is checked separately below through `winningDeclaration`.
-    //
-    // The colour is pinned to `--nv-muted`, not `--nv-border`: `--nv-border` is `bg.mix(fg, 0.15)`
-    // and measures 1.27:1 on rose-pine dawn (`tokens.rs`'s own derivation), and below the ramp's
-    // knee this 2px rule is the ENTIRE cue that distinguishes the two speakers -- a hairline that
-    // faint would make it disappear at exactly the width where position alone hasn't kicked in yet.
+    // jsdom drops the border-left shorthand containing var() from computed style. Its text is
+    // checked here, and winningDeclaration checks the cascade separately. The 2px prompt rule
+    // uses --nv-fg to match the words it marks. Below the indentation ramp's knee, the rule is
+    // the only cue separating speakers. --nv-border is bg.mix(fg, 0.15) and can make this cue
+    // too faint. The turn-separator hairline uses --nv-border on a separate edge and is tested
+    // separately.
     const rule = withoutComments.match(/\.row-prompt \.row-body\s*\{[^}]*\}/);
     expect(rule).not.toBeNull();
     const body = rule![0];
     expect(body).toMatch(/margin-left:\s*clamp\(/);
-    expect(body).toMatch(/border-left:\s*2px solid var\(--nv-muted\);/);
+    expect(body).toMatch(/border-left:\s*2px solid var\(--nv-fg\);/);
     expect(body).toMatch(/padding-left:\s*10px;/);
     expect(body).toMatch(/color:\s*var\(--nv-fg\);/);
+    // Variant C also steps the prompt text down one size, to `--fs-base` (`.row-body`'s own base
+    // rule declares `--fs-prose`), with a slightly tighter line-height. Text-matched for the same
+    // reason as `border-left` just above -- keeping this rule's whole proof in one style rather than
+    // splitting it between a text scan and a live cascade check for no real reason.
+    expect(body).toMatch(/font-size:\s*var\(--fs-base\);/);
+    expect(body).toMatch(/line-height:\s*1\.6;/);
 
     // `padding-left` and `color` are each a plain literal or a plain single-`var()` longhand --
     // neither shape gets dropped by this engine -- so the cascade half CAN be checked live for
@@ -1650,17 +1653,17 @@ describe("index.css cascade (which rule actually wins)", () => {
     // property at all). The reviewer's own exact bypass: an ancestor-qualified selector at HIGHER
     // specificity ((0,3,0) vs (0,2,0)) cancelling the border while every text-match above stayed
     // satisfied, because nothing before this line ever asked who wins.
-    expect(winningDeclaration(html, ".row-body", "border-left")).toBe("2px solid var(--nv-muted)");
+    expect(winningDeclaration(html, ".row-body", "border-left")).toBe("2px solid var(--nv-fg)");
     expect(
       winningDeclaration(html, ".row-body", "border-left", ".message-list .row-prompt .row-body { border-left: none; }"),
-    ).not.toBe("2px solid var(--nv-muted)");
+    ).not.toBe("2px solid var(--nv-fg)");
 
     // `!important` can cancel the border even at lower specificity. `winningDeclaration` must
     // account for priority as well as specificity and order, or it will report the original
     // shorthand as the winner after this rule has overridden it.
     expect(
       winningDeclaration(html, ".row-body", "border-left", ".row-body { border-left: none !important; }"),
-    ).not.toBe("2px solid var(--nv-muted)");
+    ).not.toBe("2px solid var(--nv-fg)");
 
     // Later longhands at the same specificity can cancel the visible border without declaring
     // `border-left` itself. Compare the shorthand's longhands too, returning `null` when one
@@ -1672,7 +1675,80 @@ describe("index.css cascade (which rule actually wins)", () => {
         "border-left",
         ".row-prompt .row-body { border-left-style: none; border-left-width: 0; }",
       ),
-    ).not.toBe("2px solid var(--nv-muted)");
+    ).not.toBe("2px solid var(--nv-fg)");
+  });
+
+  it("puts .row-prompt .row-sign's colour before .row-current .row-sign in source order, so the cursor still wins", () => {
+    // Global Constraint: `--nv-bg` as text only in the `.row-current .row-sign` rule -- so the new
+    // prompt-row sign colour must never be able to beat the cursor's own colour. Both rules are
+    // equal-specificity descendant selectors ((0,2,0) each: one class on the ancestor, one on
+    // `.row-sign`), so on a row that is both `.row-prompt` and `.row-current` at once, the winner is
+    // decided by which comes LAST in the file -- which means the prompt rule has to come first, not
+    // merely "somewhere before the end of the file".
+    const promptSignIndex = withoutComments.indexOf(".row-prompt .row-sign");
+    const cursorSignIndex = withoutComments.indexOf(".row-current .row-sign");
+    expect(promptSignIndex).toBeGreaterThan(-1);
+    expect(cursorSignIndex).toBeGreaterThan(-1);
+    expect(promptSignIndex).toBeLessThan(cursorSignIndex);
+
+    const rule = withoutComments.match(/\.row-prompt \.row-sign\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule![0]).toMatch(/color:\s*var\(--nv-fg\);/);
+
+    // Live, on a plain prompt row (not the cursor): the `›` reads --nv-fg now, not the base
+    // `.row-sign` rule's --nv-muted.
+    const plainHtml = `<div class="message-list"><div class="row row-prompt"><span class="row-sign">›</span><div class="row-body">hi</div></div></div>`;
+    expect(computed(plainHtml, ".row-sign").color).toBe("var(--nv-fg)");
+
+    // Live, where the row is BOTH .row-prompt and .row-current: the cursor's own --nv-bg still wins
+    // the cascade tie, because it comes later in source order.
+    const cursorHtml = `<div class="message-list"><div class="row row-prompt row-current"><span class="row-sign">›</span><div class="row-body">hi</div></div></div>`;
+    expect(computed(cursorHtml, ".row-sign").color).toBe("var(--nv-bg)");
+
+    // Negative control: an equal-specificity `.row-prompt .row-sign` rule appended AFTER the real
+    // stylesheet (simulating a future edit that moves it past `.row-current .row-sign`) flips the
+    // tie-break and steals the cursor's own colour -- proving the ordering assertion above is a real
+    // constraint and not vacuously true.
+    const reversed = computed(cursorHtml, ".row-sign", ".row-prompt .row-sign { color: var(--nv-fg); }");
+    expect(reversed.color).toBe("var(--nv-fg)");
+  });
+
+  it("marks a turn boundary between prompts, and lets back-to-back prompts share one rule", () => {
+    // The hairline here is a turn SEPARATOR, a different signal on a different edge of a different
+    // element than `.row-prompt .row-body`'s own 2px `--nv-fg` speaker cue above -- so it uses
+    // `--nv-border` (the line colour "uses --nv-border only for rules, never as a fill under text"
+    // elsewhere in this file already guards), never the speaker cue's own colour, and the two cannot
+    // be confused for one another.
+    const notFirst = withoutComments.match(/\.row-prompt:not\(:first-child\)\s*\{[^}]*\}/);
+    expect(notFirst).not.toBeNull();
+    const notFirstBody = notFirst![0];
+    expect(notFirstBody).toMatch(/margin-top:\s*10px;/);
+    expect(notFirstBody).toMatch(/padding-top:\s*10px;/);
+    expect(notFirstBody).toMatch(/border-top:\s*1px solid var\(--nv-border\);/);
+
+    // Two prompts sent back to back (no reply between them) share one hairline, not two -- the
+    // second prompt's own `:not(:first-child)` rule above would otherwise draw a second separator
+    // directly under the first one's.
+    const backToBack = withoutComments.match(/\.row-prompt \+ \.row-prompt\s*\{[^}]*\}/);
+    expect(backToBack).not.toBeNull();
+    const backToBackBody = backToBack![0];
+    expect(backToBackBody).toMatch(/margin-top:\s*0;/);
+    expect(backToBackBody).toMatch(/padding-top:\s*0;/);
+    expect(backToBackBody).toMatch(/border-top:\s*none;/);
+  });
+
+  it("keeps every .row-prompt rule, not just .row-body, off the panel's bubble vocabulary", () => {
+    // The two turn-separator rules just above are the first `.row-prompt`-selector rules that are
+    // NOT `.row-prompt .row-body`/`.row-prompt .row-sign` -- this widens the "no fill, no frame, no
+    // rounded corner" guard the dedicated `declarationsOnRealPromptBody` test below already holds
+    // `.row-body` to, so a turn-separator rule cannot quietly grow into a card the same way that
+    // test already stops `.row-body` from.
+    const allPromptRules = rulesMatching(withoutComments, ".row-prompt");
+    expect(allPromptRules.length).toBeGreaterThan(0);
+    for (const { selector, body } of allPromptRules) {
+      expect(body, `${selector} sets a background on a .row-prompt rule`).not.toMatch(/background/);
+      expect(body, `${selector} sets a border-radius on a .row-prompt rule`).not.toMatch(/border-radius/);
+    }
   });
 
   it("computes selector specificity the way this file's own comments already claim it, by hand", () => {

@@ -63,6 +63,10 @@ export type TabViewState = {
   scrollTop: number;
   atBottom: boolean;
   detailed: boolean;
+  /** The unread pill's `seq` threshold when the tab was left, or `null` if following or never parked.
+   *  Restore it as `MessageList`'s `unseenSeed` so rows arriving while the tab is away still count.
+   *  Without it, the reused list would start counting from the restored timeline's current length. */
+  unseenAfterSeq: number | null;
 };
 
 /** How long after the last keystroke the composer mirrors its text to Rust. */

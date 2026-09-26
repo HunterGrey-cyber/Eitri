@@ -1565,11 +1565,12 @@ describe("MessageList keeps a following view at its end when the list or a row c
   });
 });
 
-/** Read the last `(label, jump)` pair passed to `onUnreadChange`. The band in `App.tsx` holds
- *  this value for the unread indicator. */
-function lastUnread(mock: ReturnType<typeof vi.fn>): { label: string | null; jump: () => void } {
-  const call = mock.mock.calls[mock.mock.calls.length - 1] as [string | null, () => void];
-  return { label: call[0], jump: call[1] };
+/** Read the last `(label, jump, afterSeq)` triple passed to `onUnreadChange`. The band in
+ *  `App.tsx` holds this value for the unread indicator. `afterSeq` is the sequence threshold for
+ *  unread items. */
+function lastUnread(mock: ReturnType<typeof vi.fn>): { label: string | null; jump: () => void; afterSeq: number | null } {
+  const call = mock.mock.calls[mock.mock.calls.length - 1] as [string | null, () => void, number | null];
+  return { label: call[0], jump: call[1], afterSeq: call[2] };
 }
 
 describe("MessageList: the unread pill (reported upward)", () => {
@@ -1655,5 +1656,111 @@ describe("MessageList: the unread pill (reported upward)", () => {
     dims.grow(9000);
     rerender(<MessageList state={state({ transcript: texts("a, much longer") })} {...props} onUnreadChange={onUnreadChange} />);
     expect(onUnreadChange.mock.calls.every(([label]) => label === null)).toBe(true);
+  });
+});
+
+/* Use a `seq` threshold for unread items. `buildTimeline` can insert a card after an older tool
+   call, before a saved array-length cutoff, even though the card arrived later. Unread status
+   depends on arrival sequence rather than where the item is drawn. */
+describe("MessageList: the unread threshold is a seq, not an index", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  /** Scroll away from the bottom so `MessageList` stops following and latches
+   *  `unseenAfterSeqRef` from `state`'s timeline. */
+  function park(list: HTMLElement) {
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    noteUserScroll(list, "up");
+    list.scrollTop = 1000;
+    fireEvent.scroll(list);
+    return dims;
+  }
+
+  it("counts a card anchored after an OLD tool call, even though it lands before the old length cutoff", () => {
+    const onUnreadChange = vi.fn();
+    // At park time: a tool call (seq 1) and a LATER message (seq 2) -- the max seq present is 2,
+    // and the old, index-based threshold would have been `timeline.length` = 2.
+    const { container, rerender } = render(
+      <MessageList
+        state={state({
+          transcript: [{ seq: 2, text: "message B" }],
+          toolCalls: [{ seq: 1, toolUseId: "toolu_a", name: "Bash", input: {}, result: null }],
+        })}
+        {...props}
+        onUnreadChange={onUnreadChange}
+      />,
+    );
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = park(list);
+    dims.grow(2400);
+    // A permission request (seq 10 -- arrived long after the park) anchored to the OLD call
+    // (`toolu_a`). `buildTimeline` splices it in right after that call, so it sits BEFORE `message B`
+    // in the array even though its own `seq` is far newer: `timeline` is now
+    // `[tool(1), permission(10), message(2)]`, length 3 -- one past the old index cutoff of 2, which
+    // would slice off only `message(2)` and miss the card entirely.
+    rerender(
+      <MessageList
+        state={state({
+          transcript: [{ seq: 2, text: "message B" }],
+          toolCalls: [{ seq: 1, toolUseId: "toolu_a", name: "Bash", input: {}, result: null }],
+          pendingPermissions: [{ seq: 10, permissionId: "p1", toolUseId: "toolu_a", toolName: "Bash", input: {} }],
+        })}
+        {...props}
+        onUnreadChange={onUnreadChange}
+      />,
+    );
+    expect(lastUnread(onUnreadChange).label).toBe("↓ ⚑");
+  });
+
+  it("counts plain messages that arrive after the park, with no card below", () => {
+    const onUnreadChange = vi.fn();
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("first") })} {...props} onUnreadChange={onUnreadChange} />,
+    );
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = park(list);
+    dims.grow(2400);
+    rerender(<MessageList state={state({ transcript: texts("first", "second", "third") })} {...props} onUnreadChange={onUnreadChange} />);
+    expect(lastUnread(onUnreadChange).label).toBe("↓2");
+  });
+
+  it("seeds the threshold before the first updatePill on a restore, so a parked tab's own view is not lost", () => {
+    const onUnreadChange = vi.fn();
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("a", "b", "c") })} {...props} onUnreadChange={onUnreadChange} />,
+    );
+    const list = container.querySelector(".message-list") as HTMLElement;
+    // `MessageList` is not remounted across a tab switch (that is the whole reason this task exists),
+    // so it carries whatever `followingRef` it already had. A tab switch's restore is only ever
+    // seeded for a tab that was left PARKED (`App.tsx`'s `saveView` never saves a threshold for one
+    // left `atBottom`) -- parking it here first is what stops the `[state]` effect's own `follow()`
+    // from snapping the list back to the bottom before the seed effect below ever runs.
+    setScroll(list, { scrollHeight: 900, clientHeight: 400, scrollTop: 500 });
+    fireEvent.scroll(list);
+    noteUserScroll(list, "up");
+    // The restored scroll position: parked, far from the bottom -- the shape `App.tsx`'s own scroll
+    // restore leaves the list in before `MessageList`'s seed effect runs (both are layout effects in
+    // the same commit; jsdom does no layout, so nothing here resets what this sets).
+    setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1000 });
+    // Three items with `seq` > 2 (the seeded threshold) arrived while the tab was away.
+    rerender(
+      <MessageList
+        state={state({
+          transcript: [
+            { seq: 0, text: "a" },
+            { seq: 1, text: "b" },
+            { seq: 2, text: "c" },
+            { seq: 3, text: "d" },
+            { seq: 4, text: "e" },
+            { seq: 5, text: "f" },
+          ],
+        })}
+        {...props}
+        onUnreadChange={onUnreadChange}
+        unseenSeed={{ afterSeq: 2, tick: 1 }}
+      />,
+    );
+    expect(lastUnread(onUnreadChange).label).toBe("↓3");
+    expect(lastUnread(onUnreadChange).afterSeq).toBe(2);
   });
 });

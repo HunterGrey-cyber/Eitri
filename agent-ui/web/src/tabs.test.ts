@@ -64,13 +64,14 @@ describe("tab helpers", () => {
 });
 
 describe("the per-tab view store", () => {
-  const view = (cursor: number): TabViewState => ({
+  const view = (cursor: number, unseenAfterSeq: number | null = null): TabViewState => ({
     cursor,
     mode: "browse",
     expanded: { k: true },
     scrollTop: 40 * cursor,
     atBottom: false,
     detailed: false,
+    unseenAfterSeq,
   });
   it("gives each tab back what it left, and forgets closed tabs", () => {
     const store = new Map<number, TabViewState>();
@@ -81,6 +82,15 @@ describe("the per-tab view store", () => {
     forgetClosed(store, [2]);
     expect(takeView(store, 1)).toBeUndefined();
     expect(takeView(store, 2)?.cursor).toBe(7);
+  });
+  // Save and restore the unread pill's `seq` threshold so `MessageList` can seed it with `unseenSeed`.
+  // Preserve `null` too, for a tab left following or never parked.
+  it("round-trips the unread threshold (unseenAfterSeq)", () => {
+    const store = new Map<number, TabViewState>();
+    saveView(store, 1, view(3, 42));
+    saveView(store, 2, view(7, null));
+    expect(takeView(store, 1)?.unseenAfterSeq).toBe(42);
+    expect(takeView(store, 2)?.unseenAfterSeq).toBeNull();
   });
 });
 
