@@ -371,7 +371,8 @@ fn drain_until_finished(session: &mut agent::AgentSession) -> String {
 ///
 /// Deliberately runs with the REAL `disallowed_tools_for(Auto)` rather than an empty list: an empty
 /// list would prove the CLI can edit, which was never in doubt, and not that the product's own
-/// policy permits it.
+/// policy permits it. (That list is empty -- Auto offers `Bash` too, a policy
+/// setting -- and the call still goes through the function so a future list reaches this test.)
 #[test]
 #[ignore]
 fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_the_file() {
