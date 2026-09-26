@@ -5,11 +5,19 @@ import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { OutboundMessage, PermissionDecision } from "./bridge";
 import { noteUserScroll } from "./follow";
 import { resolveKey } from "./keymap";
-import type { KeyLike, KeymapHelp, PanelMode } from "./keymap";
-import { buildTimeline, oldestPendingPermission } from "./timeline";
-import { controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf } from "./nav";
+import type { KeyLike, KeymapHelp, PanelMode, PendingPrefix } from "./keymap";
+import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
+import { buildDisplay, indexOfKey } from "./display";
+import { outputText, primaryText } from "./copyText";
+import { countCodePoints } from "./toolRegistry";
+import { findMatch } from "./search";
+import { SearchBar } from "./components/SearchBar";
+import { answerTarget, controlsOf, currentStop, hintTargets, nextControl, nextStop, rowIndexOf, HINT_ALPHABET } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
+import { pathsIn, viewText } from "./paths";
+import type { PathRef } from "./paths";
+import { PathPick } from "./components/PathPick";
 import { acceptsEnvelope, activeTabInfo, forgetClosed, saveView, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
@@ -20,7 +28,9 @@ import { MessageList } from "./components/MessageList";
 import { Row } from "./components/Row";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusRow } from "./components/StatusRow";
-import { Footer } from "./components/Footer";
+import { Footer, INPUT_IDLE_HINT, INPUT_RUNNING_HINT } from "./components/Footer";
+import { QueueLines } from "./components/QueueLines";
+import { ContextLine } from "./components/ContextLine";
 import { DetailPopover } from "./components/DetailPopover";
 import { ContinueInTerminal } from "./components/TerminalHandoff";
 import { HintLayer } from "./components/HintLayer";
@@ -29,9 +39,9 @@ import { WhichKey } from "./components/WhichKey";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { Chooser } from "./components/Chooser";
 import { stripEntries } from "./whichKey";
-import { modePill, showTabBar } from "./tabs";
+import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
 import { statusRowText, statusWarning } from "./statusRow";
-import type { HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope } from "./types";
+import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, QueueItem } from "./types";
 import { applyTheme } from "./theme";
 
 /** Whether `el` is an ordinary editable control -- an `<input>`, a `<textarea>`, or anything
@@ -186,6 +196,32 @@ function visibleRows(list: HTMLElement): HTMLElement[] {
   });
 }
 
+/** After a scroll that was not caused by cursor motion, move an entirely off-screen cursor to
+ *  the nearest visible row. Return `null` to leave it unchanged. Reads geometry without writing
+ *  `scrollTop`. */
+export function clampCursorToView(list: HTMLElement, rows: HTMLElement[], cursor: number): number | null {
+  const current = rows[cursor];
+  if (current === undefined) return null;
+  const l = list.getBoundingClientRect();
+  const r = current.getBoundingClientRect();
+  if (r.bottom > l.top && r.top < l.bottom) return null;
+  const onScreen = visibleRows(list);
+  if (onScreen.length === 0) return null;
+  const target = r.bottom <= l.top ? onScreen[0] : onScreen[onScreen.length - 1];
+  const index = rows.indexOf(target);
+  return index === -1 ? null : index;
+}
+
+/** The tool name of the oldest pending permission, selected by lowest `seq`, for
+ *  `ActivityLine`'s "needs approval" slot. Returns `null` when nothing waits. */
+function oldestPendingTool(state: AgentUiState): string | null {
+  let oldest: (typeof state.pendingPermissions)[number] | null = null;
+  for (const request of state.pendingPermissions) {
+    if (oldest === null || request.seq < oldest.seq) oldest = request;
+  }
+  return oldest?.toolName ?? null;
+}
+
 export default function App() {
   const [state, setState] = useState(initialState());
   const [hello, setHello] = useState<Hello | null>(null);
@@ -204,6 +240,11 @@ export default function App() {
   /** The view to restore once the switch's `snapshot` (or, for a tab with none, the switch itself)
    *  is applied. Read and cleared by the `snapshot` arm's layout effect below. */
   const restoreRef = useRef<TabViewState | null>(null);
+  /** Set by the `tabs` arm whenever `payload.active` names a different tab than before (mount
+   *  included, the same condition that arm's own per-tab reset already runs on), and
+   *  read-and-cleared by the `snapshot` arm right after: landing on a tab already
+   *  holding a card puts the keys on it, the same as `Ctrl+l` does within one tab. */
+  const switchedRef = useRef(false);
   const activeTab = activeTabInfo(tabs);
   /** True once the active tab actually holds a session, live or already ended -- a `starting` or
    *  `failed` tab renders the empty tab too: it is not "started" until Rust has
@@ -249,11 +290,18 @@ export default function App() {
   /** What each in-flight request actually was, so its reply can be handled as that thing. A ref: it
    *  is bookkeeping, never rendered, and a render per outgoing command would be pure cost.
    *
-   *  Only the three kinds whose replies need special handling are recorded. An interrupt or a
-   *  permission response has no entry and comes back as `undefined`, which is correct rather than a
-   *  gap: its refusal takes the plain "show the reason" path. Every recorded request gets exactly
-   *  one `command_result` and is deleted there, so this cannot grow. */
-  const inFlight = useRef<Map<string, { kind: "send" | "handoff"; tab: TabId; text?: string }>>(new Map());
+   *  Only the kinds whose replies need special handling are recorded. An interrupt or a permission
+   *  response has no entry and comes back as `undefined`, which is correct rather than a gap: its
+   *  refusal takes the plain "show the reason" path. Every recorded request gets exactly one
+   *  `command_result` and is deleted there, so this cannot grow.
+   *
+   *  `"editor"` covers `edit_draft`/`open_path`/`view_in_editor`: all three reach the
+   *  scratch editor in Rust, and a refusal of any of them is a footer flash (`showFlash`), not the
+   *  banner -- a scratch-editor round trip that a `gf` or `Ctrl+g` failed to start is a footer
+   *  nicety, not something that should fill the space a real conversation error gets. */
+  const inFlight = useRef<Map<string, { kind: "send" | "handoff" | "editor"; tab: TabId; text?: string }>>(
+    new Map(),
+  );
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
   /** Bumped only when the `snapshot` arm actually applies a saved view's cursor/mode/expanded
@@ -286,6 +334,10 @@ export default function App() {
    *  shifts every later index, which would silently move an expansion onto a different row.
    *  Toggled by `Enter` on the row under the cursor, in `onKeyDown` below. */
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  /** `Ctrl+o` shows full results, wider cuts, and no collapsed runs. Saved per tab in
+   *  `TabViewState.detailed`, like `expanded`, and restored on a switch. A tab with no saved
+   *  view starts with `false`. */
+  const [detailed, setDetailed] = useState(false);
   /** BROWSE (read, move the cursor, act on "this item") / INPUT (typing into the composer) / HINT
    *. See
    *  `./keymap`'s own doc comment on `PanelMode`. */
@@ -294,12 +346,26 @@ export default function App() {
    *  Starts false because startup focuses the editor; `ready` resends the value to a new document.
    *  The mode block is bright only while the pane is focused, so it identifies which pane receives keys. */
   const [paneFocused, setPaneFocused] = useState(false);
-  /** Bumped by each `enter_input` envelope (`Ctrl+l` from the editor). A counter, not a flag, so
-   *  two arrivals in a row both act, and so the dispatch handler, installed once, need not read any
-   *  state: the effect below decides, against the current render, whether INPUT is possible. It
-   *  is also passed to `Composer` as `focusRequest`, which re-focuses a textarea that is already
-   *  mounted, since `setMode("input")` alone does nothing when the mode was already INPUT. */
+  /** `paneFocused` for the `snapshot` dispatch arm, which cannot read render state
+   *  directly -- the same reason `sessionStartedRef` exists. A switch landing on a card must check
+   *  whether the keys are even in this window right now: landing them silently in a background
+   *  window would be a surprise nobody asked for. */
+  const paneFocusedRef = useRef(false);
+  paneFocusedRef.current = paneFocused;
+  /** Bumped by each `enter_input` envelope (`Ctrl+l` from the editor). A counter makes repeated
+   *  requests act and lets the handler stay installed once without reading state. The effect
+   *  checks the current render for INPUT availability. Passed to `Composer` as `focusRequest`
+   *  to refocus an already mounted textarea even when the mode is already INPUT. `arrivalRef`
+   *  distinguishes an arrival that may land on a waiting card from a direct request for the
+   *  composer. */
   const [inputRequest, setInputRequest] = useState(0);
+  /** Set `true` only by the `enter_input` dispatch arm, and read-and-cleared by the `inputRequest`
+   *  effect on the very next run: `Ctrl+l` is `shell`'s one accelerator for "give
+   *  this pane the keys AND put them in the composer", which is the arrival this rule means to catch.
+   *  A HINT landing on the composer bumps `inputRequest` too (through the same effect), but is not an
+   *  arrival in this sense -- the user aimed at the composer specifically, so a card waiting must not
+   *  hijack that keystroke into BROWSE instead. */
+  const arrivalRef = useRef(false);
   /** Bumped by each `focus_permission` envelope. A counter lets the handler stay installed once
    *  without reading state; the effect finds the card against the current render. */
   const [permissionRequest, setPermissionRequest] = useState(0);
@@ -321,29 +387,119 @@ export default function App() {
   modeRef.current = mode;
   const expandedRef = useRef(expanded);
   expandedRef.current = expanded;
+  const detailedRef = useRef(detailed);
+  detailedRef.current = detailed;
   /** The composer's own unsent text, kept only so a tab switch can save it -- never
    *  read to render anything itself; `restoredDraft` is what actually reaches `Composer`. Updated
    *  from `Composer`/`EmptyTab`'s `onDraftChange`, which fires on every keystroke and once more
    *  with `""` after a send. */
   const draftRef = useRef("");
+  /** The queue behind a running turn, prompt history, rule offers, editor context, and whether
+   *  the scratch editor holds this tab's draft. All are tab-scoped except `history` and
+   *  `editorContext`, which are window-wide (`tabs.ts`'s `TAB_SCOPED`). */
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const [history, setHistory] = useState<string[]>([]);
+  const [ruleOffers, setRuleOffers] = useState<Record<string, string>>({});
+  const [editorContext, setEditorContext] = useState<ContextSummary | null>(null);
+  const [scratchEditing, setScratchEditing] = useState(false);
+  /** The footer's transient line. `seq` so the same text twice is two flashes. */
+  const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
+  const flashSeq = useRef(0);
+  function showFlash(text: string) {
+    flashSeq.current += 1;
+    setFlash({ text, seq: flashSeq.current });
+  }
+  // A newer flash replaces an older one (`showFlash` above); this only ever clears the flash that
+  // is STILL the current one when its own two seconds are up, so an older flash's timer firing late
+  // cannot erase a newer flash that has since taken its place.
+  useEffect(() => {
+    if (flash === null) return;
+    const seq = flash.seq;
+    const timer = setTimeout(() => setFlash((f) => (f?.seq === seq ? null : f)), 2000);
+    return () => clearTimeout(timer);
+  }, [flash]);
+  /** `queue_taken`, for the composer to merge. */
+  const [queueTaken, setQueueTaken] = useState<{ texts: string[]; seq: number } | null>(null);
+  const takenSeq = useRef(0);
+  // `queueError` supplies the queue error line, `editorContext` supplies the editor context line, and
+  // `flash` supplies the footer's transient message. `MessageList` receives `ruleOffers` for the
+  // permission card's third button.
+
+  /** The row just yanked flashes for 400 ms. */
+  const [yanked, setYanked] = useState<{ key: string; seq: number } | null>(null);
+  const yankSeq = useRef(0);
+  useEffect(() => {
+    if (yanked === null) return;
+    const seq = yanked.seq;
+    const timer = setTimeout(() => setYanked((y) => (y?.seq === seq ? null : y)), 400);
+    return () => clearTimeout(timer);
+  }, [yanked]);
+  function copied(text: string, key: string | undefined) {
+    void navigator.clipboard?.writeText(text);
+    showFlash(`copied ${countCodePoints(text)} chars`);
+    if (key !== undefined) {
+      yankSeq.current += 1;
+      setYanked({ key, seq: yankSeq.current });
+    }
+  }
+
+  /** The composer's text reaches Rust 300ms after its last change and immediately when the tab
+   *  stops being active. `pendingDraftRef` holds the unsent text and its tab. */
+  const pendingDraftRef = useRef<{ tab: TabId; text: string } | null>(null);
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function flushDraft() {
+    if (draftTimerRef.current !== null) clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = null;
+    const pending = pendingDraftRef.current;
+    pendingDraftRef.current = null;
+    if (pending !== null) postToRust({ type: "draft", request_id: nextRequestId(), tab: pending.tab, text: pending.text });
+  }
+  function mirrorDraft(text: string) {
+    draftRef.current = text;
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    pendingDraftRef.current = { tab, text };
+    if (draftTimerRef.current !== null) clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = setTimeout(flushDraft, DRAFT_MIRROR_DELAY_MS);
+  }
+  useEffect(
+    () => () => {
+      if (draftTimerRef.current !== null) clearTimeout(draftTimerRef.current);
+    },
+    [],
+  );
   /** How the NEXT cursor change should bring its row on screen (`revealRow`): +1/-1 when `j`/`k`
    *  moved it (a tall row shows its top or its bottom), `"keep"` when the key already put the view
    *  exactly where it belongs (`Ctrl+d`/`Ctrl+u` re-homing, `G`, `gg`), 0 otherwise. A ref, read
    *  and reset by the cursor-follow effect, and only ever set when the cursor really changes -- an
    *  unchanged cursor runs no effect, and a stale value would misplace some later, unrelated move. */
   const landingRef = useRef<1 | -1 | 0 | "keep">(0);
-  /** A lone `g` was the last key in BROWSE (`resolveKey`'s `pending-g`). Cleared on EVERY key
-   *  `onKeyDown` sees, so anything but a second `g` cancels it, and on every `pane_focus` envelope,
-   *  so a pane switch the WebView never saw as a key cancels it too; handed to `resolveKey` in its
-   *  context so the key table itself keeps no memory. */
-  const pendingGRef = useRef(false);
+  /** The open `/` prompt and the cursor position when it opened; `lastSearchRef` holds what `n`/`N` repeat. */
+  const [search, setSearch] = useState<{ query: string; origin: number } | null>(null);
+  const lastSearchRef = useRef("");
+  function moveCursorTo(index: number) {
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+    noteUserScroll(list, index < cursor ? "up" : "down");
+    setCursor(index);
+  }
+  /** The first key of a two-key BROWSE sequence (`resolveKey`'s `{kind:"pending"}`), or `null`
+   *  between sequences. Cleared on EVERY key `onKeyDown` sees, so anything but the matching second
+   *  half cancels it, and on every `pane_focus` envelope, so a pane switch the WebView never saw as
+   *  a key cancels it too; handed to `resolveKey` in its context so the key table itself keeps no
+   *  memory. (Formerly `pendingGRef`, a plain boolean, before `[[`/`]]` gave BROWSE a second prefix.) */
+  const pendingRef = useRef<PendingPrefix | null>(null);
+  /** The count accumulated from `1`-`9` followed by `0`-`9`, applied to the next
+   *  `j`/`k`/`[[`/`]]` and reset by it or any other action. `null` before any digit. Kept in a
+   *  ref because `onKeyDown` reads it without rendering it. */
+  const countRef = useRef<number | null>(null);
   /** Whether the which-key strip is currently showing the `g` prefix's continuation,
    *  i.e. whether `WHICH_KEY_G_PREFIX_DELAY_MS` has elapsed since the last lone `g` with nothing
-   *  cancelling it since. A real state, not a ref like `pendingGRef`: this one drives what the
+   *  cancelling it since. A real state, not a ref like `pendingRef`: this one drives what the
    *  strip renders, so it must cause a re-render when it flips. */
   const [gShown, setGShown] = useState(false);
   /** The pending 400ms timer that would set `gShown` true, or `null` when none is running. Cleared
-   *  in every place `pendingGRef` itself is cleared (see that ref's own doc comment) -- a `g` that
+   *  in every place `pendingRef` itself is cleared (see that ref's own doc comment) -- a `g` that
    *  gets cancelled before the delay elapses must never let a stale timer flip the strip on late. */
   const gShownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   function cancelGPrefixTimer() {
@@ -367,6 +523,16 @@ export default function App() {
   const [detail, setDetail] = useState<DetailRow[] | null>(null);
   /** The row `j`/`k`/`y` act on inside the popover, reset to 0 every time it opens. */
   const [detailCursor, setDetailCursor] = useState(0);
+  /** The paths for a `gf` letter picker, or `null` when none is waiting. Set by `open-path` and
+   *  cleared by the letter that selects a path or any other key. */
+  const [pathPick, setPathPick] = useState<PathRef[] | null>(null);
+  /** `open_path` and `view_in_editor` share `edit_draft`'s `"editor"` request handling.
+   *  They have no tab-scoped reply payload to restore; a refusal only needs a footer flash. */
+  function openPath(ref: PathRef) {
+    const requestId = nextRequestId();
+    inFlight.current.set(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+    postToRust({ type: "open_path", request_id: requestId, path: ref.path, ...(ref.line === null ? {} : { line: ref.line }) });
+  }
   /** The popover's own scrollable root -- unused today (it has nothing to scroll into view yet),
    *  kept for parity with `keymapOverlayRef` and because a forwarded ref is part of the component's
    *  contract. */
@@ -391,9 +557,13 @@ export default function App() {
   /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
    *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
   const keymapOverlayRef = useRef<HTMLDivElement>(null);
-  /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
-   *  `MessageList`'s own copy of this memo for why it is keyed on `state` as a whole. */
-  const timeline = useMemo(() => buildTimeline(state), [state]);
+  /** One ordered view of the conversation for the cursor and expand keys. Keyed on the whole
+   *  `state`, like `MessageList`'s memo, plus `expanded` and `detailed`: `buildDisplay` folds
+   *  rows using both, so either changing must recompute what the cursor indexes. */
+  const timeline = useMemo(
+    () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
+    [state, expanded, detailed],
+  );
   const answerableItems = useMemo(
     (): AnswerableItem[] =>
       timeline.map((item) =>
@@ -470,6 +640,28 @@ export default function App() {
   useEffect(() => {
     setCursor((c) => Math.min(c, Math.max(timeline.length - 1, 0)));
   }, [timeline.length]);
+  /** Keep the cursor on the same row when a run collapses or expands and shifts later indices.
+   *  `cursorKeyRef` remembers the row key; `indexOfKey` finds it again, including a call folded into a run.
+   *  Use `landingRef.current = "keep"` to preserve scroll position. A removed key uses the index clamp above.
+   *  Reconcile only when `timeline` changes identity. Running on cursor changes alone would find the
+   *  old row at its unchanged index and undo ordinary keyboard navigation. */
+  const cursorKeyRef = useRef<string | null>(null);
+  const prevTimelineRef = useRef<TimelineItem[] | null>(null);
+  useLayoutEffect(() => {
+    const timelineChanged = prevTimelineRef.current !== null && prevTimelineRef.current !== timeline;
+    prevTimelineRef.current = timeline;
+    const want = cursorKeyRef.current;
+    if (timelineChanged && want !== null && timeline[cursor]?.key !== want) {
+      const found = indexOfKey(timeline, want);
+      if (found !== null && found !== cursor) {
+        landingRef.current = "keep";
+        setCursor(found);
+        return;
+      }
+    }
+    cursorKeyRef.current = timeline[cursor]?.key ?? null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeline, cursor]);
   /** Keeps the cursor row visible when the cursor moves, using `.row-current` through `containerRef`.
    *  Following new messages depends on scroll position, so reading earlier text does not force the view
    *  to the bottom. jsdom can check which element is revealed but cannot prove the resulting layout. */
@@ -481,6 +673,54 @@ export default function App() {
     if (row == null) return;
     revealRow(row.closest<HTMLElement>(".message-list"), row, landing);
   }, [cursor]);
+  /** A wheel, drag or browser scroll key can leave the cursor's row off screen. Move the cursor
+   *  to the nearest visible row without moving the view; `clampCursorToView` never writes
+   *  `scrollTop`. `sessionStarted` matches the conversation layout's mount condition, so this
+   *  attaches only while `.message-list` exists. */
+  const cursorRefForScroll = useRef(cursor);
+  cursorRefForScroll.current = cursor;
+  useEffect(() => {
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
+    if (!list) return;
+    const onListScroll = () => {
+      const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+      const next = clampCursorToView(list, rows, cursorRefForScroll.current);
+      if (next !== null && next !== cursorRefForScroll.current) {
+        landingRef.current = "keep";
+        setCursor(next);
+      }
+    };
+    list.addEventListener("scroll", onListScroll, { passive: true });
+    return () => list.removeEventListener("scroll", onListScroll);
+  }, [sessionStarted]);
+  /** At the bottom, the cursor follows the new last row as the conversation grows, and a sent
+   *  prompt takes the cursor. Key on `timeline`: a state change that does not grow the timeline
+   *  must not move the cursor. The events dispatcher sets `landOnPromptRef` on
+   *  `user_prompt_submitted`; read and clear it here, once the target row exists in this
+   *  render's timeline. */
+  const lastLengthRef = useRef(0);
+  const landOnPromptRef = useRef(false);
+  useEffect(() => {
+    const previous = lastLengthRef.current;
+    lastLengthRef.current = timeline.length;
+    if (landOnPromptRef.current) {
+      landOnPromptRef.current = false;
+      for (let i = timeline.length - 1; i >= 0; i--) {
+        if (timeline[i].kind === "prompt") {
+          setCursor(i);
+          return;
+        }
+      }
+    }
+    if (timeline.length <= previous || cursor !== previous - 1) return;
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
+    const atBottom = !list || list.scrollHeight - list.scrollTop - list.clientHeight <= 1;
+    if (atBottom) {
+      landingRef.current = "keep";
+      setCursor(timeline.length - 1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeline]);
   /** The scroll half of a tab switch's view restore: cursor and mode are set
    *  directly in the `snapshot` handler above, but the row the cursor lands on must exist in the DOM
    *  first, so the scroll position waits for the render that `setState` there causes. A layout
@@ -532,7 +772,17 @@ export default function App() {
      (`resolveKey`): a dead session has no box to type into, and no session at all has no
      composer. Keyed on the request alone, so a session change never opens the composer by itself. */
   useEffect(() => {
-    if (inputRequest === 0 || !sessionStarted || sessionEnded) return;
+    if (inputRequest === 0) return;
+    const arrival = arrivalRef.current;
+    arrivalRef.current = false;
+    // An arrival with a pending card in this tab lands on the card in BROWSE, like
+    // `focus_permission`. Only `enter_input` (`Ctrl+l`) is treated as an arrival here. A HINT
+    // landing on the composer uses the same counter but must still enter the composer.
+    if (arrival && oldestPendingPermission(timeline) !== null) {
+      setPermissionRequest((n) => n + 1);
+      return;
+    }
+    if (!sessionStarted || sessionEnded) return;
     setMode("input");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inputRequest]);
@@ -552,7 +802,14 @@ export default function App() {
     // user scroll through `./follow.ts`, as for a HINT landing. Otherwise `MessageList` keeps
     // following and the next delta or resize can scroll the older card out of view.
     noteUserScroll(containerRef.current?.querySelector(".message-list"), "unknown");
-    setCursor(index);
+    // A landing always reveals the card, even over a `"keep"` some earlier restore left behind; and
+    // when the cursor is already on it (a switch restored it there), nothing fires the `[cursor]`
+    // effect, so the row is revealed here -- after the restore's own scroll, which is a layout effect.
+    landingRef.current = 0;
+    if (index === cursorRef.current) {
+      const row = containerRef.current?.querySelector<HTMLElement>(".row-current");
+      if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
+    } else setCursor(index);
     containerRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionRequest]);
@@ -636,10 +893,10 @@ export default function App() {
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
       } else if (payload.kind === "pane_focus") {
-        // A pending `g` is for the very next key; a pane switch in between (GTK takes `Ctrl+h`/
-        // `Ctrl+k` before the WebView sees a keydown) must not leave it armed for a `g` pressed
-        // much later, when it would jump to the top -- review.
-        pendingGRef.current = false;
+        // A pending prefix is for the very next key; a pane switch in between (GTK takes `Ctrl+h`/
+        // `Ctrl+k` before the WebView sees a keydown) must not leave it armed for a key pressed much
+        // later, when it would complete a chord nobody meant to start -- review.
+        pendingRef.current = null;
         // The which-key strip's own memory of that `g` is cancelled the same way and
         // for the same reason: a switch away and back must not leave its 400ms timer running for a
         // press that has nothing to do with the `g` that started it.
@@ -649,12 +906,17 @@ export default function App() {
         // land in INPUT, and every keystroke is swallowed by the overlay's own branch (review).
         setKeymapOpen(false);
         setDetail(null);
+        // The `/` prompt belongs to this panel, so it closes here like the `?` overlay.
+        setSearch(null);
         setPaneFocused(payload.focused);
       } else if (payload.kind === "enter_input") {
         // Same reason, the other half of that reproduction: this puts the caret in the composer, so
         // the overlay must not be left covering it and eating what gets typed.
         setKeymapOpen(false);
         setDetail(null);
+        // Mark the `Ctrl+l` arrival separately from a HINT landing on the composer, which
+        // increments the same counter. The next `inputRequest` effect reads and clears this flag.
+        arrivalRef.current = true;
         setInputRequest((n) => n + 1);
       } else if (payload.kind === "focus_permission") {
         // The overlay would cover the card the cursor is about to land on.
@@ -688,8 +950,10 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setChooser(null);
-        // ...and the `g` the strip may still be waiting on, for the reason `pane_focus` does it.
-        pendingGRef.current = false;
+        // Close the search prompt so HINT labels do not cover it or compete with `/` for keys.
+        setSearch(null);
+        // ...and the prefix the strip may still be waiting on, for the reason `pane_focus` does it.
+        pendingRef.current = null;
         hideGPrefix();
         const root = containerRef.current ?? startScreenRef.current;
         frozenRef.current = root === null ? [] : hintTargets(root);
@@ -727,6 +991,10 @@ export default function App() {
         // carry over from the tab just left. The first `tabs` this window ever sees (mount) also
         // takes this branch, since `activeTabRef.current` starts `null`.
         if (payload.active !== activeTabRef.current) {
+          switchedRef.current = true;
+          // Flush the draft before the tab becomes inactive rather than waiting for the rest of its 300ms
+          // debounce.
+          flushDraft();
           const previous = activeTabRef.current;
           // The old tab's view is saved from the live refs -- BEFORE the resets below overwrite
           // the render state they mirror -- and only when there IS an old tab (not on mount).
@@ -738,29 +1006,35 @@ export default function App() {
               expanded: expandedRef.current,
               scrollTop: list?.scrollTop ?? 0,
               atBottom: list === null || list.scrollTop + list.clientHeight >= list.scrollHeight - 1,
-              draft: draftRef.current,
+              detailed: detailedRef.current,
             });
           }
           restoreRef.current = takeView(viewStore.current, payload.active) ?? null;
-          // The composer always gets the new tab's draft, empty when it has none,
-          // through the existing restoredDraft path. `draftRef` itself is reset here too, not only
-          // through `onDraftChange` -- without this it would still hold the PREVIOUS tab's text
-          // until something typed into the new tab's box fired a change, so switching away again
-          // with nothing typed would save the old tab's draft under the new tab's id.
+          // The box goes empty on a switch, never the left tab's words: Rust's own `draft` envelope
+          // for the new tab follows in the same batch, so this is never what the reader
+          // actually sees for longer than one dispatch.
           restoreSeq.current += 1;
-          draftRef.current = restoreRef.current?.draft ?? "";
-          setRestoredDraft({ text: draftRef.current, seq: restoreSeq.current });
+          draftRef.current = "";
+          setRestoredDraft({ text: "", seq: restoreSeq.current });
           setState(initialState());
           setCursor(0);
           setExpanded({});
+          setDetailed(false);
           setMode("browse");
           setKeymapOpen(false);
           setDetail(null);
           setChooser(null);
+          // The `/` prompt belongs to the old tab's conversation and must close on a tab switch.
+          setSearch(null);
           setTurnClock(null);
           setHandoff(null);
           setFatalError(null);
           setCommandNotice(null);
+          setQueue([]);
+          setQueueError(null);
+          setRuleOffers({});
+          setScratchEditing(false);
+          setQueueTaken(null);
         }
         activeTabRef.current = payload.active;
         setTabs({ active: payload.active, tabs: payload.tabs });
@@ -785,13 +1059,25 @@ export default function App() {
         // own `"nearest"` scroll for a plain +1/-1 move.
         if (restoreRef.current !== null) {
           const view = restoreRef.current;
-          landingRef.current = "keep";
+          // Set `"keep"` only when the cursor moves. An unchanged `setCursor` fires no `[cursor]`
+          // effect to consume it, so it would suppress the next move's reveal, including a landing
+          // on a card below the restored view.
+          if (view.cursor !== cursorRef.current) landingRef.current = "keep";
           setCursor(view.cursor);
           setMode(view.mode);
           setExpanded(view.expanded);
+          setDetailed(view.detailed);
           // Tells the scroll-restoring layout effect a real restore landed in THIS render -- see
           // its own doc comment for why it cannot simply key on `state`.
           setRestoreTick((n) => n + 1);
+        }
+        // When switching to a tab with a pending card while the panel has the keys, land on the
+        // card as `Ctrl+l` does within one tab. Read `payload.state` because `timeline` still
+        // belongs to the old tab until `setState` renders. The `permissionRequest` effect finds the
+        // exact row after that render.
+        if (switchedRef.current) {
+          switchedRef.current = false;
+          if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
         }
         // A snapshot means a session is genuinely RUNNING, which is also when Rust clears its own
         // copy of the command. Clearing it when a start was merely requested would throw it away on
@@ -814,6 +1100,9 @@ export default function App() {
           firstTextReceivedAt.current = null;
           renderReportSent.current = false;
         }
+        // A sent prompt takes the cursor once its row exists. The `[timeline]` effect reads and
+        // clears this flag when the new row appears.
+        if (payload.events.some((e) => e.type === "user_prompt_submitted")) landOnPromptRef.current = true;
         // The clock's only EXACT provenance: a real `turn_started` inside this batch. Everything
         // that ends a turn clears it, mirroring exactly what already clears `state.activeTurnId` in
         // the reducer (`turn_completed`, `session_unavailable`, `session_closed`, a non-attaching
@@ -868,6 +1157,10 @@ export default function App() {
               // refusal is reported by name instead, with the full text so it is not lost.
               setCommandNotice(`A message to tab ${record.tab} was not sent (${payload.error}): ${record.text}`);
             }
+          } else if (record?.kind === "editor") {
+            // A scratch-editor round trip's own refusal is a footer nicety, not
+            // something that should fill the banner reserved for conversation-breaking errors.
+            showFlash(payload.error);
           } else {
             setCommandNotice(payload.error);
           }
@@ -941,6 +1234,28 @@ export default function App() {
         setKeymapOpen(false);
         setRenaming(null);
         setChooser({ launch: payload.launch, open: payload.open, records: payload.records });
+      } else if (payload.kind === "queue") {
+        setQueue(payload.items);
+        setQueueError(payload.error);
+      } else if (payload.kind === "draft") {
+        // Rust's copy wins only when it is sent: a switch, `ready`, a reset, a scratch return.
+        restoreSeq.current += 1;
+        draftRef.current = payload.text;
+        pendingDraftRef.current = null;
+        setRestoredDraft({ text: payload.text, seq: restoreSeq.current });
+      } else if (payload.kind === "queue_taken") {
+        takenSeq.current += 1;
+        setQueueTaken({ texts: payload.texts, seq: takenSeq.current });
+      } else if (payload.kind === "history") {
+        setHistory(payload.entries);
+      } else if (payload.kind === "rule_offers") {
+        setRuleOffers(payload.offers);
+      } else if (payload.kind === "editor_context") {
+        setEditorContext(payload.file === null ? null : { file: payload.file, lines: payload.lines });
+      } else if (payload.kind === "scratch") {
+        setScratchEditing(payload.editing);
+      } else if (payload.kind === "notice") {
+        showFlash(payload.text);
       }
     });
     requestHello();
@@ -1023,11 +1338,15 @@ export default function App() {
   }, [state.transcript]);
 
   /** Adds `request_id` and the active tab to a tab command. Posts nothing without an active tab,
-   *  since a tab command without a tab is a protocol error. */
+   *  since a tab command without a tab is a protocol error.
+   *  Tracks `edit_draft` as an `"editor"` request so refusals flash in the footer instead of
+   *  filling the `commandNotice` banner. */
   function post<M extends { type: string }>(message: M) {
     const tab = activeTabRef.current;
     if (tab === null) return;
-    postToRust({ ...message, request_id: nextRequestId(), tab } as unknown as OutboundMessage);
+    const requestId = nextRequestId();
+    if (message.type === "edit_draft") inFlight.current.set(requestId, { kind: "editor", tab });
+    postToRust({ ...message, request_id: requestId, tab } as unknown as OutboundMessage);
   }
 
   function handoffToTerminal() {
@@ -1057,12 +1376,36 @@ export default function App() {
     postToRust({ type: "send_message", request_id: requestId, tab, text });
   }
 
+  /** Queues what is typed behind the running turn. Recorded as a `"send"` for the same reason
+   *  `sendMessage` is: the composer cleared the box on Enter, and a refusal here (the session ended,
+   *  or a handoff is pending, while this side still showed a turn running) means nothing was queued
+   *  and nothing reached history -- Rust remembers a queued text only once it is queued -- so the
+   *  box is the only place left to put it.
+   *
+   *  `send_now` is deliberately NOT recorded this way: its refusal can come after its text was
+   *  already queued, where putting it back would show it
+   *  twice. Rust saves a `send_now`'s text to history before either outcome, so `↑` recovers it. */
+  function queueMessage(text: string) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    const requestId = nextRequestId();
+    inFlight.current.set(requestId, { kind: "send", tab, text });
+    setCommandNotice(null);
+    postToRust({ type: "queue_message", request_id: requestId, tab, text });
+  }
+
   function interrupt() {
     post({ type: "interrupt" });
   }
 
-  function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string) {
-    post({ type: "permission_response", permission_id: permissionId, decision, reason });
+  function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) {
+    post({
+      type: "permission_response",
+      permission_id: permissionId,
+      decision,
+      reason,
+      ...(remember ? { remember: true } : {}),
+    });
   }
 
   /** Commit or cancel an inline rename and return the keys to the root. Send `renaming.tab`
@@ -1140,21 +1483,6 @@ export default function App() {
     return true;
   }
 
-  /** Clipboard text for the item under the cursor: message markdown source or formatted tool input.
-   *  Take an item directly so the caller decides what an absent cursor target means.
-   *  An absent target must leave the clipboard untouched rather than replace it with an empty string. */
-  function copyTextForItem(item: TimelineItem): string {
-    switch (item.kind) {
-      case "prompt":
-      case "message":
-        return item.text;
-      case "tool":
-        return JSON.stringify(item.call.input, null, 2);
-      case "permission":
-        return JSON.stringify(item.request.input, null, 2);
-    }
-  }
-
   /* Rendered on both screens. A refused command can return the panel to the start screen (a failed
      handoff close, for one), and a reason that only exists in the conversation view would be gone by
      the time it could be read. */
@@ -1182,7 +1510,17 @@ export default function App() {
     // `EmptyTab` (`activeTab.failure`), and a fatal error that arrived before any `tabs` envelope
     // (nothing to blame it on yet) still reaches the reader through `failure` below, as a fallback.
     return (
-      <div className="agent-ui-root" ref={startScreenRef} tabIndex={-1}>
+      <div
+        className="agent-ui-root"
+        ref={startScreenRef}
+        tabIndex={-1}
+        // `.empty-tab` is centred, so a click above or below it lands here; taking focus would put the
+        // keys on an element that handles none (the phase-3 GUI pass, 2026-09-25). Its own background
+        // only -- a press on anything inside is the browser's.
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) event.preventDefault();
+        }}
+      >
         {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
           <TabBar
             tabs={tabs.tabs}
@@ -1194,12 +1532,6 @@ export default function App() {
           />
         )}
         {commandNoticeBanner}
-        {/* No `.panel-footer` on this screen, so the prompt is drawn here instead. */}
-        {confirm !== null && (
-          <span className="confirm-close" role="alertdialog">
-            {confirm.lines.join(" · ")}
-          </span>
-        )}
         {activeTab === null ? (
           <div className="empty-tab">
             <p className="connecting">Connecting to the shell…</p>
@@ -1213,19 +1545,59 @@ export default function App() {
             paneFocused={paneFocused}
             focusRequest={inputRequest}
             restoredDraft={restoredDraft}
-            onSend={sendMessage}
+            // Whoever sends from here is typing, and the conversation this starts must open where
+            // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
+            // as BROWSE keys (the phase-3 GUI pass, 2026-09-25).
+            onSend={(text) => {
+              setMode("input");
+              sendMessage(text);
+            }}
             onResume={(id) => post({ type: "resume", provider_session_id: id })}
             onCycleMode={() => post({ type: "cycle_mode" })}
             onReset={() => post({ type: "reset_tab" })}
             onHint={requestHint}
-            onDraftChange={(text) => (draftRef.current = text)}
+            onDraftChange={mirrorDraft}
             answerConfirm={answerConfirm}
+            onQueue={(text) => {
+              setMode("input");
+              queueMessage(text);
+            }}
+            history={history}
+            queueCount={queue.length}
+            queue={queue}
+            queueError={queueError}
+            editorContext={editorContext}
+            onTakeBackQueue={() => post({ type: "take_back_queue" })}
+            queueTaken={queueTaken}
+            onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
+            onEditInNvim={(t) => post({ type: "edit_draft", text: t })}
+            editingInNvim={scratchEditing}
+            onOpenKeymap={() => {
+              setMode("browse");
+              setKeymapOpen(true);
+            }}
           />
         )}
+        {/* No `.agent-ui-scroller` on this screen: the footer, and the window-close
+            prompt it draws while `prefix &` is open, sit directly under the empty tab instead of
+            below a composer that lives inside `EmptyTab` itself. */}
+        <Footer
+          mode="input"
+          paneFocused={paneFocused}
+          pill={modePill(activeTab?.mode ?? "auto", true)}
+          flash={flash?.text ?? null}
+          hint={INPUT_IDLE_HINT}
+        >
+          {confirm !== null ? (
+            <span className="confirm-close" role="alertdialog">
+              {confirm.lines.join(" · ")}
+            </span>
+          ) : undefined}
+        </Footer>
         {/* The launch chooser opens over empty tab 1 before the chat receives keys. This layout
             has no `.agent-ui-scroller`, so `.agent-ui-root` is its positioned ancestor. */}
         {chooser !== null && (
-          <Chooser envelope={chooser} onSwitch={onChooserSwitch} onResume={onChooserResume} onCloseTab={onChooserCloseTab} onLeave={onChooserLeave} />
+          <Chooser envelope={chooser} active={tabs?.active ?? null} onSwitch={onChooserSwitch} onResume={onChooserResume} onCloseTab={onChooserCloseTab} onLeave={onChooserLeave} />
         )}
         <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />
       </div>
@@ -1264,11 +1636,23 @@ export default function App() {
     // overlay and everything else below: tmux's own `confirm-before` prompt takes the
     // keys the same way.
     if (answerConfirm(event)) return;
+    // A `gf` picker with several paths takes the next key before other overlays. A valid letter
+    // opens its path; Esc or any other key cancels without falling through, so the key cannot also
+    // move the cursor.
+    if (pathPick !== null) {
+      event.preventDefault();
+      const index = HINT_ALPHABET.indexOf(event.key);
+      if (index !== -1 && index < pathPick.length) openPath(pathPick[index]);
+      setPathPick(null);
+      return;
+    }
     const root = containerRef.current;
-    const pendingG = pendingGRef.current;
-    pendingGRef.current = false;
+    const pending = pendingRef.current;
+    pendingRef.current = null;
+    const count = countRef.current;
+    countRef.current = null;
     // Every key seen here cancels whatever the PREVIOUS key armed, the which-key strip's `g`
-    // continuation included -- `pendingG` above already captured whether THIS key still gets to
+    // continuation included -- `pending` above already captured whether THIS key still gets to
     // read it. Unconditional, ahead of every early return below, so a key that turns out to be
     // claimed by a text box or a focused button still cancels a stale prefix line.
     hideGPrefix();
@@ -1312,8 +1696,19 @@ export default function App() {
     // keyboard route to Approve. Every OTHER key still
     // reaches the table, which is what lets `h`/`j`/`k`/`l` carry on from a focused button.
     if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
-    const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, { sessionEnded, pendingG });
+    const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, { sessionEnded, pending, count, turnRunning: turnInProgress });
     if (action === null) return;
+    // Accumulate digits into the count for the next `j`/`k`/`[[`/`]]`. That key reads it from
+    // `countRef` as `count`. Return immediately so a bare digit cannot reach the scroll or
+    // row-motion code.
+    if (action.kind === "count") {
+      event.preventDefault();
+      countRef.current = (count ?? 0) * 10 + action.digit;
+      return;
+    }
+    // How many times THIS key repeats its move: the count just accumulated (cleared above, so this
+    // is the last one) if any, else once, same as vim's own default count of 1.
+    const times = Math.max(1, count ?? 1);
     // Every key below that can move the conversation says so first, on the list itself, so
     // `MessageList` knows the scroll that follows is the user's (`./follow.ts`, 2026-09-24): it no
     // longer takes an unexplained drop in `scrollTop` for the reader leaving the bottom, because
@@ -1353,12 +1748,24 @@ export default function App() {
       event.preventDefault();
       if (root === null) return;
       if (action.kind === "move") {
-        const target = nextStop(root, cursor, action.delta);
+        // Repeat the step `times` times, starting each step from the previous landing. Do not leap
+        // by `times` rows: a banner or status-line stop has no row and must end the walk where a
+        // single `j`/`k` would.
+        let target: HTMLElement | null = null;
+        let row = cursor;
+        for (let n = 0; n < times; n++) {
+          const next = nextStop(root, row, action.delta);
+          if (next === null) break;
+          target = next;
+          const nextRow = rowIndexOf(root, next);
+          if (nextRow === null) break;
+          row = nextRow;
+        }
         if (target === null) return;
-        const row = rowIndexOf(root, target);
-        if (row !== null) {
-          if (row !== cursor) landingRef.current = action.delta;
-          setCursor(row);
+        const finalRow = rowIndexOf(root, target);
+        if (finalRow !== null) {
+          if (finalRow !== cursor) landingRef.current = action.delta;
+          setCursor(finalRow);
           root.focus({ preventScroll: true });
         } else {
           controlsOf(target)[0]?.focus();
@@ -1371,7 +1778,9 @@ export default function App() {
       } else if (!edgeFocused) {
         // `a`/`d` press the card's own button, so its guard against a second answer applies here
         // too. Not from a banner's button: the row cursor is hollow there, and not what keys act on.
-        const target = permissionTarget(answerableItems, cursor);
+        // `answerTarget`, not `permissionTarget`: with exactly one card anywhere in
+        // the conversation, it answers from any row, not only the cursor's own.
+        const target = answerTarget(answerableItems, cursor);
         const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
         const button =
           target === null ? null : rows[target]?.querySelector<HTMLButtonElement>(`[data-nav-action="${action.decision}"]`);
@@ -1386,9 +1795,21 @@ export default function App() {
         break;
       case "toggle-expand": {
         // Keyed on the timeline KEY, not the cursor index -- see the doc comment on `expanded`
-        // above for why an index would silently drift onto the wrong row.
+        // above for why an index would silently drift onto the wrong row. For a "run" key this
+        // un-collapses it right back into its calls (`display.ts`'s `buildDisplay`).
         const key = timeline[cursor]?.key;
         if (key !== undefined) setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
+        break;
+      }
+      case "detailed":
+        // `Ctrl+o` toggles per-tab detail, mirrored to Rust by `saveView` and restored on a tab
+        // switch.
+        setDetailed((d) => !d);
+        break;
+      case "table-scroll": {
+        // T1: `zh`/`zl` scroll the CURRENT row's own table, never the conversation.
+        const table = root?.querySelector<HTMLElement>(".row-current .table-scroll") ?? null;
+        if (table !== null) table.scrollLeft += action.delta * TOOL_RESULT_SCROLL_STEP_PX;
         break;
       }
       case "copy": {
@@ -1397,13 +1818,32 @@ export default function App() {
         // user is looking at something else now.
         const cursorRow = root?.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[cursor];
         if (landedCode !== null && landedCode.isConnected && cursorRow?.contains(landedCode)) {
-          void navigator.clipboard?.writeText(landedCode.querySelector("code")?.textContent ?? landedCode.textContent ?? "");
+          copied(landedCode.querySelector("code")?.textContent ?? landedCode.textContent ?? "", timeline[cursor]?.key);
           break;
         }
         // No item at the cursor (an empty timeline) writes NOTHING, rather than clobbering
         // whatever the user already had on the clipboard with "" -- found in review.
         const item = timeline[cursor];
-        if (item !== undefined) void navigator.clipboard?.writeText(copyTextForItem(item));
+        if (item !== undefined) copied(primaryText(item), item.key);
+        break;
+      }
+      case "copy-output": {
+        const item = timeline[cursor];
+        const text = item === undefined ? null : outputText(item);
+        if (text === null) showFlash("this row has no output");
+        else copied(text, item.key);
+        break;
+      }
+      case "deny-reason": {
+        if (root === null || edgeFocused) break;
+        const target = answerTarget(answerableItems, cursor);
+        const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
+        const box = target === null ? null : rows[target]?.querySelector<HTMLInputElement>(".permission-card input");
+        if (box) {
+          if (target !== cursor) setCursor(target!);
+          landedControlRef.current = box;
+          box.focus();
+        }
         break;
       }
       case "restart":
@@ -1424,17 +1864,20 @@ export default function App() {
         // (`hintPendingRef`); nothing else changes here.
         requestHint(event.repeat);
         break;
-      case "pending-g":
-        // Claimed (so the `g` does nothing else) and remembered for exactly one key.
-        pendingGRef.current = true;
+      case "pending":
+        // Claimed (so the key does nothing else) and remembered for exactly one more key.
+        pendingRef.current = action.prefix;
         // The strip shows what `g` can start once it has waited long enough that this is not just
-        // the first half of `gg`: the timer this starts is the only thing that ever
-        // sets `gShown` true, and `hideGPrefix` at the top of this function on every later key --
-        // the second `g` of `gg` included -- is the only thing that cancels it before it fires.
-        gShownTimerRef.current = setTimeout(() => {
-          gShownTimerRef.current = null;
-          setGShown(true);
-        }, WHICH_KEY_G_PREFIX_DELAY_MS);
+        // the first half of `gg` -- `[[`/`]]` have no strip continuation of their own,
+        // so only `g` arms this timer. The timer is the only thing that ever sets `gShown` true, and
+        // `hideGPrefix` at the top of this function on every later key -- the second `g` of `gg`
+        // included -- is the only thing that cancels it before it fires.
+        if (action.prefix === "g") {
+          gShownTimerRef.current = setTimeout(() => {
+            gShownTimerRef.current = null;
+            setGShown(true);
+          }, WHICH_KEY_G_PREFIX_DELAY_MS);
+        }
         break;
       case "half-page": {
         // Half the visible height, as in vim. Then, if the cursor's row is not on screen, the
@@ -1476,6 +1919,59 @@ export default function App() {
         const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
         if (list !== null) list.scrollTop = action.to === "first" ? 0 : list.scrollHeight;
         root?.focus({ preventScroll: true });
+        break;
+      }
+      case "prompt-jump": {
+        // Repeat `[[`/`]]` `times` times from each previous prompt landing. Stop at the first
+        // missing earlier or later prompt instead of wrapping.
+        let target: number | null = cursor;
+        for (let n = 0; n < times && target !== null; n++) target = promptIndex(timeline, target, action.delta) ?? null;
+        if (target !== null && target !== cursor) {
+          noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
+          landingRef.current = action.delta;
+          setCursor(target);
+        }
+        root?.focus({ preventScroll: true });
+        break;
+      }
+      case "interrupt":
+        // `Ctrl+c` interrupts a running turn from anywhere in BROWSE, using the same `interrupt()`
+        // as the activity line's Stop button.
+        interrupt();
+        break;
+      case "search":
+        setSearch({ query: "", origin: cursor });
+        break;
+      case "search-next": {
+        const found = findMatch(timeline, lastSearchRef.current, cursor, action.delta, false);
+        if (found === null) {
+          if (lastSearchRef.current !== "") showFlash(`pattern not found: ${lastSearchRef.current}`);
+        } else moveCursorTo(found);
+        // Same reason `move`/`jump`/`prompt-jump` and the Ctrl+d/Ctrl+u re-home all do this: a
+        // cursor move must take the keys back from a focused control (e.g. a permission card's
+        // Approve after `l`), or a stale `document.activeElement` keeps answering Enter/Space for a
+        // row the cursor no longer shows (found in review).
+        root?.focus({ preventScroll: true });
+        break;
+      }
+      case "open-path": {
+        // Use a tool's path field or a path found in prose, limited to what `pathsIn` in
+        // `../paths.ts` can read from the row. Do not infer what the model meant.
+        const item = timeline[cursor];
+        const paths = item === undefined ? [] : pathsIn(item).slice(0, HINT_ALPHABET.length);
+        if (paths.length === 0) showFlash("no path on this row");
+        else if (paths.length === 1) openPath(paths[0]);
+        else setPathPick(paths);
+        break;
+      }
+      case "view-in-editor": {
+        // Open the row's full text in a read-only nvim scratch buffer.
+        const item = timeline[cursor];
+        if (item === undefined) break;
+        const { title, text } = viewText(item);
+        const requestId = nextRequestId();
+        inFlight.current.set(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+        postToRust({ type: "view_in_editor", request_id: requestId, title, text });
         break;
       }
     }
@@ -1542,7 +2038,18 @@ export default function App() {
           the footer are outside its box rather than lifted back above it (review; see
           `.agent-ui-scroller` in index.css). The tab bar goes above `errorBanner`. */}
       <div className="agent-ui-scroller">
-        <MessageList state={state} sessionEnded={sessionEnded} expanded={expanded} cursor={cursor} focused={paneFocused && !edgeFocused} onAnswerPermission={answerPermission} />
+        <MessageList
+          state={state}
+          sessionEnded={sessionEnded}
+          expanded={expanded}
+          cursor={cursor}
+          detailed={detailed}
+          focused={paneFocused && !edgeFocused}
+          ruleOffers={ruleOffers}
+          yankedKey={yanked?.key ?? null}
+          onAnswerPermission={answerPermission}
+          onOpenPath={openPath}
+        />
         {keymapOpen && (
           <KeymapOverlay
             ref={keymapOverlayRef}
@@ -1556,57 +2063,123 @@ export default function App() {
           <DetailPopover ref={detailRef} rows={detail} current={detailCursor} onClose={() => setDetail(null)} />
         )}
         {chooser !== null && (
-          <Chooser envelope={chooser} onSwitch={onChooserSwitch} onResume={onChooserResume} onCloseTab={onChooserCloseTab} onLeave={onChooserLeave} />
+          <Chooser envelope={chooser} active={tabs?.active ?? null} onSwitch={onChooserSwitch} onResume={onChooserResume} onCloseTab={onChooserCloseTab} onLeave={onChooserLeave} />
         )}
       </div>
       {sessionEndedBanner}
       {commandNoticeBanner}
-      <ActivityLine state={state} turnClock={turnClock} canInterrupt={state.capabilities.interrupt} onInterrupt={interrupt} />
+      <ActivityLine
+        state={state}
+        turnClock={turnClock}
+        canInterrupt={state.capabilities.interrupt}
+        onInterrupt={interrupt}
+        queued={queue.length}
+        pendingTool={oldestPendingTool(state)}
+      />
+      <QueueLines items={queue} error={queueError} />
+      {!sessionEnded && <ContextLine context={editorContext} />}
       <Composer
-        // A dead session takes no more turns, and neither does one already being closed for a
-        // terminal handoff. Without this, clearing `activeTurnId` on a lost session would have
-        // handed the user an enabled composer pointed at nothing.
-        disabled={turnInProgress || sessionEnded || handingOff}
+        // C1: a running turn no longer disables the composer -- it queues a follow-up instead. Only
+        // a dead session, or one already being closed for a terminal handoff, takes no more turns:
+        // clearing `activeTurnId` on a lost session must not hand the user an enabled composer
+        // pointed at nothing.
+        disabled={sessionEnded || handingOff}
         sessionEnded={sessionEnded}
         closing={handingOff}
         restoredDraft={restoredDraft}
         mode={mode}
         focusRequest={inputRequest}
         // Only while the box can take a message: a landing on a disabled textarea could not focus it.
-        hintTarget={!(turnInProgress || sessionEnded || handingOff)}
+        hintTarget={!(sessionEnded || handingOff)}
         onModeChange={setMode}
         onSend={sendMessage}
-        onDraftChange={(text) => (draftRef.current = text)}
+        onDraftChange={mirrorDraft}
+        running={turnInProgress}
+        onQueue={queueMessage}
+        onSendNow={(t) => post({ type: "send_now", text: t })}
+        history={history}
+        queueCount={queue.length}
+        onTakeBackQueue={() => post({ type: "take_back_queue" })}
+        queueTaken={queueTaken}
+        onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
+        onInterrupt={interrupt}
+        onEditInNvim={(t) => post({ type: "edit_draft", text: t })}
+        editingInNvim={scratchEditing}
+        onOpenKeymap={() => {
+          setMode("browse");
+          setKeymapOpen(true);
+        }}
+        onShiftTab={() => {
+          if (!state.capabilities.modeSwitch) showFlash("mode is fixed for this session");
+        }}
       />
       <StatusRow
         text={statusRowText(state, { index: cursor, total: timeline.length })}
         warning={statusWarning(state.provider, activeTab?.failure ?? null)}
         onOpenDetail={() => post({ type: "open_detail" })}
       />
-      <Footer mode={mode} paneFocused={paneFocused} pill={modePill(activeTab?.mode ?? "auto", true)}>
+      <Footer
+        mode={mode}
+        paneFocused={paneFocused}
+        pill={modePill(activeTab?.mode ?? "auto", state.capabilities.modeSwitch === true)}
+        flash={flash?.text ?? null}
+        hint={mode === "input" ? (turnInProgress ? INPUT_RUNNING_HINT : INPUT_IDLE_HINT) : undefined}
+      >
         {/* The window-close prompt takes the footer's third slot while it is open, the
-            same way tmux draws `confirm-before` in its status line -- in place of the which-key
-            strip, never alongside it. */}
+            same way tmux draws `confirm-before` in its status line -- in place of everything else,
+            flash included. */}
         {confirm !== null ? (
           <span className="confirm-close" role="alertdialog">
             {confirm.lines.join(" · ")}
           </span>
-        ) : (
-          // Show the strip only in BROWSE with no HINT labels. Use `hints.length === 0`, the same visibility
-          // check as `HintLayer`, so the strip and labels cannot occupy the same space.
-          mode === "browse" &&
-          hints.length === 0 && (
-            <WhichKey
-              // `edgeFocused` too: `onKeyDown`'s answer arm is gated on it, so with the keys on a
-              // banner or the status row `a`/`d` resolve to nothing and the strip must not offer
-              // them (review). Its own argument, not `sessionEnded`'s: passed as that, a live
-              // session's status row offered `r new session` (GUI pass, 2026-09-25).
-              entries={stripEntries(timeline, answerableItems, cursor, sessionEnded, edgeFocused)}
-              focused={paneFocused}
-              prefix={gShown ? "g" : null}
-            />
-          )
-        )}
+        ) : // `gf` with several paths waiting for its letter, ahead of the flash and the
+        // which-key strip for the same reason the close prompt is: a card with pending input owns
+        // the space until it is answered.
+        pathPick !== null ? (
+          <PathPick paths={pathPick} />
+        ) : // The open `/` prompt, ahead of the flash and the which-key strip; vim's own
+        // command line takes the same spot the status line otherwise uses.
+        search !== null ? (
+          <SearchBar
+            query={search.query}
+            onChange={(query) => {
+              setSearch({ query, origin: search.origin });
+              const found = findMatch(timeline, query, search.origin, 1, true);
+              setCursor(found ?? search.origin);
+            }}
+            onAccept={() => {
+              lastSearchRef.current = search.query;
+              if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
+                showFlash(`pattern not found: ${search.query}`);
+                setCursor(search.origin);
+              }
+              setSearch(null);
+              containerRef.current?.focus({ preventScroll: true });
+            }}
+            onCancel={() => {
+              setCursor(search.origin);
+              setSearch(null);
+              containerRef.current?.focus({ preventScroll: true });
+            }}
+          />
+        ) : // Only in BROWSE (INPUT is typing, HINT's labels take over, the start screen
+        // has its own text), only once no HINT labels are on screen -- `hints.length === 0` is the
+        // same predicate `HintLayer` itself uses to decide whether it is drawing anything at all,
+        // so this and the labels can never both claim the same space -- and only while no flash is
+        // showing. `undefined`
+        // in every other case, deliberately, not `false`: `Footer`'s own fallback tests `children`
+        // with `??`, which only falls through on `null`/`undefined`, never on a falsy boolean.
+        mode === "browse" && hints.length === 0 && flash === null ? (
+          <WhichKey
+            // `edgeFocused` too: `onKeyDown`'s answer arm is gated on it, so with the keys on a
+            // banner or the status row `a`/`d` resolve to nothing and the strip must not offer
+            // them (review). Its own argument, not `sessionEnded`'s: passed as that, a live
+            // session's status row offered `r new session` (GUI pass, 2026-09-25).
+            entries={stripEntries(timeline, answerableItems, cursor, sessionEnded, edgeFocused)}
+            focused={paneFocused}
+            prefix={gShown ? "g" : null}
+          />
+        ) : undefined}
       </Footer>
       {/* Below the composer, deliberately: it is a way OUT of this panel, not one of the things the
           panel is for, and it must not compete with the lost-session banner for the space directly

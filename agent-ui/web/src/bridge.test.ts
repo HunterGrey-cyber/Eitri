@@ -172,4 +172,21 @@ describe("installDispatch", () => {
     window.__neovibeDispatch!(JSON.stringify({ kind: "hint_end", sessionId: 7 }));
     expect(handler).toHaveBeenCalledWith({ kind: "hint_end", sessionId: 7 });
   });
+
+  it("passes every phase 3 envelope through the whitelist", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const envelopes = [
+      { kind: "queue", tab: 1, items: [{ text: "later", queuedAt: 5 }], error: null },
+      { kind: "draft", tab: 1, text: "half" },
+      { kind: "queue_taken", tab: 1, texts: ["a"] },
+      { kind: "history", entries: ["old"] },
+      { kind: "rule_offers", tab: 1, offers: { "perm-1": "git push *" } },
+      { kind: "editor_context", file: "src/a.rs", lines: [1, 2] },
+      { kind: "scratch", tab: 1, editing: true },
+      { kind: "notice", text: "no such file" },
+    ];
+    for (const envelope of envelopes) window.__neovibeDispatch!(JSON.stringify(envelope));
+    expect(handler.mock.calls.map((c) => c[0])).toEqual(envelopes);
+  });
 });

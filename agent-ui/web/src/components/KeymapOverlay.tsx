@@ -63,7 +63,14 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       }}
     >
       <Section title="This panel" rows={BROWSE_KEYS} />
-      <Section title="Typing" rows={INPUT_KEYS} />
+      <Section
+        title="Typing"
+        rows={[
+          ...INPUT_KEYS,
+          { keys: "Ctrl+h / j / k / l", what: "Move between panes (neovibe keeps these)" },
+          { keys: prefixLabel, what: "The prefix (neovibe keeps it)" },
+        ]}
+      />
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section title={`After ${prefixLabel}`} rows={prefixKeys} />
     </div>

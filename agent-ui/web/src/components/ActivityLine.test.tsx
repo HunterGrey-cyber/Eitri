@@ -28,3 +28,16 @@ it("shows the turn's motion and Stop while working, and Stop interrupts", () => 
   rerender(<ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt={false} onInterrupt={onInterrupt} />);
   expect(container.querySelector("button.stop")).toBeNull();
 });
+
+it("counts the queue, names the interrupt key, and names a card that waits (P1)", () => {
+  const onInterrupt = vi.fn();
+  const { container, rerender } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={2} pendingTool={null} />,
+  );
+  expect(container.querySelector(".activity-line")!.textContent).toContain("2 queued · Ctrl+c interrupt");
+  rerender(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" />,
+  );
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, then a / d");
+  expect(container.textContent).not.toContain("queued");
+});

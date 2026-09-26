@@ -17,6 +17,10 @@
 
 export const STOP_ATTR = "data-nav-stop";
 
+/** Label alphabet shared with the window-wide `f` HINT. It excludes `f` because that key starts
+ *  HINT. The `gf` path picker reuses it for its letter-per-path footer list. */
+export const HINT_ALPHABET = "asdjklghweruio";
+
 const CONTROL_SELECTOR =
   'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [role="radio"]:not([aria-disabled="true"])';
 
@@ -120,6 +124,16 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
     if (item.kind !== "permission") break;
   }
   return null;
+}
+
+/** The card `a`/`d` answer from `cursor`: use `permissionTarget` first, then the sole card if
+ *  the conversation has exactly one. With multiple cards, keep the cursor rule so a shortcut
+ *  cannot guess which waiting call to answer. */
+export function answerTarget(items: AnswerableItem[], cursor: number): number | null {
+  const own = permissionTarget(items, cursor);
+  if (own !== null) return own;
+  const cards = items.flatMap((item, index) => (item.kind === "permission" ? [index] : []));
+  return cards.length === 1 ? cards[0] : null;
 }
 
 /** A panel target of global `f` HINT: a conversation row, a code block inside a row, an enabled

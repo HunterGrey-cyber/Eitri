@@ -5,6 +5,10 @@ import type { PanelMode } from "../keymap";
    `PanelMode`'s own doc comment in `../keymap` for why that mode is unreachable today. */
 const MODE_LABEL: Record<PanelMode, string> = { browse: "BROWSE", input: "INPUT", hint: "HINT" };
 
+/** F4: the footer's INPUT hints, idle and while a turn runs. */
+export const INPUT_IDLE_HINT = "Enter send · Shift+Enter newline · Esc browse · Ctrl+g nvim";
+export const INPUT_RUNNING_HINT = "Enter queue · Ctrl+Enter now · Ctrl+c interrupt";
+
 type Props = {
   mode: PanelMode;
   /** Whether this pane has keyboard focus AND the window is active, from `shell` (`pane_focus`;
@@ -18,14 +22,23 @@ type Props = {
   /** Claude Code's mode pill (`tabs.ts`'s `modePill`): `"⏵⏵ <mode> on"`, or "(shift+tab to cycle)"
    *  before a session starts. */
   pill: string;
-  /** The which-key strip, in BROWSE only (`App.tsx` gates it) -- absent everywhere else, including
-   *  the start screen, which draws its own copy. */
+  /** The INPUT hint uses the third slot only when neither `children` nor `flash` claims it. It
+   *  is `undefined` in BROWSE and on the start screen, which draw their own third-slot content. */
+  hint?: string;
+  /** A transient (2s) line for copy feedback, a fixed-mode message, or Rust `notice{text}`. It
+   *  outranks the which-key strip and INPUT hint, but the window-close prompt (`children`) wins.
+   *  `null` or `undefined` means nothing is flashing. */
+  flash?: string | null;
+  /** The third slot's own content when the caller wants to draw it directly -- the window-close
+   *  prompt or, in BROWSE, the which-key strip (`App.tsx` gates both). Wins over `flash`
+   *  and `hint`: slot priority is children > flash > hint > nothing. */
   children?: ReactNode;
 };
 
 /** V2: always present. The mode block (moved from `StatusLine`
- *  unchanged), the mode pill, then the which-key strip. */
-export function Footer({ mode, paneFocused = false, pill, children }: Props) {
+ *  unchanged), the mode pill, then the third slot -- the close prompt, a flash, the INPUT hint, or
+ *  nothing, in that priority. */
+export function Footer({ mode, paneFocused = false, pill, hint, flash = null, children }: Props) {
   return (
     <div className="panel-footer">
       <span
@@ -37,8 +50,17 @@ export function Footer({ mode, paneFocused = false, pill, children }: Props) {
       >
         {MODE_LABEL[mode]}
       </span>
-      <span className="mode-pill">{pill}</span>
-      {children}
+      <span className="mode-pill" data-testid="mode-pill">
+        {pill}
+      </span>
+      {children ??
+        (flash !== null ? (
+          <span className="footer-flash" role="status">
+            {flash}
+          </span>
+        ) : hint !== undefined ? (
+          <span className="footer-hint">{hint}</span>
+        ) : null)}
     </div>
   );
 }

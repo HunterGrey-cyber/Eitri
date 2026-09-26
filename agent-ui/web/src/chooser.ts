@@ -1,5 +1,6 @@
 import type { ChooserEnvelope, ChooserRecord, ChooserTab } from "./types";
 import { markerGlyph } from "./tabs";
+import { formatWhen } from "./components/SessionRow";
 
 export type ChooserRow = { kind: "tab"; tab: ChooserTab } | { kind: "record"; record: ChooserRecord };
 
@@ -15,7 +16,7 @@ export function rowText(row: ChooserRow): string {
     if (!row.tab.resumable) parts.push("not resumable");
     return parts.join(" · ");
   }
-  const parts = [recordLead(row.record)];
+  const parts = [recordLead(row.record), `last opened ${formatWhen(row.record.updatedAt)}`];
   if (row.record.heldElsewhere) parts.push("open in another window");
   return parts.join(" · ");
 }

@@ -105,6 +105,10 @@ pub enum InboundMessage {
         /// `InboundMessage` is already internally tagged on `type`.
         #[serde(default)]
         reason: Option<String>,
+        /// Allows the request and saves the rule Rust offered for this permission id through
+        /// `rule_offers`. The panel supplies no rule text.
+        #[serde(default)]
+        remember: bool,
     },
     /// `resume{tab, provider_session_id}` carries the Claude provider session id to continue on the
     /// tab the user was in. `start_session` is removed: a fresh session
@@ -152,6 +156,58 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
+    /// `Enter` while a turn runs: queued with the editor context of this moment.
+    QueueMessage {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        text: String,
+    },
+    /// `↑` on the box's first line with a queue: returns the whole queue as `queue_taken`.
+    TakeBackQueue {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// `Ctrl+Enter` (Claude Code's `chat:sendNow`): interrupt if running, then the queue plus `text`.
+    SendNow {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        text: String,
+    },
+    /// The box's text, mirrored 300 ms after the last change. No `command_result`.
+    Draft {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        text: String,
+    },
+    /// `Ctrl+g` in INPUT (C5): edit `text` in an nvim scratch buffer; `:wq` returns it.
+    EditDraft {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        text: String,
+    },
+    /// `Ctrl+c` on an idle draft: the text goes to history so `↑` recalls it.
+    HistoryPush {
+        request_id: String,
+        text: String,
+    },
+    /// `gf` or a click on a path opens it.
+    OpenPath {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        line: Option<u32>,
+    },
+    /// `Ctrl+g` in BROWSE: the row's full text in a read-only scratch buffer.
+    ViewInEditor {
+        request_id: String,
+        title: String,
+        text: String,
+    },
     /// A chooser was dismissed. `launch` matches the closed chooser's flag; dismissing the
     /// launch chooser returns keyboard focus to the editor.
     ChooserClosed {
@@ -186,7 +242,10 @@ impl InboundMessage {
             InboundMessage::Ready { .. }
             | InboundMessage::ChooserClosed { .. }
             | InboundMessage::HintRequest { .. }
-            | InboundMessage::HintTargets { .. } => return TabRef::WindowLevel,
+            | InboundMessage::HintTargets { .. }
+            | InboundMessage::HistoryPush { .. }
+            | InboundMessage::OpenPath { .. }
+            | InboundMessage::ViewInEditor { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
@@ -198,7 +257,12 @@ impl InboundMessage {
             | InboundMessage::CloseTab { tab, .. }
             | InboundMessage::ResetTab { tab, .. }
             | InboundMessage::CycleMode { tab, .. }
-            | InboundMessage::OpenDetail { tab, .. } => *tab,
+            | InboundMessage::OpenDetail { tab, .. }
+            | InboundMessage::QueueMessage { tab, .. }
+            | InboundMessage::TakeBackQueue { tab, .. }
+            | InboundMessage::SendNow { tab, .. }
+            | InboundMessage::Draft { tab, .. }
+            | InboundMessage::EditDraft { tab, .. } => *tab,
         };
         match tab {
             Some(id) => TabRef::Named(crate::tabs::TabId(id)),
@@ -251,7 +315,15 @@ impl InboundMessage {
             | InboundMessage::OpenDetail { request_id, .. }
             | InboundMessage::ChooserClosed { request_id, .. }
             | InboundMessage::HintRequest { request_id }
-            | InboundMessage::HintTargets { request_id, .. } => request_id,
+            | InboundMessage::HintTargets { request_id, .. }
+            | InboundMessage::QueueMessage { request_id, .. }
+            | InboundMessage::TakeBackQueue { request_id, .. }
+            | InboundMessage::SendNow { request_id, .. }
+            | InboundMessage::Draft { request_id, .. }
+            | InboundMessage::EditDraft { request_id, .. }
+            | InboundMessage::HistoryPush { request_id, .. }
+            | InboundMessage::OpenPath { request_id, .. }
+            | InboundMessage::ViewInEditor { request_id, .. } => request_id,
         }
     }
 }
@@ -604,6 +676,7 @@ pub fn serialize_snapshot_for_js(tab: crate::tabs::TabId, view: &SnapshotView<'_
             "fork": capabilities.fork,
             "interrupt": capabilities.interrupt,
             "bypassPermissionMode": capabilities.bypass_permission_mode,
+            "modeSwitch": crate::agent_backend::MODE_SWITCH_AVAILABLE,
         },
         "provider": provider,
     });
@@ -771,6 +844,93 @@ pub fn serialize_confirm_close_for_js(tab: crate::tabs::TabId, lines: &[String])
 /// `prefix ,`: open the inline rename field on the tab's label, prefilled with `current`.
 pub fn serialize_begin_rename_for_js(tab: crate::tabs::TabId, current: Option<&str>) -> String {
     json!({ "kind": "begin_rename", "tab": tab.0, "current": current }).to_string()
+}
+
+/// A tab's queue. Sends only the typed text; the wire text also carries editor context, which
+/// the panel must not display as the user's own words.
+pub fn serialize_queue_for_js(
+    tab: crate::tabs::TabId,
+    items: &[crate::tab_set::Queued],
+    error: Option<&str>,
+) -> String {
+    let items: Vec<Value> = items
+        .iter()
+        .map(|q| json!({ "text": q.text, "queuedAt": q.queued_at_ms }))
+        .collect();
+    json!({ "kind": "queue", "tab": tab.0, "items": items, "error": error }).to_string()
+}
+
+/// A tab's unsent draft, sent only when the panel's own copy is not the latest.
+pub fn serialize_draft_for_js(tab: crate::tabs::TabId, text: &str) -> String {
+    json!({ "kind": "draft", "tab": tab.0, "text": text }).to_string()
+}
+
+/// The reply to `take_back_queue`: the whole queue, oldest first.
+pub fn serialize_queue_taken_for_js(tab: crate::tabs::TabId, texts: &[String]) -> String {
+    json!({ "kind": "queue_taken", "tab": tab.0, "texts": texts }).to_string()
+}
+
+/// The project's prompt history, oldest first. Window-level: every tab shares it.
+pub fn serialize_history_for_js(entries: &[String]) -> String {
+    json!({ "kind": "history", "entries": entries }).to_string()
+}
+
+/// The pending permission ids for which a prefix rule is offered, with each rule's display text.
+pub fn serialize_rule_offers_for_js(
+    tab: crate::tabs::TabId,
+    offers: &std::collections::BTreeMap<String, agent::PrefixRule>,
+) -> String {
+    let offers: serde_json::Map<String, Value> = offers
+        .iter()
+        .map(|(id, rule)| (id.clone(), Value::String(rule.display())))
+        .collect();
+    json!({ "kind": "rule_offers", "tab": tab.0, "offers": offers }).to_string()
+}
+
+/// What V1's line says: the file, relative to the project when inside it, and a selection's lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSummary {
+    pub file: String,
+    pub lines: Option<(u32, u32)>,
+}
+
+pub fn context_summary(
+    context: Option<&crate::editor_context::EditorContext>,
+    project_root: &std::path::Path,
+) -> Option<ContextSummary> {
+    let context = context?;
+    if context.file.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(&context.file);
+    let file = path
+        .strip_prefix(project_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| context.file.clone());
+    Some(ContextSummary {
+        file,
+        lines: context.selection.as_ref().map(|s| (s.start_line, s.end_line)),
+    })
+}
+
+/// V1. Window-level: the editor is the window's.
+pub fn serialize_editor_context_for_js(summary: Option<&ContextSummary>) -> String {
+    json!({
+        "kind": "editor_context",
+        "file": summary.map(|s| s.file.clone()),
+        "lines": summary.and_then(|s| s.lines).map(|(a, b)| json!([a, b])),
+    })
+    .to_string()
+}
+
+/// Whether this tab's draft is out in an nvim scratch buffer (C5).
+pub fn serialize_scratch_for_js(tab: crate::tabs::TabId, editing: bool) -> String {
+    json!({ "kind": "scratch", "tab": tab.0, "editing": editing }).to_string()
+}
+
+/// A one-line message for the footer's transient slot.
+pub fn serialize_notice_for_js(text: &str) -> String {
+    json!({ "kind": "notice", "text": text }).to_string()
 }
 
 #[cfg(test)]
@@ -1915,5 +2075,182 @@ mod tests {
         }];
         let value: serde_json::Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
         assert_eq!(value["resumableSessions"][0]["name"], "docs");
+    }
+
+    #[test]
+    fn the_phase_three_messages_parse_and_name_their_tab_or_none() {
+        for (json, tab_scoped) in [
+            (
+                r#"{"type":"queue_message","request_id":"a","tab":2,"text":"later"}"#,
+                true,
+            ),
+            (r#"{"type":"take_back_queue","request_id":"a","tab":2}"#, true),
+            (r#"{"type":"send_now","request_id":"a","tab":2,"text":""}"#, true),
+            (
+                r#"{"type":"draft","request_id":"a","tab":2,"text":"half a thou"}"#,
+                true,
+            ),
+            (r#"{"type":"edit_draft","request_id":"a","tab":2,"text":"draft"}"#, true),
+            (r#"{"type":"history_push","request_id":"a","text":"cleared"}"#, false),
+            (
+                r#"{"type":"open_path","request_id":"a","path":"src/main.rs","line":42}"#,
+                false,
+            ),
+            (r#"{"type":"open_path","request_id":"a","path":"src/main.rs"}"#, false),
+            (
+                r#"{"type":"view_in_editor","request_id":"a","title":"Bash","text":"out"}"#,
+                false,
+            ),
+        ] {
+            let message = parse_inbound_message(json).unwrap_or_else(|| panic!("{json} did not parse"));
+            assert_eq!(message.request_id(), "a");
+            if tab_scoped {
+                assert!(matches!(message.tab_ref(), TabRef::Named(TabId(2))), "{json}");
+            } else {
+                assert!(matches!(message.tab_ref(), TabRef::WindowLevel), "{json}");
+            }
+        }
+        let untabbed = parse_inbound_message(r#"{"type":"queue_message","request_id":"b","text":"x"}"#).unwrap();
+        assert!(matches!(untabbed.tab_ref(), TabRef::Missing), "never the active one");
+    }
+
+    #[test]
+    fn remember_defaults_to_false_and_is_read_when_sent() {
+        let plain = parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r","tab":1,"permission_id":"p","decision":"allow"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            plain,
+            InboundMessage::PermissionResponse { remember: false, .. }
+        ));
+        let remembered = parse_inbound_message(
+            r#"{"type":"permission_response","request_id":"r","tab":1,"permission_id":"p","decision":"allow","remember":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            remembered,
+            InboundMessage::PermissionResponse { remember: true, .. }
+        ));
+    }
+
+    #[test]
+    fn the_phase_three_envelopes_have_their_exact_shapes() {
+        use crate::tab_set::Queued;
+        let tab = TabId(4);
+        let queue = [Queued {
+            text: "and the tests".into(),
+            wire: "ctx\n\nand the tests".into(),
+            queued_at_ms: 17,
+        }];
+        let value = |s: String| -> Value { serde_json::from_str(&s).unwrap() };
+        assert_eq!(
+            value(serialize_queue_for_js(tab, &queue, Some("refused"))),
+            json!({ "kind": "queue", "tab": 4, "items": [{ "text": "and the tests", "queuedAt": 17 }], "error": "refused" }),
+            "the wire text (with its context) never goes to the panel"
+        );
+        assert_eq!(
+            value(serialize_draft_for_js(tab, "half")),
+            json!({ "kind": "draft", "tab": 4, "text": "half" })
+        );
+        assert_eq!(
+            value(serialize_queue_taken_for_js(tab, &["a".into(), "b".into()])),
+            json!({ "kind": "queue_taken", "tab": 4, "texts": ["a", "b"] })
+        );
+        assert_eq!(
+            value(serialize_history_for_js(&["old".into(), "new".into()])),
+            json!({ "kind": "history", "entries": ["old", "new"] })
+        );
+        let mut offers = std::collections::BTreeMap::new();
+        offers.insert(
+            "perm-1".to_string(),
+            agent::PrefixRule::parse("Bash(git push *)").unwrap(),
+        );
+        assert_eq!(
+            value(serialize_rule_offers_for_js(tab, &offers)),
+            json!({ "kind": "rule_offers", "tab": 4, "offers": { "perm-1": "git push *" } })
+        );
+        assert_eq!(
+            value(serialize_editor_context_for_js(Some(&ContextSummary {
+                file: "src/a.rs".into(),
+                lines: Some((10, 20))
+            }))),
+            json!({ "kind": "editor_context", "file": "src/a.rs", "lines": [10, 20] })
+        );
+        assert_eq!(
+            value(serialize_editor_context_for_js(None)),
+            json!({ "kind": "editor_context", "file": null, "lines": null })
+        );
+        assert_eq!(
+            value(serialize_scratch_for_js(tab, true)),
+            json!({ "kind": "scratch", "tab": 4, "editing": true })
+        );
+        assert_eq!(
+            value(serialize_notice_for_js("no such file")),
+            json!({ "kind": "notice", "text": "no such file" })
+        );
+    }
+
+    #[test]
+    fn the_context_line_names_a_project_file_relatively_and_only_a_real_selection() {
+        use crate::editor_context::{EditorContext, Selection};
+        let root = std::path::Path::new("/home/user/project");
+        let inside = EditorContext {
+            file: "/home/user/project/src/parser.rs".into(),
+            selection: None,
+        };
+        assert_eq!(
+            context_summary(Some(&inside), root),
+            Some(ContextSummary {
+                file: "src/parser.rs".into(),
+                lines: None
+            })
+        );
+        let selected = EditorContext {
+            file: "/etc/hosts".into(),
+            selection: Some(Selection {
+                start_line: 3,
+                end_line: 9,
+                text: "x".into(),
+            }),
+        };
+        assert_eq!(
+            context_summary(Some(&selected), root),
+            Some(ContextSummary {
+                file: "/etc/hosts".into(),
+                lines: Some((3, 9))
+            })
+        );
+        let unnamed = EditorContext {
+            file: String::new(),
+            selection: None,
+        };
+        assert_eq!(
+            context_summary(Some(&unnamed), root),
+            None,
+            "a buffer with no file says nothing"
+        );
+        assert_eq!(context_summary(None, root), None);
+    }
+
+    /// The panel gates mode controls on this capability, which is false while mode switching is unsupported.
+    #[test]
+    // Assert `MODE_SWITCH_AVAILABLE` so enabling mode switching fails this test.
+    // The `true` branch has no wire message to call yet.
+    #[allow(clippy::assertions_on_constants)]
+    fn a_snapshot_says_the_mode_cannot_change_mid_session() {
+        let projection = AgentSessionProjection::default();
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities::default(),
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        assert_eq!(parsed["state"]["capabilities"]["modeSwitch"], false);
+        assert!(!crate::agent_backend::MODE_SWITCH_AVAILABLE);
     }
 }

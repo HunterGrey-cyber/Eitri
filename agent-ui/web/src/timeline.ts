@@ -28,7 +28,11 @@ export type TimelineItem =
   | { kind: "prompt"; seq: Seq; key: string; text: string }
   | { kind: "message"; seq: Seq; key: string; text: string }
   | { kind: "tool"; seq: Seq; key: string; call: ToolCallRecord }
-  | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord };
+  | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord }
+  /** A collapsed run of finished tool calls, drawn as one row by `display.ts`.
+   *  `buildTimeline` preserves ordering by `seq`, with cards anchored after their calls.
+   *  Folding is a display layer over that ordering. `key` is `r-<first seq>`. */
+  | { kind: "run"; seq: Seq; key: string; calls: ToolCallRecord[] };
 
 /** Whether a `toolUseId` can identify a tool call at all.
  *
@@ -120,4 +124,13 @@ export function oldestPendingPermission(timeline: TimelineItem[]): number | null
     if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
   });
   return best;
+}
+
+/** `[[`/`]]`: the next `prompt` row before (`-1`) or after (`1`) `from`, or `null` if none exists.
+ *  Navigation stops at either end, matching `clampStep` in `nav.ts`. */
+export function promptIndex(timeline: TimelineItem[], from: number, delta: 1 | -1): number | null {
+  for (let i = from + delta; i >= 0 && i < timeline.length; i += delta) {
+    if (timeline[i].kind === "prompt") return i;
+  }
+  return null;
 }

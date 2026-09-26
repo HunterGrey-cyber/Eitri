@@ -1,5 +1,5 @@
 import type { TimelineItem } from "./timeline";
-import { permissionTarget } from "./nav";
+import { answerTarget } from "./nav";
 import type { AnswerableItem } from "./nav";
 
 /** One key the which-key strip offers for the row under the cursor: the key as typed, and the
@@ -25,13 +25,19 @@ export function stripEntries(
 ): StripEntry[] {
   const entries: StripEntry[] = [];
   // A dead session's cards are inert (`resolveKey`'s own `a`/`d` refusal) -- offering them here
-  // would promise a key that does nothing.
-  if (!sessionEnded && !atEdge && permissionTarget(answerable, cursor) !== null) {
+  // would promise a key that does nothing. `answerTarget`, not `permissionTarget`, so the strip
+  // agrees with what `a`/`d` actually do now: with exactly one card in the
+  // conversation, it answers from any row.
+  if (!sessionEnded && !atEdge && answerTarget(answerable, cursor) !== null) {
     entries.push({ key: "a", label: "allow" }, { key: "d", label: "deny" }, { key: "l", label: "buttons" });
   }
   const here = timeline[cursor];
   if (!atEdge && here !== undefined && here.kind === "tool" && here.call.result !== null) {
     entries.push({ key: "Enter", label: "result" });
+  }
+  // A collapsed run has its own Enter action to expand its calls.
+  if (!atEdge && here !== undefined && here.kind === "run") {
+    entries.push({ key: "Enter", label: "expand" });
   }
   if (sessionEnded) {
     entries.push({ key: "r", label: "new session" });

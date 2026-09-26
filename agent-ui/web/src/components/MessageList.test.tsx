@@ -31,7 +31,8 @@ function texts(...values: string[]) {
 
 /* Conversation items share a sign-column grid (`.row.row-<kind>`, `.row-sign`, `.row-body`).
    State is shown by the `data-sign` glyph as well as colour; this test checks the glyphs
-   themselves. */
+   themselves. Keep the two finished calls separated by other items, since adjacent finished
+   calls collapse into one `run` row with only one glyph. */
 describe("MessageList row structure", () => {
   it("gives every row a sign column, and distinguishes state by glyph not only colour", () => {
     render(
@@ -39,11 +40,14 @@ describe("MessageList row structure", () => {
         state={{
           ...initialState(),
           userPrompts: [{ seq: 1, text: "do the thing" }],
-          transcript: [{ seq: 2, text: "on it" }],
+          transcript: [
+            { seq: 2, text: "on it" },
+            { seq: 5, text: "now the other" },
+          ],
           toolCalls: [
             { seq: 3, toolUseId: "a", name: "Read", input: {}, result: null },
             { seq: 4, toolUseId: "b", name: "Read", input: {}, result: { content: "ok", isError: false } },
-            { seq: 5, toolUseId: "c", name: "Read", input: {}, result: { content: "boom", isError: true } },
+            { seq: 6, toolUseId: "c", name: "Read", input: {}, result: { content: "boom", isError: true } },
           ],
         }}
         sessionEnded={false}
@@ -53,7 +57,7 @@ describe("MessageList row structure", () => {
       />,
     );
     const signs = Array.from(document.querySelectorAll<HTMLElement>(".row")).map((r) => r.dataset.sign);
-    expect(signs).toEqual(["›", "", "◐", "✓", "✗"]);
+    expect(signs).toEqual(["›", "", "◐", "✓", "", "✗"]);
   });
 });
 
@@ -309,7 +313,9 @@ describe("MessageList tool calls and permissions", () => {
     );
     const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
     expect(awaiting).toHaveLength(1);
-    expect(awaiting[0].textContent).toContain("rm -rf /");
+    // A gated call says it is waiting because the permission card already shows the command.
+    expect(awaiting[0].textContent).toContain("waiting for approval");
+    expect(awaiting[0].textContent).not.toContain("rm -rf /");
   });
 
   /* The legacy backend's hook-relay shape specifically (new on 2026-09-15): permissionId and
@@ -336,7 +342,7 @@ describe("MessageList tool calls and permissions", () => {
     );
     const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
     expect(awaiting).toHaveLength(1);
-    expect(awaiting[0].textContent).toContain("rm -rf /");
+    expect(awaiting[0].textContent).toContain("waiting for approval");
     expect(container.querySelector(".permission-card-tool-use-id")!.textContent).toContain("toolu_second");
   });
 
@@ -1514,5 +1520,78 @@ describe("MessageList keeps a following view at its end when the list or a row c
 
     expect(observer.unobserved).toEqual([permissionRow]);
     expect(observer.observed).toEqual([list, list.querySelector(".row")]);
+  });
+});
+
+describe("MessageList: the R2 pill", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  it("counts rows that arrived while reading up, marks a card, and jumps to the end on a click", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    noteUserScroll(list, "up");
+    list.scrollTop = 1000;
+    fireEvent.scroll(list);
+    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ Jump to bottom");
+    dims.grow(2400);
+    rerender(<MessageList state={state({ transcript: texts("first", "second", "third") })} {...props} />);
+    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ 2 new");
+    rerender(
+      <MessageList
+        state={state({
+          transcript: texts("first", "second", "third"),
+          pendingPermissions: [{ seq: 9, permissionId: "p", toolUseId: null, toolName: "Bash", input: {} }],
+        })}
+        {...props}
+      />,
+    );
+    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ ⚑ approval");
+    fireEvent.click(container.querySelector(".new-pill")!);
+    expect(list.scrollTop).toBe(2000);
+    fireEvent.scroll(list);
+    expect(container.querySelector(".new-pill")).toBeNull();
+  });
+
+  it("keeps approval after a row resizes -- the observer read the first render's timeline (GUI pass 2026-09-25)", () => {
+    // Seen in the sandbox: a Bash card landed below a reader and the pill said "Jump to bottom". The
+    // `ResizeObserver`, made once, called the FIRST render's `onScroll`, whose `updatePill` sliced the
+    // first render's timeline -- nothing past the reader's mark -- and overwrote the right label the
+    // moment the new rows' size settled. jsdom has no observer; the fake below delivers that resize.
+    const observers = stubResizeObserver();
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("the reply") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    noteUserScroll(list, "up");
+    list.scrollTop = 1000;
+    fireEvent.scroll(list);
+    dims.grow(2400);
+    const call = { seq: 3, toolUseId: "toolu_x", name: "Bash", input: { command: "cargo build" }, result: null };
+    rerender(
+      <MessageList
+        state={state({
+          transcript: texts("the reply"),
+          toolCalls: [call],
+          pendingPermissions: [{ seq: 4, permissionId: "p", toolUseId: "toolu_x", toolName: "Bash", input: {} }],
+        })}
+        {...props}
+      />,
+    );
+    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ ⚑ approval");
+    act(() => resize(observers[observers.length - 1], list.querySelector(".row-permission")!, 300));
+    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ ⚑ approval");
+    vi.unstubAllGlobals();
+  });
+
+  it("is absent while following, however far a row grows", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("a") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    dims.grow(9000);
+    rerender(<MessageList state={state({ transcript: texts("a, much longer") })} {...props} />);
+    expect(container.querySelector(".new-pill")).toBeNull();
   });
 });

@@ -13,6 +13,12 @@ type Props = {
    *  `Composer`'s own Stop button follows. */
   canInterrupt: boolean;
   onInterrupt: () => void;
+  /** How many items are queued behind the running turn. Shown beside the
+   *  interrupt key, never with `pendingTool`, which takes over the same slot instead. */
+  queued?: number;
+  /** The oldest pending permission card's tool name, or `null` if none waits.
+   *  Replaces the queue count: a waiting card already prevents the queue from flushing. */
+  pendingTool?: string | null;
 };
 
 /** V2: the old `StatusLine`'s body that was about the turn --
@@ -21,7 +27,7 @@ type Props = {
  *  `Footer`/`StatusRow`, and `data-nav-stop="status"` moves with the content it used to gate on
  *  ("the status line, only while Stop shows") rather than staying behind on an element with
  *  nothing left to answer for. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt }: Props) {
+export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null }: Props) {
   // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -40,6 +46,13 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
         <button type="button" className="stop" onClick={onInterrupt}>
           Stop
         </button>
+      )}
+      {pendingTool !== null ? (
+        <span className="activity-card">⚑ {pendingTool} needs approval — Esc, then a / d</span>
+      ) : (
+        <span className="activity-keys">
+          {queued > 0 ? `${queued} queued · ` : ""}Ctrl+c interrupt
+        </span>
       )}
     </div>
   );
