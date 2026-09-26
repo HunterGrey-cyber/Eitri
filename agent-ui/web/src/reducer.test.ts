@@ -105,6 +105,19 @@ describe("applyEvent", () => {
     expect(state.activeTurnId).toBeNull();
   });
 
+  // The mode lives on the tab in the `tabs` envelope, outside this per-session projection. This
+  // known event returns the state unchanged and must not trigger the exhaustiveness warning.
+  it("permission_mode_changed returns the state unchanged and does not warn", () => {
+    const consoleWarn = console.warn;
+    let warned = false;
+    console.warn = () => { warned = true; };
+    const before = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
+    const after = applyEvent(before, { type: "permission_mode_changed", mode: "bypass", provider_mode: "BYPASS_PERMISSIONS", floor_applied: false });
+    expect(after).toBe(before);
+    expect(warned).toBe(false);
+    console.warn = consoleWarn;
+  });
+
   it("permission_requested pushes onto pendingPermissions without clearing prior entries", () => {
     let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: {} });
     state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_use_id: null, tool_name: "Read", input: {} });

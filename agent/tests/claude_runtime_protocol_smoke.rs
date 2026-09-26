@@ -35,7 +35,16 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
                     claude_runtime_protocol::v1::SettingSource::Local as i32,
                 ],
             }),
+            // `false` preserves the value sent by clients that predate `permission_mode_switchable`.
+            // This smoke test does not exercise permission-mode switching.
+            permission_mode_switchable: false,
         }),
+        // Absent `model`, `effort`, `system_prompt` and `output_format` use the CLI defaults.
+        // This smoke test does not exercise these options.
+        model: None,
+        effort: None,
+        system_prompt: None,
+        output_format: None,
     };
     assert_eq!(request.cwd, "/tmp/example");
     let policy = request.policy.unwrap();

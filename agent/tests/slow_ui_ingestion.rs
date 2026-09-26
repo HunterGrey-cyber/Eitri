@@ -70,6 +70,7 @@ impl AgentProvider for ScriptedProvider {
             interrupt: true,
             bypass_permission_mode: true,
             interactive_permission_mode: true,
+            set_permission_mode: false,
         }
     }
     fn info(&self) -> ProviderInfo {

@@ -60,6 +60,15 @@ pub struct InterruptTurnRequest {
     pub session_id: String,
 }
 
+/// Changes a live session's permission mode through `SetPermissionMode`, using the
+/// `set_permission_mode` capability. Limited to the two modes this client requests,
+/// rather than all three modes in the wire enum.
+#[derive(Debug, Clone)]
+pub struct SetPermissionModeRequest {
+    pub session_id: String,
+    pub mode: PermissionMode,
+}
+
 /// What a human decided about one pending permission request.
 ///
 /// Enumerates exactly what a provider can actually carry and nothing more. Verdandi's
@@ -132,6 +141,10 @@ pub struct ProviderCapabilities {
     /// confirmed to behave identically to `interactive` in the current sidecar, so offering it as a
     /// third choice would be a distinction without a difference.
     pub interactive_permission_mode: bool,
+    /// The provider can switch a live session's permission mode through `SetPermissionMode`.
+    /// Requires both the advertised `set_permission_mode` capability and
+    /// `CLIENT_IMPLEMENTS_SET_PERMISSION_MODE`, just like the resume and fork checks.
+    pub set_permission_mode: bool,
 }
 
 impl ProviderCapabilities {
@@ -291,4 +304,11 @@ pub trait AgentProvider {
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --
     /// mirrors `AgentSession::pump()`'s existing contract exactly.
     fn pump(&self) -> Vec<AgentDomainEvent>;
+    /// Changes a live session's permission mode (Verdandi `SetPermissionMode`, capability
+    /// `set_permission_mode`). Returns the provider-level mode the CLI acknowledged (`default` /
+    /// `bypassPermissions`). Default: unsupported, so a provider that cannot do it says so rather
+    /// than pretending (every fake keeps compiling unchanged).
+    fn set_permission_mode(&self, _request: SetPermissionModeRequest) -> Result<String, ProviderError> {
+        Err(ProviderError::UnsupportedCapability("set_permission_mode"))
+    }
 }

@@ -124,12 +124,12 @@ pub enum AgentDomainEvent {
         kind: ContentKind,
         text: String,
     },
-    /// The assistant message that was streaming is over, and the next text starts a new one --
-    /// with no tool call between, which would have closed it anyway. `ContentDelta` carries no
-    /// message identity, so without this two messages in a row folded into one transcript entry
-    /// (`After the table.TURN-1-DONE`, the phase-3 GUI pass, 2026-09-25). Emitted by the legacy
-    /// backend when a text block's `message.id` differs from the last one; the sidecar's wire
-    /// (`TextDelta`) carries no message id, so it never emits it.
+    /// Ends the streaming assistant message so the next text starts a new transcript entry,
+    /// even when no tool call separates the messages. `ContentDelta` carries no message identity,
+    /// so consecutive messages would otherwise merge. The legacy backend emits this when a
+    /// text block's `message.id` changes. The sidecar emits it from `TextDelta.message_id` when
+    /// it advertises `text_delta_message_id`; without that capability it emits no boundary.
+    /// See `providers::claude_sidecar::translate::MessageSplit`.
     AssistantMessageBoundary {
         turn_id: String,
     },
@@ -194,6 +194,19 @@ pub enum AgentDomainEvent {
     },
     SessionClosed {
         reason: String,
+    },
+    /// Represents a sidecar acknowledgment of `SetPermissionMode` through `PermissionModeChanged`
+    /// with capability `set_permission_mode`. No producer emits this event yet.
+    PermissionModeChanged {
+        mode: crate::PermissionMode,
+        /// `SetPermissionModeResponse.permission_mode` verbatim -- `default` / `bypassPermissions`,
+        /// the provider's OWN vocabulary, kept for diagnostics rather than collapsed into `mode`.
+        provider_mode: String,
+        /// True when entering bypass applied Verdandi's conservative floor
+        /// (`PermissionModeChanged.bypass_default_deny_applied`). Neovibe states `unrestricted` on
+        /// every session (`build_create_request`), so this must never happen in practice; see the
+        /// translate-side match arm for what a `true` here means.
+        floor_applied: bool,
     },
 }
 
@@ -631,6 +644,8 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }
+            // Permission mode is carried by the tab (`Tab::mode`), so the projection ignores this change.
+            AgentDomainEvent::PermissionModeChanged { .. } => {}
         }
         self.last_revision += 1;
     }

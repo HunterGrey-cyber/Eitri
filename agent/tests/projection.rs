@@ -836,6 +836,11 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
         AgentDomainEvent::SessionClosed {
             reason: "closed_by_host".into(),
         },
+        AgentDomainEvent::PermissionModeChanged {
+            mode: agent::PermissionMode::Bypass,
+            provider_mode: "bypassPermissions".into(),
+            floor_applied: false,
+        },
     ]
 }
 
@@ -865,5 +870,6 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::ResumeOutcome { .. } => "ResumeOutcome",
         AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
         AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
+        AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
     }
 }

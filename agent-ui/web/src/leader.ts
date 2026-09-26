@@ -90,8 +90,11 @@ function humanKey(table: PanelTable, k: string): string {
 
 /** Distinct next keys reachable from `typed`: direct bindings in table order, then groups
  *  in `table.groups` order. A key is a group if a binding continues beyond it.
- *  Group labels come from `table.groups`, falling back to `+<key>`. */
-export function boxEntries(table: PanelTable, typed: string[], sessionStarted: boolean): BoxEntry[] {
+ *  Group labels come from `table.groups`, falling back to `+<key>`.
+ *
+ *  `modeFixed` means `mode.cycle` would flash instead of posting a change, so its entry is disabled.
+ *  A live tab that supports switching can still cycle; `modeKeyRoute` determines the route. */
+export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
   const depth = typed.length;
   const atDepth = table.bindings.filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
   const nextKeys: string[] = [];
@@ -108,7 +111,7 @@ export function boxEntries(table: PanelTable, typed: string[], sessionStarted: b
           ?.label ?? `+${humanKey(table, nextKey)}`)
       : (atDepth.find((b) => b.keys.length === depth + 1 && b.keys[depth] === nextKey)?.desc ?? "");
     const binding = atDepth.find((b) => b.keys.length === depth + 1 && b.keys[depth] === nextKey);
-    const disabled = !isGroup && binding?.action === "mode.cycle" && sessionStarted;
+    const disabled = !isGroup && binding?.action === "mode.cycle" && modeFixed;
     const entry: BoxEntry = { key: humanKey(table, nextKey), label, group: isGroup, disabled: Boolean(disabled) };
     (isGroup ? groups : leaves).push(entry);
   }

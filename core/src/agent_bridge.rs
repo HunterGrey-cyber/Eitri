@@ -784,7 +784,7 @@ pub fn serialize_snapshot_for_js(
             "fork": capabilities.fork,
             "interrupt": capabilities.interrupt,
             "bypassPermissionMode": capabilities.bypass_permission_mode,
-            "modeSwitch": crate::agent_backend::MODE_SWITCH_AVAILABLE,
+            "modeSwitch": capabilities.set_permission_mode,
         },
         "provider": provider,
     });
@@ -1458,6 +1458,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1529,6 +1530,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1565,6 +1567,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1608,6 +1611,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1644,6 +1648,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1684,6 +1689,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1745,6 +1751,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1835,6 +1842,7 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
+                    set_permission_mode: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1878,6 +1886,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -1944,6 +1953,7 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
+                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -2453,24 +2463,31 @@ mod tests {
         assert_eq!(context_summary(None, root), None);
     }
 
-    /// The panel gates mode controls on this capability, which is false while mode switching is unsupported.
+    /// A live tab's Shift+Tab control uses that session's `set_permission_mode` capability
+    /// from its snapshot, so availability follows each tab's backend.
     #[test]
-    // Assert `MODE_SWITCH_AVAILABLE` so enabling mode switching fails this test.
-    // The `true` branch has no wire message to call yet.
-    #[allow(clippy::assertions_on_constants)]
-    fn a_snapshot_says_the_mode_cannot_change_mid_session() {
+    fn a_snapshot_says_whether_this_session_can_switch() {
         let projection = AgentSessionProjection::default();
-        let view = SnapshotView {
-            backend: "sidecar",
-            conversation_id: None,
-            session_id: None,
-            provider_session_id: None,
-            capabilities: agent::ProviderCapabilities::default(),
-            provider: None,
-            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        let mode_switch = |capabilities: agent::ProviderCapabilities| {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities,
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            parsed["state"]["capabilities"]["modeSwitch"].clone()
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
-        assert_eq!(parsed["state"]["capabilities"]["modeSwitch"], false);
-        assert!(!crate::agent_backend::MODE_SWITCH_AVAILABLE);
+        assert_eq!(
+            mode_switch(agent::ProviderCapabilities {
+                set_permission_mode: true,
+                ..Default::default()
+            }),
+            true
+        );
+        assert_eq!(mode_switch(agent::ProviderCapabilities::default()), false);
     }
 }

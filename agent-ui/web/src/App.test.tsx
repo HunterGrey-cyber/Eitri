@@ -9,7 +9,7 @@ import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
 import { binding, TABLE } from "./testFixtures";
-import { modeFixedMessage } from "./modeKey";
+import { MODE_STARTING_MESSAGE, modeFixedMessage } from "./modeKey";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -4290,6 +4290,8 @@ describe("Shift+Tab anywhere in the chat", () => {
   });
 
   it("g. a starting tab: flash, no post", () => {
+    // A starting tab shows the starting message. Fixed-mode text would be false on a sidecar
+    // that can switch modes, so `modeKeyRoute` avoids it here regardless of `canSwitch`.
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -4299,7 +4301,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     const event = shiftTab(root);
     expect(event.defaultPrevented).toBe(true);
     expect(lastOfType("cycle_mode")).toBeUndefined();
-    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+    expect(container.querySelector(".band-message")!.textContent).toBe(MODE_STARTING_MESSAGE);
     vi.unstubAllGlobals();
   });
 
@@ -4338,14 +4340,11 @@ describe("Shift+Tab anywhere in the chat", () => {
   /** Shift+Tab and `<leader>` `mode.cycle` both use `modeKeyRoute`.
    *  On `starting` or `failed` tabs, the leader must reach the same route and flash without posting
    *  a `cycle_mode` that Rust would refuse. */
-  it.each([
-    ["starting", {}],
-    ["failed", { failure: "claude is not on PATH" }],
-  ] as const)("j. <leader> mode.cycle on a %s tab flashes like Shift+Tab, no post", (state, extra) => {
+  it("j. <leader> mode.cycle on a failed tab flashes like Shift+Tab, no post", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state, ...extra }] });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "claude is not on PATH" }] });
     act(() => widen(container));
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     dispatch({ kind: "arrive" });
@@ -4356,5 +4355,122 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(lastOfType("cycle_mode")).toBeUndefined();
     expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage("Ctrl+b c"));
     vi.unstubAllGlobals();
+  });
+
+  // A starting tab shows "session is starting" for both Shift+Tab and `<leader> mode.cycle`.
+  // `runPanelAction` uses `modeKeyRoute` for the leader action.
+  it("j2. <leader> mode.cycle on a starting tab flashes the starting text, no post", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    act(() => widen(container));
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    dispatch({ kind: "arrive" });
+    const target = (document.activeElement ?? document.body) as HTMLElement;
+    expect(container.querySelector(".empty-tab")!.contains(target)).toBe(true);
+    fireEvent.keyDown(target, { key: " " });
+    fireEvent.keyDown(target, { key: "m" });
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    expect(container.querySelector(".band-message")!.textContent).toBe(MODE_STARTING_MESSAGE);
+    vi.unstubAllGlobals();
+  });
+
+  describe("Shift+Tab switches a live tab (wave 5)", () => {
+    const switchCapable = { ...initialState().capabilities, modeSwitch: true };
+
+    it("a. live tab, switch-capable sidecar, BROWSE: one cycle_mode, no flash, focus unchanged", () => {
+      const widen = stubBandWidth();
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ capabilities: switchCapable }), 1);
+      act(() => widen(container));
+      const root = container.querySelector(".agent-ui-conversation")!;
+      act(() => (root as HTMLElement).focus());
+      const event = shiftTab(root);
+      expect(event.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(root);
+      expect(container.querySelector(".band-message")).toBeNull();
+      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+      vi.unstubAllGlobals();
+    });
+
+    it("b. same in INPUT, text in the composer: posted, text and focus kept", () => {
+      const widen = stubBandWidth();
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ capabilities: switchCapable }), 1);
+      act(() => widen(container));
+      enterInputMode(container);
+      const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "keep me" } });
+      const event = shiftTab(textarea);
+      expect(event.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(textarea);
+      expect(textarea.value).toBe("keep me");
+      expect(container.querySelector(".band-message")).toBeNull();
+      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+      vi.unstubAllGlobals();
+    });
+
+    it("c. without the capability: wave 4's fixed flash, nothing posted", () => {
+      const widen = stubBandWidth();
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ capabilities: { ...initialState().capabilities, modeSwitch: false } }), 1);
+      act(() => widen(container));
+      const root = container.querySelector(".agent-ui-conversation")!;
+      act(() => (root as HTMLElement).focus());
+      const event = shiftTab(root);
+      expect(event.defaultPrevented).toBe(true);
+      expect(lastOfType("cycle_mode")).toBeUndefined();
+      expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+      vi.unstubAllGlobals();
+    });
+
+    it("d. a starting tab: MODE_STARTING_MESSAGE, nothing posted -- never the fixed-mode text", () => {
+      // `modeKeyRoute`'s order puts `starting` ahead of `fixed` unconditionally (W5): a starting
+      // tab has no session yet, so `state.capabilities` (reset on every tab switch, along with the
+      // rest of the per-session projection) cannot yet say whether this one will switch -- but
+      // showing the fixed-mode text here would still be a lie on a switch-capable sidecar, so
+      // `modeKeyRoute` never shows it regardless.
+      const widen = stubBandWidth();
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+      act(() => widen(container));
+      const root = container.querySelector(".empty-tab")!;
+      const event = shiftTab(root);
+      expect(event.defaultPrevented).toBe(true);
+      expect(lastOfType("cycle_mode")).toBeUndefined();
+      expect(container.querySelector(".band-message")!.textContent).toBe(MODE_STARTING_MESSAGE);
+      vi.unstubAllGlobals();
+    });
+
+    it("e. <leader> mode.cycle on a live switch-capable tab: posted, box does not grey it out", () => {
+      const widen = stubBandWidth();
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ capabilities: switchCapable }), 1);
+      act(() => widen(container));
+      dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+      const root = container.querySelector(".agent-ui-conversation")!;
+      act(() => (root as HTMLElement).focus());
+      vi.useFakeTimers();
+      try {
+        fireEvent.keyDown(root, { key: " " });
+        act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+        const box = container.querySelector(".which-key-box")!;
+        expect(box).not.toBeNull();
+        expect(box.textContent).toContain("mode");
+        expect(box.querySelector(".wk-disabled")).toBeNull();
+        fireEvent.keyDown(root, { key: "m" });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(container.querySelector(".band-message")).toBeNull();
+      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+      vi.unstubAllGlobals();
+    });
   });
 });

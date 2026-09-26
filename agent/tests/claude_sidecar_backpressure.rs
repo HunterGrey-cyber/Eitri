@@ -82,6 +82,9 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::ResumeOutcome { .. } => "ResumeOutcome",
             AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
             AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
+            // No producer yet (this crate never issues SetPermissionMode this task): matched for
+            // exhaustiveness.
+            AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
         };
         *counts.entry(kind).or_default() += 1;
     }
