@@ -125,6 +125,15 @@ pub enum AgentDomainEvent {
         kind: ContentKind,
         text: String,
     },
+    /// The assistant message that was streaming is over, and the next text starts a new one --
+    /// with no tool call between, which would have closed it anyway. `ContentDelta` carries no
+    /// message identity, so without this two messages in a row folded into one transcript entry
+    /// (`After the table.TURN-1-DONE`, the phase-3 GUI pass, 2026-09-25). Emitted by the legacy
+    /// backend when a text block's `message.id` differs from the last one; the sidecar's wire
+    /// (`TextDelta`) carries no message id, so it never emits it.
+    AssistantMessageBoundary {
+        turn_id: String,
+    },
     ToolCallStarted {
         turn_id: String,
         tool_use_id: String,
@@ -520,6 +529,9 @@ impl AgentSessionProjection {
             } => {
                 // No projection effect -- mirrors the pre-Phase-1 AgentSessionState::apply's
                 // identical treatment of `Thinking`. Still bumps last_revision (see fn doc).
+            }
+            AgentDomainEvent::AssistantMessageBoundary { .. } => {
+                self.assistant_message_open = false;
             }
             AgentDomainEvent::ToolCallStarted {
                 turn_id,

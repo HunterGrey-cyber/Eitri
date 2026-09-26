@@ -23,7 +23,11 @@ use neovibe_core::editor_context::{ContextSource, EditorContext};
 ///
 /// Takes the feed's listener, so a second call logs and returns a source that is always empty,
 /// rather than installing a second timer racing the first for every connection.
-pub(crate) fn listen(feed: &mut EditorContextFeed) -> ContextSource {
+///
+/// **A report naming a scratch buffer is dropped too** (`scratch_dir`, the per-window directory of
+/// `neovibe_core::scratch`): a `Ctrl+g` draft or an R3 view is neovibe's own buffer, so the context
+/// stays on the file the user was in before it (the phase-3 GUI pass, 2026-09-25).
+pub(crate) fn listen(feed: &mut EditorContextFeed, scratch_dir: Option<std::path::PathBuf>) -> ContextSource {
     let cache: Rc<RefCell<Option<EditorContext>>> = Rc::new(RefCell::new(None));
     let Some(listener) = feed.take_listener() else {
         eprintln!("[editor-context] listen() called twice -- turns will carry no editor context");
@@ -33,7 +37,12 @@ pub(crate) fn listen(feed: &mut EditorContextFeed) -> ContextSource {
     let writer = Rc::clone(&cache);
     glib::timeout_add_local(POLL_INTERVAL, move || {
         if let Some(context) = reader.poll() {
-            *writer.borrow_mut() = Some(context);
+            let scratch = scratch_dir
+                .as_deref()
+                .is_some_and(|dir| neovibe_core::scratch::holds(dir, &context.file));
+            if !scratch {
+                *writer.borrow_mut() = Some(context);
+            }
         }
         glib::ControlFlow::Continue
     });

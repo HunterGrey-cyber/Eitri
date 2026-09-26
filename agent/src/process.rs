@@ -1350,7 +1350,8 @@ mod tests {
         // it. This is the join the two halves of this feature used to be tested either side of.
         let mut interrupt_requested = false;
         let mut sources = std::collections::HashMap::new();
-        let domain = crate::session::translate_wire_event(event, None, &mut interrupt_requested, &mut sources);
+        let domain =
+            crate::session::translate_wire_event(event, None, &mut interrupt_requested, &mut sources, &mut None);
         assert_eq!(domain.len(), 1);
         match &domain[0] {
             crate::projection::AgentDomainEvent::PermissionRequested {

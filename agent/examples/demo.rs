@@ -93,6 +93,7 @@ fn print_event(event: &AgentDomainEvent) {
             kind: agent::ContentKind::Thinking,
             ..
         } => println!("[thinking...]"),
+        AgentDomainEvent::AssistantMessageBoundary { .. } => println!(),
         AgentDomainEvent::ToolCallStarted { name, input, .. } => println!("[tool call] {name}({input})"),
         AgentDomainEvent::ToolCallCompleted { content, is_error, .. } => {
             println!("[tool result] error={is_error} content={content}");

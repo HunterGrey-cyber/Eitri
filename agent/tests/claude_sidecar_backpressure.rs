@@ -72,6 +72,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
                 ..
             } => "ContentDelta(text)",
             AgentDomainEvent::ContentDelta { .. } => "ContentDelta(thinking)",
+            // Legacy-only (the sidecar's wire has no message id): matched for exhaustiveness.
+            AgentDomainEvent::AssistantMessageBoundary { .. } => "AssistantMessageBoundary",
             AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",
             AgentDomainEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
             AgentDomainEvent::PermissionRequested { .. } => "PermissionRequested",

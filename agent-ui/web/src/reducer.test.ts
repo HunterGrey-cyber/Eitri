@@ -26,6 +26,14 @@ describe("applyEvent", () => {
     expect(state.transcript.map((m) => m.text)).toEqual(["firstsecond"]);
   });
 
+  // The phase-3 GUI pass (2026-09-25): `After the table.TURN-1-DONE`. Mirrors the Rust projection.
+  it("assistant_message_boundary ends the message, so the next text is its own entry", () => {
+    let state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "text", text: "After the table." });
+    state = applyEvent(state, { type: "assistant_message_boundary", turn_id: "t1" });
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "TURN-1-DONE" });
+    expect(state.transcript.map((m) => m.text)).toEqual(["After the table.", "TURN-1-DONE"]);
+  });
+
   it("tool_call_started then tool_call_completed links by tool_use_id", () => {
     let state = applyEvent(initialState(), { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "echo hi" } });
     expect(state.toolCalls).toHaveLength(1);

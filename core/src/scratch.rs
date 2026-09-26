@@ -87,6 +87,14 @@ impl PendingEdit {
     }
 }
 
+/// Whether nvim's buffer name `file` lies inside the scratch directory `dir`: a `Ctrl+g` draft or an
+/// `R3` view, neovibe's own buffer and never a file the user is working on. The editor-context feed
+/// drops such a report, so the V1 line and the next turn keep naming the file the user was in
+/// (the phase-3 GUI pass, 2026-09-25). Compared by path component, so `<dir>x/…` is not inside.
+pub fn holds(dir: &Path, file: &str) -> bool {
+    !file.is_empty() && Path::new(file).starts_with(dir)
+}
+
 pub struct ScratchDir {
     dir: PathBuf,
     lua_path: PathBuf,
@@ -122,6 +130,11 @@ impl ScratchDir {
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// Whether nvim's buffer name `file` is one of this directory's scratch buffers (`holds`).
+    pub fn holds_file(&self, file: &str) -> bool {
+        holds(&self.dir, file)
     }
 
     pub fn child_env(&self) -> Vec<(String, String)> {
@@ -220,6 +233,23 @@ mod tests {
         assert_eq!(value["op"], "open");
         assert_eq!(value["path"], hostile.to_string_lossy().as_ref());
         assert_eq!(value["line"], 42);
+    }
+
+    /// The phase-3 GUI pass (2026-09-25): with a `Ctrl+g` split focused, the V1 context line named
+    /// the draft's scratch file. A buffer in this directory is neovibe's own, never the user's file.
+    #[test]
+    fn only_files_inside_the_scratch_directory_are_scratch_buffers() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let (_, edit) = dir.prepare_edit("draft").unwrap();
+        let view = decode(dir.prepare_view("Bash: ls", "out").unwrap().hex());
+        assert!(dir.holds_file(&edit.body.to_string_lossy()));
+        assert!(dir.holds_file(view["path"].as_str().unwrap()));
+        assert!(!dir.holds_file("/home/user/project/src/main.rs"));
+        assert!(!dir.holds_file(""), "a buffer with no file");
+        // A sibling whose name merely starts with the directory's: a component match, not a string one.
+        let sibling = format!("{}x/1-draft.md", dir.path().display());
+        assert!(!dir.holds_file(&sibling));
+        dir.cleanup();
     }
 
     #[test]

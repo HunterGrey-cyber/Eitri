@@ -180,7 +180,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
     let editor_context_source = match context_feed.as_mut() {
-        Some(feed) => editor_context::listen(feed),
+        Some(feed) => editor_context::listen(feed, scratch_path.clone()),
         None => std::rc::Rc::new(|| None),
     };
     let (agent_widget, agent_panel_handle) =

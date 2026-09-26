@@ -291,6 +291,9 @@ export type AgentDomainEvent =
   | { type: "turn_started"; turn_id: string }
   | { type: "user_prompt_submitted"; text: string }
   | { type: "content_delta"; turn_id: string; kind: "text" | "thinking"; text: string }
+  /** The streaming assistant message is over; the next text starts a new one (legacy only: the
+   *  sidecar's wire carries no message id). Mirrors `AgentDomainEvent::AssistantMessageBoundary`. */
+  | { type: "assistant_message_boundary"; turn_id: string }
   | { type: "tool_call_started"; turn_id: string; tool_use_id: string; name: string; input: unknown }
   | { type: "tool_call_completed"; turn_id: string; tool_use_id: string; content: unknown; is_error: boolean }
   | { type: "permission_requested"; permission_id: string; tool_use_id: string | null; tool_name: string; input: unknown }

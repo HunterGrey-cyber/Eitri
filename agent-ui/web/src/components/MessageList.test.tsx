@@ -2,7 +2,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { MessageList } from "./MessageList";
-import { noteUserScroll } from "../follow";
+import { noteUserScroll, resumeFollowing } from "../follow";
 import { initialState } from "../reducer";
 import type { AgentUiState } from "../types";
 
@@ -791,6 +791,48 @@ describe("MessageList follows by intent, not by the direction of a scroll", () =
    a sub-pixel vertical jitter, a wheel an expanded tool result's own box took, a wheel with nothing
    to scroll up to), which the base did not do either. Each test below that is not marked as a
    guard fails on `b313411`. */
+describe("MessageList: a send resumes following (the phase-3 GUI pass, 2026-09-25)", () => {
+  const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
+
+  it("snaps a reader who scrolled up to the end, and follows the reply that streams after", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
+    fireEvent.scroll(list);
+    noteUserScroll(list, "up");
+    list.scrollTop = 500;
+    fireEvent.scroll(list);
+    dims.grow(2100); // the new prompt
+    rerender(<MessageList state={state({ transcript: texts("p"), userPrompts: [{ seq: 1, text: "q" }] })} {...props} />);
+    expect(list.scrollTop).toBe(500); // parked: the prompt alone does not move a reader
+
+    resumeFollowing(list);
+    expect(list.scrollTop).toBe(1700);
+    dims.grow(2400); // the reply streams in
+    rerender(
+      <MessageList
+        state={state({ transcript: [{ seq: 0, text: "p" }, { seq: 2, text: "reply" }], userPrompts: [{ seq: 1, text: "q" }] })}
+        {...props}
+      />,
+    );
+    expect(list.scrollTop).toBe(2000);
+  });
+
+  it("still lets a scroll up after the send stop following", () => {
+    const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
+    const list = container.querySelector(".message-list") as HTMLElement;
+    const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 600 });
+    resumeFollowing(list);
+    expect(list.scrollTop).toBe(1600);
+    noteUserScroll(list, "up");
+    list.scrollTop = 900;
+    fireEvent.scroll(list);
+    dims.grow(2300);
+    rerender(<MessageList state={state({ transcript: texts("pa") })} {...props} />);
+    expect(list.scrollTop).toBe(900);
+  });
+});
+
 describe("MessageList: every route a user scrolls by is theirs, and a gesture that moves nothing ends nothing", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 

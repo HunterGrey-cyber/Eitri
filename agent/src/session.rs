@@ -42,6 +42,9 @@ pub struct AgentSession {
     /// -- `interrupt()` itself must NOT synthesize a premature `TurnCompleted` before that real
     /// terminal event arrives, or the session would produce two terminal events for one turn.
     interrupt_requested: bool,
+    /// The `message.id` of the last assistant text block translated, so a text block of a
+    /// DIFFERENT message closes the one before it (`AgentDomainEvent::AssistantMessageBoundary`).
+    last_text_message_id: Option<String>,
 }
 
 impl AgentSession {
@@ -62,6 +65,7 @@ impl AgentSession {
             event_log: Vec::new(),
             pending_permission_sources: HashMap::new(),
             interrupt_requested: false,
+            last_text_message_id: None,
         })
     }
 
@@ -239,6 +243,7 @@ impl AgentSession {
             self.projection.active_turn_id.as_deref(),
             &mut self.interrupt_requested,
             &mut self.pending_permission_sources,
+            &mut self.last_text_message_id,
         )
     }
 }
@@ -257,6 +262,8 @@ impl AgentSession {
 /// - `interrupt_requested`: read and cleared when deciding a `TurnFinished`'s outcome.
 /// - `pending_permission_sources`: written, so `respond_permission` can later route an answer back
 ///   over the channel its request arrived on.
+/// - `last_text_message_id`: the `message.id` of the last text block, read and written, so a text
+///   block of a different message starts a new transcript entry.
 ///
 /// Global Constraint: an `AgentEvent` with no domain-event mapping (`ControlResponse`,
 /// `ProcessStderr`, `RateLimit`, `Unknown`) always returns an empty `Vec` -- never a fabricated
@@ -266,6 +273,7 @@ pub(crate) fn translate_wire_event(
     active_turn_id: Option<&str>,
     interrupt_requested: &mut bool,
     pending_permission_sources: &mut HashMap<String, PermissionSource>,
+    last_text_message_id: &mut Option<String>,
 ) -> Vec<AgentDomainEvent> {
     match event {
         AgentEvent::SessionStarted { session_id, model, cwd } => {
@@ -280,15 +288,27 @@ pub(crate) fn translate_wire_event(
                 cwd,
             }]
         }
-        AgentEvent::AssistantText { text } => {
+        AgentEvent::AssistantText { text, message_id } => {
             let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
                 return vec![];
             };
-            vec![AgentDomainEvent::ContentDelta {
+            let mut out = Vec::with_capacity(2);
+            // A text block of a different message than the last one: that message is over, even
+            // with no tool call between (which would have closed it anyway).
+            if let Some(id) = message_id {
+                if last_text_message_id.as_ref().is_some_and(|last| *last != id) {
+                    out.push(AgentDomainEvent::AssistantMessageBoundary {
+                        turn_id: turn_id.clone(),
+                    });
+                }
+                *last_text_message_id = Some(id);
+            }
+            out.push(AgentDomainEvent::ContentDelta {
                 turn_id,
                 kind: ContentKind::Text,
                 text,
-            }]
+            });
+            out
         }
         AgentEvent::Thinking { text } => {
             let Some(turn_id) = active_turn_id.map(|t| t.to_string()) else {
@@ -459,6 +479,56 @@ mod tests {
 
     const REAL_ID: &str = "toolu_01CtdezhmhUCrBaswxW5HYmC";
 
+    /// Folds real stream-json lines through `translate_line` and `translate_wire_event` into a
+    /// projection, the way `pump` does.
+    fn fold_lines(lines: &[serde_json::Value]) -> AgentSessionProjection {
+        let mut projection = AgentSessionProjection::default();
+        let mut interrupt_requested = false;
+        let mut sources = HashMap::new();
+        let mut last_text = None;
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        for line in lines {
+            for event in crate::wire::translate_line(&line.to_string()) {
+                for domain in translate_wire_event(
+                    event,
+                    projection.active_turn_id.as_deref(),
+                    &mut interrupt_requested,
+                    &mut sources,
+                    &mut last_text,
+                ) {
+                    projection.apply(&domain);
+                }
+            }
+        }
+        projection
+    }
+
+    fn assistant_text(message_id: &str, text: &str) -> serde_json::Value {
+        json!({"type": "assistant", "message": {"id": message_id, "role": "assistant",
+            "content": [{"type": "text", "text": text}]}})
+    }
+
+    /// The phase-3 GUI pass (2026-09-25): two assistant messages with no tool call between them
+    /// rendered as one, `After the table.TURN-1-DONE`. The CLI emits one `assistant` line per
+    /// content block, and the blocks of ONE message share its `message.id`; a different id is a
+    /// different message and must be its own transcript entry.
+    #[test]
+    fn two_assistant_messages_with_nothing_between_are_two_transcript_entries() {
+        let projection = fold_lines(&[
+            assistant_text("msg_1", "After the table."),
+            assistant_text("msg_2", "TURN-1-DONE"),
+        ]);
+        let texts: Vec<&str> = projection.transcript.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["After the table.", "TURN-1-DONE"]);
+    }
+
+    #[test]
+    fn two_text_blocks_of_one_message_still_merge() {
+        let projection = fold_lines(&[assistant_text("msg_1", "one "), assistant_text("msg_1", "message")]);
+        let texts: Vec<&str> = projection.transcript.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["one message"]);
+    }
+
     /// **The test across the seam.** Everything else in this module tests
     /// `permission_requested_event` in isolation, which is one side of a call; the arm that
     /// actually decides what gets passed into it is the other. This drives the real
@@ -483,6 +553,7 @@ mod tests {
             None,
             &mut interrupt_requested,
             &mut sources,
+            &mut None,
         );
 
         assert_eq!(produced.len(), 1);
@@ -529,6 +600,7 @@ mod tests {
             None,
             &mut interrupt_requested,
             &mut sources,
+            &mut None,
         );
 
         match &produced[0] {

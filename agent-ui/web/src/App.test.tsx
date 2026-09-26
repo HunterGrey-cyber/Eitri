@@ -3,7 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App, { HINT_PENDING_TIMEOUT_MS, WHICH_KEY_G_PREFIX_DELAY_MS } from "./App";
 import { initialState } from "./reducer";
-import { USER_SCROLL_EVENT } from "./follow";
+import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
@@ -100,6 +100,14 @@ function typeIntoInput(input: HTMLInputElement, text: string) {
     const notPrevented = fireEvent.keyDown(input, { key: ch });
     if (notPrevented) fireEvent.change(input, { target: { value: input.value + ch } });
   }
+}
+
+/** `gg`: the cursor to the first row. A snapshot now lands the cursor on the last row, where the
+ *  view is (the phase-3 GUI pass, 2026-09-25); tests written for a cursor starting at the top say so. */
+function gg(container: HTMLElement) {
+  const root = container.querySelector(".agent-ui-conversation")!;
+  fireEvent.keyDown(root, { key: "g" });
+  fireEvent.keyDown(root, { key: "g" });
 }
 
 function buttonLabelled(container: HTMLElement, label: string): HTMLButtonElement | undefined {
@@ -340,6 +348,27 @@ describe("App rehydration from a snapshot", () => {
     expect(container.textContent).toContain("pre-reload marker alpha seven.");
   });
 
+  /* The phase-3 GUI pass (2026-09-25): after `prefix r` the view was at the bottom (MessageList
+     follows from mount) but the cursor sat on row 1, off screen. A reload's first snapshot puts the
+     cursor on the last row, where the view is -- as a conversation that grew in this page does. */
+  it("puts the cursor on the last row after a reload's snapshot, where the view is", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(
+      snapshotState({
+        userPrompts: [{ seq: 0, text: "first question" }],
+        transcript: [
+          { seq: 1, text: "first answer" },
+          { seq: 3, text: "last answer" },
+        ],
+        toolCalls: [],
+      }),
+      7,
+    );
+    const current = container.querySelector(".row-current");
+    expect(current?.textContent).toContain("last answer");
+  });
+
   it("ignores a command_result for a request this document never sent", () => {
     // Exactly what a reload produces: the reply to the pre-reload page's `start_session` arrives at
     // a page that has no record of it. It must not be read as this page's own start failing.
@@ -576,7 +605,41 @@ describe("the in-flight motion indicator's elapsed clock", () => {
     });
   }
 
-  it("a panel reload loses the clock, so it re-reads 0s+ and counts up from there -- less information, never a false statement", () => {
+  /* The phase-3 GUI pass (2026-09-25): a switch away and back mid-turn read `0s+`, because the
+     panel holds only the active tab and restarted the clock at the snapshot. The tab set now keeps
+     when the turn started and the snapshot carries it (`turnStartedAtMs`). */
+  it("keeps a running turn's real elapsed time across a tab switch", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState(), 0);
+      const started = Date.now();
+      events({ type: "turn_started", turn_id: "t1" });
+      act(() => {
+        vi.advanceTimersByTime(42_000);
+      });
+      const two = { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" } as const;
+      dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, two] });
+      expect(container.querySelector(".turn-activity")).toBeNull();
+      dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB, two] });
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ activeTurnId: "t1" }), turnStartedAtMs: started });
+      expect(container.querySelector(".turn-elapsed")?.textContent).toBe("42s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("takes a reload's start time from the snapshot when Rust sends one", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 5, state: snapshotState({ activeTurnId: "t1" }), turnStartedAtMs: Date.now() - 7_500 });
+    expect(container.querySelector(".turn-elapsed")?.textContent).toBe("7s");
+  });
+
+  // A snapshot with no `turnStartedAtMs` (an older build) keeps the old, honest reading.
+  it("without a start time from Rust, a panel reload re-reads 0s+ and counts up from there -- less information, never a false statement", () => {
     // A "reload" here is simply a fresh App mount receiving its first snapshot with a turn already
     // active -- `turnClock` starts at `null` on every mount, same as `state` starts at
     // `initialState()`, and there is no persisted copy of it to restore.
@@ -2526,6 +2589,31 @@ describe("the panel's own scroll keys announce themselves to the message list", 
     fireEvent.keyDown(root, { key: "Escape" });
     expect(seen).toEqual([]);
   });
+
+  /* The phase-3 GUI pass (2026-09-25): a message sent while scrolled up landed the cursor on the new
+     prompt but left the reply streaming below the view. A send the user makes resumes following; an
+     Enter that only queues behind a running turn sends nothing yet, and says nothing. */
+  it("resumes following on a send, on Ctrl+Enter over a running turn, and not on a queue", () => {
+    const { container } = startedApp();
+    const list = container.querySelector(".message-list")!;
+    let resumed = 0;
+    list.addEventListener(RESUME_FOLLOW_EVENT, () => resumed++);
+    enterInputMode(container);
+    const box = () => container.querySelector("textarea")!;
+    fireEvent.change(box(), { target: { value: "send me" } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(lastOfType("send_message")!.text).toBe("send me");
+    expect(resumed).toBe(1);
+    dispatch({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events: [{ type: "turn_started", turn_id: "t1" }] });
+    fireEvent.change(box(), { target: { value: "queue me" } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(lastOfType("queue_message")!.text).toBe("queue me");
+    expect(resumed).toBe(1);
+    fireEvent.change(box(), { target: { value: "now" } });
+    fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+    expect(lastOfType("send_now")!.text).toBe("now");
+    expect(resumed).toBe(2);
+  });
 });
 
 describe("session tabs", () => {
@@ -2939,6 +3027,8 @@ describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
     );
     const root = container.querySelector(".agent-ui-conversation")!;
     const current = () => container.querySelector(".row-current")!.textContent;
+    // A reload's snapshot lands the cursor on the last row (the phase-3 GUI pass); start at the top.
+    gg(container);
     fireEvent.keyDown(root, { key: "3" });
     fireEvent.keyDown(root, { key: "j" });
     expect(current()).toContain("charlie");
@@ -2976,6 +3066,8 @@ describe("R1: the cursor follows the view", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "zero" }, { seq: 2, text: "one" }, { seq: 3, text: "two" }] }), 4);
+    // A reload's snapshot lands the cursor on the last row (the phase-3 GUI pass); start at the top.
+    gg(container);
     const list = container.querySelector<HTMLElement>(".message-list")!;
     const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
     list.getBoundingClientRect = () => rect(0, 100);
@@ -3013,6 +3105,7 @@ describe("R4: / and n / N", () => {
       snapshotState({ transcript: ["alpha", "bravo", "charlie", "bravo again"].map((text, i) => ({ seq: i + 1, text })) }),
       5,
     );
+    gg(rendered.container);
     return rendered;
   }
   const current = (c: HTMLElement) => c.querySelector(".row-current")!.textContent;
@@ -3102,6 +3195,8 @@ describe("P2 runs and R3 the detailed view", () => {
     dispatch({ kind: "tabs", active: 1, tabs: two });
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 5, state });
     const root = container.querySelector(".agent-ui-conversation")!;
+    // A reload's snapshot lands the cursor on the last row (the phase-3 GUI pass); start at the top.
+    gg(container);
     expect(container.querySelectorAll(".row-tool-run")).toHaveLength(1);
     expect(container.querySelector(".row-tool-run")!.textContent).toContain("Read ×2 · Bash ×1");
     fireEvent.keyDown(root, { key: "Enter" });
@@ -3130,6 +3225,7 @@ describe("N3 and P5 in the conversation", () => {
       }),
       3,
     );
+    gg(rendered.container);
     return rendered;
   }
 

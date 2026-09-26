@@ -148,6 +148,13 @@ pub struct Tab {
     /// The pending permission ids `rule_offers` was last computed for, sorted, so the classifier
     /// (which canonicalizes `Bash` arguments) runs once per change rather than every tick.
     rule_offers_seen: Vec<String>,
+    /// The running turn's id and when (wall clock, ms since the epoch) the first tick saw it
+    /// running. The panel holds only the active tab's state, so without this a switch back to a tab
+    /// mid-turn restarted its elapsed clock at `0s+` (the phase-3 GUI pass, 2026-09-25); the
+    /// snapshot carries it as `turnStartedAtMs`. Stamped from the projection, not from a
+    /// `TurnStarted` event, because a legacy `TurnStarted` is returned by `send_turn` and never
+    /// pumped -- so it is at most one 33 ms tick late, on both backends.
+    turn_clock: Option<(String, u64)>,
 }
 
 impl Tab {
@@ -172,7 +179,13 @@ impl Tab {
             editing_draft: None,
             was_running: false,
             rule_offers_seen: Vec::new(),
+            turn_clock: None,
         }
+    }
+
+    /// When this tab's running turn started, if one is running (see `turn_clock`).
+    pub fn turn_started_at_ms(&self) -> Option<u64> {
+        self.turn_clock.as_ref().map(|(_, at)| *at)
     }
 
     pub fn live(&self) -> Option<&AgentBackend> {
@@ -540,11 +553,19 @@ impl TabSet {
                 // No backend holds no card: the backstop `agent_panel` had for `session.is_none()`.
                 tab.attention.retain_pending(|_| false);
                 tab.was_running = false;
+                tab.turn_clock = None;
                 continue;
             };
             let from_revision = backend.projection().last_revision;
             let mut turn_ended = false;
-            match backend.take_ui_delivery_with_rules(project_root, rules) {
+            let delivery = backend.take_ui_delivery_with_rules(project_root, rules);
+            observe_turn_clock(
+                &mut tab.turn_clock,
+                backend.projection().active_turn_id.as_deref(),
+                wall_clock_ms(),
+            );
+            let turn_started_at_ms = tab.turn_clock.as_ref().map(|(_, at)| *at);
+            match delivery {
                 UiDelivery::Nothing => {}
                 UiDelivery::Events(events) => {
                     for event in &events {
@@ -593,7 +614,11 @@ impl TabSet {
                     let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
                     tab.attention.resync(pending);
                     if is_active {
-                        out.active_payload = Some(serialize_snapshot_for_js(tab.id, &SnapshotView::of(backend)));
+                        out.active_payload = Some(serialize_snapshot_for_js(
+                            tab.id,
+                            &SnapshotView::of(backend),
+                            turn_started_at_ms,
+                        ));
                     } else {
                         tab.stale = true;
                     }
@@ -686,7 +711,11 @@ impl TabSet {
         tab.stale = false;
         let mut payloads = Vec::new();
         match &tab.backend {
-            TabBackend::Live(backend) => payloads.push(serialize_snapshot_for_js(tab.id, &SnapshotView::of(backend))),
+            TabBackend::Live(backend) => payloads.push(serialize_snapshot_for_js(
+                tab.id,
+                &SnapshotView::of(backend),
+                tab.turn_clock.as_ref().map(|(_, at)| *at),
+            )),
             TabBackend::NotStarted => payloads.extend(
                 tab.last_handoff
                     .iter()
@@ -949,6 +978,24 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
     let changed = offers != tab.rule_offers;
     tab.rule_offers = offers;
     changed
+}
+
+/// Keeps `clock` in step with the projection's running turn: stamped `now_ms` the first time a
+/// turn id is seen, kept while that id runs, cleared when none does.
+fn observe_turn_clock(clock: &mut Option<(String, u64)>, active_turn_id: Option<&str>, now_ms: u64) {
+    match active_turn_id {
+        None => *clock = None,
+        Some(id) if clock.as_ref().is_some_and(|(seen, _)| seen == id) => {}
+        Some(id) => *clock = Some((id.to_string(), now_ms)),
+    }
+}
+
+/// Milliseconds since the Unix epoch: the same clock the panel's `Date.now()` reads.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1478,6 +1525,56 @@ mod tests {
             "one turn, each item with the context captured when it was queued"
         );
         assert!(set.get(tab).unwrap().queue.is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// The phase-3 GUI pass (2026-09-25): the elapsed clock read `0s+` after a tab switch, because
+    /// the panel holds only the active tab's state and restarted the clock at the snapshot. The tab
+    /// now keeps when its running turn started, from the first tick that delivered it, and the
+    /// snapshot a switch (or a reload) sends carries it.
+    #[test]
+    fn a_running_turn_keeps_its_start_time_across_ticks_and_the_snapshot_carries_it() {
+        let dir = workspace("tabs-turn-clock");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(set.get(tab).unwrap().turn_started_at_ms(), None);
+        let before = wall_clock_ms();
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        let stamp = set
+            .get(tab)
+            .unwrap()
+            .turn_started_at_ms()
+            .expect("stamped when the turn is delivered");
+        assert!(stamp >= before && stamp <= wall_clock_ms());
+        std::thread::sleep(Duration::from_millis(20));
+        set.pump(&dir, true);
+        assert_eq!(
+            set.get(tab).unwrap().turn_started_at_ms(),
+            Some(stamp),
+            "a later tick keeps it"
+        );
+
+        let other = set.open();
+        set.pump(&dir, true);
+        set.select(tab);
+        let payloads = set.active_state_payloads();
+        let snapshot: serde_json::Value = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .find(|v| v["kind"] == "snapshot")
+            .expect("a live tab's snapshot");
+        assert_eq!(snapshot["turnStartedAtMs"], serde_json::json!(stamp));
+        set.remove(other).unwrap();
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        pump_until_running(&mut set, &dir, tab, false);
+        until("the clock to clear", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().turn_started_at_ms().is_none()
+        });
         shut_down_all(&mut set);
     }
 

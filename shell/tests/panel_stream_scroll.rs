@@ -532,6 +532,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),
         },
+        None,
     );
     let on_ready = vec![
         serialize_hello_for_js(&greeting),

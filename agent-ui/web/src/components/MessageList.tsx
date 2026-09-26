@@ -9,7 +9,7 @@ import { NewPill } from "./NewPill";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import type { PermissionDecision } from "../bridge";
-import { noteUserScroll, USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
+import { noteUserScroll, RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
 import { pillLabel, pillShown } from "../pill";
 import { parsePath } from "../paths";
 import type { PathRef } from "../paths";
@@ -528,6 +528,17 @@ export function MessageList({
       }
       steer();
     };
+    // The user sent a message (`../follow.ts`, `resumeFollowing`): follow again, wherever the view
+    // was, and show the end now -- a pending provisional stop or its timer included. A later scroll
+    // up stops following exactly as before.
+    const onResume = () => {
+      followingRef.current = true;
+      provisionalStopRef.current = null;
+      if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
+      follow(list);
+      onScrollRef.current();
+    };
     list.addEventListener("wheel", onWheel, { passive: true });
     list.addEventListener("keydown", onKeyDown, { passive: true });
     // Focus landing on something inside the list (Tab, a click) scrolls it into view, either way.
@@ -540,6 +551,7 @@ export function MessageList({
     list.addEventListener("pointerdown", onPointerDown, { passive: true });
     list.addEventListener("mousedown", onPointerDown, { passive: true });
     list.addEventListener(USER_SCROLL_EVENT, onUserScroll);
+    list.addEventListener(RESUME_FOLLOW_EVENT, onResume);
     // On the window, not the list: the pointer is often released somewhere else after a drag.
     window.addEventListener("pointerup", onPointerUp, { passive: true });
     window.addEventListener("pointercancel", onPointerUp, { passive: true });
@@ -552,6 +564,7 @@ export function MessageList({
       list.removeEventListener("pointerdown", onPointerDown);
       list.removeEventListener("mousedown", onPointerDown);
       list.removeEventListener(USER_SCROLL_EVENT, onUserScroll);
+      list.removeEventListener(RESUME_FOLLOW_EVENT, onResume);
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("pointercancel", onPointerUp);
       window.removeEventListener("mouseup", onPointerUp);

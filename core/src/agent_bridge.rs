@@ -575,7 +575,11 @@ impl<'a> SnapshotView<'a> {
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
 /// answers with SESSION_NOT_FOUND. `tab` names the session tab it is about; the panel drops it
 /// unless that tab is active (session tabs spec §3.1).
-pub fn serialize_snapshot_for_js(tab: crate::tabs::TabId, view: &SnapshotView<'_>) -> String {
+pub fn serialize_snapshot_for_js(
+    tab: crate::tabs::TabId,
+    view: &SnapshotView<'_>,
+    turn_started_at_ms: Option<u64>,
+) -> String {
     let projection = &*view.projection;
     // Written out for the same stated reason as `transcript` just below: both field names happen
     // to be single lowercase words today, so the derive would produce the same JSON, but this
@@ -710,7 +714,17 @@ pub fn serialize_snapshot_for_js(tab: crate::tabs::TabId, view: &SnapshotView<'_
         "provider": provider,
     });
 
-    json!({ "kind": "snapshot", "tab": tab.0, "throughRevision": projection.last_revision, "state": state }).to_string()
+    // When the running turn started (wall clock ms, `Date.now()`'s clock), which the tab set keeps
+    // per tab so a switch or a reload shows the turn's real elapsed time rather than `0s+`. On the
+    // envelope, not in `state`: it is the tab's, not the projection's. `null` when no turn runs.
+    json!({
+        "kind": "snapshot",
+        "tab": tab.0,
+        "throughRevision": projection.last_revision,
+        "state": state,
+        "turnStartedAtMs": turn_started_at_ms,
+    })
+    .to_string()
 }
 
 /// `{"kind":"handoff","tab":...,"command":...,"cwd":...,"providerSessionId":...}` -- the
@@ -1294,7 +1308,7 @@ mod tests {
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
 
-        let json_str = serialize_snapshot_for_js(TabId(1), &view);
+        let json_str = serialize_snapshot_for_js(TabId(1), &view, None);
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["kind"], "snapshot");
         assert_eq!(parsed["tab"], 1);
@@ -1364,7 +1378,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert_eq!(pending["permissionId"], "perm-1");
         assert_eq!(pending["toolUseId"], "toolu_01ABC");
@@ -1400,7 +1414,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert!(pending["toolUseId"].is_null());
         assert!(
@@ -1443,7 +1457,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let history = &parsed["state"]["history"];
         assert_eq!(history["source"], "neovibe_copy");
         assert_eq!(history["restoredItems"], 314);
@@ -1479,7 +1493,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let state = parsed["state"].as_object().unwrap();
         assert!(
             state.contains_key("history"),
@@ -1519,7 +1533,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert_eq!(pending["permissionId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
         assert_eq!(pending["toolUseId"], "toolu_01CtdezhmhUCrBaswxW5HYmC");
@@ -1580,7 +1594,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let state = &parsed["state"];
 
         let mut merged: Vec<(u64, String)> = Vec::new();
@@ -1670,7 +1684,7 @@ mod tests {
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
             };
-            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
             let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
 
             let ids: Vec<&str> = cards.iter().map(|p| p["permissionId"].as_str().unwrap()).collect();
@@ -1713,7 +1727,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let json: serde_json::Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         assert_eq!(json["state"]["userPrompts"][0]["text"], "hello");
         assert_eq!(json["state"]["userPrompts"][0]["seq"], 0);
     }
@@ -1779,7 +1793,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         assert_eq!(parsed["state"]["backend"], "legacy");
         assert!(
             parsed["state"]["conversationId"].is_null(),
@@ -2287,7 +2301,7 @@ mod tests {
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
         };
-        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view)).unwrap();
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         assert_eq!(parsed["state"]["capabilities"]["modeSwitch"], false);
         assert!(!crate::agent_backend::MODE_SWITCH_AVAILABLE);
     }

@@ -28,7 +28,12 @@ pub enum AgentEvent {
         cwd: String,
     },
     /// One `{"type": "text", "text": ...}` content block from an `assistant` message.
-    AssistantText { text: String },
+    ///
+    /// `message_id` is that message's `message.id`. The CLI emits one `assistant` line per content
+    /// block, and the blocks of one message share its id, so a different id is a different message
+    /// (2026-09-25: two messages with no tool between them used to fold into one). `None` when the
+    /// line carried none.
+    AssistantText { text: String, message_id: Option<String> },
     /// One `{"type": "thinking", "thinking": ...}` content block. Real captured output showed
     /// this can legitimately be an empty string (extended-thinking summarization) -- callers
     /// should not assume a non-empty value.

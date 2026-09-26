@@ -39,6 +39,10 @@ struct ContentBlock {
 
 #[derive(Deserialize)]
 struct AssistantMessage {
+    /// The API message's id, shared by every content block of that message (the CLI writes one
+    /// line per block). Absent in some synthetic lines, hence optional.
+    #[serde(default)]
+    id: Option<String>,
     content: Vec<ContentBlock>,
 }
 
@@ -166,30 +170,33 @@ pub fn translate_line(line: &str) -> Vec<AgentEvent> {
                 .cloned()
                 .unwrap_or_default();
             match serde_json::from_value::<AssistantLine>(raw.clone()) {
-                Ok(line) => line
-                    .message
-                    .content
-                    .into_iter()
-                    .zip(raw_blocks.into_iter().map(Some).chain(std::iter::repeat(None)))
-                    .map(|(block, raw_block)| match block.kind.as_str() {
-                        "text" => AgentEvent::AssistantText {
-                            text: block.text.unwrap_or_default(),
-                        },
-                        "thinking" => AgentEvent::Thinking {
-                            text: block.thinking.unwrap_or_default(),
-                        },
-                        "tool_use" => AgentEvent::ToolStarted {
-                            id: block.id.unwrap_or_default(),
-                            name: block.name.unwrap_or_default(),
-                            input: block.input.unwrap_or(Value::Null),
-                        },
-                        other => AgentEvent::Unknown {
-                            kind: "assistant_content_block".into(),
-                            subtype: Some(other.to_string()),
-                            raw: raw_block.unwrap_or(Value::Null),
-                        },
-                    })
-                    .collect(),
+                Ok(line) => {
+                    let message_id = line.message.id;
+                    line.message
+                        .content
+                        .into_iter()
+                        .zip(raw_blocks.into_iter().map(Some).chain(std::iter::repeat(None)))
+                        .map(|(block, raw_block)| match block.kind.as_str() {
+                            "text" => AgentEvent::AssistantText {
+                                text: block.text.unwrap_or_default(),
+                                message_id: message_id.clone(),
+                            },
+                            "thinking" => AgentEvent::Thinking {
+                                text: block.thinking.unwrap_or_default(),
+                            },
+                            "tool_use" => AgentEvent::ToolStarted {
+                                id: block.id.unwrap_or_default(),
+                                name: block.name.unwrap_or_default(),
+                                input: block.input.unwrap_or(Value::Null),
+                            },
+                            other => AgentEvent::Unknown {
+                                kind: "assistant_content_block".into(),
+                                subtype: Some(other.to_string()),
+                                raw: raw_block.unwrap_or(Value::Null),
+                            },
+                        })
+                        .collect()
+                }
                 Err(_) => vec![AgentEvent::Unknown {
                     kind: envelope.kind,
                     subtype: envelope.subtype,

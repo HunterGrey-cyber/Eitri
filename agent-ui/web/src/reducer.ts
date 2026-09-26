@@ -98,6 +98,10 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       };
     case "turn_started":
       return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false };
+    case "assistant_message_boundary":
+      // Two messages with no tool call between them are two entries, as `AgentSessionProjection`
+      // folds them (the phase-3 GUI pass, 2026-09-25).
+      return { ...state, assistantMessageOpen: false };
     case "user_prompt_submitted":
       // `assistantMessageOpen: false` for the same reason `AgentSessionProjection::apply` does it:
       // a prompt can only occur between assistant messages, and leaving the run open appends the

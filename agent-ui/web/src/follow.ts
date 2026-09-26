@@ -26,3 +26,16 @@ export type UserScrollDirection = "up" | "down" | "unknown";
 export function noteUserScroll(list: Element | null | undefined, direction: UserScrollDirection): void {
   list?.dispatchEvent(new CustomEvent<UserScrollDirection>(USER_SCROLL_EVENT, { detail: direction }));
 }
+
+/** The user sent a message (`Enter`, or `Ctrl+Enter` interrupting a running turn): follow the
+ *  newest content again, wherever the view was (2026-09-25, the phase-3 GUI pass). Claude Code does
+ *  this, and a reader who scrolled up and then sends is asking for the reply, not for the older text
+ *  they were reading -- so, unlike every other signal here, this re-arms following outright and snaps
+ *  the view to the end at once. Only a send the user made announces it: a queue flushed at a turn's
+ *  end is not a keypress of theirs, and `Enter` that only QUEUES behind a running turn sends nothing
+ *  yet. */
+export const RESUME_FOLLOW_EVENT = "nv-resume-follow";
+
+export function resumeFollowing(list: Element | null | undefined): void {
+  list?.dispatchEvent(new CustomEvent(RESUME_FOLLOW_EVENT));
+}

@@ -3,7 +3,7 @@ import type { KeyboardEvent } from "react";
 import { applyEvent, applySnapshot, initialState, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { OutboundMessage, PermissionDecision } from "./bridge";
-import { noteUserScroll } from "./follow";
+import { noteUserScroll, resumeFollowing } from "./follow";
 import { resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelMode, PendingPrefix } from "./keymap";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
@@ -806,9 +806,22 @@ export default function App() {
    *  it targets does not exist until this render's `timeline` reflects it. */
   const lastLengthRef = useRef(0);
   const landOnPromptRef = useRef(false);
+  /** Set by a switch's (or a mount's) first snapshot with no saved view: see the `snapshot` arm. */
+  const landOnLastRef = useRef(false);
   useEffect(() => {
     const previous = lastLengthRef.current;
     lastLengthRef.current = timeline.length;
+    if (landOnLastRef.current) {
+      landOnLastRef.current = false;
+      const last = Math.max(timeline.length - 1, 0);
+      // The view is already at the end, so the landing moves nothing -- and `"keep"` only for a
+      // cursor that really moves (a `"keep"` no `[cursor]` effect consumes swallows the next reveal).
+      if (last !== cursor && !landOnPromptRef.current) {
+        landingRef.current = "keep";
+        setCursor(last);
+        return;
+      }
+    }
     if (landOnPromptRef.current) {
       landOnPromptRef.current = false;
       for (let i = timeline.length - 1; i >= 0; i--) {
@@ -1191,6 +1204,12 @@ export default function App() {
         // to find the exact row once it does.
         if (switchedRef.current) {
           switchedRef.current = false;
+          // A tab this page has no saved view for -- a reload's (`prefix r`) or a fresh mount's
+          // first snapshot, or a tab never shown before -- opens at the bottom (`MessageList`
+          // follows from mount), so the cursor goes to the last row, where the view is. It sat on
+          // row 1, off screen (the phase-3 GUI pass, 2026-09-25). The `[timeline]` effect does it,
+          // once this snapshot's rows exist; P1's card landing below still wins over it.
+          if (restoreRef.current === null) landOnLastRef.current = true;
           if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
         }
         // A snapshot means a session is genuinely RUNNING, which is also when Rust clears its own
@@ -1203,10 +1222,17 @@ export default function App() {
         // `exact: false` -- this panel cannot know how long it had already been running (design doc
         // §8.4). Untouched if the snapshot names the SAME turn already tracked (a resync must not
         // restart the clock); cleared if the snapshot carries no active turn at all.
+        //
+        // Since the phase-3 GUI pass (2026-09-25) the envelope can say when the turn started
+        // (`turnStartedAtMs`, stamped by Rust's tab set within one 33ms tick of the turn's start):
+        // then a switch back or a reload shows the real elapsed time, exactly. Only without it is the
+        // reading "at least" (`0s+`) -- which a switch used to give for every running turn.
+        const startedAt = payload.turnStartedAtMs;
         setTurnClock((current) => {
           const activeTurnId = payload.state.activeTurnId;
           if (activeTurnId === null) return null;
-          if (current !== null && current.turnId === activeTurnId) return current;
+          if (current !== null && current.turnId === activeTurnId && (current.exact || typeof startedAt !== "number")) return current;
+          if (typeof startedAt === "number") return { turnId: activeTurnId, since: startedAt, exact: true };
           return { turnId: activeTurnId, since: Date.now(), exact: false };
         });
       } else if (payload.kind === "events") {
@@ -1496,6 +1522,8 @@ export default function App() {
     inFlight.current.set(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
     postToRust({ type: "send_message", request_id: requestId, tab, text });
+    // A send follows the reply, wherever the reader had scrolled (`./follow.ts`).
+    resumeFollowing(containerRef.current?.querySelector(".message-list"));
   }
 
   /** Queues what is typed behind the running turn. Recorded as a `"send"` for the same reason
@@ -2224,7 +2252,10 @@ export default function App() {
         onDraftChange={mirrorDraft}
         running={turnInProgress}
         onQueue={queueMessage}
-        onSendNow={(t) => post({ type: "send_now", text: t })}
+        onSendNow={(t) => {
+          post({ type: "send_now", text: t });
+          resumeFollowing(containerRef.current?.querySelector(".message-list"));
+        }}
         history={history}
         queueCount={queue.length}
         onTakeBackQueue={() => post({ type: "take_back_queue" })}
