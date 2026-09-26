@@ -1735,17 +1735,36 @@ mod tests {
         assert!(payload["response"]["response"].get("message").is_none());
     }
 
-    /// Writes a small shell script to a fresh temp file, makes it executable, and returns its
-    /// path -- a fake `claude` binary standing in for the real one, so the preflight tests below
-    /// can drive both its accept and refuse paths deterministically, with no real CLI, no
-    /// network, and no tokens.
-    fn fake_binary_script(body: &str) -> std::path::PathBuf {
+    /// Owns a fake-`claude`-binary script file created by [`fake_binary_script`] and removes it on
+    /// drop, so a test that panics on an assertion before reaching its own cleanup line (as every
+    /// call site below used to write by hand) still leaves nothing behind in `/tmp`. Derefs to
+    /// `Path` so callers can keep passing it wherever a `&Path`/`.to_str()` was expected.
+    struct FakeBinaryScript(std::path::PathBuf);
+
+    impl std::ops::Deref for FakeBinaryScript {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FakeBinaryScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Writes a small shell script to a fresh temp file, makes it executable, and returns a guard
+    /// owning its path -- a fake `claude` binary standing in for the real one, so the preflight
+    /// tests below can drive both its accept and refuse paths deterministically, with no real
+    /// CLI, no network, and no tokens.
+    fn fake_binary_script(body: &str) -> FakeBinaryScript {
         let path = std::env::temp_dir().join(format!("agent-process-fake-binary-{}.sh", uuid::Uuid::new_v4()));
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&path, perms).unwrap();
-        path
+        FakeBinaryScript(path)
     }
 
     /// The preflight must probe the PROJECT directory, not this process's own cwd.
@@ -1784,7 +1803,6 @@ mod tests {
             "the refusal must carry the binary's own stderr, got: {err}"
         );
 
-        let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1795,7 +1813,6 @@ mod tests {
         let script = fake_binary_script("exit 0");
         let result = preflight_gate_flag_is_accepted(script.to_str().unwrap(), "{}", &std::env::temp_dir());
         assert!(result.is_ok(), "expected the preflight to pass, got {result:?}");
-        let _ = std::fs::remove_file(&script);
     }
 
     /// The regression test for the real 2026-09-18 bug: a fake `claude-wrapper`-shaped launcher
@@ -1821,7 +1838,6 @@ exit 0"#,
                 .contains("claude-wrapper: production launcher owns --settings for autoMemoryDirectory"),
             "the real launcher's own refusal message must reach the caller verbatim, got: {err}"
         );
-        let _ = std::fs::remove_file(&script);
     }
 
     /// The same fake launcher, but exercised through the real `spawn_with_binary` in `Auto` mode
@@ -1866,7 +1882,6 @@ exit 0"#,
             "a preflight failure must happen before the hook socket is ever bound, found: {new_sockets:?}"
         );
 
-        let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1924,7 +1939,6 @@ exit 0"#,
             "Auto must offer Bash (and every other tool) under the gate, so no deny list is passed: {session_argv}"
         );
 
-        let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1952,7 +1966,6 @@ exit 0"#,
             Err(e) => panic!("Bypass mode must not preflight the resolved binary at all, got: {e}"),
         }
 
-        let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
