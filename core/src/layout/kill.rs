@@ -14,8 +14,8 @@
 //! once per process.
 //! Gone is not saved; the leaf is saved as hidden and reopens hidden on relaunch.
 //!
-//! Focus moves first, as for a hide (`super::hide`). Killing the last shown module
-//! is refused, just as hiding it is.
+//! Focus moves first, as for a hide (`super::hide`). `kill` refuses the last shown module;
+//! `KillScope::Window` tells `shell` to close the window instead.
 
 use super::geometry::{hide, Frame};
 use super::module::{ModuleId, Placement};
@@ -35,9 +35,22 @@ pub enum Reopen {
     Never,
 }
 
+/// What killing a module ends. Killing the last shown module closes the window;
+/// otherwise it removes only that module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillScope {
+    /// Another module is on screen: [`kill`] takes this one off it.
+    Module,
+    /// It is the last module on screen: the kill closes the window, which is the whole of this
+    /// neovibe process. The layout is not changed; `shell` closes the window instead.
+    Window,
+}
+
 /// Whether [`kill`] would take `id`, changing nothing: what `shell` asks before its y/n, so a kill
-/// the layout will refuse is refused at once rather than after the question.
-pub fn can_kill(layout: &Layout, id: &ModuleId) -> Result<(), LayoutError> {
+/// that cannot happen is refused at once rather than after the question. The last module on screen
+/// is not refused: it is the window's kill ([`KillScope::Window`]), which [`kill`] itself still
+/// refuses, since the layout never hides the last module.
+pub fn can_kill(layout: &Layout, id: &ModuleId) -> Result<KillScope, LayoutError> {
     if !layout.contains(id) {
         return Err(LayoutError::NotInTree(id.clone()));
     }
@@ -46,9 +59,9 @@ pub fn can_kill(layout: &Layout, id: &ModuleId) -> Result<(), LayoutError> {
     }
     let others_shown = layout.leaves().iter().any(|m| m != id && layout.is_shown(m));
     if layout.is_shown(id) && !others_shown {
-        return Err(LayoutError::LastVisible(id.clone()));
+        return Ok(KillScope::Window);
     }
-    Ok(())
+    Ok(KillScope::Module)
 }
 
 /// Kills `id` in the layout: hides it (the keys go where a hide sends them, returned), then leaves
@@ -176,13 +189,20 @@ mod tests {
         assert_eq!(layout.show(&agent()), Ok(true), "it can come back");
     }
 
+    /// tmux: killing the last pane closes the window. The layout never hides the last module, so
+    /// `kill` still refuses it; `can_kill` says the kill is the window's instead, and `shell` closes it.
     #[test]
-    fn the_last_module_on_screen_is_refused_and_nothing_changes() {
+    fn the_last_module_on_screen_is_the_windows_kill_and_the_layout_does_not_change() {
         let mut layout = Layout::initial(&[]).unwrap();
+        assert_eq!(can_kill(&layout, &editor()), Ok(KillScope::Module));
         kill(&mut layout, &agent(), Reopen::InPlace, &frame()).unwrap();
         let before = layout.clone();
-        assert_eq!(can_kill(&layout, &editor()), Err(LayoutError::LastVisible(editor())));
-        assert_eq!(can_kill(&layout, &agent()), Ok(()), "hidden, but still killable");
+        assert_eq!(can_kill(&layout, &editor()), Ok(KillScope::Window));
+        assert_eq!(
+            can_kill(&layout, &agent()),
+            Ok(KillScope::Module),
+            "hidden, but still killable"
+        );
         assert_eq!(
             can_kill(&layout, &ModuleId::lua("ghost")),
             Err(LayoutError::NotInTree(ModuleId::lua("ghost")))

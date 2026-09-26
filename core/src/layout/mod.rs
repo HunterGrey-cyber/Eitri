@@ -18,7 +18,7 @@ pub use geometry::{
     Frame, Nav, Rect, Size,
 };
 pub use keys::{key_action, strip, strip_direct, KeyAction, KeyError, ModuleKeys, StripEntry};
-pub use kill::{can_kill, kill, Reopen};
+pub use kill::{can_kill, kill, KillScope, Reopen};
 pub use module::{ModuleDecl, ModuleError, ModuleId, ModuleKind, Placement};
 pub use ops::{even, place, swap, swap_adjacent};
 pub use reconcile::{reconcile, reconcile_default, ReconcileError, Reconciled};
