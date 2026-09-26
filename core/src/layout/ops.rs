@@ -20,6 +20,9 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
     if module == target {
         return Err(LayoutError::SameModule(module.clone()));
     }
+    if layout.is_gone(module) {
+        return Err(LayoutError::Gone(module.clone()));
+    }
     if !layout.contains(target) {
         return Err(LayoutError::NotInTree(target.clone()));
     }

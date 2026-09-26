@@ -1,8 +1,9 @@
-//! The window-close y/n (session tabs spec §3.5, D11 A): shown over the window when a close would
-//! interrupt a running tab. `y` closes again with no prompt; any other key cancels, as tmux's
-//! `confirm-before` does; a bare modifier is neither.
+//! The window's y/n, tmux's `confirm-before`: the window close (session tabs spec §3.5, D11 A),
+//! shown when a close would interrupt a running tab, and `prefix x`'s `kill-pane` (2026-09-26,
+//! `kill_pane`). `y` runs what was asked; any other key cancels, as tmux's `confirm-before` does; a
+//! bare modifier is neither.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::gdk::Key;
@@ -30,6 +31,11 @@ pub(crate) struct ClosePrompt {
     label: gtk4::Label,
     open: Cell<bool>,
     confirmed: Cell<bool>,
+    window: gtk4::ApplicationWindow,
+    /// What `y` runs; taken when the prompt closes either way.
+    on_yes: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// The open prompt is the window close's: `y` sets `confirmed` before it closes again.
+    closes_window: Cell<bool>,
 }
 
 impl ClosePrompt {
@@ -50,13 +56,18 @@ impl ClosePrompt {
             label,
             open: Cell::new(false),
             confirmed: Cell::new(false),
+            window: window.clone(),
+            on_yes: RefCell::new(None),
+            closes_window: Cell::new(false),
         });
         let controller = gtk4::EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         {
-            let prompt = prompt.clone();
-            let window = window.clone();
+            let prompt = Rc::downgrade(&prompt);
             controller.connect_key_pressed(move |event, key, _code, _state| {
+                let Some(prompt) = prompt.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
                 if !prompt.open.get() {
                     return glib::Propagation::Proceed;
                 }
@@ -66,11 +77,20 @@ impl ClosePrompt {
                     .is_some_and(|e| e.is_modifier());
                 match classify(key, is_modifier) {
                     PromptKey::Ignore => return glib::Propagation::Proceed,
-                    PromptKey::No => prompt.hide(),
-                    PromptKey::Yes => {
-                        prompt.confirmed.set(true);
+                    PromptKey::No => {
                         prompt.hide();
-                        window.close();
+                        prompt.on_yes.borrow_mut().take();
+                    }
+                    PromptKey::Yes => {
+                        prompt.hide();
+                        if prompt.closes_window.get() {
+                            prompt.confirmed.set(true);
+                        }
+                        // Taken out before it runs: what it does may ask again.
+                        let on_yes = prompt.on_yes.borrow_mut().take();
+                        if let Some(on_yes) = on_yes {
+                            on_yes();
+                        }
                     }
                 }
                 glib::Propagation::Stop
@@ -84,7 +104,19 @@ impl ClosePrompt {
         self.confirmed.get()
     }
 
-    pub(crate) fn ask(&self, text: &str) {
+    /// The window close's y/n: `y` closes the window again, and the close handler sees
+    /// [`ClosePrompt::confirmed`].
+    pub(crate) fn ask_to_close_window(&self, text: &str) {
+        let window = self.window.clone();
+        self.ask(text, move || window.close());
+        self.closes_window.set(true);
+    }
+
+    /// Shows `text` and runs `on_yes` if the next key is `y`. A second ask while one is open
+    /// replaces it.
+    pub(crate) fn ask(&self, text: &str, on_yes: impl FnOnce() + 'static) {
+        self.closes_window.set(false);
+        *self.on_yes.borrow_mut() = Some(Box::new(on_yes));
         self.label.set_label(text);
         self.label.set_visible(true);
         self.open.set(true);

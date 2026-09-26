@@ -6,12 +6,13 @@ use super::module::ModuleId;
 use super::tree::Layout;
 use crate::attention::{AgentPlace, Attention};
 
-/// Every module that is not on screen, in tree order: the tray's chips, left to right.
+/// Every module that is not on screen, in tree order: the tray's chips, left to right. A module gone
+/// for the rest of the window (`super::kill`) has none: nothing would bring it back.
 pub fn tray(layout: &Layout) -> Vec<ModuleId> {
     layout
         .leaves()
         .into_iter()
-        .filter(|id| !layout.is_visible(id))
+        .filter(|id| !layout.is_visible(id) && !layout.is_gone(id))
         .collect()
 }
 

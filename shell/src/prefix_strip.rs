@@ -184,7 +184,7 @@ mod tests {
         let pieces = strip_pieces(Waiting::Command, &entries(), "editor", &title, &verbs());
         assert_eq!(
             reads(&pieces),
-            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x hide \u{b7} % right \u{b7} \" below \u{b7} \
+            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x kill \u{b7} % right \u{b7} \" below \u{b7} \
              M-1 M-2 even \u{b7} { } swap",
             "a hidden module is dimmed"
         );

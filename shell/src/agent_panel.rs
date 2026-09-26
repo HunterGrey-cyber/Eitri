@@ -975,6 +975,35 @@ impl AgentPanelHandle {
         state.tabs.get(id).map(|t| (t.number, t.label_name()))
     }
 
+    /// `prefix x` on the chat (2026-09-26): every session tab is closed exactly as `y` to `prefix &`
+    /// closes one (`close_tab`: a running turn interrupted, queued words kept as history, the backend
+    /// shut down and dropped on a worker the window-close backstop still covers, the record never
+    /// deleted, so each session stays resumable). The set is left with one fresh empty tab, as closing
+    /// its last tab always leaves it. How many tabs were closed.
+    ///
+    /// Refused, closing nothing, while a tab is being handed off to a terminal: `close_tab` refuses
+    /// that tab, and a kill that closed the others and left it would not be a kill.
+    pub(crate) fn close_every_tab(&self) -> Result<usize, &'static str> {
+        if self.closing() {
+            return Ok(0);
+        }
+        let ids: Vec<TabId> = {
+            let state = self.state.borrow();
+            if state.tabs.tabs().iter().any(|t| t.pending_handoff.is_some()) {
+                return Err("a tab is still being handed off to a terminal; kill the chat once that finishes");
+            }
+            state.tabs.tabs().iter().map(|t| t.id).collect()
+        };
+        for id in &ids {
+            close_tab(&self.state, &self.webview, *id)?;
+        }
+        eprintln!(
+            "[agent_panel] killed: {} session tab(s) closed, records kept",
+            ids.len()
+        );
+        Ok(ids.len())
+    }
+
     /// Ruling 15: tabs whose turn is running or whose session is still connecting.
     pub(crate) fn running_count(&self) -> usize {
         let state = self.state.borrow();

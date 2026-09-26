@@ -56,6 +56,9 @@ pub enum Action {
     /// `Row` is tmux's `even-horizontal` (every module side by side); `Column` is `even-vertical`.
     Even(Axis),
     ModuleHide,
+    /// tmux's `kill-pane`: close the module with the keys and end what runs in it, after a y/n
+    /// (owner, 2026-09-26). `ModuleHide` stays an action of its own for a config that wants it.
+    ModuleKill,
     Module(ModuleId),
     Tab(TabAction),
     Hint,
@@ -193,6 +196,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "layout.even-horizontal" => (Action::Even(Axis::Row), &[]),
         "layout.even-vertical" => (Action::Even(Axis::Column), &[]),
         "module.hide" => (Action::ModuleHide, &[]),
+        "module.kill" => (Action::ModuleKill, &[]),
         "tab.new" => (Action::Tab(TabAction::New), &[]),
         "tab.next" => (Action::Tab(TabAction::Next), &[]),
         "tab.prev" => (Action::Tab(TabAction::Prev), &[]),
@@ -283,6 +287,7 @@ impl Action {
             Action::Even(Axis::Row) => "layout.even-horizontal".into(),
             Action::Even(Axis::Column) => "layout.even-vertical".into(),
             Action::ModuleHide => "module.hide".into(),
+            Action::ModuleKill => "module.kill".into(),
             Action::Module(id) => format!("module.{}", id.as_str().trim_start_matches("lua:")),
             Action::Tab(tab) => match tab {
                 TabAction::New => "tab.new",
@@ -339,6 +344,9 @@ impl Action {
             Action::Even(Axis::Row) => "Every module in one row, at equal sizes".into(),
             Action::Even(Axis::Column) => "Every module in one column, at equal sizes".into(),
             Action::ModuleHide => "Hide this module; it keeps running (not the last one on screen)".into(),
+            Action::ModuleKill => {
+                "Close this module and end what runs in it, after y/n (not the last one on screen)".into()
+            }
             Action::Module(id) => match id.kind() {
                 ModuleKind::Editor => "Editor: show and focus it, or hide it when it has the keys".into(),
                 ModuleKind::Agent => "Agent: show and focus it, or hide it when it has the keys".into(),

@@ -27,7 +27,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
 use neovibe_core::layout::{
-    arrange, Axis, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Rect, Size, ZoomChange,
+    arrange, Axis, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Rect, Reopen, Size, ZoomChange,
 };
 
 use throttle::{WebThrottle, QUIET};
@@ -527,6 +527,29 @@ impl ModuleGrid {
         })
     }
 
+    /// `prefix x` (`neovibe_core::layout::kill`): `id` leaves the screen as a hide does -- the keys to
+    /// the module the layout chooses first, then the unmap, in [`hide_then_unmap`]'s order -- and is
+    /// left where `reopen` says. Ending what ran in it is the caller's.
+    pub(crate) fn kill_module(
+        &self,
+        id: &ModuleId,
+        reopen: Reopen,
+        focus: &dyn Fn(&ModuleId) -> bool,
+    ) -> Result<(), LayoutError> {
+        let size = self.size();
+        let layout = self.layout();
+        self.with_frame(size, |frame| {
+            leave_then_unmap(
+                &layout,
+                |layout| neovibe_core::layout::kill(layout, id, reopen, frame),
+                |next| {
+                    focus(next);
+                },
+                || self.apply(),
+            )
+        })
+    }
+
     /// Shows `id` where it was hidden from. `Ok(false)` if it was already shown. First caller:
     /// `Ctrl+a t` showing the bottom terminal.
     pub(crate) fn show_module(&self, id: &ModuleId) -> Result<bool, LayoutError> {
@@ -687,7 +710,23 @@ fn hide_then_unmap(
     focus: impl FnOnce(&ModuleId),
     unmap: impl FnOnce(),
 ) -> Result<(), LayoutError> {
-    let next = neovibe_core::layout::hide(&mut layout.borrow_mut(), id, frame)?;
+    leave_then_unmap(
+        layout,
+        |layout| neovibe_core::layout::hide(layout, id, frame),
+        focus,
+        unmap,
+    )
+}
+
+/// [`hide_then_unmap`]'s order for any way of leaving the screen (a hide, a kill): `leave` changes the
+/// layout and names who gets the keys, `focus` gives them, `unmap` takes the module off screen.
+fn leave_then_unmap(
+    layout: &RefCell<Layout>,
+    leave: impl FnOnce(&mut Layout) -> Result<Option<ModuleId>, LayoutError>,
+    focus: impl FnOnce(&ModuleId),
+    unmap: impl FnOnce(),
+) -> Result<(), LayoutError> {
+    let next = leave(&mut layout.borrow_mut())?;
     if let Some(next) = next {
         focus(&next);
     }
@@ -998,6 +1037,43 @@ mod tests {
             assert_eq!(effects, [Effect::Focus(last_above.clone()), Effect::Unmap]);
             assert_eq!(layout.borrow().focus(), &last_above);
         }
+    }
+
+    /// `prefix x` takes the same door (2026-09-26): the keys leave the killed terminal before it
+    /// unmaps, and it is left hidden where a first launch puts it.
+    #[test]
+    fn killing_the_module_with_the_keys_gives_them_away_before_it_unmaps() {
+        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
+        layout.show(&ModuleId::terminal()).unwrap();
+        layout.set_focus(&ModuleId::agent()).unwrap();
+        layout.set_focus(&ModuleId::terminal()).unwrap();
+        let layout = RefCell::new(layout);
+        let id = ModuleId::terminal();
+        let effects = RefCell::new(Vec::new());
+        let result = leave_then_unmap(
+            &layout,
+            |l| {
+                neovibe_core::layout::kill(
+                    l,
+                    &id,
+                    Reopen::At(neovibe_core::layout::Placement::BelowRoot),
+                    &Frame::new(UNALLOCATED, 1),
+                )
+            },
+            |next| {
+                let l = layout.try_borrow_mut().expect("released before the keys move");
+                assert!(!l.is_shown(&id));
+                effects.borrow_mut().push(Effect::Focus(next.clone()));
+            },
+            || effects.borrow_mut().push(Effect::Unmap),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(effects.into_inner(), [Effect::Focus(ModuleId::agent()), Effect::Unmap]);
+        assert_eq!(
+            layout.borrow().root(),
+            crate::terminal::initial_layout(&[]).unwrap().root(),
+            "back where a first launch puts it"
+        );
     }
 
     /// Hiding a module that does not hold the keys moves no keys, and still unmaps it. A hide the

@@ -25,7 +25,7 @@ pub(crate) use pane::TerminalPane;
 use gtk4::gdk::{Key, ModifierType};
 use neovibe_core::layout::{Frame, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKind, Placement};
 use neovibe_core::theme::ThemeTokens;
-use neovibe_terminal::TerminalColors;
+use neovibe_terminal::{ExitInfo, TerminalColors};
 use terminal_render::RgbColor;
 
 use crate::layout::Direction;
@@ -123,6 +123,22 @@ impl ToggleAction {
             ToggleAction::HideAndReturn => &[Unzoom, Hide],
         }
     }
+}
+
+/// Whether the shell's end closes the terminal module (owner, 2026-09-26: "底下终端exit应该是直接关闭
+/// terminal窗口"), as tmux closes a pane whose process exits. A real end does -- `exit`, `Ctrl+d`, a
+/// signal -- and `main.rs` then kills the module as `prefix x` does, without asking. What does not,
+/// and keeps its notice under the last screen with Enter restarting:
+/// - a child that left the terminal and still runs (`exec nohup cmd`): it is still this terminal's
+///   child, and closing the module would hang it up;
+/// - an end with no status (`ExitInfo::UNKNOWN`: the session thread failed, or the child could not
+///   be waited for): the pane's frame is the only place that says so.
+///
+/// A shell that never started (an exec error) is not an end at all -- the pane shows the error in
+/// its own frame (`pane::ensure_session`) and never reaches this. Nor is the terminal closed when it
+/// is the last module on screen: the kill is refused there, and the notice stays.
+pub(crate) fn closes_on_exit(exit: &ExitInfo) -> bool {
+    !exit.detached && (exit.code.is_some() || exit.signal.is_some())
 }
 
 /// Where `Ctrl+a Ctrl+a` hands its literal `Ctrl+a`.
@@ -347,6 +363,16 @@ mod tests {
             Nav::Module(ModuleId::lua("m"))
         );
         assert_eq!(hide(&mut layout, &term(), &frame()), Ok(Some(ModuleId::lua("m"))));
+    }
+
+    #[test]
+    fn a_real_end_closes_the_terminal_and_a_detach_or_an_unknown_end_does_not() {
+        let exit = |code, signal, detached| ExitInfo { code, signal, detached };
+        assert!(closes_on_exit(&exit(Some(0), None, false)), "exit");
+        assert!(closes_on_exit(&exit(Some(130), None, false)), "exit 130");
+        assert!(closes_on_exit(&exit(None, Some(9), false)), "kill -9");
+        assert!(!closes_on_exit(&exit(None, None, true)), "exec nohup: still running");
+        assert!(!closes_on_exit(&ExitInfo::UNKNOWN), "the session thread failed");
     }
 
     #[test]

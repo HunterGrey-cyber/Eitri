@@ -33,6 +33,9 @@ pub(crate) struct PanelEntry<W = gtk4::Widget> {
     /// Its module key after `Ctrl+a`, as written (modules P2). `main.rs` checks every panel's
     /// together (`ModuleKeys::build`) once `init.lua` has run.
     pub(crate) key: Option<String>,
+    /// The page it loads, resolved against the config directory: what a `prefix x`'d panel loads
+    /// afresh when its key reopens it (2026-09-26).
+    pub(crate) url: String,
     pub(crate) widget: W,
 }
 
@@ -86,6 +89,7 @@ pub(crate) fn install(
             title: parsed.title,
             slot: parsed.slot,
             key: parsed.key,
+            url: resolved_url,
             widget: webview.upcast(),
         });
         Ok(())
@@ -105,6 +109,7 @@ mod tests {
             title: id.to_string(),
             slot,
             key: None,
+            url: format!("file:///{id}.html"),
             widget,
         }
     }

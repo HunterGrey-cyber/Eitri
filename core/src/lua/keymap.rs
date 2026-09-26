@@ -247,8 +247,8 @@ mod tests {
         assert_eq!(action("q"), Some((Action::Tab(TabAction::Close), false)));
         assert_eq!(
             action("x"),
-            Some((Action::ModuleHide, false)),
-            "base.conf:69 is a default"
+            Some((Action::ModuleKill, false)),
+            "base.conf:69 (`bind x kill-pane`) is a default"
         );
         assert_eq!(
             action("C-l"),

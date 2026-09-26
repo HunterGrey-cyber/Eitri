@@ -123,6 +123,9 @@ struct State {
     colors: TerminalColors,
     focused: bool,
     cwd: PathBuf,
+    /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
+    /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
+    on_shell_exit: Option<Rc<dyn Fn() -> bool>>,
 }
 
 impl State {
@@ -148,6 +151,7 @@ impl State {
             colors: TerminalColors::default(),
             focused: false,
             cwd,
+            on_shell_exit: None,
         }
     }
 
@@ -252,6 +256,15 @@ impl State {
         self.exited = false;
         self.queue.clear();
         self.cursor = None;
+    }
+
+    /// [`TerminalPane::close`]'s half that needs no display: no shell wanted, none kept, nothing of
+    /// the last one left on screen. The metrics and the allocation stay: they are the pane's, not
+    /// the shell's, and the next start spawns at them.
+    fn close(&mut self) {
+        self.wanted = false;
+        self.forget_session();
+        self.frame = None;
     }
 
     /// [`ensure_session`]'s gate, and the size it spawns at. `None`: nothing to start (no shell
@@ -394,6 +407,25 @@ impl TerminalPane {
     pub(crate) fn send(&self, input: NormalizedInput) {
         discard_composition(&self.state, &self.im, &self.area);
         submit(&self.state, input);
+    }
+
+    /// `f` runs when the shell ends by itself in a way that closes the module (`super::closes_on_exit`),
+    /// after the notice has been published and with this pane's state released. It takes the module
+    /// off screen and says whether it did; if it did, the pane is [`Self::close`]d, and if it could
+    /// not (the last module on screen), the notice stays and Enter restarts, as before.
+    pub(crate) fn on_shell_exit(&self, f: impl Fn() -> bool + 'static) {
+        self.state.borrow_mut().on_shell_exit = Some(Rc::new(f));
+    }
+
+    /// `prefix x` (or the shell's own end): the shell is hung up if it still runs, and the pane
+    /// forgets it -- its screen, its cursor, anything queued behind a paste (and the input method is reset) -- so the
+    /// next [`Self::start`] is a fresh shell on a blank pane, as the first one was. Does not wait:
+    /// `TerminalSession`'s own `Drop` hangs up and reaps off the thread.
+    pub(crate) fn close(&self) {
+        self.state.borrow_mut().close();
+        // No borrow held: `reset` can emit `commit`/`preedit-changed`, whose handlers borrow the state.
+        self.im.reset();
+        self.area.queue_render();
     }
 
     /// Window close: hang the shell up. Does not wait -- `TerminalSession`'s own `Drop`.
@@ -570,9 +602,10 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
     let Some(update) = state.borrow().session.as_ref().map(|s| s.take_update()) else {
         return;
     };
-    let (repoint, flash_until) = {
+    let (repoint, flash_until, closed_by_exit) = {
         let mut s = state.borrow_mut();
         let mut repoint = false;
+        let mut closed_by_exit = None;
         if let Some(frame) = update.frame {
             s.frame = Some(frame);
             repoint = s.take_cursor(update.cursor);
@@ -581,13 +614,16 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
         if let Some(exit) = update.exited {
             s.exited = true;
             println!("[terminal] {}", exit.notice());
+            if super::closes_on_exit(&exit) {
+                closed_by_exit = s.on_shell_exit.clone();
+            }
         }
         let flash_until = if update.events.bell {
             s.bell(on_screen, Instant::now())
         } else {
             None
         };
-        (repoint, flash_until)
+        (repoint, flash_until, closed_by_exit)
     };
     if repoint {
         point_input_method(im, state, area);
@@ -622,6 +658,16 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
     }
     // `update.events.title` has nowhere to go: the spec gives it to the pane's header "when one
     // exists", and the terminal has no header yet.
+
+    // Last, with nothing borrowed: the hook kills the module, unmapping this pane, whose handler
+    // borrows the state. Then the pane forgets the shell, as `TerminalPane::close` does.
+    if let Some(closed_by_exit) = closed_by_exit {
+        if closed_by_exit() {
+            state.borrow_mut().close();
+            im.reset();
+            area.queue_render();
+        }
+    }
 }
 
 /// Enter after the shell exited: a fresh session on a fresh PTY, in the same place.
@@ -988,6 +1034,40 @@ mod tests {
         assert!(
             state.metrics.is_none(),
             "metrics must wait for ensure_session's first spawn attempt, not be built at construction"
+        );
+    }
+
+    /// `prefix x` or the shell's own end (2026-09-26): after a close nothing spawns until a start
+    /// wants a shell again, and then a fresh one does -- even after an exit, which on its own waits
+    /// for Enter -- on a blank pane, at the allocation the pane already had.
+    #[test]
+    fn a_closed_pane_forgets_its_shell_and_the_next_start_spawns_a_fresh_one() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.wanted = true;
+        state.allocate(FIRST_SHOW);
+        let first = state.spawn_size(build_metrics).unwrap().unwrap();
+        // The shell exited: its notice is on screen and Enter would restart it.
+        state.exited = true;
+        state.frame = Some(message_frame(first, state.colors, "[process exited 0]"));
+        state.cursor = Some(CursorCell {
+            row: 1,
+            col: 0,
+            visible: true,
+        });
+
+        state.close();
+        assert!(!state.wanted && !state.exited && state.session.is_none());
+        assert!(
+            state.frame.is_none() && state.cursor.is_none(),
+            "nothing of the last shell stays"
+        );
+        assert_eq!(state.spawn_size(build_metrics), None, "closed: nothing spawns");
+
+        state.wanted = true;
+        assert_eq!(
+            state.spawn_size(build_metrics).unwrap().unwrap(),
+            first,
+            "a fresh shell, at the allocation the pane already had"
         );
     }
 

@@ -118,6 +118,12 @@ pub enum LiveState {
     Starting,
     Ready(Box<LiveSession>),
     Failed(String),
+    /// nvim quit and the host let this pane go ([`NeovideEditorPane::release_exited`]): the harness
+    /// is shut down and dropped, so nothing -- a focus report, a resize, a key -- can reach its
+    /// closed command channel (`send_ui` panics on one). Never left: a second `nvim --embed` cannot
+    /// be started in this process, because `LiveHarness` builds a winit `EventLoop` and winit allows
+    /// one per process (`EventLoopError::RecreationAttempt`).
+    Exited,
 }
 
 pub struct LiveSession {
@@ -983,6 +989,8 @@ impl NeovideEditorPane {
                         fill_content_region(canvas, &content_region, FAILED_COLOR);
                         let _ = message; // already logged once when the transition happened
                     }
+                    // Only the clear above: a host that released the pane does not show it.
+                    LiveState::Exited => {}
                 }
                 drop(live);
 
@@ -1139,6 +1147,8 @@ impl NeovideEditorPane {
                     // terminal state; keep rendering rather than risk the one remaining
                     // Starting->Failed state-transition frame never actually getting painted.
                     LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
+                    // Nothing will ever change: no frame is needed.
+                    LiveState::Exited => false,
                 };
                 drop(live);
 
@@ -1337,6 +1347,26 @@ impl NeovideEditorPane {
     /// dialog, etc).
     pub fn on_exited_unrequested(&self, callback: impl Fn() + 'static) {
         *self.exited_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// After nvim quit on its own ([`NeovideEditorPane::on_exited_unrequested`]), for a host that
+    /// keeps its window open without the editor (`shell`'s `prefix x`): shuts the harness down --
+    /// nvim is already gone, so this does not wait for it -- drops it, and leaves the pane
+    /// [`LiveState::Exited`], where every method is a no-op and nothing is sent to the closed
+    /// connection. `false`, changing nothing, if nvim has not exited or never started.
+    pub fn release_exited(&self) -> bool {
+        let mut live = self.live_state.borrow_mut();
+        let LiveState::Ready(session) = &mut *live else {
+            return false;
+        };
+        if !session.harness.has_neovim_exited() {
+            return false;
+        }
+        session.close_requested.set(true);
+        session.harness.shutdown();
+        *live = LiveState::Exited;
+        println!("[live] nvim exited and the host released the pane; it stays empty");
+        true
     }
 
     /// Cleanly shuts down the live `nvim --embed` connection, if one was ever started. Mirrors
