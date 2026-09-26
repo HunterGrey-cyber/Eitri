@@ -28,6 +28,7 @@
 
 use gtk4::gdk::{Key as GdkKey, ModifierType};
 use gtk4::glib::translate::IntoGlib;
+use neovibe_terminal::ScrollRequest;
 use terminal_input::keys::{ElementState, Key, KeyEvent, KeyLocation, ModifiersState, NamedKey};
 use terminal_input::NormalizedInput;
 
@@ -636,7 +637,8 @@ mod tests {
 /// Which of foot's two clipboard chords a key is ([`clipboard_chord`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardChord {
-    /// `Ctrl+Shift+C`. Still held back in phase 2: there is no selection to copy until phase 3.
+    /// `Ctrl+Shift+C` copies the last finished selection to the clipboard again.
+    /// The chord is consumed even with nothing selected and is never forwarded to the shell.
     Copy,
     /// `Ctrl+Shift+V`: the clipboard's text, as a paste (phase 2).
     Paste,
@@ -645,7 +647,7 @@ pub(crate) enum ClipboardChord {
 /// Recognises `Ctrl+Shift+C` and `Ctrl+Shift+V` as clipboard chords.
 /// The pane keeps both from the child: the encoder would turn them into 0x03
 /// (SIGINT) and 0x16 respectively. `Paste` pastes clipboard text;
-/// `Copy` is swallowed until there is a selection to copy.
+/// `Copy` copies the last finished selection, or is swallowed if none exists.
 pub(crate) fn clipboard_chord(keyval: GdkKey, state: ModifierType) -> Option<ClipboardChord> {
     let others = ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
     if !state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) || state.intersects(others) {
@@ -705,6 +707,30 @@ pub(crate) fn restarts(keyval: GdkKey, state: ModifierType) -> bool {
     let chords =
         ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::SHIFT_MASK;
     matches!(keyval, GdkKey::Return | GdkKey::KP_Enter | GdkKey::ISO_Enter) && !state.intersects(chords)
+}
+
+/// `Shift+Page_Up`/`Shift+Page_Down` move a screen at a time; `Shift+Home`/`Shift+End` jump to the
+/// oldest retained line and back to the live bottom -- foot's own `scrollback-up-page`/
+/// `-down-page`/`-home`/`-end`.
+/// Matched in `connect_keyboard` before [`clipboard_chord`] and never forwarded to the child: unlike
+/// that chord's Ctrl+Shift pair these are Shift-ONLY, so a plain (unshifted) `Page_Up`/`Home`/`End`
+/// still reaches the shell -- a full-screen program's own paging, or a shell's own history search.
+/// `Shift+Home` is `Lines(i32::MAX)`, not a dedicated "top" request: [`ScrollRequest::Lines`]'s own
+/// clamp at the oldest retained line already does exactly what "jump to the top" means, and
+/// `saturating_sub` makes the huge delta safe.
+pub(crate) fn scroll_chord(keyval: GdkKey, state: ModifierType) -> Option<ScrollRequest> {
+    let others =
+        ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
+    if !state.contains(ModifierType::SHIFT_MASK) || state.intersects(others) {
+        return None;
+    }
+    match keyval {
+        GdkKey::Page_Up | GdkKey::KP_Page_Up => Some(ScrollRequest::Pages(1)),
+        GdkKey::Page_Down | GdkKey::KP_Page_Down => Some(ScrollRequest::Pages(-1)),
+        GdkKey::Home | GdkKey::KP_Home => Some(ScrollRequest::Lines(i32::MAX)),
+        GdkKey::End | GdkKey::KP_End => Some(ScrollRequest::Bottom),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +865,34 @@ mod neovibe_tests {
             };
             assert_eq!(event.location, location);
         }
+    }
+
+    /// The four chords `scroll_chord` recognises, plus its two negatives: unshifted `Page_Up` must
+    /// stay `None` so the child (a full-screen program's own paging) gets it, and `Ctrl+Shift+Page_Up`
+    /// must stay `None` too -- Shift-ONLY, unlike `clipboard_chord`'s Ctrl+Shift pair.
+    #[test]
+    fn scroll_chord_recognises_shift_only_paging_and_leaves_everything_else_alone() {
+        let shift = ModifierType::SHIFT_MASK;
+        assert_eq!(scroll_chord(GdkKey::Page_Up, shift), Some(ScrollRequest::Pages(1)));
+        assert_eq!(scroll_chord(GdkKey::Page_Down, shift), Some(ScrollRequest::Pages(-1)));
+        assert_eq!(scroll_chord(GdkKey::Home, shift), Some(ScrollRequest::Lines(i32::MAX)));
+        assert_eq!(scroll_chord(GdkKey::End, shift), Some(ScrollRequest::Bottom));
+        assert_eq!(
+            scroll_chord(GdkKey::KP_Page_Up, shift),
+            Some(ScrollRequest::Pages(1)),
+            "the numpad twin"
+        );
+        assert_eq!(
+            scroll_chord(GdkKey::Page_Up, ModifierType::empty()),
+            None,
+            "unshifted: the child gets it"
+        );
+        assert_eq!(
+            scroll_chord(GdkKey::Page_Up, shift | ModifierType::CONTROL_MASK),
+            None,
+            "Shift-only, unlike clipboard_chord's Ctrl+Shift pair"
+        );
+        assert_eq!(scroll_chord(GdkKey::a, shift), None, "not a scroll key at all");
     }
 
     #[test]

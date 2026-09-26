@@ -27,7 +27,11 @@
 //! The clipboard read is asynchronous; `input_queue` holds later typing behind it so Enter
 //! cannot overtake the text it runs.
 //!
-//! `Ctrl+Shift+C` is swallowed because selection is not implemented yet.
+//! A middle click pastes the primary selection through `paste_primary` and the same input queue.
+//! `connect_pointer` maps drag motion and double/triple clicks to `SelectCommand`s using
+//! `pointer::cell_at` and `kind_for`. On release, `pump` copies the finished selection to both
+//! the clipboard and primary selection. `copy_selection` copies `State::last_selection` again
+//! for `Ctrl+Shift+C` without another session round trip.
 //!
 //! OSC 52 copies go to GTK's clipboard (`c`) or primary selection (`p`/`s`), even while hidden.
 //! `Term` refuses clipboard reads. A bell briefly tints the pane through `bell.rs`; a bell rung
@@ -43,15 +47,19 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gtk4::gdk::{ModifierType, Rectangle};
+use gtk4::gdk::{Clipboard, ModifierType, Rectangle};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{EventControllerFocus, EventControllerKey, GLArea, GestureClick, IMMulticontext, InputPurpose};
+use gtk4::{
+    EventControllerFocus, EventControllerKey, EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick,
+    GestureDrag, IMMulticontext, InputPurpose,
+};
 
+use neovibe_terminal::mouse::{Button as MouseButton, MouseKind, MouseModes, MouseMods, WheelDir};
 use neovibe_terminal::pty::{fallback_shell, passwd_shell};
 use neovibe_terminal::{
-    layout_preedit, CursorCell, PreeditLayout, PtySize, Screen, SessionCommand, SessionConfig, SpawnSpec,
-    TerminalColors, TerminalMetrics, TerminalSession,
+    layout_preedit, CursorCell, PreeditLayout, PtySize, Screen, ScrollRequest, SelectCommand, SessionCommand,
+    SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics, TerminalSession,
 };
 use terminal_input::NormalizedInput;
 use terminal_render::PaintList;
@@ -59,8 +67,15 @@ use terminal_render::PaintList;
 use super::bell::{self, BellFlash};
 use super::gl::SkiaState;
 use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
-use super::input_queue::{InputQueue, PasteTicket};
+use super::input_queue::{InputQueue, PaneInput, PasteTicket};
 use super::keys::{self, ClipboardChord, DeliveredKeys, RawKey, RepeatTracker};
+use super::pointer;
+use crate::wheel_zoom::WheelZoom;
+
+/// GDK's own numbering (X11/Wayland convention, not named constants in `gtk4-rs`): button 1 is the
+/// primary (left) button, button 2 the middle.
+const BUTTON_PRIMARY: u32 = 1;
+const BUTTON_MIDDLE: u32 = 2;
 
 /// Phase 1's face: the frozen pane's own default. Phase 4 takes nvim's `guifont`.
 const FONT_FAMILY: &str = "monospace";
@@ -99,6 +114,21 @@ struct State {
     queue: InputQueue,
     /// The bell's flash (phase 2).
     bell: BellFlash,
+    /// The last selection a drag finished: kept host-side so `Ctrl+Shift+C`
+    /// can copy it again without a round trip through the session (`copy_selection`'s own doc).
+    /// Cleared on a restart, the same as `cursor`.
+    last_selection: Option<String>,
+    /// The live mouse-mode summary, as the session last reported it (bottom-terminal phase 3c):
+    /// what [`pointer::route`]/[`pointer::wheel_route`] need to decide, *before* sending, whether a
+    /// gesture is the program's or this pane's own. Reset to [`MouseModes::default`] (report off) on
+    /// a restart, the same as `cursor`.
+    mouse: MouseModes,
+    /// Which button (if any) a drag or motion is holding, for the live mouse mode's own report
+    ///. Reset on a restart: a button held across a restarted shell reports nothing new.
+    reports: pointer::ReportTracker,
+    /// The last widget-relative pointer position: a wheel event carries no position of its
+    /// own, so a report needs the last one the motion controller (or drag gesture) saw.
+    last_pointer: (f64, f64),
     colors: TerminalColors,
     focused: bool,
     cwd: PathBuf,
@@ -125,6 +155,10 @@ impl State {
             delivered: DeliveredKeys::new(),
             queue: InputQueue::new(),
             bell: BellFlash::new(),
+            last_selection: None,
+            mouse: MouseModes::default(),
+            reports: pointer::ReportTracker::default(),
+            last_pointer: (0.0, 0.0),
             colors: TerminalColors::default(),
             focused: false,
             cwd,
@@ -204,10 +238,18 @@ impl State {
         }
     }
 
-    /// Straight to the running shell; dropped when there is none (not started, or exited).
-    fn send_input(&self, input: NormalizedInput) {
+    /// Straight to the running shell; dropped when there is none (not started, or exited). The one
+    /// place that turns a [`PaneInput`] into the matching [`SessionCommand`] (bottom-terminal phase
+    /// 3c): a key is `Input`, a mouse gesture `Mouse`, a focus change `FocusReport` -- never the
+    /// direct `SessionCommand::Focus` a report must not ride (`set_focused`'s own doc).
+    fn send_input(&self, input: PaneInput) {
         if let (Some(session), false) = (&self.session, self.exited) {
-            session.send(SessionCommand::Input(input));
+            let command = match input {
+                PaneInput::Key(input) => SessionCommand::Input(input),
+                PaneInput::Mouse(m) => SessionCommand::Mouse(m),
+                PaneInput::Focus(focused) => SessionCommand::FocusReport(focused),
+            };
+            session.send(command);
         }
     }
 
@@ -232,6 +274,20 @@ impl State {
         self.exited = false;
         self.queue.clear();
         self.cursor = None;
+        self.last_selection = None;
+        self.mouse = MouseModes::default();
+        self.reports = pointer::ReportTracker::default();
+    }
+
+    /// What [`pointer::route`]/[`pointer::wheel_route`] see: the live mode while a shell is running,
+    /// or [`MouseModes::default`] (report off) once it has exited or never started -- a program that
+    /// died in mouse mode (`kill -9 htop`) must not leave its final screen unselectable.
+    fn routing_modes(&self) -> MouseModes {
+        if self.exited || self.session.is_none() {
+            MouseModes::default()
+        } else {
+            self.mouse
+        }
     }
 
     /// [`TerminalPane::close`]'s half that needs no display: no shell wanted, none kept, nothing of
@@ -312,7 +368,8 @@ impl TerminalPane {
         connect_render(&area, &state);
         connect_keyboard(&area, &state, &im);
         connect_ime(&area, &state, &im);
-        connect_click_to_focus(&area);
+        connect_pointer(&area, &state, &im);
+        connect_scroll(&area, &state);
         connect_visibility(&area, &state, &im);
         TerminalPane { area, state, im }
     }
@@ -345,17 +402,25 @@ impl TerminalPane {
     ///
     /// `SessionCommand::Focus` goes straight to the session, beside [`submit`], because it changes
     /// only the cursor's shape: no byte reaches the program. **Phase 3's focus reports (DECSET 1004)
-    /// must not ride it that way:** a report is input, and one sent here would overtake keys still
-    /// waiting behind a paste.
+    /// do not ride it that way:** a report is input, and one sent here would overtake keys still
+    /// waiting behind a paste -- so this method also
+    /// submits a [`PaneInput::Focus`] through the door, once the borrow above is released.
     pub(crate) fn set_focused(&self, focused: bool) {
-        let change = {
+        let (was, change) = {
             let mut state = self.state.borrow_mut();
+            let was = state.focused;
             state.focused = focused;
             if let Some(session) = &state.session {
                 session.send(SessionCommand::Focus(focused));
             }
-            state.ime.set_focused(focused)
+            (was, state.ime.set_focused(focused))
         };
+        // Submit the focus report after dropping the borrow above: `submit` mutably borrows `state`,
+        // and a nested borrow would panic the GTK thread. `pane_focus.rs` already suppresses duplicate
+        // reports, so `was != focused` is an additional guard.
+        if was != focused {
+            submit(&self.state, PaneInput::Focus(focused));
+        }
         match change {
             FocusChange::In => point_input_method(&self.im, &self.state, &self.area),
             FocusChange::Out => {
@@ -381,7 +446,7 @@ impl TerminalPane {
     /// being read, it waits for it ([`submit`]).
     pub(crate) fn send(&self, input: NormalizedInput) {
         discard_composition(&self.state, &self.im, &self.area);
-        submit(&self.state, input);
+        submit(&self.state, PaneInput::Key(input));
     }
 
     /// `f` runs when the shell ends by itself in a way that closes the module (`super::closes_on_exit`),
@@ -584,6 +649,13 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             repoint = s.take_cursor(update.cursor);
             area.queue_render();
         }
+        // Independent of `update.frame`: a synchronized update
+        // can hold every frame back for up to 150ms while the mode changes underneath it, and
+        // `pointer::route`/`wheel_route` must see the live mode the moment it changes, not only
+        // when the next frame happens to render.
+        if let Some(m) = update.mouse {
+            s.mouse = m;
+        }
         if let Some(exit) = update.exited {
             s.exited = true;
             println!("[terminal] {}", exit.notice());
@@ -616,6 +688,18 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             "[terminal] a program copied {} characters to the primary selection (OSC 52)",
             text.chars().count()
         );
+    }
+    // A finished selection is copied to both the clipboard and primary selection on release.
+    // Keep it in `State::last_selection` so `Ctrl+Shift+C` can copy it again without a session
+    // round trip. The OSC 52 copies above do not update this cached selection.
+    if let Some(text) = update.events.selection {
+        area.clipboard().set_text(&text);
+        area.primary_clipboard().set_text(&text);
+        println!(
+            "[terminal] a selection finished: copied {} characters to the clipboard and the primary selection",
+            text.chars().count()
+        );
+        state.borrow_mut().last_selection = Some(text);
     }
     if let Some(until) = flash_until {
         area.queue_render();
@@ -733,18 +817,389 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
     });
 }
 
-/// Clicking the pane focuses it. GTK4 does not do this for a plain widget; the frozen pane's own
-/// doc records the editor losing click-focus the day a second focusable pane appeared.
-fn connect_click_to_focus(area: &GLArea) {
-    let click = GestureClick::new();
-    click.set_button(0);
-    let target = area.clone();
-    click.connect_pressed(move |_, _, _, _| {
-        if !target.has_focus() {
-            target.grab_focus();
+/// Clicking the pane focuses it (GTK4 does not do this for a plain widget; the frozen pane's own
+/// doc records the editor losing click-focus the day a second focusable pane appeared), the primary
+/// button also drags a selection out of it, and the middle
+/// button pastes the primary selection -- foot's and alacritty's own convention. **Since phase 3c
+///, any of that is instead a mouse report when the program's own mode asks for one and
+/// `Shift` is not held**: what changed
+/// is which of two already-connected controllers acts, never a new one for reporting.
+///
+/// **Two controllers on the primary button, not one**, because they answer different questions:
+/// `GestureClick` is the only one of the two GTK tells the click COUNT (`n_press`), which
+/// `pointer::kind_for` needs and `GestureDrag` has no notion of; `GestureDrag` is the only one GTK
+/// tells the drag's motion and release. Both attached to the same widget and button see the same
+/// press, since neither claims the event sequence away from the other (`set_state` is never
+/// called): the click gesture starts the selection at `pressed`, and the drag gesture extends and
+/// finishes it as the button moves and lifts. A plain click with no motion still fires
+/// `drag-end` at zero offset -- `Finish` on a selection that never left its single starting cell,
+/// which for `Simple` is empty (`Term::selection_to_string` reports `None`, same as never having
+/// selected anything) and for `Word`/`Line` is exactly the click's own word or line, no drag
+/// required (`select.rs`'s own tests already prove `Start` + `Finish` alone is enough for those two).
+/// **Known limit:** whether GTK really dispatches to both controllers rather than one claiming the
+/// sequence away from the other is GTK's own runtime behaviour and is not tested without a display
+/// (the same limit `paste_clipboard`'s own doc already names for the clipboard read and its timer).
+///
+/// **The drag gesture is widened to button 0** (every button, not only the primary): a `GestureClick`
+/// stops delivering `released` once the pointer crosses the drag threshold, so it cannot be a
+/// press/release pair's own source once a real drag is possible -- `GestureDrag`'s `drag-begin` and
+/// `drag-end` always fire, at zero offset for a plain click. Its own selection code (button 1,
+/// `Shift` not held) is unchanged; every other case (a report, or a local button 2/3 with nothing
+/// defined for it) is new here and does nothing to the selection path.
+fn connect_pointer(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
+    let focus_click = GestureClick::new();
+    focus_click.set_button(0);
+    {
+        let target = area.clone();
+        focus_click.connect_pressed(move |_, _, _, _| {
+            if !target.has_focus() {
+                target.grab_focus();
+            }
+        });
+    }
+    area.add_controller(focus_click);
+
+    let select_click = GestureClick::new();
+    select_click.set_button(BUTTON_PRIMARY);
+    {
+        let state = state.clone();
+        select_click.connect_pressed(move |gesture, n_press, x, y| {
+            let modes = state.borrow().routing_modes();
+            if pointer::route(shift_held(gesture), modes) == pointer::PointerRoute::Program {
+                return; // the widened drag gesture below reports this press instead.
+            }
+            send_select(&state, SelectStage::Start(n_press), x, y);
+        });
+    }
+    area.add_controller(select_click);
+
+    let drag = GestureDrag::new();
+    drag.set_button(0);
+    {
+        let state = state.clone();
+        drag.connect_drag_begin(move |gesture, x, y| {
+            let modes = state.borrow().routing_modes();
+            let shift = shift_held(gesture);
+            if pointer::route(shift, modes) == pointer::PointerRoute::Program {
+                if let Some(button) = mouse_button(gesture.current_button()) {
+                    report_press(&state, button, gesture.current_event_state(), x, y);
+                }
+            }
+            // A local button 1 press is `select_click`'s own `pressed`, above; a local button 2/3
+            // press has nothing defined for it here (button 2's paste is `middle_click`'s own).
+        });
+    }
+    {
+        let state = state.clone();
+        drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+            let Some((start_x, start_y)) = gesture.start_point() else {
+                return;
+            };
+            let (x, y) = (start_x + offset_x, start_y + offset_y);
+            let modes = state.borrow().routing_modes();
+            let shift = shift_held(gesture);
+            if pointer::route(shift, modes) == pointer::PointerRoute::Program {
+                report_motion(&state, gesture.current_event_state(), x, y);
+                return;
+            }
+            if gesture.current_button() == BUTTON_PRIMARY {
+                send_select(&state, SelectStage::Extend, x, y);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        drag.connect_drag_end(move |gesture, offset_x, offset_y| {
+            let Some((start_x, start_y)) = gesture.start_point() else {
+                return;
+            };
+            let (x, y) = (start_x + offset_x, start_y + offset_y);
+            let modes = state.borrow().routing_modes();
+            let shift = shift_held(gesture);
+            if pointer::route(shift, modes) == pointer::PointerRoute::Program {
+                report_release(&state, gesture.current_event_state(), x, y);
+                return;
+            }
+            if gesture.current_button() == BUTTON_PRIMARY {
+                send_select(&state, SelectStage::Extend, x, y);
+                if let Some(session) = &state.borrow().session {
+                    session.send(SessionCommand::Select(SelectCommand::Finish));
+                }
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        // A sequence cancelled (another widget claimed it, a touch was cancelled) fires no
+        // `drag-end`. A button `report_press` reported and never released would leave the program
+        // thinking it is still held down; `report_release` itself is a no-op if nothing is held
+        // (Local route, or nothing was ever pressed), so this is safe to call unconditionally.
+        drag.connect_cancel(move |_, _| {
+            let (x, y) = state.borrow().last_pointer;
+            report_release(&state, ModifierType::empty(), x, y);
+        });
+    }
+    area.add_controller(drag);
+
+    let middle_click = GestureClick::new();
+    middle_click.set_button(BUTTON_MIDDLE);
+    {
+        let state = state.clone();
+        let area = area.clone();
+        let im = im.clone();
+        middle_click.connect_pressed(move |gesture, _, _, _| {
+            let modes = state.borrow().routing_modes();
+            if pointer::route(shift_held(gesture), modes) == pointer::PointerRoute::Program {
+                return; // the widened drag gesture above reports this press instead.
+            }
+            paste_primary(&state, &area, &im);
+        });
+    }
+    area.add_controller(middle_click);
+
+    connect_pointer_motion(area, state);
+}
+
+/// Whether `Shift` is held on the event a controller is currently handling
+/// (`EventControllerExt::current_event_state`, which every gesture below inherits).
+fn shift_held(controller: &impl IsA<gtk4::EventController>) -> bool {
+    controller.current_event_state().contains(ModifierType::SHIFT_MASK)
+}
+
+/// GDK's button numbering (1/2/3) to [`MouseButton`]; any other button (4/5, the wheel's own
+/// "buttons" on some setups; a stylus button) is not reportable.
+fn mouse_button(gdk_button: u32) -> Option<MouseButton> {
+    match gdk_button {
+        1 => Some(MouseButton::Left),
+        2 => Some(MouseButton::Middle),
+        3 => Some(MouseButton::Right),
+        _ => None,
+    }
+}
+
+fn mouse_mods(modifiers: ModifierType) -> MouseMods {
+    MouseMods {
+        shift: modifiers.contains(ModifierType::SHIFT_MASK),
+        alt: modifiers.contains(ModifierType::ALT_MASK),
+        ctrl: modifiers.contains(ModifierType::CONTROL_MASK),
+    }
+}
+
+/// A widget-relative pixel turned into the absolute (line, column) cell a mouse report names --
+/// [`selection_geometry`]'s own mapping, reused rather than reimplemented (`pointer.rs`'s
+/// own module doc). `None` before a shell has ever spawned or rendered once.
+fn report_cell(state: &State, x: f64, y: f64) -> Option<(i32, u16)> {
+    let (cell_w, cell_h, cols, rows, top_line) = selection_geometry(state)?;
+    let (line, col, _) = pointer::cell_at(x, y, cell_w, cell_h, cols, rows, top_line);
+    Some((line, col))
+}
+
+/// A press at `(x, y)`: turned into a cell, fed to [`pointer::ReportTracker::press`], and sent
+/// through the pane's one door. Dropped with no session/metrics/frame yet, or a scrollback cell
+/// (`ReportTracker`'s own doc).
+fn report_press(state: &Rc<RefCell<State>>, button: MouseButton, modifiers: ModifierType, x: f64, y: f64) {
+    let mut s = state.borrow_mut();
+    let Some(cell) = report_cell(&s, x, y) else { return };
+    let Some(mut input) = s.reports.press(button, cell) else {
+        return;
+    };
+    input.mods = mouse_mods(modifiers);
+    drop(s);
+    submit(state, PaneInput::Mouse(input));
+}
+
+/// A motion to `(x, y)`, deduped by cell (`ReportTracker`'s own doc): fed from both the drag
+/// gesture's own update and the plain motion controller below, which is harmless (design decision,
+/// spec Phase 3).
+fn report_motion(state: &Rc<RefCell<State>>, modifiers: ModifierType, x: f64, y: f64) {
+    let mut s = state.borrow_mut();
+    let Some(cell) = report_cell(&s, x, y) else { return };
+    let Some(mut input) = s.reports.motion(cell) else {
+        return;
+    };
+    input.mods = mouse_mods(modifiers);
+    drop(s);
+    submit(state, PaneInput::Mouse(input));
+}
+
+/// A release at `(x, y)`: `None` from [`pointer::ReportTracker::release`] with no button held (a
+/// gesture that started before the mode turned on) is silently dropped, same as a press/motion with
+/// no geometry yet.
+fn report_release(state: &Rc<RefCell<State>>, modifiers: ModifierType, x: f64, y: f64) {
+    let mut s = state.borrow_mut();
+    let Some(cell) = report_cell(&s, x, y) else { return };
+    let Some(mut input) = s.reports.release(cell) else {
+        return;
+    };
+    input.mods = mouse_mods(modifiers);
+    drop(s);
+    submit(state, PaneInput::Mouse(input));
+}
+
+/// Hover motion (no button held): `MOUSE_MOTION` (1003) reporting, and the pointer position wheel
+/// events need but GDK does not carry on a scroll event (`connect_scroll`'s own doc). Its own report
+/// is filtered by `encode_mouse` against the live mode exactly like the drag gesture's -- `wants`
+/// does not accept `Motion(None)` under 1002 alone, only 1003 (`mouse.rs`'s own tests).
+fn connect_pointer_motion(area: &GLArea, state: &Rc<RefCell<State>>) {
+    let motion = gtk4::EventControllerMotion::new();
+    {
+        let state = state.clone();
+        motion.connect_enter(move |controller, x, y| {
+            state.borrow_mut().last_pointer = (x, y);
+            let modes = state.borrow().routing_modes();
+            if pointer::route(shift_held(controller), modes) == pointer::PointerRoute::Program {
+                report_motion(&state, controller.current_event_state(), x, y);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        motion.connect_motion(move |controller, x, y| {
+            state.borrow_mut().last_pointer = (x, y);
+            let modes = state.borrow().routing_modes();
+            if pointer::route(shift_held(controller), modes) == pointer::PointerRoute::Program {
+                report_motion(&state, controller.current_event_state(), x, y);
+            }
+        });
+    }
+    area.add_controller(motion);
+}
+
+/// Which half of a `Start`/`Extend` pair [`send_select`] is sending: `Start` carries the click count
+/// `pointer::kind_for` turns into a [`neovibe_terminal::SelectKind`], `Extend` carries none.
+enum SelectStage {
+    Start(i32),
+    Extend,
+}
+
+/// The geometry needed to turn a pointer position into a [`SelectCommand`]: cell size, grid
+/// dimensions and the last frame's absolute top line (`PaintList::top_line`). The session thread
+/// keeps `Screen::top_line`; the pane uses the frame to correlate a click with its displayed text.
+/// Returns `None` until metrics exist, and uses top line zero when no frame exists.
+fn selection_geometry(state: &State) -> Option<(f64, f64, u16, u16, i32)> {
+    let metrics = state.metrics.as_ref()?;
+    let top_line = state.frame.as_ref().map_or(0, |f| f.top_line);
+    Some((
+        f64::from(metrics.cell_width()),
+        f64::from(metrics.cell_height()),
+        metrics.cols(),
+        metrics.rows(),
+        top_line,
+    ))
+}
+
+/// Turns one pointer position into a [`SelectCommand`] and sends it, dropped with no session or no
+/// metrics yet (nothing to select against).
+fn send_select(state: &Rc<RefCell<State>>, stage: SelectStage, x: f64, y: f64) {
+    let s = state.borrow();
+    let Some(session) = &s.session else { return };
+    let Some((cell_w, cell_h, cols, rows, top_line)) = selection_geometry(&s) else {
+        return;
+    };
+    let (line, col, right_half) = pointer::cell_at(x, y, cell_w, cell_h, cols, rows, top_line);
+    let cmd = match stage {
+        SelectStage::Start(n_press) => SelectCommand::Start {
+            line,
+            col,
+            right_half,
+            kind: pointer::kind_for(n_press),
+        },
+        SelectStage::Extend => SelectCommand::Extend { line, col, right_half },
+    };
+    session.send(SessionCommand::Select(cmd));
+}
+
+/// Copy the last finished selection to the clipboard for `Ctrl+Shift+C`.
+/// `State::last_selection` holds the text received through `pump`'s `events.selection`, so no
+/// additional `SelectCommand::Finish` or session round trip is needed. With no selection, only
+/// a log line is emitted. The key is still swallowed so its encoding cannot reach the child.
+fn copy_selection(state: &Rc<RefCell<State>>, area: &GLArea) {
+    let Some(text) = state.borrow().last_selection.clone() else {
+        println!("[terminal] Ctrl+Shift+C: nothing is selected");
+        return;
+    };
+    area.clipboard().set_text(&text);
+    println!(
+        "[terminal] Ctrl+Shift+C: copied {} characters to the clipboard",
+        text.chars().count()
+    );
+}
+
+/// Grid lines scrolled per wheel notch. Reuse the terminal library's `LINES_PER_NOTCH`
+/// so scrollback and alternate-screen arrow-key repeats use the same multiplier.
+const LINES_PER_WHEEL_NOTCH: i32 = neovibe_terminal::mouse::LINES_PER_NOTCH as i32;
+
+/// One scroll event, in `unit`, folded into `wheel`'s carry-over state -- the same accumulator
+/// `crate::wheel_zoom::WheelZoom` uses for Ctrl+wheel text size, reused rather than reimplemented so
+/// a slow touchpad gesture and a reversal mid-scroll behave identically here (its own module doc and
+/// tests already cover both). How many whole notches this event completed, positive up
+/// (`WheelZoom`'s own "up is larger" convention, `dy` negative -- "up is into history" for
+/// `scroll_request` below, "up" for a mouse-mode wheel report either way). **Called at most once
+/// per scroll event**: `WheelZoom::scroll_in` is stateful, and calling it twice for one event (once
+/// for a report, once for the scrollback) would double-count it.
+fn wheel_notches(wheel: &mut WheelZoom, unit: gtk4::gdk::ScrollUnit, dy: f64) -> i32 {
+    wheel.scroll_in(unit, dy)
+}
+
+/// Convert whole `notches` from [`wheel_notches`] to a scrollback request. Zero returns `None`.
+/// Multiply the positive-is-up count by `LINES_PER_WHEEL_NOTCH` without changing its sign,
+/// so positive values scroll into history.
+fn scroll_request(notches: i32) -> Option<ScrollRequest> {
+    (notches != 0).then_some(ScrollRequest::Lines(notches * LINES_PER_WHEEL_NOTCH))
+}
+
+/// Handle vertical wheel scrolling over the pane. `KINETIC` is disabled so scrolling stops
+/// with the gesture. `crate::wheel_zoom::install` claims Ctrl+wheel during capture on the module
+/// host to change text size before this controller receives it.
+///
+/// `pointer::wheel_route` chooses program mouse reports, alternate-screen arrow keys or
+/// scrollback. Reports and arrows both use `SessionCommand::Mouse(Wheel)` because the session
+/// thread needs the live `APP_CURSOR` bit to choose the bytes. Scrollback uses
+/// `SessionCommand::Scroll` directly. Send one mouse report per notch: programs may already
+/// multiply each wheel event, so sending a report per scrollback line would multiply twice.
+fn connect_scroll(area: &GLArea, state: &Rc<RefCell<State>>) {
+    let controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    let wheel = RefCell::new(WheelZoom::default());
+    let state = state.clone();
+    controller.connect_scroll(move |controller, _dx, dy| {
+        let notches = wheel_notches(&mut wheel.borrow_mut(), controller.unit(), dy);
+        if notches != 0 {
+            let modes = state.borrow().routing_modes();
+            match pointer::wheel_route(shift_held(controller), modes) {
+                pointer::WheelRoute::Scrollback => {
+                    if let Some(req) = scroll_request(notches) {
+                        if let Some(session) = &state.borrow().session {
+                            session.send(SessionCommand::Scroll(req));
+                        }
+                    }
+                }
+                pointer::WheelRoute::Report | pointer::WheelRoute::Arrows => {
+                    let dir = if notches > 0 { WheelDir::Up } else { WheelDir::Down };
+                    let (x, y) = state.borrow().last_pointer;
+                    let modifiers = controller.current_event_state();
+                    for _ in 0..notches.unsigned_abs() {
+                        report_wheel(&state, dir, modifiers, x, y);
+                    }
+                }
+            }
         }
+        glib::Propagation::Stop
     });
-    area.add_controller(click);
+    area.add_controller(controller);
+}
+
+/// A wheel notch: unlike a press/release/motion, a wheel report needs no [`pointer::ReportTracker`]
+/// state (it is never deduped and carries no held button) -- just the current cell, dropped the
+/// same way a scrollback cell is (`pointer::mouse_input`'s own doc).
+fn report_wheel(state: &Rc<RefCell<State>>, dir: WheelDir, modifiers: ModifierType, x: f64, y: f64) {
+    let s = state.borrow();
+    let Some(cell) = report_cell(&s, x, y) else { return };
+    drop(s);
+    let Some(mut input) = pointer::mouse_input(MouseKind::Wheel(dir), cell) else {
+        return;
+    };
+    input.mods = mouse_mods(modifiers);
+    submit(state, PaneInput::Mouse(input));
 }
 
 fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
@@ -767,9 +1222,17 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
                 }
                 return glib::Propagation::Stop;
             }
+            if let Some(req) = keys::scroll_chord(keyval, modifier) {
+                if let Some(session) = &state.borrow().session {
+                    session.send(SessionCommand::Scroll(req));
+                }
+                // Never forwarded to the child: `Shift+PageUp`/`Shift+PageDown`/`Shift+Home`/
+                // `Shift+End` are this pane's own scrollback chords (bottom-terminal phase 3a).
+                return glib::Propagation::Stop;
+            }
             match keys::clipboard_chord(keyval, modifier) {
                 Some(ClipboardChord::Copy) => {
-                    println!("[terminal] Ctrl+Shift+C: nothing can be selected yet (phase 3); held back");
+                    copy_selection(&state, &area);
                     return glib::Propagation::Stop;
                 }
                 Some(ClipboardChord::Paste) => {
@@ -863,7 +1326,7 @@ fn connect_ime(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
             });
             let verdict = state.borrow_mut().ime.commit(text, gtk);
             match verdict {
-                Commit::Send(input) => submit(&state, input),
+                Commit::Send(input) => submit(&state, PaneInput::Key(input)),
                 Commit::Dropped(why) => println!(
                     "[terminal] an input-method commit ({} characters) was dropped: {why}",
                     text.chars().count()
@@ -939,11 +1402,11 @@ fn raw_key(
 
 fn deliver(state: &RefCell<State>, raw: RawKey) {
     let Some(input) = keys::normalize_key(raw) else { return };
-    submit(state, input);
+    submit(state, PaneInput::Key(input));
 }
 
 /// The one door to the shell: straight through, or behind a paste still being read.
-fn submit(state: &RefCell<State>, input: NormalizedInput) {
+fn submit(state: &RefCell<State>, input: PaneInput) {
     let mut s = state.borrow_mut();
     if let Some(input) = s.queue.submit(input) {
         s.send_input(input);
@@ -955,20 +1418,39 @@ fn submit(state: &RefCell<State>, input: NormalizedInput) {
 /// clipboard that does not answer. **Known limit:** the read and the timer are GTK's and are not
 /// tested without a display; what they call (`State::finish_paste`, `InputQueue`) is.
 fn paste_clipboard(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
+    paste_from(state, area, im, area.clipboard(), "Ctrl+Shift+V");
+}
+
+/// Paste the PRIMARY selection on a middle click through the same path as `Ctrl+Shift+V`.
+/// Reuse `InputQueue` and [`PASTE_TIMEOUT`] so composition, asynchronous paste reads and later
+/// typing stay ordered without a second implementation for this gesture.
+fn paste_primary(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
+    paste_from(state, area, im, area.primary_clipboard(), "middle click");
+}
+
+/// What [`paste_clipboard`] and [`paste_primary`] share: read `clipboard`'s text asynchronously and
+/// paste it, `label` naming the gesture in every log line so the two are told apart.
+fn paste_from(
+    state: &Rc<RefCell<State>>,
+    area: &GLArea,
+    im: &IMMulticontext,
+    clipboard: Clipboard,
+    label: &'static str,
+) {
     discard_composition(state, im, area);
     let ticket = state.borrow_mut().queue.begin_paste();
-    let read = area.clipboard().read_text_future();
+    let read = clipboard.read_text_future();
     {
         let state = Rc::downgrade(state);
         glib::spawn_future_local(async move {
             let text = match read.await {
                 Ok(Some(text)) => text.to_string(),
                 Ok(None) => {
-                    println!("[terminal] Ctrl+Shift+V: the clipboard holds no text");
+                    println!("[terminal] {label}: the clipboard holds no text");
                     String::new()
                 }
                 Err(err) => {
-                    eprintln!("[terminal] Ctrl+Shift+V: could not read the clipboard: {err}");
+                    eprintln!("[terminal] {label}: could not read the clipboard: {err}");
                     String::new()
                 }
             };
@@ -976,7 +1458,7 @@ fn paste_clipboard(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontex
             let input = keys::paste(&text);
             let had_text = input.is_some();
             if !state.borrow_mut().finish_paste(ticket, input) && had_text {
-                eprintln!("[terminal] Ctrl+Shift+V: the clipboard answered too late; that paste is dropped");
+                eprintln!("[terminal] {label}: the clipboard answered too late; that paste is dropped");
             }
         });
     }
@@ -984,7 +1466,7 @@ fn paste_clipboard(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontex
     glib::timeout_add_local_once(PASTE_TIMEOUT, move || {
         let Some(state) = state.upgrade() else { return };
         if state.borrow_mut().finish_paste(ticket, None) {
-            eprintln!("[terminal] Ctrl+Shift+V: no answer from the clipboard in {PASTE_TIMEOUT:?}; typing goes on");
+            eprintln!("[terminal] {label}: no answer from the clipboard in {PASTE_TIMEOUT:?}; typing goes on");
         }
     });
 }
@@ -992,6 +1474,45 @@ fn paste_clipboard(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontex
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtk4::gdk::ScrollUnit;
+
+    /// One wheel notch scrolls 3 lines UP (into history): `WheelZoom`'s own "up is larger"
+    /// convention (`dy` negative) carries straight through to "up is into history" with no sign
+    /// flip in `scroll_request` itself.
+    #[test]
+    fn one_wheel_notch_is_three_lines_up() {
+        let mut wheel = WheelZoom::default();
+        let notches = wheel_notches(&mut wheel, ScrollUnit::Wheel, -1.0);
+        assert_eq!(scroll_request(notches), Some(ScrollRequest::Lines(3)));
+    }
+
+    /// Small touchpad `dy` values accumulate to one whole wheel notch before producing a request,
+    /// rather than producing a scroll step for every event.
+    #[test]
+    fn ten_surface_pixel_events_worth_one_notch_make_one_request() {
+        let mut wheel = WheelZoom::default();
+        let mut requests = Vec::new();
+        for _ in 0..10 {
+            requests.extend(scroll_request(wheel_notches(&mut wheel, ScrollUnit::Surface, -1.5)));
+        }
+        assert_eq!(requests, vec![ScrollRequest::Lines(3)], "one notch (15px), not ten");
+    }
+
+    /// `WheelZoom`'s own semantics, reused rather than reimplemented: a reversal mid-gesture drops
+    /// the fractional remainder instead of netting it against the new direction.
+    #[test]
+    fn a_reversal_drops_the_remainder_instead_of_netting_it() {
+        let mut wheel = WheelZoom::default();
+        assert_eq!(
+            scroll_request(wheel_notches(&mut wheel, ScrollUnit::Wheel, -0.75)),
+            None
+        );
+        assert_eq!(
+            scroll_request(wheel_notches(&mut wheel, ScrollUnit::Wheel, 1.0)),
+            Some(ScrollRequest::Lines(-3)),
+            "the -0.75 is dropped, not netted into this one"
+        );
+    }
 
     /// An unused terminal must not create a Skia `FontMgr` or perform a fontconfig match at launch.
     /// `State::new`, used by `TerminalPane::new`, leaves metrics absent before any `gtk4::GLArea`
@@ -1125,7 +1646,11 @@ mod tests {
             text: "for the old shell".to_string(),
             bracketed: false,
         };
-        assert_eq!(state.queue.submit(typed.clone()), None, "it waits behind the paste");
+        assert_eq!(
+            state.queue.submit(typed.clone().into()),
+            None,
+            "it waits behind the paste"
+        );
         state.exited = true;
         state.forget_session();
         assert!(!state.exited);
@@ -1133,7 +1658,41 @@ mod tests {
             !state.finish_paste(ticket, None),
             "that paste is gone with the old shell"
         );
-        assert_eq!(state.queue.submit(typed.clone()), Some(typed), "nothing waits any more");
+        assert_eq!(
+            state.queue.submit(typed.clone().into()),
+            Some(typed.into()),
+            "nothing waits any more"
+        );
+    }
+
+    /// Bottom-terminal phase 3c: a restart forgets the live mouse mode too -- a program that turned
+    /// mouse reporting on must not have its old mode outlive it into a fresh shell.
+    #[test]
+    fn restarting_forgets_the_mouse_mode() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.mouse = MouseModes {
+            report: true,
+            alt_screen: true,
+            alternate_scroll: true,
+        };
+        state.forget_session();
+        assert_eq!(state.mouse, MouseModes::default());
+    }
+
+    /// A program that turned mouse reporting on and then died (`kill -9 htop`) must not leave its
+    /// final screen unselectable: once the pane knows the shell has exited, routing sees the mode
+    /// off, whatever the session last reported.
+    #[test]
+    fn routing_modes_ignores_a_stale_report_mode_once_exited() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.mouse = MouseModes {
+            report: true,
+            alt_screen: false,
+            alternate_scroll: true,
+        };
+        assert!(!state.routing_modes().report, "no session yet: routing ignores it");
+        state.exited = true;
+        assert!(!state.routing_modes().report, "exited: routing ignores it too");
     }
 
     /// Bottom-terminal phase 2: a composition is drawn at the cursor the session reported with the

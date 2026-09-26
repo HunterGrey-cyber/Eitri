@@ -34,6 +34,11 @@ pub struct HostEvents {
     /// as the same thing): what a middle click pastes. Kept apart from `clipboard` (bottom-terminal
     /// phase 2) so an nvim `"*y` inside the terminal does not overwrite what `Ctrl+V` pastes.
     pub primary: Option<String>,
+    /// Text completed by a host selection gesture on drag release. Selection does not pass through
+    /// `Term`'s event stream, so [`Listener`] never populates this field.
+    /// `crate::screen::Screen::take_events` merges it from `pending_selection`.
+    /// On release, the text is copied to both the clipboard and the primary selection.
+    pub selection: Option<String>,
 }
 
 #[derive(Default)]
