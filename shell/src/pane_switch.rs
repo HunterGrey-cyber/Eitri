@@ -76,8 +76,8 @@ use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 
 use crate::layout::Direction;
-pub(crate) use neovibe_core::pane_switch::PaneSwitchChannel;
-use neovibe_core::pane_switch::{accept_pending_directions, sweep_stale_dirs, POLL_INTERVAL};
+use neovibe_core::pane_switch::{accept_pending_messages, sweep_stale_dirs, POLL_INTERVAL};
+pub(crate) use neovibe_core::pane_switch::{PaneMessage, PaneSwitchChannel};
 
 /// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
 /// else is not a direction (the shim only ever sends these four).
@@ -193,8 +193,8 @@ pub(crate) fn open() -> Option<PaneSwitchChannel> {
     PaneSwitchChannel::bind(&shim)
 }
 
-/// Starts polling the socket from the GTK main loop, invoking `on_direction` with one of
-/// `'L'`/`'R'`/`'U'`/`'D'` for each message the shim sends.
+/// Starts polling the socket from the GTK main loop, invoking `on_message` with a direction letter
+/// or a quit-cancelled generation for each message the shim, or a cancelled `:confirm qall`, sends.
 ///
 /// A poll loop on the main thread rather than a background thread with a blocking `accept()`:
 /// the callback has to touch GTK widgets (grabbing focus), which is main-thread-only anyway,
@@ -203,14 +203,14 @@ pub(crate) fn open() -> Option<PaneSwitchChannel> {
 ///
 /// Takes the channel's listener, so a second call on the same channel logs and does nothing rather
 /// than installing a second timer that would race the first for every connection.
-pub(crate) fn listen(channel: &mut PaneSwitchChannel, on_direction: impl Fn(char) + 'static) {
+pub(crate) fn listen(channel: &mut PaneSwitchChannel, on_message: impl Fn(PaneMessage) + 'static) {
     let Some(listener) = channel.take_listener() else {
         eprintln!("[pane_switch] listen() called twice -- ignoring");
         return;
     };
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        for direction in accept_pending_directions(&listener) {
-            on_direction(direction);
+        for message in accept_pending_messages(&listener) {
+            on_message(message);
         }
         glib::ControlFlow::Continue
     });

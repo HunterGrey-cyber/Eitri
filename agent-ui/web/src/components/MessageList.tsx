@@ -5,7 +5,6 @@ import { buildTimeline, isUsableLink } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { renderMarkdown } from "../markdown";
 import { HistoryNotice } from "./HistoryNotice";
-import { NewPill } from "./NewPill";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import type { PermissionDecision } from "../bridge";
@@ -48,6 +47,27 @@ type Props = {
    *  target `gf` reaches from the keyboard (`App.tsx`'s `open-path` action). Absent, clicks inside
    *  the list do nothing beyond React's own defaults (a permission card's buttons, say). */
   onOpenPath?: (ref: PathRef) => void;
+  /** R2's pill, reported upward rather than floated over the last line here (panel round 2 plan,
+   *  Task 10, spec §5.1: "the band's right, `↓N` inverted; never over text"). `label` is the band's
+   *  compact form -- `↓N`, `↓ ⚑` when a card is below the view, or bare `↓` while shown with
+   *  nothing counted yet (`pillShown`'s own "far from the bottom, nothing new" case) -- `null` when
+   *  the pill should not show at all. `jump` is this call's own `jumpToEnd`, safe to invoke any time
+   *  after this fires (it reads `listRef` fresh, not a stale snapshot). `afterSeq` is the current
+   *  `seq` threshold itself (wave 3, Task 3) -- the largest `seq` on screen when following last
+   *  stopped, `null` while following -- reported so a caller can save it across a tab switch
+   *  (`App.tsx`'s `TabViewState.unseenAfterSeq`) and hand it back as `unseenSeed` below. Called every
+   *  time this component recomputes the pill (`updatePill`, below), including with `null` -- the
+   *  caller (the band's `unread` fact) is expected to just hold the latest value, the same way
+   *  `pill`/`setPill` already do internally. */
+  onUnreadChange?: (label: string | null, jump: () => void, afterSeq: number | null) => void;
+  /** Seeds the unread threshold back in on a tab switch (wave 3, Task 3): a tab switch reuses this
+   *  component, so without this the first `updatePill` after a restore falls back to counting from
+   *  the CURRENT timeline length, and a row that arrived while the tab was away is never counted --
+   *  the defect this task fixes. `afterSeq` is the seq threshold to seed (`TabViewState.unseenAfterSeq`
+   *  from the tab just switched TO); `tick` distinguishes one seed from the next so a second switch
+   *  back to the same `afterSeq` still re-fires the effect. `null` for a tab with no saved threshold
+   *  (never parked, or restored at the bottom) -- nothing to seed. */
+  unseenSeed?: { afterSeq: number; tick: number } | null;
 };
 
 /** Whether a finished tool call succeeded, failed, or is still running -- the state a row's sign
@@ -138,6 +158,8 @@ export function MessageList({
   yankedKey = null,
   onAnswerPermission,
   onOpenPath,
+  onUnreadChange,
+  unseenSeed,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   /** The one `ResizeObserver`, on the list and on every child of it (see "Correction (the GUI pass)"
@@ -382,21 +404,44 @@ export function MessageList({
       lastScrollTopRef.current = list.scrollTop;
     }
   };
-  /** Timeline length when following last stopped; `null` while following (R2). */
-  const unseenFromRef = useRef<number | null>(null);
+  /** The largest `seq` on screen when following last stopped; `null` while following (R2).
+   *
+   *  Wave 3, Task 3: this used to be a timeline INDEX (`unseenFromRef`, the timeline's length at the
+   *  moment following stopped), sliced off the CURRENT timeline with `timeline.slice(from)`. That
+   *  broke two ways. First, a tab switch reuses this component (`App.tsx` never remounts it), so the
+   *  first `updatePill` after a restore reset `from` to the just-restored (short) timeline's own
+   *  length -- every row that had arrived while the tab was away sat BELOW that length and was
+   *  silently never counted. Second, even within one tab, `buildTimeline` does not keep the array in
+   *  `seq` order: a permission card anchored to an older tool call is spliced in right after that
+   *  call (see `timeline.ts`), which can land it BEFORE the old length cutoff even though its own
+   *  `seq` -- when it actually arrived -- is far newer than everything after it. A `seq` threshold
+   *  does not care where an item landed in the array, only when it happened. */
+  const unseenAfterSeqRef = useRef<number | null>(null);
   const [pill, setPill] = useState<string | null>(null);
   const updatePill = () => {
     const list = listRef.current;
     if (list === null) return;
     const following = followingRef.current;
-    if (following) unseenFromRef.current = null;
-    else if (unseenFromRef.current === null) unseenFromRef.current = timeline.length;
+    if (following) unseenAfterSeqRef.current = null;
+    // The largest `seq` anywhere in the timeline, not the last element's `seq`: an anchored card can
+    // sit earlier in the array than an item with a lower `seq` that follows it (the ordering
+    // `buildTimeline` deliberately breaks for anchoring), so the tail is not reliably the max. `-1`
+    // when the timeline is empty, so every real `seq` (>= 0) still counts as fresh once something
+    // does arrive.
+    else if (unseenAfterSeqRef.current === null) {
+      unseenAfterSeqRef.current = timeline.reduce((max, item) => (item.seq > max ? item.seq : max), -1);
+    }
     const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
     const shown = pillShown(pill !== null, following, distance);
-    const from = unseenFromRef.current ?? timeline.length;
-    const fresh = timeline.slice(from);
+    const threshold = unseenAfterSeqRef.current;
+    const fresh = threshold === null ? [] : timeline.filter((item) => item.seq > threshold);
     const label = shown ? pillLabel(fresh.length, fresh.some((item) => item.kind === "permission")) : null;
     if (label !== pill) setPill(label);
+    // The band's compact form (panel round 2 plan, Task 10): a card below wins over a count, a
+    // count over the bare arrow -- the same priority `pillLabel` already encodes, just short enough
+    // for a monospace band instead of the floating pill's full words.
+    const cardBelow = fresh.some((item) => item.kind === "permission");
+    onUnreadChange?.(shown ? (cardBelow ? "↓ ⚑" : fresh.length > 0 ? `↓${fresh.length}` : "↓") : null, jumpToEnd, threshold);
   };
   const jumpToEnd = () => {
     const list = listRef.current;
@@ -617,6 +662,31 @@ export function MessageList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
+  /** Wave 3, Task 3: seeds the unread threshold back in when `App.tsx` restores a parked tab's view.
+   *  Declared -- and so run -- AFTER the `[state]` effect above: that effect's own `updatePill()` ran
+   *  first, against whatever `unseenAfterSeqRef` already held (stale from the tab just left, or reset
+   *  to `null` by `followingRef.current` still being `true` from this component's initial mount
+   *  default); this effect's own `updatePill()` call runs after it and is what `onUnreadChange`'s
+   *  caller actually ends up holding. Keyed on `unseenSeed?.tick`, not on `unseenSeed` itself, so a
+   *  second switch back to a tab whose threshold happens to be numerically the same still re-fires --
+   *  see the prop's own doc comment. A LAYOUT effect, and not by accident: `App.tsx`'s own scroll
+   *  restore (`useLayoutEffect` on `[restoreTick]`) is what actually moves `list.scrollTop` to the
+   *  parked position, and child layout effects run before the parent's -- so this must set
+   *  `followingRef.current = false` and the threshold BEFORE that restore runs, or the restore's own
+   *  (later, asynchronous) `scroll` event would recompute the threshold itself from whatever the
+   *  timeline holds by then, rather than from what `App.tsx` remembered. ASSUMES `if (following)
+   *  unseenAfterSeqRef.current = null` above is the only other place this ref is reset -- checked:
+   *  `jumpToEnd` does not touch it directly (it relies on the `scroll` event it provokes reaching
+   *  `onScroll` -> `updatePill`), and the `[state]` effect above only ever calls `updatePill`, never
+   *  writes the ref itself. */
+  useLayoutEffect(() => {
+    if (unseenSeed == null) return;
+    followingRef.current = false;
+    unseenAfterSeqRef.current = unseenSeed.afterSeq;
+    updatePill();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unseenSeed?.tick]);
+
   /* Which tool calls are blocked on a decision the user has not made yet. A turn can have several
      calls of the same tool in flight, so "Bash is waiting" identifies nothing on its own -- this is
      the whole reason `tool_use_id` is carried on a permission request.
@@ -743,7 +813,6 @@ export function MessageList({
         {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
             to get, and following is a snap to `scrollHeight` now (the GUI pass, 2026-09-24). */}
       </div>
-      {pill !== null && <NewPill label={pill} onJump={jumpToEnd} />}
     </>
   );
 }

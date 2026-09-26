@@ -17,12 +17,32 @@ depends:
   - gtk4
   - webkitgtk-6.0
   - neovim
+# A soft dependency (nfpm's `recommends` field, mirroring `depends`'s own base+per-packager shape):
+# the band's mode pill draws `⏵⏵` (U+23F5), which FiraCode Nerd Font does not carry (`fc-list
+# ':charset=23f5'`, 2026-09-26; `index.css`'s `.mode-glyph` falls through several fonts for the same
+# reason). Without one of them the band shows the font's `.notdef` box instead of the glyph -- never
+# a missing package, so `depends` would be too strong. Verified on this host, 2026-09-26:
+# `pacman -Fl noto-fonts | grep Symbols2` -> `usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf`.
+# Debian's `fonts-noto-core` (bookworm) checked online the same day, its own file list page:
+# `/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf`.
+#
+# KNOWN LIMIT: this reaches the .deb only. nfpm's archlinux packager writes `depend` lines and
+# nothing else -- no `optdepend`, and `recommends`/`suggests` are dropped (checked 2026-09-26 by
+# building a throwaway package with this host's nfpm: the .deb's control had `Recommends:`, the
+# .pkg.tar.zst's `.PKGINFO` had only `depend = bash`). So the pacman package declares no font, and
+# on an Arch machine without noto-fonts (or Symbola) the glyph falls to whatever fontconfig picks.
+# A hard `depends: noto-fonts` would close it and is left to the owner, since a missing font costs
+# one glyph, not a working install.
+recommends:
+  - noto-fonts # NotoSansSymbols2: the ⏵⏵ mode glyph (spec 2026-09-26 §9)
 overrides:
   deb:
     depends:
       - libgtk-4-1
       - libwebkitgtk-6.0-4
       - neovim
+    recommends:
+      - fonts-noto-core
 
 contents:
   # All five must land in ONE directory: each companion is located as a sibling of the running

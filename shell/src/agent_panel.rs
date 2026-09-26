@@ -27,8 +27,9 @@ use gtk4::Application;
 use neovibe_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
-    serialize_hello_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage, SessionModeChoice,
+    serialize_hello_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage, SessionModeChoice, TabVerbWire,
 };
+use neovibe_core::keymap::TabAction;
 use neovibe_core::tab_set::{FirstTurn, PendingHandoff, PendingStart, ResumeRoute, StartCollected, Tab, TabBackend};
 use neovibe_core::tabs::TabId;
 use std::cell::RefCell;
@@ -498,6 +499,9 @@ struct AgentPanelState {
     document_ready: bool,
     /// The last `editor_context` envelope sent (ruling 32).
     last_context_payload: Option<String>,
+    /// Where a `tab_verb` message's mapped `TabAction` goes (panel round 2 plan Task 6). `None`
+    /// until `main.rs`'s `AgentPanelHandle::on_tab_verb` installs one.
+    tab_verb_hook: Option<Rc<dyn Fn(TabAction)>>,
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
@@ -724,14 +728,24 @@ impl AgentPanelHandle {
         );
     }
 
-    /// Asks the panel to open its composer with the caret in it. Sent after `Ctrl+l` has moved GTK
-    /// focus into the panel; see `serialize_enter_input_for_js`. Safe before the page loads (the
-    /// dispatch is guarded), in which case there is no composer yet and nothing happens.
+    /// Asks the panel to open its composer with the caret in it. Sent only from the new-tab path
+    /// now (panel round 2 plan Task 6, spec §8); see `serialize_enter_input_for_js`. Safe before
+    /// the page loads (the dispatch is guarded), in which case there is no composer yet and nothing
+    /// happens.
     pub(crate) fn enter_input(&self) {
         self.dispatch(
             neovibe_core::agent_bridge::serialize_enter_input_for_js(),
             "enter-input",
         );
+    }
+
+    /// Where every other keyboard arrival lands: BROWSE, on the last row, following resumed if it
+    /// was, or the view restored as it was left (spec §8, Owner answers Q1). Sent after `Ctrl+l`/a
+    /// tray chip/`prefix a`'s miss have moved GTK focus into the panel (panel round 2 plan Task 6,
+    /// decision 4: reverses 2026-09-19's "control l直接闪cursor"). Mirrors `enter_input` exactly
+    /// except for the envelope it dispatches; safe before the page loads for the same reason.
+    pub(crate) fn arrive(&self) {
+        self.dispatch(neovibe_core::agent_bridge::serialize_arrive_for_js(), "arrive");
     }
 
     /// The `?` overlay's rows (`serialize_keymap_for_js`): recorded for every later `ready`, and
@@ -816,6 +830,14 @@ impl AgentPanelHandle {
         hook: impl Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention) + 'static,
     ) {
         self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
+    }
+
+    /// Where a `tab_verb` message's mapped `TabAction` goes: the same code the prefix's own
+    /// `Action::Tab` arm runs (`main.rs`'s `run_tab_action`, panel round 2 plan Task 6). `None`
+    /// until `main.rs` installs one, which is why `InboundMessage::TabVerb` can be refused.
+    /// `main.rs` installs this once.
+    pub(crate) fn on_tab_verb(&self, hook: impl Fn(TabAction) + 'static) {
+        self.state.borrow_mut().tab_verb_hook = Some(Rc::new(hook));
     }
 }
 
@@ -910,6 +932,21 @@ impl AgentPanelHandle {
             )
         };
         self.dispatch(payload, "confirm-close");
+    }
+
+    /// `<leader>bo` (Owner answers Q2): the footer's y/n prompt over every tab but the active one.
+    /// Nothing to dispatch, and no flash, when the active tab is the only one open -- `<leader>bo`
+    /// with one tab is simply nothing to do, the same as `prefix n`/`p` with one tab (ruling 10 is
+    /// about a verb naming a tab that does not exist, not about this).
+    pub(crate) fn confirm_close_others(&self) {
+        if self.closing() {
+            return;
+        }
+        let Some((tabs, prompt)) = self.state.borrow().tabs.close_others_plan() else {
+            return;
+        };
+        let payload = neovibe_core::agent_bridge::serialize_confirm_close_others_for_js(&tabs, &[prompt]);
+        self.dispatch(payload, "confirm-close-others");
     }
 
     /// `prefix w` (and D10's launch chooser, `launch: true`).
@@ -1165,6 +1202,7 @@ pub(crate) fn build_agent_panel(
         history,
         document_ready: false,
         last_context_payload: None,
+        tab_verb_hook: None,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -2763,6 +2801,87 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             }
             ok(webview);
         }
+        InboundMessage::TabVerb { verb, .. } => match run_tab_verb(state, verb) {
+            Ok(()) => ok(webview),
+            Err(why) => refuse(webview, why),
+        },
+        InboundMessage::CycleDefaultMode { .. } => {
+            // `Shift+Tab` on the chooser's `New session` row or a record (spec §6.3): the window's
+            // remembered default, exactly as `CycleMode` remembers a tab's own mode above.
+            cycle_default_mode(state);
+            send_tabs(state, webview);
+            ok(webview);
+        }
+        InboundMessage::CloseOthers { .. } => {
+            // `y` to `confirm_close_others` (Owner answers Q2): recomputed fresh rather than
+            // trusting the set the prompt was shown with, then `close_tab` -- the same close path
+            // `prefix &`'s own `y` runs -- once per tab.
+            let ids = state
+                .borrow()
+                .tabs
+                .close_others_plan()
+                .map_or_else(Vec::new, |(ids, _)| ids);
+            let mut first_err = None;
+            for id in ids {
+                if let Err(why) = close_tab(state, webview, id) {
+                    first_err.get_or_insert(why);
+                }
+            }
+            match first_err {
+                None => ok(webview),
+                Some(why) => refuse(webview, why),
+            }
+        }
+    }
+}
+
+/// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default, exactly as
+/// `CycleMode`'s arm above does for a tab's own mode -- a failure to write is logged, not refused,
+/// since the mode itself did change. Never touches the WebView, so it is tested directly; the arm
+/// above owns `send_tabs`.
+fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> SessionModeChoice {
+    let mode = state.borrow_mut().tabs.cycle_default_mode();
+    let (prefs_dir, project_dir) = {
+        let state_ref = state.borrow();
+        (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
+    };
+    if let Some(dir) = prefs_dir {
+        if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
+            eprintln!("[agent_panel] could not remember the permission mode: {e}");
+        }
+    }
+    mode
+}
+
+/// `tab_verb`: the hook `main.rs` installs via `on_tab_verb` (`run_tab_action`, panel round 2 plan
+/// Task 6), mapped from the wire shape and called -- or a refusal naming why there is none yet (a
+/// legacy backend at startup, before `main.rs` has wired it). Never touches the WebView, so it is
+/// tested directly.
+fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, verb: TabVerbWire) -> Result<(), &'static str> {
+    // Cloned out in its own statement: a `state.borrow()` in the `match` scrutinee would live to
+    // the end of the `match` (edition 2021), and the hook -- `main.rs`'s `run_tab_action` -- goes
+    // back through this same state with `borrow_mut` (`switch_with`, `new_tab`), which panics.
+    let hook = state.borrow().tab_verb_hook.clone();
+    match hook {
+        Some(hook) => {
+            hook(tab_action_for(verb));
+            Ok(())
+        }
+        None => Err("tab verbs are not wired"),
+    }
+}
+
+/// `tab_verb`'s wire shape to the `TabAction` the prefix's own `Action::Tab` arm runs (spec §10.2).
+fn tab_action_for(verb: TabVerbWire) -> TabAction {
+    match verb {
+        TabVerbWire::Next => TabAction::Next,
+        TabVerbWire::Prev => TabAction::Prev,
+        TabVerbWire::Last => TabAction::Last,
+        TabVerbWire::New => TabAction::New,
+        TabVerbWire::Close => TabAction::Close,
+        TabVerbWire::CloseOthers => TabAction::CloseOthers,
+        TabVerbWire::Choose => TabAction::Choose,
+        TabVerbWire::Info => TabAction::Info,
     }
 }
 
@@ -3097,6 +3216,138 @@ mod tests {
         assert_eq!(error.message, "no active session");
     }
 
+    /// A minimal `AgentPanelState` for tests that only care about window-level hooks (`tab_verb`)
+    /// and never touch the WebView, which lives on `AgentPanelHandle` and not on this struct --
+    /// so no display is required to run them.
+    fn state_for_hooks(tabs: TabSet) -> Rc<RefCell<AgentPanelState>> {
+        Rc::new(RefCell::new(AgentPanelState {
+            tabs,
+            editor_context: Rc::new(|| None),
+            backend_kind: BackendKind::Sidecar,
+            project_dir: PathBuf::new(),
+            canonical_project_dir: String::new(),
+            prefs_dir: None,
+            supervisor: None,
+            supervisor_pending: None,
+            shutting_down: false,
+            theme: neovibe_core::theme::ThemeTokens::fallback(),
+            keymap_help: None,
+            pane_focused: false,
+            hint_hook: None,
+            attention_hook: None,
+            last_tabs_payload: None,
+            last_open_ids: Vec::new(),
+            launch_chooser_allowed: false,
+            launch_chooser_done: false,
+            launch_chooser_hook: None,
+            chooser_closed_hook: None,
+            scratch: None,
+            pending_edits: Vec::new(),
+            editor_request_hook: None,
+            editor_done_hook: None,
+            retiring: Retiring::default(),
+            history_dir: None,
+            rules_dir: None,
+            history: Vec::new(),
+            document_ready: false,
+            last_context_payload: None,
+            tab_verb_hook: None,
+        }))
+    }
+
+    /// Panel round 2 plan Task 6: `tab_verb` refuses naming why until `main.rs` installs a hook
+    /// (`AgentPanelHandle::on_tab_verb`), and once one is installed it is called with the mapped
+    /// `TabAction` -- every wire value, not just one, since a mapping this exhaustive is easy to
+    /// get wrong silently for the one case nobody wrote a test for.
+    #[test]
+    fn tab_verb_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_action() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        assert_eq!(run_tab_verb(&state, TabVerbWire::Close), Err("tab verbs are not wired"));
+
+        let seen: Rc<RefCell<Vec<TabAction>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            state.borrow_mut().tab_verb_hook = Some(Rc::new(move |action| seen.borrow_mut().push(action)));
+        }
+        for (verb, action) in [
+            (TabVerbWire::Next, TabAction::Next),
+            (TabVerbWire::Prev, TabAction::Prev),
+            (TabVerbWire::Last, TabAction::Last),
+            (TabVerbWire::New, TabAction::New),
+            (TabVerbWire::Close, TabAction::Close),
+            (TabVerbWire::CloseOthers, TabAction::CloseOthers),
+            (TabVerbWire::Choose, TabAction::Choose),
+            (TabVerbWire::Info, TabAction::Info),
+        ] {
+            assert_eq!(run_tab_verb(&state, verb), Ok(()));
+            assert_eq!(seen.borrow_mut().pop(), Some(action), "{verb:?} -> {action:?}");
+        }
+    }
+
+    /// The whole-branch review: the product hook (`main.rs`'s `run_tab_action`) re-enters this
+    /// same state with `borrow_mut` (`switch_with`, `new_tab`). `run_tab_verb` must not still hold
+    /// its own borrow while the hook runs, or every panel tab key panics on the GTK thread.
+    #[test]
+    fn tab_verb_hook_may_borrow_the_panel_state_mutably() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        let ran = Rc::new(RefCell::new(0usize));
+        {
+            let weak = Rc::downgrade(&state);
+            let ran = ran.clone();
+            state.borrow_mut().tab_verb_hook = Some(Rc::new(move |_action| {
+                let state = weak.upgrade().expect("state alive");
+                let _guard = state.borrow_mut();
+                *ran.borrow_mut() += 1;
+            }));
+        }
+        assert_eq!(run_tab_verb(&state, TabVerbWire::Next), Ok(()));
+        assert_eq!(*ran.borrow(), 1);
+    }
+
+    /// Panel round 2 plan Task 6, spec §6.3: `CycleDefaultMode` moves the window's remembered
+    /// default (not any open tab's own mode -- `tab_set`'s own test already pins that half) and
+    /// remembers it on disk exactly as `CycleMode`'s arm does, readable back by `load_mode`.
+    #[test]
+    fn cycle_default_mode_moves_the_default_and_remembers_it_on_disk() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-cycle-default-mode");
+        let prefs_dir = dir.join("prefs");
+        let project_dir = dir.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let open_tab = set.active();
+        let state = state_for_hooks(set);
+        state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
+        state.borrow_mut().project_dir = project_dir.clone();
+
+        let mode = cycle_default_mode(&state);
+        assert_eq!(
+            mode,
+            SessionModeChoice::Bypass,
+            "Auto -> Bypass is the only other implemented mode"
+        );
+        assert_eq!(state.borrow().tabs.default_mode(), mode);
+        // Never the open tab's own mode (still `NotStarted`, so `cycle_mode` alone would move it;
+        // `cycle_default_mode` must not).
+        assert_eq!(set_mode(&state, open_tab), SessionModeChoice::Auto);
+        assert_eq!(
+            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            neovibe_core::agent_prefs::LoadedMode::Remembered(mode)
+        );
+    }
+
+    /// `cycle_default_mode`'s own reading of a tab's mode field, without going through
+    /// `TabSet::cycle_mode` (which would change it): a thin accessor so the test above can assert
+    /// on the untouched tab without reaching into a private field from two call sites.
+    fn set_mode(state: &Rc<RefCell<AgentPanelState>>, tab: TabId) -> SessionModeChoice {
+        state.borrow().tabs.get(tab).unwrap().mode
+    }
+
     /// Review focus 3 (spec §3.5): every worker is counted, and a worker that died (dropped its
     /// sender without reporting) neither hangs the collector nor counts as finished.
     #[test]
@@ -3146,7 +3397,13 @@ mod tests {
     #[test]
     fn ready_sends_the_history_and_the_editor_context_before_the_tabs() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js("Ctrl+b", &[], &[]);
+        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js(
+            "Ctrl+b",
+            &[],
+            &[],
+            &neovibe_core::keymap::panel::effective(&Default::default(), None).0,
+            "Ctrl+b c",
+        );
         let window = vec![
             neovibe_core::agent_bridge::serialize_history_for_js(&["earlier".into()]),
             neovibe_core::agent_bridge::serialize_editor_context_for_js(None),
@@ -3236,7 +3493,13 @@ mod tests {
     #[test]
     fn ready_sends_hello_theme_keymap_tabs_then_the_active_tabs_state() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js("Ctrl+b", &[], &[]);
+        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js(
+            "Ctrl+b",
+            &[],
+            &[],
+            &neovibe_core::keymap::panel::effective(&Default::default(), None).0,
+            "Ctrl+b c",
+        );
         let snapshot = r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string();
         let payloads = ready_payloads(
             legacy_greeting(),
@@ -3633,7 +3896,13 @@ mod tests {
     #[test]
     fn the_keymap_follows_the_theme() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
-        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js("Ctrl+b", &[], &[]);
+        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js(
+            "Ctrl+b",
+            &[],
+            &[],
+            &neovibe_core::keymap::panel::effective(&Default::default(), None).0,
+            "Ctrl+b c",
+        );
         assert_eq!(
             kinds(&ready_payloads(
                 legacy_greeting(),
@@ -3682,6 +3951,7 @@ mod tests {
                     name: None,
                 },
             ],
+            account: None,
         };
         let command = a_command();
         // The tab set's `open_session_ids` includes a handed-off session (ruling 13).

@@ -135,10 +135,34 @@ impl ToggleAction {
 ///   be waited for): the pane's frame is the only place that says so.
 ///
 /// A shell that never started (an exec error) is not an end at all -- the pane shows the error in
-/// its own frame (`pane::ensure_session`) and never reaches this. Nor is the terminal closed when it
-/// is the last module on screen: the kill is refused there, and the notice stays.
+/// its own frame (`pane::ensure_session`) and never reaches this.
+///
+/// As the last module on screen, this is not the layout's kill to make (`neovibe_core::layout::kill`
+/// refuses the last one, as a hide does): it closes the window instead, tmux's own last-pane rule,
+/// through the ordinary close path -- `close window? N running (y/n)` when a tab runs, and `n`
+/// leaves everything, this terminal and its notice included ([`OnExit`], task 6, 2026-09-26).
 pub(crate) fn closes_on_exit(exit: &ExitInfo) -> bool {
     !exit.detached && (exit.code.is_some() || exit.signal.is_some())
+}
+
+/// What a shell's own end does with the module ([`closes_on_exit`]'s `true` case), by
+/// `neovibe_core::layout::can_kill`'s answer for it: another module is on screen, so the layout can
+/// take this one off it ([`KillScope::Module`]); or it is the last one, so ending it closes the
+/// window instead and the module itself is left alone until that really happens
+/// ([`KillScope::Window`]) -- `main.rs`'s `on_shell_exit` reads this rather than repeating the
+/// match, and its own test pins which scope means which.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OnExit {
+    CloseModule,
+    CloseWindow,
+}
+
+pub(crate) fn on_exit(scope: neovibe_core::layout::KillScope) -> OnExit {
+    use neovibe_core::layout::KillScope;
+    match scope {
+        KillScope::Module => OnExit::CloseModule,
+        KillScope::Window => OnExit::CloseWindow,
+    }
 }
 
 /// Where `Ctrl+a Ctrl+a` hands its literal `Ctrl+a`.
@@ -373,6 +397,13 @@ mod tests {
         assert!(closes_on_exit(&exit(None, Some(9), false)), "kill -9");
         assert!(!closes_on_exit(&exit(None, None, true)), "exec nohup: still running");
         assert!(!closes_on_exit(&ExitInfo::UNKNOWN), "the session thread failed");
+    }
+
+    #[test]
+    fn on_exit_reads_can_kills_scope() {
+        use neovibe_core::layout::KillScope;
+        assert_eq!(on_exit(KillScope::Module), OnExit::CloseModule);
+        assert_eq!(on_exit(KillScope::Window), OnExit::CloseWindow);
     }
 
     #[test]

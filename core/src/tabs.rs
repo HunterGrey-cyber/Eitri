@@ -221,6 +221,29 @@ pub fn window_close_prompt(running: usize, queued: usize) -> Option<String> {
     Some(format!("close window? {} (y/n)", parts.join(", ")))
 }
 
+/// `<leader>bo` (panel round 2 plan's Owner answers Q2, "yes"): every tab but `active`, and the one
+/// y/n naming how many close and how many of them are running, e.g. `close 3 other tabs? 1 running
+/// (y/n)`. `entries` is every open tab's id paired with whether it is running (a turn in progress,
+/// or still connecting -- the same test `TabSet::running_count` uses). `None` when there is nothing
+/// to close (the active tab is the only one open): the caller should not prompt at all, the same as
+/// `window_close_prompt`'s `None` for "nothing running or queued".
+pub fn close_others(entries: &[(TabId, bool)], active: TabId) -> Option<(Vec<TabId>, String)> {
+    let others: Vec<(TabId, bool)> = entries.iter().copied().filter(|(id, _)| *id != active).collect();
+    if others.is_empty() {
+        return None;
+    }
+    let count = others.len();
+    let running = others.iter().filter(|(_, running)| *running).count();
+    let ids = others.into_iter().map(|(id, _)| id).collect();
+    let plural = if count == 1 { "tab" } else { "tabs" };
+    let mut prompt = format!("close {count} other {plural}?");
+    if running > 0 {
+        prompt.push_str(&format!(" {running} running"));
+    }
+    prompt.push_str(" (y/n)");
+    Some((ids, prompt))
+}
+
 /// The tray's `agent ⚑N` sums every tab's cards and is unread if any tab is (spec §3.7).
 pub fn sum_attention(each: &[Attention]) -> Attention {
     each.iter().fold(Attention::default(), |sum, a| Attention {
@@ -440,6 +463,32 @@ mod tests {
             window_close_prompt(0, 3).as_deref(),
             Some("close window? 3 queued (y/n)")
         );
+    }
+
+    #[test]
+    fn close_others_names_the_count_and_how_many_run_and_never_includes_the_active_tab() {
+        let entries = [
+            (TabId(1), false),
+            (TabId(2), true),
+            (TabId(3), false),
+            (TabId(4), false),
+        ];
+        let (ids, prompt) = close_others(&entries, TabId(1)).unwrap();
+        assert_eq!(ids, vec![TabId(2), TabId(3), TabId(4)], "never the active tab");
+        assert_eq!(prompt, "close 3 other tabs? 1 running (y/n)");
+    }
+
+    #[test]
+    fn close_others_omits_the_running_clause_when_none_are_and_singularizes_one() {
+        let entries = [(TabId(1), false), (TabId(2), false)];
+        let (ids, prompt) = close_others(&entries, TabId(1)).unwrap();
+        assert_eq!(ids, vec![TabId(2)]);
+        assert_eq!(prompt, "close 1 other tab? (y/n)");
+    }
+
+    #[test]
+    fn close_others_is_none_with_only_one_tab_open() {
+        assert_eq!(close_others(&[(TabId(1), false)], TabId(1)), None);
     }
 
     #[test]

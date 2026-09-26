@@ -2545,6 +2545,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "mlua",
+ "rmpv",
  "serde",
  "serde_json",
  "uuid",

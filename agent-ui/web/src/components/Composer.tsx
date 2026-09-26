@@ -303,6 +303,13 @@ export function Composer({
               }}
             />
           )}
+          {/* Claude Code's own shell-prompt look (panel round 2 plan, Task 10; spec §5.1, `mock:
+              bottom.html` B `.b-comp`): a bare `❯` line replaces the textarea's bordered box.
+              Plain `--nv-fg` (`index.css`'s own `.composer-prompt` doc comment explains why it is
+              not a mode colour). */}
+          <span className="composer-prompt" aria-hidden="true">
+            ❯
+          </span>
           <textarea
             ref={textareaRef}
             value={text}
@@ -370,14 +377,21 @@ export function Composer({
         // It reads like the empty box it stands in for, not like an instruction: the owner asked for
         // the "按 i 开始输入" line to go (2026-09-19), since Ctrl+l now opens the composer anyway.
         // `i`, a click and Tab still reach INPUT from here exactly as before.
-        <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
-          {text.trim() === "" ? (
-            "Ask the agent..."
-          ) : (
-            <span className="composer-draft">{twoLines(text)}</span>
-          )}
-          {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
-        </div>
+        // The r2-gui GUI pass (2026-09-26): the same bare `❯` line INPUT draws (`mock: bottom.html`
+        // B), so the bottom keeps its shape across `i`/`Esc`; the band's mode block is the mode.
+        <>
+          <span className="composer-prompt" aria-hidden="true">
+            ❯
+          </span>
+          <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
+            {text.trim() === "" ? (
+              "Ask the agent..."
+            ) : (
+              <span className="composer-draft">{twoLines(text)}</span>
+            )}
+            {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
+          </div>
+        </>
       )}
       {/* No Send/Stop buttons here (spec §3.4, removed panel-as-document task 6 fix round 1):
           Enter still sends and Shift+Enter still inserts a newline (both handled above), and Stop

@@ -19,6 +19,22 @@ it("lists every row, marks the current one, and closes on a backdrop click only"
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
+it("draws a trailing Continue in a terminal row only when onHandoff is given, and it calls it on click (panel round 2 plan, Task 10)", () => {
+  const rows = [{ label: "account", value: "work" }];
+  const withoutHandoff = render(<DetailPopover rows={rows} current={0} onClose={() => {}} />);
+  expect(withoutHandoff.container.textContent).not.toContain("Continue in a terminal");
+  withoutHandoff.unmount();
+
+  const onHandoff = vi.fn();
+  const { container } = render(<DetailPopover rows={rows} current={1} onClose={() => {}} onHandoff={onHandoff} />);
+  const trs = container.querySelectorAll("tr");
+  expect(trs.length).toBe(2);
+  expect(trs[1].textContent).toContain("Continue in a terminal");
+  expect(trs[1].getAttribute("aria-current")).toBe("true");
+  fireEvent.click(trs[1]);
+  expect(onHandoff).toHaveBeenCalledTimes(1);
+});
+
 it("keeps the current row in view as j/k move it (the phase-3 GUI pass, 2026-09-25)", () => {
   // Seen in the sandbox: with phase 3's rows the table outgrew a short panel, and `j` walked the
   // highlight off the bottom with nothing scrolling after it.

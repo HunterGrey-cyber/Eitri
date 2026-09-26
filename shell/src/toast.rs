@@ -16,8 +16,9 @@ use neovibe_core::attention::Attention;
 /// How long a toast stays up; a new one restarts it.
 pub(crate) const TOAST_FOR: Duration = Duration::from_secs(4);
 
-/// The toast's distance from the edge of what it sits over.
-const TOAST_MARGIN: i32 = 8;
+/// The toast's distance from the edge of what it sits over. Also `close_prompt`'s corner margin
+/// when the top bar is hidden (Immersive) -- the two overlay labels share one Immersive fallback.
+pub(crate) const TOAST_MARGIN: i32 = 8;
 
 /// How far below the window's top the toast sits: under the top bar while the bar is drawn, so it
 /// never covers the tray chip it announces; at the top when Immersive hides the bar.

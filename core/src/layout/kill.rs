@@ -25,11 +25,35 @@ use super::geometry::{hide, Frame};
 use super::module::{ModuleId, Placement};
 use super::tree::{place_new, Layout, LayoutError};
 
-/// What `shell` types into nvim to kill the editor: `:confirm qall`, so unsaved buffers get nvim's
-/// own prompt, through `<Cmd>` so a cancelled prompt leaves nvim in the mode it was in. Here rather
-/// than in `shell`, whose sources hold no key-notation literal (its
-/// `shell_src_writes_no_accelerator_literal`).
-pub const EDITOR_QUIT_KEYS: &str = "<Cmd>confirm qall<CR>";
+/// What `shell` types into nvim to kill the editor: one `<Cmd>lua` line, through `<Cmd>` so a
+/// cancelled prompt leaves nvim in the mode it was in, that carries `generation` -- the kill's own
+/// number, bumped by `shell` before each send (`kill_pane::QuitInFlight`) -- so a cancel can be told
+/// apart from a later, different kill of the same editor.
+///
+/// It has to be exactly one `<Cmd>…<CR>` with no other `<` inside: a second `<Cmd>…<CR>` queued
+/// right after `:confirm qall` in the same `send_keys` call would sit in nvim's typeahead and be
+/// read as the **answer** to the dialog `:confirm qall` just opened, not as a separate command --
+/// and `nvim_input` (what `send_keys` goes through) parses `<...>` key notation, so any other `<` in
+/// the Lua source itself would be misread the same way. Here rather than in `shell`, whose sources
+/// hold no key-notation literal (`shell_src_writes_no_accelerator_literal`).
+///
+/// `pcall(vim.cmd, 'confirm qall')` returns only when nvim did NOT exit (a genuine quit ends the
+/// process before any Lua after it can run) -- cancelled, interrupted with `Ctrl+c`, or stopped by a
+/// user `QuitPre`/`ExitPre` autocommand that errors, all three swallowed by the `pcall` the same way.
+/// Only then is the generation written, on the pane-switch socket (`NEOVIBE_PANE_SWITCH_SOCKET`,
+/// already set on the nvim child for `vim-tmux-navigator`) rather than a socket of its own -- the
+/// Global Constraints forbid adding a new one -- mirroring `core/src/theme/nvim_theme.lua`'s own
+/// `send()`: `pcall(vim.fn.sockconnect, 'pipe', p, {rpc = false})`, then a `pcall`-wrapped
+/// `chansend` (an unprotected one would raise E5108 in the user's editor on a failed write) and
+/// `chanclose`.
+pub fn editor_quit_keys(generation: u32) -> String {
+    format!(
+        "<Cmd>lua pcall(vim.cmd, 'confirm qall') \
+         local p = os.getenv('NEOVIBE_PANE_SWITCH_SOCKET') \
+         if p then local ok, c = pcall(vim.fn.sockconnect, 'pipe', p, {{rpc = false}}) \
+         if ok and c ~= 0 then pcall(vim.fn.chansend, c, 'Q {generation}\\n') pcall(vim.fn.chanclose, c) end end<CR>"
+    )
+}
 
 /// Where a killed module is left (the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +184,43 @@ mod tests {
         assert_eq!(arrange(&layout, &frame()).rect_of(&term()).unwrap().h, 240);
     }
 
+    /// The first launch with a Lua `side` panel too, terminal `BelowRoot` before it (task 6's own
+    /// equivalence check, brief step 1): `[editor | agent] | side`, terminal below `[editor | agent]`
+    /// only.
+    fn with_terminal_and_side() -> Layout {
+        Layout::initial(&[
+            ModuleDecl {
+                id: term(),
+                placement: Placement::BelowRoot,
+            },
+            ModuleDecl {
+                id: ModuleId::lua("side"),
+                placement: Placement::RightOfRoot,
+            },
+        ])
+        .unwrap()
+    }
+
+    /// A terminal moved next to the side panel and killed there with `Reopen::At(BelowEditorAndAgent)`
+    /// comes back under `[editor | agent]` only, producing exactly the tree a first launch with the
+    /// same terminal and side panel builds -- not full width below the side panel too, which
+    /// `Reopen::At(BelowRoot)` would give it.
+    #[test]
+    fn a_killed_terminal_reopens_below_editor_and_agent_not_below_the_side_panel() {
+        let mut layout = with_terminal_and_side();
+        place(&mut layout, &term(), &ModuleId::lua("side"), Axis::Row).unwrap();
+        assert_eq!(
+            kill(
+                &mut layout,
+                &term(),
+                Reopen::At(Placement::BelowEditorAndAgent),
+                &frame()
+            ),
+            Ok(Some(ModuleId::lua("side")))
+        );
+        assert_eq!(layout.root(), with_terminal_and_side().root());
+    }
+
     /// The pin the bottom row had settled goes with the old split: the next show settles anew.
     #[test]
     fn a_killed_bottom_row_forgets_its_pinned_height() {
@@ -220,8 +281,14 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_is_asked_to_confirm_before_it_quits() {
-        assert_eq!(EDITOR_QUIT_KEYS, "<Cmd>confirm qall<CR>");
+    fn the_editor_quit_is_one_cmd_line_carrying_its_generation() {
+        let keys = editor_quit_keys(7);
+        assert!(keys.starts_with("<Cmd>lua "), "{keys}");
+        assert!(keys.ends_with("<CR>"), "{keys}");
+        assert!(keys.contains("confirm qall"), "{keys}");
+        assert!(keys.contains(r"'Q 7\n'"), "{keys}");
+        assert_eq!(keys.matches('<').count(), 2, "only <Cmd> and <CR>: {keys}");
+        assert_ne!(editor_quit_keys(7), editor_quit_keys(8));
     }
 
     /// Gone: never shown, placed, focused or offered in the tray again in this window.

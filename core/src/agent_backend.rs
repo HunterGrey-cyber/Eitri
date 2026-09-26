@@ -752,6 +752,10 @@ pub struct BackendGreeting {
     /// each level of the ladder is a real title from a real source, and a row with none still shows
     /// its id and its timestamps rather than an invented label.
     pub resumable: Vec<ResumableSession>,
+    /// The configured Claude account's name (`agent::account::configured`), `null` when none is
+    /// set (panel round 2 plan's §7, Task 5). Read, never written, here -- the same asymmetry as
+    /// `expected_verdandi_revision`.
+    pub account: Option<String>,
 }
 
 impl BackendGreeting {
@@ -792,6 +796,7 @@ impl BackendGreeting {
         } else {
             Vec::new()
         };
+        let account = agent::account::configured().map(|a| a.name().to_string());
         match kind {
             BackendKind::Legacy => Self {
                 kind,
@@ -799,6 +804,7 @@ impl BackendGreeting {
                 permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
                 expected_verdandi_revision: None,
                 resumable,
+                account,
             },
             BackendKind::Sidecar => Self {
                 kind,
@@ -806,6 +812,7 @@ impl BackendGreeting {
                 permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
                 expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
                 resumable,
+                account,
             },
         }
     }

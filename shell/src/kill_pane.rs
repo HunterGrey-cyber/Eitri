@@ -72,6 +72,22 @@ pub(crate) enum EditorQuit {
     Window { confirmed: Option<String> },
 }
 
+/// A kill of the editor in flight, keyed by the generation `main.rs` bumped before sending it
+/// (`editor_quit_keys(generation)`): what the kill is for, and which one it was, so a cancel's own
+/// generation can be told apart from a later, different kill of the same editor
+/// ([`clear_if_cancelled`]).
+pub(crate) type QuitInFlight = Option<(u32, EditorQuit)>;
+
+/// Clears the kill in flight if `generation` is its own; a letter from an earlier, already
+/// superseded kill leaves a newer one alone. Returns whether it cleared.
+pub(crate) fn clear_if_cancelled(quitting: &mut QuitInFlight, generation: u32) -> bool {
+    if quitting.as_ref().is_some_and(|(g, _)| *g == generation) {
+        *quitting = None;
+        return true;
+    }
+    false
+}
+
 /// Whether a window close after a `y` to [`KillScope::Window`] may skip its own y/n. `confirmed` is
 /// the window close's prompt (`neovibe_core::tabs::window_close_prompt`) as it stood when the kill
 /// was asked, `now` as it stands at the close: the editor's close waits for nvim, whose own
@@ -85,7 +101,10 @@ pub(crate) fn close_is_confirmed(confirmed: Option<&str>, now: Option<&str>) -> 
 /// panels as `init.lua` registered them.
 pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     match id.kind() {
-        ModuleKind::Terminal => Reopen::At(Placement::BelowRoot),
+        // `BelowEditorAndAgent`, not `BelowRoot`: a terminal killed next to a Lua `side` panel
+        // comes back under `[editor | agent]` only (as a first launch puts it), not full width
+        // below the side panel too (`neovibe_core::layout::tree::place_new`'s own doc, task 6).
+        ModuleKind::Terminal => Reopen::At(Placement::BelowEditorAndAgent),
         ModuleKind::LuaWebview => decls
             .iter()
             .find(|d| d.id == *id)
@@ -95,13 +114,50 @@ pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     }
 }
 
-/// The nvim command a kill of the editor types (`neovibe_core::layout::kill::EDITOR_QUIT_KEYS`: in
+/// The nvim command a kill of the editor types (`neovibe_core::layout::kill::editor_quit_keys`: in
 /// core, because `shell/src` holds no key-notation literal, `shell_src_writes_no_accelerator_literal`).
-pub(crate) use neovibe_core::layout::kill::EDITOR_QUIT_KEYS;
+pub(crate) use neovibe_core::layout::kill::editor_quit_keys;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_quit_clears_its_own_kill() {
+        let mut quitting: QuitInFlight = Some((3, EditorQuit::Module));
+        assert!(clear_if_cancelled(&mut quitting, 3));
+        assert_eq!(quitting, None);
+
+        let mut quitting: QuitInFlight = Some((
+            3,
+            EditorQuit::Window {
+                confirmed: Some("x".into()),
+            },
+        ));
+        assert!(clear_if_cancelled(&mut quitting, 3));
+        assert_eq!(quitting, None);
+    }
+
+    #[test]
+    fn a_late_letter_from_an_earlier_kill_leaves_the_newer_one() {
+        let mut quitting: QuitInFlight = Some((4, EditorQuit::Module));
+        assert!(!clear_if_cancelled(&mut quitting, 3));
+        assert_eq!(quitting, Some((4, EditorQuit::Module)));
+    }
+
+    #[test]
+    fn a_letter_with_nothing_in_flight_changes_nothing() {
+        let mut quitting: QuitInFlight = None;
+        assert!(!clear_if_cancelled(&mut quitting, 1));
+        assert_eq!(quitting, None);
+    }
+
+    #[test]
+    fn a_letter_from_the_future_is_not_this_kill() {
+        let mut quitting: QuitInFlight = Some((2, EditorQuit::Module));
+        assert!(!clear_if_cancelled(&mut quitting, 5));
+        assert_eq!(quitting, Some((2, EditorQuit::Module)));
+    }
 
     /// tmux's own text, with the module's name where tmux puts the pane's number.
     #[test]
@@ -189,7 +245,10 @@ mod tests {
             id: ModuleId::lua("side"),
             placement: Placement::RightOfRoot,
         }];
-        assert_eq!(reopen(&ModuleId::terminal(), &decls), Reopen::At(Placement::BelowRoot));
+        assert_eq!(
+            reopen(&ModuleId::terminal(), &decls),
+            Reopen::At(Placement::BelowEditorAndAgent)
+        );
         assert_eq!(
             reopen(&ModuleId::lua("side"), &decls),
             Reopen::At(Placement::RightOfRoot)

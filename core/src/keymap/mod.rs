@@ -5,11 +5,16 @@
 
 pub mod action;
 pub mod key;
+pub mod panel;
 pub mod root;
 pub mod stock;
 pub mod table;
 
 pub use action::{Action, ActionError, OptValue, Parsed, SwapTarget, TabAction, TextChange};
 pub use key::{Chord, KeyName, KeyParseError, KeySpec};
+pub use panel::{
+    default_bindings, effective, parse_action, parse_seq, reserved, LeaderSource, PanelAction, PanelBinding, PanelKey,
+    PanelKeymap, PanelSeq, PanelSource, PanelUserTable, DEFAULT_GROUPS,
+};
 pub use root::HelpRow;
 pub use table::{check_command_keybinding, Binding, Keymap, KeymapError, KeymapOp, Source};

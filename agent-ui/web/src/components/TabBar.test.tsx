@@ -10,12 +10,15 @@ beforeAll(() => {
 });
 
 const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({
-  id, number: id, label: `${id} new`, name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: true, failure: null, ...over,
+  id, number: id, label: `${id} new`, name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: true, failure: null, title: null, ...over,
 });
 const TABS = [tab(1, { label: "1 fix-parser", marker: "needs_input", pending: 1 }), tab(2, { label: "2 docs", marker: "unread" }), tab(3, { label: "3 new", marker: "ended", state: "ended" })];
 
 function renderBar(over: Partial<Parameters<typeof TabBar>[0]> = {}) {
-  const props = { tabs: TABS, active: 2, renaming: null, onSelect: vi.fn(), onRenameCommit: vi.fn(), onRenameCancel: vi.fn(), ...over };
+  const props = {
+    tabs: TABS, active: 2, renaming: null, focusRequest: 0,
+    onSelect: vi.fn(), onRenameCommit: vi.fn(), onRenameCancel: vi.fn(), ...over,
+  };
   return { props, ...render(<TabBar {...props} />) };
 }
 
@@ -59,5 +62,19 @@ describe("TabBar", () => {
     fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
     expect(props.onRenameCommit).not.toHaveBeenCalled();
     expect(props.onRenameCancel).not.toHaveBeenCalled();
+  });
+
+  /** Wave 3 Task 1: `App` bumps `focusRequest` on `pane_focus` regaining focus so a rename field
+   *  that lost DOM focus (a GTK round trip) gets it back, without re-selecting the typed text. */
+  it("focusRequest re-focuses the rename input after focus moved elsewhere", () => {
+    const { container, props, rerender } = renderBar({ renaming: { tab: 2, initial: "docs" } });
+    expect(document.activeElement).toBe(container.querySelector<HTMLInputElement>(".tab-rename"));
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+    rerender(<TabBar {...props} focusRequest={1} />);
+    expect(document.activeElement).toBe(container.querySelector<HTMLInputElement>(".tab-rename"));
+    document.body.removeChild(outside);
   });
 });

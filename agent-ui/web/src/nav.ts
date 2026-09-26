@@ -28,6 +28,38 @@ export const STOP_ATTR = "data-nav-stop";
  *  own letter-per-path footer list -- the panel has never needed its own copy of this until now. */
 export const HINT_ALPHABET = "asdjklghweruio";
 
+/** Whether `el` is, or sits inside, a control a key press ACTIVATES by default -- a `<button>`, a
+ *  `<summary>`, a link, or anything wearing `role="button"`.
+ *
+ *  This is the second half of "the panel does not own every keystroke inside its own subtree", and
+ *  it is not a theoretical one. Enter's default action on a focused `<button>` *is* its activation
+ *  click; there is no separate click event to let through. So a keydown handler that claims Enter
+ *  from any non-editable target and calls `preventDefault()` does not merely also do something
+ *  else -- it silently DELETES the button's activation.
+ *
+ *  **Observed on an installed build before it was fixed** (2026-09-18, the owner: "approve 现在没有
+ *  键位能够触及好像"). Tab-to-Approve then Enter is the only keyboard route to a permission
+ *  decision today -- the spec's `a`/`d` allow/deny keys belong to a later sub-project and are
+ *  deliberately not in this keyboard skeleton -- and this panel's own `onKeyDown` had taken it
+ *  away. Before this branch nothing listened for Enter at all, so the route worked; the branch
+ *  created the hole and the fix restores exactly what was there, rather than pulling the later
+ *  sub-project's keys forward to paper over it.
+ *
+ *  The same applies to Space on a button and to Enter on `<summary>` (the generic tool card's
+ *  disclosure, `toolRegistry.tsx`), which is why this is a selector over activatable controls and
+ *  not a special case for Enter. `closest`, not a tag check: a real click target is usually a
+ *  `<strong>`/`<span>` INSIDE the button, and focus-then-Enter dispatches the keydown at the
+ *  button itself -- both have to bail.
+ *
+ *  Moved here from `App.tsx` (fix round 1, panel round 2 plan Task 12+13, reviewer finding: Space
+ *  never reached the leader engine on the empty tab's dashboard, because the leader engine lived
+ *  only in `App.tsx` and could not be imported into `EmptyTab.tsx` without a circular import back
+ *  into the component that renders it). `nav.ts` already sits below both without importing either. */
+export function isActivatableControl(el: EventTarget | null): el is HTMLElement {
+  if (!(el instanceof HTMLElement)) return false;
+  return el.closest("button, summary, a[href], [role=button]") !== null;
+}
+
 const CONTROL_SELECTOR =
   'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [role="radio"]:not([aria-disabled="true"])';
 

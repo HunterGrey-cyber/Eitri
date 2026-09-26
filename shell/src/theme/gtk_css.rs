@@ -187,14 +187,15 @@ window {{
     font-size: 12px;
 }}
 
-/* The window-close y/n (session tabs spec §3.5, D11 A): `.module-toast`'s own colours, `shell::
-   close_prompt`'s own widget. */
+/* The window-close y/n (session tabs spec §3.5, D11 A) and `prefix x`'s kill y/n (2026-09-26,
+   Task 5): `.module-toast`'s own colours, `shell::close_prompt`'s own widget. Sized to sit inside
+   the top bar's own strip, where the prefix strip just drew (`close_prompt::prompt_origin`). */
 .close-prompt {{
     background-color: {chrome};
     color: {chrome_fg};
     border: 1px solid {border};
-    border-radius: 6px;
-    padding: 8px 12px;
+    border-radius: 4px;
+    padding: 2px 8px;
     font-size: 12px;
 }}
 

@@ -1,0 +1,83 @@
+-- neovibe nvim-keys feed (spec 2026-09-26 §3). Loaded with --cmd before the user's config; installs
+-- autocommands and one dict watcher, changes no setting and no mapping. Writes one JSON line per
+-- report to NEOVIBE_KEYS_SOCKET, only when the report differs from the last one sent.
+local socket = vim.env.NEOVIBE_KEYS_SOCKET
+if not socket or socket == "" then
+  return
+end
+
+local MAX_MAPS, MAX_TEXT = 2000, 200
+local last, scheduled = nil, false
+
+local function cut(s)
+  if type(s) ~= "string" then
+    return nil
+  end
+  return vim.fn.strcharpart(s, 0, MAX_TEXT)
+end
+
+local function report()
+  local maps = {}
+  for _, m in ipairs(vim.api.nvim_get_keymap("n")) do
+    local lhs = vim.fn.keytrans(m.lhsraw or m.lhs)
+    if not lhs:find("<Plug>", 1, true) and not lhs:find("<SNR>", 1, true) then
+      maps[#maps + 1] = { lhs = lhs, rhs = cut(m.rhs), desc = cut(m.desc), callback = m.callback ~= nil }
+      if #maps >= MAX_MAPS then
+        break
+      end
+    end
+  end
+  local leader = vim.g.mapleader
+  return vim.json.encode({
+    v = 1,
+    mapleader = (type(leader) == "string" and leader ~= "") and vim.fn.keytrans(leader) or vim.NIL,
+    timeoutlen = vim.o.timeoutlen,
+    timeout = vim.o.timeout,
+    maps = maps,
+  })
+end
+
+-- Connect/write/close are asynchronous, exactly as in the editor-context snippet (the tested one).
+-- The host may accept before this connect callback writes any bytes; it retains incomplete lines
+-- across polls instead of waiting on the GTK thread.
+local function send(payload)
+  local pipe = vim.uv.new_pipe(false)
+  pipe:connect(socket, function(err)
+    if err then
+      pipe:close()
+      return
+    end
+    pipe:write(payload .. "\n", function()
+      pipe:close()
+    end)
+  end)
+end
+
+-- nvim has no "mappings changed" event (autocmd.txt), so re-read after the events that plausibly
+-- change them, debounced, and send only a difference.
+local function schedule()
+  if scheduled then
+    return
+  end
+  scheduled = true
+  vim.defer_fn(function()
+    scheduled = false
+    local ok, payload = pcall(report)
+    if ok and payload ~= last then
+      last = payload
+      send(payload)
+    end
+  end, 100)
+end
+_G.__neovibe_keys_schedule = schedule
+
+local group = vim.api.nvim_create_augroup("neovibe_keys", { clear = true })
+vim.api.nvim_create_autocmd({ "VimEnter", "SourcePost", "FocusLost" }, { group = group, callback = schedule })
+vim.api.nvim_create_autocmd("User", { group = group, pattern = { "VeryLazy", "LazyLoad" }, callback = schedule })
+vim.api.nvim_create_autocmd("OptionSet", { group = group, pattern = { "timeoutlen", "timeout" }, callback = schedule })
+vim.cmd([[
+  function! NeovibeKeysLeaderChanged(d, k, z) abort
+    call v:lua.__neovibe_keys_schedule()
+  endfunction
+  call dictwatcheradd(g:, 'mapleader', 'NeovibeKeysLeaderChanged')
+]])

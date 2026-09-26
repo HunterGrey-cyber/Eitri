@@ -1,9 +1,13 @@
 //! The pane-switch *protocol*: the private directory, the fake-`tmux` symlink, the socket the shim
-//! writes one direction letter to, and the parser that reads it. Toolkit-free.
+//! writes one direction letter to, and the parser that reads it -- plus, since Task 4 of the
+//! 2026-09-26 wave, a second message on the same socket: `Q <generation>`, sent by
+//! [`crate::layout::kill::editor_quit_keys`] when a `:confirm qall` it asked nvim for is cancelled.
+//! Toolkit-free.
 //!
 //! The half that is **not** here is the polling driver: `shell::pane_switch` owns the
-//! `glib::timeout_add_local` timer that calls [`accept_pending_directions`] once a tick and hands
-//! each letter to a GTK focus grab. That split is L2's own requirement -- "协议搬进核心，轮询驱动
+//! `glib::timeout_add_local` timer that calls [`accept_pending_messages`] once a tick and hands
+//! each message to a GTK focus grab or a kill-cancellation clear. That split is L2's own
+//! requirement -- "协议搬进核心，轮询驱动
 //! 留在壳里" (`docs/superpowers/specs/2026-09-16-macos-path-design.md`, L2) -- and it is what lets a
 //! second host (the macOS spike, M3) reuse every line below with its own run-loop timer.
 //!
@@ -17,7 +21,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// How often a host should call [`accept_pending_directions`]. A keypress-driven focus switch at
+/// How often a host should call [`accept_pending_messages`]. A keypress-driven focus switch at
 /// this cadence is imperceptible, and an idle poll of a non-blocking `accept()` costs one failing
 /// syscall.
 ///
@@ -29,7 +33,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Bound on how long a single accepted connection may block the caller while its one short line
 /// arrives. The shim writes immediately after `connect()` returns, so in practice this is never
 /// reached; it exists because an accepted `UnixStream`'s blocking mode is not something a portable
-/// caller may assume -- see [`accept_pending_directions`], which sets it explicitly.
+/// caller may assume -- see [`accept_pending_messages`], which sets it explicitly.
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The directory-name prefix [`crate::instance_dir`] keys this module's directories on.
@@ -216,7 +220,16 @@ impl Drop for PaneSwitchChannel {
     }
 }
 
-/// Every direction already queued on the socket, in accept order.
+/// A message accepted off the socket: a pane-switch direction letter from the `vim-tmux-navigator`
+/// shim, or a kill's generation from a cancelled `:confirm qall`
+/// ([`crate::layout::kill::editor_quit_keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneMessage {
+    Direction(char),
+    QuitCancelled(u32),
+}
+
+/// Every message already queued on the socket, in accept order.
 ///
 /// Drains rather than taking one per call: a fast repeated keypress can leave more than one
 /// connection pending between two polls.
@@ -241,20 +254,21 @@ impl Drop for PaneSwitchChannel {
 ///
 /// A stream whose mode cannot be set is skipped rather than read, but unlike `agent`'s hook relay
 /// -- which answers such a stream with a fail-closed deny, because it gates tool execution -- this
-/// channel has nothing to fail closed *to*: a dropped letter costs one focus switch the user can
-/// repeat, and inventing a direction would move focus somewhere nobody asked for.
-pub fn accept_pending_directions(listener: &UnixListener) -> Vec<char> {
-    accept_pending_directions_within(listener, READ_TIMEOUT)
+/// channel has nothing to fail closed *to*: a dropped message costs one focus switch or one stuck
+/// kill flag the user can retry, and inventing one would move focus, or clear a kill, nobody asked
+/// for.
+pub fn accept_pending_messages(listener: &UnixListener) -> Vec<PaneMessage> {
+    accept_pending_messages_within(listener, READ_TIMEOUT)
 }
 
-/// [`accept_pending_directions`] with the per-connection read timeout as a parameter.
+/// [`accept_pending_messages`] with the per-connection read timeout as a parameter.
 ///
 /// Private, and it exists for the tests rather than for a second production caller: the macOS
 /// regression test below has to let a connection sit accepted-but-silent for a measurable moment,
 /// and with `READ_TIMEOUT` fixed at 50ms that test's only lever was a sleep short enough to race
 /// its own bound. See `a_direction_written_after_the_reader_is_already_waiting_still_arrives`.
-fn accept_pending_directions_within(listener: &UnixListener, read_timeout: Duration) -> Vec<char> {
-    let mut directions = Vec::new();
+fn accept_pending_messages_within(listener: &UnixListener, read_timeout: Duration) -> Vec<PaneMessage> {
+    let mut messages = Vec::new();
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
@@ -265,11 +279,11 @@ fn accept_pending_directions_within(listener: &UnixListener, read_timeout: Durat
                 let _ = stream.set_read_timeout(Some(read_timeout));
                 let mut line = String::new();
                 if BufReader::new(stream).read_line(&mut line).is_err() {
-                    eprintln!("[pane_switch] failed to read a direction from an accepted connection");
+                    eprintln!("[pane_switch] failed to read a message from an accepted connection");
                     continue;
                 }
-                match parse_direction(&line) {
-                    Some(direction) => directions.push(direction),
+                match parse_message(&line) {
+                    Some(message) => messages.push(message),
                     None => eprintln!("[pane_switch] ignoring unrecognized message {line:?}"),
                 }
             }
@@ -280,19 +294,33 @@ fn accept_pending_directions_within(listener: &UnixListener, read_timeout: Durat
             }
         }
     }
-    directions
+    messages
 }
 
-/// The one line the shim writes, turned into a direction. Anything else is rejected rather than
-/// guessed at -- the socket is only ever written to by the shim, but a garbled message must not
-/// be able to move the user's focus somewhere they didn't ask for.
-fn parse_direction(line: &str) -> Option<char> {
-    match line.trim() {
-        "L" => Some('L'),
-        "R" => Some('R'),
-        "U" => Some('U'),
-        "D" => Some('D'),
-        _ => None,
+/// The one line the shim or [`crate::layout::kill::editor_quit_keys`] writes, turned into a
+/// [`PaneMessage`]. Anything else is rejected rather than guessed at -- the socket is only ever
+/// written to by those two senders, but a garbled message must not be able to move the user's focus
+/// or clear a kill nobody asked for.
+///
+/// The quit-generation form is parsed strictly: `"Q "` followed by one or more ASCII digits and
+/// nothing else, checked digit-by-digit before `parse` -- `u32::from_str` alone accepts a leading
+/// `"+"` (`"Q +7"` would otherwise parse), and a byte check is what rejects a second run of digits
+/// (`"Q 7 8"`), a second space (`"Q  7"`) or an out-of-range value (`"Q 4294967296"`) instead of
+/// truncating or panicking.
+fn parse_message(line: &str) -> Option<PaneMessage> {
+    let trimmed = line.trim();
+    match trimmed {
+        "L" => return Some(PaneMessage::Direction('L')),
+        "R" => return Some(PaneMessage::Direction('R')),
+        "U" => return Some(PaneMessage::Direction('U')),
+        "D" => return Some(PaneMessage::Direction('D')),
+        _ => {}
+    }
+    let rest = trimmed.strip_prefix("Q ")?;
+    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+        rest.parse::<u32>().ok().map(PaneMessage::QuitCancelled)
+    } else {
+        None
     }
 }
 
@@ -303,16 +331,36 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
-    fn parses_exactly_the_four_directions() {
-        assert_eq!(parse_direction("R\n"), Some('R'));
-        assert_eq!(parse_direction("L\n"), Some('L'));
-        assert_eq!(parse_direction("U\n"), Some('U'));
-        assert_eq!(parse_direction("D\n"), Some('D'));
+    fn parses_exactly_the_four_directions_and_a_quit_generation() {
+        assert_eq!(parse_message("R\n"), Some(PaneMessage::Direction('R')));
+        assert_eq!(parse_message("L\n"), Some(PaneMessage::Direction('L')));
+        assert_eq!(parse_message("U\n"), Some(PaneMessage::Direction('U')));
+        assert_eq!(parse_message("D\n"), Some(PaneMessage::Direction('D')));
         // Trailing/leading whitespace is tolerated; anything else is not a direction.
-        assert_eq!(parse_direction("  R  "), Some('R'));
-        assert_eq!(parse_direction("r\n"), None);
-        assert_eq!(parse_direction(""), None);
-        assert_eq!(parse_direction("RIGHT\n"), None);
+        assert_eq!(parse_message("  R  "), Some(PaneMessage::Direction('R')));
+        assert_eq!(parse_message("r\n"), None);
+        assert_eq!(parse_message(""), None);
+        assert_eq!(parse_message("RIGHT\n"), None);
+
+        assert_eq!(parse_message("Q 7\n"), Some(PaneMessage::QuitCancelled(7)));
+        assert_eq!(parse_message("  Q 0  "), Some(PaneMessage::QuitCancelled(0)));
+        assert_eq!(
+            parse_message("Q 4294967295"),
+            Some(PaneMessage::QuitCancelled(u32::MAX))
+        );
+        for bad in [
+            "Q",
+            "Q x",
+            "Q -1",
+            "QQ 1",
+            "Q +7",
+            "Q  7",
+            "Q 7 8",
+            "q 7",
+            "Q 4294967296",
+        ] {
+            assert_eq!(parse_message(bad), None, "{bad:?} must not parse");
+        }
     }
 
     #[test]
@@ -393,15 +441,23 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind");
         listener.set_nonblocking(true).expect("non-blocking");
 
-        for letter in ["R", "D", "nonsense"] {
+        for letter in ["R", "D", "nonsense", "Q 3"] {
             let mut stream = UnixStream::connect(&socket_path).expect("connect");
             writeln!(stream, "{letter}").unwrap();
         }
-        // A garbled message is dropped, and never stops the letters around it being delivered.
-        assert_eq!(accept_pending_directions(&listener), vec!['R', 'D']);
+        // A garbled message is dropped, and never stops the letters or the quit generation around it
+        // being delivered, in accept order.
+        assert_eq!(
+            accept_pending_messages(&listener),
+            vec![
+                PaneMessage::Direction('R'),
+                PaneMessage::Direction('D'),
+                PaneMessage::QuitCancelled(3),
+            ]
+        );
         // Nothing pending: the non-blocking `accept()` returns `WouldBlock` and this returns empty
         // rather than parking the caller's main loop.
-        assert!(accept_pending_directions(&listener).is_empty());
+        assert!(accept_pending_messages(&listener).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -447,7 +503,10 @@ mod tests {
             std::thread::sleep(SLEEP);
             writeln!(stream, "R").unwrap();
         });
-        assert_eq!(accept_pending_directions_within(&listener, SLACK), vec!['R']);
+        assert_eq!(
+            accept_pending_messages_within(&listener, SLACK),
+            vec![PaneMessage::Direction('R')]
+        );
         writer.join().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -27,6 +27,9 @@ pub enum TabAction {
     Select(u8),
     Rename,
     Close,
+    /// Close every other tab (LazyVim "Delete Other Buffers", `keymaps.lua:43-45`; panel round 2
+    /// plan's Owner answers Q2). Panel-only for now: not bound after the prefix.
+    CloseOthers,
     Choose,
     Info,
 }
@@ -297,6 +300,7 @@ impl Action {
                 TabAction::Select(_) => "tab.select",
                 TabAction::Rename => "tab.rename",
                 TabAction::Close => "tab.close",
+                TabAction::CloseOthers => "tab.close-others",
                 TabAction::Choose => "tab.choose",
                 TabAction::Info => "tab.info",
             }
@@ -365,6 +369,7 @@ impl Action {
                 TabAction::Select(_) => "Select that session tab",
                 TabAction::Rename => "Rename this session tab",
                 TabAction::Close => "Close this session tab, after y/n",
+                TabAction::CloseOthers => "Close every other session tab, after y/n",
                 TabAction::Choose => "Choose a session: open tabs, then ones to resume",
                 TabAction::Info => "This session's details",
             }

@@ -1,4 +1,5 @@
 import type { AgentUiState, TurnClock } from "../types";
+import type { PanelMode } from "../keymap";
 import { phaseOf } from "../turnPhase";
 import { TurnActivity } from "./TurnActivity";
 
@@ -20,6 +21,10 @@ type Props = {
    *  ruling 26). While it is set, this line names the card rather than the queue count -- a card
    *  already means the queue cannot flush (ruling 4), so the two are never both worth reading. */
   pendingTool?: string | null;
+  /** Panel round 2 (plan Task 10; spec §5.1): the card row reads differently by mode -- `a`/`d`
+   *  answer directly in BROWSE, but INPUT's keys go to the composer, so it says `Esc` first.
+   *  Defaulted to `"browse"` for existing callers that never cared before this. */
+  mode?: PanelMode;
 };
 
 /** V2 (session tabs spec §3.3, ruling 8): the old `StatusLine`'s body that was about the turn --
@@ -27,8 +32,12 @@ type Props = {
  *  above the composer. The mode block, the session status word and the position counter moved to
  *  `Footer`/`StatusRow`, and `data-nav-stop="status"` moves with the content it used to gate on
  *  ("the status line, only while Stop shows") rather than staying behind on an element with
- *  nothing left to answer for. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null }: Props) {
+ *  nothing left to answer for.
+ *
+ *  Panel round 2 (plan Task 10; spec §5.1): restyled to one mono line, Claude Code's own
+ *  `✻ Working… 1m 12s · ctrl+c interrupt` -- the interrupt words ARE the Stop button now (the
+ *  mouse route N1 keeps), not a separate span beside it. */
+export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, mode = "browse" }: Props) {
   // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -42,18 +51,26 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   if (!working) return null;
   return (
     <div className="activity-line" data-nav-stop="status">
-      <TurnActivity phase={phaseOf(state)} clock={turnClock} />
+      <span className="activity-glyph" aria-hidden="true">
+        ✻
+      </span>
+      {/* A card waiting IS what the line says (spec §5.1): the phase word beside it only said
+          "waiting for you" again, and at 520px the two were cut together, losing the keys that
+          answer the card (r2-gui GUI pass, 2026-09-26). */}
+      {pendingTool === null && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
+      {pendingTool !== null ? (
+        <span className="activity-card">
+          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, then a / d" : "a / d"}
+        </span>
+      ) : (
+        queued > 0 && <span className="activity-keys">{queued} queued · </span>
+      )}
+      {/* Stays reachable even while a card waits (`j` past the last row lands here, `withACardAndStop`'s
+          own fixture name) -- the card takes over the LINE's message, not this control. */}
       {canInterrupt && (
         <button type="button" className="stop" onClick={onInterrupt}>
-          Stop
+          ctrl+c interrupt
         </button>
-      )}
-      {pendingTool !== null ? (
-        <span className="activity-card">⚑ {pendingTool} needs approval — Esc, then a / d</span>
-      ) : (
-        <span className="activity-keys">
-          {queued > 0 ? `${queued} queued · ` : ""}Ctrl+c interrupt
-        </span>
       )}
     </div>
   );

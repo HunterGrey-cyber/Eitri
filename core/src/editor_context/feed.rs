@@ -5,13 +5,13 @@
 //! protocol is in production and its failure modes are already paid for. Read that module's
 //! comments before changing anything here; several of them are about bugs, not style.
 
-use std::io::{ErrorKind, Read};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::editor_context::compose::{EditorContext, Selection};
+use crate::line_feed::NewestLineReader;
 
 /// Instance-directory prefix. Six bytes, like the other two, and that is a budget rather than a
 /// convention: `crate::instance_dir` builds `<tmp>/<prefix><pid>-<uuid32>`, which reaches 93 bytes
@@ -35,14 +35,6 @@ const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME)];
 /// so a shorter poll here buys nothing; a longer one would make a selection made just before the
 /// user clicks the panel arrive late.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-// A stalled/oversized sender must not monopolize the GTK driver. The snippet normally sends a
-// small update every 150ms; these limits also leave room for its bounded 400-line selection.
-const MAX_PENDING_CONNECTIONS: usize = 16;
-const MAX_ACCEPTS_PER_POLL: usize = 16;
-const MAX_LINE_BYTES: usize = 256 * 1024;
-const MAX_READ_BYTES_PER_POLL: usize = 64 * 1024;
-const MAX_CONNECTION_AGE: Duration = Duration::from_secs(2);
 
 pub(crate) const NVIM_EDITOR_CONTEXT_LUA: &str = include_str!("nvim_editor_context.lua");
 
@@ -153,146 +145,33 @@ impl Drop for EditorContextFeed {
     }
 }
 
-/// A non-blocking reader retained across the host's existing 100ms polls.
-///
-/// Connecting and writing are separate async operations in the Lua sender. An accepted socket
-/// need not contain a whole line yet: retaining it on `WouldBlock` avoids both the former GTK
-/// thread's 100ms read wait and the lost updates a stateless non-blocking read would cause.
-///
-/// Accept order defines freshness, as it did in the original protocol. A newer complete, valid
-/// update supersedes all older connections, even if an older sender only finishes on a later
-/// poll. A malformed newer update does not discard the last valid context.
-pub struct EditorContextReader {
-    listener: UnixListener,
-    pending: Vec<PendingContext>,
-    next_sequence: u64,
-    published_sequence: u64,
-}
-
-struct PendingContext {
-    stream: UnixStream,
-    bytes: Vec<u8>,
-    accepted_at: Instant,
-    sequence: u64,
-}
-
-enum ReadStatus {
-    Pending,
-    Complete(Vec<u8>),
-    Closed,
-}
-
-impl PendingContext {
-    fn read_available(&mut self, budget: &mut usize) -> ReadStatus {
-        let mut buffer = [0; 4096];
-        while *budget > 0 {
-            let limit = buffer.len().min(*budget);
-            match self.stream.read(&mut buffer[..limit]) {
-                // Preserve read_line's EOF framing: a complete JSON value without a newline is
-                // still valid; a truncated value is rejected by parse, without clearing the cache.
-                Ok(0) => return ReadStatus::Complete(std::mem::take(&mut self.bytes)),
-                Ok(read) => {
-                    *budget -= read;
-                    let newline = buffer[..read].iter().position(|byte| *byte == b'\n');
-                    let length = newline.unwrap_or(read);
-                    if self.bytes.len() + length > MAX_LINE_BYTES {
-                        return ReadStatus::Closed;
-                    }
-                    self.bytes.extend_from_slice(&buffer[..length]);
-                    if newline.is_some() {
-                        return ReadStatus::Complete(std::mem::take(&mut self.bytes));
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                    return ReadStatus::Pending;
-                }
-                Err(_) => return ReadStatus::Closed,
-            }
-        }
-        ReadStatus::Pending
-    }
-}
+/// The editor-context reader: [`crate::line_feed::NewestLineReader`]'s bounded, newest-wins
+/// polling with this wire's parser as its acceptance test. A malformed newer update does not
+/// discard the last valid context; the bounds and freshness rules are documented, and tested,
+/// in `line_feed`.
+pub struct EditorContextReader(NewestLineReader);
 
 impl EditorContextReader {
-    /// Takes the feed's already non-blocking listener. Each accepted stream is explicitly made
-    /// non-blocking too: Linux does not inherit the listener's flag, while macOS does.
     pub fn new(listener: UnixListener) -> Self {
-        Self {
-            listener,
-            pending: Vec::new(),
-            next_sequence: 1,
-            published_sequence: 0,
-        }
+        Self(NewestLineReader::new(listener, "editor-context"))
     }
 
     /// Returns the newest valid update available without waiting, or `None` for no news.
     pub fn poll(&mut self) -> Option<EditorContext> {
-        self.poll_at(Instant::now())
-    }
-
-    fn poll_at(&mut self, now: Instant) -> Option<EditorContext> {
-        self.pending
-            .retain(|pending| now.duration_since(pending.accepted_at) < MAX_CONNECTION_AGE);
-        for _ in 0..MAX_ACCEPTS_PER_POLL {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    if let Err(e) = stream.set_nonblocking(true) {
-                        eprintln!("[editor-context] could not make an accepted connection non-blocking: {e}");
-                        continue;
-                    }
-                    if self.pending.len() == MAX_PENDING_CONNECTIONS {
-                        // Prefer a recent context over a sender that has not completed an older one.
-                        self.pending.remove(0);
-                    }
-                    self.pending.push(PendingContext {
-                        stream,
-                        bytes: Vec::new(),
-                        accepted_at: now,
-                        sequence: self.next_sequence,
-                    });
-                    self.next_sequence += 1;
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
+        self.0
+            .poll_with(|line| match parse_bytes(line) {
+                Ok(_) => true,
                 Err(e) => {
-                    eprintln!("[editor-context] accept failed: {e}");
-                    break;
+                    eprintln!("[editor-context] ignoring an update: {e}");
+                    false
                 }
-            }
-        }
-
-        let mut budget = MAX_READ_BYTES_PER_POLL;
-        let mut latest = None;
-        // Newest first: an older large selection must not consume the read budget before a small,
-        // recent cursor update. Completed malformed updates still leave earlier valid ones eligible.
-        for index in (0..self.pending.len()).rev() {
-            let pending = &mut self.pending[index];
-            if pending.sequence <= self.published_sequence {
-                self.pending.remove(index);
-                continue;
-            }
-            match pending.read_available(&mut budget) {
-                ReadStatus::Pending => {}
-                ReadStatus::Closed => {
-                    self.pending.remove(index);
-                }
-                ReadStatus::Complete(bytes) => {
-                    let sequence = pending.sequence;
-                    self.pending.remove(index);
-                    match String::from_utf8(bytes)
-                        .map_err(|e| e.to_string())
-                        .and_then(|line| parse(&line))
-                    {
-                        Ok(context) => {
-                            self.published_sequence = sequence;
-                            latest = Some(context);
-                        }
-                        Err(e) => eprintln!("[editor-context] ignoring an update: {e}"),
-                    }
-                }
-            }
-        }
-        latest
+            })
+            .and_then(|line| parse_bytes(&line).ok())
     }
+}
+
+fn parse_bytes(line: &[u8]) -> Result<EditorContext, String> {
+    std::str::from_utf8(line).map_err(|e| e.to_string()).and_then(parse)
 }
 
 /// The last line that parses. A malformed line is logged and skipped; it never discards an earlier
@@ -348,180 +227,6 @@ fn parse(line: &str) -> Result<EditorContext, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn an_incomplete_line_survives_until_a_later_poll() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        client.write_all(br#"{"v":1,"file":"/partial"#).unwrap();
-        assert!(reader.poll().is_none());
-        client
-            .write_all(b".rs\"}\n")
-            .expect("an incomplete update must stay connected");
-        let context = reader.poll().expect("retain the first part");
-        assert_eq!(context.file, "/partial.rs");
-    }
-
-    /// A coarse guard against the old four successive 100ms socket waits. This is a real Unix
-    /// socket check, not a claim about GUI frame time or input-to-photon latency.
-    #[test]
-    fn four_silent_connections_do_not_hold_the_ui_poll() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let clients: Vec<_> = (0..4)
-            .map(|_| UnixStream::connect(feed.socket_path()).unwrap())
-            .collect();
-        let before = Instant::now();
-        assert!(reader.poll().is_none());
-        let elapsed = before.elapsed();
-        eprintln!("editor-context poll with four silent clients: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(200), "poll blocked for {elapsed:?}");
-        drop(clients);
-    }
-
-    #[test]
-    fn a_late_old_connection_cannot_overwrite_a_newer_context() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut old = UnixStream::connect(feed.socket_path()).unwrap();
-        old.write_all(br#"{"v":1,"file":"/old"#).unwrap();
-        assert!(reader.poll().is_none());
-
-        let mut new = UnixStream::connect(feed.socket_path()).unwrap();
-        new.write_all(b"{\"v\":1,\"file\":\"/new.rs\"}\n").unwrap();
-        assert_eq!(reader.poll().unwrap().file, "/new.rs");
-        // Superseded connections may already have been closed; either way they cannot publish.
-        let _ = old.write_all(b".rs\"}\n");
-        assert!(reader.poll().is_none());
-    }
-
-    #[test]
-    fn a_malformed_new_connection_does_not_supersede_an_older_valid_one() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut old = UnixStream::connect(feed.socket_path()).unwrap();
-        old.write_all(br#"{"v":1,"file":"/valid"#).unwrap();
-        assert!(reader.poll().is_none());
-        let mut new = UnixStream::connect(feed.socket_path()).unwrap();
-        new.write_all(b"broken json\n").unwrap();
-        assert!(reader.poll().is_none());
-        old.write_all(b".rs\"}\n").unwrap();
-        assert_eq!(reader.poll().unwrap().file, "/valid.rs");
-    }
-
-    #[test]
-    fn split_utf8_is_decoded_only_after_the_line_finishes() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        client.write_all(b"{\"v\":1,\"file\":\"/\xe4").unwrap();
-        assert!(reader.poll().is_none());
-        client.write_all(b"\xb8\xad.rs\"}\n").unwrap();
-        assert_eq!(reader.poll().unwrap().file, "/中.rs");
-    }
-
-    #[test]
-    fn closed_partial_messages_are_discarded_but_valid_eof_framing_still_works() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        client.write_all(br#"{"v":1,"file":"/partial"#).unwrap();
-        assert!(reader.poll().is_none());
-        drop(client);
-        assert!(reader.poll().is_none());
-        assert!(reader.pending.is_empty());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        client.write_all(br#"{"v":1,"file":"/eof.rs"}"#).unwrap();
-        drop(client);
-        assert_eq!(reader.poll().unwrap().file, "/eof.rs");
-    }
-
-    #[test]
-    fn incomplete_connections_expire_without_a_real_time_sleep() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        client.write_all(br#"{"v":1,"file":"/expired"#).unwrap();
-        let accepted = Instant::now();
-        assert!(reader.poll_at(accepted).is_none());
-        assert!(reader.poll_at(accepted + MAX_CONNECTION_AGE).is_none());
-        let _ = client.write_all(b".rs\"}\n");
-        assert!(reader.poll_at(accepted + MAX_CONNECTION_AGE).is_none());
-        assert!(reader.pending.is_empty());
-    }
-
-    #[test]
-    fn connection_pressure_evicts_the_oldest_incomplete_message() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut old = UnixStream::connect(feed.socket_path()).unwrap();
-        old.write_all(br#"{"v":1,"file":"/evicted"#).unwrap();
-        assert!(reader.poll().is_none());
-        let clients: Vec<_> = (0..MAX_PENDING_CONNECTIONS)
-            .map(|_| UnixStream::connect(feed.socket_path()).unwrap())
-            .collect();
-        assert!(reader.poll().is_none());
-        let _ = old.write_all(b".rs\"}\n");
-        assert!(reader.poll().is_none());
-        drop(clients);
-    }
-
-    #[test]
-    fn accepting_a_backlog_is_bounded_per_poll() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut clients: Vec<_> = (0..=MAX_ACCEPTS_PER_POLL)
-            .map(|_| UnixStream::connect(feed.socket_path()).unwrap())
-            .collect();
-        clients
-            .last_mut()
-            .unwrap()
-            .write_all(b"{\"v\":1,\"file\":\"/last.rs\"}\n")
-            .unwrap();
-        assert!(
-            reader.poll().is_none(),
-            "the accept budget leaves the last connection for the next poll"
-        );
-        assert_eq!(reader.poll().unwrap().file, "/last.rs");
-    }
-
-    #[test]
-    fn the_read_budget_keeps_large_messages_for_later_polls() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        let file = "x".repeat(MAX_READ_BYTES_PER_POLL);
-        writeln!(client, "{{\"v\":1,\"file\":\"{file}\"}}").unwrap();
-        assert!(
-            reader.poll().is_none(),
-            "one poll must not consume more than its read budget"
-        );
-        assert_eq!(reader.poll().unwrap().file, file);
-    }
-
-    #[test]
-    fn oversized_messages_are_closed_without_blocking_later_updates() {
-        let mut feed = EditorContextFeed::new().expect("bind the test feed");
-        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
-        let mut client = UnixStream::connect(feed.socket_path()).unwrap();
-        // Stream in chunks with a poll between them, so this test does not depend on the OS socket
-        // send-buffer capacity. No newline is sent; the size limit must apply to partial lines too.
-        for _ in 0..MAX_LINE_BYTES / 4096 {
-            client.write_all(&[b'x'; 4096]).unwrap();
-            assert!(reader.poll().is_none());
-        }
-        client.write_all(b"x").unwrap();
-        assert!(reader.poll().is_none());
-        assert!(
-            reader.pending.is_empty(),
-            "an oversized incomplete line must be dropped"
-        );
-        let mut good = UnixStream::connect(feed.socket_path()).unwrap();
-        good.write_all(b"{\"v\":1,\"file\":\"/after-limit.rs\"}\n").unwrap();
-        assert_eq!(reader.poll().unwrap().file, "/after-limit.rs");
-    }
 
     #[test]
     fn a_real_snippet_line_parses_into_a_selection() {

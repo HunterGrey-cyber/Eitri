@@ -411,8 +411,10 @@ impl TerminalPane {
 
     /// `f` runs when the shell ends by itself in a way that closes the module (`super::closes_on_exit`),
     /// after the notice has been published and with this pane's state released. It takes the module
-    /// off screen and says whether it did; if it did, the pane is [`Self::close`]d, and if it could
-    /// not (the last module on screen), the notice stays and Enter restarts, as before.
+    /// off screen and says whether it did; if it did, the pane is [`Self::close`]d. If it could not
+    /// -- the terminal is the last module on screen (`super::OnExit::CloseWindow`), so `f` closes
+    /// the window instead of the module -- this pane is left alone: the notice stays and Enter
+    /// restarts, until the window really goes.
     pub(crate) fn on_shell_exit(&self, f: impl Fn() -> bool + 'static) {
         self.state.borrow_mut().on_shell_exit = Some(Rc::new(f));
     }

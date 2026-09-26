@@ -512,6 +512,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
         expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
         resumable: Vec::new(),
+        account: None,
     };
     // Interim (session tabs plan Task 4): one tab until Task 6 moves the panel onto TabSet.
     let sole_tab = neovibe_core::tabs::TabId(1);

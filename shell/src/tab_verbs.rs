@@ -13,6 +13,8 @@ pub(crate) enum TabVerb {
     Select(u16),
     Rename,
     Close,
+    /// `<leader>bo` (Owner answers Q2): the footer's y/n over every tab but the active one.
+    CloseOthers,
     Choose,
     Info,
     /// Nothing to act on yet (the canvas's revisions): the app name flashes.
@@ -36,6 +38,12 @@ pub(crate) fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: us
         TabAction::Close => (TabVerb::Close, true),
         TabAction::Choose => (TabVerb::Choose, true),
         TabAction::Info => (TabVerb::Info, true),
+        // Panel round 2 plan's Owner answers Q2: `<leader>bo` is a panel-table binding only (not
+        // bound after the prefix), so it never reaches this function through `table.rs`'s
+        // `bind()` calls -- there is no prefix chord for it. It arrives only as a `tab_verb`
+        // message, already inside the panel, so the keys are already there -- `true` here mirrors
+        // `Close`'s own reasoning rather than moving anything.
+        TabAction::CloseOthers => (TabVerb::CloseOthers, true),
         TabAction::Last => (TabVerb::Last, false),
         TabAction::Select(n) => (TabVerb::Select(u16::from(n)), false),
         TabAction::Next | TabAction::Prev => {
@@ -63,11 +71,17 @@ mod tests {
             TabAction::New,
             TabAction::Rename,
             TabAction::Close,
+            TabAction::CloseOthers,
             TabAction::Choose,
             TabAction::Info,
         ] {
             assert!(plan(action, Some(ModuleKind::Editor), 1).takes_the_keys, "{action:?}");
         }
+        assert_eq!(
+            plan(TabAction::CloseOthers, Some(ModuleKind::Editor), 1).verb,
+            TabVerb::CloseOthers,
+            "<leader>bo, Owner answers Q2"
+        );
         assert_eq!(
             plan(TabAction::New, Some(ModuleKind::Editor), 1).verb,
             TabVerb::New,

@@ -267,6 +267,7 @@ impl Tab {
                 TabBackend::Failed { reason } => Some(reason.clone()),
                 _ => None,
             },
+            title: self.title.clone(),
         }
     }
 }
@@ -460,6 +461,18 @@ impl TabSet {
         let mode = tab.mode;
         self.default_mode = mode;
         Some(mode)
+    }
+
+    /// `Shift+Tab` on the chooser's `New session` row or a record, once the active tab is not itself
+    /// `NotStarted` (spec §6.3, panel round 2 plan Task 5): cycles the window's remembered
+    /// `default_mode` -- the mode a fresh tab, or a resume that opens a new tab, takes. Every open
+    /// tab keeps whatever mode it already has; ruling 5 ("fixed once the session exists") is about a
+    /// *tab's own* mode, and does not apply here since this never touches one.
+    pub fn cycle_default_mode(&mut self) -> SessionModeChoice {
+        self.default_mode = self
+            .default_mode
+            .cycled(crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES);
+        self.default_mode
     }
 
     /// `r` (ruling 12): an ended or failed tab back to empty, keeping its number, name and mode.
@@ -745,7 +758,7 @@ impl TabSet {
     pub fn tabs_payload(&self) -> String {
         let resumable = self.kind == BackendKind::Sidecar;
         let views: Vec<TabView> = self.tabs.iter().map(|t| t.view(resumable)).collect();
-        serialize_tabs_for_js(self.active, &views)
+        serialize_tabs_for_js(self.active, &views, self.default_mode)
     }
 
     /// The active tab is on screen: what finished in it while away has been seen.
@@ -799,6 +812,18 @@ impl TabSet {
             legacy: self.kind == BackendKind::Legacy,
             has_backend: tab.live().is_some(),
         })
+    }
+
+    /// `<leader>bo` (Owner answers Q2): the ids `tabs::close_others` would close, and the y/n
+    /// naming them, over every tab but the active one. Same "running" test as [`Self::running_count`]
+    /// (a turn in progress, or still connecting). `None` when the active tab is the only one open.
+    pub fn close_others_plan(&self) -> Option<(Vec<TabId>, String)> {
+        let entries: Vec<(TabId, bool)> = self
+            .tabs
+            .iter()
+            .map(|t| (t.id, matches!(t.backend, TabBackend::Starting(_)) || t.turn_running()))
+            .collect();
+        tabs::close_others(&entries, self.active())
     }
 
     /// Ruling 5. `wire` is already composed with the editor context of this moment (ruling 1).
@@ -1402,6 +1427,27 @@ mod tests {
     }
 
     #[test]
+    fn cycle_default_mode_moves_the_window_default_and_leaves_open_tabs_alone() {
+        let mut set = set();
+        let tab = set.active();
+        assert_eq!(set.default_mode(), SessionModeChoice::Auto);
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
+        assert_eq!(set.cycle_default_mode(), SessionModeChoice::Bypass);
+        assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
+        assert_eq!(
+            set.get(tab).unwrap().mode,
+            SessionModeChoice::Auto,
+            "the open tab's own mode is untouched"
+        );
+        assert_eq!(
+            set.cycle_default_mode(),
+            SessionModeChoice::Auto,
+            "wraps like cycle_mode does"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
     fn reset_is_refused_while_a_session_runs_and_keeps_the_number_and_the_name() {
         let dir = workspace("tabs-reset");
         let mut set = set();
@@ -1458,6 +1504,19 @@ mod tests {
         assert!(!facts.turn_running && !facts.has_backend && !facts.legacy);
         let legacy = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
         assert!(legacy.close_facts(legacy.active()).unwrap().legacy);
+    }
+
+    #[test]
+    fn close_others_plan_names_every_tab_but_the_active_one_and_is_none_alone() {
+        let mut set = set();
+        let active = set.active();
+        assert_eq!(set.close_others_plan(), None, "the active tab is the only one open");
+        let second = set.open();
+        let third = set.open();
+        set.select(active);
+        let (ids, prompt) = set.close_others_plan().unwrap();
+        assert_eq!(ids, vec![second, third]);
+        assert_eq!(prompt, "close 2 other tabs? (y/n)");
     }
 
     fn interruptible_live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {

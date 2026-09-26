@@ -8,6 +8,7 @@ use std::fmt;
 
 use super::action::{self, Action, ActionError, OptValue, SwapTarget, TabAction};
 use super::key::{Chord, KeyName, KeyParseError, KeySpec};
+use super::panel::PanelUserTable;
 use super::root::{self, HelpRow};
 use crate::layout::{Axis, Direction, ModuleId, ModuleKeys, ModuleKind};
 
@@ -35,11 +36,14 @@ pub struct Binding {
     pub source: Source,
 }
 
-/// The effective prefix table: the prefix chord and what each key after it does.
+/// The effective prefix table: the prefix chord and what each key after it does, plus (Task 3)
+/// `init.lua`'s recorded `"panel"` table ops -- unmerged with nvim's own mappings or the panel
+/// defaults here; `neovibe_core::keymap::panel::effective` does that merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keymap {
     prefix: KeySpec,
     bindings: Vec<Binding>,
+    panel_user: PanelUserTable,
 }
 
 /// One `neovibe.keymap` call, as `core::lua::keymap` recorded it -- raw, so every error is found
@@ -113,6 +117,12 @@ pub enum KeymapError {
         keybinding: String,
         hits: String,
     },
+    /// An `init.lua` `"panel"` table op `PanelUserTable::set`/`del` refused (Task 3): `why` is its
+    /// message (already naming the key/action), `call` the op as the user wrote it.
+    Panel {
+        call: String,
+        why: String,
+    },
 }
 
 impl fmt::Display for KeymapError {
@@ -120,7 +130,7 @@ impl fmt::Display for KeymapError {
         match self {
             KeymapError::Recorded(message) => f.write_str(message),
             KeymapError::UnknownTable { call, table } => {
-                write!(f, "{call}: {table:?} is not a table (v1 has one, \"prefix\")")
+                write!(f, "{call}: {table:?} is not a table (v1 has \"prefix\" and \"panel\")")
             }
             KeymapError::BadKey { call, error } => write!(f, "{call}: {error}"),
             KeymapError::Action { call, error } => write!(f, "{call}: {error}"),
@@ -161,6 +171,7 @@ impl fmt::Display for KeymapError {
                 f,
                 "neovibe.command.register{{ id = {command:?}, keybinding = {keybinding:?} }}: {keybinding} is {hits}"
             ),
+            KeymapError::Panel { call, why } => write!(f, "{call}: {why}"),
         }
     }
 }
@@ -171,6 +182,9 @@ fn parse_key(op: &KeymapOp, text: &str) -> Result<KeySpec, KeymapError> {
     KeySpec::parse(text).map_err(|error| KeymapError::BadKey { call: op.call(), error })
 }
 
+/// `v1`'s two tables: `"prefix"` (this file) and `"panel"` (`PanelUserTable::set`/`del`, called
+/// directly from the `Set`/`Del` arms below, since its key/action types differ from the prefix
+/// table's). Anything else is `UnknownTable`.
 fn prefix_table(op: &KeymapOp, table: &str) -> Result<(), KeymapError> {
     if table == "prefix" {
         Ok(())
@@ -253,6 +267,7 @@ impl Keymap {
         Keymap {
             prefix: KeySpec::parse(super::stock::STOCK_PREFIX).expect("C-b parses"),
             bindings: default_bindings(),
+            panel_user: PanelUserTable::default(),
         }
     }
 
@@ -277,37 +292,49 @@ impl Keymap {
                     action,
                     opts,
                 } => {
-                    prefix_table(op, table)?;
-                    let spec = parse_key(op, key)?;
-                    let parsed = action::parse(action, opts, lua_panels)
-                        .map_err(|error| KeymapError::Action { call: op.call(), error })?;
-                    if let Some(existing) = map.lookup(&spec) {
-                        return Err(KeymapError::AlreadyBound {
-                            call: op.call(),
+                    if table == "panel" {
+                        map.panel_user
+                            .set(key, action)
+                            .map_err(|why| KeymapError::Panel { call: op.call(), why })?;
+                    } else {
+                        prefix_table(op, table)?;
+                        let spec = parse_key(op, key)?;
+                        let parsed = action::parse(action, opts, lua_panels)
+                            .map_err(|error| KeymapError::Action { call: op.call(), error })?;
+                        if let Some(existing) = map.lookup(&spec) {
+                            return Err(KeymapError::AlreadyBound {
+                                call: op.call(),
+                                key: spec,
+                                bound_to: existing.action.name(),
+                                source: existing.source,
+                            });
+                        }
+                        map.bindings.push(Binding {
                             key: spec,
-                            bound_to: existing.action.name(),
-                            source: existing.source,
+                            action: parsed.action,
+                            repeatable: parsed.repeatable,
+                            source: Source::User,
                         });
                     }
-                    map.bindings.push(Binding {
-                        key: spec,
-                        action: parsed.action,
-                        repeatable: parsed.repeatable,
-                        source: Source::User,
-                    });
                 }
                 KeymapOp::Del { table, key } => {
-                    prefix_table(op, table)?;
-                    let spec = parse_key(op, key)?;
-                    let at = map
-                        .bindings
-                        .iter()
-                        .position(|b| b.key == spec)
-                        .ok_or_else(|| KeymapError::NotBound {
-                            call: op.call(),
-                            key: spec,
-                        })?;
-                    map.bindings.remove(at);
+                    if table == "panel" {
+                        map.panel_user
+                            .del(key)
+                            .map_err(|why| KeymapError::Panel { call: op.call(), why })?;
+                    } else {
+                        prefix_table(op, table)?;
+                        let spec = parse_key(op, key)?;
+                        let at =
+                            map.bindings
+                                .iter()
+                                .position(|b| b.key == spec)
+                                .ok_or_else(|| KeymapError::NotBound {
+                                    call: op.call(),
+                                    key: spec,
+                                })?;
+                        map.bindings.remove(at);
+                    }
                 }
             }
         }
@@ -331,6 +358,12 @@ impl Keymap {
 
     pub fn bindings(&self) -> &[Binding] {
         &self.bindings
+    }
+
+    /// `init.lua`'s recorded `"panel"` table ops (Task 3); `panel::effective` merges them with nvim's
+    /// own mappings and the panel's defaults.
+    pub fn panel_user(&self) -> &PanelUserTable {
+        &self.panel_user
     }
 
     /// Every key bound to `action`, in table order.
@@ -762,5 +795,28 @@ mod tests {
             [k("a")]
         );
         assert!(Keymap::defaults().keys_for(&Action::Zoom).contains(&k("z")));
+    }
+
+    #[test]
+    fn panel_ops_fail_on_defaults_reservations_and_unknowns() {
+        let set = |key: &str, action: &str| KeymapOp::Set {
+            table: "panel".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        };
+        let del = |key: &str| KeymapOp::Del {
+            table: "panel".into(),
+            key: key.into(),
+        };
+        let err = |ops: &[KeymapOp]| Keymap::apply_user(ops, &[]).unwrap_err().to_string();
+        assert!(err(&[set("H", "tab.next")]).contains("tab.prev (default)"));
+        assert!(err(&[set("j", "tab.next")]).contains("BROWSE"));
+        assert!(err(&[set("gt", "tab.rename")]).contains("tab.rename"));
+        assert!(err(&[set("<C-x>", "tab.new")]).contains("<C-x>"));
+        assert!(err(&[del("zz")]).contains("nothing binds"));
+        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("gt", "tab.new")], &[]).unwrap();
+        assert_eq!(ok.panel_user().sets.len(), 2);
+        assert_eq!(ok.panel_user().dels.len(), 1);
     }
 }

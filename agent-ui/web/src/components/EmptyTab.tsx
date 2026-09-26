@@ -1,18 +1,27 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
-import type { ContextSummary, HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
-import type { PanelMode } from "../keymap";
+import type { HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
+import { EMPTY_PANEL_TABLE } from "../keymap";
+import type { PanelBinding, PanelMode, PanelTable } from "../keymap";
+import { advanceSequence, boxEntries, isPendingFirst, pendingPairBinding, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "../leader";
+import type { BoxEntry, SeqStep } from "../leader";
+import { isActivatableControl } from "../nav";
+import { isImeKey } from "../composerKeys";
 import { Composer } from "./Composer";
 import type { RestoredDraft } from "./Composer";
 import { HandoffCommandCard } from "./TerminalHandoff";
 import { QueueLines } from "./QueueLines";
-import { ContextLine } from "./ContextLine";
 import { Row } from "./Row";
-import { SessionRowText } from "./SessionRow";
-import { controlsOf, nextStop } from "../nav";
+import { Dashboard, dashItems } from "./Dashboard";
+import type { DashItem } from "./Dashboard";
+import { WhichKeyBox } from "./WhichKeyBox";
 
-/** Resume rows under the fresh prompt (spec §3.6: "up to 8"). The chooser (`prefix w`) lists all. */
-export const EMPTY_TAB_RESUME_ROWS = 8;
+/** Below this width (spec §7, "At 360 px") the dashboard's where-line cuts the cwd and drops the
+ *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
+ *  screen's own root, falling back to "not narrow" at the `widthPx <= 0` a real host shows for one
+ *  frame before its first measurement lands (and the only thing jsdom, which lays nothing out,
+ *  ever reports). */
+const DASH_NARROW_PX = 360;
 
 export type EmptyTabProps = {
   hello: Hello | null;
@@ -21,12 +30,38 @@ export type EmptyTabProps = {
   failure: string | null;
   paneFocused: boolean;
   focusRequest: number;
+  /** Bumped by App's `arrive` handling (panel round 2, spec §8, decision 4): lands BROWSE with the
+   *  cursor on the dashboard's `New session` item, the same reversal a live tab's arrival gets. */
+  arriveRequest: number;
+  /** Wave 3 Task 1: bumped by `App`'s own `[keysRequest]` effect when this is the empty layout --
+   *  the launch-chooser investigation's defect 4 (a `pane_focus` round trip, or an overlay closing,
+   *  must never leave the keys on `document.body`). Landed on the composer (INPUT) or this screen's
+   *  own root (BROWSE), whichever currently has the live control. */
+  keysRequest: number;
+  /** Wave 3 Task 1: true while the launch chooser (D10) is drawn over this screen. Guards
+   *  `focusRequest`/`arriveRequest`/`keysRequest` from stealing the keys out from under it -- the
+   *  same `overlayOpen` `App.tsx` computes, threaded through since this screen has no
+   *  `containerRef` of its own for `App` to check. */
+  overlayOpen: boolean;
+  /** Where this screen starts when it mounts, or when the window switches it to another empty tab
+   *  (GUI pass 2026-09-26, r2-gui): `"browse"` after a tab switch or an arrival, `"input"` after a
+   *  new tab's `enter_input` (R7) and at launch. `focusRequest` and `arriveRequest` are the
+   *  window's counters and outlive any one tab, so a count already reached when this mounted is
+   *  not a request to it -- only a later change is. Defaults to `"input"`, today's launch state. */
+  landing?: PanelMode;
+  /** This screen's own mode, for the band `App.tsx` draws under it (GUI pass 2026-09-26: the band
+   *  read `INPUT` whatever this screen was in). */
+  onModeChange?: (mode: PanelMode) => void;
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
   onResume: (providerSessionId: string) => void;
   onCycleMode: () => void;
   onReset: () => void;
   onHint: (repeat: boolean) => void;
+  /** The dashboard's `w` item / key (spec §7, "All sessions"): the same window-level `tab_verb
+   *  choose` a live tab's `prefix w` posts (`App.tsx`'s `runPanelAction`, `tab.choose`). Optional,
+   *  like `onOpenKeymap` below, so this component's own tests need no stand-in. */
+  onChooseSessions?: () => void;
   /** Mirrors `Composer`'s own prop of the same name (session tabs Task 11, ruling 24): this tab's
    *  draft is saved and restored across a switch like any other, so an empty tab's composer needs
    *  the same hook into it. */
@@ -51,18 +86,31 @@ export type EmptyTabProps = {
   onQueue?: (text: string) => void;
   history?: string[];
   queueCount?: number;
-  /** The queue and V1's editor-context line, shown above the composer the same way the live
-   *  conversation shows them (Task 9): a `starting` tab can already have queued behind its own
-   *  connect (C1), and the editor context is window-wide, not gated on a session existing. */
+  /** The queue, shown above the composer the same way the live conversation shows it (Task 9): a
+   *  `starting` tab can already have queued behind its own connect (C1). V1's editor-context line
+   *  used to be shown here too, through its own `ContextLine`; panel round 2 (plan Task 10) moved
+   *  it into the outer band's `context` fact instead (`App.tsx` builds that directly from its own
+   *  `editorContext` state, so this component no longer needs a copy of it at all). */
   queue?: QueueItem[];
   queueError?: string | null;
-  editorContext?: ContextSummary | null;
   onTakeBackQueue?: () => void;
   queueTaken?: { texts: string[]; seq: number } | null;
   onHistoryPush?: (text: string) => void;
   onEditInNvim?: (text: string) => void;
   editingInNvim?: boolean;
   onOpenKeymap?: () => void;
+  /** The panel's leader/which-key table (`keymapHelp.panel` in `App.tsx`, itself `keymap` envelope's
+   *  `panel`), and where a completed sequence's binding goes. Fix round 1 (panel round 2 plan Task
+   *  12+13, reviewer finding): the dashboard's own root never ran the leader engine that `App.tsx`'s
+   *  `onKeyDown` already had for the live conversation (spec §7, "Space starts a leader sequence"),
+   *  so Space did nothing here. Both optional, defaulting to `EMPTY_PANEL_TABLE` (no bindings) and a
+   *  no-op, so this component's own tests need no stand-in for either -- the same reason
+   *  `onChooseSessions` above is optional. `onPanelAction` is `App.tsx`'s own `runPanelAction`,
+   *  reused rather than duplicated: its `mode.cycle` case already branches on whether a session has
+   *  started (posting `cycle_mode` directly here, since this tab has none), and its `tab.*` cases
+   *  post the same window-level `tab_verb` regardless of which tab held the keys. */
+  panelTable?: PanelTable;
+  onPanelAction?: (binding: PanelBinding) => void;
 };
 
 /** An empty session tab: Claude Code's fresh prompt (spec §3.6, F3). The composer is live in INPUT;
@@ -70,22 +118,244 @@ export type EmptyTabProps = {
  *  spawns a process. */
 export function EmptyTab(props: EmptyTabProps) {
   const { hello, tab, handoff, failure } = props;
-  const [mode, setMode] = useState<PanelMode>("input");
+  const [mode, setMode] = useState<PanelMode>(props.landing === "browse" ? "browse" : "input");
+  // The counts this screen mounted with (see `landing`'s doc): the two request effects below act
+  // only on a count that changed after that.
+  const focusAtMount = useRef(props.focusRequest);
+  const arriveAtMount = useRef(props.arriveRequest);
   const starting = tab.state === "starting";
   const failed = tab.state === "failed";
-  const rows = (hello?.resumableSessions ?? []).slice(0, EMPTY_TAB_RESUME_ROWS);
+  const showDashboard = hello !== null && !starting && !failed;
+  const [dashCursor, setDashCursor] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  /** Wave 3 Task 1: what `Composer` actually reads, mirroring `App.tsx`'s own `composerFocusRequest`
+   *  -- bumped only from the guarded `focusRequest`/`keysRequest` effects below, so an overlay drawn
+   *  over this screen can never have its composer autofocused out from under it. */
+  const [composerFocus, setComposerFocus] = useState(0);
+  const [widthPx, setWidthPx] = useState(0);
+  /* The dashboard's own narrow breakpoint (spec §7, "At 360 px"), measured the same way
+     `StatusBand` measures its own box: jsdom lays nothing out, so `widthPx` stays 0 and `narrow`
+     stays `false`, the same floor a real host shows for one frame before its first measurement
+     lands. */
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (el !== null) setWidthPx(el.clientWidth);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) if (entry.target === el) setWidthPx(entry.contentRect.width);
+    });
+    if (el !== null) observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  const narrow = widthPx > 0 && widthPx <= DASH_NARROW_PX;
+  const panelTable = props.panelTable ?? EMPTY_PANEL_TABLE;
+  /* The leader/which-key engine (fix round 1, panel round 2 plan Task 12+13): a scoped-down copy of
+     `App.tsx`'s own `seqRef`/`seq`/`boxShown`/`applySeqStep`/`clearSequence`, kept local to this
+     screen rather than lifted to `App.tsx` -- this tab already keeps its own `mode` locally (BROWSE
+     here means the dashboard has the keys, not the live conversation), and `App.tsx`'s copy cannot
+     see it. The reserved `g`/`z`/`[`/`]` prefixes get only their table half here
+     (`pendingPrefixRef` below): `[b`/`]b` step tabs from the dashboard as from a live tab (spec §4,
+     the whole-branch review), while `resolveKey`'s own fixed pairs (`gg`, `[[`, ...) have no rows
+     to act on on this screen and stay unimplemented. */
+  const pendingPrefixRef = useRef<string | null>(null);
+  const seqRef = useRef<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
+  const [seq, setSeq] = useState<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
+  const boxShownRef = useRef(false);
+  const [boxShown, setBoxShown] = useState(false);
+  const boxTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seqTimeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function cancelBoxTimer() {
+    if (boxTimerRef.current !== null) clearTimeout(boxTimerRef.current);
+    boxTimerRef.current = null;
+  }
+  function cancelSeqTimeoutTimer() {
+    if (seqTimeoutTimerRef.current !== null) clearTimeout(seqTimeoutTimerRef.current);
+    seqTimeoutTimerRef.current = null;
+  }
+  function showBox() {
+    boxShownRef.current = true;
+    setBoxShown(true);
+  }
+  function hideBox() {
+    boxShownRef.current = false;
+    setBoxShown(false);
+  }
+  function scheduleBoxTimer() {
+    if (boxShownRef.current) return;
+    cancelBoxTimer();
+    boxTimerRef.current = setTimeout(() => {
+      boxTimerRef.current = null;
+      showBox();
+    }, WHICH_KEY_DELAY_MS);
+  }
+  function clearSequence() {
+    pendingPrefixRef.current = null;
+    seqRef.current = null;
+    setSeq(null);
+    cancelBoxTimer();
+    cancelSeqTimeoutTimer();
+    hideBox();
+  }
+  function applySeqStep(step: SeqStep) {
+    if (step.kind === "run") {
+      clearSequence();
+      props.onPanelAction?.(step.binding);
+      return;
+    }
+    if (step.kind === "cancel") {
+      clearSequence();
+      return;
+    }
+    if (step.kind === "none") return;
+    seqRef.current = { typed: step.typed, ambiguous: step.ambiguous };
+    setSeq(seqRef.current);
+    cancelSeqTimeoutTimer();
+    scheduleBoxTimer();
+    if (step.ambiguous !== null && panelTable.timeout) {
+      const ambiguous = step.ambiguous;
+      seqTimeoutTimerRef.current = setTimeout(() => {
+        seqTimeoutTimerRef.current = null;
+        applySeqStep({ kind: "run", binding: ambiguous });
+      }, panelTable.timeoutlen);
+    }
+  }
+  // Review Focus 1, reproduced for this local copy: a table that changes mid-sequence must never
+  // let the OLD table's binding run against the new one.
+  useEffect(() => {
+    clearSequence();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelTable]);
+  // Leaving BROWSE by any route other than a key this engine itself consumed (a click into the
+  // composer, `focusRequest`), or the dashboard itself disappearing out from under a pending
+  // sequence (the tab starting to fail mid-sequence), must not leave a stale sequence or box armed
+  // for a screen that no longer shows either.
+  useEffect(() => {
+    if (mode !== "browse" || starting || failed || !props.paneFocused) clearSequence();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, starting, failed, props.paneFocused]);
+  useEffect(() => {
+    return () => {
+      cancelBoxTimer();
+      cancelSeqTimeoutTimer();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const box: { title: string; entries: BoxEntry[] } | null =
+    seq !== null ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, false) } : null;
   /* A request for the keys (`enter_input`, a chooser closing) is a request for INPUT, not only for
      focus: once anything took focus off the textarea (the chooser, a HINT, a click), `Composer`'s
      blur left this tab in BROWSE with no textarea to focus, and the keys landed on an ancestor that
-     handles none (GUI pass, 2026-09-25). Refused where `i` is. */
+     handles none (GUI pass, 2026-09-25). Refused where `i` is. Wave 3 Task 1: also refused while an
+     overlay (the launch chooser) is drawn over this screen -- its own `autoFocus` must not steal the
+     keys from a chooser opened over the empty tab. */
   useEffect(() => {
-    if (props.focusRequest > 0 && !starting && !failed) setMode("input");
+    if (props.overlayOpen) return;
+    if (props.focusRequest !== focusAtMount.current && !starting && !failed) {
+      setMode("input");
+      setComposerFocus((n) => n + 1);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.focusRequest]);
+  /* Panel round 2 (spec §8, decision 4): an `arrive` that lands here -- a launch that starts with the
+     keys already in the chat -- ends INPUT the way it ends a live tab's, rather than leaving the
+     fresh prompt's default composer focused. No `!starting && !failed` guard: unlike `focusRequest`,
+     landing BROWSE never needs a box to type into. The cursor resets to the dashboard's first item
+     (`"new"`, spec §8: "the New session item"). Wave 3 Task 1: focusing the root happens BEFORE
+     `setMode("browse")` -- that synchronously blurs the textarea (its own `onBlur` then sees
+     `relatedTarget` already the root, not `.history-search`, and reports browse itself too), so the
+     unmount a moment later never drops the keys onto `document.body` (defect 4). Also guarded by
+     `overlayOpen`: the launch chooser's own `Esc` sends this when Rust could not hand the keys to
+     the editor, but a `chooser`/`begin_rename`/`/` still open over this screen keeps them instead. */
+  useEffect(() => {
+    if (props.overlayOpen) return;
+    if (props.arriveRequest !== arriveAtMount.current) {
+      rootRef.current?.focus({ preventScroll: true });
+      setMode("browse");
+      setDashCursor(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.arriveRequest]);
+  /** Wave 3 Task 1: `App`'s own `[keysRequest]` effect bumps this directly (there is no
+   *  `containerRef` on this layout for it to check). A no-op when the root already contains the
+   *  active element -- WebKitGTK's DOM focus across a GTK round trip may well have survived, and a
+   *  `root.contains` skips reaching for anything in that case, the same guard `takeKeys` itself
+   *  applies to the live conversation. */
+  useEffect(() => {
+    if (props.keysRequest === 0 || props.overlayOpen) return;
+    const root = rootRef.current;
+    if (root === null || root.contains(document.activeElement)) return;
+    if (mode === "input" && !starting && !failed) setComposerFocus((n) => n + 1);
+    else root.focus({ preventScroll: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.keysRequest]);
+  /* Where the keys go when this screen is landed (integration of wave 3's single focus route with
+     r2-gui's edge-only requests): the two request effects above now ignore a count reached before
+     mount, so a mount or a switch has to put the keys somewhere itself -- otherwise a new tab made
+     from a live one (whose container just unmounted) lands with nothing focused. BROWSE takes the
+     root; INPUT takes the composer, but only when a request for it exists (`focusRequest > 0`, the
+     batch that made this tab), so a plain launch leaves DOM focus alone as it always has. Never
+     under an overlay (the chooser, a rename, `/` hold the keys there). */
+  function land(where: PanelMode, onMount: boolean) {
+    if (props.overlayOpen) return;
+    const root = rootRef.current;
+    // On mount the keys usually sit on the window's layout root (React keeps that `div` across the
+    // live/empty layouts) or on `document.body`; neither hands a key to this screen.
+    if (onMount && root !== null && root.contains(document.activeElement)) return;
+    if (where === "browse") root?.focus({ preventScroll: true });
+    else if (props.focusRequest > 0 && !starting && !failed) setComposerFocus((n) => n + 1);
+  }
+  useEffect(() => {
+    land(props.landing === "browse" ? "browse" : "input", true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  /* A switch from one empty tab to another keeps this component mounted: land it the way a mount
+     would (see `landing`). Skips the first run, which the initial state already covers. */
+  const tabAtMount = useRef(tab.id);
+  useEffect(() => {
+    if (tab.id === tabAtMount.current) return;
+    tabAtMount.current = tab.id;
+    const where = props.landing === "browse" ? "browse" : "input";
+    // The root first, as `arrive` does: `setMode("browse")` unmounts the focused textarea.
+    land(where, false);
+    setMode(where);
+    setDashCursor(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id]);
+  useEffect(() => {
+    props.onModeChange?.(mode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  /** What each dashboard item does (spec §7's table) -- the one place both a click (`Dashboard`'s
+   *  own `onItem`) and a keyboard letter/`Enter` (`onKeyDown` below) end up. */
+  function runItem(item: DashItem) {
+    switch (item) {
+      case "new":
+        setMode("input");
+        break;
+      case "resume": {
+        const newest = hello?.resumableSessions[0];
+        if (newest !== undefined) props.onResume(newest.providerSessionId);
+        break;
+      }
+      case "sessions":
+        props.onChooseSessions?.();
+        break;
+      case "mode":
+        props.onCycleMode();
+        break;
+      case "keys":
+        props.onOpenKeymap?.();
+        break;
+    }
+  }
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (props.answerConfirm?.(event)) return;
-    if (event.nativeEvent.isComposing) return;
+    // An IME key is never a key of this screen's, the leader engine's below included: the same
+    // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
+    // (a key the input method consumed, reported without `isComposing`) is caught here as well.
+    if (isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) return;
     if (event.key === "Tab" && event.shiftKey && !starting && !failed) {
       event.preventDefault();
       props.onCycleMode();
@@ -97,28 +367,93 @@ export function EmptyTab(props: EmptyTabProps) {
     // gives for a dead session's INPUT being an empty mode. A `starting` tab's composer is live now
     // (C1: it queues behind the connect), so it is no longer exempted here.
     if (mode === "input" && !failed) return;
-    const root = event.currentTarget;
-    if (event.key === "j" || event.key === "k") {
-      event.preventDefault();
-      const target = nextStop(root, null, event.key === "j" ? 1 : -1);
-      if (target !== null) controlsOf(target)[0]?.focus();
-    } else if (event.key === "i" && !failed) {
-      event.preventDefault();
-      setMode("input");
-    } else if (event.key === "r" && failed) {
+    if (event.key === "r" && failed) {
       event.preventDefault();
       props.onReset();
-    } else if (event.key === "f") {
+      return;
+    }
+    if (event.key === "f") {
       event.preventDefault();
       props.onHint(event.repeat);
-    } else if (event.key === "y" && handoff !== null) {
+      return;
+    }
+    if (event.key === "y" && handoff !== null) {
       event.preventDefault();
       void navigator.clipboard?.writeText(handoff.command);
+      return;
+    }
+    if (hello === null || starting || failed) return;
+    // The leader/which-key engine (fix round 1, panel round 2 plan Task 12+13; spec §7, "Space
+    // starts a leader sequence"): tried first, mirroring `App.tsx`'s own `onKeyDown` ordering, so a
+    // table binding on any key not already claimed above (Space itself, or `H`/`L`/... once the
+    // owner's table has them) takes it before the dashboard's own fixed `j`/`k`/`Enter`/letters
+    // below ever see it -- the reserved-key list (Global Constraint) is what keeps those from ever
+    // colliding with a real table entry.
+    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
+    if (seqRef.current !== null) {
+      event.preventDefault();
+      applySeqStep(advanceSequence(panelTable, seqRef.current.typed, event.key));
+      return;
+    }
+    // A reserved prefix typed a key ago (`[`): its table pair runs (`[b` -> tab.prev); anything
+    // else drops the prefix and is read as an ordinary key, as vim drops an unfinished `g` and as
+    // `resolveKey` does for a live tab.
+    const prefix = pendingPrefixRef.current;
+    pendingPrefixRef.current = null;
+    if (prefix !== null && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+      const pair = pendingPairBinding(panelTable, prefix, event.key);
+      if (pair !== null) {
+        event.preventDefault();
+        props.onPanelAction?.(pair);
+        return;
+      }
+    }
+    if (!event.ctrlKey && !event.altKey && !event.shiftKey && isPendingFirst(event.key)) {
+      event.preventDefault();
+      pendingPrefixRef.current = event.key;
+      return;
+    }
+    if (!event.ctrlKey && !event.altKey) {
+      const start = startSequence(panelTable, event.key, isActivatableControl(event.target));
+      if (start.kind !== "none") {
+        event.preventDefault();
+        applySeqStep(start);
+        return;
+      }
+    }
+    const items = dashItems(hello);
+    if (event.key === "j" || event.key === "k") {
+      event.preventDefault();
+      const delta = event.key === "j" ? 1 : -1;
+      setDashCursor((c) => Math.max(0, Math.min(items.length - 1, c + delta)));
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const item = items[dashCursor];
+      if (item !== undefined) runItem(item);
+      return;
+    }
+    if (event.key === "i") {
+      event.preventDefault();
+      runItem("new");
+    } else if (event.key === "r" && items.includes("resume")) {
+      event.preventDefault();
+      runItem("resume");
+    } else if (event.key === "w") {
+      event.preventDefault();
+      runItem("sessions");
+    } else if (event.key === "m") {
+      event.preventDefault();
+      runItem("mode");
+    } else if (event.key === "?") {
+      event.preventDefault();
+      runItem("keys");
     }
   }
 
   return (
-    <div className="empty-tab" tabIndex={0} onKeyDown={onKeyDown}>
+    <div className="empty-tab" tabIndex={0} onKeyDown={onKeyDown} ref={rootRef}>
       {handoff !== null && <HandoffCommandCard handoff={handoff} />}
       {failed && (
         <Row kind="error" sign="✗" role="alert">
@@ -132,15 +467,21 @@ export function EmptyTab(props: EmptyTabProps) {
           Starting the agent backend… The first start on a fresh Verdandi checkout also builds the sidecar.
         </p>
       )}
+      {/* The empty tab's dashboard (spec §7): replaces the eight resume rows that used to sit below
+          the composer. Never drawn while starting or failed (those screens keep their own).
+          `hello !== null` (not just `showDashboard`, which TS cannot narrow through) is what lets
+          `Dashboard`'s `hello: Hello` prop take it without a non-null assertion. */}
+      {hello !== null && showDashboard && (
+        <Dashboard hello={hello} mode={tab.mode} cursor={dashCursor} narrow={narrow} onItem={runItem} />
+      )}
       <QueueLines items={props.queue ?? []} error={props.queueError ?? null} />
-      <ContextLine context={props.editorContext ?? null} />
       <Composer
         disabled={failed}
         sessionEnded={failed}
         closing={false}
         restoredDraft={props.restoredDraft}
         mode={mode}
-        focusRequest={props.focusRequest}
+        focusRequest={composerFocus}
         hintTarget={!failed}
         onModeChange={setMode}
         onSend={props.onSend}
@@ -159,21 +500,22 @@ export function EmptyTab(props: EmptyTabProps) {
         editingInNvim={props.editingInNvim}
         onOpenKeymap={props.onOpenKeymap}
       />
-      {rows.length > 0 && (
-        <div className="empty-tab-resume" aria-label="Resume a session">
-          {rows.map((session) => (
-            <Row
-              key={session.providerSessionId}
-              as="button"
-              kind="choice"
-              sign="↺"
-              navStop="resume"
-              onClick={() => props.onResume(session.providerSessionId)}
-            >
-              <SessionRowText session={session} />
-            </Row>
-          ))}
-        </div>
+      {/* The which-key box (fix round 1, panel round 2 plan Task 12+13): `WHICH_KEY_DELAY_MS` after
+          a leader/table sequence started above is still pending. `.empty-tab` is this screen's own
+          positioned ancestor (index.css) -- there is no `.agent-ui-scroller` here (ruling 7) for it
+          to dock against the way the live conversation's copy does, so it sits against this
+          centred block's own bottom edge rather than the screen's; a GUI pass owes the real
+          placement (Task 13's checklist, "Panel round 2"). */}
+      {boxShown && box !== null && (
+        <WhichKeyBox
+          title={box.title}
+          entries={box.entries}
+          onPick={(key) => {
+            const root = rootRef.current;
+            root?.focus({ preventScroll: true });
+            root?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+          }}
+        />
       )}
     </div>
   );

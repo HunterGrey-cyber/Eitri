@@ -204,6 +204,28 @@ mod tests {
         );
     }
 
+    /// Task 3: `neovibe.keymap.set("panel", ...)` is recorded the same way as the prefix table, and
+    /// `Keymap::apply_user` accepts it.
+    #[test]
+    fn a_panel_table_set_is_recorded_and_accepted() {
+        let ops = run(r#"neovibe.keymap.set("panel", "<leader>tn", "tab.new")"#);
+        let KeymapOp::Set {
+            table,
+            key,
+            action,
+            opts,
+        } = &ops[0]
+        else {
+            panic!("{:?}", ops[0])
+        };
+        assert_eq!(
+            (table.as_str(), key.as_str(), action.as_str(), opts.as_slice()),
+            ("panel", "<leader>tn", "tab.new", [].as_slice())
+        );
+        let map = Keymap::apply_user(&ops, &[]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(map.panel_user().sets.len(), 1);
+    }
+
     /// Spec §2.5/§2.9: the shipped snippet applies cleanly through real Lua, and does what it says.
     #[test]
     fn the_owners_snippet_applies_cleanly_and_reproduces_his_tmux() {

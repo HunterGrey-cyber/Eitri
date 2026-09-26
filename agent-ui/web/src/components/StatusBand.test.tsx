@@ -1,0 +1,126 @@
+// @vitest-environment jsdom
+import { afterEach, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { StatusBand } from "./StatusBand";
+import type { BandFacts } from "../band";
+
+afterEach(cleanup);
+
+/** A `ResizeObserver` jsdom lacks, the same shape `MessageList.test.tsx` stubs with: records what
+ *  it observes and delivers a synthetic entry on demand. */
+type FakeObserver = { callback: ResizeObserverCallback; observed: Element[] };
+function stubResizeObserver(): FakeObserver[] {
+  const observers: FakeObserver[] = [];
+  class FakeResizeObserver {
+    private record: FakeObserver;
+    constructor(callback: ResizeObserverCallback) {
+      this.record = { callback, observed: [] };
+      observers.push(this.record);
+    }
+    observe(el: Element) {
+      this.record.observed.push(el);
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+  return observers;
+}
+const resize = (observer: FakeObserver, target: Element, width: number) =>
+  observer.callback([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
+
+const RUNNING: BandFacts = {
+  mode: "input",
+  pill: "⏵⏵ auto",
+  showcmd: "Space b…",
+  message: null,
+  prompt: null,
+  warn: "Verdandi baseline drift: running 1234567.",
+  unread: "↓3",
+  cards: 1,
+  queued: 1,
+  context: { file: "neovibe.zsh", lines: [3, 9] },
+  position: "14/30",
+  model: "sonnet-5",
+};
+
+/** Renders with a wide-enough band and a real character width, through the same fake observer
+ *  `MessageList.test.tsx` uses -- jsdom never lays anything out, so without this every segment past
+ *  mode/pill would be dropped by `bandLayout`'s own pre-measurement floor (Review Focus 3), and this
+ *  suite would only ever see the two that never get dropped. */
+function renderWide(facts: BandFacts, onOpenDetail = vi.fn(), onJump = vi.fn()) {
+  const observers = stubResizeObserver();
+  const rendered = render(<StatusBand facts={facts} paneFocused={true} onOpenDetail={onOpenDetail} onJump={onJump} />);
+  const band = rendered.container.querySelector(".status-band")!;
+  const measure = rendered.container.querySelector(".band-measure")!;
+  act(() => {
+    resize(observers[0], measure, 7.2);
+    resize(observers[0], band, 900);
+  });
+  return rendered;
+}
+
+it("draws mode with data-mode and data-focused, dim when the pane lacks the keys", () => {
+  const { container } = renderWide(RUNNING);
+  const mode = container.querySelector<HTMLElement>('[data-testid="mode-block"]')!;
+  expect(mode.dataset.mode).toBe("input");
+  expect(mode.dataset.focused).toBe("true");
+  expect(mode.textContent).toBe("INPUT");
+});
+
+it("draws the mode glyph in its own span, named for the permission mode", () => {
+  const { container } = renderWide(RUNNING);
+  const glyph = container.querySelector<HTMLElement>(".mode-glyph")!;
+  expect(glyph.textContent).toBe("⏵⏵");
+  expect(glyph.dataset.modeName).toBe("auto");
+  expect(container.querySelector(".mode-pill")!.textContent).toBe("⏵⏵ auto");
+
+  vi.unstubAllGlobals();
+  const bypass = renderWide({ ...RUNNING, pill: "⏵⏵ bypass" });
+  expect(bypass.container.querySelector<HTMLElement>(".mode-glyph")!.dataset.modeName).toBe("bypass");
+});
+
+it("the ↓N segment is a button that jumps and carries title G", () => {
+  const onJump = vi.fn();
+  const { container } = renderWide(RUNNING, vi.fn(), onJump);
+  const unread = container.querySelector<HTMLButtonElement>(".band-unread")!;
+  expect(unread.tagName).toBe("BUTTON");
+  expect(unread.title).toBe("G");
+  expect(unread.textContent).toBe("↓3");
+  fireEvent.click(unread);
+  expect(onJump).toHaveBeenCalledTimes(1);
+});
+
+it("a click elsewhere on the band opens the detail popover, not a click on ↓N", () => {
+  const onOpenDetail = vi.fn();
+  const onJump = vi.fn();
+  const { container } = renderWide(RUNNING, onOpenDetail, onJump);
+  fireEvent.click(container.querySelector(".band-unread")!);
+  expect(onOpenDetail).not.toHaveBeenCalled();
+  fireEvent.click(container.querySelector(".band-open")!);
+  expect(onOpenDetail).toHaveBeenCalledTimes(1);
+  expect(onJump).toHaveBeenCalledTimes(1); // from the previous click, unaffected by this one
+});
+
+it("⚠'s title holds the warning text, not just the glyph", () => {
+  const { container } = renderWide(RUNNING);
+  const warn = container.querySelector<HTMLElement>(".band-warn")!;
+  expect(warn.textContent).toBe("⚠");
+  expect(warn.title).toBe(RUNNING.warn);
+});
+
+it("the showcmd segment carries data-testid=showcmd", () => {
+  const { container } = renderWide(RUNNING);
+  const showcmd = container.querySelector<HTMLElement>('[data-testid="showcmd"]')!;
+  expect(showcmd.textContent).toBe("Space b…");
+});
+
+it("before any measurement (Review Focus 3), only mode and pill show -- no crash on an unmounted ref", () => {
+  const { container } = render(<StatusBand facts={RUNNING} paneFocused={false} />);
+  const mode = container.querySelector<HTMLElement>('[data-testid="mode-block"]')!;
+  expect(mode.textContent).toBe("INPUT");
+  expect(mode.dataset.focused).toBe("false");
+  expect(container.querySelector(".mode-pill")).not.toBeNull();
+  expect(container.querySelector(".band-warn")).toBeNull();
+  expect(container.querySelector(".band-unread")).toBeNull();
+});

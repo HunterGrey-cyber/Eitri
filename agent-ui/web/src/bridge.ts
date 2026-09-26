@@ -29,6 +29,10 @@ export type OutboundMessage =
   | { type: "close_tab"; request_id: string; tab: TabId }
   | { type: "reset_tab"; request_id: string; tab: TabId }
   | { type: "cycle_mode"; request_id: string; tab: TabId }
+  /** `Shift+Tab` over `New session` or a record in the chooser, once the active tab has already
+   *  started (spec §6.3, ruling R9): window-level, like `TabVerb` -- there is no tab to name, since
+   *  a resume from here would open a fresh one. Cycles `TabSet::default_mode` and re-sends `tabs`. */
+  | { type: "cycle_default_mode"; request_id: string }
   | { type: "open_detail"; request_id: string; tab: TabId }
   | { type: "chooser_closed"; request_id: string; launch: boolean }
   /** Global `f` HINT: panel has pressed `f` in BROWSE, asking shell to start a global HINT. */
@@ -53,7 +57,18 @@ export type OutboundMessage =
   /** `gf` on a path (phase 3 ruling 18, 19): open it in the scratch split, at `line` when given. */
   | { type: "open_path"; request_id: string; path: string; line?: number }
   /** `Ctrl+g` on a row (phase 3 ruling 18): show this text read-only in the scratch split. */
-  | { type: "view_in_editor"; request_id: string; title: string; text: string };
+  | { type: "view_in_editor"; request_id: string; title: string; text: string }
+  /** A tab.* panel-table action (`runPanelAction`, panel round 2 plan Task 8): the same verbs the
+   *  prefix's own tmux window keys run. Window-level, like the prefix's own `tab_verb` -- whichever
+   *  tab is under the keys decides, so this carries no `tab` of its own (Rust's `InboundMessage::
+   *  TabVerb` has none either); sent through `postToRust` directly rather than `post()`, which would
+   *  add one. `TabVerbWire`'s wire spelling, `core/src/agent_bridge.rs`. */
+  | { type: "tab_verb"; request_id: string; verb: "next" | "prev" | "last" | "new" | "close" | "close_others" | "choose" | "info" }
+  /** `y` to a `confirm_close_others` prompt (Owner answers Q2): window-level, like `TabVerb` --
+   *  Rust recomputes "every tab but the active one" fresh rather than trusting the set the prompt
+   *  was shown with, so this carries no tab list of its own. `InboundMessage::CloseOthers`,
+   *  `core/src/agent_bridge.rs`. */
+  | { type: "close_others"; request_id: string };
 
 /** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
  *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send
@@ -106,10 +121,17 @@ type InboundHandler = (
      *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
      *  status bar and the pane outline, so the three agree. */
     | { kind: "pane_focus"; focused: boolean }
-    /** The user moved into this panel with the keyboard (`Ctrl+l`), so open the composer with the
-     *  caret in it. Only the keyboard route sends this; a click on a row still lands in BROWSE on
-     *  that row. See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
+    /** A brand-new tab's own arrival: open the composer with the caret in it. This is `enter_input`'s
+     *  only sender now (panel round 2, spec §8, decision 4) -- every other keyboard arrival that used
+     *  to send this now sends `arrive` instead. A click on a row still lands in BROWSE on that row.
+     *  See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "enter_input" }
+    /** Every OTHER keyboard arrival (`Ctrl+h/j/k/l` into the chat, `prefix a`/a tray chip with no
+     *  card, a launch that starts with the keys already in the chat): BROWSE, on the oldest pending
+     *  card if one waits (P1, unchanged), else on the last row with following resumed. Reverses the
+     *  2026-09-19 ruling "control l直接闪cursor" (panel round 2 spec §8, decision 4). See
+     *  `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. */
+    | { kind: "arrive" }
     /** `shell`'s keys for the `?` overlay (`serialize_keymap_for_js`). */
     | ({ kind: "keymap" } & KeymapHelp)
     /** `send-prefix`/`send-keys` with this panel holding the keys: WebKitGTK cannot be handed the
@@ -138,6 +160,10 @@ type InboundHandler = (
     | { kind: "tab_detail"; tab: TabId; rows: DetailRow[] }
     | ({ kind: "chooser" } & ChooserEnvelope)
     | { kind: "confirm_close"; tab: TabId; lines: string[] }
+    /** `<leader>bo` / `tab.close-others` (Owner answers Q2): window-level, unlike `confirm_close`
+     *  -- `tabs` is every tab the `y` answer would close, recomputed fresh by Rust rather than
+     *  trusted from here. `serialize_confirm_close_others_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "confirm_close_others"; tabs: TabId[]; lines: string[] }
     | { kind: "begin_rename"; tab: TabId; current: string | null }
     /** This tab's queue, and its current refusal reason if the last flush was refused (phase 3
      *  ruling 3). */
@@ -186,6 +212,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "theme" ||
         obj.kind === "pane_focus" ||
         obj.kind === "enter_input" ||
+        obj.kind === "arrive" ||
         obj.kind === "keymap" ||
         obj.kind === "literal_key" ||
         obj.kind === "open_keymap" ||
@@ -200,6 +227,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "tab_detail" ||
         obj.kind === "chooser" ||
         obj.kind === "confirm_close" ||
+        obj.kind === "confirm_close_others" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||
         obj.kind === "draft" ||

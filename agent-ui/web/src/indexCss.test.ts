@@ -13,6 +13,7 @@ import { renderToolCall } from "./toolRegistry";
 import { renderMarkdown } from "./markdown";
 import { PermissionCard } from "./components/PermissionCard";
 import { KeymapOverlay } from "./components/KeymapOverlay";
+import { EMPTY_PANEL_TABLE } from "./keymap";
 
 /** Strip CSS comments, but never a `/*` that is inside a string.
  *
@@ -69,11 +70,22 @@ const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
 /** A selector branch that sits inside the winbar or the status line -- `.winbar`, `.status-line`,
  *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
-/** The solid cursor block: the current row's sign cell, and a focused button with its children
- *  (every control is keyboard-reachable and the selected one is drawn as the cursor). Nothing else. */
-const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?)$/;
+/** The solid cursor block: the current row's sign cell, a focused button with its children (every
+ *  control is keyboard-reachable and the selected one is drawn as the cursor), the band's own
+ *  `↓N` button (panel round 2 plan, Task 10; spec §5.2: "inverted", the same reversed body pair),
+ *  and the chooser's current row's sign cell (spec §6.1; r2-gui GUI pass, 2026-09-26). Nothing
+ *  else. */
+const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread|\.chooser-row\.current \.chooser-sign)$/;
 /** The global `f` HINT's label, and nothing else (spec 2026-09-19-global-hint-design.md §2.3). */
 const HINT_BRANCH = /^\.hint-label$/;
+/** The which-key box's own keycap glyph (panel round 2 plan, Task 8), and nothing else -- a
+ *  selector branch ending in exactly `.wk-key`. */
+const WK_KEY_BRANCH = /(?:^|[\s.])wk-key$/;
+/** The band's `⏵⏵` mode glyph (panel round 2 plan, Task 10; spec §9), and nothing else -- a
+ *  selector branch that is `.mode-glyph` optionally followed by a `[data-mode-name="..."]`
+ *  attribute selector, narrowed so it cannot widen to `.band-mode`/`.mode-pill`/anything else the
+ *  glyph sits beside. */
+const MODE_GLYPH_BRANCH = /(?:^|[\s.])mode-glyph(?:\[data-mode-name="[a-z]+"\])?$/;
 
 /**
  * The rule this file actually enforces, in one sentence: **a colour may be used as text only where
@@ -85,7 +97,9 @@ const HINT_BRANCH = /^\.hint-label$/;
  * `bg`-guarded text on chrome, was never measured against the surface actually under it. The one
  * other exemption (panel-as-document task 4) is `--nv-syn-*` inside a `hljs-*` rule -- deliberately
  * UNguarded, because syntax tokens are meant to be the editor's own colours; see the big comment on
- * the real guard test below for why that one is not a contrast exemption at all.
+ * the real guard test below for why that one is not a contrast exemption at all. Panel round 2 plan
+ * Task 8 adds a fourth, narrower instance of that same non-guarantee: `--nv-syn-keyword` on exactly
+ * the which-key box's own `.wk-key` glyph.
  *
  * Returns every `color:` declaration in `source` that is NOT one of the three sanctioned pairings
  * above. Shared by the real guard test and the tests proving none of the three exemptions can
@@ -107,9 +121,21 @@ function unguardedTextColorDeclarations(source: string): string[] {
       everyBranchIsOnSurface(selector, CURSOR_BRANCH) && /(?:^|;)\s*background: var\(--nv-fg\);/.test(body);
     const onHintSurface =
       everyBranchIsOnSurface(selector, HINT_BRANCH) && /(?:^|;)\s*background: var\(--nv-hint-bg\);/.test(body);
+    const onWkKeySurface = everyBranchIsOnSurface(selector, WK_KEY_BRANCH);
+    const onModeGlyphSurface = everyBranchIsOnSurface(selector, MODE_GLYPH_BRANCH);
     for (const declaration of body.match(/(?<![a-z-])color:[^;]*;/g) ?? []) {
       if (onHljsSurface && /^color: var\(--nv-syn-[a-z]+\);$/.test(declaration)) continue;
       if (onChromeSurface && /^color: var\(--nv-chrome-(fg|muted)\);$/.test(declaration)) continue;
+      // The which-key box's own keycap (panel round 2 plan, Task 8): the same deliberately-
+      // unguarded exemption `--nv-syn-*` gets inside `hljs-*` above, extended to the one place
+      // outside a code block that also wants a "this is a key" glyph -- narrowed to exactly
+      // `.wk-key`, so it cannot widen to `.wk-group`/`.wk-disabled`/anything else in the box.
+      if (onWkKeySurface && /^color: var\(--nv-syn-keyword\);$/.test(declaration)) continue;
+      // The band's own mode glyph (panel round 2 plan, Task 10; spec §9): `--nv-warn`/`--nv-error`
+      // as a glyph colour, not text -- `--nv-warn`/`--nv-error` are guarded at `UI_CONTRAST` (3.0)
+      // against `bg`, not the 4.5:1 text needs, the same reasoning every other signal colour in
+      // this file gets kept off text for.
+      if (onModeGlyphSurface && /^color: var\(--nv-(warn|error)\);$/.test(declaration)) continue;
       // The panel's cursor: `--nv-bg` text on an `--nv-fg` fill, the body's own pair reversed.
       // Only where the SAME rule paints that fill, so the exemption cannot outlive the fill.
       if (onCursorSurface && /^color: var\(--nv-bg\);$/.test(declaration)) continue;
@@ -429,7 +455,7 @@ function allStyleRules(rules: CSSRuleList): CSSStyleRule[] {
  *  enough for this file's own selectors (plain classes, attribute selectors, `:not()`/`:focus`
  *  pseudo-classes counted at one each, type selectors) and validated below against specificities
  *  this file's own comments already state by hand (`.mode-selector button:not(.row-choice)` is
- *  documented as (0,2,1); `.panel-footer .mode-block[data-mode="input"]` as (0,3,0)). Not a full
+ *  documented as (0,2,1); `.band-mode[data-mode="input"]` as (0,2,0)). Not a full
  *  implementation of the spec's handling of `:not()`'s own argument, or of `:is()`/`:where()`,
  *  neither of which any selector in this file uses. */
 function specificity(selector: string): [number, number, number] {
@@ -548,12 +574,28 @@ describe("index.css", () => {
     expect(withoutComments.match(/#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(/g)).toBeNull();
   });
 
-  it("names no font family -- both stacks come from Rust", () => {
+  /** Panel round 2 (plan Task 10; spec §9): `⏵⏵` (U+23F5) is not in FiraCode Nerd Font, so
+   *  `.mode-glyph` names a real font stack rather than a `--nv-font-*` token -- the one named
+   *  exemption to "both stacks come from Rust", narrowed to exactly that one selector and exactly
+   *  that one literal stack so it cannot quietly widen to cover an unrelated rule. */
+  const MODE_GLYPH_FONT_STACK =
+    'font-family: "Noto Sans Symbols 2", "Symbola", "Segoe UI Symbol", "Adwaita Mono", var(--nv-font-mono);';
+
+  it("names no font family -- both stacks come from Rust, except the mode glyph's own", () => {
     const families = withoutComments.match(/font-family:[^;]*;/g) ?? [];
     expect(families.length).toBeGreaterThan(0);
     for (const declaration of families) {
+      if (declaration === MODE_GLYPH_FONT_STACK) continue;
       expect(declaration).toMatch(/^font-family: var\(--nv-font-(prose|mono)\);$/);
     }
+  });
+
+  it("the mode-glyph font stack is on .mode-glyph alone, not a grouped or wider selector", () => {
+    const rules = withoutComments.match(/[^{}]*\{[^{}]*\}/g) ?? [];
+    const owning = rules.filter((rule) => rule.includes(MODE_GLYPH_FONT_STACK));
+    expect(owning.length).toBe(1);
+    const selector = owning[0].slice(0, owning[0].indexOf("{")).trim();
+    expect(selector).toBe(".mode-glyph");
   });
 
   it("uses --nv-border only for rules, never as a fill under text", () => {
@@ -616,6 +658,25 @@ describe("index.css", () => {
     );
     expect(declarations).toEqual(["color: var(--nv-syn-keyword);"]);
     expect(declarations[0]).not.toMatch(/^color: var\(--nv-(fg|muted)\);$/);
+  });
+
+  it("exempts --nv-syn-keyword as text only on the which-key box's own keycap", () => {
+    expect(unguardedTextColorDeclarations(".which-key-box .wk-key { color: var(--nv-syn-keyword); }")).toEqual([]);
+    // Anywhere else, and a group with one branch on it, it is refused -- same shape as the hljs-*
+    // and chrome-surface proofs above.
+    expect(unguardedTextColorDeclarations(".wk-title { color: var(--nv-syn-keyword); }")).toEqual([
+      "color: var(--nv-syn-keyword);",
+    ]);
+    expect(
+      unguardedTextColorDeclarations(".session-lost, .which-key-box .wk-key { color: var(--nv-syn-keyword); }"),
+    ).toEqual(["color: var(--nv-syn-keyword);"]);
+  });
+
+  it("still refuses a different signal colour on the which-key box's own keycap", () => {
+    // Proves the narrowed guard did not quietly become "anything inside .wk-key is exempt" -- only
+    // --nv-syn-keyword survives it, the same check the hljs-* proof above makes for that exemption.
+    const declarations = unguardedTextColorDeclarations(".which-key-box .wk-key { color: var(--nv-warn); }");
+    expect(declarations).toEqual(["color: var(--nv-warn);"]);
   });
 
   it("still refuses --nv-chrome-accent as text inside the winbar", () => {
@@ -718,11 +779,13 @@ describe("index.css", () => {
     }
   });
 
-  it("does not dim the status row, the activity line or the footer with opacity either", () => {
+  it("does not dim the activity line or the band with opacity either", () => {
     // Same defect, same fix, same reason: opacity on top of an already-guarded muted text colour
     // would multiply its contrast back down below what tokens.rs actually guaranteed. The winbar
-    // is gone (V2, session tabs Task 10); these three replace it and the old status line.
-    const rules = withoutComments.match(/\.(?:status-row|activity-line|panel-footer)[^{}]*\{[^}]*\}/g) ?? [];
+    // is gone (V2, session tabs Task 10); these two replace it and the old status line -- `.status-row`
+    // and `.panel-footer`, session tabs Task 10's own replacement, are themselves gone now
+    // (panel round 2 plan, Task 10), folded into `.status-band`.
+    const rules = withoutComments.match(/\.(?:status-band|activity-line)[^{}]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThan(0);
     for (const rule of rules) {
       expect(rule).not.toMatch(/opacity/);
@@ -1093,19 +1156,22 @@ describe("index.css cascade (which rule actually wins)", () => {
   // below, and `.selected` exercises `.row-choice.selected`'s own fill -- neither was reachable
   // when this fixture held only the unselected row.
   const CHOICE_ROW = `<div class="mode-selector"><div class="session-choice"><button type="button" class="row row-choice"><span class="row-sign">›</span><span class="row-body">y</span></button><button type="button" class="row row-choice selected"><span class="row-sign">›</span><span class="row-body">z</span></button></div></div>`;
-  const MODE_BLOCK = `<div class="panel-footer"><span class="mode-block" data-mode="input">INPUT</span></div>`;
-  const UNFOCUSED_INPUT_BLOCK = `<div class="panel-footer"><span class="mode-block" data-mode="input" data-focused="false">INPUT</span></div>`;
+  // Panel round 2 (plan Task 10): `.panel-footer .mode-block` is `.band-mode` now, a bare selector
+  // (no wrapper prefix -- `StatusBand.tsx` never nests it under a `.panel-footer`, which is gone).
+  const MODE_BLOCK = `<div class="status-band"><span class="band-mode" data-mode="input">INPUT</span></div>`;
+  const UNFOCUSED_INPUT_BLOCK = `<div class="status-band"><span class="band-mode" data-mode="input" data-focused="false">INPUT</span></div>`;
 
   // Review (2026-09-19): the conversation used to be `grid-template-rows: auto 1fr auto auto`, which
   // gives the `1fr` to the SECOND child -- the fatal-error banner when it is shown, not the list.
   // The list then took its full content height and never scrolled, so `j`/`k` could not step
   // through a long reply over a dead session. jsdom has no layout, so this pins the rule that
   // decides it: the list grows by its own class, whatever sits between it and the rest of the
-  // panel (V2, session tabs Task 10: the activity line, the composer, the status row, the footer --
-  // formerly the winbar and the status line).
+  // panel (V2, session tabs Task 10: the activity line, the composer, the status row, the footer;
+  // panel round 2 plan Task 10 replaced the latter two with the one band, formerly the winbar and
+  // the status line before that).
   const CONVERSATION = (banner: string) =>
     `<div class="agent-ui-root agent-ui-conversation">${banner}<div class="agent-ui-scroller"><div class="message-list">m</div></div>` +
-    `<div class="activity-line">a</div><div class="composer">c</div><div class="status-row">s</div><div class="panel-footer">f</div></div>`;
+    `<div class="activity-line">a</div><div class="composer">c</div><div class="status-band">s</div></div>`;
 
   it("gives the free height to the message list, fatal banner or not", () => {
     for (const banner of ["", `<div class="fatal-error">e</div>`]) {
@@ -1122,7 +1188,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       const root = computed(CONVERSATION(banner), ".agent-ui-conversation");
       expect(root.display).toBe("flex");
       expect(root.gridTemplateRows).toBe("none");
-      for (const other of [".activity-line", ".composer", ".status-row", ".panel-footer", ...(banner ? [".fatal-error"] : [])]) {
+      for (const other of [".activity-line", ".composer", ".status-band", ...(banner ? [".fatal-error"] : [])]) {
         expect(computed(CONVERSATION(banner), other).flexGrow).toBe("0");
       }
     }
@@ -1140,19 +1206,23 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="agent-ui-root agent-ui-conversation">` +
       `<div class="agent-ui-scroller"><div class="message-list">m</div>` +
       `<div class="keymap-overlay"><section><h2>This panel</h2></section></div></div>` +
-      `<div class="activity-line">a</div><div class="status-row">s</div><div class="panel-footer">f</div></div>`;
+      `<div class="activity-line">a</div><div class="status-band">s</div></div>`;
     expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
     expect(computed(markup, ".keymap-overlay").position).toBe("absolute");
     // And the bars are back to taking part in normal painting: nothing has to out-stack the overlay.
-    for (const bar of [".activity-line", ".status-row", ".panel-footer"]) {
+    for (const bar of [".activity-line", ".status-band"]) {
       expect(computed(markup, bar).zIndex).toBe("auto");
     }
   });
 
-  it("puts the R2 pill inside the list's own region", () => {
-    const markup = `<div class="agent-ui-scroller"><div class="message-list">m</div><button class="new-pill">↓</button></div>`;
-    expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
-    expect(computed(markup, ".new-pill").position).toBe("absolute");
+  /** R2's pill is the band's own `.band-unread` now (panel round 2 plan, Task 10; spec §5.1: "the
+   *  band's right, `↓N` inverted; never over text"), not a `NewPill` floated absolutely over the
+   *  list -- the opposite invariant from the one this test used to pin. */
+  it("keeps the R2 pill in normal flow inside the band, not floated over the list", () => {
+    const markup = `<div class="status-band"><div class="band-right"><button class="band-seg band-unread">↓</button></div></div>`;
+    expect(computed(markup, ".band-unread").position).toBe("static");
+    expect(computed(markup, ".band-unread").background).toBe("var(--nv-fg)");
+    expect(computed(markup, ".band-unread").color).toBe("var(--nv-bg)");
   });
 
   it("does not dim the which-key strip with opacity", () => {
@@ -1763,22 +1833,32 @@ describe("index.css cascade (which rule actually wins)", () => {
      quietly turns the indent back into a card. */
 
   it("carries the prompt row's displacement, rule and colour on .row-prompt .row-body, and the cascade lets each win", () => {
-    // `border-left: 2px solid var(--nv-muted)` is a shorthand containing a `var()`, which this
+    // `border-left: 2px solid var(--nv-fg)` is a shorthand containing a `var()`, which this
     // jsdom engine drops from computed style entirely (see the big comment atop this describe
     // block, and the `--nv-border` test near the top of the file for the same idiom) -- so its
     // TEXT is checked here and its CASCADE is checked separately below through `winningDeclaration`.
     //
-    // The colour is pinned to `--nv-muted`, not `--nv-border`: `--nv-border` is `bg.mix(fg, 0.15)`
-    // and measures 1.27:1 on rose-pine dawn (`tokens.rs`'s own derivation), and below the ramp's
-    // knee this 2px rule is the ENTIRE cue that distinguishes the two speakers -- a hairline that
-    // faint would make it disappear at exactly the width where position alone hasn't kicked in yet.
+    // Wave 3 Task 2 (variant C): the rule moved from `--nv-muted` to `--nv-fg`, the owner's
+    // "现在的ui不错" starting point pushed one step further -- the rule now reads as the same colour
+    // as the words it marks, rather than a step fainter than them. `--nv-border` is still never used
+    // here: it is `bg.mix(fg, 0.15)` and measures 1.27:1 on rose-pine dawn (`tokens.rs`'s own
+    // derivation), and below the ramp's knee this 2px rule is still the ENTIRE cue that
+    // distinguishes the two speakers -- a hairline that faint would make it disappear at exactly the
+    // width where position alone hasn't kicked in yet. `--nv-border` is used instead for the NEW
+    // turn-separator hairline below, a different edge of a different element, tested separately.
     const rule = withoutComments.match(/\.row-prompt \.row-body\s*\{[^}]*\}/);
     expect(rule).not.toBeNull();
     const body = rule![0];
     expect(body).toMatch(/margin-left:\s*clamp\(/);
-    expect(body).toMatch(/border-left:\s*2px solid var\(--nv-muted\);/);
+    expect(body).toMatch(/border-left:\s*2px solid var\(--nv-fg\);/);
     expect(body).toMatch(/padding-left:\s*10px;/);
     expect(body).toMatch(/color:\s*var\(--nv-fg\);/);
+    // Variant C also steps the prompt text down one size, to `--fs-base` (`.row-body`'s own base
+    // rule declares `--fs-prose`), with a slightly tighter line-height. Text-matched for the same
+    // reason as `border-left` just above -- keeping this rule's whole proof in one style rather than
+    // splitting it between a text scan and a live cascade check for no real reason.
+    expect(body).toMatch(/font-size:\s*var\(--fs-base\);/);
+    expect(body).toMatch(/line-height:\s*1\.6;/);
 
     // `padding-left` and `color` are each a plain literal or a plain single-`var()` longhand --
     // neither shape gets dropped by this engine -- so the cascade half CAN be checked live for
@@ -1804,10 +1884,10 @@ describe("index.css cascade (which rule actually wins)", () => {
     // property at all). The reviewer's own exact bypass: an ancestor-qualified selector at HIGHER
     // specificity ((0,3,0) vs (0,2,0)) cancelling the border while every text-match above stayed
     // satisfied, because nothing before this line ever asked who wins.
-    expect(winningDeclaration(html, ".row-body", "border-left")).toBe("2px solid var(--nv-muted)");
+    expect(winningDeclaration(html, ".row-body", "border-left")).toBe("2px solid var(--nv-fg)");
     expect(
       winningDeclaration(html, ".row-body", "border-left", ".message-list .row-prompt .row-body { border-left: none; }"),
-    ).not.toBe("2px solid var(--nv-muted)");
+    ).not.toBe("2px solid var(--nv-fg)");
 
     // Round-2 review, exploit 1: `!important` beats specificity outright, so a LOWER-specificity
     // `.row-body { border-left: none !important; }` appended after the real rule still wins in a
@@ -1817,7 +1897,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     // `winningDeclaration` has to say the shorthand no longer wins.
     expect(
       winningDeclaration(html, ".row-body", "border-left", ".row-body { border-left: none !important; }"),
-    ).not.toBe("2px solid var(--nv-muted)");
+    ).not.toBe("2px solid var(--nv-fg)");
 
     // Round-2 review, exploit 2: a rule that never spells the word "border-left" at all, only its
     // own LONGHANDS, at the SAME specificity and placed after the real rule -- a real cascade
@@ -1834,7 +1914,80 @@ describe("index.css cascade (which rule actually wins)", () => {
         "border-left",
         ".row-prompt .row-body { border-left-style: none; border-left-width: 0; }",
       ),
-    ).not.toBe("2px solid var(--nv-muted)");
+    ).not.toBe("2px solid var(--nv-fg)");
+  });
+
+  it("puts .row-prompt .row-sign's colour before .row-current .row-sign in source order, so the cursor still wins", () => {
+    // Global Constraint: `--nv-bg` as text only in the `.row-current .row-sign` rule -- so the new
+    // prompt-row sign colour must never be able to beat the cursor's own colour. Both rules are
+    // equal-specificity descendant selectors ((0,2,0) each: one class on the ancestor, one on
+    // `.row-sign`), so on a row that is both `.row-prompt` and `.row-current` at once, the winner is
+    // decided by which comes LAST in the file -- which means the prompt rule has to come first, not
+    // merely "somewhere before the end of the file".
+    const promptSignIndex = withoutComments.indexOf(".row-prompt .row-sign");
+    const cursorSignIndex = withoutComments.indexOf(".row-current .row-sign");
+    expect(promptSignIndex).toBeGreaterThan(-1);
+    expect(cursorSignIndex).toBeGreaterThan(-1);
+    expect(promptSignIndex).toBeLessThan(cursorSignIndex);
+
+    const rule = withoutComments.match(/\.row-prompt \.row-sign\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule![0]).toMatch(/color:\s*var\(--nv-fg\);/);
+
+    // Live, on a plain prompt row (not the cursor): the `›` reads --nv-fg now, not the base
+    // `.row-sign` rule's --nv-muted.
+    const plainHtml = `<div class="message-list"><div class="row row-prompt"><span class="row-sign">›</span><div class="row-body">hi</div></div></div>`;
+    expect(computed(plainHtml, ".row-sign").color).toBe("var(--nv-fg)");
+
+    // Live, where the row is BOTH .row-prompt and .row-current: the cursor's own --nv-bg still wins
+    // the cascade tie, because it comes later in source order.
+    const cursorHtml = `<div class="message-list"><div class="row row-prompt row-current"><span class="row-sign">›</span><div class="row-body">hi</div></div></div>`;
+    expect(computed(cursorHtml, ".row-sign").color).toBe("var(--nv-bg)");
+
+    // Negative control: an equal-specificity `.row-prompt .row-sign` rule appended AFTER the real
+    // stylesheet (simulating a future edit that moves it past `.row-current .row-sign`) flips the
+    // tie-break and steals the cursor's own colour -- proving the ordering assertion above is a real
+    // constraint and not vacuously true.
+    const reversed = computed(cursorHtml, ".row-sign", ".row-prompt .row-sign { color: var(--nv-fg); }");
+    expect(reversed.color).toBe("var(--nv-fg)");
+  });
+
+  it("marks a turn boundary between prompts, and lets back-to-back prompts share one rule", () => {
+    // The hairline here is a turn SEPARATOR, a different signal on a different edge of a different
+    // element than `.row-prompt .row-body`'s own 2px `--nv-fg` speaker cue above -- so it uses
+    // `--nv-border` (the line colour "uses --nv-border only for rules, never as a fill under text"
+    // elsewhere in this file already guards), never the speaker cue's own colour, and the two cannot
+    // be confused for one another.
+    const notFirst = withoutComments.match(/\.row-prompt:not\(:first-child\)\s*\{[^}]*\}/);
+    expect(notFirst).not.toBeNull();
+    const notFirstBody = notFirst![0];
+    expect(notFirstBody).toMatch(/margin-top:\s*10px;/);
+    expect(notFirstBody).toMatch(/padding-top:\s*10px;/);
+    expect(notFirstBody).toMatch(/border-top:\s*1px solid var\(--nv-border\);/);
+
+    // Two prompts sent back to back (no reply between them) share one hairline, not two -- the
+    // second prompt's own `:not(:first-child)` rule above would otherwise draw a second separator
+    // directly under the first one's.
+    const backToBack = withoutComments.match(/\.row-prompt \+ \.row-prompt\s*\{[^}]*\}/);
+    expect(backToBack).not.toBeNull();
+    const backToBackBody = backToBack![0];
+    expect(backToBackBody).toMatch(/margin-top:\s*0;/);
+    expect(backToBackBody).toMatch(/padding-top:\s*0;/);
+    expect(backToBackBody).toMatch(/border-top:\s*none;/);
+  });
+
+  it("keeps every .row-prompt rule, not just .row-body, off the panel's bubble vocabulary", () => {
+    // The two turn-separator rules just above are the first `.row-prompt`-selector rules that are
+    // NOT `.row-prompt .row-body`/`.row-prompt .row-sign` -- this widens the "no fill, no frame, no
+    // rounded corner" guard the dedicated `declarationsOnRealPromptBody` test below already holds
+    // `.row-body` to, so a turn-separator rule cannot quietly grow into a card the same way that
+    // test already stops `.row-body` from.
+    const allPromptRules = rulesMatching(withoutComments, ".row-prompt");
+    expect(allPromptRules.length).toBeGreaterThan(0);
+    for (const { selector, body } of allPromptRules) {
+      expect(body, `${selector} sets a background on a .row-prompt rule`).not.toMatch(/background/);
+      expect(body, `${selector} sets a border-radius on a .row-prompt rule`).not.toMatch(/border-radius/);
+    }
   });
 
   it("computes selector specificity the way this file's own comments already claim it, by hand", () => {
@@ -1847,7 +2000,9 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(specificity(".row-choice")).toEqual([0, 1, 0]);
     expect(specificity(".row-prompt .row-body")).toEqual([0, 2, 0]);
     expect(specificity(".message-list .row-prompt .row-body")).toEqual([0, 3, 0]);
-    expect(specificity('.panel-footer .mode-block[data-mode="input"]')).toEqual([0, 3, 0]);
+    // Panel round 2 (plan Task 10): `.band-mode[data-mode="input"]`, not `.panel-footer .mode-block
+    // [data-mode="input"]` -- one class plus one attribute now that the wrapper prefix is gone.
+    expect(specificity('.band-mode[data-mode="input"]')).toEqual([0, 2, 0]);
     expect(compareSpecificity([0, 3, 0], [0, 2, 0])).toBeGreaterThan(0);
   });
 
@@ -2150,11 +2305,11 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("lets the per-mode border-left-color override the mode block's own border shorthand", () => {
-    expect(computed(MODE_BLOCK, ".mode-block").borderLeftColor).toBe("var(--nv-mode-input)");
+    expect(computed(MODE_BLOCK, ".band-mode").borderLeftColor).toBe("var(--nv-mode-input)");
     const clobbered = computed(
       MODE_BLOCK,
-      ".mode-block",
-      ".panel-footer .mode-block { border-left: 3px solid var(--nv-mode-browse); }",
+      ".band-mode",
+      ".band-mode { border-left: 3px solid var(--nv-mode-browse); }",
     );
     // A later rule at HIGHER specificity than the `[data-mode]` one would be the real defect; this
     // control is the weaker "later, equal-specificity shorthand", which is enough to show the
@@ -2217,24 +2372,70 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("dims an unfocused mode block even in INPUT, whose own rule has equal specificity", () => {
-    // `[data-mode="input"]` and `[data-focused="false"]` are both (0,3,0), so source order decides
+    // `[data-mode="input"]` and `[data-focused="false"]` are both (0,2,0), so source order decides
     // and the unfocused rule must come second. Both sides are `var()` longhands, the combination
     // this engine resolves correctly (see the big comment above).
-    const block = computed(UNFOCUSED_INPUT_BLOCK, ".mode-block");
+    const block = computed(UNFOCUSED_INPUT_BLOCK, ".band-mode");
     expect(block.borderLeftColor).toBe("var(--nv-muted)");
     expect(block.color).toBe("var(--nv-muted)");
     // A focused block keeps its per-mode rule and inherits the bright label colour.
-    const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".mode-block");
+    const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".band-mode");
     expect(focused.borderLeftColor).toBe("var(--nv-mode-input)");
     expect(focused.color).not.toBe("var(--nv-muted)");
     // Negative control: the INPUT rule re-declared after the unfocused one wins it back. That is
     // what swapping the two rules in index.css would do.
     const clobbered = computed(
       UNFOCUSED_INPUT_BLOCK,
-      ".mode-block",
-      '.panel-footer .mode-block[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
+      ".band-mode",
+      '.band-mode[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
     );
     expect(clobbered.borderLeftColor).toBe("var(--nv-mode-input)");
+  });
+
+  /** Spec §6.1, the r2-gui GUI pass (2026-09-26): the chooser's current row carries the panel's
+   *  solid cursor in its sign cell, and a record's long title stays on its own line beside the sign,
+   *  cut, rather than wrapping under it (it dropped to the row's left edge, under the sign column). */
+  it("draws the chooser's cursor solid and keeps a long title beside its sign", () => {
+    const html = `<div class="chooser"><div class="chooser-row current"><span class="chooser-sign">›</span><span class="chooser-line1"><span class="chooser-lead">t</span><span class="chooser-right">12 min ago</span></span></div></div>`;
+    const sign = computed(html, ".chooser-sign");
+    expect(sign.background).toBe("var(--nv-fg)");
+    expect(sign.color).toBe("var(--nv-bg)");
+    const line1 = computed(html, ".chooser-line1");
+    expect(line1.flexBasis).toMatch(/^0(%|px)?$/);
+    const lead = computed(html, ".chooser-lead");
+    expect(lead.whiteSpace).toBe("nowrap");
+    expect(lead.overflow).toBe("hidden");
+    expect(lead.textOverflow).toBe("ellipsis");
+  });
+
+  /** `mock: bottom.html` B: `✻ Working… 1m 12s · ctrl+c interrupt` -- the Stop control is words in
+   *  the line (spec §5.1), not a boxed button (the r2-gui GUI pass, 2026-09-26, saw WebKit's own
+   *  button face). Focused, it is still the solid cursor every focused control is. */
+  it("draws the activity line's Stop as words, and as the solid cursor when focused", () => {
+    const html = `<div class="agent-ui-root"><div class="activity-line"><button type="button" class="stop">ctrl+c interrupt</button></div></div>`;
+    const stop = computed(html, ".stop");
+    expect(stop.borderTopStyle).toMatch(/^(none|)$/);
+    expect(stop.backgroundColor).toMatch(/^(transparent|rgba\(0, 0, 0, 0\)|)$/);
+    expect(stop.color).toBe("var(--nv-muted)");
+    // A fresh copy, focused before its style is first read: jsdom does not recompute on focus.
+    document.body.innerHTML = html;
+    document.body.querySelector<HTMLElement>(".stop")!.focus();
+    const now = getComputedStyle(document.body.querySelector(".stop")!);
+    expect(now.background).toBe("var(--nv-fg)");
+    expect(now.color).toBe("var(--nv-bg)");
+  });
+
+  /** `mock: bottom.html` B: a bare `❯` line in both modes (spec §5.1). The r2-gui GUI pass
+   *  (2026-09-26) saw BROWSE's stand-in still boxed, and WebKit's own focus ring drawing a box round
+   *  the textarea in INPUT. */
+  it("draws the composer as a bare line in both modes: no box, no focus ring", () => {
+    const hint = computed(`<div class="composer"><div class="composer-browse-hint">x</div></div>`, ".composer-browse-hint");
+    for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+      expect(hint[`border${side}Style` as "borderTopStyle"], side).toMatch(/^(none|)$/);
+    }
+    expect(hint.borderRadius).toMatch(/^(0|0px|)$/);
+    const box = computed(`<div class="composer"><textarea></textarea></div>`, ".composer textarea");
+    expect(box.outlineStyle).toBe("none");
   });
 
   it("gives the composer the panel's own font and caps its growth", () => {
@@ -2404,7 +2605,13 @@ describe("index.css: the ? overlay never scrolls sideways", () => {
     const long = { keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)", what: "Text size reset (both panes)" };
     document.head.innerHTML = `<style>${css}${extraCss}</style>`;
     document.body.innerHTML = renderToStaticMarkup(
-      createElement(KeymapOverlay, { onClose: () => {}, windowKeys: [long], prefixKeys: [], prefixLabel: "Ctrl+b" }),
+      createElement(KeymapOverlay, {
+        onClose: () => {},
+        windowKeys: [long],
+        prefixKeys: [],
+        prefixLabel: "Ctrl+b",
+        panel: EMPTY_PANEL_TABLE,
+      }),
     );
     return Array.from(document.querySelectorAll<HTMLElement>(".keymap-overlay td:first-child"));
   }

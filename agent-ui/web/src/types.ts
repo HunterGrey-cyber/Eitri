@@ -271,6 +271,10 @@ export type Hello = {
    * Rust ranks this; the frontend renders it in array order and sorts nothing. */
   resumableSessions: ResumableSession[];
   expectedVerdandiRevision: string | null;
+  /** `agent::account`'s configured name, `null` when none is set (panel round 2 plan's §7, Task
+   *  5: `serialize_hello_for_js`'s own `"account"` field). Read by the empty tab's dashboard
+   *  (§7's cwd/backend/account line) and by nothing else yet. */
+  account: string | null;
 };
 
 export type TurnOutcome = "completed" | "interrupted" | "failed" | "limit_reached";
@@ -332,8 +336,19 @@ export type TabInfo = {
   /** False on legacy (spec D13 A): "not resumable". */
   resumable: boolean;
   failure: string | null;
+  /** The record's title (panel round 2 plan's Task 5, spec §10.1): the first prompt's title, or a
+   *  resumed record's display title. `null` before one exists. Read by the chooser's open-tab rows
+   *  (spec §6.1's line 2) once they join a `ChooserTab` to its `TabInfo` here. */
+  title: string | null;
 };
-export type TabsEnvelope = { active: TabId; tabs: TabInfo[] };
+export type TabsEnvelope = {
+  active: TabId;
+  tabs: TabInfo[];
+  /** `TabSet::default_mode` (panel round 2 plan's Task 5, spec §6.3/§10.1): the mode a fresh tab,
+   *  or a resume into a new tab, takes. The chooser derives its mode line from this rather than
+   *  re-deriving it, so a cycle never needs the chooser re-sent. */
+  defaultMode: PermissionModeChoice;
+};
 export type DetailRow = { label: string; value: string };
 export type ChooserTab = { tab: TabId; label: string; marker: TabMarker | null; pending: number; resumable: boolean };
 export type ChooserRecord = {

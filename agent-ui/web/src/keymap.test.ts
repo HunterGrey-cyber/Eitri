@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BROWSE_KEYS, INPUT_KEYS, resolveKey } from "./keymap";
-import type { KeyContext, KeyLike, PendingPrefix } from "./keymap";
+import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
 const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; isComposing: boolean; keyCode: number }> = {}) =>
   ({ key: k, ctrlKey: false, shiftKey: false, isComposing: false, ...over });
@@ -201,6 +201,32 @@ describe("resolveKey, phase 3", () => {
   });
 });
 
+/** Just enough of a `PanelTable` (panel round 2 plan, Task 7) to exercise `resolveKey`'s
+ *  second-key-of-a-pending-prefix lookup: one binding, `[b`, that shares its first key with the
+ *  fixed `[[` prompt-jump pair. */
+const TABLE: PanelTable = {
+  leader: " ",
+  leaderLabel: "Space",
+  leaderSource: "default",
+  timeoutlen: 1000,
+  timeout: true,
+  bindings: [{ keys: ["[", "b"], action: "tab.prev", desc: "previous tab", source: "default" }],
+  groups: [],
+};
+
+describe("resolveKey with a panel table (panel round 2 plan, Task 7)", () => {
+  it("resolves a second key the fixed pairs don't own to the table's binding", () => {
+    const binding: PanelBinding = TABLE.bindings[0];
+    expect(resolveKey("browse", key("b"), { ...ctx, pending: "[", table: TABLE })).toEqual({ kind: "panel", binding });
+  });
+  it("still runs the fixed [[ prompt-jump even with a table present", () => {
+    expect(resolveKey("browse", key("["), { ...ctx, pending: "[", table: TABLE })).toEqual({ kind: "prompt-jump", delta: -1 });
+  });
+  it("resolves to null for [b without a table, exactly as today", () => {
+    expect(resolveKey("browse", key("b"), { ...ctx, pending: "[" })).toBeNull();
+  });
+});
+
 /* The two-way check spec §3.3 asks for: `BROWSE_KEYS` may neither promise a key `resolveKey` does
    nothing with, nor leave out a key that does something. Each half is its own `it` so a failure
    names which direction broke. */
@@ -224,7 +250,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
      check for this test) makes "y" resolve to `{kind:"copy"}` here with no row to match it against. */
   it("every key that does something in resolveKey is listed somewhere in BROWSE_KEYS", () => {
     const known = new Set(BROWSE_KEYS.flatMap((row) => row.keys.split(" / ")));
-    const candidates: { token: string; ev: KeyLike; pending?: PendingPrefix }[] = [
+    const candidates: { token: string; ev: KeyLike; pending?: PendingPrefix; table?: PanelTable }[] = [
       ...("abcdefghijklmnopqrstuvwxyz".split("").map((letter) => ({ token: letter, ev: key(letter) }))),
       { token: "Enter", ev: key("Enter") },
       { token: "Escape", ev: key("Escape") },
@@ -246,16 +272,21 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "zl", ev: key("l"), pending: "z" },
       { token: "gf", ev: key("f"), pending: "g" },
       { token: "Ctrl+g", ev: key("g", { ctrlKey: true }) },
+      // A key named only by the panel's own which-key table (Task 7): the overlay's new section
+      // (Task 8) names it, not BROWSE_KEYS, so it must resolve without needing a row here.
+      { token: "[b", ev: key("b"), pending: "[", table: TABLE },
     ];
     for (const sessionEnded of [false, true]) {
-      for (const { token, ev, pending } of candidates) {
-        const result = resolveKey("browse", ev, { sessionEnded, pending, turnRunning: true });
+      for (const { token, ev, pending, table } of candidates) {
+        const result = resolveKey("browse", ev, { sessionEnded, pending, table, turnRunning: true });
         if (result === null) continue;
         // `pending`/`count` are intermediate results -- claimed, but not yet the thing the key does.
         // A candidate the table spells explicitly (`1-9`, `[[`, `]]`) is checked like everything
         // else; a bare letter or digit that merely STARTS one of those (a lone `g`, `[`, `]`, `3`)
         // is skipped, the same as `gg`'s own first `g` always was.
         if ((result.kind === "pending" || result.kind === "count") && !known.has(token)) continue;
+        // A table-resolved key is listed by the overlay's own panel section (Task 8), never here.
+        if (result.kind === "panel") continue;
         expect(known.has(token), `"${token}" (sessionEnded=${sessionEnded}) resolves to ${JSON.stringify(result)} but no BROWSE_KEYS row spells it`).toBe(true);
       }
     }

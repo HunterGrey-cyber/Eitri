@@ -23,8 +23,16 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
  *  (`hello.permissionModes`): neovibe's `auto` is not the CLI's. `cycleOffered` names D6's own
  *  capability gate (`state.capabilities.modeSwitch`) before a start it is always offered
  *  (phase 2's own behaviour); once a session is live it is offered only when Verdandi can actually
- *  change a live session's mode, which today is never (ruling 35). */
-export function modePill(mode: PermissionModeChoice, cycleOffered: boolean): string {
+ *  change a live session's mode, which today is never (ruling 35).
+ *
+ *  `short` (panel round 2 plan, Task 10; spec §5.2): the bottom band has no room for "on" or the
+ *  cycle hint, so it always reads `short = true` and gets the bare `⏵⏵ <mode>` -- `cycleOffered` is
+ *  ignored entirely in that case, since there is nowhere left to draw the hint anyway. Backend and
+ *  model, and the full pill with its hint, moved to `prefix i` (decision 6); nothing left calls this
+ *  with `short` omitted, but the parameter defaults to `false` rather than being required, so a
+ *  future caller that wants the long form back does not have to relearn what it looked like. */
+export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
+  if (short) return `⏵⏵ ${mode}`;
   return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to cycle)` : `⏵⏵ ${mode} on`;
 }
 
@@ -62,6 +70,12 @@ export type TabViewState = {
   scrollTop: number;
   atBottom: boolean;
   detailed: boolean;
+  /** The `seq` threshold `MessageList`'s unread pill was counting from when the tab was left (wave 3,
+   *  Task 3) -- `null` when the tab was left following (nothing parked) or never had one. Seeded back
+   *  into `MessageList` as `unseenSeed` on restore, so a row that arrived while the tab was away is
+   *  still counted: without this, a tab switch reuses `MessageList`, and its first `updatePill` after
+   *  the restore would start counting fresh from the just-restored timeline's own length. */
+  unseenAfterSeq: number | null;
 };
 
 /** How long after the last keystroke the composer mirrors its text to Rust (phase 3 ruling 6). */

@@ -5,7 +5,7 @@ import type { TabInfo } from "./types";
 
 const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({
   id, number: id, label: `${id} new`, name: null, state: "not_started", mode: "auto",
-  marker: null, pending: 0, resumable: true, failure: null, ...over,
+  marker: null, pending: 0, resumable: true, failure: null, title: null, ...over,
 });
 
 describe("acceptsEnvelope", () => {
@@ -39,6 +39,10 @@ describe("tab helpers", () => {
     expect(modePill("auto", true)).toBe("⏵⏵ auto on (shift+tab to cycle)");
     expect(modePill("bypass", false)).toBe("⏵⏵ bypass on");
   });
+  it("drops the hint and the word 'on' in short form, for the band (panel round 2 plan, Task 10)", () => {
+    expect(modePill("auto", true, true)).toBe("⏵⏵ auto");
+    expect(modePill("bypass", false, true)).toBe("⏵⏵ bypass");
+  });
   it("draws one glyph per marker", () => {
     expect(markerGlyph("needs_input", 1)).toBe("⚑");
     expect(markerGlyph("needs_input", 3)).toBe("⚑3");
@@ -54,19 +58,20 @@ describe("tab helpers", () => {
     expect(showTabBar(1, true)).toBe(true);
   });
   it("finds the active tab", () => {
-    expect(activeTabInfo({ active: 2, tabs: [tab(1), tab(2, { name: "docs" })] })?.name).toBe("docs");
+    expect(activeTabInfo({ active: 2, tabs: [tab(1), tab(2, { name: "docs" })], defaultMode: "auto" })?.name).toBe("docs");
     expect(activeTabInfo(null)).toBeNull();
   });
 });
 
 describe("the per-tab view store", () => {
-  const view = (cursor: number): TabViewState => ({
+  const view = (cursor: number, unseenAfterSeq: number | null = null): TabViewState => ({
     cursor,
     mode: "browse",
     expanded: { k: true },
     scrollTop: 40 * cursor,
     atBottom: false,
     detailed: false,
+    unseenAfterSeq,
   });
   it("gives each tab back what it left, and forgets closed tabs", () => {
     const store = new Map<number, TabViewState>();
@@ -77,6 +82,16 @@ describe("the per-tab view store", () => {
     forgetClosed(store, [2]);
     expect(takeView(store, 1)).toBeUndefined();
     expect(takeView(store, 2)?.cursor).toBe(7);
+  });
+  // Wave 3, Task 3: the unread pill's threshold is a `seq`, saved and handed back across a switch so
+  // `MessageList`'s `unseenSeed` can seed it in -- round-tripped here the same way every other field
+  // already is above; `null` (a tab left following, or never parked) round-trips too.
+  it("round-trips the unread threshold (unseenAfterSeq)", () => {
+    const store = new Map<number, TabViewState>();
+    saveView(store, 1, view(3, 42));
+    saveView(store, 2, view(7, null));
+    expect(takeView(store, 1)?.unseenAfterSeq).toBe(42);
+    expect(takeView(store, 2)?.unseenAfterSeq).toBeNull();
   });
 });
 

@@ -80,6 +80,80 @@ pub(super) fn place_new(root: Node, id: &ModuleId, placement: Placement) -> (Nod
             Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
             false,
         ),
+        Placement::BelowEditorAndAgent => {
+            let present = root.leaves();
+            let ids: Vec<ModuleId> = if present.contains(&ModuleId::editor()) && present.contains(&ModuleId::agent()) {
+                vec![ModuleId::editor(), ModuleId::agent()]
+            } else if present.contains(&ModuleId::agent()) {
+                vec![ModuleId::agent()]
+            } else {
+                Vec::new()
+            };
+            if ids.is_empty() {
+                (
+                    Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
+                    false,
+                )
+            } else {
+                (wrap_below_editor_and_agent(root, &ids, leaf), false)
+            }
+        }
+    }
+}
+
+/// [`Placement::BelowEditorAndAgent`]'s own placement: wraps the smallest subtree of `node` that
+/// contains every id in `ids` (the editor and the agent, or the agent alone) in a column split
+/// below it, with the same pin/share [`Placement::BelowRoot`] uses. `ids` is never empty here --
+/// `place_new` falls back to [`Placement::BelowRoot`] itself when neither leaf is in the tree --
+/// so this always wraps exactly one subtree on its way down.
+fn wrap_below_editor_and_agent(node: Node, ids: &[ModuleId], leaf: Node) -> Node {
+    match node {
+        Node::Leaf(id) => Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, Node::Leaf(id), leaf),
+        Node::Split {
+            axis,
+            ratio,
+            pin,
+            first,
+            second,
+        } => {
+            let first_leaves = first.leaves();
+            if ids.iter().all(|id| first_leaves.contains(id)) {
+                let first = wrap_below_editor_and_agent(*first, ids, leaf);
+                return Node::Split {
+                    axis,
+                    ratio,
+                    pin,
+                    first: Box::new(first),
+                    second,
+                };
+            }
+            let second_leaves = second.leaves();
+            if ids.iter().all(|id| second_leaves.contains(id)) {
+                let second = wrap_below_editor_and_agent(*second, ids, leaf);
+                return Node::Split {
+                    axis,
+                    ratio,
+                    pin,
+                    first,
+                    second: Box::new(second),
+                };
+            }
+            // Neither child alone holds every id in `ids`: this split is the smallest subtree that
+            // does, so it is what gets wrapped.
+            Node::pinned(
+                Axis::Column,
+                BELOW_ROOT_SHARE,
+                Branch::Second,
+                Node::Split {
+                    axis,
+                    ratio,
+                    pin,
+                    first,
+                    second,
+                },
+                leaf,
+            )
+        }
     }
 }
 
@@ -303,7 +377,7 @@ impl fmt::Display for LayoutError {
             LayoutError::Duplicate(id) => write!(f, "module '{id}' appears more than once"),
             LayoutError::NotInTree(id) => write!(f, "module '{id}' is not in the layout"),
             LayoutError::Hidden(id) => write!(f, "module '{id}' is hidden and cannot hold the keys"),
-            LayoutError::LastVisible(id) => write!(f, "'{id}' is the last visible module and cannot be hidden"),
+            LayoutError::LastVisible(id) => write!(f, "'{id}' is the last module on screen"),
             LayoutError::Ratio(r) => write!(f, "ratio {r} is outside {MIN_RATIO}..={MAX_RATIO}"),
             LayoutError::NotASplit(path) => write!(f, "{path:?} does not lead to a split"),
             LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
@@ -698,6 +772,99 @@ mod tests {
         assert_eq!(layout.focus(), &lua("m"));
     }
 
+    /// `Placement::BelowEditorAndAgent` (task 6, 2026-09-26): with a side panel already wrapping the
+    /// whole root, a module placed this way wraps only `[editor | agent]`, not the side panel too --
+    /// the smallest subtree that holds both.
+    #[test]
+    fn below_editor_and_agent_wraps_only_the_editor_and_agent_subtree() {
+        let root = Node::split(
+            Axis::Row,
+            RIGHT_OF_ROOT_SHARE,
+            Node::split(
+                Axis::Row,
+                DEFAULT_EDITOR_SHARE,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            Node::Leaf(lua("side")),
+        );
+        let (placed, took_editors_place) = place_new(root, &lua("term"), Placement::BelowEditorAndAgent);
+        assert!(!took_editors_place);
+        assert_eq!(
+            placed,
+            Node::split(
+                Axis::Row,
+                RIGHT_OF_ROOT_SHARE,
+                Node::pinned(
+                    Axis::Column,
+                    BELOW_ROOT_SHARE,
+                    Branch::Second,
+                    Node::split(
+                        Axis::Row,
+                        DEFAULT_EDITOR_SHARE,
+                        Node::Leaf(ModuleId::editor()),
+                        Node::Leaf(ModuleId::agent())
+                    ),
+                    Node::Leaf(lua("term"))
+                ),
+                Node::Leaf(lua("side")),
+            )
+        );
+    }
+
+    /// With no side panel, `[editor | agent]` is the whole root, so this is the same tree
+    /// `Placement::BelowRoot` would build.
+    #[test]
+    fn below_editor_and_agent_is_below_root_when_they_are_the_whole_tree() {
+        let root = Node::split(
+            Axis::Row,
+            DEFAULT_EDITOR_SHARE,
+            Node::Leaf(ModuleId::editor()),
+            Node::Leaf(ModuleId::agent()),
+        );
+        let (with_ea, _) = place_new(root.clone(), &lua("term"), Placement::BelowEditorAndAgent);
+        let (with_below, _) = place_new(root, &lua("term"), Placement::BelowRoot);
+        assert_eq!(with_ea, with_below);
+    }
+
+    /// The editor is gone (`super::kill::Reopen::Never`): the module is placed below the agent's
+    /// leaf alone.
+    #[test]
+    fn below_editor_and_agent_falls_back_to_the_agent_alone_when_the_editor_is_gone() {
+        let root = Node::split(
+            Axis::Row,
+            RIGHT_OF_ROOT_SHARE,
+            Node::Leaf(ModuleId::agent()),
+            Node::Leaf(lua("side")),
+        );
+        let (placed, _) = place_new(root, &lua("term"), Placement::BelowEditorAndAgent);
+        assert_eq!(
+            placed,
+            Node::split(
+                Axis::Row,
+                RIGHT_OF_ROOT_SHARE,
+                Node::pinned(
+                    Axis::Column,
+                    BELOW_ROOT_SHARE,
+                    Branch::Second,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(lua("term"))
+                ),
+                Node::Leaf(lua("side")),
+            )
+        );
+    }
+
+    /// Neither the editor nor the agent is in the tree: falls back to `Placement::BelowRoot`, below
+    /// the whole root.
+    #[test]
+    fn below_editor_and_agent_falls_back_to_below_root_when_neither_leaf_is_present() {
+        let root = Node::Leaf(lua("side"));
+        let (placed, _) = place_new(root.clone(), &lua("term"), Placement::BelowEditorAndAgent);
+        let (expected, _) = place_new(root, &lua("term"), Placement::BelowRoot);
+        assert_eq!(placed, expected);
+    }
+
     #[test]
     fn invariant_1_a_module_appears_once() {
         assert_eq!(
@@ -759,6 +926,17 @@ mod tests {
         );
         assert_eq!(layout.show(&lua("ghost")), Err(LayoutError::NotInTree(lua("ghost"))));
         assert!(layout.hidden().is_empty());
+    }
+
+    /// Task 5: `LastVisible`'s wording no longer says "cannot be hidden" -- since `x` is a kill, the
+    /// same text reaches `kill()`'s inner `hide` too (`on_exited_unrequested`, and until Task 6
+    /// `on_shell_exit`), where a kill was never a hide.
+    #[test]
+    fn last_visible_reads_the_last_module_on_screen_not_cannot_be_hidden() {
+        assert_eq!(
+            LayoutError::LastVisible(ModuleId::editor()).to_string(),
+            "'editor' is the last module on screen"
+        );
     }
 
     #[test]
