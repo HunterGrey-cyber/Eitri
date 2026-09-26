@@ -131,14 +131,13 @@ pub fn startup(dir: Option<&Path>, project_root: &Path) -> (PrefixRules, Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_scratch_dir::ScratchDir;
     use agent::PrefixRule;
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nv-rules-{label}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(label: &str) -> ScratchDir {
+        ScratchDir::new("nv-rules", label)
     }
     fn root() -> PathBuf {
         PathBuf::from("/home/user/project")

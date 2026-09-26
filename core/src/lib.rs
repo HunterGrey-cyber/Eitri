@@ -48,3 +48,7 @@ mod socket_path_guard;
 /// doc for why that is the actual point of this crate existing at all.
 #[cfg(test)]
 mod manifest_guard;
+
+/// Shared `#[cfg(test)]` RAII guard for a throwaway `/tmp` directory -- see its own doc.
+#[cfg(test)]
+mod test_scratch_dir;

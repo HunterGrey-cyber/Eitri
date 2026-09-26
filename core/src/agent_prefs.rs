@@ -120,13 +120,12 @@ pub fn startup_mode(dir: Option<&Path>, project_root: &Path) -> (SessionModeChoi
 mod tests {
     use super::*;
     use crate::agent_bridge::SessionModeChoice;
+    use crate::test_scratch_dir::ScratchDir;
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nv-agent-prefs-{label}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(label: &str) -> ScratchDir {
+        ScratchDir::new("nv-agent-prefs", label)
     }
 
     fn root() -> PathBuf {
