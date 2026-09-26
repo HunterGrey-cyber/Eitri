@@ -282,6 +282,8 @@ pub enum LayoutError {
     Pin(i32),
     /// A module cannot be placed next to itself (tmux: "source and target panes must be different").
     SameModule(ModuleId),
+    /// Killed for the rest of this window (`super::kill`, `Reopen::Never`).
+    Gone(ModuleId),
 }
 
 impl fmt::Display for LayoutError {
@@ -295,6 +297,7 @@ impl fmt::Display for LayoutError {
             LayoutError::NotASplit(path) => write!(f, "{path:?} does not lead to a split"),
             LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
             LayoutError::SameModule(id) => write!(f, "'{id}' cannot be placed next to itself"),
+            LayoutError::Gone(id) => write!(f, "'{id}' was closed and cannot be reopened in this window"),
         }
     }
 }
@@ -321,6 +324,9 @@ pub struct Layout {
     focus: ModuleId,
     /// Every leaf, most recently focused first. Breaks `neighbor()`'s ties (tmux's rule).
     mru: Vec<ModuleId>,
+    /// Hidden modules that can never be shown again in this window (`super::kill`'s
+    /// `Reopen::Never`). A subset of `hidden`; never read from or written to a state file.
+    gone: BTreeSet<ModuleId>,
 }
 
 impl Layout {
@@ -355,6 +361,7 @@ impl Layout {
             zoomed: None,
             focus,
             mru,
+            gone: BTreeSet::new(),
         })
     }
 
@@ -423,6 +430,12 @@ impl Layout {
 
     pub fn mru(&self) -> &[ModuleId] {
         &self.mru
+    }
+
+    /// Killed for the rest of this window: hidden, and refused by [`Layout::show`] and
+    /// `super::ops::place` (`super::kill`'s module doc says why only the editor ever is).
+    pub fn is_gone(&self, id: &ModuleId) -> bool {
+        self.gone.contains(id)
     }
 
     pub fn leaves(&self) -> Vec<ModuleId> {
@@ -513,6 +526,9 @@ impl Layout {
         if !self.contains(id) {
             return Err(LayoutError::NotInTree(id.clone()));
         }
+        if self.gone.contains(id) {
+            return Err(LayoutError::Gone(id.clone()));
+        }
         Ok(self.hidden.remove(id))
     }
 
@@ -547,6 +563,12 @@ impl Layout {
             }
         }
         self.root = root;
+    }
+
+    /// Marks the hidden module `id` gone, for `super::kill`, which has just hidden it.
+    pub(super) fn retire(&mut self, id: &ModuleId) {
+        debug_assert!(self.hidden.contains(id), "only a hidden module can be gone");
+        self.gone.insert(id.clone());
     }
 
     /// Takes `id` out of `hidden` without the checks [`Layout::show`] makes, for `super::ops`,

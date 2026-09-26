@@ -214,7 +214,7 @@ fn default_bindings() -> Vec<Binding> {
     bind("}", Action::Swap(SwapTarget::Next), false);
     bind("M-1", Action::Even(Axis::Row), false);
     bind("M-2", Action::Even(Axis::Column), false);
-    bind("x", Action::ModuleHide, false);
+    bind("x", Action::ModuleKill, false);
     bind("c", Action::Tab(TabAction::New), false);
     bind("n", Action::Tab(TabAction::Next), false);
     bind("p", Action::Tab(TabAction::Prev), false);
@@ -379,10 +379,12 @@ impl Keymap {
     }
 
     /// The verbs the top bar's strip lists after the module keys: the keys bound to
-    /// hide, split right, split below, even and swap, in that order, in tmux spelling.
+    /// kill, hide, split right, split below, even and swap, in that order, in tmux spelling. A verb
+    /// nothing is bound to is left out (`hide`, by default, since `x` kills).
     pub fn strip_verbs(&self) -> Vec<String> {
         type Is = fn(&Action) -> bool;
-        let groups: [(&str, Is); 5] = [
+        let groups: [(&str, Is); 6] = [
+            ("kill", |a| matches!(a, Action::ModuleKill)),
             ("hide", |a| matches!(a, Action::ModuleHide)),
             ("right", |a| matches!(a, Action::Split(Axis::Row))),
             ("below", |a| matches!(a, Action::Split(Axis::Column))),
@@ -478,7 +480,7 @@ mod tests {
         ("}", "swap.next", false),
         ("M-1", "layout.even-horizontal", false),
         ("M-2", "layout.even-vertical", false),
-        ("x", "module.hide", false),
+        ("x", "module.kill", false),
         ("c", "tab.new", false),
         ("n", "tab.next", false),
         ("p", "tab.prev", false),
@@ -744,8 +746,10 @@ mod tests {
     fn the_strip_verbs_come_from_the_table() {
         assert_eq!(
             Keymap::defaults().strip_verbs(),
-            ["x hide", "% right", "\" below", "M-1 M-2 even", "{ } swap"]
+            ["x kill", "% right", "\" below", "M-1 M-2 even", "{ } swap"]
         );
+        let map = Keymap::apply_user(&[set("X", "module.hide")], &[]).unwrap();
+        assert_eq!(map.strip_verbs()[..2], ["x kill".to_string(), "X hide".to_string()]);
         let map = Keymap::apply_user(&[del("%"), set("\\", "split.right")], &[]).unwrap();
         assert_eq!(map.strip_verbs()[1], "\\ right");
     }
