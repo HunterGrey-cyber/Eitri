@@ -41,6 +41,14 @@ export type EmptyTabProps = {
    *  `keysRequest` so they cannot steal focus from it. Pass `App.tsx`'s `overlayOpen` because
    *  this layout has no conversation `containerRef` to check. */
   overlayOpen: boolean;
+  /** The initial mode on mount or a switch to another empty tab: browse after a tab switch or
+   *  arrival, input after `enter_input` or at launch. `focusRequest` and `arriveRequest` outlive
+   *  individual tabs, so only later counter changes are requests to this instance. Defaults to
+   *  input. */
+  landing?: PanelMode;
+  /** This screen's own mode, for the band `App.tsx` draws under it (GUI pass 2026-09-26: the band
+   *  read `INPUT` whatever this screen was in). */
+  onModeChange?: (mode: PanelMode) => void;
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
   onResume: (providerSessionId: string) => void;
@@ -99,7 +107,11 @@ export type EmptyTabProps = {
  *  spawns a process. */
 export function EmptyTab(props: EmptyTabProps) {
   const { hello, tab, handoff, failure } = props;
-  const [mode, setMode] = useState<PanelMode>("input");
+  const [mode, setMode] = useState<PanelMode>(props.landing === "browse" ? "browse" : "input");
+  // The counts this screen mounted with (see `landing`'s doc): the two request effects below act
+  // only on a count that changed after that.
+  const focusAtMount = useRef(props.focusRequest);
+  const arriveAtMount = useRef(props.arriveRequest);
   const starting = tab.state === "starting";
   const failed = tab.state === "failed";
   const showDashboard = hello !== null && !starting && !failed;
@@ -221,7 +233,7 @@ export function EmptyTab(props: EmptyTabProps) {
      autofocus cannot take its keys. */
   useEffect(() => {
     if (props.overlayOpen) return;
-    if (props.focusRequest > 0 && !starting && !failed) {
+    if (props.focusRequest !== focusAtMount.current && !starting && !failed) {
       setMode("input");
       setComposerFocus((n) => n + 1);
     }
@@ -233,7 +245,7 @@ export function EmptyTab(props: EmptyTabProps) {
      this while `overlayOpen` so a chooser, rename, or search keeps the keys. */
   useEffect(() => {
     if (props.overlayOpen) return;
-    if (props.arriveRequest > 0) {
+    if (props.arriveRequest !== arriveAtMount.current) {
       rootRef.current?.focus({ preventScroll: true });
       setMode("browse");
       setDashCursor(0);
@@ -251,6 +263,40 @@ export function EmptyTab(props: EmptyTabProps) {
     else root.focus({ preventScroll: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.keysRequest]);
+  /* The request effects ignore counts reached before mount, so mounting or switching must
+     place focus explicitly. Otherwise a new tab can inherit no focused element after the live
+     container unmounts. BROWSE focuses the root; INPUT focuses the composer only when
+     `focusRequest > 0`, so a plain launch leaves DOM focus alone. An open overlay keeps focus. */
+  function land(where: PanelMode, onMount: boolean) {
+    if (props.overlayOpen) return;
+    const root = rootRef.current;
+    // On mount the keys usually sit on the window's layout root (React keeps that `div` across the
+    // live/empty layouts) or on `document.body`; neither hands a key to this screen.
+    if (onMount && root !== null && root.contains(document.activeElement)) return;
+    if (where === "browse") root?.focus({ preventScroll: true });
+    else if (props.focusRequest > 0 && !starting && !failed) setComposerFocus((n) => n + 1);
+  }
+  useEffect(() => {
+    land(props.landing === "browse" ? "browse" : "input", true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  /* A switch from one empty tab to another keeps this component mounted: land it the way a mount
+     would (see `landing`). Skips the first run, which the initial state already covers. */
+  const tabAtMount = useRef(tab.id);
+  useEffect(() => {
+    if (tab.id === tabAtMount.current) return;
+    tabAtMount.current = tab.id;
+    const where = props.landing === "browse" ? "browse" : "input";
+    // The root first, as `arrive` does: `setMode("browse")` unmounts the focused textarea.
+    land(where, false);
+    setMode(where);
+    setDashCursor(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id]);
+  useEffect(() => {
+    props.onModeChange?.(mode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   /** What each dashboard item does -- the one place both a click (`Dashboard`'s
    *  own `onItem`) and a keyboard letter/`Enter` (`onKeyDown` below) end up. */

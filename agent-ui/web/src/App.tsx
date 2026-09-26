@@ -382,6 +382,11 @@ export default function App() {
    *  act without the installed handler reading state. The effect uses the current render to
    *  land on a waiting card or enter BROWSE on the last row with following resumed. */
   const [arriveRequest, setArriveRequest] = useState(0);
+  /** The empty tab's landing mode on mount or switch: the latest `enter_input` requests INPUT;
+   *  `arrive` or a tab switch requests BROWSE. Launch starts in INPUT. */
+  const [emptyLanding, setEmptyLanding] = useState<PanelMode>("input");
+  /** The empty tab's own mode, reported by `EmptyTab`, for the band drawn under it. */
+  const [emptyMode, setEmptyMode] = useState<PanelMode>("input");
   /** Bumped by each `focus_permission` envelope. A counter lets the handler stay installed once
    *  without reading state; the effect finds the card against the current render. */
   const [permissionRequest, setPermissionRequest] = useState(0);
@@ -1218,6 +1223,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
+        setEmptyLanding("input");
         setInputRequest((n) => n + 1);
       } else if (payload.kind === "arrive") {
         // Keyboard arrivals land in BROWSE through this envelope. Close overlays that would cover
@@ -1229,6 +1235,7 @@ export default function App() {
         // nothing about it -- the same reason `pane_focus` cancels both.
         pendingRef.current = null;
         clearSequence();
+        setEmptyLanding("browse");
         setArriveRequest((n) => n + 1);
       } else if (payload.kind === "focus_permission") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
@@ -1264,9 +1271,8 @@ export default function App() {
           el.select();
         }
       } else if (payload.kind === "open_keymap") {
-        // The start screen draws no overlay. Arming it here anyway would pop it up over
-        // the conversation once a session starts, swallowing every key until `?`/Esc/q.
-        if (!sessionStartedRef.current) return;
+        // The start screen displays the keymap overlay through `? Keys`, so this request opens it there
+        // too.
         setMode("browse");
         setKeymapOpen(true);
       } else if (payload.kind === "hint_collect") {
@@ -1360,6 +1366,8 @@ export default function App() {
           // A tab switch lands in BROWSE while restoring the saved cursor and scroll position. Later
           // handling, including the snapshot restore, must not restore a saved INPUT mode.
           setMode("browse");
+          // The first `tabs` (mount) is no switch: launch keeps its INPUT.
+          if (previous !== null) setEmptyLanding("browse");
           setKeymapOpen(false);
           setDetail(null);
           setHandoffOpen(false);
@@ -1943,6 +1951,16 @@ export default function App() {
         onMouseDown={(event) => {
           if (event.target === event.currentTarget) event.preventDefault();
         }}
+        // The `?` overlay owns every key while it is open, as it does over a conversation (the
+        // live layout's `onKeyDown`); in capture, ahead of `EmptyTab`'s own handler and its
+        // composer, which would otherwise take `m`, `j` or a typed letter under it.
+        onKeyDownCapture={(event) => {
+          if (!keymapOpen) return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (event.key === "?" || event.key === "Escape" || event.key === "q") setKeymapOpen(false);
+          else if (event.key === "j" || event.key === "k") scrollKeymapOverlay(keymapOverlayRef.current, event.key === "j" ? 1 : -1);
+        }}
       >
         {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
           <TabBar
@@ -1974,6 +1992,8 @@ export default function App() {
             // no `App` conversation `containerRef`.
             keysRequest={emptyKeysRequest}
             overlayOpen={overlayOpen}
+            landing={emptyLanding}
+            onModeChange={setEmptyMode}
             restoredDraft={restoredDraft}
             // `EmptyTab` keeps its own leader sequence and box state, alongside its local mode. It shares the
             // pure panel table and `runPanelAction` with the live conversation.
@@ -2020,7 +2040,7 @@ export default function App() {
             fact. */}
         <StatusBand
           facts={{
-            mode: "input",
+            mode: emptyMode,
             pill: modePill(activeTab?.mode ?? "auto", true, true),
             showcmd: null,
             message: flash?.text ?? null,
@@ -2054,6 +2074,18 @@ export default function App() {
             onRenameTab={onChooserRenameTab}
             onCycleMode={onChooserCycleMode}
             onLeave={onChooserLeave}
+          />
+        )}
+        {/* `? Keys`, `?` on an empty draft and `prefix ?` open this overlay here too.
+            `.agent-ui-root` is this layout's positioned ancestor, as for the chooser. */}
+        {keymapOpen && (
+          <KeymapOverlay
+            ref={keymapOverlayRef}
+            onClose={() => setKeymapOpen(false)}
+            windowKeys={keymapHelp.window}
+            prefixKeys={keymapHelp.prefixKeys}
+            prefixLabel={keymapHelp.prefix}
+            panel={panelTable}
           />
         )}
         <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />

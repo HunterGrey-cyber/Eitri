@@ -369,15 +369,21 @@ export function Composer({
         // mounting the textarea below with `autoFocus`), and Tab. Tab is deliberate: a focusable
         // control that does not become active when focus reaches it would be the surprising
         // behaviour. It reads like the empty box it stands in for, not like an instruction, since
-        // Ctrl+l opens the composer anyway.
-        <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
-          {text.trim() === "" ? (
-            "Ask the agent..."
-          ) : (
-            <span className="composer-draft">{twoLines(text)}</span>
-          )}
-          {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
-        </div>
+        // Ctrl+l opens the composer anyway. It draws the same bare `❯` line INPUT draws, so the
+        // bottom keeps its shape across `i`/`Esc`; the band's mode block is the mode.
+        <>
+          <span className="composer-prompt" aria-hidden="true">
+            ❯
+          </span>
+          <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
+            {text.trim() === "" ? (
+              "Ask the agent..."
+            ) : (
+              <span className="composer-draft">{twoLines(text)}</span>
+            )}
+            {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
+          </div>
+        </>
       )}
       {/* No Send or Stop buttons here: Enter sends and Shift+Enter inserts a newline (both handled
           above), and the mouse Stop button lives in `ActivityLine`, gated on the provider's advertised

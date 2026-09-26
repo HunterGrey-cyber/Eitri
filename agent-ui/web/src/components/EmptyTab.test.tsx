@@ -41,6 +41,33 @@ function toBrowse(rendered: RenderResult, props: EmptyTabProps): HTMLElement {
   return rendered.container.querySelector(".empty-tab")!;
 }
 
+describe("EmptyTab: requests are edges, not levels (GUI pass 2026-09-26, r2-gui)", () => {
+  it("an arrival counted before it mounted is not one: it mounts where it was landed", () => {
+    // The window's counters outlive any one tab: a new tab mounts with whatever `arrive` count the
+    // window reached long ago, and that count is not a request to this tab.
+    const { container } = renderEmpty({ arriveRequest: 3, focusRequest: 2 });
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+  it("mounts in BROWSE when the window landed it there", () => {
+    const { container } = renderEmpty({ landing: "browse" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".composer-browse-hint")).not.toBeNull();
+  });
+  it("lands a switch to another empty tab where the window landed it, without remounting", () => {
+    const rendered = renderEmpty();
+    expect(rendered.container.querySelector("textarea")).not.toBeNull();
+    rendered.rerender(<EmptyTab {...rendered.props} tab={{ ...TAB, id: 2, number: 2, label: "2 new" }} landing="browse" />);
+    expect(rendered.container.querySelector("textarea")).toBeNull();
+  });
+  it("tells the window its mode, for the band under it", () => {
+    const onModeChange = vi.fn();
+    const rendered = renderEmpty({ onModeChange });
+    expect(onModeChange).toHaveBeenLastCalledWith("input");
+    toBrowse(rendered, { ...rendered.props, onModeChange });
+    expect(onModeChange).toHaveBeenLastCalledWith("browse");
+  });
+});
+
 describe("EmptyTab (F3)", () => {
   it("is Claude Code's fresh prompt: a live composer, with the dashboard drawn under it", () => {
     // The mode pill moved into the footer `App.tsx` draws; see `App.test.tsx`'s

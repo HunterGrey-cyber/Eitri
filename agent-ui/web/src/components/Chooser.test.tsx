@@ -285,4 +285,39 @@ describe("Chooser", () => {
       document.body.removeChild(outside);
     });
   });
+  /** `gg`/`G` move to the first/last row and are consumed here so they cannot move
+   *  the conversation underneath the chooser. */
+  it("gg goes to the first row and G to the last, and neither reaches the panel under it", () => {
+    // The panel under it is a React `onKeyDown` on an ancestor (`App.tsx`'s root), so the check is
+    // one too.
+    const outer = vi.fn((e: { key: string }) => e.key);
+    const { root, props, rerender } = renderChooser();
+    rerender(
+      <div onKeyDown={(e) => outer({ key: e.key })}>
+        <Chooser {...props} />
+      </div>,
+    );
+    const current = () => document.querySelector(".chooser-row.current")!.textContent;
+    void root;
+    const el = () => document.querySelector<HTMLElement>(".chooser")!;
+    fireEvent.keyDown(el(), { key: "G" });
+    expect(current()).toContain("free one");
+    fireEvent.keyDown(el(), { key: "g" });
+    fireEvent.keyDown(el(), { key: "g" });
+    expect(current()).toContain("New session");
+    // A lone `g` then another key is not `gg`.
+    fireEvent.keyDown(el(), { key: "j" });
+    fireEvent.keyDown(el(), { key: "g" });
+    fireEvent.keyDown(el(), { key: "j" });
+    expect(current()).toContain("2 legacy");
+    expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "g" }));
+    expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "G" }));
+  });
+  /** The current row's sign cell draws a solid cursor holding `›`, alongside the row fill. */
+  it("draws the current row's sign as › and no other row's", () => {
+    const { root } = renderChooser();
+    const signs = Array.from(root.querySelectorAll(".chooser-row .chooser-sign")).map((el) => el.textContent);
+    expect(signs.filter((t) => t === "›").length).toBe(1);
+    expect(root.querySelector(".chooser-row.current .chooser-sign")!.textContent).toBe("›");
+  });
 });

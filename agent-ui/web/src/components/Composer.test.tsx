@@ -58,14 +58,23 @@ function renderComposerWithRerender(overrides: Overrides = {}) {
 
 /** The bare shell-prompt glyph replaces the bordered box. */
 describe("Composer's prompt glyph", () => {
-  it("draws ❯ right before the textarea in INPUT, and not at all in BROWSE", () => {
+  /** `mock: bottom.html` B draws `❯ Ask the agent…` in BROWSE too; until the r2-gui GUI pass
+   *  (2026-09-26) BROWSE kept the old bordered box with no glyph, so the bottom changed shape on
+   *  every `i` and `Esc`. */
+  it("draws ❯ right before the textarea in INPUT, and before the stand-in in BROWSE", () => {
     const { container } = renderComposer();
     const prompt = container.querySelector(".composer-prompt")!;
     expect(prompt.textContent).toBe("❯");
     expect(prompt.compareDocumentPosition(container.querySelector("textarea")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     cleanup();
     const browse = renderComposer({ mode: "browse" });
-    expect(browse.container.querySelector(".composer-prompt")).toBeNull();
+    const glyph = browse.container.querySelector(".composer-prompt")!;
+    expect(glyph.textContent).toBe("❯");
+    expect(glyph.compareDocumentPosition(browse.container.querySelector(".composer-browse-hint")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+  it("draws no glyph for a session that has ended: there is no prompt to type at", () => {
+    const { container } = renderComposer({ mode: "browse", sessionEnded: true });
+    expect(container.querySelector(".composer-prompt")).toBeNull();
   });
 });
 

@@ -266,6 +266,64 @@ describe("arrive", () => {
     expect(container.querySelector("textarea")).toBeNull();
   });
 
+  /** GUI pass (2026-09-26, r2-gui): the empty tab's band read `INPUT` whatever the tab was in --
+   *  its facts hard-coded `mode: "input"`, so an arrival that put the dashboard in BROWSE still
+   *  said INPUT under it. */
+  it("on an empty tab, the band shows the tab's own mode", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    expect(modeBlock(container).textContent).toBe("INPUT");
+    dispatch({ kind: "arrive" });
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+  });
+
+  /** `EmptyTab` must ignore `arrive` counts reached before it mounted. Reading a stale count
+   *  as a new request made tabs created from a live tab drop straight to BROWSE with nothing
+   *  focused, leaving the keys dead. */
+  it("a new tab made from a live tab after an earlier arrival still lands INPUT (R7)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "only" }] }));
+    dispatch({ kind: "arrive" });
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
+    // One batch, as WebKitGTK delivered them in the pass: Rust's `new_tab()` and `enter_input()`
+    // run back to back, and React committed both before the new `EmptyTab`'s mount effects ran.
+    act(() => {
+      window.__neovibeDispatch!(JSON.stringify({ kind: "tabs", active: 2, tabs: two }));
+      window.__neovibeDispatch!(JSON.stringify({ kind: "enter_input" }));
+    });
+    const box = container.querySelector("textarea");
+    expect(box).not.toBeNull();
+    expect(document.activeElement).toBe(box);
+    expect(modeBlock(container).textContent).toBe("INPUT");
+  });
+
+  /** A tab switch lands BROWSE, including on an empty tab, where the dashboard receives focus. */
+  it("a switch to an existing empty tab lands BROWSE, not a composer nobody asked for", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "only" }] }) });
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(modeBlock(container).textContent).toBe("BROWSE");
+  });
+
+  /** The empty tab ignores request counts reached before it mounted. Switching from a live tab
+   *  unmounts that tab's root and loses its focus, so the dashboard itself must receive focus. */
+  it("a switch from a live tab onto an empty tab leaves the keys on the dashboard", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "only" }] }) });
+    act(() => container.querySelector<HTMLElement>(".agent-ui-root")!.focus());
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
+  });
+
   /** A tab switch lands in BROWSE while restoring that tab's cursor and scroll position.
    *  This reset is driven by `tabs`/`snapshot`, independently of the `arrive` envelope. */
   it("a tabs envelope switching the active tab while in INPUT lands BROWSE", () => {
@@ -2778,14 +2836,31 @@ describe("App: the ? keymap overlay", () => {
     expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.textContent).toBe("BROWSE");
   });
 
-  it("ignores an open_keymap on the start screen -- it does not pop up once a session starts", () => {
-    // The start screen draws no overlay, so a `prefix ?` there must leave nothing
-    // armed: otherwise the overlay appears over the new conversation and swallows every key.
+  /** The start screen renders and closes the keymap overlay opened by `? Keys` or an empty draft's `?`.
+   *  It must not leave a hidden overlay armed to appear when a session starts. */
+  it("opens on the start screen too, and closes there, so it never pops up once a session starts", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
     act(() => dispatch({ kind: "open_keymap" }));
+    expect(overlay(container)).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".agent-ui-root")!, { key: "q" });
     expect(overlay(container)).toBeNull();
     dispatchLiveTab(snapshotState(), 0);
+    expect(overlay(container)).toBeNull();
+  });
+
+  it("opens from the empty tab's own `?` item, and a key typed under it reaches nothing else", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    const keys = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Keys"))!;
+    fireEvent.click(keys);
+    expect(overlay(container)).not.toBeNull();
+    // `m` would cycle the mode on the dashboard; under the overlay it is swallowed.
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "m" });
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "Escape" });
     expect(overlay(container)).toBeNull();
   });
 
@@ -3057,6 +3132,10 @@ describe("the tab bar", () => {
   });
 
   it("takes each tab's draft from Rust, never from the tab it left", () => {
+    // A tab switch lands BROWSE, including on an empty tab, so the draft appears in the
+    // composer preview rather than a textarea's value.
+    const draft = (c: HTMLElement) =>
+      c.querySelector("textarea")?.value ?? c.querySelector(".composer-draft")?.textContent ?? "";
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     const empty = [{ ...LIVE_TAB, state: "not_started" }, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
@@ -3064,12 +3143,12 @@ describe("the tab bar", () => {
     fireEvent.change(container.querySelector("textarea")!, { target: { value: "tab one's words" } });
     dispatch({ kind: "tabs", active: 2, tabs: empty });
     dispatch({ kind: "draft", tab: 2, text: "" });
-    expect(container.querySelector("textarea")!.value).toBe("");
+    expect(draft(container)).toBe("");
     dispatch({ kind: "draft", tab: 1, text: "stale, for a tab not on screen" });
-    expect(container.querySelector("textarea")!.value, "dropped: not the active tab").toBe("");
+    expect(draft(container), "dropped: not the active tab").toBe("");
     dispatch({ kind: "tabs", active: 1, tabs: empty });
     dispatch({ kind: "draft", tab: 1, text: "tab one's words" });
-    expect(container.querySelector("textarea")!.value).toBe("tab one's words");
+    expect(draft(container)).toBe("tab one's words");
   });
 
   it("prefix , renames inline and prefix & closes after y, any other key cancels", () => {

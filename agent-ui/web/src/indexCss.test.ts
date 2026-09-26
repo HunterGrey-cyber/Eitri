@@ -67,10 +67,11 @@ const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
  *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
 /** The solid cursor block: the current row's sign cell, a focused button with its children (every
- *  control is keyboard-reachable and the selected one is drawn as the cursor), and the band's own
- *  `↓N` button.
- *  Nothing else. */
-const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread)$/;
+ *  control is keyboard-reachable and the selected one is drawn as the cursor), the band's own
+ *  `↓N` button,
+ *  and the chooser's current row's sign cell. Nothing
+ *  else. */
+const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread|\.chooser-row\.current \.chooser-sign)$/;
 /** The global `f` HINT's label, and nothing else. */
 const HINT_BRANCH = /^\.hint-label$/;
 /** The which-key box's own keycap glyph, and nothing else -- a
@@ -2087,6 +2088,51 @@ describe("index.css cascade (which rule actually wins)", () => {
       '.band-mode[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
     );
     expect(clobbered.borderLeftColor).toBe("var(--nv-mode-input)");
+  });
+
+  /** The chooser's current row has a solid cursor in its sign cell. A long title is truncated
+   *  on its own line beside the sign so it cannot wrap underneath the sign column. */
+  it("draws the chooser's cursor solid and keeps a long title beside its sign", () => {
+    const html = `<div class="chooser"><div class="chooser-row current"><span class="chooser-sign">›</span><span class="chooser-line1"><span class="chooser-lead">t</span><span class="chooser-right">12 min ago</span></span></div></div>`;
+    const sign = computed(html, ".chooser-sign");
+    expect(sign.background).toBe("var(--nv-fg)");
+    expect(sign.color).toBe("var(--nv-bg)");
+    const line1 = computed(html, ".chooser-line1");
+    expect(line1.flexBasis).toMatch(/^0(%|px)?$/);
+    const lead = computed(html, ".chooser-lead");
+    expect(lead.whiteSpace).toBe("nowrap");
+    expect(lead.overflow).toBe("hidden");
+    expect(lead.textOverflow).toBe("ellipsis");
+  });
+
+  /** `mock: bottom.html` B: `✻ Working… 1m 12s · ctrl+c interrupt` -- the Stop control is words in
+   *  the line, not a boxed button (the r2-gui GUI pass, 2026-09-26, saw WebKit's own
+   *  button face). Focused, it is still the solid cursor every focused control is. */
+  it("draws the activity line's Stop as words, and as the solid cursor when focused", () => {
+    const html = `<div class="agent-ui-root"><div class="activity-line"><button type="button" class="stop">ctrl+c interrupt</button></div></div>`;
+    const stop = computed(html, ".stop");
+    expect(stop.borderTopStyle).toMatch(/^(none|)$/);
+    expect(stop.backgroundColor).toMatch(/^(transparent|rgba\(0, 0, 0, 0\)|)$/);
+    expect(stop.color).toBe("var(--nv-muted)");
+    // A fresh copy, focused before its style is first read: jsdom does not recompute on focus.
+    document.body.innerHTML = html;
+    document.body.querySelector<HTMLElement>(".stop")!.focus();
+    const now = getComputedStyle(document.body.querySelector(".stop")!);
+    expect(now.background).toBe("var(--nv-fg)");
+    expect(now.color).toBe("var(--nv-bg)");
+  });
+
+  /** `mock: bottom.html` B: a bare `❯` line in both modes. The r2-gui GUI pass
+   *  (2026-09-26) saw BROWSE's stand-in still boxed, and WebKit's own focus ring drawing a box round
+   *  the textarea in INPUT. */
+  it("draws the composer as a bare line in both modes: no box, no focus ring", () => {
+    const hint = computed(`<div class="composer"><div class="composer-browse-hint">x</div></div>`, ".composer-browse-hint");
+    for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+      expect(hint[`border${side}Style` as "borderTopStyle"], side).toMatch(/^(none|)$/);
+    }
+    expect(hint.borderRadius).toMatch(/^(0|0px|)$/);
+    const box = computed(`<div class="composer"><textarea></textarea></div>`, ".composer textarea");
+    expect(box.outlineStyle).toBe("none");
   });
 
   it("gives the composer the panel's own font and caps its growth", () => {

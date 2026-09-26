@@ -209,9 +209,21 @@ export function Chooser({
     else onCycleMode();
   }
 
+  // A lone `g` waits for the second `g`. Any other key clears the wait and then performs its
+  // normal action.
+  const pendingG = useRef(false);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (filtering || renaming !== null || composing(event)) return;
     const key = event.key;
+    if (key === "g" || key === "G") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (key === "G") setCursor(Math.max(rows.length - 1, 0));
+      else if (pendingG.current) setCursor(0);
+      pendingG.current = key === "g" && !pendingG.current;
+      return;
+    }
+    pendingG.current = false;
     if (event.ctrlKey && key === "r") {
       event.preventDefault();
       event.stopPropagation();
@@ -343,12 +355,14 @@ function ChooserRowItem({
   onRenameCancel: () => void;
 }) {
   const classes = ["chooser-row", current ? "current" : "", choosable(row) ? "" : "unchoosable"].filter(Boolean).join(" ");
+  // The current row replaces its usual sign with the panel cursor: a solid block containing `›`.
+  const cursorSign = <span className="chooser-sign">›</span>;
   if (row.kind === "new") {
     return (
       <div className={classes} onClick={onClick}>
-        <span className="chooser-sign" />
+        {current ? cursorSign : <span className="chooser-sign" />}
         <span className="chooser-line1">
-          <span>+ New session</span>
+          <span className="chooser-lead">+ New session</span>
           <span className="chooser-right chooser-muted">{newTabChord}</span>
         </span>
       </div>
@@ -362,7 +376,7 @@ function ChooserRowItem({
     const title = row.info?.title ?? null;
     return (
       <div className={classes} onClick={onClick}>
-        <span className={sign === null ? "chooser-sign" : `chooser-sign chooser-sign-${sign}`} />
+        {current ? cursorSign : <span className={sign === null ? "chooser-sign" : `chooser-sign chooser-sign-${sign}`} />}
         <span className="chooser-line1">
           {isRenaming ? (
             <input
@@ -386,7 +400,7 @@ function ChooserRowItem({
               }}
             />
           ) : (
-            <span>
+            <span className="chooser-lead">
               <Highlighted text={row.tab.label} needle={needle} />
             </span>
           )}
@@ -405,9 +419,9 @@ function ChooserRowItem({
   const record = row.record;
   return (
     <div className={classes} onClick={onClick}>
-      <span className="chooser-sign">{record.heldElsewhere ? "⊘" : ""}</span>
+      {current ? cursorSign : <span className="chooser-sign">{record.heldElsewhere ? "⊘" : ""}</span>}
       <span className="chooser-line1">
-        <span>
+        <span className="chooser-lead">
           <RecordLead name={record.name} title={record.title} needle={needle} />
         </span>
         <span className="chooser-right">{relativeWhen(Date.now(), record.updatedAt)}</span>

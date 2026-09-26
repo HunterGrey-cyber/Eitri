@@ -1057,23 +1057,25 @@ body,
   color: var(--nv-fg);
   border: 0;
   padding: 0;
+  /* WebKit's own focus ring drew the box back round the textarea (r2-gui GUI pass, 2026-09-26);
+     the caret and the band's INPUT block say where the keys are. */
+  outline: none;
 }
 /* BROWSE's stand-in for the textarea (`Composer.tsx`): same slot in the flex row, but nothing here
-   accepts a keystroke. The left border carries the mode signal -- `--nv-mode-browse` is not
-   guarded for text contrast (see the big comment near `.tool-result-error` below), which is why
-   the label itself stays `--nv-muted` and the colour goes on a border instead. */
+   accepts a keystroke. Bare, like the textarea, behind the same `❯` (`mock: bottom.html` B; the
+   r2-gui GUI pass, 2026-09-26, found it still boxed). It used to carry the mode on a
+   `--nv-mode-browse` left border; the band's mode block carries it now. The label stays
+   `--nv-muted`, the placeholder's colour. */
 .composer-browse-hint {
   flex: 1;
-  min-height: 44px;
+  min-height: 1.4em;
   display: flex;
   align-items: center;
-  background: var(--nv-bg);
   color: var(--nv-muted);
-  border: 1px solid var(--nv-border);
-  border-left: 3px solid var(--nv-mode-browse);
-  border-radius: 4px;
-  padding: 8px;
+  font-size: var(--fs-base);
+  line-height: 1.4;
   cursor: text;
+  outline: none;
 }
 /* C2: the unsent draft, previewed like the greyed-out text it stands in for, never the panel's own
    fill or a bubble -- see `.row-prompt`'s own comment for why a prompt is never boxed here. */
@@ -1341,6 +1343,20 @@ body,
 .activity-line .stop {
   flex: none;
 }
+/* `ctrl+c interrupt` is words in the line, not WebKit's button
+   face. Still a real button for the mouse and `hjkl`; focused, the
+   solid-cursor rule at the end of this file wins (it is more specific). */
+.activity-line .stop {
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  font: inherit;
+  color: var(--nv-muted);
+  cursor: pointer;
+}
+.activity-line .stop::before {
+  content: "· ";
+}
 /* The only shrinkable child of `.turn-activity`. The plain default, stated rather than inherited so
    that the day a second shrinkable child appears here, this is a number someone has to choose
    rather than one nobody noticed. */
@@ -1554,15 +1570,30 @@ body,
 .chooser-sign-running {
   background: var(--nv-ok);
 }
+/* The current row's sign cell is the panel's cursor: the solid block, `›` in it, the
+   body's own pair reversed, as `.row-current .row-sign` draws it. */
+.chooser-row.current .chooser-sign {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+}
 .chooser-sign-unread {
   background: var(--nv-chrome-accent);
 }
+/* `flex-basis: 0`, not `auto` (r2-gui GUI pass, 2026-09-26): with `auto` a long record title made
+   this line wider than the row, so `flex-wrap` dropped it under the sign column and the title
+   wrapped there. It stays beside the sign now and `.chooser-lead` cuts it. */
 .chooser-line1 {
-  flex: 1 1 auto;
+  flex: 1 1 0%;
   display: flex;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+}
+.chooser-lead {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .chooser-line2 {
   flex: 1 1 100%;

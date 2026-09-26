@@ -46,7 +46,10 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       <span className="activity-glyph" aria-hidden="true">
         ✻
       </span>
-      <TurnActivity phase={phaseOf(state)} clock={turnClock} />
+      {/* A card waiting IS what the line says: the phase word beside it only said
+          "waiting for you" again, and at 520px the two were cut together, losing the keys that
+          answer the card (r2-gui GUI pass, 2026-09-26). */}
+      {pendingTool === null && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
       {pendingTool !== null ? (
         <span className="activity-card">
           ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, then a / d" : "a / d"}

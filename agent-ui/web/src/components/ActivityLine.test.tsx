@@ -53,3 +53,14 @@ it("the card row says a / d alone in BROWSE, and defaults to it", () => {
   );
   expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — a / d");
 });
+
+/** A waiting card gets the activity line without a phase word beside it.
+ *  At 520px, showing both truncated the card's answer keys. */
+it("with a card waiting, the card is the line: no phase word or clock beside it", () => {
+  const { container } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Write" />,
+  );
+  expect(container.querySelector(".turn-activity")).toBeNull();
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — a / d");
+  expect(container.querySelector("button.stop")).not.toBeNull();
+});
