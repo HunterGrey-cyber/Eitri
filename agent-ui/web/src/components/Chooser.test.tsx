@@ -218,6 +218,12 @@ describe("Chooser", () => {
     expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("mode is fixed for this session");
   });
 
+  it("Shift+Tab as WebKitGTK delivers it from a real keyboard (key Unidentified, code Tab) cycles too", () => {
+    const { root, props } = renderChooser();
+    fireEvent.keyDown(root, { key: "Unidentified", code: "Tab", keyCode: 9, shiftKey: true });
+    expect(props.onCycleMode).toHaveBeenCalledTimes(1);
+  });
+
   it("Ctrl+r on an open tab opens its inline rename, posting rename_tab through onRenameTab on Enter", () => {
     const { root, container, props } = renderChooser({ active: 1 });
     fireEvent.keyDown(root, { key: "r", ctrlKey: true });

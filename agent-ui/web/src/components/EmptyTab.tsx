@@ -226,7 +226,7 @@ export function EmptyTab(props: EmptyTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const box: { title: string; entries: BoxEntry[] } | null =
-    seq !== null ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, false) } : null;
+    seq !== null ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, starting || failed) } : null;
   /* A request for the keys (`enter_input`, a chooser closing) must enter INPUT as well as
      request focus. Blurring `Composer` leaves this tab in BROWSE with no textarea to focus.
      Apply the same guards as `i`, and skip the request while an overlay is open so composer
@@ -357,10 +357,12 @@ export function EmptyTab(props: EmptyTabProps) {
       void navigator.clipboard?.writeText(handoff.command);
       return;
     }
-    if (hello === null || starting || failed) return;
-    // Try the leader/which-key engine before the dashboard's fixed `j`/`k`/`Enter`/letter handlers,
-    // matching `App.tsx`. Table bindings take keys not already claimed above; the reserved-key list
-    // prevents collisions with fixed bindings.
+    if (hello === null) return;
+    // The leader/which-key engine also runs on starting and failed tabs so `<leader>` `mode.cycle`
+    // can flash `mode is fixed ...` there. Only the dashboard menu keys below require a
+    // `not_started` tab. Try the leader/which-key engine before the dashboard's fixed
+    // `j`/`k`/`Enter`/letter handlers, matching `App.tsx`. Table bindings take keys not already
+    // claimed above; the reserved-key list prevents collisions with fixed bindings.
     if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
     if (seqRef.current !== null) {
       event.preventDefault();
@@ -393,6 +395,7 @@ export function EmptyTab(props: EmptyTabProps) {
         return;
       }
     }
+    if (starting || failed) return;
     const items = dashItems(hello);
     // The dashboard has one column, so h/l do not change the item. Claim them here so they
     // do not fall through to the composer or leave as unhandled keys.

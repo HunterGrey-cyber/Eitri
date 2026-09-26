@@ -1076,12 +1076,18 @@ enum SelectStage {
 /// dimensions and the last frame's absolute top line (`PaintList::top_line`). The session thread
 /// keeps `Screen::top_line`; the pane uses the frame to correlate a click with its displayed text.
 /// Returns `None` until metrics exist, and uses top line zero when no frame exists.
+///
+/// Cell sizes are returned in widget-logical pixels, matching GTK gesture and motion coordinates.
+/// Metrics use device pixels, so divide by [`TerminalMetrics::scale`]. [`im_cursor_rect`] makes
+/// the reverse conversion. Without this division, scale 2 clicks land at about half their
+/// intended row and column.
 fn selection_geometry(state: &State) -> Option<(f64, f64, u16, u16, i32)> {
     let metrics = state.metrics.as_ref()?;
     let top_line = state.frame.as_ref().map_or(0, |f| f.top_line);
+    let scale = f64::from(metrics.scale()).max(1.0);
     Some((
-        f64::from(metrics.cell_width()),
-        f64::from(metrics.cell_height()),
+        f64::from(metrics.cell_width()) / scale,
+        f64::from(metrics.cell_height()) / scale,
         metrics.cols(),
         metrics.rows(),
         top_line,
@@ -1612,6 +1618,35 @@ mod tests {
         assert_eq!(metrics.scale(), 2.0);
         let expected = TerminalMetrics::with_font(FONT_FAMILY, FONT_SIZE_PT, 2560.0, 468.0, 2.0);
         assert_eq!((size.cols, size.rows), (expected.cols(), expected.rows()));
+    }
+
+    /// Pointer positions use widget-logical pixels while metrics use device pixels. At scale 2,
+    /// a logical point in the middle of cell (row 3, col 10) must map to that cell. Dividing by
+    /// the device cell size without converting units would halve both coordinates.
+    #[test]
+    fn a_pointer_at_scale_2_lands_on_the_cell_it_is_over() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.wanted = true;
+        state.allocate(Allocation {
+            width: 2560.0,
+            height: 936.0,
+            scale: 2.0,
+        });
+        state.spawn_size(build_metrics).unwrap().unwrap();
+        let metrics = state.metrics.as_ref().expect("built by spawn_size");
+        assert_eq!(metrics.scale(), 2.0);
+        assert!(
+            metrics.rows() > 3 && metrics.cols() > 10,
+            "{}x{}",
+            metrics.cols(),
+            metrics.rows()
+        );
+        let logical_w = f64::from(metrics.cell_width()) / 2.0;
+        let logical_h = f64::from(metrics.cell_height()) / 2.0;
+        let (x, y) = (logical_w * 10.25, logical_h * 3.5);
+        assert_eq!(report_cell(&state, x, y), Some((3, 10)));
+        let (cw, ch, cols, rows, top) = selection_geometry(&state).unwrap();
+        assert_eq!(pointer::cell_at(x, y, cw, ch, cols, rows, top), (3, 10, false));
     }
 
     /// Once the metrics exist, a later allocation resizes them and is reported to the PTY -- and

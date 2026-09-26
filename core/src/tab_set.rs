@@ -941,6 +941,16 @@ impl TabSet {
         true
     }
 
+    /// Clear the mirrored draft when `id` sends a prompt. The composer clears on Enter but mirrors
+    /// `""` only 300 ms later. `active_state_payloads` can run when the first connect finishes and
+    /// send this stale copy back to the composer, restoring text already sent. Clear it here
+    /// rather than waiting for the mirror.
+    pub fn note_sent(&mut self, id: TabId) {
+        if let Some(tab) = self.get_mut(id) {
+            tab.draft.clear();
+        }
+    }
+
     /// The queued texts of one tab, oldest first (the close path reads them before removing it).
     pub fn queue_texts(&self, id: TabId) -> Vec<String> {
         self.get(id)
@@ -1959,6 +1969,23 @@ mod tests {
         assert_eq!(live_payloads[1].1["items"][0]["text"], "queued");
         assert_eq!(live_payloads[2].1["text"], "typing");
         shut_down_all(&mut set);
+    }
+
+    /// Sending the first message from an empty tab clears its mirrored draft, so state payloads
+    /// sent after the connect finishes cannot restore the sent text to the new composer.
+    #[test]
+    fn a_sent_prompt_is_no_longer_the_tabs_draft() {
+        let mut set = set();
+        let tab = set.active();
+        set.set_draft(tab, "STREAM2 abc");
+        set.note_sent(tab);
+        let draft = set
+            .active_state_payloads()
+            .into_iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(&p).unwrap())
+            .find(|v| v["kind"] == "draft")
+            .expect("a draft payload");
+        assert_eq!(draft["text"], "");
     }
 
     /// A draft edited in nvim returns to the tab it came from, after a switch too.

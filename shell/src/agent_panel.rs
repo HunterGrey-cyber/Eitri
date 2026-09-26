@@ -2200,6 +2200,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let tab = tab_of(target);
             // A sent prompt is history whether or not the backend takes it, as in Claude Code.
             remember_prompts(state, webview, std::slice::from_ref(&text));
+            // ...and no longer the tab's draft (a refusal puts it back in the box panel-side).
+            state.borrow_mut().tabs.note_sent(tab);
             enum Plan {
                 Sent(Result<Vec<agent::AgentDomainEvent>, BackendError>),
                 Starting,

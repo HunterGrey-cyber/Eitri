@@ -4,6 +4,7 @@ import type { BackendKind, ChooserEnvelope, PermissionModeChoice, TabId, TabInfo
 import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
+import { isShiftTab } from "../modeKey";
 
 type Props = {
   envelope: ChooserEnvelope;
@@ -217,7 +218,7 @@ export function Chooser({
     // Claim Shift+Tab even in the filter or rename input. The document-capture router sends it here
     // while the chooser is open, and `cycleMode` selects the row-dependent action. Handle it
     // before the text-input guard because Shift+Tab types no text.
-    if (event.shiftKey && event.key === "Tab") {
+    if (isShiftTab(event)) {
       event.preventDefault();
       event.stopPropagation();
       cycleMode(current);

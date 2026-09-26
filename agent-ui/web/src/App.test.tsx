@@ -4335,4 +4335,26 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(lastOfType("cycle_mode")).toBeUndefined();
     vi.unstubAllGlobals();
   });
+  /** Shift+Tab and `<leader>` `mode.cycle` both use `modeKeyRoute`.
+   *  On `starting` or `failed` tabs, the leader must reach the same route and flash without posting
+   *  a `cycle_mode` that Rust would refuse. */
+  it.each([
+    ["starting", {}],
+    ["failed", { failure: "claude is not on PATH" }],
+  ] as const)("j. <leader> mode.cycle on a %s tab flashes like Shift+Tab, no post", (state, extra) => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state, ...extra }] });
+    act(() => widen(container));
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    dispatch({ kind: "arrive" });
+    const target = (document.activeElement ?? document.body) as HTMLElement;
+    expect(container.querySelector(".empty-tab")!.contains(target)).toBe(true);
+    fireEvent.keyDown(target, { key: " " });
+    fireEvent.keyDown(target, { key: "m" });
+    expect(lastOfType("cycle_mode")).toBeUndefined();
+    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage("Ctrl+b c"));
+    vi.unstubAllGlobals();
+  });
 });

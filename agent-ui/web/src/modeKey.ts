@@ -5,6 +5,7 @@ import type { TabInfo } from "./types";
  *  becomes WebKit's backward focus navigation or GTK's `move-focus`. */
 export function isModeCycleKey(e: {
   key: string;
+  code?: string;
   shiftKey: boolean;
   ctrlKey: boolean;
   altKey: boolean;
@@ -13,7 +14,16 @@ export function isModeCycleKey(e: {
   keyCode?: number;
 }): boolean {
   if (isImeKey({ isComposing: e.isComposing, keyCode: e.keyCode ?? 0 })) return false;
-  return e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+  return isShiftTab(e) && !e.ctrlKey && !e.altKey && !e.metaKey;
+}
+
+/** Recognize Shift+Tab when WebKitGTK reports the `ISO_Left_Tab` keysym as `key:
+ *  "Unidentified"`, `code: "Tab"`, `keyCode: 9`. Checking `key === "Tab"` alone lets that event
+ *  fall through to GTK focus movement. Keep the `key === "Tab"` case for keymaps and tests that
+ *  deliver it. */
+export function isShiftTab(e: { key: string; code?: string; shiftKey: boolean }): boolean {
+  if (!e.shiftKey) return false;
+  return e.key === "Tab" || (e.key === "Unidentified" && e.code === "Tab");
 }
 
 export type ModeKeyState = { confirmOpen: boolean; chooserOpen: boolean; tabState: TabInfo["state"] | null };

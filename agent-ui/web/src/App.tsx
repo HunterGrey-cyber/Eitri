@@ -275,6 +275,9 @@ export default function App() {
    *  its first render's value forever. Assigned during render, so it is current by the time any
    *  later envelope arrives. */
   const sessionStartedRef = useRef(false);
+  /** Whether `<leader>` `mode.cycle` is disabled: any tab state except `not_started`, matching
+   *  `modeKeyRoute`. A starting or failed tab's box greys the entry too. */
+  const modeFixed = activeTab !== null && activeTab.state !== "not_started";
   sessionStartedRef.current = sessionStarted;
   /** A fatal, session-ending failure, shown in the panel. Replaces window.alert, which cannot be
    * copied, cannot show the sidecar's own multi-line startup diagnostics, and blocks the WebView. */
@@ -667,10 +670,17 @@ export default function App() {
         setHandoffOpen(true);
         break;
       case "mode.cycle":
-        // Disabled in the box once a session has started (`leader.ts`'s own `boxEntries` doc
-        // comment): cycling makes no sense any more, so this flashes rather than posting.
-        if (sessionStarted) showFlash(modeFixedMessage(keymapHelp.newTabChord));
-        else post({ type: "cycle_mode" });
+        // The box disables cycling once the tab is no longer `not_started`. Use `modeKeyRoute`,
+        // as Shift+Tab does, so a starting or failed tab flashes here instead of posting a
+        // `cycle_mode` that Rust's `TabSet::cycle_mode` would refuse.
+        switch (modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: activeTab?.state ?? null })) {
+          case "cycle":
+            post({ type: "cycle_mode" });
+            break;
+          case "fixed":
+            showFlash(modeFixedMessage(keymapHelp.newTabChord));
+            break;
+        }
         break;
     }
   }
@@ -2579,11 +2589,11 @@ export default function App() {
    *  to decide between them. */
   const box: { title: string; entries: BoxEntry[] } | null =
     seq !== null
-      ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, sessionStarted) }
+      ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, modeFixed) }
       : pendingRef.current !== null
         ? {
             title: pendingRef.current,
-            entries: [...FIXED_PENDING_ENTRIES[pendingRef.current], ...boxEntries(panelTable, [pendingRef.current], sessionStarted)],
+            entries: [...FIXED_PENDING_ENTRIES[pendingRef.current], ...boxEntries(panelTable, [pendingRef.current], modeFixed)],
           }
         : null;
 

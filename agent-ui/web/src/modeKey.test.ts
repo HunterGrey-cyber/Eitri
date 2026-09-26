@@ -13,6 +13,12 @@ describe("isModeCycleKey", () => {
     expect(isModeCycleKey(key({ altKey: true }))).toBe(false);
     expect(isModeCycleKey(key({ key: "ISO_Left_Tab" }))).toBe(false);
   });
+  it("matches Shift+Tab as WebKitGTK delivers it from a real keyboard (ISO_Left_Tab)", () => {
+    // WebKitGTK delivers Shift+Tab with key "Unidentified", code "Tab", keyCode 9.
+    expect(isModeCycleKey(key({ key: "Unidentified", code: "Tab", keyCode: 9 }))).toBe(true);
+    expect(isModeCycleKey(key({ key: "Unidentified", code: "Tab", keyCode: 9, shiftKey: false }))).toBe(false);
+    expect(isModeCycleKey(key({ key: "Unidentified", code: "KeyQ", keyCode: 81 }))).toBe(false);
+  });
   it("leaves a composing key to the input method", () => {
     expect(isModeCycleKey(key({ isComposing: true }))).toBe(false);
     expect(isModeCycleKey(key({ keyCode: 229 }))).toBe(false);
