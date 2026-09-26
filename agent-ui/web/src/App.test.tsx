@@ -3014,6 +3014,81 @@ describe("P1 over a restored view (the phase-3 GUI pass, 2026-09-25)", () => {
   });
 });
 
+describe("a switch back to a tab whose reply streams (the small-defects GUI pass, 2026-09-25)", () => {
+  const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
+  const rowsUpTo = (n: number) =>
+    snapshotState({ activeTurnId: "t", transcript: Array.from({ length: n }, (_, i) => ({ seq: i + 1, text: `row ${i + 1}` })) });
+  const current = (container: HTMLElement) => container.querySelector(".row-current")?.textContent ?? "";
+
+  it("a tab left while following comes back on the last row, even with rows that arrived meanwhile", () => {
+    // Seen in the sandbox: `prefix c`, then `prefix p` while STREAM200 ran -- the cursor came back on
+    // the row that was last when the tab was left, 27 rows above the end.
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 3, state: rowsUpTo(3) });
+    expect(current(container)).toContain("row 3");
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    const spy = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 9, state: rowsUpTo(9) });
+    expect(current(container)).toContain("row 9");
+    // (The tab bar reveals its active tab; only a reveal inside the conversation moves the list.)
+    const rowReveals = spy.mock.contexts.filter((el) => (el as Element).closest(".message-list") !== null);
+    expect(rowReveals, "nothing reveals an older row, which would scroll the view up").toEqual([]);
+    dispatch({ kind: "events", tab: 1, fromRevision: 9, throughRevision: 11, events: [
+      { type: "assistant_message_boundary" },
+      { type: "content_delta", turn_id: "t", kind: "text", text: "row 10" },
+    ] });
+    expect(current(container), "and rides the new last row").toContain("row 10");
+  });
+
+  it("a tab left while following comes back following", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 3, state: rowsUpTo(3) });
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    const seen: string[] = [];
+    const onResume = () => seen.push("resume");
+    const onUser = (e: Event) => seen.push(`user ${(e as CustomEvent).detail}`);
+    document.addEventListener(RESUME_FOLLOW_EVENT, onResume, true);
+    document.addEventListener(USER_SCROLL_EVENT, onUser, true);
+    try {
+      dispatch({ kind: "tabs", active: 1, tabs: two });
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 9, state: rowsUpTo(9) });
+    } finally {
+      document.removeEventListener(RESUME_FOLLOW_EVENT, onResume, true);
+      document.removeEventListener(USER_SCROLL_EVENT, onUser, true);
+    }
+    // Following is restored outright, not left to a scroll event read inside a steering window --
+    // where any later reveal above the end reads as the user scrolling up.
+    expect(seen).toEqual(["resume"]);
+  });
+
+  it("a cursor move in the same render as a streamed delta is not undone", () => {
+    // The mechanism behind the first test's parked view: R1's clamp moved the cursor while a delta
+    // landed in the same render, the key reconciliation (for a run folding) read that as the row
+    // having moved and put the cursor back, and its reveal scrolled the list up.
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: two });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 3, state: rowsUpTo(3) });
+    expect(current(container)).toContain("row 3");
+    const root = container.querySelector(".agent-ui-conversation")!;
+    act(() => {
+      fireEvent.keyDown(root, { key: "k" });
+      window.__neovibeDispatch!(
+        JSON.stringify({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events: [
+          { type: "content_delta", turn_id: "t", kind: "text", text: " more" },
+        ] }),
+      );
+    });
+    expect(current(container)).toContain("row 2");
+  });
+});
+
 describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
   it("3j moves three rows, and ]] / [[ go from prompt to prompt", () => {
     const { container } = render(<App />);

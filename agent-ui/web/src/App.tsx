@@ -731,11 +731,22 @@ export default function App() {
    *  last time this effect ran (a real collapse/expand/tab-switch), never merely because `cursor` did. */
   const cursorKeyRef = useRef<string | null>(null);
   const prevTimelineRef = useRef<TimelineItem[] | null>(null);
+  /* **Correction (the small-defects GUI pass, 2026-09-25): and only when `cursor` did NOT change.**
+     `timeline` is a new object on every streamed delta, so a cursor move committed in the same render
+     as one -- R1's clamp, a `j`/`k`, a restore -- met `timelineChanged`, found the key it had just left
+     still at its old index, and was put straight back. The move back carried no `"keep"` (the slot
+     was spent on the move it undid), so the `[cursor]` effect revealed the stale row, scrolling the
+     list up inside a restore's steering window, and `MessageList` stopped following: a tab switched
+     back to mid-stream came back parked above the end with a pill. A cursor that moved in this render
+     was moved on purpose; only a timeline change under a still cursor is a fold to follow. */
+  const prevCursorRef = useRef(cursor);
   useLayoutEffect(() => {
     const timelineChanged = prevTimelineRef.current !== null && prevTimelineRef.current !== timeline;
+    const cursorMoved = prevCursorRef.current !== cursor;
     prevTimelineRef.current = timeline;
+    prevCursorRef.current = cursor;
     const want = cursorKeyRef.current;
-    if (timelineChanged && want !== null && timeline[cursor]?.key !== want) {
+    if (timelineChanged && !cursorMoved && want !== null && timeline[cursor]?.key !== want) {
       const found = indexOfKey(timeline, want);
       if (found !== null && found !== cursor) {
         landingRef.current = "keep";
@@ -808,7 +819,15 @@ export default function App() {
   const landOnPromptRef = useRef(false);
   /** Set by a switch's (or a mount's) first snapshot with no saved view: see the `snapshot` arm. */
   const landOnLastRef = useRef(false);
-  useEffect(() => {
+  /* A layout effect since the small-defects GUI pass (2026-09-25). As a passive effect it ran after
+     the browser's next rendering step, which is where the list's scroll event -- from `MessageList`'s
+     own snap to the end -- is dispatched; R1's clamp therefore saw the cursor still on the row that
+     WAS last, off screen once a row taller than the view had arrived, and moved it to the nearest
+     visible row, which is not always the last one. The ride then no longer matched (`cursor` was no
+     longer `previous - 1`), and a following view kept its cursor a row above the end for the rest
+     of the reply. `MessageList`'s snap is a layout effect of a child, so it has already run here and
+     the distance read below is the snapped one. */
+  useLayoutEffect(() => {
     const previous = lastLengthRef.current;
     lastLengthRef.current = timeline.length;
     if (landOnLastRef.current) {
@@ -857,8 +876,16 @@ export default function App() {
     restoreRef.current = null;
     const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
     if (!list) return;
+    // A tab left while following comes back following (the small-defects GUI pass, 2026-09-25):
+    // said outright, as a send does, rather than as a scroll to the end the list reads a frame later
+    // inside a steering window -- where any other movement above the end counted as the user
+    // scrolling up. A tab left parked comes back exactly where it was.
+    if (view.atBottom) {
+      resumeFollowing(list);
+      return;
+    }
     noteUserScroll(list, "unknown");
-    list.scrollTop = view.atBottom ? list.scrollHeight : view.scrollTop;
+    list.scrollTop = view.scrollTop;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restoreTick]);
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
@@ -1188,8 +1215,13 @@ export default function App() {
           // Only when the cursor really moves: a `"keep"` set for a `setCursor` that changes nothing
           // fires no `[cursor]` effect, so nothing consumes it, and it swallowed the NEXT move's reveal
           // -- P1's landing on a card below the restored view (the phase-3 GUI pass, 2026-09-25).
-          if (view.cursor !== cursorRef.current) landingRef.current = "keep";
-          setCursor(view.cursor);
+          // A view that was following the end comes back on the LAST row, as a first snapshot does
+          // (`landOnLastRef` below): rows kept arriving while the tab was away, so the cursor saved
+          // then names a row that is no longer last (the small-defects GUI pass, 2026-09-25).
+          if (!view.atBottom) {
+            if (view.cursor !== cursorRef.current) landingRef.current = "keep";
+            setCursor(view.cursor);
+          }
           setMode(view.mode);
           setExpanded(view.expanded);
           setDetailed(view.detailed);
@@ -1209,7 +1241,7 @@ export default function App() {
           // follows from mount), so the cursor goes to the last row, where the view is. It sat on
           // row 1, off screen (the phase-3 GUI pass, 2026-09-25). The `[timeline]` effect does it,
           // once this snapshot's rows exist; P1's card landing below still wins over it.
-          if (restoreRef.current === null) landOnLastRef.current = true;
+          if (restoreRef.current === null || restoreRef.current.atBottom) landOnLastRef.current = true;
           if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
         }
         // A snapshot means a session is genuinely RUNNING, which is also when Rust clears its own
