@@ -25,11 +25,12 @@ function renderEmpty(over: Partial<EmptyTabProps> = {}) {
 }
 
 describe("EmptyTab (F3)", () => {
-  it("is Claude Code's fresh prompt: a live composer, the mode pill, at most 8 resume rows", () => {
-    const { container, getByText } = renderEmpty();
+  it("is Claude Code's fresh prompt: a live composer, at most 8 resume rows", () => {
+    // The mode pill moved into the footer `App.tsx` draws (Task 9); see `App.test.tsx`'s
+    // "draws the empty tab's close prompt in the footer" for where it is covered now.
+    const { container } = renderEmpty();
     expect(container.querySelector("textarea")).not.toBeNull();
     expect(document.activeElement).toBe(container.querySelector("textarea"));
-    getByText("⏵⏵ auto on (shift+tab to cycle)");
     expect(container.querySelectorAll('[data-nav-stop="resume"]').length).toBe(8);
     expect(container.textContent).not.toContain("about 8");
   });
@@ -55,10 +56,33 @@ describe("EmptyTab (F3)", () => {
     fireEvent.click(rows[2]);
     expect(props.onResume).toHaveBeenCalledWith("id-2-0000000000");
   });
-  it("says it is starting while the session connects, with the box disabled", () => {
-    const { container, getByText } = renderEmpty({ tab: { ...TAB, state: "starting" } });
+  it("says it is starting while the session connects, with the box live, queueing", () => {
+    const onQueue = vi.fn();
+    const { container, getByText } = renderEmpty({ tab: { ...TAB, state: "starting" }, onQueue });
     getByText(/Starting the agent backend/);
-    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    const box = container.querySelector("textarea")!;
+    expect(box.disabled).toBe(false);
+    fireEvent.change(box, { target: { value: "queue this" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onQueue).toHaveBeenCalledWith("queue this");
+  });
+  /** Fix round 1 (reviewer finding, blocking): a starting tab has no live turn to send-now to, so
+   *  Ctrl+Enter used to fall through to `Composer`'s default no-op `onSendNow` while its `submit()`
+   *  cleared the box anyway -- the typed text vanished with no send, no queue and no restore. */
+  it("queues on Ctrl+Enter too, instead of silently discarding the draft (fix round 1)", () => {
+    const onQueue = vi.fn();
+    const { container } = renderEmpty({ tab: { ...TAB, state: "starting" }, onQueue });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "important text" } });
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    expect(onQueue).toHaveBeenCalledWith("important text");
+  });
+  it("does not queue a blank entry when Ctrl+Enter is pressed on an empty box", () => {
+    const onQueue = vi.fn();
+    const { container } = renderEmpty({ tab: { ...TAB, state: "starting" }, onQueue });
+    const box = container.querySelector("textarea")!;
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    expect(onQueue).not.toHaveBeenCalled();
   });
   it("shows why a failed tab failed, and r starts it over", () => {
     const { container, getByText, props } = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "the gate refused 2.1.999" });

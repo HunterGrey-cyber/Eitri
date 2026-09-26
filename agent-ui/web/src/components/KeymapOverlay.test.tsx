@@ -38,9 +38,19 @@ describe("KeymapOverlay", () => {
       expect(text).toContain(row.keys);
       expect(text).toContain(row.what);
     }
+    // Typing carries two rows of its own on top of INPUT_KEYS (C6): the pane-switch chord and the
+    // prefix, both of which neovibe keeps for itself rather than handing to the composer.
     expect(container.querySelectorAll("tr").length).toBe(
-      BROWSE_KEYS.length + INPUT_KEYS.length + WINDOW.length + PREFIX.length,
+      BROWSE_KEYS.length + INPUT_KEYS.length + 2 + WINDOW.length + PREFIX.length,
     );
+  });
+
+  it("names the chords neovibe keeps while typing (C6)", () => {
+    const { container } = render(<KeymapOverlay onClose={() => {}} windowKeys={[]} prefixKeys={[]} prefixLabel="Ctrl+b" />);
+    const typing = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Typing"))!;
+    expect(typing.textContent).toContain("Ctrl+h / j / k / l");
+    expect(typing.textContent).toContain("Move between panes (neovibe keeps these)");
+    expect(typing.textContent).toContain("Ctrl+b");
   });
 
   it("closes on a click on its own backdrop, not on a click inside a table", () => {

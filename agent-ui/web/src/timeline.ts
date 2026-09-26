@@ -28,7 +28,12 @@ export type TimelineItem =
   | { kind: "prompt"; seq: Seq; key: string; text: string }
   | { kind: "message"; seq: Seq; key: string; text: string }
   | { kind: "tool"; seq: Seq; key: string; call: ToolCallRecord }
-  | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord };
+  | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord }
+  /** P2: a collapsed run of finished tool calls, drawn as one row. Made by `display.ts`, never by
+   *  `buildTimeline` -- this function's own ordering (by `seq`, cards anchored after their call)
+   *  stays exactly as it was, and folding several rows into one is a DISPLAY decision layered on
+   *  top of it, not a change to what the conversation actually contains. `key` is `r-<first seq>`. */
+  | { kind: "run"; seq: Seq; key: string; calls: ToolCallRecord[] };
 
 /** Whether a `toolUseId` can identify a tool call at all.
  *
@@ -140,4 +145,14 @@ export function oldestPendingPermission(timeline: TimelineItem[]): number | null
     if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
   });
   return best;
+}
+
+/** R4's `[[`/`]]`: the next `prompt` row before (`-1`) or after (`1`) `from`, or `null` when there is
+ *  none. Never wraps -- `[[` at the first prompt, or `]]` at the last, simply does nothing, the same
+ *  way `clampStep` (`nav.ts`) stops `j`/`k` at either end rather than cycling. */
+export function promptIndex(timeline: TimelineItem[], from: number, delta: 1 | -1): number | null {
+  for (let i = from + delta; i >= 0 && i < timeline.length; i += delta) {
+    if (timeline[i].kind === "prompt") return i;
+  }
+  return null;
 }

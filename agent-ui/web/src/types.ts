@@ -105,6 +105,9 @@ export type Capabilities = {
   fork: boolean;
   interrupt: boolean;
   bypassPermissionMode: boolean;
+  /** D6: false until Verdandi can change a live session's mode; every mode control is hidden
+   *  while it is false (`agent_backend::MODE_SWITCH_AVAILABLE`). */
+  modeSwitch?: boolean;
 };
 
 /** Descriptive only -- for display and diagnostics, never for deciding whether a control is
@@ -162,6 +165,14 @@ export type HistoryNotice = {
    * it. `null` on the `neovibe_copy` path, which has no such concept. */
   writerVersion: string | null;
 };
+
+/** One item waiting behind a running turn (phase 3 ruling 1), as it reaches the panel: what the
+ * user typed, and when it was queued (epoch ms), for the composer's "queued" list. The wire text
+ * composed against the editor context at queue time is Rust's own concern and never reaches here. */
+export type QueueItem = { text: string; queuedAt: number };
+/** V1's editor-context line (phase 3 ruling 32): the file relative to the project root (or
+ * absolute outside it), and the selected line range when there is a selection. */
+export type ContextSummary = { file: string | null; lines: [number, number] | null };
 
 export type AgentUiState = {
   backend: BackendKind;

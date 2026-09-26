@@ -27,6 +27,13 @@ describe("stripEntries", () => {
     ]);
   });
 
+  /** P1 (ruling 26): with exactly one card anywhere in the conversation, the strip agrees with what
+   *  `a`/`d` now do even when the cursor sits on neither the card nor the tool call it gates. */
+  it("offers allow/deny/buttons for the only card in the conversation, from any row", () => {
+    const answerable: AnswerableItem[] = [{ kind: "other" }, { kind: "permission", toolUseId: "toolu_1" }];
+    expect(KEYS_ONLY(stripEntries([otherItem(1), otherItem(2)], answerable, 0, false))).toEqual(["a", "d", "l"]);
+  });
+
   it("offers allow/deny/buttons from the tool call the card gates, too", () => {
     const answerable: AnswerableItem[] = [
       { kind: "tool", toolUseId: "toolu_1" },
@@ -78,5 +85,12 @@ describe("stripEntries", () => {
 
   it("does not go past the end of the timeline", () => {
     expect(stripEntries([], [], 0, false)).toEqual([]);
+  });
+
+  /* P2 (Task 13): a collapsed run is a row with its own Enter action -- expand it -- distinct from
+     an ordinary finished tool row, which offers to fold/unfold its own result instead. */
+  it("offers Enter expand on a collapsed run", () => {
+    const run: TimelineItem = { kind: "run", seq: 1, key: "r-1", calls: [] };
+    expect(stripEntries([run], [{ kind: "other" }], 0, false)).toEqual([{ key: "Enter", label: "expand" }]);
   });
 });

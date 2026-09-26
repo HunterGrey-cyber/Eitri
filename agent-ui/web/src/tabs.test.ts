@@ -25,12 +25,19 @@ describe("acceptsEnvelope", () => {
       expect(acceptsEnvelope({ kind }, null)).toBe(true);
     }
   });
+  it("treats the queue, the draft, the rule offers and the scratch state as the active tab's own", () => {
+    for (const kind of ["queue", "draft", "queue_taken", "rule_offers", "scratch"]) {
+      expect(acceptsEnvelope({ kind, tab: 1 }, 2), kind).toBe(false);
+      expect(acceptsEnvelope({ kind, tab: 2 }, 2), kind).toBe(true);
+    }
+    for (const kind of ["history", "editor_context", "notice"]) expect(acceptsEnvelope({ kind }, 2), kind).toBe(true);
+  });
 });
 
 describe("tab helpers", () => {
-  it("names the mode the way the pill reads, with the cycle hint before a start", () => {
-    expect(modePill("auto", false)).toBe("⏵⏵ auto on (shift+tab to cycle)");
-    expect(modePill("bypass", true)).toBe("⏵⏵ bypass on");
+  it("names the mode the way the pill reads, with the cycle hint only when it is offered", () => {
+    expect(modePill("auto", true)).toBe("⏵⏵ auto on (shift+tab to cycle)");
+    expect(modePill("bypass", false)).toBe("⏵⏵ bypass on");
   });
   it("draws one glyph per marker", () => {
     expect(markerGlyph("needs_input", 1)).toBe("⚑");
@@ -59,7 +66,7 @@ describe("the per-tab view store", () => {
     expanded: { k: true },
     scrollTop: 40 * cursor,
     atBottom: false,
-    draft: `draft ${cursor}`,
+    detailed: false,
   });
   it("gives each tab back what it left, and forgets closed tabs", () => {
     const store = new Map<number, TabViewState>();

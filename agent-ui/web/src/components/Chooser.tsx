@@ -6,6 +6,7 @@ import type { ChooserRow } from "../chooser";
 
 type Props = {
   envelope: ChooserEnvelope;
+  active: TabId | null;
   onSwitch: (tab: TabId) => void;
   onResume: (providerSessionId: string) => void;
   onCloseTab: (tab: TabId) => void;
@@ -17,10 +18,14 @@ function composing(event: KeyboardEvent): boolean {
 }
 
 /** `prefix w` (spec §3.6). Owns every key while open, like the `?` overlay. */
-export function Chooser({ envelope, onSwitch, onResume, onCloseTab, onLeave }: Props) {
+export function Chooser({ envelope, active, onSwitch, onResume, onCloseTab, onLeave }: Props) {
   const [filter, setFilter] = useState("");
   const [filtering, setFiltering] = useState(false);
-  const [cursor, setCursor] = useState(0);
+  // Defect 5 (ruling 37): starts on the active tab's row, not row 1.
+  const [cursor, setCursor] = useState(() => {
+    const rows = chooserRows(envelope, "");
+    return Math.max(0, rows.findIndex((r) => r.kind === "tab" && r.tab.tab === active));
+  });
   const rootRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const rows = chooserRows(envelope, filter);

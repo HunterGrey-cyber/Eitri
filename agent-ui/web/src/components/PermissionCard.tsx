@@ -3,15 +3,21 @@ import type { PermissionRequestRecord } from "../types";
 import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
 import { isUsableLink } from "../timeline";
+import { EditDiff } from "./EditDiff";
 
 type Props = {
   request: PermissionRequestRecord;
   /** The session this request belongs to has ended. */
   sessionEnded: boolean;
-  onAnswer: (permissionId: string, decision: PermissionDecision, reason?: string) => void;
+  /** D7's third button: the rule Rust would apply to this exact tool call
+   *  (`permission_rules::offer`), or `null`/absent when it offered none. The card never invents its
+   *  own suggestion -- the words shown here are Rust's, byte for byte, so `remember: true` can only
+   *  ever be sent for a request Rust itself is prepared to answer with a rule. */
+  ruleOffer?: string | null;
+  onAnswer: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
 };
 
-export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
+export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: Props) {
   const [reason, setReason] = useState("");
   const [answered, setAnswered] = useState(false);
 
@@ -22,10 +28,15 @@ export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
      event is still in flight. Neither of these clears the card; only a provider event does that. */
   const inert = answered || sessionEnded;
 
-  function handleAnswer(decision: PermissionDecision) {
+  function handleAnswer(decision: PermissionDecision, remember = false) {
     if (inert) return;
     setAnswered(true);
-    onAnswer(request.permissionId, decision, decision === "deny" ? reason || undefined : undefined);
+    onAnswer(
+      request.permissionId,
+      decision,
+      decision === "deny" ? reason || undefined : undefined,
+      ...(remember ? [true] : []),
+    );
   }
 
   return (
@@ -48,18 +59,30 @@ export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
       <ToolInput toolName={request.toolName} input={request.input} />
       <input
         type="text"
-        data-nav-order={3}
-        placeholder="Reason (shown to the agent if you deny)"
+        data-nav-order={ruleOffer ? 4 : 3}
+        placeholder="Reason (shown to the agent if you deny) — Enter denies"
         value={reason}
         onChange={(e) => setReason(e.target.value)}
+        onKeyDown={(e) => {
+          // P5: Enter here denies with the reason; an IME's Enter is its own (C4).
+          if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
+          e.preventDefault();
+          handleAnswer("deny");
+        }}
         disabled={inert}
       />
       <div className="permission-card-buttons">
-        {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the reason
-            box above them. `data-nav-action` is how `a`/`d` press these very buttons, so the card's
-            own `inert`/`answered` guard against a double answer applies to the keyboard too. */}
+        {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the third
+            (Always allow) button when Rust offered one, then the reason box above them.
+            `data-nav-action` is how `a`/`d` press these very buttons, so the card's own
+            `inert`/`answered` guard against a double answer applies to the keyboard too. */}
         <button data-nav-order={1} data-nav-action="allow" onClick={() => handleAnswer("allow")} disabled={inert}>Approve</button>
         <button data-nav-order={2} data-nav-action="deny" onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
+        {ruleOffer && (
+          <button data-nav-order={3} data-nav-action="always" onClick={() => handleAnswer("allow", true)} disabled={inert}>
+            Always allow {ruleOffer} in this project
+          </button>
+        )}
       </div>
       {sessionEnded && !answered && (
         <div className="permission-card-stale">
@@ -72,60 +95,28 @@ export function PermissionCard({ request, sessionEnded, onAnswer }: Props) {
 
 /** What the call would do, for a person deciding whether to allow it.
  *
- * A file-changing tool gets a real diff; everything else gets its input as JSON, which for a `Bash`
+ * A file-changing tool gets a real diff (`EditDiff`, moved out to its own component in Task 13 so
+ * a conversation row can fold it too); everything else gets its input as JSON, which for a `Bash`
  * or an `mcp__*` call is the honest rendering. The data for both has always been in the request --
  * `PreToolUse` carries the whole tool-input object -- so this is a rendering change and nothing
  * more: no new event, no wire field, no protocol work.
- *
- * **Signal colours are on the gutter, never on the text.** `--nv-ok`/`--nv-error` are guarded at
- * 3:1 for non-text UI, and drawing diff lines in them measured 2.05-3.84:1 on rose-pine dawn when
- * the same mistake was made in this file's banners. The `+`/`-` gutter carries the colour; the code
- * stays `--nv-fg`, and `indexCss.test.ts` enforces that.
  */
 function ToolInput({ toolName, input }: { toolName: string; input: unknown }) {
   const preview = editPreview(toolName, input);
-  if (preview === null) {
-    return <pre className="permission-card-input">{JSON.stringify(input, null, 2)}</pre>;
+  if (preview !== null) {
+    // No cap here: a card shows the whole change, unlike the folded preview a conversation row gets
+    // (`EditDiff`'s `maxLines`, Task 13's P3).
+    return <EditDiff preview={preview} />;
   }
-  return (
-    <div className="permission-card-edit">
-      <div className="permission-card-edit-head">
-        {/* The path first: which file is the question a reader asks before what changed. */}
-        <span className="permission-card-edit-path">{preview.filePath || "(no file named)"}</span>
-        <span className="permission-card-edit-counts">
-          +{preview.added} −{preview.removed}
-        </span>
-      </div>
-      {preview.wholeFile && (
-        /* Said rather than implied. A Write request carries only what the file WILL contain, so a
-           patch-shaped rendering would suggest the rest of the file survives. It may not. */
-        <div className="permission-card-edit-note">
-          Writes the whole file. The request does not say what is there now.
-        </div>
-      )}
-      {preview.replaceAll && (
-        /* The diff looks identical with and without this, so a reader cannot infer it. */
-        <div className="permission-card-edit-note">
-          Replaces <strong>every</strong> occurrence in the file, not just the first.
-        </div>
-      )}
-      {preview.diff === null ? (
-        <div className="permission-card-edit-note">
-          Too large to show here ({preview.added + preview.removed} lines). Shown as counts rather
-          than as part of a diff, because a diff missing lines is one you would approve anyway.
-        </div>
-      ) : (
-        <pre className="permission-card-diff">
-          {preview.diff.map((line, i) => (
-            <div key={i} className={`diff-line diff-${line.kind}`}>
-              <span className="diff-gutter" aria-hidden="true">
-                {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
-              </span>
-              <span className="diff-text">{line.text}</span>
-            </div>
-          ))}
-        </pre>
-      )}
-    </div>
-  );
+  const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;
+  if (toolName === "Bash" && fields && typeof fields.command === "string") {
+    // P4: Claude Code's `Command:` line -- the command as the shell will read it, newlines and all.
+    return (
+      <>
+        <pre className="permission-card-command">$ {fields.command}</pre>
+        {typeof fields.description === "string" && <div className="permission-card-description">{fields.description}</div>}
+      </>
+    );
+  }
+  return <pre className="permission-card-input">{JSON.stringify(input, null, 2)}</pre>;
 }

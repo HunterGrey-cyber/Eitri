@@ -1,4 +1,4 @@
-import { forwardRef } from "react";
+import { forwardRef, useEffect, useRef } from "react";
 import type { DetailRow } from "../types";
 
 type Props = {
@@ -16,6 +16,13 @@ type Props = {
 /** This session's details (session tabs spec §3.3), opened by `prefix i` or `Enter` on the status
  *  row: a two-column table of `rows`, shaped like `KeymapOverlay`. */
 export const DetailPopover = forwardRef<HTMLDivElement, Props>(function DetailPopover({ rows, current, onClose }, ref) {
+  // The row `j`/`k` sit on stays in view: once phase 3's rows made the table taller than a short
+  // panel, the highlight walked off the bottom with nothing following it (the phase-3 GUI pass).
+  const currentRef = useRef<HTMLTableRowElement | null>(null);
+  useEffect(() => {
+    // `?.()`: jsdom has no `scrollIntoView`.
+    currentRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [current]);
   return (
     <div
       className="detail-popover"
@@ -29,7 +36,7 @@ export const DetailPopover = forwardRef<HTMLDivElement, Props>(function DetailPo
       <table>
         <tbody>
           {rows.map((row, index) => (
-            <tr key={row.label} className={index === current ? "current" : undefined} aria-current={index === current ? "true" : undefined}>
+            <tr key={row.label} ref={index === current ? currentRef : undefined} className={index === current ? "current" : undefined} aria-current={index === current ? "true" : undefined}>
               <td>{row.label}</td>
               <td>{row.value}</td>
             </tr>

@@ -1,31 +1,53 @@
-import { useLayoutEffect, useMemo, useRef } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentUiState, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
 import { buildTimeline, isUsableLink } from "../timeline";
+import { buildDisplay, runSummary } from "../display";
 import { renderMarkdown } from "../markdown";
 import { HistoryNotice } from "./HistoryNotice";
+import { NewPill } from "./NewPill";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import type { PermissionDecision } from "../bridge";
-import { USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
+import { noteUserScroll, USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
+import { pillLabel, pillShown } from "../pill";
+import { parsePath } from "../paths";
+import type { PathRef } from "../paths";
 
 type Props = {
   state: AgentUiState;
   /** The session is gone. Pending cards stay visible but can no longer submit into it. */
   sessionEnded: boolean;
   /** Which rows are expanded, keyed by the timeline `key`. Owned by `App.tsx` because `Enter` acts
-   *  on the cursor, and the cursor is App's -- see `App.tsx`'s `onKeyDown`, `toggle-expand` arm. */
+   *  on the cursor, and the cursor is App's -- see `App.tsx`'s `onKeyDown`, `toggle-expand` arm. A
+   *  run's own key expanding is what un-collapses it (P2, `display.ts`). */
   expanded: Record<string, boolean>;
   /** The index into THIS component's own `timeline` (below) that `Enter`/`y` act on in `App.tsx`.
    *  Safe to compare by position rather than by identity: both here and there, `timeline` is
-   *  `buildTimeline(state)` over the same `state`, a pure function, so the two computations always
-   *  agree on what sits at a given index for a given `state` even though each holds its own copy. */
+   *  `buildDisplay(buildTimeline(state), …)` over the same `state`, `expanded` and `detailed`, a pure
+   *  function, so the two computations always agree on what sits at a given index for a given input
+   *  even though each holds its own copy. */
   cursor: number;
+  /** R3 (`Ctrl+o`): every result shown in full, at wider cuts, with no collapsed runs. Per tab
+   *  (`App.tsx`'s `TabViewState.detailed`); defaults to `false`, the state every fresh tab starts
+   *  in. */
+  detailed?: boolean;
   /** Whether the panel has the keyboard (the `pane_focus` envelope). Drives the cursor's solid
    *  and hollow states in `index.css`; see the `.row-current .row-sign` rule there. Defaults to
    *  `true`, the state with no host to say otherwise; `App.tsx` always passes it explicitly. */
   focused?: boolean;
-  onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string) => void;
+  /** D7's third button: `permissionId -> "<words> *"`, exactly the rules Rust offered for the
+   *  cards currently on screen (`rule_offers`). Absent/no entry means no rule -- the card never
+   *  invents its own suggestion. */
+  ruleOffers?: Record<string, string>;
+  /** N3: the row just yanked, so it can flash (`.row-yanked`). `App.tsx` owns the timer; this only
+   *  reads the current key. */
+  yankedKey?: string | null;
+  onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
+  /** N2: a click on a path link or an inline code span that parses as a path opens it -- the same
+   *  target `gf` reaches from the keyboard (`App.tsx`'s `open-path` action). Absent, clicks inside
+   *  the list do nothing beyond React's own defaults (a permission card's buttons, say). */
+  onOpenPath?: (ref: PathRef) => void;
 };
 
 /** Whether a finished tool call succeeded, failed, or is still running -- the state a row's sign
@@ -105,12 +127,29 @@ function writeListInlineSize(list: HTMLElement, contentWidth: number): void {
   }
 }
 
-export function MessageList({ state, sessionEnded, expanded, cursor, focused = true, onAnswerPermission }: Props) {
+export function MessageList({
+  state,
+  sessionEnded,
+  expanded,
+  cursor,
+  detailed = false,
+  focused = true,
+  ruleOffers,
+  yankedKey = null,
+  onAnswerPermission,
+  onOpenPath,
+}: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   /** The one `ResizeObserver`, on the list and on every child of it (see "Correction (the GUI pass)"
    *  below), and which children it is watching. `null` where there is none (jsdom). */
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const observedChildrenRef = useRef<Set<Element>>(new Set());
+  /** The CURRENT render's `onScroll`, for the observer below, which is made once. Calling the first
+   *  render's own `onScroll` from there ran that render's `updatePill`, which slices that render's
+   *  timeline: every row that arrived since was invisible to it, so a row settling its size after a
+   *  card landed below a reader rewrote `↓ ⚑ approval` as `↓ Jump to bottom` (the phase-3 GUI pass,
+   *  2026-09-25). Assigned right after `onScroll` is defined, on every render. */
+  const onScrollRef = useRef<() => void>(() => {});
 
   /* The list's width, measured here rather than queried by CSS (2026-09-24).
 
@@ -154,8 +193,8 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
         if (entry.target === list) writeListInlineSize(list, entry.contentRect.width);
       }
       // As the follow effect does, read the position first: a scroll whose event has not arrived yet
-      // still decides whether this is a view that is following.
-      onScroll();
+      // still decides whether this is a view that is following. Through the ref: see `onScrollRef`.
+      onScrollRef.current();
       if (followingRef.current) follow(list);
     });
     observer.observe(list);
@@ -296,6 +335,32 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
   // paint, so a new row is in view in the first frame that shows it; the price is that a new row no
   // longer glides in. (F-a) The snap ran only when the state changed, so a resize with nothing
   // streaming left the view short -- see the `ResizeObserver` above, which now snaps too.
+
+  /* One ordered sequence, not three lists one after another.
+
+     Until 2026-09-15 this component mapped `transcript`, then `toolCalls`, then
+     `pendingPermissions`, so every tool card rendered below every assistant message however the
+     turn really went. `buildTimeline` merges them on `seq`, an ordering key Rust's projection
+     assigns and its snapshot ships -- so a reload or a `UiDelivery::Resync`, which rebuild this
+     whole state from that snapshot, produce the same order as the live path did.
+
+     Memoised on `state`, which the reducer replaces wholesale on every folded event -- so this
+     recomputes exactly as often as the conversation changes, and not on a re-render caused by
+     anything else (a `sessionEnded` flip, a parent re-render while the user types). The merge
+     allocates four mapped arrays, a Map and a Set and then sorts the whole conversation, which
+     during streaming would otherwise run on every 33ms pump batch.
+
+     Not a fix for this component's real cost, and not measured: `renderMarkdown` (marked, now with
+     highlight.js, then DOMPurify) below still runs over EVERY transcript message on EVERY render,
+     and is pre-existing, larger, and nobody has profiled it.
+
+     Declared here, above `onScroll` (moved for R2): the pill's `updatePill` closure, defined
+     below alongside `onScroll`, reads `timeline` too, and both need the same binding in scope. */
+  const timeline = useMemo(
+    () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
+    [state, expanded, detailed],
+  );
+
   const followingRef = useRef(true);
   const lastScrollTopRef = useRef(0);
   const steerUntilRef = useRef(0);
@@ -316,6 +381,28 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
       // the stale value, was not seen as a scroll up, and the next delta snapped the view back.
       lastScrollTopRef.current = list.scrollTop;
     }
+  };
+  /** Timeline length when following last stopped; `null` while following (R2). */
+  const unseenFromRef = useRef<number | null>(null);
+  const [pill, setPill] = useState<string | null>(null);
+  const updatePill = () => {
+    const list = listRef.current;
+    if (list === null) return;
+    const following = followingRef.current;
+    if (following) unseenFromRef.current = null;
+    else if (unseenFromRef.current === null) unseenFromRef.current = timeline.length;
+    const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
+    const shown = pillShown(pill !== null, following, distance);
+    const from = unseenFromRef.current ?? timeline.length;
+    const fresh = timeline.slice(from);
+    const label = shown ? pillLabel(fresh.length, fresh.some((item) => item.kind === "permission")) : null;
+    if (label !== pill) setPill(label);
+  };
+  const jumpToEnd = () => {
+    const list = listRef.current;
+    if (list === null) return;
+    noteUserScroll(list, "down");
+    list.scrollTop = list.scrollHeight;
   };
   /** Run before each follow decision, and when a gesture's window runs out: a provisional stop whose
    *  gesture is over, with the list no higher than where the gesture found it, is taken back.
@@ -392,7 +479,9 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
       }
     }
     lastScrollTopRef.current = list.scrollTop;
+    updatePill();
   };
+  onScrollRef.current = onScroll;
 
   // The intent signals, attached once to the list itself. Passive: none of them cancels anything.
   useLayoutEffect(() => {
@@ -511,6 +600,7 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
     settleProvisionalStop(list);
     observeChildren(list);
     if (followingRef.current) follow(list);
+    updatePill();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
@@ -533,91 +623,114 @@ export function MessageList({ state, sessionEnded, expanded, cursor, focused = t
      time.) */
   const awaitingPermission = new Set(state.pendingPermissions.map((p) => p.toolUseId).filter(isUsableLink));
 
-  /* One ordered sequence, not three lists one after another.
-
-     Until 2026-09-15 this component mapped `transcript`, then `toolCalls`, then
-     `pendingPermissions`, so every tool card rendered below every assistant message however the
-     turn really went. `buildTimeline` merges them on `seq`, an ordering key Rust's projection
-     assigns and its snapshot ships -- so a reload or a `UiDelivery::Resync`, which rebuild this
-     whole state from that snapshot, produce the same order as the live path did.
-
-     Memoised on `state`, which the reducer replaces wholesale on every folded event -- so this
-     recomputes exactly as often as the conversation changes, and not on a re-render caused by
-     anything else (a `sessionEnded` flip, a parent re-render while the user types). The merge
-     allocates four mapped arrays, a Map and a Set and then sorts the whole conversation, which
-     during streaming would otherwise run on every 33ms pump batch.
-
-     Not a fix for this component's real cost, and not measured: `renderMarkdown` (marked, now with
-     highlight.js, then DOMPurify) below still runs over EVERY transcript message on EVERY render,
-     and is pre-existing, larger, and nobody has profiled it. */
-  const timeline = useMemo(() => buildTimeline(state), [state]);
-
   return (
-    <div className="message-list" data-focused={String(focused)} ref={listRef} onScroll={onScroll}>
-      {/* The top of the list, above the first conversation item and inside the scroll box with it:
-          it describes where everything below came from, so it belongs at the head of that document
-          rather than pinned over it. It is not a `TimelineItem` and holds no `seq` -- see
-          `HistoryNotice` for why it must never become a row. `null` for every fresh session, which
-          is most of them. */}
-      {state.history !== null && <HistoryNotice notice={state.history} />}
-      {timeline.map((item, index) => {
-        const current = index === cursor;
-        switch (item.kind) {
-          case "prompt":
-            // Plain text, never markdown: this is what the user typed, and parsing it would render
-            // their literal backticks and asterisks as formatting they did not ask for.
-            return (
-              <Row key={item.key} kind="prompt" sign="›" current={current} navStop="row">
-                {item.text}
-              </Row>
-            );
-          case "message":
-            return (
-              <Row key={item.key} kind="assistant" sign="" current={current} navStop="row">
-                {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
-                    that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
-                    -- one function so no caller can run half of it. */}
-                <div dangerouslySetInnerHTML={{ __html: renderMarkdown(item.text) }} />
-              </Row>
-            );
-          case "tool":
-            return (
-              <Row key={item.key} kind="tool" sign={toolSign(item.call)} current={current} navStop="row">
-                <div data-awaiting-permission={awaitingPermission.has(item.call.toolUseId) ? "true" : undefined}>
-                  {renderToolCall(item.call, expanded[item.key] === true)}
-                  {awaitingPermission.has(item.call.toolUseId) && (
-                    /* "below" is literal for the call that owns the card: `buildTimeline` emits a
-                       linked card immediately after it. The one case where it is not is two tool
-                       calls sharing one `toolUseId` — the card is consumed by the first, so the
-                       second renders this line with the card above it rather than below. That
-                       should not happen, `buildTimeline` refuses to amplify it into a duplicate
-                       card, and it is not worth a second lookup here; it is noted so the sentence
-                       is not read as a guarantee. */
-                    <div className="tool-awaiting-permission">Waiting for your decision below.</div>
-                  )}
-                </div>
-              </Row>
-            );
-          case "permission":
-            return (
-              <Row key={item.key} kind="permission" sign="!" current={current} navStop="row">
-                <PermissionCard request={item.request} sessionEnded={sessionEnded} onAnswer={onAnswerPermission} />
-              </Row>
-            );
-          default: {
-            // Exhaustiveness guard. Without it, a fifth `TimelineItem` kind gaining no case here
-            // renders as nothing: this `.map()` callback has no pinned return type, a missing case
-            // falls through to `undefined`, `undefined` is a valid `ReactNode`, and `tsc -b` stays
-            // clean -- exactly how the "prompt" case's own placeholder was allowed to hide for a
-            // whole task (see the git history of this switch). Assigning `item` to `never` turns
-            // that same mistake into a compile error instead of an invisible blank row.
-            const _exhaustive: never = item;
-            return _exhaustive;
+    <>
+      <div
+        className="message-list"
+        data-focused={String(focused)}
+        ref={listRef}
+        onScroll={onScroll}
+        // N2: a click on a path -- the tool registry's own `.path-link` spans, or an inline code
+        // span in an assistant reply that happens to parse as one. Never a fenced code BLOCK
+        // (`pre code`): that is a real snippet, not a path, and HINT's own `y` already owns copying
+        // it.
+        onClick={(event) => {
+          if (onOpenPath === undefined) return;
+          const target = (event.target as HTMLElement).closest<HTMLElement>(".path-link, .row-assistant code:not(pre code)");
+          if (target === null) return;
+          const ref = parsePath(target.dataset.path ?? target.textContent ?? "");
+          if (ref !== null) onOpenPath(ref);
+        }}
+      >
+        {/* The top of the list, above the first conversation item and inside the scroll box with it:
+            it describes where everything below came from, so it belongs at the head of that document
+            rather than pinned over it. It is not a `TimelineItem` and holds no `seq` -- see
+            `HistoryNotice` for why it must never become a row. `null` for every fresh session, which
+            is most of them. */}
+        {state.history !== null && <HistoryNotice notice={state.history} />}
+        {timeline.map((item, index) => {
+          const current = index === cursor;
+          switch (item.kind) {
+            case "prompt": {
+              // Plain text, never markdown: this is what the user typed, and parsing it would render
+              // their literal backticks and asterisks as formatting they did not ask for.
+              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              return (
+                <Row key={item.key} kind="prompt" sign="›" current={current} className={yanked} navStop="row">
+                  {item.text}
+                </Row>
+              );
+            }
+            case "message": {
+              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              return (
+                <Row key={item.key} kind="assistant" sign="" current={current} className={yanked} navStop="row">
+                  {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
+                      that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
+                      -- one function so no caller can run half of it. */}
+                  <div dangerouslySetInnerHTML={{ __html: renderMarkdown(item.text) }} />
+                </Row>
+              );
+            }
+            case "tool": {
+              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              return (
+                <Row key={item.key} kind="tool" sign={toolSign(item.call)} current={current} className={yanked} navStop="row">
+                  <div data-awaiting-permission={awaitingPermission.has(item.call.toolUseId) ? "true" : undefined}>
+                    {/* P4: a call a card is waiting on no longer repeats its own invocation below the
+                        card too -- the gated line above says "waiting for approval" already, so the
+                        two would otherwise say the same thing twice, once as an offer and once as if
+                        it had already run. */}
+                    {renderToolCall(item.call, expanded[item.key] === true, {
+                      gated: awaitingPermission.has(item.call.toolUseId),
+                      detailed,
+                      expanded: expanded[item.key] === true,
+                    })}
+                  </div>
+                </Row>
+              );
+            }
+            case "permission": {
+              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              return (
+                <Row key={item.key} kind="permission" sign="!" current={current} className={yanked} navStop="row">
+                  <PermissionCard
+                    request={item.request}
+                    sessionEnded={sessionEnded}
+                    ruleOffer={ruleOffers?.[item.request.permissionId] ?? null}
+                    onAnswer={onAnswerPermission}
+                  />
+                </Row>
+              );
+            }
+            case "run": {
+              // P2: a run replaces its calls with one line, `Read ×3 · Bash ×2`; `Enter`
+              // (`toggle-expand`, keyed on this row's OWN key) puts them back.
+              const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              return (
+                <Row key={item.key} kind="tool-run" sign="✓" current={current} className={yanked} navStop="row">
+                  <div className="tool-card tool-card-run">
+                    {runSummary(item.calls)} <span aria-label="collapsed">▸</span>
+                  </div>
+                </Row>
+              );
+            }
+            default: {
+              // Exhaustiveness guard. Without it, a fifth `TimelineItem` kind gaining no case here
+              // renders as nothing: this `.map()` callback has no pinned return type, a missing case
+              // falls through to `undefined`, `undefined` is a valid `ReactNode`, and `tsc -b` stays
+              // clean -- exactly how the "prompt" case's own placeholder was allowed to hide for a
+              // whole task (see the git history of this switch). Assigning `item` to `never` turns
+              // that same mistake into a compile error instead of an invisible blank row.
+              const _exhaustive: never = item;
+              return _exhaustive;
+            }
           }
-        }
-      })}
-      {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
-          to get, and following is a snap to `scrollHeight` now (the GUI pass, 2026-09-24). */}
-    </div>
+        })}
+        {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
+            to get, and following is a snap to `scrollHeight` now (the GUI pass, 2026-09-24). */}
+      </div>
+      {pill !== null && <NewPill label={pill} onJump={jumpToEnd} />}
+    </>
   );
 }

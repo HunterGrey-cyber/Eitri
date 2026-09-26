@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { choosable, chooserRows, rowText } from "./chooser";
 import type { ChooserEnvelope } from "./types";
+import { formatWhen } from "./components/SessionRow";
 
 const ENVELOPE: ChooserEnvelope = {
   launch: false,
@@ -20,16 +21,24 @@ describe("the chooser's rows", () => {
     expect(chooserRows(ENVELOPE, "").map(rowText)).toEqual([
       "1 fix-parser ⚑2",
       "2 legacy one · not resumable",
-      "docs",
-      "fix the picker · open in another window",
-      "claude cccc3333",
+      `docs · last opened ${formatWhen("2")}`,
+      `fix the picker · last opened ${formatWhen("2")} · open in another window`,
+      `claude cccc3333 · last opened ${formatWhen("2")}`,
     ]);
   });
   it("a record open in another window cannot be chosen; everything else can", () => {
     expect(chooserRows(ENVELOPE, "").map(choosable)).toEqual([true, true, true, false, true]);
   });
   it("/ filters by the text a row shows, case-insensitively", () => {
-    expect(chooserRows(ENVELOPE, "PICK").map(rowText)).toEqual(["fix the picker · open in another window"]);
-    expect(chooserRows(ENVELOPE, "fix").map(rowText)).toEqual(["1 fix-parser ⚑2", "fix the picker · open in another window"]);
+    expect(chooserRows(ENVELOPE, "PICK").map(rowText)).toEqual([`fix the picker · last opened ${formatWhen("2")} · open in another window`]);
+    expect(chooserRows(ENVELOPE, "fix").map(rowText)).toEqual([
+      "1 fix-parser ⚑2",
+      `fix the picker · last opened ${formatWhen("2")} · open in another window`,
+    ]);
+  });
+  /** Defect 5 (ruling 37): a record row says when it was last opened. */
+  it("says when each record was last opened", () => {
+    expect(rowText({ kind: "record", record: ENVELOPE.records[0] })).toBe(`docs · last opened ${formatWhen("2")}`);
+    expect(rowText({ kind: "record", record: ENVELOPE.records[1] })).toBe(`fix the picker · last opened ${formatWhen("2")} · open in another window`);
   });
 });

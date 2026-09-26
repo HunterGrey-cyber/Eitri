@@ -1,8 +1,21 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { countCodePoints, formatResultContent, lookupTool, renderToolCall, RESULT_HEAD_CHARS, RESULT_TAIL_CHARS, truncateResult } from "./toolRegistry";
+import { renderToStaticMarkup } from "react-dom/server";
+import type { ReactNode } from "react";
+import {
+  countCodePoints,
+  DETAILED_HEAD_CHARS,
+  DETAILED_TAIL_CHARS,
+  formatResultContent,
+  lookupTool,
+  renderToolCall,
+  RESULT_HEAD_CHARS,
+  RESULT_TAIL_CHARS,
+  truncateResult,
+} from "./toolRegistry";
 import type { ToolCallRecord } from "./types";
+import policyRs from "../../../agent/src/permission_policy.rs?raw";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered. Without
 // this, the second render in a file leaves the first one's DOM in place and `getByText` throws on
@@ -223,5 +236,61 @@ describe("a tool named after an Object.prototype member", () => {
       expect(container.textContent).toContain(name);
       cleanup();
     }
+  });
+});
+
+/* Task 13: P2 (every real tool is named, ToolSearch is one muted line, a finished run collapses),
+   P3 (an edit's diff, folded to 6 lines anywhere except the detailed view or an expanded row), P4
+   (a gated row says it waits rather than repeating the call), R3 (the detailed view's wider cuts). */
+describe("P2, P3, P4, R3 in the registry", () => {
+  const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
+
+  it("names every tool Claude Code 2.1.27x offers (read from permission_policy.rs)", () => {
+    const block = policyRs.match(/TOOLS_OFFERED_BY_CLI_2_1_272: &\[&str\] = &\[([\s\S]*?)\];/)![1];
+    const offered = Array.from(block.matchAll(/"([^"]+)"/g)).map((m) => m[1]);
+    expect(offered.length).toBeGreaterThan(20);
+    for (const name of offered) expect(lookupTool(name), name).toBeDefined();
+  });
+
+  it("draws ToolSearch as one muted line with no result row", () => {
+    const out = html(renderToolCall({ seq: 1, toolUseId: "t", name: "ToolSearch", input: { query: "select:Read" }, result: { content: "schema", isError: false } }));
+    expect(out).toContain("tool-card-muted");
+    expect(out).toContain("select:Read");
+    expect(out).not.toContain("tool-result");
+  });
+
+  it("never says Unrecognized, and folds a result behind ▸", () => {
+    const out = html(renderToolCall({ seq: 1, toolUseId: "t", name: "mcp__x__y", input: { name: "z" }, result: { content: "r", isError: false } }, false));
+    expect(out).not.toContain("Unrecognized");
+    expect(out).toContain("mcp__x__y");
+    expect(out).toContain('aria-label="result folded"');
+    expect(out).toContain("▸");
+    expect(out).not.toContain("Enter to expand");
+  });
+
+  it("shows an edit's diff folded to 6 lines with its counts, in any mode (P3)", () => {
+    const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
+    const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
+    const input = { file_path: "/p/a.rs", old_string, new_string };
+    const folded = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false }));
+    expect(folded).toContain("/p/a.rs");
+    expect(folded).toContain("+10 −10");
+    expect((folded.match(/class="diff-line/g) ?? []).length).toBe(6);
+    const full = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, true, { expanded: true }));
+    expect((full.match(/class="diff-line/g) ?? []).length).toBe(20);
+  });
+
+  it("says a gated call waits for approval instead of repeating it (P4)", () => {
+    const out = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Bash", input: { command: "rm -rf build" }, result: null }, true, { gated: true }));
+    expect(out).toContain("waiting for approval");
+    expect(out).not.toContain("rm -rf build");
+  });
+
+  it("raises the cut to 20k / 5k in the detailed view (R3)", () => {
+    const long = "h".repeat(30000) + "t".repeat(6000);
+    expect(truncateResult(long).shown.length).toBeLessThan(3000);
+    const detailed = truncateResult(long, DETAILED_HEAD_CHARS, DETAILED_TAIL_CHARS);
+    expect(detailed.shown.startsWith("h".repeat(20000))).toBe(true);
+    expect(detailed.shown.endsWith("t".repeat(5000))).toBe(true);
   });
 });

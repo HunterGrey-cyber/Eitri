@@ -23,6 +23,11 @@
 
 export const STOP_ATTR = "data-nav-stop";
 
+/** The label alphabet `neovibe_core::hint` uses for the window-wide `f` HINT (no `f` itself, since
+ *  that key starts the HINT). N2's `gf` path picker (`components/PathPick.tsx`) reuses it for its
+ *  own letter-per-path footer list -- the panel has never needed its own copy of this until now. */
+export const HINT_ALPHABET = "asdjklghweruio";
+
 const CONTROL_SELECTOR =
   'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [role="radio"]:not([aria-disabled="true"])';
 
@@ -131,6 +136,18 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
     if (item.kind !== "permission") break;
   }
   return null;
+}
+
+/** P1 (spec, ruling 26): the card `a`/`d` answer from `cursor` -- the cursor's own
+ *  (`permissionTarget`, unchanged), or, when the conversation holds exactly one card, that one from
+ *  ANY row. Two or more cards keep the cursor rule: with more than one waiting, guessing which one a
+ *  press with the cursor elsewhere meant is exactly the kind of surprise a keyboard shortcut must
+ *  not risk (the same reasoning `permissionTarget`'s own doc comment gives). */
+export function answerTarget(items: AnswerableItem[], cursor: number): number | null {
+  const own = permissionTarget(items, cursor);
+  if (own !== null) return own;
+  const cards = items.flatMap((item, index) => (item.kind === "permission" ? [index] : []));
+  return cards.length === 1 ? cards[0] : null;
 }
 
 /** One panel target of the global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md

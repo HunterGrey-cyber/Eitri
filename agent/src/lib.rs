@@ -33,6 +33,7 @@ pub mod hook_protocol;
 pub mod ingestion;
 pub mod lease;
 pub mod permission_policy;
+pub mod permission_rules;
 pub mod persistence;
 #[doc(hidden)]
 pub mod process_probe;
@@ -47,7 +48,8 @@ pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 pub use event::{AgentEvent, PermissionSource};
 pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
-pub use permission_policy::{classify_permission_request, Classification, PermissionVerdict};
+pub use permission_policy::{classify_permission_request, classify_with_rules, Classification, PermissionVerdict};
+pub use permission_rules::{PrefixRule, PrefixRules};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
 pub use process::{disallowed_tools_for, AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
 pub use session::AgentSession;

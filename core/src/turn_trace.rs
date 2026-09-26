@@ -72,13 +72,21 @@ pub struct TurnTrace {
     completed: Option<Duration>,
     /// Set once the line has been printed, so a second terminal event cannot print a second line.
     emitted: bool,
+    /// The first text arrived while this turn's tab was not the one on screen (phase 3 ruling 39):
+    /// no paint will be reported, so the trace completes without one.
+    background: bool,
 }
 
 impl TurnTrace {
     /// Starts a trace, or returns `None` when tracing is off -- so every call site is a cheap
     /// `Option` check rather than a flag test scattered through the panel.
     pub fn start() -> Option<Self> {
-        enabled().then(|| Self {
+        enabled().then(Self::started_now)
+    }
+
+    /// A trace regardless of `NEOVIBE_AGENT_TRACE`, for this crate's tests.
+    pub(crate) fn started_now() -> Self {
+        Self {
             submitted_at: Instant::now(),
             turn_id: None,
             first_provider_event: None,
@@ -87,7 +95,18 @@ impl TurnTrace {
             first_text_dispatched: None,
             completed: None,
             emitted: false,
-        })
+            background: false,
+        }
+    }
+
+    /// The turn's first text reached this side while its tab was not the one on screen (phase 3
+    /// ruling 39): nothing will paint it, so the trace completes without a paint mark.
+    pub fn mark_background(&mut self) {
+        self.background = true;
+    }
+
+    pub fn is_emitted(&self) -> bool {
+        self.emitted
     }
 
     fn since_submit(&self) -> Duration {
@@ -159,9 +178,11 @@ impl TurnTrace {
 
     /// True once every mark that is still coming has arrived. A turn whose text was never painted
     /// (an interrupt before any text, a session that died first) is finished without it, so this
-    /// also reports true when there is nothing left to wait for.
+    /// also reports true when there is nothing left to wait for. Nor is a paint coming for a turn
+    /// whose text arrived while its tab was in the background (`mark_background`).
     pub fn is_complete(&self) -> bool {
-        self.is_finished() && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none())
+        self.is_finished()
+            && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none() || self.background)
     }
 
     /// Prints the line. Idempotent: the caller emits on completion and again on a deadline, and only
@@ -171,19 +192,29 @@ impl TurnTrace {
             return;
         }
         self.emitted = true;
+        eprintln!("{}", self.line());
+    }
+
+    /// The line `emit` prints. A background turn with no paint reads `first_paint_frame=bg`.
+    pub fn line(&self) -> String {
         let mark = |d: Option<Duration>| match d {
             Some(d) => format!("{:.0}ms", ms(d)),
             None => "--".to_string(),
         };
-        eprintln!(
+        let paint = if self.background && self.first_paint_frame.is_none() {
+            "bg".to_string()
+        } else {
+            mark(self.first_paint_frame)
+        };
+        format!(
             "[turn-trace] turn={} submitted=0ms first_provider_event={} first_presentation_delta={} \
              first_paint_frame={} completed={}",
             self.turn_id.as_deref().unwrap_or("?"),
             mark(self.first_provider_event),
             mark(self.first_presentation_delta),
-            mark(self.first_paint_frame),
+            paint,
             mark(self.completed),
-        );
+        )
     }
 }
 
@@ -204,6 +235,7 @@ mod tests {
             first_text_dispatched: None,
             completed: None,
             emitted: false,
+            background: false,
         }
     }
 
@@ -318,6 +350,28 @@ mod tests {
         trace.mark_first_text_dispatched();
         trace.observe(&[AgentDomainEvent::SessionUnavailable { reason: "gone".into() }]);
         assert!(trace.is_finished());
+    }
+
+    #[test]
+    fn a_background_turn_is_complete_without_a_paint_and_says_so() {
+        let mut trace = trace();
+        trace.observe(&[AgentDomainEvent::TurnStarted { turn_id: "t1".into() }, text("hi")]);
+        trace.mark_background();
+        trace.observe(&[AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        }]);
+        assert!(
+            trace.is_complete(),
+            "no paint is coming for a tab that was not on screen"
+        );
+        assert!(trace.line().contains("first_paint_frame=bg"), "{}", trace.line());
+        assert!(!trace.is_emitted());
+        trace.emit();
+        assert!(trace.is_emitted());
     }
 
     #[test]

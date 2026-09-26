@@ -11,7 +11,10 @@ beforeAll(() => {
 
 const ENVELOPE: ChooserEnvelope = {
   launch: false,
-  open: [{ tab: 1, label: "1 fix-parser", marker: null, pending: 0, resumable: true }],
+  open: [
+    { tab: 1, label: "1 fix-parser", marker: null, pending: 0, resumable: true },
+    { tab: 2, label: "2 legacy", marker: null, pending: 0, resumable: true },
+  ],
   records: [
     { providerSessionId: "held-0000", name: null, title: "held one", createdAt: "1", updatedAt: "2", heldElsewhere: true },
     { providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false },
@@ -19,7 +22,7 @@ const ENVELOPE: ChooserEnvelope = {
 };
 
 function renderChooser(envelope = ENVELOPE) {
-  const props = { envelope, onSwitch: vi.fn(), onResume: vi.fn(), onCloseTab: vi.fn(), onLeave: vi.fn() };
+  const props = { envelope, active: null, onSwitch: vi.fn(), onResume: vi.fn(), onCloseTab: vi.fn(), onLeave: vi.fn() };
   const view = render(<Chooser {...props} />);
   const root = view.container.querySelector<HTMLElement>(".chooser")!;
   return { props, root, ...view };
@@ -34,12 +37,20 @@ describe("Chooser", () => {
   });
   it("a record held elsewhere cannot be chosen, and the next one can", () => {
     const { root, props } = renderChooser();
+    // Row 0 and 1 are the two open tabs; row 2 is "held one".
+    fireEvent.keyDown(root, { key: "j" });
     fireEvent.keyDown(root, { key: "j" });
     fireEvent.keyDown(root, { key: "Enter" });
     expect(props.onResume).not.toHaveBeenCalled();
     fireEvent.keyDown(root, { key: "j" });
     fireEvent.keyDown(root, { key: "Enter" });
     expect(props.onResume).toHaveBeenCalledWith("free-0000");
+  });
+  it("starts on the active tab's row", () => {
+    const { container } = render(
+      <Chooser envelope={ENVELOPE} active={2} onSwitch={vi.fn()} onResume={vi.fn()} onCloseTab={vi.fn()} onLeave={vi.fn()} />,
+    );
+    expect(container.querySelector(".chooser-row.current")!.textContent).toMatch(/^2 /);
   });
   it("x asks to close the open tab under the cursor", () => {
     const { root, props } = renderChooser();

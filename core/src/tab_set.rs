@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::sync::mpsc;
 
-use agent::UiDelivery;
+use agent::{AgentDomainEvent, UiDelivery};
 
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind};
 use crate::agent_bridge::{
@@ -70,6 +70,28 @@ pub struct PendingHandoff {
     pub dropped_rx: mpsc::Receiver<()>,
 }
 
+/// One message typed while a turn ran (D4). `wire` is composed against the editor context of the
+/// moment it was queued (spec §4.1); `text` is what was typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    pub text: String,
+    pub wire: String,
+    pub queued_at_ms: u64,
+}
+
+/// What a flush sent, and how the backend answered (ruling 2).
+pub struct Flush {
+    pub typed: String,
+    pub outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
+}
+
+pub enum SendNow {
+    /// A turn was running: it was asked to stop; the queue goes out when it ends (ruling 8).
+    Interrupting(Result<Vec<agent::AgentDomainEvent>, BackendError>),
+    /// Idle: flushed at once (`None` when there was nothing to send).
+    Flushed(Option<Flush>),
+}
+
 /// Not boxed: a window holds a handful of tabs, `Live` is the state a tab spends its life in, and
 /// the plan's interface (Task 6) matches on `Live(AgentBackend)` directly.
 #[allow(clippy::large_enum_variant)]
@@ -105,6 +127,27 @@ pub struct Tab {
     /// Held here, not only in the WebView, so a panel reload cannot lose it (see the doc this field
     /// had on `AgentPanelState` before session tabs; it moved per tab with ruling 13).
     pub last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
+    /// Messages typed while a turn ran, oldest first (D4, ruling 1). Flushed as one turn when the
+    /// turn ends (ruling 3), never while a card waits (ruling 4).
+    pub queue: Vec<Queued>,
+    /// Why the last flush was refused (spec §4.4). Cleared by a flush that goes out, a take-back or
+    /// a reset.
+    pub queue_error: Option<String>,
+    /// The panel's composer text, mirrored here so a switch or a reload cannot lose it (ruling 6).
+    pub draft: String,
+    /// Permission id -> the rule the card offers (D7, ruling 16): only for a card a rule would answer.
+    pub rule_offers: std::collections::BTreeMap<String, agent::PrefixRule>,
+    /// The scratch edit of the draft in nvim, when one is open (set by the shell's round trip).
+    pub editing_draft: Option<u64>,
+    /// Whether a turn is running in what the pump has DELIVERED (a `TurnStarted` without its
+    /// `TurnCompleted`), so it reports a turn's end exactly once (ruling 3a). Read off the event
+    /// stream rather than re-read from `projection()` after the delivery: on the sidecar path the
+    /// ingestion thread folds into the projection concurrently, so a re-read can already include a
+    /// completion the delivery did not carry, and the end was then never reported.
+    was_running: bool,
+    /// The pending permission ids `rule_offers` was last computed for, sorted, so the classifier
+    /// (which canonicalizes `Bash` arguments) runs once per change rather than every tick.
+    rule_offers_seen: Vec<String>,
 }
 
 impl Tab {
@@ -122,6 +165,13 @@ impl Tab {
             reported_start_failure: false,
             pending_handoff: None,
             last_handoff: None,
+            queue: Vec::new(),
+            queue_error: None,
+            draft: String::new(),
+            rule_offers: std::collections::BTreeMap::new(),
+            editing_draft: None,
+            was_running: false,
+            rule_offers_seen: Vec::new(),
         }
     }
 
@@ -213,6 +263,11 @@ pub struct PumpOutput {
     pub active_payload: Option<String>,
     /// The active tab's turn trace saw its first text in this batch.
     pub first_text: bool,
+    /// Tabs whose turn went from running to not running in this tick: the caller flushes their
+    /// queues (ruling 3a).
+    pub turn_ended: Vec<TabId>,
+    /// Tabs whose `rule_offers` changed in this tick: the caller sends them to the panel.
+    pub offers_changed: Vec<TabId>,
 }
 
 pub enum StartCollected {
@@ -249,6 +304,8 @@ pub struct TabSet {
     /// (`attention`) never goes down when a tab closes: [`crate::attention::react`] reads only its
     /// growth.
     removed_arrived: u64,
+    /// The project's D7 prefix rules, window-level: every tab's pump applies them (ruling 17).
+    rules: agent::PrefixRules,
 }
 
 impl TabSet {
@@ -262,6 +319,7 @@ impl TabSet {
             kind,
             default_mode,
             removed_arrived: 0,
+            rules: agent::PrefixRules::default(),
         };
         set.open();
         set.last_active = None;
@@ -292,6 +350,16 @@ impl TabSet {
     }
     pub fn default_mode(&self) -> SessionModeChoice {
         self.default_mode
+    }
+
+    /// Ruling 17: the rules apply to every tab from the next pump; a card already on screen is not
+    /// answered by a rule added after it arrived.
+    pub fn set_rules(&mut self, rules: agent::PrefixRules) {
+        self.rules = rules;
+    }
+
+    pub fn rules(&self) -> &agent::PrefixRules {
+        &self.rules
     }
 
     /// `prefix c`: a new empty tab at the lowest free number, selected.
@@ -388,6 +456,16 @@ impl TabSet {
             TabStateWire::Ended | TabStateWire::Failed => {}
             _ => return Err("only an ended or failed tab starts over".to_string()),
         }
+        // Ruling 9: the queue and the unsent draft come back as the draft, oldest first.
+        let mut parts: Vec<String> = std::mem::take(&mut tab.queue).into_iter().map(|q| q.text).collect();
+        if !tab.draft.trim().is_empty() {
+            parts.push(std::mem::take(&mut tab.draft));
+        }
+        tab.draft = parts.join("\n\n");
+        tab.queue_error = None;
+        tab.rule_offers.clear();
+        tab.rule_offers_seen.clear();
+        tab.was_running = false;
         let old = std::mem::replace(&mut tab.backend, TabBackend::NotStarted);
         tab.title = None;
         tab.attention.restart();
@@ -451,24 +529,51 @@ impl TabSet {
         let mut out = PumpOutput {
             active_payload: None,
             first_text: false,
+            turn_ended: Vec::new(),
+            offers_changed: Vec::new(),
         };
+        let rules = &self.rules;
         for tab in &mut self.tabs {
             let is_active = tab.id == active;
             let on_screen = panel_mapped && is_active;
             let TabBackend::Live(backend) = &mut tab.backend else {
                 // No backend holds no card: the backstop `agent_panel` had for `session.is_none()`.
                 tab.attention.retain_pending(|_| false);
+                tab.was_running = false;
                 continue;
             };
             let from_revision = backend.projection().last_revision;
-            match backend.take_ui_delivery(project_root) {
+            let mut turn_ended = false;
+            match backend.take_ui_delivery_with_rules(project_root, rules) {
                 UiDelivery::Nothing => {}
                 UiDelivery::Events(events) => {
-                    tab.attention.observe(&events, on_screen);
-                    if is_active {
-                        if let Some(trace) = tab.turn_trace.as_mut() {
-                            out.first_text = trace.observe(&events);
+                    for event in &events {
+                        match event {
+                            AgentDomainEvent::TurnStarted { .. } => tab.was_running = true,
+                            // An interrupt's end and the legacy backend's synthesized end are
+                            // `TurnCompleted`s too. Reported whatever `was_running` says: a legacy
+                            // `TurnStarted` is returned by `send_turn` and never pumped.
+                            AgentDomainEvent::TurnCompleted { .. } => {
+                                tab.was_running = false;
+                                turn_ended = true;
+                            }
+                            // The session ended: its queue waits for `r` (ruling 9), not a flush.
+                            AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
+                                tab.was_running = false
+                            }
+                            _ => {}
                         }
+                    }
+                    tab.attention.observe(&events, on_screen);
+                    if let Some(trace) = tab.turn_trace.as_mut() {
+                        let first_text = trace.observe(&events);
+                        if is_active {
+                            out.first_text |= first_text;
+                        } else if first_text {
+                            trace.mark_background();
+                        }
+                    }
+                    if is_active {
                         let through_revision = backend.projection().last_revision;
                         out.active_payload = Some(serialize_events_for_js(
                             tab.id,
@@ -481,6 +586,10 @@ impl TabSet {
                     }
                 }
                 UiDelivery::Resync => {
+                    // The events are gone; the snapshot is what the panel is shown now.
+                    let running = backend.projection().active_turn_id.is_some();
+                    turn_ended = tab.was_running && !running;
+                    tab.was_running = running;
                     let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
                     tab.attention.resync(pending);
                     if is_active {
@@ -490,9 +599,25 @@ impl TabSet {
                     }
                 }
             }
+            // A background trace has no dispatch to wait for: printed here when it finishes.
+            if !is_active {
+                if let Some(trace) = tab.turn_trace.as_mut() {
+                    if trace.is_complete() {
+                        trace.emit();
+                    }
+                }
+            }
             let still: std::collections::HashSet<String> =
                 backend.projection().pending_permissions.keys().cloned().collect();
             tab.attention.retain_pending(|id| still.contains(id));
+            if refresh_offers(tab, project_root) {
+                out.offers_changed.push(tab.id);
+            }
+            // `turn_running()` guards a turn that has already started again (a send that raced the
+            // completion): the queue waits for that one's end instead.
+            if turn_ended && !tab.turn_running() {
+                out.turn_ended.push(tab.id);
+            }
         }
         out
     }
@@ -528,6 +653,7 @@ impl TabSet {
                         tab.name = pending.resumed_name;
                     }
                     tab.backend = TabBackend::Live(backend);
+                    tab.was_running = false;
                     tab.attention.restart();
                     tab.last_handoff = None;
                     tab.reported_start_failure = false;
@@ -558,15 +684,33 @@ impl TabSet {
     pub fn active_state_payloads(&mut self) -> Vec<String> {
         let tab = self.active_tab_mut();
         tab.stale = false;
+        let mut payloads = Vec::new();
         match &tab.backend {
-            TabBackend::Live(backend) => vec![serialize_snapshot_for_js(tab.id, &SnapshotView::of(backend))],
-            TabBackend::NotStarted => tab
-                .last_handoff
-                .iter()
-                .map(|command| serialize_handoff_for_js(tab.id, command))
-                .collect(),
-            _ => Vec::new(),
+            TabBackend::Live(backend) => payloads.push(serialize_snapshot_for_js(tab.id, &SnapshotView::of(backend))),
+            TabBackend::NotStarted => payloads.extend(
+                tab.last_handoff
+                    .iter()
+                    .map(|command| serialize_handoff_for_js(tab.id, command)),
+            ),
+            _ => {}
         }
+        payloads.push(crate::agent_bridge::serialize_queue_for_js(
+            tab.id,
+            &tab.queue,
+            tab.queue_error.as_deref(),
+        ));
+        payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.draft));
+        if tab.live().is_some() {
+            payloads.push(crate::agent_bridge::serialize_rule_offers_for_js(
+                tab.id,
+                &tab.rule_offers,
+            ));
+        }
+        payloads.push(crate::agent_bridge::serialize_scratch_for_js(
+            tab.id,
+            tab.editing_draft.is_some(),
+        ));
+        payloads
     }
 
     pub fn tabs_payload(&self) -> String {
@@ -622,10 +766,145 @@ impl TabSet {
             number: tab.number,
             label_name: tab.label_name(),
             turn_running: tab.turn_running(),
-            queued: 0,
+            queued: tab.queue.len(),
             legacy: self.kind == BackendKind::Legacy,
             has_backend: tab.live().is_some(),
         })
+    }
+
+    /// Ruling 5. `wire` is already composed with the editor context of this moment (ruling 1).
+    pub fn queue_message(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<usize, String> {
+        let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
+        if tab.pending_handoff.is_some() {
+            return Err("this tab is being handed off to a terminal".to_string());
+        }
+        match tab.wire_state() {
+            TabStateWire::Starting | TabStateWire::Live => {}
+            TabStateWire::NotStarted => return Err("nothing is running to queue behind; Enter sends".to_string()),
+            TabStateWire::Ended | TabStateWire::Failed => {
+                return Err("this tab's session has ended; press r to start over".to_string())
+            }
+        }
+        tab.queue.push(Queued {
+            text: text.to_string(),
+            wire,
+            queued_at_ms: now_ms,
+        });
+        Ok(tab.queue.len())
+    }
+
+    /// Ruling 3 and 4: one turn from the whole queue, only when the tab can take one.
+    pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
+        let tab = self.get_mut(id)?;
+        if tab.queue.is_empty() || tab.pending_handoff.is_some() || tab.turn_running() {
+            return None;
+        }
+        let backend = tab.live_mut()?;
+        if !backend.projection().pending_permissions.is_empty() {
+            return None;
+        }
+        let wire = tab
+            .queue
+            .iter()
+            .map(|q| q.wire.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let typed = tab
+            .queue
+            .iter()
+            .map(|q| q.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let trace = crate::turn_trace::TurnTrace::start();
+        let outcome = tab.live_mut().expect("checked above").send_turn(&wire, &typed);
+        match &outcome {
+            Ok(_) => {
+                tab.queue.clear();
+                tab.queue_error = None;
+                tab.turn_trace = trace;
+            }
+            Err(error) => tab.queue_error = Some(error.message.clone()),
+        }
+        tab.was_running = tab.turn_running();
+        Some(Flush { typed, outcome })
+    }
+
+    /// Ruling 8.
+    pub fn send_now(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<SendNow, String> {
+        if !text.trim().is_empty() {
+            self.queue_message(id, text, wire, now_ms)?;
+        }
+        let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
+        if tab.turn_running() {
+            let backend = tab.live_mut().expect("a running turn has a backend");
+            return Ok(SendNow::Interrupting(backend.interrupt()));
+        }
+        Ok(SendNow::Flushed(self.flush_queue(id)))
+    }
+
+    /// C5: `id` is the scratch request now holding `tab`'s draft.
+    ///
+    /// Known limit: an edit whose buffer is never wiped (nvim quit with `:qa!`, where `BufWipeout`
+    /// does not fire, or crashed) writes no marker, so `editing_draft` stays set and every later
+    /// `Ctrl+g` on this tab is refused for the rest of the window. Nothing times it out, and
+    /// `reset` leaves it alone on purpose: clearing it there would orphan an edit still open.
+    pub fn begin_scratch_edit(&mut self, tab: TabId, id: u64) -> Result<(), String> {
+        let t = self.get_mut(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
+        if t.editing_draft.is_some() {
+            return Err("this tab's draft is already open in nvim".to_string());
+        }
+        t.editing_draft = Some(id);
+        Ok(())
+    }
+
+    /// The tab edit `id` belonged to, and its new draft when one came back. A closed tab's edit
+    /// finds no owner and is dropped: the caller removes its scratch files on the same tick, so
+    /// text `:wq`'d for a tab closed while the edit was out is gone (the tab's draft went with it).
+    pub fn finish_scratch_edit(&mut self, id: u64, done: &crate::scratch::EditDone) -> Option<(TabId, Option<String>)> {
+        let tab = self.tabs.iter_mut().find(|t| t.editing_draft == Some(id))?;
+        tab.editing_draft = None;
+        let draft = match done {
+            crate::scratch::EditDone::Written(text) => {
+                tab.draft = text.clone();
+                Some(text.clone())
+            }
+            _ => None,
+        };
+        Some((tab.id, draft))
+    }
+
+    /// Ruling 7: the whole queue, oldest first, for the panel to merge into the box.
+    pub fn take_back_queue(&mut self, id: TabId) -> Vec<String> {
+        let Some(tab) = self.get_mut(id) else { return Vec::new() };
+        tab.queue_error = None;
+        std::mem::take(&mut tab.queue).into_iter().map(|q| q.text).collect()
+    }
+
+    /// Ruling 6: the panel's mirror. Never echoed.
+    pub fn set_draft(&mut self, id: TabId, text: &str) -> bool {
+        let Some(tab) = self.get_mut(id) else { return false };
+        tab.draft = text.to_string();
+        true
+    }
+
+    /// The queued texts of one tab, oldest first (the close path reads them before removing it).
+    pub fn queue_texts(&self, id: TabId) -> Vec<String> {
+        self.get(id)
+            .map(|t| t.queue.iter().map(|q| q.text.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every tab's queue, summed (the window-close prompt, ruling 10).
+    pub fn queued_count(&self) -> usize {
+        self.tabs.iter().map(|t| t.queue.len()).sum()
+    }
+
+    /// Ruling 10: the window is closing; every queued text, tab by tab, for the history.
+    pub fn take_every_queued_text(&mut self) -> Vec<String> {
+        self.tabs
+            .iter_mut()
+            .flat_map(|t| std::mem::take(&mut t.queue).into_iter().map(|q| q.text))
+            .collect()
     }
 
     /// The window is closing: every tab, for the close path to tear down.
@@ -636,6 +915,40 @@ impl TabSet {
     pub fn take_all(&mut self) -> Vec<Tab> {
         std::mem::take(&mut self.tabs)
     }
+}
+
+/// Recomputes `rule_offers` when the set of pending permission ids changed; `true` if the offers did.
+/// Only `projection()` is read, once, and released before anything else is touched.
+fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
+    let Some(backend) = tab.live() else {
+        let had = !tab.rule_offers.is_empty();
+        tab.rule_offers.clear();
+        tab.rule_offers_seen.clear();
+        return had;
+    };
+    let pending: Vec<(String, String, serde_json::Value)> = {
+        let projection = backend.projection();
+        let mut ids: Vec<_> = projection
+            .pending_permissions
+            .values()
+            .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
+            .collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids
+    };
+    let same = pending.len() == tab.rule_offers_seen.len()
+        && pending.iter().zip(&tab.rule_offers_seen).all(|(p, seen)| &p.0 == seen);
+    if same {
+        return false;
+    }
+    tab.rule_offers_seen = pending.iter().map(|p| p.0.clone()).collect();
+    let offers: std::collections::BTreeMap<String, agent::PrefixRule> = pending
+        .into_iter()
+        .filter_map(|(id, tool, input)| agent::permission_rules::offer(&tool, &input, project_root).map(|r| (id, r)))
+        .collect();
+    let changed = offers != tab.rule_offers;
+    tab.rule_offers = offers;
+    changed
 }
 
 #[cfg(test)]
@@ -1098,5 +1411,394 @@ mod tests {
         assert!(!facts.turn_running && !facts.has_backend && !facts.legacy);
         let legacy = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
         assert!(legacy.close_facts(legacy.active()).unwrap().legacy);
+    }
+
+    fn interruptible_live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
+        let provider = Arc::new(RecordingProvider::interruptible());
+        let conversation = AgentConversation::create(provider.clone(), dir, PermissionMode::Auto).unwrap();
+        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+    }
+
+    fn started(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnStarted { turn_id: id.into() }
+    }
+
+    fn completed(id: &str, outcome: agent::TurnOutcome) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: id.into(),
+            outcome,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        }
+    }
+
+    /// Pumps until the pump has DELIVERED the turn state `running` for `tab`, returning every tab
+    /// whose turn ended meanwhile. Waiting on `turn_running()` instead races the ingestion thread:
+    /// the projection can be ahead of what the pump has delivered.
+    fn pump_until_running(set: &mut TabSet, dir: &Path, tab: TabId, running: bool) -> Vec<TabId> {
+        let mut ended = Vec::new();
+        until("the turn state", || {
+            ended.extend(set.pump(dir, true).turn_ended);
+            set.get(tab).unwrap().was_running == running
+        });
+        ended
+    }
+
+    #[test]
+    fn queued_messages_go_out_as_one_turn_when_the_turn_completes() {
+        let dir = workspace("tabs-queue-flush");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+
+        assert_eq!(
+            set.queue_message(tab, "and the tests", "ctx A\n\nand the tests".into(), 1),
+            Ok(1)
+        );
+        assert_eq!(
+            set.queue_message(tab, "then commit", "ctx B\n\nthen commit".into(), 2),
+            Ok(2)
+        );
+        assert!(set.flush_queue(tab).is_none(), "a running turn holds the queue");
+        assert_eq!(set.queued_count(), 2);
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        let ended = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(ended, vec![tab], "the pump reports the end of the turn once");
+        let flush = set.flush_queue(tab).expect("the queue goes out");
+        assert!(flush.outcome.is_ok());
+        assert_eq!(flush.typed, "and the tests\n\nthen commit");
+        assert_eq!(
+            provider.turns(),
+            vec!["ctx A\n\nand the tests\n\nctx B\n\nthen commit".to_string()],
+            "one turn, each item with the context captured when it was queued"
+        );
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// Review focus 1 (spec §4.4): a flush the backend refuses stays in the queue with a line saying
+    /// why, and is not retried on every tick.
+    #[test]
+    fn a_refused_flush_keeps_the_queue_and_is_not_retried_every_tick() {
+        let dir = workspace("tabs-queue-refused");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        set.queue_message(tab, "later", "later".into(), 1).unwrap();
+        provider.refuse_sends(true);
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        pump_until_running(&mut set, &dir, tab, false);
+        let flush = set.flush_queue(tab).unwrap();
+        assert!(flush.outcome.is_err());
+        let t = set.get(tab).unwrap();
+        assert_eq!(t.queue.len(), 1, "never dropped");
+        assert!(t.queue_error.is_some(), "the line saying why");
+        for _ in 0..10 {
+            assert!(
+                set.pump(&dir, true).turn_ended.is_empty(),
+                "no new turn end, so no retry"
+            );
+        }
+        assert_eq!(provider.turns().len(), 1, "one attempt");
+        shut_down_all(&mut set);
+    }
+
+    /// §4.1: "A pending card holds the queue."
+    #[test]
+    fn the_queue_waits_while_a_card_is_pending() {
+        let dir = workspace("tabs-queue-card");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(write("perm-w"));
+        until("the card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        set.queue_message(tab, "after the card", "after the card".into(), 1)
+            .unwrap();
+        assert!(set.flush_queue(tab).is_none());
+        assert!(provider.turns().is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// D5 A: after an interrupt the queue still goes out, with what `Ctrl+Enter` added.
+    #[test]
+    fn send_now_interrupts_and_the_queue_goes_out_when_the_turn_ends() {
+        let dir = workspace("tabs-send-now");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = interruptible_live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        set.queue_message(tab, "one", "one".into(), 1).unwrap();
+        match set.send_now(tab, "two", "two".into(), 2).unwrap() {
+            SendNow::Interrupting(outcome) => assert!(outcome.is_ok()),
+            SendNow::Flushed(_) => panic!("a running turn is interrupted first"),
+        }
+        assert_eq!(provider.interrupts(), 1);
+        assert!(
+            provider.turns().is_empty(),
+            "nothing is sent before the interrupt lands"
+        );
+        provider.queue(completed("t1", agent::TurnOutcome::Interrupted));
+        assert_eq!(pump_until_running(&mut set, &dir, tab, false), vec![tab]);
+        set.flush_queue(tab).unwrap().outcome.unwrap();
+        assert_eq!(provider.turns(), vec!["one\n\ntwo".to_string()]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn send_now_on_an_idle_tab_sends_at_once() {
+        let dir = workspace("tabs-send-now-idle");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        match set.send_now(tab, "now", "ctx\n\nnow".into(), 1).unwrap() {
+            SendNow::Flushed(Some(flush)) => assert_eq!(flush.typed, "now"),
+            _ => panic!("idle: flushed at once"),
+        }
+        assert_eq!(provider.turns(), vec!["ctx\n\nnow".to_string()]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn take_back_returns_every_item_in_order_and_empties_the_queue() {
+        let dir = workspace("tabs-take-back");
+        let mut set = set();
+        let tab = set.active();
+        let (_provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.queue_message(tab, "a", "a".into(), 1).unwrap();
+        set.queue_message(tab, "b", "b".into(), 2).unwrap();
+        assert_eq!(set.take_back_queue(tab), vec!["a".to_string(), "b".to_string()]);
+        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.take_back_queue(tab).is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// Ruling 5.
+    #[test]
+    fn queueing_needs_a_session_that_is_starting_or_alive() {
+        let mut set = set();
+        let tab = set.active();
+        assert!(
+            set.queue_message(tab, "x", "x".into(), 1).is_err(),
+            "an empty tab sends, it does not queue"
+        );
+        let (_tx, result_rx) = mpsc::channel();
+        set.get_mut(tab).unwrap().backend = TabBackend::Starting(PendingStart {
+            request_id: "r".into(),
+            result_rx,
+            first_turn: None,
+            resume: None,
+            resumed_title: None,
+            resumed_name: None,
+        });
+        assert_eq!(
+            set.queue_message(tab, "x", "x".into(), 1),
+            Ok(1),
+            "the box is live while it starts"
+        );
+        set.get_mut(tab).unwrap().backend = TabBackend::Failed { reason: "no".into() };
+        assert!(set.queue_message(tab, "y", "y".into(), 2).is_err());
+    }
+
+    /// Ruling 9 (spec §4.4): `r` on an ended tab puts its queue back into the draft.
+    #[test]
+    fn reset_folds_the_queue_and_the_old_draft_into_the_draft() {
+        let mut set = set();
+        let tab = set.active();
+        {
+            let t = set.get_mut(tab).unwrap();
+            t.queue.push(Queued {
+                text: "q1".into(),
+                wire: "q1".into(),
+                queued_at_ms: 1,
+            });
+            t.queue.push(Queued {
+                text: "q2".into(),
+                wire: "q2".into(),
+                queued_at_ms: 2,
+            });
+            t.draft = "half".into();
+            t.backend = TabBackend::Failed { reason: "gone".into() };
+        }
+        set.reset(tab).unwrap();
+        let t = set.get(tab).unwrap();
+        assert_eq!(t.draft, "q1\n\nq2\n\nhalf");
+        assert!(t.queue.is_empty());
+        assert_eq!(set.close_facts(tab).unwrap().queued, 0);
+    }
+
+    #[test]
+    fn close_facts_and_the_window_count_the_queue_and_a_close_hands_the_texts_back() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open();
+        for (tab, text) in [(one, "a"), (two, "b"), (two, "c")] {
+            set.get_mut(tab).unwrap().queue.push(Queued {
+                text: text.into(),
+                wire: text.into(),
+                queued_at_ms: 0,
+            });
+        }
+        assert_eq!(set.close_facts(two).unwrap().queued, 2);
+        assert_eq!(set.queued_count(), 3);
+        assert_eq!(
+            set.take_every_queued_text(),
+            vec!["a".to_string(), "b".into(), "c".into()]
+        );
+        assert_eq!(set.queued_count(), 0);
+    }
+
+    /// D7 through the tab set: the rules answer a background tab's call, and a card that a rule
+    /// could answer is offered one.
+    #[test]
+    fn rules_answer_a_background_call_and_a_card_is_offered_the_rule_that_would() {
+        let dir = workspace("tabs-rules");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let background = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
+        set.open();
+        let bash = |id: &str, command: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+        };
+        provider.queue(bash("perm-npm", "npm ci"));
+        provider.queue(bash("perm-cargo", "cargo test --lib"));
+        let mut changed = Vec::new();
+        until("the cargo card", || {
+            changed.extend(set.pump(&dir, true).offers_changed);
+            set.get(background).unwrap().attention.attention().pending == 1
+                && set.get(background).unwrap().rule_offers.contains_key("perm-cargo")
+        });
+        assert_eq!(provider.resolutions(), vec![("perm-npm".to_string(), true)]);
+        let offers = &set.get(background).unwrap().rule_offers;
+        assert_eq!(offers["perm-cargo"].display(), "cargo test *");
+        assert!(changed.contains(&background));
+        shut_down_all(&mut set);
+    }
+
+    /// Defect 8 (phase 2's sandbox pass): a background tab's turn trace was never observed.
+    #[test]
+    fn a_background_tabs_trace_is_observed_marked_and_emitted() {
+        let dir = workspace("tabs-bg-trace");
+        let mut set = set();
+        let background = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
+        set.get_mut(background).unwrap().turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
+        set.open();
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: "hi".into(),
+        });
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        until("the background turn to end", || {
+            set.pump(&dir, true);
+            !set.get(background).unwrap().turn_running()
+                && set
+                    .get(background)
+                    .unwrap()
+                    .turn_trace
+                    .as_ref()
+                    .is_some_and(|t| t.is_finished())
+        });
+        let trace = set.get(background).unwrap().turn_trace.as_ref().unwrap();
+        assert!(trace.line().contains("first_paint_frame=bg"), "{}", trace.line());
+        assert!(
+            trace.is_emitted(),
+            "the pump emits a background trace: nothing else will"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// Every tab's own queue, draft and offers follow its snapshot on a switch, so the panel never
+    /// shows the tab it left.
+    #[test]
+    fn a_switch_sends_the_tabs_own_queue_draft_and_offers() {
+        let dir = workspace("tabs-switch-payloads");
+        let mut set = set();
+        let first = set.active();
+        let (_provider, backend) = live(&dir);
+        set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
+        set.queue_message(first, "queued", "queued".into(), 5).unwrap();
+        set.set_draft(first, "typing");
+        let second = set.open();
+        let kinds = |payloads: Vec<String>| -> Vec<(String, serde_json::Value)> {
+            payloads
+                .into_iter()
+                .map(|p| {
+                    let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+                    (v["kind"].as_str().unwrap().to_string(), v)
+                })
+                .collect()
+        };
+        let empty = kinds(set.active_state_payloads());
+        assert_eq!(
+            empty.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["queue", "draft", "scratch"],
+            "an empty tab still resets the panel's queue and draft"
+        );
+        assert!(empty.iter().all(|(_, v)| v["tab"] == second.0));
+        set.select(first);
+        let live_payloads = kinds(set.active_state_payloads());
+        assert_eq!(
+            live_payloads.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["snapshot", "queue", "draft", "rule_offers", "scratch"]
+        );
+        assert_eq!(live_payloads[1].1["items"][0]["text"], "queued");
+        assert_eq!(live_payloads[2].1["text"], "typing");
+        shut_down_all(&mut set);
+    }
+
+    /// Review focus 4: a draft edited in nvim returns to the tab it came from, after a switch too.
+    #[test]
+    fn a_scratch_edit_returns_to_its_own_tab() {
+        let mut set = set();
+        let first = set.active();
+        set.set_draft(first, "before");
+        set.begin_scratch_edit(first, 7).unwrap();
+        assert!(set.begin_scratch_edit(first, 8).is_err(), "one edit per tab at a time");
+        let second = set.open();
+        set.set_draft(second, "second's own");
+        let (tab, draft) = set
+            .finish_scratch_edit(7, &crate::scratch::EditDone::Written("after".into()))
+            .expect("edit 7 belongs to a tab");
+        assert_eq!((tab, draft.as_deref()), (first, Some("after")));
+        assert_eq!(set.get(first).unwrap().draft, "after");
+        assert_eq!(set.get(second).unwrap().draft, "second's own", "never the active tab");
+        assert_eq!(set.get(first).unwrap().editing_draft, None);
+        assert!(
+            set.finish_scratch_edit(7, &crate::scratch::EditDone::Discarded)
+                .is_none(),
+            "already finished"
+        );
+
+        set.begin_scratch_edit(second, 9).unwrap();
+        let (_, draft) = set
+            .finish_scratch_edit(9, &crate::scratch::EditDone::Discarded)
+            .unwrap();
+        assert_eq!(draft, None, ":q! changes nothing");
+        assert_eq!(set.get(second).unwrap().draft, "second's own");
     }
 }

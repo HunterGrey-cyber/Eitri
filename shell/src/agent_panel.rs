@@ -478,13 +478,33 @@ struct AgentPanelState {
     launch_chooser_done: bool,
     launch_chooser_hook: Option<Rc<dyn Fn()>>,
     chooser_closed_hook: Option<Rc<dyn Fn(bool)>>,
+    /// The per-window scratch directory (phase 3 ruling 18), `None` if it could not be made.
+    scratch: Option<neovibe_core::scratch::ScratchDir>,
+    /// Edits out in nvim, polled by the tick until their marker appears.
+    pending_edits: Vec<neovibe_core::scratch::PendingEdit>,
+    /// shows and focuses the editor, then hands it these keys; `Err` says why it could not.
+    editor_request_hook: Option<EditorRequestHook>,
+    /// An edit came back (or was discarded): the keys return to the chat, in INPUT.
+    editor_done_hook: Option<Rc<dyn Fn()>>,
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
     /// backstop covers them too. See [`Retiring`].
     retiring: Retiring,
+    /// `$XDG_STATE_HOME/neovibe/history` (C5) and `.../permissions` (D7); `None` with no state directory.
+    history_dir: Option<PathBuf>,
+    rules_dir: Option<PathBuf>,
+    /// The project's prompts, oldest first, as last read or written (ruling 11).
+    history: Vec<String>,
+    /// Set by `ready`, cleared by `reload_document` (ruling 38).
+    document_ready: bool,
+    /// The last `editor_context` envelope sent (ruling 32).
+    last_context_payload: Option<String>,
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
 type AttentionHook = Rc<dyn Fn(neovibe_core::attention::Attention, neovibe_core::attention::Attention)>;
+
+/// `AgentPanelHandle::on_editor_request`: the keys to hand nvim; `Err` says why it could not.
+type EditorRequestHook = Rc<dyn Fn(&str) -> Result<(), String>>;
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
 /// so a real window close can shut down whatever `AgentSession` exists -- without this, the
@@ -542,6 +562,19 @@ impl AgentPanelHandle {
     /// one: this handle is per-window, and the hold belongs to the application that owns the loop
     /// this panel's timers run on.
     pub(crate) fn shutdown(&self, app: &Application) {
+        // Ruling 10: queued words outlive the window as history.
+        let texts = self.state.borrow_mut().tabs.take_every_queued_text();
+        if !texts.is_empty() {
+            let (dir, root) = {
+                let s = self.state.borrow();
+                (s.history_dir.clone(), s.project_dir.clone())
+            };
+            if let Some(dir) = dir {
+                if let Err(e) = neovibe_core::prompt_history::append(&dir, &root, &texts) {
+                    eprintln!("[history] the queue could not be kept: {e}");
+                }
+            }
+        }
         let tabs = {
             let mut state = self.state.borrow_mut();
             // Read by the 33ms pump, by `poll_activate` and by every path into the tab set, all of
@@ -603,6 +636,8 @@ impl AgentPanelHandle {
     /// this into a quiet data-loss path with no test failing.
     pub(crate) fn reload_document(&self) {
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
+        // The page that said `ready` is going; the tick holds its envelopes until the new one does.
+        self.state.borrow_mut().document_ready = false;
         let vars = self.state.borrow().theme.css_vars();
         self.webview.load_html(&themed_document(&vars), Some(PANEL_BASE_URI));
     }
@@ -759,6 +794,18 @@ impl AgentPanelHandle {
     /// Where the panel's two HINT messages go. `shell::hint::HintCoordinator` installs this once.
     pub(crate) fn on_hint(&self, hook: impl Fn(HintInbound) + 'static) {
         self.state.borrow_mut().hint_hook = Some(Rc::new(hook));
+    }
+
+    /// Where the scratch round trips (`Ctrl+g`, `gf`) hand nvim their keys. The hook shows and
+    /// focuses the editor, then sends them; `Err` says why it could not. `main.rs` installs this once.
+    pub(crate) fn on_editor_request(&self, hook: impl Fn(&str) -> Result<(), String> + 'static) {
+        self.state.borrow_mut().editor_request_hook = Some(Rc::new(hook));
+    }
+
+    /// Called when a draft edited in nvim came back (or was discarded): the keys return to the
+    /// chat. `main.rs` installs this once.
+    pub(crate) fn on_editor_done(&self, hook: impl Fn() + 'static) {
+        self.state.borrow_mut().editor_done_hook = Some(Rc::new(hook));
     }
 
     /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes --
@@ -936,6 +983,15 @@ impl AgentPanelHandle {
         }
         state.tabs.running_count()
     }
+
+    /// Phase 3 ruling 10: every tab's queued messages, summed (the window-close prompt).
+    pub(crate) fn queued_count(&self) -> usize {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return 0;
+        }
+        state.tabs.queued_count()
+    }
 }
 
 /// Tells the attention hook, if the value changed. The hook is cloned out of the borrow first: it
@@ -958,6 +1014,7 @@ fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::
 pub(crate) fn build_agent_panel(
     project_dir: PathBuf,
     editor_context: neovibe_core::editor_context::ContextSource,
+    scratch: Option<neovibe_core::scratch::ScratchDir>,
 ) -> (gtk4::Widget, AgentPanelHandle) {
     let content_manager = UserContentManager::new();
     let webview = WebView::builder().user_content_manager(&content_manager).build();
@@ -1022,15 +1079,25 @@ pub(crate) fn build_agent_panel(
         };
     let backend_kind = BackendKind::from_env();
     println!("[agent_panel] backend: {}", backend_kind.as_str());
-    let prefs_dir = neovibe_core::agent_prefs::state_dir(
-        std::env::var_os("XDG_STATE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    );
+    let state_home = std::env::var_os("XDG_STATE_HOME");
+    let home = std::env::var_os("HOME");
+    let prefs_dir = neovibe_core::agent_prefs::state_dir(state_home.as_deref(), home.as_deref());
     let (mode, notes) = neovibe_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
     for note in notes {
         eprintln!("{note}");
     }
-    let tabs = neovibe_core::tab_set::TabSet::new(backend_kind, mode);
+    let history_dir = neovibe_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
+    let rules_dir = neovibe_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
+    let (history, notes) = neovibe_core::prompt_history::startup(history_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
+    let (rules, notes) = neovibe_core::permission_store::startup(rules_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
+    let mut tabs = neovibe_core::tab_set::TabSet::new(backend_kind, mode);
+    tabs.set_rules(rules);
     // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
     // way). `main.rs` already canonicalized the root; this only makes the string explicit.
     let canonical_project_dir = project_dir
@@ -1059,7 +1126,16 @@ pub(crate) fn build_agent_panel(
         launch_chooser_done: false,
         launch_chooser_hook: None,
         chooser_closed_hook: None,
+        scratch,
+        pending_edits: Vec::new(),
+        editor_request_hook: None,
+        editor_done_hook: None,
         retiring: Retiring::default(),
+        history_dir,
+        rules_dir,
+        history,
+        document_ready: false,
+        last_context_payload: None,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -1137,7 +1213,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully.
-        let (payload, first_text) = {
+        let (payload, first_text, turn_ended, offers_changed) = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -1176,7 +1252,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
             if let Some(supervisor) = state_ref.supervisor.as_mut() {
                 supervisor.send_status(status);
             }
-            (out.active_payload, out.first_text)
+            (out.active_payload, out.first_text, out.turn_ended, out.offers_changed)
         };
         if let Some(payload) = payload {
             evaluate_js_dispatch(&webview, &payload);
@@ -1191,6 +1267,24 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
                 }
             }
         }
+        // Ruling 3a: a turn ended in these tabs; their queues go out now.
+        for tab in turn_ended {
+            let flush = state.borrow_mut().tabs.flush_queue(tab);
+            if let Some(flush) = flush {
+                apply_flush(&state, &webview, tab, flush);
+            }
+        }
+        // The active tab's offers changed (a card arrived or went): the panel's third buttons follow.
+        if offers_changed.contains(&state.borrow().tabs.active()) && state.borrow().document_ready {
+            let payload = {
+                let state_ref = state.borrow();
+                let tab = state_ref.tabs.active_tab();
+                neovibe_core::agent_bridge::serialize_rule_offers_for_js(tab.id, &tab.rule_offers)
+            };
+            evaluate_js_dispatch(&webview, &payload);
+        }
+        send_context_if_changed(&state, &webview);
+        poll_scratch_edits(&state, &webview);
         send_tabs_if_changed(&state, &webview);
         send_hello_if_open_sessions_changed(&state, &webview);
         // After the payload, not before it: a reaction that sends the panel an envelope -- one
@@ -1221,19 +1315,145 @@ fn send_tabs(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     evaluate_js_dispatch(webview, &payload);
 }
 
+/// Hands nvim `keys` through `main.rs`'s hook, which shows and focuses the editor first.
+fn request_editor(state: &Rc<RefCell<AgentPanelState>>, keys: &str) -> Result<(), String> {
+    let hook = state.borrow().editor_request_hook.clone();
+    match hook {
+        Some(hook) => hook(keys),
+        None => Err("the editor is not connected to this panel".to_string()),
+    }
+}
+
+/// C5's return half: every edit whose marker appeared goes back to the tab it came from (review
+/// focus 4), and the keys return to the chat.
+fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let finished: Vec<(neovibe_core::scratch::PendingEdit, neovibe_core::scratch::EditDone)> = {
+        let mut state_ref = state.borrow_mut();
+        if state_ref.pending_edits.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        state_ref.pending_edits.retain(|edit| match edit.poll() {
+            Some(result) => {
+                done.push((edit.clone(), result));
+                false
+            }
+            None => true,
+        });
+        done
+    };
+    if finished.is_empty() {
+        return;
+    }
+    for (edit, result) in finished {
+        let returned = state.borrow_mut().tabs.finish_scratch_edit(edit.id, &result);
+        edit.cleanup();
+        let Some((tab, draft)) = returned else { continue };
+        let active = state.borrow().tabs.active() == tab;
+        if active {
+            if let Some(text) = &draft {
+                evaluate_js_dispatch(webview, &neovibe_core::agent_bridge::serialize_draft_for_js(tab, text));
+            }
+            evaluate_js_dispatch(
+                webview,
+                &neovibe_core::agent_bridge::serialize_scratch_for_js(tab, false),
+            );
+        }
+        if let neovibe_core::scratch::EditDone::Failed(why) = &result {
+            evaluate_js_dispatch(
+                webview,
+                &neovibe_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
+            );
+        }
+    }
+    let hook = state.borrow().editor_done_hook.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// The tick's `tabs` envelope: sent only when it differs from the last one sent (a marker, a
 /// label, a state -- whatever `TabSet::tabs_payload` says).
+///
+/// Held back while no document has said `ready` (ruling 38), and then not recorded as sent, so it
+/// goes out once one has.
 fn send_tabs_if_changed(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let payload = {
         let mut state_ref = state.borrow_mut();
-        let payload = state_ref.tabs.tabs_payload();
-        if state_ref.last_tabs_payload.as_deref() == Some(payload.as_str()) {
+        let state_ref = &mut *state_ref;
+        let now = state_ref.tabs.tabs_payload();
+        changed_envelope(&mut state_ref.last_tabs_payload, now, state_ref.document_ready)
+    };
+    if let Some(payload) = payload {
+        evaluate_js_dispatch(webview, &payload);
+    }
+}
+
+/// V1 (ruling 32): the editor context's summary, when it changed.
+fn send_context_if_changed(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
+    let payload = {
+        let mut state_ref = state.borrow_mut();
+        let state_ref = &mut *state_ref;
+        let summary =
+            neovibe_core::agent_bridge::context_summary((state_ref.editor_context)().as_ref(), &state_ref.project_dir);
+        let now = neovibe_core::agent_bridge::serialize_editor_context_for_js(summary.as_ref());
+        changed_envelope(&mut state_ref.last_context_payload, now, state_ref.document_ready)
+    };
+    if let Some(payload) = payload {
+        evaluate_js_dispatch(webview, &payload);
+    }
+}
+
+/// Appends `texts` to the project's history and tells the panel (ruling 11). Best-effort: a failed
+/// write is logged and the panel keeps the list it had.
+fn remember_prompts(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, texts: &[String]) {
+    let (dir, root) = {
+        let s = state.borrow();
+        (s.history_dir.clone(), s.project_dir.clone())
+    };
+    let Some(dir) = dir else { return };
+    match neovibe_core::prompt_history::append(&dir, &root, texts) {
+        Ok(entries) => {
+            let ready = {
+                let mut s = state.borrow_mut();
+                s.history = entries;
+                s.document_ready
+            };
+            if ready {
+                let payload = neovibe_core::agent_bridge::serialize_history_for_js(&state.borrow().history);
+                evaluate_js_dispatch(webview, &payload);
+            }
+        }
+        Err(e) => eprintln!("[history] could not append: {e}"),
+    }
+}
+
+/// The active tab's queue, after anything changed it.
+fn send_queue(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId) {
+    let payload = {
+        let s = state.borrow();
+        if s.tabs.active() != tab || !s.document_ready {
             return;
         }
-        state_ref.last_tabs_payload = Some(payload.clone());
-        payload
+        let t = s.tabs.get(tab).expect("the active tab exists");
+        neovibe_core::agent_bridge::serialize_queue_for_js(tab, &t.queue, t.queue_error.as_deref())
     };
     evaluate_js_dispatch(webview, &payload);
+}
+
+/// A flush's outcome (ruling 3): the same benign/fatal split a command gets, with no request to
+/// answer. A refusal leaves the queue and its `error` line; the queue envelope says so.
+fn apply_flush(
+    state: &Rc<RefCell<AgentPanelState>>,
+    webview: &WebView,
+    tab: TabId,
+    flush: neovibe_core::tab_set::Flush,
+) {
+    if flush.outcome.is_ok() {
+        title_from_first_prompt(state, tab, &flush.typed);
+    }
+    apply_outcome(state, webview, tab, None, flush.outcome);
+    send_queue(state, webview, tab);
 }
 
 /// `tabs`, then the active tab's own state (ruling 18: always, not only when stale).
@@ -1263,6 +1483,10 @@ fn send_switch(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
 fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let payload = {
         let mut state_ref = state.borrow_mut();
+        // Ruling 38: `ready` sends `hello` itself, and records what it was computed against.
+        if !state_ref.document_ready {
+            return;
+        }
         let open = state_ref.tabs.open_session_ids();
         if open == state_ref.last_open_ids {
             return;
@@ -1310,6 +1534,11 @@ fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
             state.backend_kind,
             agent::account::configured().map(|a| a.name()),
             &state.project_dir,
+            state
+                .rules_dir
+                .as_ref()
+                .map(|d| neovibe_core::permission_store::path(d, &state.project_dir))
+                .as_deref(),
         ),
         None => Vec::new(),
     };
@@ -1352,7 +1581,13 @@ fn chooser_records(
 ///
 /// `provider_session_id()` is read into a local BEFORE `projection()` is taken: on the sidecar path
 /// both lock the same ingestion mutex (the 2026-09-15 GTK freeze; `tab_set`'s module doc).
-fn detail_rows(tab: &Tab, kind: BackendKind, account: Option<&str>, project_dir: &Path) -> Vec<DetailRow> {
+fn detail_rows(
+    tab: &Tab,
+    kind: BackendKind,
+    account: Option<&str>,
+    project_dir: &Path,
+    rules_file: Option<&Path>,
+) -> Vec<DetailRow> {
     const UNKNOWN: &str = "—";
     let known = |value: Option<String>| value.filter(|v| !v.is_empty()).unwrap_or_else(|| UNKNOWN.to_string());
     let backend = tab.live();
@@ -1394,7 +1629,7 @@ fn detail_rows(tab: &Tab, kind: BackendKind, account: Option<&str>, project_dir:
         BackendKind::Sidecar => "yes",
         BackendKind::Legacy => "no (legacy backend)",
     };
-    let rows: [(&str, String); 17] = [
+    let rows: [(&str, String); 18] = [
         ("name", known(tab.name.clone())),
         ("title", known(tab.title.clone())),
         ("state", tab.wire_state().as_str().to_string()),
@@ -1414,7 +1649,8 @@ fn detail_rows(tab: &Tab, kind: BackendKind, account: Option<&str>, project_dir:
         ("resumable", resumable.to_string()),
         ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
         ("updated", known(record.as_ref().map(|r| r.updated_at.clone()))),
-        ("queued", "0".to_string()),
+        ("queued", tab.queue.len().to_string()),
+        ("permission rules", known(rules_file.map(|p| p.display().to_string()))),
     ];
     rows.into_iter()
         .map(|(label, value)| DetailRow {
@@ -1700,11 +1936,13 @@ fn handoff_payloads(
 /// a later change loses something from without any test noticing.
 ///
 /// `hello` first, then the theme and the keymap (colours before anything drawn with them), then the
+/// window-level envelopes in `window` (the history, then the editor context), then the
 /// `tabs` envelope, then the active tab's own state. The handoff card is now one of the active
 /// tab's own payloads (`TabSet::active_state_payloads`), as its snapshot is.
 fn ready_payloads(
     mut greeting: BackendGreeting,
     open: &[String],
+    window: Vec<String>,
     tabs: String,
     active: Vec<String>,
     theme: Option<&str>,
@@ -1716,9 +1954,49 @@ fn ready_payloads(
     let mut payloads = vec![serialize_hello_for_js(&greeting)];
     payloads.extend(theme.map(str::to_string));
     payloads.extend(keymap.map(str::to_string));
+    // Window-level state (the history, then the editor context), before the tabs that use it.
+    payloads.extend(window);
     payloads.push(tabs);
     payloads.extend(active);
     payloads
+}
+
+/// A window-level envelope for the tick: `Some` when the page can take it and it changed since the
+/// last one sent (phase 3 ruling 38). Recorded as sent only when it is returned.
+fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool) -> Option<String> {
+    if !document_ready || last.as_deref() == Some(now.as_str()) {
+        return None;
+    }
+    *last = Some(now.clone());
+    Some(now)
+}
+
+/// D7's `remember` (ruling 16): the rule Rust offered for `permission_id`, only with an allow.
+fn rule_to_remember(
+    tab: &Tab,
+    permission_id: &str,
+    decision: neovibe_core::agent_bridge::DecisionChoice,
+    remember: bool,
+) -> Result<Option<agent::PrefixRule>, &'static str> {
+    if !remember {
+        return Ok(None);
+    }
+    if decision != neovibe_core::agent_bridge::DecisionChoice::Allow {
+        return Err("only an allow can be remembered");
+    }
+    tab.rule_offers
+        .get(permission_id)
+        .cloned()
+        .map(Some)
+        .ok_or("no rule can be offered for this request")
+}
+
+/// Milliseconds since the epoch, for a queued item's `queuedAt`; 0 on a clock before 1970.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The events a command's outcome owes the frontend, SUCCESS OR FAILURE.
@@ -1757,6 +2035,18 @@ fn apply_command_outcome(
     request_id: &str,
     outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
 ) {
+    apply_outcome(state, webview, tab, Some(request_id), outcome);
+}
+
+/// [`apply_command_outcome`] for an outcome no request is waiting on (a queue flush, ruling 3):
+/// `request_id` is `None` and no `command_result` goes out.
+fn apply_outcome(
+    state: &Rc<RefCell<AgentPanelState>>,
+    webview: &WebView,
+    tab: TabId,
+    request_id: Option<&str>,
+    outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
+) {
     let events = events_owed(&outcome);
     let active = state.borrow().tabs.active() == tab;
     if !events.is_empty() && active {
@@ -1781,17 +2071,18 @@ fn apply_command_outcome(
     }
     match outcome {
         Ok(_) => {
-            evaluate_js_dispatch(webview, &serialize_command_result_for_js(request_id, Ok(())));
+            if let Some(id) = request_id {
+                evaluate_js_dispatch(webview, &serialize_command_result_for_js(id, Ok(())));
+            }
         }
         Err(error) if error.benign => {
             eprintln!(
                 "[agent_panel] tab {}: command rejected (session stays alive): {}",
                 tab.0, error.message
             );
-            evaluate_js_dispatch(
-                webview,
-                &serialize_command_result_for_js(request_id, Err(&error.message)),
-            );
+            if let Some(id) = request_id {
+                evaluate_js_dispatch(webview, &serialize_command_result_for_js(id, Err(&error.message)));
+            }
         }
         Err(error) => {
             eprintln!("[agent_panel] tab {}: command failed fatally: {}", tab.0, error.message);
@@ -1819,10 +2110,9 @@ fn apply_command_outcome(
             if let Some(TabBackend::Live(backend)) = dead {
                 state.borrow_mut().retiring.backend(backend);
             }
-            evaluate_js_dispatch(
-                webview,
-                &serialize_command_result_for_js(request_id, Err(&error.message)),
-            );
+            if let Some(id) = request_id {
+                evaluate_js_dispatch(webview, &serialize_command_result_for_js(id, Err(&error.message)));
+            }
             if active {
                 evaluate_js_dispatch(webview, &serialize_error_for_js(tab, &error.message));
             }
@@ -1874,11 +2164,22 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     .filter(|r| !open.contains(&r.provider_session_id))
                     .count();
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
+                let context = neovibe_core::agent_bridge::context_summary(
+                    (state_ref.editor_context)().as_ref(),
+                    &state_ref.project_dir,
+                );
+                let context_payload = neovibe_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
+                state_ref.last_context_payload = Some(context_payload.clone());
+                let window = vec![
+                    neovibe_core::agent_bridge::serialize_history_for_js(&state_ref.history),
+                    context_payload,
+                ];
                 let tabs = tabs_payload_recorded(state_ref);
                 let active = state_ref.tabs.active_state_payloads();
                 let mut payloads = ready_payloads(
                     greeting,
                     &open,
+                    window,
                     tabs,
                     active,
                     Some(&theme),
@@ -1894,6 +2195,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                     && state_ref.launch_chooser_allowed
                     && neovibe_core::tabs::launch_opens_chooser(offerable, true);
                 state_ref.launch_chooser_done = true;
+                // Ruling 38: from here on the tick may send into this document.
+                state_ref.document_ready = true;
                 (payloads, launch_chooser)
             };
             dispatch_all(webview, payloads);
@@ -1911,6 +2214,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         }
         InboundMessage::SendMessage { text, .. } => {
             let tab = tab_of(target);
+            // A sent prompt is history whether or not the backend takes it, as in Claude Code.
+            remember_prompts(state, webview, std::slice::from_ref(&text));
             enum Plan {
                 Sent(Result<Vec<agent::AgentDomainEvent>, BackendError>),
                 Starting,
@@ -2045,9 +2350,40 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             permission_id,
             decision,
             reason,
+            remember,
             ..
         } => {
             let tab = tab_of(target);
+            let remembered = {
+                let state_ref = state.borrow();
+                let t = state_ref.tabs.get(tab).expect("resolved above");
+                rule_to_remember(t, &permission_id, decision, remember)
+            };
+            match remembered {
+                Err(why) => return refuse(webview, why),
+                Ok(Some(rule)) => {
+                    let (dir, root) = {
+                        let s = state.borrow();
+                        (s.rules_dir.clone(), s.project_dir.clone())
+                    };
+                    let Some(dir) = dir else {
+                        return refuse(webview, "no state directory: the rule cannot be saved");
+                    };
+                    match neovibe_core::permission_store::add(&dir, &root, &rule) {
+                        Ok(rules) => {
+                            eprintln!(
+                                "[permission] rule saved: {} ({})",
+                                rule.to_rule_string(),
+                                neovibe_core::permission_store::path(&dir, &root).display()
+                            );
+                            state.borrow_mut().tabs.set_rules(rules);
+                        }
+                        // Not answered: the card stays and `a` still works (ruling 16).
+                        Err(e) => return refuse(webview, &format!("could not save the rule: {e}")),
+                    }
+                }
+                Ok(None) => {}
+            }
             let decision = decision.into_decision(reason);
             let outcome = backend_for(&mut state.borrow_mut().tabs, tab)
                 .and_then(|backend| backend.respond_permission(&permission_id, decision));
@@ -2260,6 +2596,137 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             evaluate_js_dispatch(webview, &payload);
             ok(webview);
         }
+        InboundMessage::QueueMessage { text, .. } => {
+            let tab = tab_of(target);
+            let queued = {
+                let mut state_ref = state.borrow_mut();
+                let state_ref = &mut *state_ref;
+                // Captured now (ruling 1): what the editor shows when Enter is pressed.
+                let wire =
+                    neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
+                state_ref.tabs.queue_message(tab, &text, wire, now_ms())
+            };
+            match queued {
+                Ok(_) => {
+                    remember_prompts(state, webview, std::slice::from_ref(&text));
+                    // The turn may have ended between the panel's Enter and this handler (ruling 3b).
+                    let flush = state.borrow_mut().tabs.flush_queue(tab);
+                    match flush {
+                        Some(flush) => apply_flush(state, webview, tab, flush),
+                        None => send_queue(state, webview, tab),
+                    }
+                    ok(webview);
+                }
+                Err(why) => refuse(webview, &why),
+            }
+        }
+        InboundMessage::TakeBackQueue { .. } => {
+            let tab = tab_of(target);
+            let texts = state.borrow_mut().tabs.take_back_queue(tab);
+            evaluate_js_dispatch(
+                webview,
+                &neovibe_core::agent_bridge::serialize_queue_taken_for_js(tab, &texts),
+            );
+            send_queue(state, webview, tab);
+            ok(webview);
+        }
+        InboundMessage::SendNow { text, .. } => {
+            let tab = tab_of(target);
+            let result = {
+                let mut state_ref = state.borrow_mut();
+                let state_ref = &mut *state_ref;
+                let wire =
+                    neovibe_core::editor_context::compose_turn_text(&text, (state_ref.editor_context)().as_ref());
+                state_ref.tabs.send_now(tab, &text, wire, now_ms())
+            };
+            if !text.trim().is_empty() {
+                remember_prompts(state, webview, std::slice::from_ref(&text));
+            }
+            match result {
+                Err(why) => refuse(webview, &why),
+                Ok(neovibe_core::tab_set::SendNow::Interrupting(outcome)) => {
+                    send_queue(state, webview, tab);
+                    apply_command_outcome(state, webview, tab, &request_id, outcome);
+                }
+                Ok(neovibe_core::tab_set::SendNow::Flushed(flush)) => {
+                    if let Some(flush) = flush {
+                        apply_flush(state, webview, tab, flush);
+                    }
+                    ok(webview);
+                }
+            }
+        }
+        InboundMessage::Draft { text, .. } => {
+            // Ruling 6: a mirror, answered with nothing.
+            state.borrow_mut().tabs.set_draft(tab_of(target), &text);
+        }
+        InboundMessage::HistoryPush { text, .. } => {
+            remember_prompts(state, webview, std::slice::from_ref(&text));
+            ok(webview);
+        }
+        InboundMessage::OpenPath { path, line, .. } => {
+            let project_dir = state.borrow().project_dir.clone();
+            let candidate = std::path::Path::new(&path);
+            let resolved = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                project_dir.join(candidate)
+            };
+            if !resolved.exists() {
+                refuse(webview, &format!("no such file: {path}"));
+                return;
+            }
+            let keys = neovibe_core::scratch::open_request(&resolved, line).input_keys();
+            match request_editor(state, &keys) {
+                Ok(()) => ok(webview),
+                Err(why) => refuse(webview, &why),
+            }
+        }
+        InboundMessage::ViewInEditor { title, text, .. } => {
+            let prepared = match state.borrow_mut().scratch.as_mut() {
+                Some(dir) => dir
+                    .prepare_view(&title, &text)
+                    .map_err(|e| format!("could not write the scratch file: {e}")),
+                None => Err("the scratch directory could not be created at startup".to_string()),
+            };
+            match prepared.and_then(|request| request_editor(state, &request.input_keys())) {
+                Ok(()) => ok(webview),
+                Err(why) => refuse(webview, &why),
+            }
+        }
+        InboundMessage::EditDraft { text, .. } => {
+            let tab = tab_of(target);
+            let prepared = match state.borrow_mut().scratch.as_mut() {
+                Some(dir) => dir
+                    .prepare_edit(&text)
+                    .map_err(|e| format!("could not write the scratch file: {e}")),
+                None => Err("the scratch directory could not be created at startup".to_string()),
+            };
+            let (request, edit) = match prepared {
+                Ok(pair) => pair,
+                Err(why) => return refuse(webview, &why),
+            };
+            if let Err(why) = state.borrow_mut().tabs.begin_scratch_edit(tab, edit.id) {
+                edit.cleanup();
+                return refuse(webview, &why);
+            }
+            if let Err(why) = request_editor(state, &request.input_keys()) {
+                let mut state_ref = state.borrow_mut();
+                state_ref
+                    .tabs
+                    .finish_scratch_edit(edit.id, &neovibe_core::scratch::EditDone::Discarded);
+                edit.cleanup();
+                drop(state_ref);
+                return refuse(webview, &why);
+            }
+            state.borrow_mut().tabs.set_draft(tab, &text);
+            state.borrow_mut().pending_edits.push(edit);
+            evaluate_js_dispatch(
+                webview,
+                &neovibe_core::agent_bridge::serialize_scratch_for_js(tab, true),
+            );
+            ok(webview);
+        }
         InboundMessage::ChooserClosed { launch, .. } => {
             let hook = state.borrow().chooser_closed_hook.clone();
             if let Some(hook) = hook {
@@ -2306,8 +2773,11 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView, tab: TabId
                     );
                 }
             }
-            // Always 0 queued in phase 2.
-            neovibe_core::tabs::CloseStep::QueueToHistory => {}
+            // Ruling 10: the queued words outlive the tab as history.
+            neovibe_core::tabs::CloseStep::QueueToHistory => {
+                let texts = state.borrow().tabs.queue_texts(tab);
+                remember_prompts(state, webview, &texts);
+            }
             // Folded into `Remove`: `Retiring::tab` shuts the removed tab's backend down.
             neovibe_core::tabs::CloseStep::Shutdown => {}
             neovibe_core::tabs::CloseStep::Remove => {
@@ -2474,7 +2944,10 @@ mod tests {
             .collect();
         assert!(calls.len() >= 2, "{calls:?}");
         for call in calls {
-            assert!(call.contains("Some(PANEL_BASE_URI)"), "a load_html without the secure base: {call}");
+            assert!(
+                call.contains("Some(PANEL_BASE_URI)"),
+                "a load_html without the secure base: {call}"
+            );
         }
     }
 
@@ -2622,6 +3095,115 @@ mod tests {
         assert_eq!(finished, 2);
     }
 
+    /// Defect 7 (phase 2's sandbox pass): the first tick dispatched `tabs` into a page that had not
+    /// loaded. A window-level envelope goes out only once the document said `ready`, and one held
+    /// back is not recorded as sent, so it still goes out once it is.
+    #[test]
+    fn a_window_envelope_waits_for_the_document_and_goes_out_once_per_change() {
+        let mut last = None;
+        assert_eq!(changed_envelope(&mut last, "tabs-1".into(), false), None);
+        assert_eq!(last, None, "not recorded while the page cannot take it");
+        assert_eq!(
+            changed_envelope(&mut last, "tabs-1".into(), true),
+            Some("tabs-1".into())
+        );
+        assert_eq!(changed_envelope(&mut last, "tabs-1".into(), true), None, "unchanged");
+        assert_eq!(
+            changed_envelope(&mut last, "tabs-2".into(), true),
+            Some("tabs-2".into())
+        );
+    }
+
+    #[test]
+    fn ready_sends_the_history_and_the_editor_context_before_the_tabs() {
+        let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
+        let keymap = neovibe_core::agent_bridge::serialize_keymap_for_js("Ctrl+b", &[], &[]);
+        let window = vec![
+            neovibe_core::agent_bridge::serialize_history_for_js(&["earlier".into()]),
+            neovibe_core::agent_bridge::serialize_editor_context_for_js(None),
+        ];
+        let payloads = ready_payloads(
+            legacy_greeting(),
+            &[],
+            window,
+            r#"{"kind":"tabs","active":1,"tabs":[]}"#.to_string(),
+            vec![],
+            Some(&theme),
+            Some(&keymap),
+        );
+        assert_eq!(
+            kinds(&payloads),
+            vec!["hello", "theme", "keymap", "history", "editor_context", "tabs"]
+        );
+    }
+
+    /// Ruling 16: the rule comes from what Rust offered for that card, never from the panel, and only
+    /// with an allow.
+    #[test]
+    fn remember_saves_only_the_rule_rust_offered_and_only_with_an_allow() {
+        use neovibe_core::agent_bridge::DecisionChoice;
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        set.get_mut(tab)
+            .unwrap()
+            .rule_offers
+            .insert("perm-1".into(), agent::PrefixRule::parse("Bash(git push *)").unwrap());
+        let t = set.get(tab).unwrap();
+        assert_eq!(
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, false),
+            Ok(None),
+            "a plain allow"
+        );
+        assert_eq!(
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true)
+                .unwrap()
+                .unwrap()
+                .display(),
+            "git push *"
+        );
+        assert!(
+            rule_to_remember(t, "perm-2", DecisionChoice::Allow, true).is_err(),
+            "never offered"
+        );
+        assert!(
+            rule_to_remember(t, "perm-1", DecisionChoice::Deny, true).is_err(),
+            "remember is an allow"
+        );
+    }
+
+    #[test]
+    fn the_detail_popover_counts_the_queue_and_names_the_rules_file() {
+        let mut set = TabSet::new(BackendKind::Legacy, neovibe_core::agent_bridge::SessionModeChoice::Auto);
+        let tab = set.active();
+        set.get_mut(tab).unwrap().queue.push(neovibe_core::tab_set::Queued {
+            text: "a".into(),
+            wire: "a".into(),
+            queued_at_ms: 0,
+        });
+        let rules = std::path::Path::new("/s/neovibe/permissions/0123456789abcdef.json");
+        let rows = detail_rows(
+            set.active_tab(),
+            BackendKind::Legacy,
+            None,
+            std::path::Path::new("/p"),
+            Some(rules),
+        );
+        let value = |label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+        assert_eq!(value("queued"), "1");
+        assert_eq!(value("permission rules"), rules.display().to_string());
+        let rows = detail_rows(
+            set.active_tab(),
+            BackendKind::Legacy,
+            None,
+            std::path::Path::new("/p"),
+            None,
+        );
+        assert_eq!(rows.iter().find(|r| r.label == "permission rules").unwrap().value, "—");
+    }
+
     #[test]
     fn ready_sends_hello_theme_keymap_tabs_then_the_active_tabs_state() {
         let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&neovibe_core::theme::ThemeTokens::fallback());
@@ -2630,6 +3212,7 @@ mod tests {
         let payloads = ready_payloads(
             legacy_greeting(),
             &[],
+            vec![],
             r#"{"kind":"tabs","active":1,"tabs":[]}"#.to_string(),
             vec![snapshot],
             Some(&theme),
@@ -2657,6 +3240,7 @@ mod tests {
         let payloads = ready_payloads(
             greeting,
             &["open-here".to_string()],
+            vec![],
             "{}".to_string(),
             vec![],
             None,
@@ -2704,6 +3288,7 @@ mod tests {
             BackendKind::Legacy,
             Some("work"),
             std::path::Path::new("/p"),
+            None,
         );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         for want in [
@@ -2724,6 +3309,7 @@ mod tests {
             "created",
             "updated",
             "queued",
+            "permission rules",
         ] {
             assert!(labels.contains(&want), "missing {want}: {labels:?}");
         }
@@ -2947,6 +3533,7 @@ mod tests {
         let payloads = ready_payloads(
             legacy_greeting(),
             &[],
+            vec![],
             "{\"kind\":\"tabs\"}".to_string(),
             vec![neovibe_core::agent_bridge::serialize_handoff_for_js(TabId(1), &command)],
             None,
@@ -2974,6 +3561,7 @@ mod tests {
             kinds(&ready_payloads(
                 legacy_greeting(),
                 &[],
+                vec![],
                 "{\"kind\":\"tabs\"}".to_string(),
                 vec![],
                 None,
@@ -2991,6 +3579,7 @@ mod tests {
             kinds(&ready_payloads(
                 legacy_greeting(),
                 &[],
+                vec![],
                 "{\"kind\":\"tabs\"}".to_string(),
                 vec![],
                 Some(&theme),
@@ -3001,6 +3590,7 @@ mod tests {
         let payloads = ready_payloads(
             legacy_greeting(),
             &[],
+            vec![],
             "{\"kind\":\"tabs\"}".to_string(),
             vec![r#"{"kind":"snapshot","tab":1,"throughRevision":3,"state":{}}"#.to_string()],
             Some(&theme),
@@ -3019,6 +3609,7 @@ mod tests {
             kinds(&ready_payloads(
                 legacy_greeting(),
                 &[],
+                vec![],
                 "{\"kind\":\"tabs\"}".to_string(),
                 vec![],
                 Some(&theme),
@@ -3066,7 +3657,7 @@ mod tests {
         let command = a_command();
         // The tab set's `open_session_ids` includes a handed-off session (ruling 13).
         let open = vec![command.provider_session_id().to_string()];
-        let payloads = ready_payloads(greeting, &open, "{}".to_string(), vec![], None, None);
+        let payloads = ready_payloads(greeting, &open, vec![], "{}".to_string(), vec![], None, None);
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
             .as_array()

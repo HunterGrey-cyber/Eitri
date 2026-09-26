@@ -154,6 +154,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // in this shell ever tells nvim it lost or gained focus. Without this a `git checkout`, a
     // formatter, or an edit made anywhere else never reaches the buffer.
     nvim_extra_args.extend(neovibe_core::buffer_reload::nvim_args());
+    // The two nvim round trips (phase 3 ruling 18): env and `--cmd` reach nvim only at spawn.
+    let scratch_dir = neovibe_core::scratch::ScratchDir::new();
+    nvim_child_env.extend(scratch_dir.as_ref().map(|dir| dir.child_env()).unwrap_or_default());
+    nvim_extra_args.extend(scratch_dir.as_ref().map(|dir| dir.nvim_args()).unwrap_or_default());
+    let scratch_path = scratch_dir.as_ref().map(|dir| dir.path().to_path_buf());
 
     // `Rc` because two separate closures need it after this function returns: the agent panel's
     // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
@@ -179,7 +184,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         None => std::rc::Rc::new(|| None),
     };
     let (agent_widget, agent_panel_handle) =
-        agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source);
+        agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source, scratch_dir);
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
@@ -805,6 +810,30 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             grid.show_module(id).map(|_| ())
         })
     };
+    // The scratch round trips (`Ctrl+g`, `gf`): the editor is shown and given the keys before nvim
+    // is handed the request, and an edit that came back returns the keys to the chat.
+    {
+        let pane = pane.clone();
+        let show_on_screen = show_on_screen.clone();
+        let focus_module = focus_module.clone();
+        agent_panel_handle.on_editor_request(move |keys| {
+            if !pane.is_ready() {
+                return Err("the editor is not ready yet".to_string());
+            }
+            show_on_screen(&ModuleId::editor()).map_err(|e| e.to_string())?;
+            focus_module(&ModuleId::editor());
+            pane.send_keys(keys);
+            Ok(())
+        });
+    }
+    {
+        let focus_and_arrive = focus_and_arrive.clone();
+        agent_panel_handle.on_editor_done(move || {
+            if let Err(err) = focus_and_arrive(&ModuleId::agent()) {
+                eprintln!("[scratch] could not return the keys to the chat: {err}");
+            }
+        });
+    }
     // `place_and_arrive`: `id` into a new split after the module with the keys, along `axis`, moved
     // there if it is elsewhere, and the keys to it (`Ctrl+a \`/`"` + a key, `Ctrl+a <key>` for a
     // module never placed, `neovibe.layout.split`).
@@ -1369,7 +1398,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         // D11 A (spec §3.5): a running tab is worth one y/n. `y` calls `close()` again and lands
         // here with the prompt confirmed.
         if !close_prompt.confirmed() {
-            if let Some(text) = neovibe_core::tabs::window_close_prompt(agent_panel_handle.running_count(), 0) {
+            if let Some(text) = neovibe_core::tabs::window_close_prompt(
+                agent_panel_handle.running_count(),
+                agent_panel_handle.queued_count(),
+            ) {
                 close_prompt.ask(&text);
                 return glib::Propagation::Stop;
             }
@@ -1382,6 +1414,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         // Hangs the terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
         // the process exit first, the kernel closing the PTY master hangs it up anyway.
         terminal.shutdown();
+        // The scratch directory is owned by the panel's `ScratchDir`, which GTK may never drop.
+        if let Some(path) = &scratch_path {
+            let _ = std::fs::remove_dir_all(path);
+        }
         // Capturing `pane_switch` here is load-bearing twice over. First, it keeps the
         // `PaneSwitch` alive for the window's whole lifetime -- it is otherwise a local of
         // `build_ui`, and its directory (holding the fake-`tmux` symlink and the live socket)

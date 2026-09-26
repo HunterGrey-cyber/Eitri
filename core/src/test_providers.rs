@@ -3,6 +3,7 @@
 //! test module unchanged when the tab set needed the same double (session tabs plan, Task 5).
 
 use agent::{AgentDomainEvent, ProviderCapabilities, ProviderInfo};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A provider that queues whatever events a test wants and records every resolution it is
 /// handed. The twin of `agent_backend`'s `RejectingProvider`, for the opposite question: that one exists to
@@ -11,6 +12,11 @@ use agent::{AgentDomainEvent, ProviderCapabilities, ProviderInfo};
 pub struct RecordingProvider {
     queued: std::sync::Mutex<Vec<AgentDomainEvent>>,
     resolved: std::sync::Mutex<Vec<(String, bool)>>,
+    /// Every turn text a send reached the provider with, accepted or refused.
+    turns: std::sync::Mutex<Vec<String>>,
+    interrupts: AtomicUsize,
+    refusing: AtomicBool,
+    interrupt_capable: bool,
 }
 
 impl RecordingProvider {
@@ -20,11 +26,32 @@ impl RecordingProvider {
     pub fn resolutions(&self) -> Vec<(String, bool)> {
         self.resolved.lock().unwrap().clone()
     }
+    /// A provider that advertises `interrupt` (read by `AgentConversation::create`, so choose it
+    /// before creating the conversation).
+    pub fn interruptible() -> Self {
+        RecordingProvider {
+            interrupt_capable: true,
+            ..Default::default()
+        }
+    }
+    pub fn turns(&self) -> Vec<String> {
+        self.turns.lock().unwrap().clone()
+    }
+    pub fn interrupts(&self) -> usize {
+        self.interrupts.load(Ordering::SeqCst)
+    }
+    /// While on, every send is refused as a provider error (benign: the session stays).
+    pub fn refuse_sends(&self, on: bool) {
+        self.refusing.store(on, Ordering::SeqCst);
+    }
 }
 
 impl agent::AgentProvider for RecordingProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities::default()
+        ProviderCapabilities {
+            interrupt: self.interrupt_capable,
+            ..ProviderCapabilities::default()
+        }
     }
     fn info(&self) -> ProviderInfo {
         ProviderInfo::default()
@@ -35,10 +62,18 @@ impl agent::AgentProvider for RecordingProvider {
     fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
         Err(agent::ProviderError::UnsupportedCapability("resume"))
     }
-    fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+    fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+        self.turns.lock().unwrap().push(request.text);
+        if self.refusing.load(Ordering::SeqCst) {
+            return Err(agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::TurnAlreadyActive,
+                message: "refused by the test".into(),
+            });
+        }
         Ok("turn-1".into())
     }
     fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+        self.interrupts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {

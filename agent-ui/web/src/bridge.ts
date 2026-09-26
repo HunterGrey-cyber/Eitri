@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, DetailRow, HandoffCommand, Hello, TabId, TabsEnvelope } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, HandoffCommand, Hello, QueueItem, TabId, TabsEnvelope } from "./types";
 import type { KeymapHelp } from "./keymap";
 
 export type OutboundMessage =
@@ -9,7 +9,9 @@ export type OutboundMessage =
    *  rather than defaulting it, and the tempting default would be the one that runs the tool.
    *  `reason` is only ever sent with a denial -- there is no field downstream that would show the
    *  model an approval's reason. */
-  | { type: "permission_response"; request_id: string; tab: TabId; permission_id: string; decision: PermissionDecision; reason?: string }
+  /** `remember: true` on an allow is "always allow" (phase 3 ruling 16) -- Rust honours it only for
+   *  a permission id it itself offered a rule for; the panel's own text is never trusted. */
+  | { type: "permission_response"; request_id: string; tab: TabId; permission_id: string; decision: PermissionDecision; reason?: string; remember?: boolean }
   /** How long this WebView took to draw a turn's first assistant text, from its own receipt of the
    *  payload to the animation frame that rendered it. A SPAN, not an instant: `performance.now()`
    *  and Rust's `Instant` have unrelated epochs, so a timestamp crossing this boundary would be a
@@ -32,12 +34,34 @@ export type OutboundMessage =
   /** Global `f` HINT: panel has pressed `f` in BROWSE, asking shell to start a global HINT. */
   | { type: "hint_request"; request_id: string }
   /** Answer to hint_collect: the number of visible targets the panel froze for this sessionId. */
-  | { type: "hint_targets"; request_id: string; session_id: number; count: number };
+  | { type: "hint_targets"; request_id: string; session_id: number; count: number }
+  /** Queue this text behind the tab's running turn (phase 3 ruling 3, 5). Rust answers with a
+   *  `command_result`; a refusal never touches the box (the panel already sent it). */
+  | { type: "queue_message"; request_id: string; tab: TabId; text: string }
+  /** `↑` (phase 3 ruling 7): empty the tab's queue and hand its texts back as `queue_taken`. */
+  | { type: "take_back_queue"; request_id: string; tab: TabId }
+  /** `Ctrl+Enter` (phase 3 ruling 8): queue this text (if non-empty), then interrupt if a turn is
+   *  running, or flush at once if idle. */
+  | { type: "send_now"; request_id: string; tab: TabId; text: string }
+  /** The box's text, mirrored (phase 3 ruling 6). Rust answers nothing. */
+  | { type: "draft"; request_id: string; tab: TabId; text: string }
+  /** The scratch-editor round trip's draft half (spec §4.2, plan ruling 18): the box's text handed
+   *  to the nvim scratch buffer for editing with `Ctrl+g`. */
+  | { type: "edit_draft"; request_id: string; tab: TabId; text: string }
+  /** Append this typed text to the shared prompt history (phase 3 ruling 11), e.g. `Ctrl+c`'s clear. */
+  | { type: "history_push"; request_id: string; text: string }
+  /** `gf` on a path (phase 3 ruling 18, 19): open it in the scratch split, at `line` when given. */
+  | { type: "open_path"; request_id: string; path: string; line?: number }
+  /** `Ctrl+g` on a row (phase 3 ruling 18): show this text read-only in the scratch split. */
+  | { type: "view_in_editor"; request_id: string; title: string; text: string };
 
 /** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
  *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send
  *  one to -- adding a button for it here would produce a control that silently degrades to a plain
- *  allow. Widening this is a Verdandi protocol change first. */
+ *  allow. Widening this is a Verdandi protocol change first.
+ *
+ *  "Always allow" is not a third decision: it is `remember: true` on an `"allow"`, which Rust
+ *  honours only for a permission id it itself offered a rule for (phase 3 ruling 16). */
 export type PermissionDecision = "allow" | "deny";
 
 declare global {
@@ -111,7 +135,28 @@ type InboundHandler = (
     | { kind: "tab_detail"; tab: TabId; rows: DetailRow[] }
     | ({ kind: "chooser" } & ChooserEnvelope)
     | { kind: "confirm_close"; tab: TabId; lines: string[] }
-    | { kind: "begin_rename"; tab: TabId; current: string | null },
+    | { kind: "begin_rename"; tab: TabId; current: string | null }
+    /** This tab's queue, and its current refusal reason if the last flush was refused (phase 3
+     *  ruling 3). */
+    | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
+    /** Rust's mirror of the composer's own text (phase 3 ruling 6), sent only on a switch, `ready`,
+     *  a reset or a scratch-editor return -- never while the user is typing. */
+    | { kind: "draft"; tab: TabId; text: string }
+    /** Reply to `take_back_queue` (phase 3 ruling 7): the queue's texts, for the panel to merge into
+     *  the box itself. */
+    | { kind: "queue_taken"; tab: TabId; texts: string[] }
+    /** The shared prompt history (phase 3 ruling 11, 12), newest last. */
+    | { kind: "history"; entries: string[] }
+    /** Per pending card, the "always allow" rule it would install (phase 3 ruling 16), keyed by
+     *  permission id; a card with no entry offers no third button. */
+    | { kind: "rule_offers"; tab: TabId; offers: Record<string, string> }
+    /** V1's editor-context line (phase 3 ruling 32), window-scoped. */
+    | ({ kind: "editor_context" } & ContextSummary)
+    /** Whether the scratch-editor round trip currently has this tab's draft open in nvim (plan
+     *  ruling 18). */
+    | { kind: "scratch"; tab: TabId; editing: boolean }
+    /** The footer's transient line (phase 3 ruling 29), from Rust -- e.g. a `gf` refusal. */
+    | { kind: "notice"; text: string },
 ) => void;
 
 /** The handler's own payload type, exported so callers (`tabs.ts`'s `acceptsEnvelope`, `App.tsx`)
@@ -152,7 +197,15 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "tab_detail" ||
         obj.kind === "chooser" ||
         obj.kind === "confirm_close" ||
-        obj.kind === "begin_rename"
+        obj.kind === "begin_rename" ||
+        obj.kind === "queue" ||
+        obj.kind === "draft" ||
+        obj.kind === "queue_taken" ||
+        obj.kind === "history" ||
+        obj.kind === "rule_offers" ||
+        obj.kind === "editor_context" ||
+        obj.kind === "scratch" ||
+        obj.kind === "notice"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;

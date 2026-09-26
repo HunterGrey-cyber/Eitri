@@ -1312,6 +1312,12 @@ impl NeovideEditorPane {
         self.widget.queue_render();
     }
 
+    /// Whether nvim is up, so a host can refuse a request `send_keys` would drop (phase 3: the
+    /// scratch round trips answer "the editor is not ready yet" instead of doing nothing).
+    pub fn is_ready(&self) -> bool {
+        matches!(&*self.live_state.borrow(), LiveState::Ready(_))
+    }
+
     /// One grid cell's size in logical pixels (the unit GTK sizes and positions widgets in), or
     /// `None` before nvim is ready. For a host that moves a divider by whole cells.
     pub fn cell_size(&self) -> Option<(f64, f64)> {

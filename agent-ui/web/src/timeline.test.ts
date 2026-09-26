@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline, oldestPendingPermission } from "./timeline";
+import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { initialState } from "./reducer";
 import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage } from "./types";
 
@@ -28,6 +28,11 @@ function labels(s: AgentUiState): string[] {
         return `tool:${item.call.toolUseId}`;
       case "permission":
         return `perm:${item.request.permissionId}`;
+      case "run":
+        // `buildTimeline` itself never produces this kind -- only `display.ts`'s `buildDisplay`
+        // does, over `buildTimeline`'s own output -- but `TimelineItem`'s union includes it (Task
+        // 13, P2), so this switch has to name it too.
+        throw new Error("buildTimeline never produces a run item");
     }
   });
 }
@@ -217,5 +222,16 @@ describe("oldestPendingPermission (focus_permission's target)", () => {
 
   it("is null with no card pending", () => {
     expect(oldestPendingPermission(buildTimeline(state({ transcript: [msg(1, "hi")] })))).toBeNull();
+  });
+});
+
+describe("promptIndex (R4's [[ / ]])", () => {
+  it("walks to the previous or next prompt row, and stops (never wraps) at either end", () => {
+    const timeline = buildTimeline(state({ userPrompts: [{ seq: 1, text: "first" }, { seq: 5, text: "second" }], transcript: [msg(2, "a"), msg(3, "b"), msg(4, "c"), msg(6, "d")] }));
+    // [prompt(1), message(2), message(3), message(4), prompt(5), message(6)]
+    expect(promptIndex(timeline, 3, 1)).toBe(4);
+    expect(promptIndex(timeline, 4, 1)).toBeNull();
+    expect(promptIndex(timeline, 3, -1)).toBe(0);
+    expect(promptIndex(timeline, 0, -1)).toBeNull();
   });
 });

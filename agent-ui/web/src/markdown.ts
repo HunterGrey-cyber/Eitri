@@ -64,6 +64,18 @@ function escapeHtml(text: string): string {
   );
 }
 
+/** T1: a table scrolls sideways in its own box; the list never does (`eb22380`). Wrapped BEFORE the
+ *  sanitize, so DOMPurify still sees (and keeps) the wrapper. */
+function wrapTables(html: string): string {
+  return html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, "</table></div>");
+}
+
+let parses = 0;
+/** How many times `marked.parse` has run in this page (V3's measurement). */
+export function markdownParseCount(): number {
+  return parses;
+}
+
 /**
  * Markdown to HTML, highlighted and then sanitized — in that order, deliberately.
  *
@@ -74,7 +86,22 @@ function escapeHtml(text: string): string {
  * output on the page unchecked.
  *
  * One function, exported from one module, so no component can do half of this.
+ *
+ * V3 (ruling 33): memoized in a bounded, insertion-order-evicted cache. A `j` press re-renders the
+ * whole panel; before this, every visible message was re-parsed (marked + highlight.js +
+ * DOMPurify) on every press -- measured at 500 `marked.parse` calls per press over 500 messages
+ * (`perf.test.tsx`). The theme never changes this HTML (highlighting emits classes, colours come
+ * from CSS variables), so a cached string cannot go stale.
  */
+export const MARKDOWN_CACHE_LIMIT = 1000;
+const cache = new Map<string, string>();
+
 export function renderMarkdown(text: string): string {
-  return DOMPurify.sanitize(marked.parse(text) as string);
+  const hit = cache.get(text);
+  if (hit !== undefined) return hit;
+  parses += 1;
+  const html = DOMPurify.sanitize(wrapTables(marked.parse(text) as string));
+  if (cache.size >= MARKDOWN_CACHE_LIMIT) cache.delete(cache.keys().next().value as string);
+  cache.set(text, html);
+  return html;
 }

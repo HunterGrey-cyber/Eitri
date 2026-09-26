@@ -170,6 +170,7 @@ impl BackendKind {
 /// still healthy -- report it and carry on. Anything else means the session is gone and the panel
 /// must tear it down. Getting this wrong in the benign direction strands a dead session in the UI;
 /// getting it wrong the other way throws away a working conversation over a double-click.
+#[derive(Debug)]
 pub struct BackendError {
     pub message: String,
     pub benign: bool,
@@ -518,6 +519,13 @@ impl AgentBackend {
     /// rather than state on this enum because `AgentBackend` is an enum its own tests construct
     /// variant-by-variant, and a caller that forgets it does not compile.
     pub fn take_ui_delivery(&mut self, project_root: &Path) -> UiDelivery {
+        self.take_ui_delivery_with_rules(project_root, &agent::PrefixRules::default())
+    }
+
+    /// `take_ui_delivery`, with the project's D7 prefix rules (`agent::permission_rules`) applied by
+    /// the classifier. A rule can only replace the two "not on the read-only list" verdicts, never a
+    /// fail-closed one; see `agent::classify_with_rules`.
+    pub fn take_ui_delivery_with_rules(&mut self, project_root: &Path, rules: &agent::PrefixRules) -> UiDelivery {
         let delivery = match self {
             AgentBackend::Legacy(session) => {
                 let events = session.pump();
@@ -531,7 +539,7 @@ impl AgentBackend {
         };
         match delivery {
             UiDelivery::Events(events) => {
-                let kept = self.answer_what_needs_no_human(events, project_root);
+                let kept = self.answer_what_needs_no_human(events, project_root, rules);
                 if kept.is_empty() {
                     UiDelivery::Nothing
                 } else {
@@ -580,6 +588,7 @@ impl AgentBackend {
         &mut self,
         events: Vec<AgentDomainEvent>,
         project_root: &Path,
+        rules: &agent::PrefixRules,
     ) -> Vec<AgentDomainEvent> {
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
@@ -593,7 +602,7 @@ impl AgentBackend {
                 kept.push(event);
                 continue;
             };
-            let classification = agent::classify_permission_request(tool_name, input, project_root);
+            let classification = agent::classify_with_rules(tool_name, input, project_root, rules);
             if classification.needs_a_human() {
                 // The other half of the line below, added 2026-09-19 (later) because its absence
                 // cost a diagnosis: the owner reported auto mode still being a wall of popups, and
@@ -660,6 +669,13 @@ impl AgentBackend {
 /// `verdandi_rules` is absent because it is confirmed to behave identically to `interactive` in the
 /// current sidecar. A third button that does nothing different is a worse lie than a missing one.
 pub const CLIENT_IMPLEMENTED_PERMISSION_MODES: &[&str] = &["auto", "bypass"];
+
+/// Whether a session's permission mode can change after it starts (D6, keymap/tabs spec §4.1).
+/// `false` until Verdandi ships a `SetPermissionMode` RPC and a handshake capability for it (filed in
+/// Verdandi's own notes); the pinned protocol (`28a5e4c`) has neither. The
+/// panel reads it as `capabilities.modeSwitch` and hides every mode control while it is `false`.
+/// There is deliberately no reconnect or resume-in-another-mode fallback.
+pub const MODE_SWITCH_AVAILABLE: bool = false;
 
 /// Whether THIS CLIENT can drive a resume for a backend kind, before any provider exists.
 ///
@@ -1578,6 +1594,39 @@ mod tests {
             "a read outside the project must reach the user: {delivered:?}"
         );
         assert!(provider.resolutions().is_empty());
+        backend.shutdown();
+    }
+
+    /// D7 through the backend, not only the policy: a rule reaches the one point both backends
+    /// converge, and a compound command with a matching first word still reaches the user.
+    #[test]
+    fn a_project_rule_answers_a_bash_call_and_never_a_compound_one() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
+        for (id, command) in [("perm-rule", "npm ci"), ("perm-compound", "npm ci && rm -rf .")] {
+            provider.queue(AgentDomainEvent::PermissionRequested {
+                permission_id: id.into(),
+                tool_use_id: None,
+                tool_name: "Bash".into(),
+                input: serde_json::json!({ "command": command }),
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let delivered = loop {
+            match backend.take_ui_delivery_with_rules(&dir, &rules) {
+                UiDelivery::Events(events) => break events,
+                _ => {
+                    assert!(std::time::Instant::now() < deadline, "nothing was delivered");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        };
+        assert_eq!(provider.resolutions(), vec![("perm-rule".to_string(), true)]);
+        assert!(delivered.iter().any(|e| matches!(e,
+            AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "perm-compound")));
         backend.shutdown();
     }
 

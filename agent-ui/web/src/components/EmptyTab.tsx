@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
 import type { KeyboardEvent } from "react";
-import type { HandoffCommand, Hello, TabInfo } from "../types";
+import type { ContextSummary, HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
 import type { PanelMode } from "../keymap";
 import { Composer } from "./Composer";
 import type { RestoredDraft } from "./Composer";
 import { HandoffCommandCard } from "./TerminalHandoff";
+import { QueueLines } from "./QueueLines";
+import { ContextLine } from "./ContextLine";
 import { Row } from "./Row";
 import { SessionRowText } from "./SessionRow";
-import { modePill } from "../tabs";
 import { controlsOf, nextStop } from "../nav";
 
 /** Resume rows under the fresh prompt (spec §3.6: "up to 8"). The chooser (`prefix w`) lists all. */
@@ -34,6 +35,34 @@ export type EmptyTabProps = {
    *  agree: called first, and if it returns `true` this component's own key handling stops there.
    *  Optional so a caller with no window (this component's own tests) needs no stand-in. */
   answerConfirm?: (event: KeyboardEvent<HTMLDivElement>) => boolean;
+  /** Phase 3: this tab's own queue and prompt-history plumbing, threaded through to `Composer` --
+   *  see that component's own props of the same names. `running` is this tab's own `starting`, not
+   *  a turn: a `NotStarted`/`starting` tab has no turn yet, but starting is still not "idle" (the
+   *  box queues behind the connect rather than lazily starting a second session). No `onInterrupt`
+   *  here -- there is no live turn to interrupt while merely connecting, so `Composer`'s Ctrl+c
+   *  branch for a running box is inert (the draft stays put, which is harmless).
+   *
+   *  `Composer` DOES need something wired to `onSendNow`, though (fix round 1, reviewer finding):
+   *  its `submit()` clears the box on the `now` branch unconditionally, whether or not `onSendNow`
+   *  did anything, so leaving it as the default no-op silently threw away whatever the user typed
+   *  on Ctrl+Enter. A starting tab has no turn to send to "now" either, so it falls back to the same
+   *  effect as `onQueue` below, guarded against an empty box (`queue_message` has no such guard of
+   *  its own and would happily queue a blank entry). */
+  onQueue?: (text: string) => void;
+  history?: string[];
+  queueCount?: number;
+  /** The queue and V1's editor-context line, shown above the composer the same way the live
+   *  conversation shows them (Task 9): a `starting` tab can already have queued behind its own
+   *  connect (C1), and the editor context is window-wide, not gated on a session existing. */
+  queue?: QueueItem[];
+  queueError?: string | null;
+  editorContext?: ContextSummary | null;
+  onTakeBackQueue?: () => void;
+  queueTaken?: { texts: string[]; seq: number } | null;
+  onHistoryPush?: (text: string) => void;
+  onEditInNvim?: (text: string) => void;
+  editingInNvim?: boolean;
+  onOpenKeymap?: () => void;
 };
 
 /** An empty session tab: Claude Code's fresh prompt (spec §3.6, F3). The composer is live in INPUT;
@@ -62,11 +91,12 @@ export function EmptyTab(props: EmptyTabProps) {
       props.onCycleMode();
       return;
     }
-    // Once the composer is disabled (starting or failed) there is nothing left to type into, so
-    // `mode` staying "input" must not swallow the keys the disabled screen still offers -- `r` on a
-    // failed tab, `f` for HINT, `y` to copy a handoff command -- the same reasoning `Composer`'s own
-    // doc comment gives for a dead session's INPUT being an empty mode.
-    if (mode === "input" && !starting && !failed) return;
+    // Once the composer is disabled (failed) there is nothing left to type into, so `mode` staying
+    // "input" must not swallow the keys the disabled screen still offers -- `r` on a failed tab, `f`
+    // for HINT, `y` to copy a handoff command -- the same reasoning `Composer`'s own doc comment
+    // gives for a dead session's INPUT being an empty mode. A `starting` tab's composer is live now
+    // (C1: it queues behind the connect), so it is no longer exempted here.
+    if (mode === "input" && !failed) return;
     const root = event.currentTarget;
     if (event.key === "j" || event.key === "k") {
       event.preventDefault();
@@ -102,21 +132,33 @@ export function EmptyTab(props: EmptyTabProps) {
           Starting the agent backend… The first start on a fresh Verdandi checkout also builds the sidecar.
         </p>
       )}
+      <QueueLines items={props.queue ?? []} error={props.queueError ?? null} />
+      <ContextLine context={props.editorContext ?? null} />
       <Composer
-        disabled={starting || failed}
+        disabled={failed}
         sessionEnded={failed}
         closing={false}
         restoredDraft={props.restoredDraft}
         mode={mode}
         focusRequest={props.focusRequest}
-        hintTarget={!(starting || failed)}
+        hintTarget={!failed}
         onModeChange={setMode}
         onSend={props.onSend}
         onDraftChange={props.onDraftChange}
+        running={starting}
+        onQueue={props.onQueue}
+        onSendNow={(text) => {
+          if (text.trim() !== "") props.onQueue?.(text);
+        }}
+        history={props.history}
+        queueCount={props.queueCount}
+        onTakeBackQueue={props.onTakeBackQueue}
+        queueTaken={props.queueTaken}
+        onHistoryPush={props.onHistoryPush}
+        onEditInNvim={props.onEditInNvim}
+        editingInNvim={props.editingInNvim}
+        onOpenKeymap={props.onOpenKeymap}
       />
-      <div className="mode-pill" data-testid="mode-pill">
-        {modePill(tab.mode, false)}
-      </div>
       {rows.length > 0 && (
         <div className="empty-tab-resume" aria-label="Resume a session">
           {rows.map((session) => (

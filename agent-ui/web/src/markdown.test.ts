@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { renderMarkdown } from "./markdown";
+import { MARKDOWN_CACHE_LIMIT, markdownParseCount, renderMarkdown } from "./markdown";
 
 describe("renderMarkdown", () => {
   it("highlights a fenced block in a language it knows", () => {
@@ -34,5 +34,21 @@ describe("renderMarkdown", () => {
     // is the one test in this file that pins the ORDER, not just that sanitizing happens at all.
     const html = renderMarkdown("[x](javascript:alert(1))");
     expect(html).not.toContain("javascript:");
+  });
+
+  it("wraps a table in its own sideways scroller (T1)", () => {
+    const html = renderMarkdown("| a | b |\n|---|---|\n| 1 | 2 |");
+    expect(html).toMatch(/<div class="table-scroll"><table>[\s\S]*<\/table><\/div>/);
+  });
+
+  it("parses a text once and serves the rest from a bounded cache (V3)", () => {
+    const before = markdownParseCount();
+    const a = renderMarkdown("once **only**");
+    expect(renderMarkdown("once **only**")).toBe(a);
+    expect(markdownParseCount() - before).toBe(1);
+    for (let i = 0; i < MARKDOWN_CACHE_LIMIT + 5; i++) renderMarkdown(`filler ${i}`);
+    const again = markdownParseCount();
+    renderMarkdown("once **only**");
+    expect(markdownParseCount() - again, "the oldest entry was evicted").toBe(1);
   });
 });

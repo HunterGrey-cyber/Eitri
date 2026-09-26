@@ -997,6 +997,13 @@ describe("index.css", () => {
     expect(keyframeDeclarations(unterminated).filter((d) => !d.startsWith("transform:"))).toEqual(["opacity: 1"]);
     expect((unterminated.match(/[a-z-]+:[^;]*;/g) ?? []).filter((d) => !d.startsWith("transform:"))).toEqual([]);
   });
+
+  /** Defect 4 (phase 2's sandbox pass): a label cut with `…` followed by the working marker read `……`. */
+  it("marks a working tab with a separated glyph that is not an ellipsis", () => {
+    const rules = splitRules(withoutComments).filter((r) => r.selector.trim() === ".tab-working::after");
+    expect(rules).toHaveLength(1);
+    expect(rules[0].declarations).toMatch(/content:\s*" ✻"/);
+  });
 });
 
 /**
@@ -1140,6 +1147,12 @@ describe("index.css cascade (which rule actually wins)", () => {
     for (const bar of [".activity-line", ".status-row", ".panel-footer"]) {
       expect(computed(markup, bar).zIndex).toBe("auto");
     }
+  });
+
+  it("puts the R2 pill inside the list's own region", () => {
+    const markup = `<div class="agent-ui-scroller"><div class="message-list">m</div><button class="new-pill">↓</button></div>`;
+    expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
+    expect(computed(markup, ".new-pill").position).toBe("absolute");
   });
 
   it("does not dim the which-key strip with opacity", () => {
@@ -2223,6 +2236,31 @@ describe("index.css cascade (which rule actually wins)", () => {
     );
     expect(clobbered.borderLeftColor).toBe("var(--nv-mode-input)");
   });
+
+  it("gives the composer the panel's own font and caps its growth", () => {
+    const box = computed(`<div class="composer"><textarea></textarea></div>`, ".composer textarea");
+    expect(box.fontFamily).not.toMatch(/-webkit-small-control/);
+    // jsdom resolves `40vh` against `window.innerHeight` rather than reporting the token verbatim
+    // (unlike a `var()`, which every other test in this file checks unresolved) -- deviation from
+    // the brief's literal `toBe("40vh")`, recorded in the task report. `parseFloat`, not a string
+    // comparison against `window.innerHeight * 0.4`: the two float multiplications round
+    // differently (`307.2` here vs `307.20000000000005` in plain JS arithmetic).
+    expect(box.maxHeight.endsWith("px")).toBe(true);
+    expect(Number.parseFloat(box.maxHeight)).toBeCloseTo(window.innerHeight * 0.4, 5);
+    expect(box.overflowY).toBe("auto");
+    const reason = computed(`<div class="permission-card"><input type="text"></div>`, ".permission-card input");
+    expect(reason.lineHeight).toBe("1.4");
+  });
+
+  /** Defect 3 (phase 2's sandbox pass): at ~348px beside a Lua panel the empty tab scrolled
+   *  sideways -- `width: 100%` plus 48px of padding in a content-box. */
+  it("keeps the empty tab inside its column", () => {
+    const tab = computed(`<div class="agent-ui-root"><div class="empty-tab">x</div></div>`, ".empty-tab");
+    expect(tab.boxSizing).toBe("border-box");
+    expect(tab.minWidth).toBe("0px");
+    const title = computed(`<div class="empty-tab-resume"><strong class="session-title">t</strong></div>`, ".session-title");
+    expect(title.overflowWrap).toBe("anywhere");
+  });
 });
 
 /**
@@ -2293,6 +2331,9 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
       renderMarkdown("```rust\nfn main() {}\n```"),
       renderToStaticMarkup(card("Bash", { command: "cargo test" })),
       renderToStaticMarkup(card("Edit", { file_path: "/p/a.rs", old_string: "a\n", new_string: "b\n" })),
+      // Task 14 (P4): a Bash card now renders `.permission-card-command`, not `.permission-card-input`
+      // -- this row is what keeps the raw-JSON class in the fixture, for a tool with no dedicated view.
+      renderToStaticMarkup(card("mcp__demo__lookup", { k: "v" })),
     ];
     document.head.innerHTML = `<style>${css}${extraCss}</style>`;
     document.body.innerHTML =
@@ -2319,7 +2360,15 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     // The fixture really holds all six, so a renderer that stopped emitting one cannot pass by absence.
     const kinds = pres.map((pre) => pre.className || "(no class)").sort();
     expect(kinds).toEqual(
-      ["(no class)", "code-block", "permission-card-diff", "permission-card-input", "tool-card tool-card-bash", "tool-result-body"].sort(),
+      [
+        "(no class)",
+        "code-block",
+        "permission-card-command",
+        "permission-card-diff",
+        "permission-card-input",
+        "tool-card tool-card-bash",
+        "tool-result-body",
+      ].sort(),
     );
     for (const pre of pres) {
       expect({ pre: pre.className || pre.parentElement?.className, how: containment(pre) }).not.toMatchObject({ how: null });
@@ -2327,6 +2376,15 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     // Negative control: the `Bash` command's own rule taken away is exactly the GUI pass's defect.
     const bash = panelPres(".tool-card-bash { white-space: pre; }").find((pre) => pre.classList.contains("tool-card-bash"))!;
     expect(containment(bash)).toBeNull();
+  });
+
+  it("scrolls a markdown table in its own box and keeps its words whole (T1)", () => {
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = `<div class="message-list"><div class="row"><div class="row-body">${renderMarkdown("| a | b |\n|---|---|\n| supercalifragilistic | 2 |")}</div></div></div>`;
+    const wrapper = document.querySelector<HTMLElement>(".table-scroll")!;
+    expect(winningDeclarationOn(wrapper, "overflow-x")).toBe("auto");
+    const cell = document.querySelector<HTMLElement>(".table-scroll td")!;
+    expect(winningDeclarationOn(cell, "overflow-wrap")).toBe("normal");
   });
 });
 

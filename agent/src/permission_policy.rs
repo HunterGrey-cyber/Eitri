@@ -204,6 +204,15 @@ pub const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
 /// read-only command. Reproduced rather than reasoned about.
 pub const MAX_BASH_COMMAND_LEN: usize = 10_000;
 
+/// The two fixed reasons a prefix rule (`crate::permission_rules`) may replace, and nothing else.
+/// Both are returned by `classify_bash` only after every syntax, path, symlink, link-following, `cd`,
+/// `git --output` and `find` action check has already passed (ruling 15 of the phase 3 plan).
+pub const REASON_NOT_ON_READ_ONLY_LIST: &str = "this command is not on the CLI's read-only list";
+pub const REASON_GIT_SUBCOMMAND_NOT_READ_ONLY: &str = "this git subcommand is not one of the read-only forms";
+pub const REPLACEABLE_BY_A_RULE: &[&str] = &[REASON_NOT_ON_READ_ONLY_LIST, REASON_GIT_SUBCOMMAND_NOT_READ_ONLY];
+/// The allow a rule produces, logged by `take_ui_delivery` like every other auto-answer.
+pub const REASON_ALLOWED_BY_A_PROJECT_RULE: &str = "a prefix rule the user approved for this project";
+
 /// Characters that end the analysis and send the call to a card.
 ///
 /// This is not a claim that each one is dangerous. It is a claim that a command containing one
@@ -251,6 +260,25 @@ const GIT_ARGUMENT_PREFIXES_THAT_WRITE: &[&str] = &["--output"];
 pub fn classify_permission_request(tool_name: &str, input: &Value, project_root: &Path) -> Classification {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     classify_with_home(tool_name, input, project_root, home.as_deref())
+}
+
+/// [`classify_permission_request`], then the project's prefix rules -- in that order, always. A rule
+/// turns an ask into an allow only when the ask's reason is in [`REPLACEABLE_BY_A_RULE`]; every
+/// other verdict, allow or ask, is returned unchanged.
+pub fn classify_with_rules(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+) -> Classification {
+    let classification = classify_permission_request(tool_name, input, project_root);
+    if classification.needs_a_human()
+        && REPLACEABLE_BY_A_RULE.contains(&classification.reason)
+        && rules.matches(tool_name, input)
+    {
+        return allow(REASON_ALLOWED_BY_A_PROJECT_RULE);
+    }
+    classification
 }
 
 /// [`classify_permission_request`] with the home directory passed in rather than read from the
@@ -462,7 +490,7 @@ fn classify_bash(input: &Value, root: &Path) -> Classification {
                 ask("this git call carries an option that writes a file")
             }
             Some(sub) if READ_ONLY_GIT_SUBCOMMANDS.contains(sub) => allow("a read-only git subcommand"),
-            _ => ask("this git subcommand is not one of the read-only forms"),
+            _ => ask(REASON_GIT_SUBCOMMAND_NOT_READ_ONLY),
         },
         "find"
             if arguments
@@ -475,7 +503,7 @@ fn classify_bash(input: &Value, root: &Path) -> Classification {
         other if READ_ONLY_BASH_COMMANDS.contains(&other) => {
             allow("a read-only command from the CLI's own list, with no shell syntax")
         }
-        _ => ask("this command is not on the CLI's read-only list"),
+        _ => ask(REASON_NOT_ON_READ_ONLY_LIST),
     }
 }
 
@@ -1128,6 +1156,163 @@ mod tests {
         assert_eq!(
             classify("TodoWrite", json!({ "todos": [] }), ws.path(), ws.path()),
             PermissionVerdict::AllowWithoutAsking
+        );
+    }
+
+    // ---- prefix rules (D7) ------------------------------------------------------------------------
+
+    use crate::permission_rules::{PrefixRule, PrefixRules};
+
+    /// Both rules a person could plausibly have made from `command`: its first word, and its first
+    /// two words. The strongest rule set that could apply to it.
+    fn rules_for(command: &str) -> PrefixRules {
+        let words: Vec<&str> = command.split_whitespace().collect();
+        let mut rules = PrefixRules::default();
+        for n in 1..=words.len().min(2) {
+            if let Some(rule) = PrefixRule::parse(&format!("Bash({} *)", words[..n].join(" "))) {
+                rules = rules.with(rule);
+            }
+        }
+        rules
+    }
+
+    /// Review focus 2 (spec §4.5: "every existing card-producing test is re-run with a matching rule
+    /// present and must still card"). The corpus is every card-producing `Bash` input this module's
+    /// tests use, copied here verbatim, against a workspace with the same links those tests make.
+    #[test]
+    fn no_rule_ever_turns_a_card_the_classifier_refused_on_syntax_or_paths_into_an_allow() {
+        let ws = Workspace::new();
+        let outside = std::env::temp_dir().join(format!("agent-policy-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.path().join("escape")).unwrap();
+        std::os::unix::fs::symlink(ws.path().join("nowhere"), ws.path().join("dangling")).unwrap();
+        let long = format!("ls {}", "a".repeat(MAX_BASH_COMMAND_LEN));
+        let corpus: Vec<&str> = vec![
+            "echo hi > c.txt",
+            "echo hi >> c.txt",
+            "cat < a.txt",
+            "ls | tee out.txt",
+            "ls && rm -rf .",
+            "ls; rm -rf .",
+            "echo $(rm -rf .)",
+            "echo `rm -rf .`",
+            "ls *.rs",
+            "cat 'a b.txt'",
+            "ls ~",
+            "ls \\\n -l",
+            "ls & ",
+            "cat /etc/hostname",
+            "ls ../..",
+            "grep -r x ../other",
+            "find . -delete",
+            "find . -exec rm -rf . +",
+            "find . -fprint out.txt",
+            "git log --output=/home/someone/.bashrc",
+            "git show --output=src/main.rs",
+            "git log --output o3.txt",
+            "git diff --output out.patch",
+            "diff --from-file=/home/someone/.ssh/id_ed25519 README.md",
+            "git blame --contents=/etc/hostname src/main.rs",
+            "grep -f/etc/hostname src/main.rs",
+            "diff --from-file=src/main.rs src/main.rs",
+            "find . -maxdepth 0 -fprint0 src/main.rs",
+            "find . -fprintf out.txt x",
+            "find . -fls out.txt",
+            "find . -execdir ls +",
+            "find . -okdir ls +",
+            "cat escape/secret",
+            "head escape/secret",
+            "ls escape",
+            "cat dangling",
+            "grep -fescape src/main.rs",
+            "wc -l escape/secret",
+            "grep -R token .",
+            "grep -rR token .",
+            "grep --dereference-recursive token .",
+            "grep --deref token .",
+            "find -L . -name secret",
+            "find . -follow -name secret",
+            "ls -RL",
+            "du -L .",
+            "du --dereference .",
+            "diff -r src src",
+            "diff -ur src src",
+            "diff --recursive src src",
+            "cd",
+            "cd src",
+            "cd .",
+            &long,
+        ];
+        for command in corpus {
+            let input = json!({ "command": command });
+            let plain = classify_permission_request("Bash", &input, ws.path());
+            assert!(plain.needs_a_human(), "the corpus is card-producing: `{command}`");
+            let with_rules = classify_with_rules("Bash", &input, ws.path(), &rules_for(command));
+            assert_eq!(
+                with_rules, plain,
+                "a rule changed a fail-closed verdict for `{command}`"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The positive control, without which the test above proves nothing: the commands the classifier
+    /// refuses only because their first word is not on a read-only list DO become allows.
+    #[test]
+    fn a_matching_rule_allows_what_was_refused_only_for_its_first_words() {
+        let ws = Workspace::new();
+        for command in [
+            "rm b.txt",
+            "mv a b",
+            "npm ci",
+            "python script.py",
+            "git commit -m probe",
+            "git push",
+            "uname -a",
+        ] {
+            let input = json!({ "command": command });
+            assert!(
+                classify_permission_request("Bash", &input, ws.path()).needs_a_human(),
+                "`{command}`"
+            );
+            let decided = classify_with_rules("Bash", &input, ws.path(), &rules_for(command));
+            assert_eq!(decided.verdict, PermissionVerdict::AllowWithoutAsking, "`{command}`");
+            assert_eq!(decided.reason, REASON_ALLOWED_BY_A_PROJECT_RULE);
+        }
+        // A rule for other words changes nothing.
+        let other = PrefixRules::default().with(PrefixRule::parse("Bash(cargo test *)").unwrap());
+        assert!(classify_with_rules("Bash", &json!({ "command": "rm b.txt" }), ws.path(), &other).needs_a_human());
+        // No rule ever reaches another tool, even one the classifier cards.
+        let all = PrefixRules::default().with(PrefixRule::parse("Bash(src *)").unwrap());
+        assert!(classify_with_rules("Write", &json!({ "file_path": "src/main.rs" }), ws.path(), &all).needs_a_human());
+    }
+
+    /// Only the offer the card may show: a rule for a command it would allow, none for one it would
+    /// not change (ruling 16).
+    #[test]
+    fn a_card_is_offered_a_rule_only_where_one_would_take_effect() {
+        let ws = Workspace::new();
+        let offer = |command: &str| crate::permission_rules::offer("Bash", &json!({ "command": command }), ws.path());
+        assert_eq!(
+            offer("git push origin main").map(|r| r.display()),
+            Some("git push *".to_string())
+        );
+        assert_eq!(
+            offer("cargo test --lib").map(|r| r.display()),
+            Some("cargo test *".to_string())
+        );
+        assert_eq!(
+            offer("git log --output o3.txt"),
+            None,
+            "a writing option: no rule changes that"
+        );
+        assert_eq!(offer("ls && rm -rf ."), None, "compound: no rule changes that");
+        assert_eq!(offer("cat /etc/hostname"), None, "outside the root");
+        assert_eq!(offer("ls"), None, "already allowed");
+        assert_eq!(
+            crate::permission_rules::offer("Write", &json!({ "file_path": "a" }), ws.path()),
+            None
         );
     }
 }

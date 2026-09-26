@@ -120,3 +120,58 @@ describe("PermissionCard on a session that has ended", () => {
     );
   });
 });
+
+describe("P4: the Bash card", () => {
+  it("shows the command as a shell line with real newlines, and its description", () => {
+    const { container } = render(
+      <PermissionCard
+        request={{ ...REQUEST, input: { command: 'git commit -m "one\ntwo"', description: "Commit the fix" } }}
+        sessionEnded={false}
+        onAnswer={vi.fn()}
+      />,
+    );
+    expect(container.querySelector("pre.permission-card-command")!.textContent).toBe('$ git commit -m "one\ntwo"');
+    expect(container.querySelector(".permission-card-description")!.textContent).toBe("Commit the fix");
+    expect(container.querySelector(".permission-card-input")).toBeNull();
+  });
+
+  it("keeps JSON for a tool it has no view for", () => {
+    const { container } = render(<PermissionCard request={{ ...REQUEST, toolName: "mcp__x__y", input: { k: "v" } }} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(container.querySelector(".permission-card-input")!.textContent).toContain('"k": "v"');
+  });
+});
+
+describe("P5 and D7", () => {
+  it("denies with the reason on Enter in the reason box", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
+    const reason = container.querySelector<HTMLInputElement>("input")!;
+    fireEvent.change(reason, { target: { value: "not the whole disk" } });
+    fireEvent.keyDown(reason, { key: "Enter" });
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "not the whole disk");
+  });
+
+  /** Review focus 3. */
+  it("enter_in_the_reason_box_while_composing_does_not_deny", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
+    const reason = container.querySelector<HTMLInputElement>("input")!;
+    fireEvent.keyDown(reason, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(reason, { key: "Enter", keyCode: 229 });
+    expect(onAnswer).not.toHaveBeenCalled();
+  });
+
+  it("offers Always allow only with a rule from Rust, third for l, and sends remember", () => {
+    const onAnswer = vi.fn();
+    const without = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
+    expect(without.container.textContent).not.toContain("Always allow");
+    without.unmount();
+    const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} ruleOffer="git push *" />);
+    const always = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.startsWith("Always allow"))!;
+    expect(always.textContent).toBe("Always allow git push * in this project");
+    expect(always.getAttribute("data-nav-order")).toBe("3");
+    expect(container.querySelector("input")!.getAttribute("data-nav-order")).toBe("4");
+    fireEvent.click(always);
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, true);
+  });
+});

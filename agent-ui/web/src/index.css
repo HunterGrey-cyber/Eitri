@@ -58,6 +58,22 @@ body,
   min-height: 0;
 }
 
+/* R2: bottom edge of the list's region (`.agent-ui-scroller` is positioned), centred, above the rows. */
+.new-pill {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--nv-cursorline);
+  color: var(--nv-fg);
+  border: 1px solid var(--nv-border);
+  border-radius: 12px;
+  padding: 2px 10px;
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
 /* The empty tab (F3, session tabs Task 9): Claude Code's fresh prompt, replacing the old
    `.mode-selector` start screen. The mode-selector's own boxed Auto/Bypass buttons are gone with
    it -- there is no second `:not(.row-choice)` rule to keep in step, since this screen never draws
@@ -68,6 +84,16 @@ body,
   width: 100%;
   text-align: center;
   outline: none;
+  /* Defect 3 (phase 2's sandbox pass): `width: 100%` plus 24px padding each side, in the default
+     content-box, overflowed a narrow column (beside a Lua panel, ~348px). `border-box` folds the
+     padding into the 100%, and `min-width: 0` lets a flex/grid ancestor actually shrink it instead
+     of holding it to its content's own min-content width. */
+  box-sizing: border-box;
+  min-width: 0;
+}
+.empty-tab-resume .session-title,
+.empty-tab-resume .detail {
+  overflow-wrap: anywhere;
 }
 
 /* tmux's window list (session tabs spec §3.3): one row, shown only with two or more tabs or while
@@ -109,8 +135,11 @@ body,
    animated -- `.turn-activity .meter-fill` is the one animated element in this stylesheet
    (`indexCss.test.ts`), and a second, per-tab motion would either duplicate that guarantee or
    escape it. The active tab's own turn is shown by `ActivityLine` instead. */
+/* Defect 4 (phase 2's sandbox pass): a label cut with `…` (the tab's own name-truncation) followed
+   by this marker read `……`, two ellipses run together with no visual break. Separated, and not an
+   ellipsis itself, so it can never repeat that collision. */
 .tab-working::after {
-  content: "…";
+  content: " ✻";
 }
 .tab-rename {
   font: inherit;
@@ -122,6 +151,18 @@ body,
   color: var(--nv-fg);
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
+}
+/* R4's `/` prompt (ruling 25): vim's own command line, in the same footer slot. */
+.search-bar {
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
+}
+.search-bar input {
+  font: inherit;
+  background: none;
+  border: 0;
+  color: var(--nv-fg);
+  width: 24ch;
 }
 
 /* The activity line (only while a turn runs, directly above the composer), the status row
@@ -150,6 +191,57 @@ body,
 .activity-line {
   /* Never two lines: see the in-flight indicator's own comment further down. */
   white-space: nowrap;
+}
+/* P1 (ruling 26): the interrupt-key reminder, or a card that waits, in the activity line's own
+   slot. `.activity-card` is deliberately readable text (`--nv-fg`), not muted like the reminder it
+   replaces -- a card holding the queue is worth noticing, the reminder is not. */
+.activity-card,
+.activity-keys,
+.footer-hint,
+.footer-flash {
+  color: var(--nv-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.activity-card,
+.footer-flash {
+  color: var(--nv-fg);
+}
+/* N2: a path `gf`/a click can open -- the tool registry's own spans and a diff's own path line
+   share this class (`.path-link`); an inline code span in an assistant reply is a click target too,
+   without a class of its own, since not every inline `code` is a path. `.path-pick` is the footer's
+   letter-per-path list while a `gf` with several paths waits for one (ruling 19). */
+.path-link {
+  text-decoration: underline;
+  text-decoration-color: var(--nv-muted);
+  cursor: pointer;
+}
+.row-assistant code:not(pre code) {
+  cursor: pointer;
+}
+.path-pick {
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
+}
+/* The queued lines and V1's context line (phase 3 ruling 1, 32): muted, one line each, directly
+   above the composer in both layouts. */
+.queue-lines,
+.context-line {
+  padding: 0 12px;
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.queue-line,
+.context-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-error {
+  color: var(--nv-fg);
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
 }
 /* A button styled as a plain text row (session tabs spec §3.3): `Enter` on it, and a click, both
    open the detail popover -- see `StatusRow.tsx`. Body prose, deliberately not `--nv-font-mono`/
@@ -360,6 +452,18 @@ body,
    two cues must not fight each other for the same 2px border. */
 .row-current {
   background: var(--nv-cursorline);
+}
+/* N3: the row `y`/`Y` just copied, flashed for 400ms (`App.tsx`'s `copied`, codecompanion's yank
+   flash) so a keypress with no visible result of its own still tells the reader something happened.
+   **Correction (fix round 1):** `y`/`Y` always act on `timeline[cursor]` (`App.tsx`), so the row
+   this class lands on already carries `.row-current`'s cursorline fill -- painting the identical
+   `background: var(--nv-cursorline)` again is a no-op the reader never sees. An inset outline in
+   `--nv-ok` (already an admitted non-text colour, the same token `.row-tool[data-sign="✓"]` below
+   uses for a successful tool row) reads as "copied" and stays visible on top of the cursorline fill,
+   with no new token and no new text-colour-guard exemption. */
+.row-yanked {
+  outline: 2px solid var(--nv-ok);
+  outline-offset: -2px;
 }
 .row-sign {
   font-family: var(--nv-font-mono);
@@ -580,6 +684,27 @@ body,
   border-left-color: var(--nv-ok);
   font-style: italic;
 }
+/* T1: a table scrolls in its own box, cells never break mid-word; the list never scrolls sideways
+   (see `.message-list: nothing scrolls it sideways` below, which this joins). */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.table-scroll th,
+.table-scroll td {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+/* P2: ToolSearch's line, and a collapsed run, recede -- neither is an action waiting on you. */
+.tool-card-muted,
+.tool-card-run {
+  color: var(--nv-muted);
+}
+/* P4: a gated call's own line stays full-strength text (unlike the muted rows above) -- it is not
+   receding, it is the reason a card is on screen at all. */
+.tool-card-gated {
+  color: var(--nv-fg);
+}
 /* A `Bash` call's command is a `<pre>` (`toolRegistry.tsx`), and a `<pre>` keeps the UA's
    `white-space: pre` -- no wrapping at all, not even at its spaces -- so a long command was the
    GUI pass's case of the whole conversation scrolling sideways (see `.message-list`). It wraps like
@@ -671,6 +796,18 @@ body,
   width: max(100%, calc(var(--row-inline-size) - var(--row-gutter)));
   margin-left: -11px;
 }
+/* P4: the `Bash` card's own command line -- Claude Code's `Command:`, real newlines and all, wrapped
+   rather than scrolled sideways (unlike the JSON `<pre>` above, which stays a single unbroken block
+   the reader may want to copy byte-for-byte). */
+.permission-card-command {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+}
+.permission-card-description {
+  color: var(--nv-muted);
+}
 .permission-card-buttons button {
   margin-right: 8px;
 }
@@ -723,6 +860,49 @@ body,
   border-radius: 4px;
   padding: 8px;
   cursor: text;
+}
+/* C2: the unsent draft, previewed like the greyed-out text it stands in for, never the panel's own
+   fill or a bubble -- see `.row-prompt`'s own comment for why a prompt is never boxed here. */
+.composer-draft {
+  white-space: pre-wrap;
+}
+.composer-queued {
+  margin-left: auto;
+  padding-left: 8px;
+}
+
+/* C3: the composer uses the panel's own face and scale (WebKitGTK's UA sheet gives form controls
+   `font: -webkit-small-control` otherwise), and grows to its content up to 40% of the panel --
+   `Composer`'s layout effect sets the height; this is the backstop. */
+.composer textarea,
+.permission-card input,
+.tab-rename,
+.history-search input {
+  font: inherit;
+  font-size: var(--fs-base);
+  line-height: 1.4;
+}
+.composer textarea {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.history-search {
+  flex: 0 0 100%;
+  display: flex;
+  gap: 0;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.history-search input {
+  background: none;
+  border: 0;
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  width: 16ch;
+}
+.history-search-match {
+  color: var(--nv-fg);
 }
 
 /* --- Phase 3: backend-aware start screen, identities, and in-panel errors ------------------- */
