@@ -1015,8 +1015,6 @@ impl TabSet {
     }
 }
 
-/// Recomputes `rule_offers` when the set of pending permission ids changed; `true` if the offers did.
-/// Only `projection()` is read, once, and released before anything else is touched.
 /// The tab's choice for a mode a provider reported. Only the reverse `From` exists
 /// (`agent_bridge`), and this one is needed only by the pump.
 fn choice_of(mode: agent::PermissionMode) -> SessionModeChoice {
@@ -1026,6 +1024,8 @@ fn choice_of(mode: agent::PermissionMode) -> SessionModeChoice {
     }
 }
 
+/// Recomputes `rule_offers` when the set of pending permission ids changed; `true` if the offers did.
+/// Only `projection()` is read, once, and released before anything else is touched.
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
     let Some(backend) = tab.live() else {
         let had = !tab.rule_offers.is_empty();

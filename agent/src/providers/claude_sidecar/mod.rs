@@ -321,13 +321,6 @@ impl ClaudeSidecarProvider {
         Ok(response.session_id)
     }
 
-    /// Refuses a permission policy the live handshake does not advertise.
-    ///
-    /// The mode reaches here from a choice made on the start screen, before any provider existed --
-    /// so the offer there is what this CLIENT implements, and this is the server half of the same
-    /// two-term check `resume` already uses. Failing loudly is the whole point: the alternative,
-    /// mapping an unsupported mode onto whatever the provider does support, would start an agent
-    /// under a permission policy the user did not pick and would not be told about.
     /// `finish_start` against this sidecar: the switch to bypass and the close are the real RPCs.
     fn complete_start(&self, session_id: String, switch_after: bool) -> Result<String, ProviderError> {
         finish_start(
@@ -347,6 +340,13 @@ impl ClaudeSidecarProvider {
         )
     }
 
+    /// Refuses a permission policy the live handshake does not advertise.
+    ///
+    /// The mode reaches here from a choice made on the start screen, before any provider existed --
+    /// so the offer there is what this CLIENT implements, and this is the server half of the same
+    /// two-term check `resume` already uses. Failing loudly is the whole point: the alternative,
+    /// mapping an unsupported mode onto whatever the provider does support, would start an agent
+    /// under a permission policy the user did not pick and would not be told about.
     fn require_permission_mode(&self, mode: PermissionMode) -> Result<(), ProviderError> {
         if self.capabilities.supports_permission_mode(mode) {
             return Ok(());

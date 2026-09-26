@@ -195,8 +195,9 @@ pub enum AgentDomainEvent {
     SessionClosed {
         reason: String,
     },
-    /// Represents a sidecar acknowledgment of `SetPermissionMode` through `PermissionModeChanged`
-    /// with capability `set_permission_mode`. No producer emits this event yet.
+    /// A sidecar acknowledgment of `SetPermissionMode` through `PermissionModeChanged`,
+    /// with capability `set_permission_mode`. Produced by `providers/claude_sidecar/translate.rs`
+    /// when the sidecar acknowledges the RPC this client issues.
     PermissionModeChanged {
         mode: crate::PermissionMode,
         /// `SetPermissionModeResponse.permission_mode` verbatim -- `default` / `bypassPermissions`,

@@ -323,8 +323,8 @@ export type AgentDomainEvent =
   /** The sidecar's own acknowledgement of a `set_permission_mode` RPC (a
    *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is neovibe's own
    *  `PermissionModeChoice`; `provider_mode` is Verdandi's raw string (diagnostics only); `floor_applied`
-   *  is `true` exactly when Verdandi's bypass floor (`usesDefaultBypassDeny`) still widened the
-   *  session despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores
+   *  is `true` exactly when Verdandi's bypass floor (`usesDefaultBypassDeny`) still restricted
+   *  the session (a deny list) despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores
    *  this event on purpose**: the mode a tab is in lives on the `tabs` envelope (`TabInfo.mode`), not
    *  on this per-session projection, so folding it here would just be a second, driftable copy. */
   | { type: "permission_mode_changed"; mode: PermissionModeChoice; provider_mode: string; floor_applied: boolean };
