@@ -54,3 +54,10 @@ harness = false
 [[test]]
 name = "hidden_widget_restyle"
 harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
+# server of its own (see the file's header). Holds the integration GUI pass's finding (2026-09-26):
+# the y/n prompt placed as if it had no height, half below the top bar.
+[[test]]
+name = "close_prompt_placement"
+harness = false

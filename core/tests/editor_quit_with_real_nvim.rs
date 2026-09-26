@@ -83,8 +83,12 @@ impl Client {
     }
 }
 
+/// Under `std::env::temp_dir()`, as every other real-nvim test in this crate does, not
+/// `CARGO_TARGET_TMPDIR`: the socket bound inside it is capped at 103 bytes
+/// (`agent::socket_path`), and a target directory in a git worktree
+/// (`…/.worktrees/<name>/target/tmp/eq-<pid>-quit-unmodified/s.sock`) ran past it.
 fn scratch_dir(case: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("eq-{}-{case}", std::process::id()))
+    std::env::temp_dir().join(format!("eq-{}-{case}", std::process::id()))
 }
 
 fn spawn_nvim(scratch: &Path, socket_path: &Path) -> Child {

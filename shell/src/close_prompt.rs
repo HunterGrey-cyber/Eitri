@@ -160,11 +160,14 @@ impl ClosePrompt {
             .compute_point(&self.overlay, &graphene::Point::new(0.0, 0.0))
             .map(|p| p.x().round() as i32)
             .unwrap_or(0);
+        // Shown BEFORE it is measured: GTK measures a hidden widget as 0 high, which centred the
+        // prompt's top edge on the bar's middle and hung half of it over the pane below (the
+        // integration GUI pass, 2026-09-26; `tests/close_prompt_placement.rs`).
+        self.label.set_visible(true);
         let label_height = self.label.measure(gtk4::Orientation::Vertical, -1).1;
         let (x, y) = prompt_origin(self.bar.is_visible(), strip_x, self.bar.height(), label_height.max(0));
         self.label.set_margin_start(x);
         self.label.set_margin_top(y);
-        self.label.set_visible(true);
         self.open.set(true);
     }
 
