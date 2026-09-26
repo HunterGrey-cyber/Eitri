@@ -22,9 +22,13 @@ fn project(label: &str) -> std::path::PathBuf {
 }
 
 fn live_set(dir: &std::path::Path) -> (TabSet, neovibe_core::tabs::TabId) {
-    let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+    live_set_on(BackendKind::Sidecar, dir)
+}
+
+fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, neovibe_core::tabs::TabId) {
+    let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
-    let backend = AgentBackend::start(BackendKind::Sidecar, dir, agent::PermissionMode::Auto, None)
+    let backend = AgentBackend::start(kind, dir, agent::PermissionMode::Auto, None)
         .map_err(|e| e.message)
         .expect("a sidecar session starts; is this running under a test-account wrapper?");
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -53,7 +57,23 @@ fn pump_until(
         if done(set, ended) {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out: {what}");
+        if Instant::now() >= deadline {
+            let tab = set.active();
+            let state = set.get(tab).and_then(|t| t.live()).map(|b| {
+                let p = b.projection();
+                format!(
+                    "running={} pending={} tools={:?} transcript={:?}",
+                    set.get(tab).unwrap().turn_running(),
+                    p.pending_permissions.len(),
+                    p.tool_calls
+                        .iter()
+                        .map(|c| (c.name.clone(), c.input.clone()))
+                        .collect::<Vec<_>>(),
+                    p.transcript.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+                )
+            });
+            panic!("timed out: {what}; {state:?}");
+        }
         std::thread::sleep(Duration::from_millis(33));
     }
 }
@@ -157,41 +177,138 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
         .tool_calls
         .iter()
         .any(|call| call.name == "Bash" && call.input["command"].as_str().is_some_and(|c| c.contains("uname")));
+    // Since 2026-09-25 Auto offers Bash (owner's ruling), so this now fails only if the model
+    // chose not to call it.
     assert!(
         ran_bash,
-        "no Bash call reached the gate: Auto disallows Bash (agent::disallowed_tools_for), so a D7 rule has nothing to answer"
+        "no Bash call reached the gate, so a D7 rule was not shown answering anything \
+         (check agent::disallowed_tools_for(Auto) still offers Bash)"
     );
 
+    deny_the_next_card(
+        &mut set,
+        &dir,
+        tab,
+        "Use the Bash tool to run exactly this command, unchanged: git log --output=friction-probe.txt -1",
+        "git log output",
+    );
+    assert!(!dir.join("friction-probe.txt").exists(), "denied: nothing was written");
+
+    // A redirect is checked before any rule (rules replace only the two not-on-a-list reasons), so
+    // the `uname *` rule must not answer `uname -a > file`.
+    deny_the_next_card(
+        &mut set,
+        &dir,
+        tab,
+        "Use the Bash tool to run exactly this command, unchanged: uname -a > uname-probe.txt",
+        "uname redirect",
+    );
+    assert!(!dir.join("uname-probe.txt").exists(), "denied: nothing was written");
+    shut_down(&mut set);
+}
+
+/// Sends `prompt`, waits for exactly one card, denies it, and waits for the turn to end.
+fn deny_the_next_card(
+    set: &mut TabSet,
+    dir: &std::path::Path,
+    tab: neovibe_core::tabs::TabId,
+    prompt: &str,
+    label: &str,
+) -> agent::PermissionRequestRecord {
     set.get_mut(tab)
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(
-            "Use the Bash tool to run exactly this command, unchanged: git log --output=friction-probe.txt -1",
-            "git log output",
-        )
+        .send_turn(prompt, label)
         .map_err(|e| e.message)
         .unwrap();
-    pump_until(&mut set, &dir, "the git log card", |set, _| {
+    pump_until(set, dir, label, |set, _| {
         set.get(tab).unwrap().attention.attention().pending == 1
     });
-    let permission_id = {
+    let permission = {
         let backend = set.get(tab).unwrap().live().unwrap();
         let projection = backend.projection();
-        projection.pending_permissions.keys().next().unwrap().clone()
+        projection.pending_permissions.values().next().unwrap().clone()
     };
     set.get_mut(tab)
         .unwrap()
         .live_mut()
         .unwrap()
         .respond_permission(
-            &permission_id,
+            &permission.permission_id,
             agent::PermissionDecision::Deny {
                 reason: Some("probe".into()),
             },
         )
         .map_err(|e| e.message)
         .unwrap();
-    assert!(!dir.join("friction-probe.txt").exists(), "denied: nothing was written");
+    pump_until(set, dir, "the denied turn to end", |set, _| {
+        !set.get(tab).unwrap().turn_running()
+    });
+    permission
+}
+
+/// The owner's 2026-09-25 ruling ("auto模式给claude，和claude本身的做法一致"), on the real CLI with no
+/// rules: Auto offers Bash, a read-only command inside the project runs with no card, and a command
+/// that writes is a card.
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn auto_offers_bash_runs_a_read_only_command_and_cards_a_write() {
+    auto_offers_bash_on(BackendKind::Sidecar, "auto-bash");
+}
+
+/// The same on the legacy backend, whose `claude` gets no `--disallowedTools` in Auto now.
+#[test]
+#[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
+fn auto_offers_bash_on_the_legacy_backend_too() {
+    auto_offers_bash_on(BackendKind::Legacy, "auto-bash-legacy");
+}
+
+fn auto_offers_bash_on(kind: BackendKind, label: &str) {
+    let dir = project(label);
+    let (mut set, tab) = live_set_on(kind, &dir);
+    set.get_mut(tab)
+        .unwrap()
+        .live_mut()
+        .unwrap()
+        .send_turn(
+            "Use the Bash tool to run `ls` in the current directory and tell me the file names.",
+            "ls",
+        )
+        .map_err(|e| e.message)
+        .unwrap();
+    pump_until(&mut set, &dir, "the ls turn", |set, _| {
+        assert_eq!(
+            set.get(tab).unwrap().attention.attention().pending,
+            0,
+            "a read-only command inside the project needs nobody: no card"
+        );
+        !set.get(tab).unwrap().turn_running() && transcript(set, tab).to_lowercase().contains("main.rs")
+    });
+    let ran_ls = set
+        .get(tab)
+        .unwrap()
+        .live()
+        .unwrap()
+        .projection()
+        .tool_calls
+        .iter()
+        .any(|call| {
+            call.name == "Bash"
+                && call.input["command"]
+                    .as_str()
+                    .is_some_and(|c| c.trim_start().starts_with("ls"))
+        });
+    assert!(ran_ls, "the model had Bash in Auto and ran ls through it");
+
+    let card = deny_the_next_card(
+        &mut set,
+        &dir,
+        tab,
+        "Use the Bash tool to run exactly this command, unchanged: touch auto-bash-probe.txt",
+        "touch",
+    );
+    assert_eq!(card.tool_name, "Bash", "the write was gated as a Bash call: {card:?}");
+    assert!(!dir.join("auto-bash-probe.txt").exists(), "denied: nothing was written");
     shut_down(&mut set);
 }

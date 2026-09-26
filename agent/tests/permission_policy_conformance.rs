@@ -85,6 +85,9 @@ const REFUSAL_PHRASES: &[&str] = &[
     "requested permissions",
     "was blocked",
     "requires approval",
+    // CLI 2.1.282, measured 2026-09-25: "Output redirection to '<path>' needs approval. ... Claude
+    // Code asks before a shell command creates, changes or removes files there."
+    "needs approval",
     "permission denied by",
     "user doesn't want",
 ];
@@ -262,7 +265,21 @@ fn a_fresh_workspace() -> PathBuf {
 fn run_one_probe(workspace: &Path, prompt: &str) -> Vec<ObservedCall> {
     let output = std::process::Command::new("claude")
         .current_dir(workspace)
-        .args(["--print", prompt, "--output-format", "stream-json", "--verbose"])
+        // `project,local`, as the product passes, and not the user tier: on 2026-09-25 the TEST
+        // profile's user settings (shared with the owner's) carried an `rtk hook claude`
+        // `PreToolUse` hook that rewrote `ls` to `rtk ls`, which the CLI then refused as not
+        // read-only -- a refusal of a command nobody asked for, reported as the CLI refusing `ls`.
+        // The user tier can also carry `permissions.allow`, which would make the oracle more
+        // permissive than a product session and hide the failure this test exists to catch.
+        .args([
+            "--print",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--setting-sources",
+            "project,local",
+        ])
         .output()
         .expect("`claude` must be on PATH; run this through a test-account wrapper");
     let stdout = String::from_utf8_lossy(&output.stdout);

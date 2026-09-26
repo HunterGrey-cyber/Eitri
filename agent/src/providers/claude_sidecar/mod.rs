@@ -764,6 +764,40 @@ fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64)
 mod tests {
     use super::*;
 
+    /// The sidecar half of the owner's 2026-09-25 ruling ("auto模式给claude，和claude本身的做法一致"):
+    /// an `Auto` session is `INTERACTIVE` with an empty deny list stated as `unrestricted`, so
+    /// `Bash` is offered. Checked against Verdandi's source (read-only, 2026-09-25): the
+    /// `CONSERVATIVE_BYPASS_DENY` floor is injected only when `permissions === 'bypass'`
+    /// (`usesDefaultBypassDeny`, `packages/claude-runtime/src/session.ts`), and the `PreToolUse`
+    /// hook (matcher `*`) is installed whenever `permissions !== 'bypass'` -- neither reads
+    /// `unrestricted`, so the gate stays and no floor comes back.
+    #[test]
+    fn an_auto_request_is_interactive_and_restricts_no_tool() {
+        let request = build_create_request(
+            "/tmp/p".into(),
+            PermissionMode::Auto,
+            StreamingPreference::Partial,
+            None,
+            false,
+        );
+        let policy = request.policy.expect("a policy is always sent");
+        assert_eq!(
+            policy.permissions,
+            ProtoPermissionMode::Interactive as i32,
+            "Auto is the mode Verdandi installs the PreToolUse gate for"
+        );
+        let tools = policy.tool_policy.expect("a tool policy is always stated");
+        assert!(tools.deny.is_empty(), "Auto offers Bash: {:?}", tools.deny);
+        assert!(
+            tools.allow.is_none(),
+            "absent, not empty: the base tool set is untouched"
+        );
+        assert!(
+            tools.unrestricted,
+            "an empty list is stated, never left as silence the sidecar could read as a floor request"
+        );
+    }
+
     /// The shape the real sidecar returns at the revision this crate pins
     /// (`EXPECTED_VERDANDI_REVISION`) -- transcribed from
     /// `apps/claude-sidecar/src/runtimeServiceImpl.ts`'s handshake handler, not invented.

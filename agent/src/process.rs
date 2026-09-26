@@ -100,12 +100,27 @@ pub const CONSERVATIVE_DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "N
 /// (`AllowAlways`), never a capability the agent loses. See
 /// `docs/canonical/2026-09-20-cursor-permission-survey.md`.
 ///
+/// **Overridden by the owner again, 2026-09-25, for `Auto`: it denies nothing either.** "auto模式给
+/// claude，和claude本身的做法一致" -- Auto gets `Bash`, as Claude Code's own `default` mode does.
+/// The paragraph above that kept it ("whose blast radius is not a file but a machine") is answered
+/// by the gate rather than by the list: every `Bash` call reaches the `PreToolUse` hook (matcher
+/// `*`, both backends), `crate::permission_policy` auto-answers only a read-only command inside the
+/// project, and everything else -- a write, a redirect, compound syntax, an option naming a path
+/// outside the tree -- is a card a human answers. Removing `Bash` also removed the thing phase 3's
+/// prefix rules (`crate::permission_rules`) and the card's "always allow" exist to answer, which the
+/// phase-3 sandbox pass found. So both lists are empty now and what separates the modes is only
+/// the gate: `Auto` installs it, `Bypass` does not. On the sidecar an empty list is sent as
+/// `unrestricted`; Verdandi's `CONSERVATIVE_BYPASS_DENY` floor applies only under `bypass` and its
+/// hook is installed for every other mode, so `Auto` keeps its gate (checked in Verdandi's source,
+/// `usesDefaultBypassDeny` and `createSession`).
+///
 /// This is best-effort in both modes and was documented as such from the start -- no single
 /// permission flag reliably blocks all tool use. It is the second line; the hook is the first.
 pub fn disallowed_tools_for(mode: PermissionMode) -> &'static [&'static str] {
     match mode {
-        // The hook gates every tool (matcher `*`), so an edit reaches the user as a card.
-        PermissionMode::Auto => &["Bash"],
+        // The hook gates every tool (matcher `*`), so an edit or a shell command reaches the policy,
+        // and through it the user as a card when it needs one (owner's ruling, 2026-09-25).
+        PermissionMode::Auto => &[],
         // Empty, not `CONSERVATIVE_DISALLOWED_TOOLS`. On the sidecar path this ALONE would have
         // changed nothing -- an empty list under `bypass` reads to Verdandi as silence and earns its
         // own identical floor -- so the request also states `unrestricted` (see
@@ -958,28 +973,39 @@ mod tests {
     ///
     /// This test now pins the ruling, so restoring the old list fails here and has to argue with
     /// the paragraph above rather than around it.
+    ///
+    /// **Superseded again, 2026-09-25, for `Auto`'s half.** It asserted `Auto` still denied `Bash`
+    /// ("its worst case is not a file, and un-denying it there is a separate decision that owes its
+    /// own evidence"). The owner made that decision -- "auto模式给claude，和claude本身的做法一致" --
+    /// and the evidence is the gate itself: every `Bash` call reaches the `PreToolUse` hook (matcher
+    /// `*`), `permission_policy` answers only the read-only-inside-the-project ones, and the rest are
+    /// cards. That is Claude Code's own `default` mode. With `Bash` removed, phase 3's prefix rules
+    /// and the card's "always allow" had nothing on the real CLI to answer.
     #[test]
-    fn auto_may_edit_because_the_gate_covers_it_and_bypass_may_edit_because_the_owner_ruled_so() {
+    fn auto_offers_every_tool_because_the_gate_covers_them_and_bypass_denies_nothing() {
         let auto = disallowed_tools_for(PermissionMode::Auto);
         let bypass = disallowed_tools_for(PermissionMode::Bypass);
-        for tool in ["Edit", "Write", "NotebookEdit"] {
-            assert!(!auto.contains(&tool), "Auto must permit {tool}: the hook gates it");
+        for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
+            assert!(
+                !auto.contains(&tool),
+                "Auto must offer {tool}: the PreToolUse hook gates every call (owner's ruling, 2026-09-25)"
+            );
             assert!(
                 !bypass.contains(&tool),
                 "Bypass must permit {tool}: a mode named after having every permission cannot be \
                  the one mode that may not edit (owner's ruling, 2026-09-20)"
             );
         }
-        // `Auto` still denies Bash: its worst case is not a file, and un-denying it there is a
-        // separate decision that owes its own evidence. `Bypass` denies nothing at all, which is
-        // what the word means.
-        assert!(auto.contains(&"Bash"));
+        // Both empty, and that is the whole of both lists: an empty list is what makes the legacy
+        // spawn omit `--disallowedTools` and the sidecar request state `unrestricted`.
+        assert!(auto.is_empty(), "Auto denies nothing; the gate is the boundary");
         assert!(
             bypass.is_empty(),
             "Bypass denies nothing; an empty list is also what makes the sidecar request state \
              `unrestricted`, without which Verdandi re-applies its own identical floor"
         );
-        assert_ne!(auto, bypass, "one list for both modes cannot be right for either");
+        // What still separates the two modes is the gate, not the list: Auto installs the hook and
+        // Bypass installs none (`spawn_with_binary`). The list no longer carries that difference.
     }
 
     /// Pins the exact contents of `CONSERVATIVE_DISALLOWED_TOOLS`, because a typo in it is silent
@@ -1575,6 +1601,7 @@ mod tests {
     /// silently.
     #[test]
     fn a_failed_spawn_leaks_no_thread_no_socket_and_no_settings_file() {
+        let _socket_guard = hook_socket_guard();
         let dir = std::env::temp_dir().join(format!("agent-failed-spawn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1647,6 +1674,16 @@ mod tests {
     }
 
     /// Every per-conversation hook socket currently sitting in the temp dir, by name.
+    /// Held by every test here that binds a hook socket in the temp dir or asserts on the set of
+    /// them: two such tests running in parallel would each see the other's socket as its own leak.
+    static HOOK_SOCKET_TESTS: Mutex<()> = Mutex::new(());
+
+    fn hook_socket_guard() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_SOCKET_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn temp_hook_socket_names() -> std::collections::HashSet<String> {
         std::fs::read_dir(std::env::temp_dir())
             .unwrap()
@@ -1787,6 +1824,7 @@ exit 0"#,
     /// BEFORE the socket is ever bound, so a doomed spawn leaves nothing behind to clean up.
     #[test]
     fn spawn_with_binary_fails_fast_via_preflight_and_binds_no_socket_when_the_resolved_binary_refuses_settings() {
+        let _socket_guard = hook_socket_guard();
         let dir = std::env::temp_dir().join(format!("agent-process-preflight-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         crate::settings::hook_settings_arg(&dir.join("probe.sock"))
@@ -1826,6 +1864,64 @@ exit 0"#,
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The legacy half of the owner's 2026-09-25 ruling ("auto模式给claude，和claude本身的做法一致"),
+    /// read off the argv the real spawn path hands the child rather than off `disallowed_tools_for`:
+    /// in `Auto` the child gets the `PreToolUse` gate (`--settings`) and NO `--disallowedTools`, so
+    /// `Bash` is offered and every call to it reaches the hook. A spawn that still passed
+    /// `--disallowedTools Bash` would pass the pure test above and fail here.
+    #[test]
+    fn an_auto_spawn_offers_bash_under_the_gate_and_passes_no_deny_list() {
+        let _socket_guard = hook_socket_guard();
+        let dir = std::env::temp_dir().join(format!("agent-process-auto-argv-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::settings::hook_settings_arg(&dir.join("probe.sock"))
+            .expect("agent-hook must be built for this test to exercise the real gate path");
+        let record = dir.join("argv.txt");
+        // Records every invocation's argv (the preflight's `--version` one included), one per line,
+        // then waits on stdin like a real stream-json session until `shutdown` closes it.
+        let script = fake_binary_script(&format!(
+            "printf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do [ \"$arg\" = --version ] && exit 0; done\nexec cat >/dev/null",
+            record.display()
+        ));
+
+        let mut process = AgentProcess::spawn_with_binary(
+            &dir,
+            PermissionMode::Auto,
+            disallowed_tools_for(PermissionMode::Auto),
+            script.to_str().unwrap(),
+        )
+        .expect("the fake binary accepts --settings, so the Auto spawn succeeds");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let session_argv = loop {
+            let text = std::fs::read_to_string(&record).unwrap_or_default();
+            if let Some(line) = text.lines().find(|l| l.contains("--input-format")) {
+                break line.to_string();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session spawn never recorded its argv"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        process.shutdown();
+
+        assert!(
+            session_argv.contains("--permission-mode auto"),
+            "Auto spawns the CLI in auto: {session_argv}"
+        );
+        assert!(
+            session_argv.contains("--settings"),
+            "Auto installs the PreToolUse gate, which is what makes offering Bash safe: {session_argv}"
+        );
+        assert!(
+            !session_argv.contains("--disallowedTools"),
+            "Auto must offer Bash (and every other tool) under the gate, so no deny list is passed: {session_argv}"
+        );
+
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `Bypass` mode installs no gate and therefore builds no `--settings` value, so the
     /// preflight must never run at all -- a binary that would refuse `--settings` is irrelevant
     /// to a mode that never passes it, and this is also the mode this project explicitly calls
@@ -1834,6 +1930,7 @@ exit 0"#,
     /// works on this host.
     #[test]
     fn spawn_with_binary_never_preflights_in_bypass_mode() {
+        let _socket_guard = hook_socket_guard();
         let dir = std::env::temp_dir().join(format!("agent-process-bypass-preflight-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
