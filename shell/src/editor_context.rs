@@ -16,14 +16,16 @@ use neovibe_core::editor_context::{ContextSource, EditorContext};
 
 /// Starts draining the feed and returns the source the panel reads.
 ///
-/// **A tick that brings no line leaves the cache alone.** The reader returning `None` means
-/// "no news", not "no context": nvim only writes when something changed, so forgetting on an empty
-/// tick would drop the user's selection roughly 150ms after they made it -- which is exactly when
-/// they are moving their hand to the panel to ask about it.
+/// A tick with no line leaves the cache alone. The reader returning `None` means no update:
+/// nvim writes only when something changes. Clearing the cache on an empty tick would lose
+/// the selection roughly 150 ms later, just as the user moves to the panel to ask about it.
 ///
-/// Takes the feed's listener, so a second call logs and returns a source that is always empty,
-/// rather than installing a second timer racing the first for every connection.
-pub(crate) fn listen(feed: &mut EditorContextFeed) -> ContextSource {
+/// Takes the feed's listener. A second call logs and returns an always-empty source instead
+/// of installing another timer that races the first for connections.
+///
+/// Reports naming buffers in the per-window `scratch_dir` are ignored. Drafts and scratch
+/// views must leave the context on the file the user was in before opening them.
+pub(crate) fn listen(feed: &mut EditorContextFeed, scratch_dir: Option<std::path::PathBuf>) -> ContextSource {
     let cache: Rc<RefCell<Option<EditorContext>>> = Rc::new(RefCell::new(None));
     let Some(listener) = feed.take_listener() else {
         eprintln!("[editor-context] listen() called twice -- turns will carry no editor context");
@@ -33,7 +35,12 @@ pub(crate) fn listen(feed: &mut EditorContextFeed) -> ContextSource {
     let writer = Rc::clone(&cache);
     glib::timeout_add_local(POLL_INTERVAL, move || {
         if let Some(context) = reader.poll() {
-            *writer.borrow_mut() = Some(context);
+            let scratch = scratch_dir
+                .as_deref()
+                .is_some_and(|dir| neovibe_core::scratch::holds(dir, &context.file));
+            if !scratch {
+                *writer.borrow_mut() = Some(context);
+            }
         }
         glib::ControlFlow::Continue
     });

@@ -95,7 +95,10 @@ type InboundHandler = (
     | { kind: "command_result"; requestId: string; ok: true }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     | { kind: "events"; tab: TabId; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
-    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot }
+    /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
+     *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
+     *  (or absent, from an older build) when none runs. */
+    | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot; turnStartedAtMs?: number | null }
     | ({ kind: "handoff"; tab: TabId } & HandoffCommand)
     | { kind: "theme"; vars: Record<string, string> }
     /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from

@@ -785,6 +785,7 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             kind: ContentKind::Thinking,
             text: "hmm".into(),
         },
+        AgentDomainEvent::AssistantMessageBoundary { turn_id: "t1".into() },
         AgentDomainEvent::ToolCallStarted {
             turn_id: "t1".into(),
             tool_use_id: "toolu_1".into(),
@@ -855,6 +856,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
             kind: ContentKind::Thinking,
             ..
         } => "ContentDelta(Thinking)",
+        AgentDomainEvent::AssistantMessageBoundary { .. } => "AssistantMessageBoundary",
         AgentDomainEvent::ToolCallStarted { .. } => "ToolCallStarted",
         AgentDomainEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
         AgentDomainEvent::PermissionRequested { .. } => "PermissionRequested",

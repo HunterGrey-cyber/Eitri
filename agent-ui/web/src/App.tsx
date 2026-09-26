@@ -3,7 +3,7 @@ import type { KeyboardEvent } from "react";
 import { applyEvent, applySnapshot, initialState, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { OutboundMessage, PermissionDecision } from "./bridge";
-import { noteUserScroll } from "./follow";
+import { noteUserScroll, resumeFollowing } from "./follow";
 import { resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelMode, PendingPrefix } from "./keymap";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
@@ -700,9 +700,22 @@ export default function App() {
    *  render's timeline. */
   const lastLengthRef = useRef(0);
   const landOnPromptRef = useRef(false);
+  /** Set by a switch's (or a mount's) first snapshot with no saved view: see the `snapshot` arm. */
+  const landOnLastRef = useRef(false);
   useEffect(() => {
     const previous = lastLengthRef.current;
     lastLengthRef.current = timeline.length;
+    if (landOnLastRef.current) {
+      landOnLastRef.current = false;
+      const last = Math.max(timeline.length - 1, 0);
+      // The view is already at the end, so the landing moves nothing -- and `"keep"` only for a
+      // cursor that really moves (a `"keep"` no `[cursor]` effect consumes swallows the next reveal).
+      if (last !== cursor && !landOnPromptRef.current) {
+        landingRef.current = "keep";
+        setCursor(last);
+        return;
+      }
+    }
     if (landOnPromptRef.current) {
       landOnPromptRef.current = false;
       for (let i = timeline.length - 1; i >= 0; i--) {
@@ -1077,6 +1090,10 @@ export default function App() {
         // exact row after that render.
         if (switchedRef.current) {
           switchedRef.current = false;
+          // A tab with no saved view opens at the bottom because `MessageList` follows from mount.
+          // Put the cursor on the last row in the `[timeline]` effect once the snapshot's rows
+          // exist, so it stays visible. A pending-card landing below takes priority.
+          if (restoreRef.current === null) landOnLastRef.current = true;
           if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
         }
         // A snapshot means a session is genuinely RUNNING, which is also when Rust clears its own
@@ -1085,13 +1102,16 @@ export default function App() {
         // conversation nothing else remembers.
         setHandoff(null);
         setCommandNotice(null);
-        // A turn first seen in a snapshot gets `exact: false`, since the panel cannot know how
-        // long it was already running. Preserve the clock if the snapshot names the tracked
-        // turn so resync does not restart it. Clear the clock if there is no active turn.
+        // A snapshot with `turnStartedAtMs` restores the start time and sets `exact: true`. Without
+        // it, a newly seen turn starts an approximate clock at `0s+` because its earlier runtime is
+        // unknown. Keep an already exact clock for the same turn, and do not restart an approximate
+        // one without a supplied start time. Clear the clock when there is no active turn.
+        const startedAt = payload.turnStartedAtMs;
         setTurnClock((current) => {
           const activeTurnId = payload.state.activeTurnId;
           if (activeTurnId === null) return null;
-          if (current !== null && current.turnId === activeTurnId) return current;
+          if (current !== null && current.turnId === activeTurnId && (current.exact || typeof startedAt !== "number")) return current;
+          if (typeof startedAt === "number") return { turnId: activeTurnId, since: startedAt, exact: true };
           return { turnId: activeTurnId, since: Date.now(), exact: false };
         });
       } else if (payload.kind === "events") {
@@ -1374,6 +1394,8 @@ export default function App() {
     inFlight.current.set(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
     postToRust({ type: "send_message", request_id: requestId, tab, text });
+    // A send follows the reply, wherever the reader had scrolled (`./follow.ts`).
+    resumeFollowing(containerRef.current?.querySelector(".message-list"));
   }
 
   /** Queues what is typed behind the running turn. Recorded as a `"send"` for the same reason
@@ -2096,7 +2118,10 @@ export default function App() {
         onDraftChange={mirrorDraft}
         running={turnInProgress}
         onQueue={queueMessage}
-        onSendNow={(t) => post({ type: "send_now", text: t })}
+        onSendNow={(t) => {
+          post({ type: "send_now", text: t });
+          resumeFollowing(containerRef.current?.querySelector(".message-list"));
+        }}
         history={history}
         queueCount={queue.length}
         onTakeBackQueue={() => post({ type: "take_back_queue" })}

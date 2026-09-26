@@ -26,7 +26,8 @@ fn assistant_text_block_becomes_assistant_text() {
     assert_eq!(
         events[0],
         AgentEvent::AssistantText {
-            text: "pong".to_string()
+            text: "pong".to_string(),
+            message_id: Some("msg_011Cep1VPpoKuerNr9Wjt2gL".to_string()),
         }
     );
 }
