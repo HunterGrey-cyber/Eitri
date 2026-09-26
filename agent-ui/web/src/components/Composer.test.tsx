@@ -56,6 +56,19 @@ function renderComposerWithRerender(overrides: Overrides = {}) {
   };
 }
 
+/** The bare shell-prompt glyph replaces the bordered box. */
+describe("Composer's prompt glyph", () => {
+  it("draws ❯ right before the textarea in INPUT, and not at all in BROWSE", () => {
+    const { container } = renderComposer();
+    const prompt = container.querySelector(".composer-prompt")!;
+    expect(prompt.textContent).toBe("❯");
+    expect(prompt.compareDocumentPosition(container.querySelector("textarea")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    cleanup();
+    const browse = renderComposer({ mode: "browse" });
+    expect(browse.container.querySelector(".composer-prompt")).toBeNull();
+  });
+});
+
 describe("Composer sending", () => {
   it("sends on Enter and clears the box", () => {
     const { textarea, onSend } = renderComposer();

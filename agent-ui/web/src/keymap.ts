@@ -9,6 +9,54 @@ export type PanelMode = "browse" | "input" | "hint";
  *  two presses. See `KeyContext.pending`. */
 export type PendingPrefix = "g" | "z" | "[" | "]";
 
+/** Action names for the panel's which-key table, matching `core::keymap::panel::PanelAction::name()`.
+ *  `resolveKey` and `leader.ts` look up these names in table bindings. The `PanelAction` union
+ *  below instead describes the result of resolving a key. */
+export type PanelActionName =
+  | "tab.new"
+  | "tab.next"
+  | "tab.prev"
+  | "tab.last"
+  | "tab.close"
+  | "tab.close-others"
+  | "tab.choose"
+  | "tab.info"
+  | "panel.search"
+  | "panel.keymap"
+  | "panel.handoff"
+  | "mode.cycle";
+
+/** One binding in the panel's key table, as `serialize_keymap_for_js`'s `panel.bindings` sends it:
+ *  `keys` is vim notation split into tokens (`["<leader>", "b", "d"]`, `["H"]`), `source` says which
+ *  layer of `defaults < nvim < init.lua` produced it. */
+export type PanelBinding = { keys: string[]; action: PanelActionName; desc: string; source: "default" | "nvim" | "init.lua" };
+
+/** The panel's which-key table, sent by `serialize_keymap_for_js` in a `keymap` message.
+ *  Leader fields come from nvim's `g:mapleader` through `keytrans`; unset, empty or unusable
+ *  values fall back to Space. `timeoutlen` and `timeout` come from nvim's options.
+ *  Before any report, the defaults are Space, 1000 ms and timeout enabled. */
+export type PanelTable = {
+  leader: string;
+  leaderLabel: string;
+  leaderSource: "default" | "mapleader" | "unset" | "unusable";
+  timeoutlen: number;
+  timeout: boolean;
+  bindings: PanelBinding[];
+  groups: { keys: string[]; label: string }[];
+};
+
+/** The table's value before the first `keymap` envelope arrives: nvim's own defaults (Space,
+ *  `timeoutlen` 1000, `timeout` on -- Global Constraint), no bindings yet. */
+export const EMPTY_PANEL_TABLE: PanelTable = {
+  leader: " ",
+  leaderLabel: "Space",
+  leaderSource: "default",
+  timeoutlen: 1000,
+  timeout: true,
+  bindings: [],
+  groups: [],
+};
+
 export type PanelAction =
   | { kind: "mode"; to: PanelMode }
   /** `j`/`k`: to the next or previous stop (a row, a banner, the status line, ...), top to bottom.
@@ -60,6 +108,11 @@ export type PanelAction =
   /** `Ctrl+g` in BROWSE: view the current row's whole text in an nvim scratch
    *  buffer. Distinct from INPUT's own `Ctrl+g`, which edits the composer's draft (`Composer.tsx`). */
   | { kind: "view-in-editor" }
+  /** A `PanelBinding` reached through the panel's own which-key table (`./leader`), rather than a
+   *  fixed row above. Reached today only as the second key of a two-key BROWSE prefix (`[b`); the
+   *  leader itself and longer sequences run through `./leader`'s `startSequence`/`advanceSequence`,
+   *  not this function. */
+  | { kind: "panel"; binding: PanelBinding }
   | null;
 
 /** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
@@ -84,6 +137,11 @@ export type KeyContext = {
   /** Whether a turn is running in the active tab, for `Ctrl+c`.
    *  `undefined` and `false` both mean idle, including callers that omit this field. */
   turnRunning?: boolean;
+  /** The panel's own which-key table, absent before the first `keymap`
+   *  envelope. Consulted only for a second key completing a two-key BROWSE prefix (`[b`); `App.tsx`
+   *  is expected to pass `KeymapHelp.panel` (or leave it unset), never `EMPTY_PANEL_TABLE` -- an
+   *  empty table and an absent one behave identically here (no bindings to match). */
+  table?: PanelTable;
 };
 
 /**
@@ -147,6 +205,13 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // `!event.isComposing` keeps the same guard explicit in this branch.
     if (event.key === "Escape" && !event.isComposing) return { kind: "mode", to: "browse" };
     return null;
+  }
+  // Resolve panel-table pairs such as [b once for all four prefixes before the switch.
+  // This lookup follows the blanket Ctrl/Shift refusal, so shifted second keys such as [B
+  // cannot reach it.
+  if (ctx.pending) {
+    const tableHit = ctx.table?.bindings.find((b) => b.keys.length === 2 && b.keys[0] === ctx.pending && b.keys[1] === event.key);
+    if (tableHit) return { kind: "panel", binding: tableHit };
   }
   // The second key of a two-key sequence (`gg`, `[[`, `]]`). Anything that does not complete the
   // pending one falls through as an ordinary key below: the prefix is simply dropped, as vim drops
@@ -272,7 +337,10 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "?", what: "This list, from an empty box" },
 ];
 
-/** `shell`'s own keys, which nothing on this page can read: sent by `shell` in a `keymap` envelope
- *  on every `ready`, generated from `neovibe_core::keymap` (the root table and the effective prefix
- *  table after `init.lua`). `prefix` is the prefix as a person reads it (`Ctrl+b`). */
-export type KeymapHelp = { prefix: string; window: KeyHelp[]; prefixKeys: KeyHelp[] };
+/** Key help sent by `shell` in a `keymap` envelope on every `ready`.
+ *  It contains the core root table and effective prefix table after `init.lua`.
+ *  `prefix` is the readable chord, such as `Ctrl+b`.
+ *  `serialize_keymap_for_js` also includes the effective panel which-key table,
+ *  with precedence `defaults < nvim < init.lua`, and `newTabChord`, the chord shown
+ *  on the chooser's "New session" row, such as `Ctrl+b c`. */
+export type KeymapHelp = { prefix: string; window: KeyHelp[]; prefixKeys: KeyHelp[]; panel: PanelTable; newTabChord: string };

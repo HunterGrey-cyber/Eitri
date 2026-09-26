@@ -21,8 +21,11 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
 
 /** The mode pill uses the panel's mode names from `hello.permissionModes`; `auto` differs from the CLI's.
  *  `cycleOffered` reflects `state.capabilities.modeSwitch`: cycling is offered before a session starts,
- *  but a live session requires backend support for changing its mode, which is currently unavailable. */
-export function modePill(mode: PermissionModeChoice, cycleOffered: boolean): string {
+ *  but a live session requires backend support for changing its mode, which is currently unavailable.
+ *  The bottom band uses `short = true` to omit "on" and the cycle hint when space is tight.
+ *  Backend, model and the full pill are shown under `prefix i`. `short` defaults to `false` for long-form callers. */
+export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
+  if (short) return `⏵⏵ ${mode}`;
   return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to cycle)` : `⏵⏵ ${mode} on`;
 }
 

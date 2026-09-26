@@ -224,6 +224,44 @@ pub enum InboundMessage {
         session_id: u64,
         count: usize,
     },
+    /// `prefix` + one of tmux's window keys, or `<leader>bo`'s panel binding, once `keymap.ts`
+    /// resolves a verb. Window-level: `shell` runs it through the very code the
+    /// prefix's own `Action::Tab` arm runs -- whichever tab is under it decides, not one this
+    /// message names, which is why no `tab` field travels with it.
+    TabVerb {
+        request_id: String,
+        verb: TabVerbWire,
+    },
+    /// `Shift+Tab` on the chooser's `New session` row or a record: cycles
+    /// `TabSet::default_mode` rather than any one tab's `mode` (which `cycle_mode{tab}` already
+    /// does for a `NotStarted` active tab). Window-level for the same reason `TabVerb` is.
+    CycleDefaultMode {
+        request_id: String,
+    },
+    /// Sent after `confirm_close_others`'s y/n is answered `y`: the same close path as `CloseTab`,
+    /// run once per tab.
+    /// Window-level and carries no tab list of its own -- like `TabVerb`, whichever tabs are still
+    /// "every tab but the active one" by the time this arrives decides, recomputed fresh rather
+    /// than trusting a set the user could have changed while the prompt was open.
+    CloseOthers {
+        request_id: String,
+    },
+}
+
+/// A `tab_verb` payload carries the same actions as `Action::Tab`, including `close_others`.
+/// `Select` and `Rename` use `SelectTab` and `RenameTab` because they need a number or text
+/// that a verb alone cannot carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabVerbWire {
+    Next,
+    Prev,
+    Last,
+    New,
+    Close,
+    CloseOthers,
+    Choose,
+    Info,
 }
 
 /// Which tab a command is about.
@@ -245,7 +283,10 @@ impl InboundMessage {
             | InboundMessage::HintTargets { .. }
             | InboundMessage::HistoryPush { .. }
             | InboundMessage::OpenPath { .. }
-            | InboundMessage::ViewInEditor { .. } => return TabRef::WindowLevel,
+            | InboundMessage::ViewInEditor { .. }
+            | InboundMessage::TabVerb { .. }
+            | InboundMessage::CycleDefaultMode { .. }
+            | InboundMessage::CloseOthers { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
@@ -323,7 +364,10 @@ impl InboundMessage {
             | InboundMessage::EditDraft { request_id, .. }
             | InboundMessage::HistoryPush { request_id, .. }
             | InboundMessage::OpenPath { request_id, .. }
-            | InboundMessage::ViewInEditor { request_id, .. } => request_id,
+            | InboundMessage::ViewInEditor { request_id, .. }
+            | InboundMessage::TabVerb { request_id, .. }
+            | InboundMessage::CycleDefaultMode { request_id }
+            | InboundMessage::CloseOthers { request_id } => request_id,
         }
     }
 }
@@ -389,6 +433,8 @@ pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) 
             "name": r.name,
         })).collect::<Vec<_>>(),
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
+        // `agent::account`'s configured name, or `null` when none is set.
+        "account": greeting.account,
     })
     .to_string()
 }
@@ -424,6 +470,12 @@ pub fn serialize_enter_input_for_js() -> String {
     json!({ "kind": "enter_input" }).to_string()
 }
 
+/// `{"kind":"arrive"}` signals keyboard arrival in the panel and lands in BROWSE.
+/// Rust chooses the row and mode. The envelope does not carry that choice or open the composer.
+pub fn serialize_arrive_for_js() -> String {
+    json!({ "kind": "arrive" }).to_string()
+}
+
 /// `{"kind":"focus_permission","tab":...}`: the chat was brought back to answer a card -- its tray
 /// chip `agent ⚑N` activated, or `Ctrl+a a` with a card waiting. The panel goes
 /// to BROWSE with its cursor on the oldest pending card. `shell` sends it only when the count it
@@ -434,16 +486,76 @@ pub fn serialize_focus_permission_for_js(tab: crate::tabs::TabId) -> String {
     json!({ "kind": "focus_permission", "tab": tab.0 }).to_string()
 }
 
-/// `{"kind":"keymap", ...}`: the `?` overlay's two `shell` sections, generated from
-/// `neovibe_core::keymap` -- `window` from the root table, `prefixKeys` from the
-/// effective prefix table -- and the prefix as a person reads it, for the heading `After <prefix>`.
-/// Sent on every `ready`.
+/// `{"kind":"keymap", ...}` supplies the `?` overlay from `crate::keymap`.
+/// `window` comes from the root table and `prefixKeys` from the effective prefix table.
+/// The readable prefix is used in the heading `After <prefix>`.
+///
+/// Also carries the panel's BROWSE table as `panel` and the effective new-tab chord as
+/// `newTabChord` for the chooser's `New session` row. Sent on every `ready` and again when
+/// `effective()` changes.
 pub fn serialize_keymap_for_js(
     prefix: &str,
     window: &[crate::keymap::HelpRow],
     prefix_keys: &[crate::keymap::HelpRow],
+    panel: &crate::keymap::panel::PanelKeymap,
+    new_tab_chord: &str,
 ) -> String {
-    json!({ "kind": "keymap", "prefix": prefix, "window": window, "prefixKeys": prefix_keys }).to_string()
+    use crate::keymap::panel::{LeaderSource, PanelKey, PanelSource};
+
+    let leader_source = match panel.leader_source {
+        LeaderSource::Default => "default",
+        LeaderSource::Mapleader => "mapleader",
+        LeaderSource::Unset => "unset",
+        LeaderSource::Unusable => "unusable",
+    };
+    let leader_wire = match panel.leader {
+        PanelKey::Leader => "<leader>".to_string(),
+        PanelKey::Space => " ".to_string(),
+        PanelKey::Char(c) => c.to_string(),
+    };
+    let bindings: Vec<Value> = panel
+        .bindings
+        .iter()
+        .map(|b| {
+            let source = match b.source {
+                PanelSource::Default => "default",
+                PanelSource::Nvim => "nvim",
+                PanelSource::User => "init.lua",
+            };
+            json!({
+                "keys": b.seq.wire(),
+                "action": b.action.name(),
+                "desc": b.action.desc(),
+                "source": source,
+            })
+        })
+        .collect();
+    let groups: Vec<Value> = crate::keymap::panel::DEFAULT_GROUPS
+        .iter()
+        .map(|(keys, label)| {
+            let seq = crate::keymap::panel::parse_seq(keys)
+                .unwrap_or_else(|why| panic!("DEFAULT_GROUPS key {keys:?} must parse: {why}"));
+            json!({ "keys": seq.wire(), "label": label })
+        })
+        .collect();
+    let panel_json = json!({
+        "leader": leader_wire,
+        "leaderLabel": panel.leader_label,
+        "leaderSource": leader_source,
+        "timeoutlen": panel.timeoutlen_ms,
+        "timeout": panel.timeout,
+        "bindings": bindings,
+        "groups": groups,
+    });
+    json!({
+        "kind": "keymap",
+        "prefix": prefix,
+        "window": window,
+        "prefixKeys": prefix_keys,
+        "panel": panel_json,
+        "newTabChord": new_tab_chord,
+    })
+    .to_string()
 }
 
 /// `{"kind":"literal_key","key":"C-a"}`: `send-prefix`/`send-keys` with the panel holding the keys
@@ -765,12 +877,17 @@ pub struct TabView {
     pub resumable: bool,
     /// Why a `failed` tab failed, shown when it is.
     pub failure: Option<String>,
+    /// The first prompt's title or the resumed record's display title; `null` before one exists.
+    /// Filled from `Tab.title` in `Tab::view`.
+    pub title: Option<String>,
 }
 
-/// `{"kind":"tabs",...}`: every tab and which one is active. Sent on `ready` and whenever any of it
-/// changes; always BEFORE the active tab's snapshot on a switch, so the panel knows which tab the
-/// snapshot is for.
-pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView]) -> String {
+/// `{"kind":"tabs",...}` carries every tab and the active id. Sent on `ready` and when tabs
+/// change, before the active tab's snapshot on a switch so the panel can identify it. Also
+/// carries `defaultMode` from `TabSet::default_mode`, used by fresh tabs and resumes into new
+/// tabs. The chooser reads its mode line from this field, so cycling the mode needs no new
+/// chooser payload.
+pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], default_mode: SessionModeChoice) -> String {
     let tabs: Vec<Value> = tabs
         .iter()
         .map(|t| {
@@ -785,10 +902,17 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView]) -> St
                 "pending": t.pending,
                 "resumable": t.resumable,
                 "failure": t.failure,
+                "title": t.title,
             })
         })
         .collect();
-    json!({ "kind": "tabs", "active": active.0, "tabs": tabs }).to_string()
+    json!({
+        "kind": "tabs",
+        "active": active.0,
+        "tabs": tabs,
+        "defaultMode": default_mode.as_str(),
+    })
+    .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,6 +977,13 @@ pub fn serialize_chooser_for_js(launch: bool, open: &[ChooserTab], records: &[Ch
 /// `prefix &`: the footer's y/n prompt, first line the question (`tabs::close_prompt`).
 pub fn serialize_confirm_close_for_js(tab: crate::tabs::TabId, lines: &[String]) -> String {
     json!({ "kind": "confirm_close", "tab": tab.0, "lines": lines }).to_string()
+}
+
+/// `<leader>bo`: the footer's y/n prompt to close every tab except the active one.
+/// Carries the tab ids and `tabs::close_others` prompt lines in the same shape as `confirm_close`.
+pub fn serialize_confirm_close_others_for_js(tabs: &[crate::tabs::TabId], lines: &[String]) -> String {
+    let ids: Vec<u64> = tabs.iter().map(|t| t.0).collect();
+    json!({ "kind": "confirm_close_others", "tabs": ids, "lines": lines }).to_string()
 }
 
 /// `prefix ,`: open the inline rename field on the tab's label, prefilled with `current`.
@@ -990,21 +1121,92 @@ mod tests {
             keys: k.into(),
             what: w.into(),
         };
+        let (panel, _) = crate::keymap::panel::effective(&Default::default(), None);
         let value: serde_json::Value = serde_json::from_str(&serialize_keymap_for_js(
             "Ctrl+b",
             &[row("F11", "Fullscreen")],
             &[row("Ctrl+b f", "HINT")],
+            &panel,
+            "Ctrl+b c",
         ))
         .unwrap();
+        assert_eq!(value["kind"], "keymap");
+        assert_eq!(value["prefix"], "Ctrl+b");
         assert_eq!(
-            value,
-            serde_json::json!({
-                "kind": "keymap",
-                "prefix": "Ctrl+b",
-                "window": [{ "keys": "F11", "what": "Fullscreen" }],
-                "prefixKeys": [{ "keys": "Ctrl+b f", "what": "HINT" }]
-            })
+            value["window"],
+            serde_json::json!([{ "keys": "F11", "what": "Fullscreen" }])
         );
+        assert_eq!(
+            value["prefixKeys"],
+            serde_json::json!([{ "keys": "Ctrl+b f", "what": "HINT" }])
+        );
+        assert_eq!(value["newTabChord"], "Ctrl+b c");
+        assert!(value["panel"]["bindings"].is_array(), "the panel table travels too");
+    }
+
+    #[test]
+    fn the_keymap_envelope_carries_the_panel_table() {
+        let (panel, _) = crate::keymap::panel::effective(&Default::default(), None);
+        let v: serde_json::Value =
+            serde_json::from_str(&serialize_keymap_for_js("Ctrl+b", &[], &[], &panel, "Ctrl+b c")).unwrap();
+        assert_eq!(v["newTabChord"], "Ctrl+b c");
+        assert_eq!(v["panel"]["leader"], " ");
+        assert_eq!(v["panel"]["leaderSource"], "default");
+        assert_eq!(v["panel"]["timeoutlen"], 1000);
+        let bd = v["panel"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["action"] == "tab.close")
+            .unwrap();
+        assert_eq!(bd["keys"], serde_json::json!(["<leader>", "b", "d"]));
+        assert_eq!(bd["source"], "default");
+        assert_eq!(
+            v["panel"]["groups"][0],
+            serde_json::json!({"keys": ["<leader>", "b"], "label": "+tab"})
+        );
+    }
+
+    /// An unrecognized tab verb parses as `None`, like any other unrecognized wire value.
+    /// `parse_inbound_message` returns `Option<InboundMessage>`, so the test checks `is_none()`.
+    #[test]
+    fn arrive_tab_verb_and_cycle_default_mode() {
+        assert_eq!(serialize_arrive_for_js(), r#"{"kind":"arrive"}"#);
+        let m = parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"close"}"#).unwrap();
+        assert!(matches!(
+            m,
+            InboundMessage::TabVerb {
+                verb: TabVerbWire::Close,
+                ..
+            }
+        ));
+        assert_eq!(m.tab_ref(), TabRef::WindowLevel);
+        assert!(parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"rename"}"#).is_none());
+        let c = parse_inbound_message(r#"{"type":"cycle_default_mode","request_id":"a"}"#).unwrap();
+        assert_eq!(c.tab_ref(), TabRef::WindowLevel);
+        let m = parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"close_others"}"#).unwrap();
+        assert!(matches!(
+            m,
+            InboundMessage::TabVerb {
+                verb: TabVerbWire::CloseOthers,
+                ..
+            }
+        ));
+        let co = parse_inbound_message(r#"{"type":"close_others","request_id":"a"}"#).unwrap();
+        assert_eq!(co.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(co.request_id(), "a");
+    }
+
+    #[test]
+    fn the_confirm_close_others_envelope_carries_the_ids_and_the_prompt() {
+        let v: serde_json::Value = serde_json::from_str(&serialize_confirm_close_others_for_js(
+            &[crate::tabs::TabId(2), crate::tabs::TabId(3)],
+            &["close 2 other tabs? 1 running (y/n)".to_string()],
+        ))
+        .unwrap();
+        assert_eq!(v["kind"], "confirm_close_others");
+        assert_eq!(v["tabs"], serde_json::json!([2, 3]));
+        assert_eq!(v["lines"], serde_json::json!(["close 2 other tabs? 1 running (y/n)"]));
     }
 
     #[test]
@@ -1790,7 +1992,18 @@ mod tests {
             permission_modes: &["bypass"],
             expected_verdandi_revision: Some("abc1234"),
             resumable,
+            account: None,
         }
+    }
+
+    #[test]
+    fn hello_carries_the_configured_account_or_null() {
+        let mut greeting = greeting_with(Vec::new());
+        let value: serde_json::Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert!(value["account"].is_null(), "no account configured");
+        greeting.account = Some("work".to_string());
+        let value: serde_json::Value = serde_json::from_str(&serialize_hello_for_js(&greeting)).unwrap();
+        assert_eq!(value["account"], "work");
     }
 
     fn resumable(provider_session_id: &str, created_at: &str, updated_at: &str) -> agent::ResumableSession {
@@ -2006,6 +2219,7 @@ mod tests {
                 pending: 2,
                 resumable: true,
                 failure: None,
+                title: Some("fix the parser".into()),
             },
             TabView {
                 id: TabId(4),
@@ -2018,21 +2232,26 @@ mod tests {
                 pending: 0,
                 resumable: false,
                 failure: Some("the gate refused".into()),
+                title: None,
             },
         ];
-        let value: serde_json::Value = serde_json::from_str(&serialize_tabs_for_js(TabId(4), &tabs)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&serialize_tabs_for_js(TabId(4), &tabs, SessionModeChoice::Bypass)).unwrap();
         assert_eq!(value["kind"], "tabs");
         assert_eq!(value["active"], 4);
+        assert_eq!(value["defaultMode"], "bypass");
         assert_eq!(
             value["tabs"][0],
             serde_json::json!({
                 "id": 1, "number": 1, "label": "1 fix-parser", "name": "fix-parser", "state": "live",
-                "mode": "auto", "marker": "needs_input", "pending": 2, "resumable": true, "failure": null
+                "mode": "auto", "marker": "needs_input", "pending": 2, "resumable": true, "failure": null,
+                "title": "fix the parser"
             })
         );
         assert_eq!(value["tabs"][1]["state"], "failed");
         assert_eq!(value["tabs"][1]["marker"], "ended");
         assert_eq!(value["tabs"][1]["name"], serde_json::Value::Null);
+        assert_eq!(value["tabs"][1]["title"], serde_json::Value::Null);
     }
 
     #[test]

@@ -21,6 +21,23 @@ export const STOP_ATTR = "data-nav-stop";
  *  HINT. The `gf` path picker reuses it for its letter-per-path footer list. */
 export const HINT_ALPHABET = "asdjklghweruio";
 
+/** Whether `el` is inside a control a key activates by default: a button, summary, link or
+ *  element with `role="button"`.
+ *
+ *  Calling `preventDefault()` on Enter for a focused button suppresses its activation click.
+ *  Tab-to-Approve then Enter must keep working so permission decisions remain keyboard reachable.
+ *  Space on buttons and Enter on tool-card summaries need the same protection.
+ *
+ *  `closest` also handles targets inside a button, such as a strong or span element, while
+ *  keyboard activation targets the button itself. Both must bypass the panel's key handler.
+ *
+ *  Keeping this helper in `nav.ts` lets `App.tsx` and `EmptyTab.tsx` share the leader engine's
+ *  control check without importing one component into the other and creating a circular import. */
+export function isActivatableControl(el: EventTarget | null): el is HTMLElement {
+  if (!(el instanceof HTMLElement)) return false;
+  return el.closest("button, summary, a[href], [role=button]") !== null;
+}
+
 const CONTROL_SELECTOR =
   'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [role="radio"]:not([aria-disabled="true"])';
 

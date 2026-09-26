@@ -7,6 +7,9 @@ type Props = {
   tabs: TabInfo[];
   active: TabId;
   renaming: { tab: TabId; initial: string } | null;
+  /** Incremented by `App` when `pane_focus` regains focus to refocus a rename field after a GTK focus cycle.
+   *  Call `focus()` alone so text the user is still typing is not selected again. */
+  focusRequest: number;
   onSelect: (tab: TabId) => void;
   onRenameCommit: (name: string) => void;
   onRenameCancel: () => void;
@@ -20,7 +23,7 @@ function composing(event: KeyboardEvent): boolean {
 /** tmux's window list, at the top of the panel. One nav stop: `k` from the first row
  *  reaches it, `h`/`l` move between tabs, `Enter` (a focused button's click) selects. HINT labels
  *  each tab as a control. `App` renders it only with two or more tabs, or during a rename. */
-export function TabBar({ tabs, active, renaming, onSelect, onRenameCommit, onRenameCancel }: Props) {
+export function TabBar({ tabs, active, renaming, focusRequest, onSelect, onRenameCommit, onRenameCancel }: Props) {
   const activeRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -31,7 +34,16 @@ export function TabBar({ tabs, active, renaming, onSelect, onRenameCommit, onRen
         const isActive = tab.id === active;
         const classes = ["tab", isActive ? "tab-active" : "", tab.marker === "ended" ? "tab-ended" : ""].filter(Boolean).join(" ");
         if (renaming !== null && renaming.tab === tab.id) {
-          return <RenameField key={tab.id} number={tab.number} initial={renaming.initial} onCommit={onRenameCommit} onCancel={onRenameCancel} />;
+          return (
+            <RenameField
+              key={tab.id}
+              number={tab.number}
+              initial={renaming.initial}
+              focusRequest={focusRequest}
+              onCommit={onRenameCommit}
+              onCancel={onRenameCancel}
+            />
+          );
         }
         const glyph = markerGlyph(tab.marker, tab.pending);
         return (
@@ -57,11 +69,13 @@ export function TabBar({ tabs, active, renaming, onSelect, onRenameCommit, onRen
 function RenameField({
   number,
   initial,
+  focusRequest,
   onCommit,
   onCancel,
 }: {
   number: number;
   initial: string;
+  focusRequest: number;
   onCommit: (name: string) => void;
   onCancel: () => void;
 }) {
@@ -71,6 +85,12 @@ function RenameField({
     ref.current?.focus();
     ref.current?.select();
   }, []);
+  // Refocus on later requests without `select()`, which would select a half-typed name
+  // again each time `pane_focus` regains focus.
+  useEffect(() => {
+    if (focusRequest > 0) ref.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest]);
   return (
     <span className="tab tab-active tab-renaming">
       {number}{" "}

@@ -1,4 +1,5 @@
 import type { AgentUiState, TurnClock } from "../types";
+import type { PanelMode } from "../keymap";
 import { phaseOf } from "../turnPhase";
 import { TurnActivity } from "./TurnActivity";
 
@@ -19,15 +20,16 @@ type Props = {
   /** The oldest pending permission card's tool name, or `null` if none waits.
    *  Replaces the queue count: a waiting card already prevents the queue from flushing. */
   pendingTool?: string | null;
+  /** The card hint names `a`/`d` in BROWSE. In INPUT it says Escape first because keys go to the
+   *  composer. Defaults to browse for callers that omit the mode. */
+  mode?: PanelMode;
 };
 
-/** V2: the old `StatusLine`'s body that was about the turn --
- *  the in-flight motion indicator and Stop -- now its own line, only while a turn runs, directly
- *  above the composer. The mode block, the session status word and the position counter moved to
- *  `Footer`/`StatusRow`, and `data-nav-stop="status"` moves with the content it used to gate on
- *  ("the status line, only while Stop shows") rather than staying behind on an element with
- *  nothing left to answer for. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null }: Props) {
+/** Show the turn's motion indicator and Stop directly above the composer, only while a turn runs.
+ *  Mode, session status, and position live in `Footer`/`StatusRow`. Keep `data-nav-stop="status"`
+ *  with the turn controls. The lowercase `ctrl+c interrupt` text is the Stop button itself,
+ *  preserving mouse activation. */
+export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, mode = "browse" }: Props) {
   // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -41,18 +43,23 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   if (!working) return null;
   return (
     <div className="activity-line" data-nav-stop="status">
+      <span className="activity-glyph" aria-hidden="true">
+        ✻
+      </span>
       <TurnActivity phase={phaseOf(state)} clock={turnClock} />
+      {pendingTool !== null ? (
+        <span className="activity-card">
+          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, then a / d" : "a / d"}
+        </span>
+      ) : (
+        queued > 0 && <span className="activity-keys">{queued} queued · </span>
+      )}
+      {/* Stays reachable even while a card waits (`j` past the last row lands here, `withACardAndStop`'s
+          own fixture name) -- the card takes over the LINE's message, not this control. */}
       {canInterrupt && (
         <button type="button" className="stop" onClick={onInterrupt}>
-          Stop
+          ctrl+c interrupt
         </button>
-      )}
-      {pendingTool !== null ? (
-        <span className="activity-card">⚑ {pendingTool} needs approval — Esc, then a / d</span>
-      ) : (
-        <span className="activity-keys">
-          {queued > 0 ? `${queued} queued · ` : ""}Ctrl+c interrupt
-        </span>
       )}
     </div>
   );

@@ -302,6 +302,11 @@ export function Composer({
               }}
             />
           )}
+          {/* A bare `❯` prompt replaces the bordered textarea look. Use plain `--nv-fg` so the prompt does
+              not carry a mode colour. */}
+          <span className="composer-prompt" aria-hidden="true">
+            ❯
+          </span>
           <textarea
             ref={textareaRef}
             value={text}

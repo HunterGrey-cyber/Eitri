@@ -5,7 +5,6 @@ import { buildTimeline, isUsableLink } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { renderMarkdown } from "../markdown";
 import { HistoryNotice } from "./HistoryNotice";
-import { NewPill } from "./NewPill";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import type { PermissionDecision } from "../bridge";
@@ -45,6 +44,12 @@ type Props = {
    *  `gf` target through `App.tsx`'s `open-path` action. When absent, clicks retain their normal
    *  control behavior without opening paths. */
   onOpenPath?: (ref: PathRef) => void;
+  /** Reports the unread pill to the caller so it can appear in the band without covering text.
+   *  `label` is `↓N`, `↓ ⚑` for a card below the view, or bare `↓` when shown with nothing counted yet.
+   *  `null` hides the pill. `jump` calls `jumpToEnd` and reads `listRef` fresh when invoked.
+   *  Called whenever `updatePill` recomputes the pill, including with `null`.
+   *  The caller holds the latest value, as `pill`/`setPill` do internally. */
+  onUnreadChange?: (label: string | null, jump: () => void) => void;
 };
 
 /** Whether a finished tool call succeeded, failed, or is still running -- the state a row's sign
@@ -135,6 +140,7 @@ export function MessageList({
   yankedKey = null,
   onAnswerPermission,
   onOpenPath,
+  onUnreadChange,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   /** The one `ResizeObserver`, on the list and on every child of it (see "Correction (the GUI pass)"
@@ -273,6 +279,11 @@ export function MessageList({
     const fresh = timeline.slice(from);
     const label = shown ? pillLabel(fresh.length, fresh.some((item) => item.kind === "permission")) : null;
     if (label !== pill) setPill(label);
+    // The band's compact form: a card below wins over a count, a
+    // count over the bare arrow -- the same priority `pillLabel` already encodes, just short enough
+    // for a monospace band instead of the floating pill's full words.
+    const cardBelow = fresh.some((item) => item.kind === "permission");
+    onUnreadChange?.(shown ? (cardBelow ? "↓ ⚑" : fresh.length > 0 ? `↓${fresh.length}` : "↓") : null, jumpToEnd);
   };
   const jumpToEnd = () => {
     const list = listRef.current;
@@ -566,7 +577,6 @@ export function MessageList({
         {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
             to get, and following is a snap to `scrollHeight` now (the GUI pass, 2026-09-24). */}
       </div>
-      {pill !== null && <NewPill label={pill} onJump={jumpToEnd} />}
     </>
   );
 }

@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import type { HandoffCommand } from "../types";
 import { Row } from "./Row";
 
@@ -27,6 +26,13 @@ export function handoffBlockedReason(providerSessionId: string | null, turnInPro
 }
 
 type Props = {
+  /** Controlled by `App.tsx`'s `handoffOpen`: both entry points, `<leader>t` and the detail
+   *  popover's trailing row, are outside this component. `false` renders nothing. */
+  open: boolean;
+  /** `Esc`, or the confirmation's own Cancel button. Never called by this component on its own
+   *  initiative otherwise -- in particular, NOT once `onHandoff` is pressed (see that button's own
+   *  doc comment below for why that would be wrong). */
+  onClose: () => void;
   /** Claude's own session id — the only identity `claude --resume` takes. */
   providerSessionId: string | null;
   turnInProgress: boolean;
@@ -43,31 +49,17 @@ type Props = {
   onHandoff: () => void;
 };
 
-/** The control, plus the confirmation it opens.
- *
- * It confirms rather than acting because the action closes the conversation — on a backend with no
- * resume, irreversibly. Stating that afterwards would be too late. */
-export function ContinueInTerminal({
-  providerSessionId,
-  turnInProgress,
-  canResume,
-  handingOff,
-  onHandoff,
-}: Props) {
-  const [confirming, setConfirming] = useState(false);
+/** Confirmation opened by `<leader>t` or the detail popover's trailing row.
+ *  When `open` is false it renders nothing. Confirm before closing the conversation,
+ *  because a backend without resume support cannot reopen it. */
+export function ContinueInTerminal({ open, onClose, providerSessionId, turnInProgress, canResume, handingOff, onHandoff }: Props) {
   const blocked = handingOff
     ? "This conversation is being closed — the command will appear here once that has finished."
     : handoffBlockedReason(providerSessionId, turnInProgress);
 
-  /* A confirmation dialog must never appear without a deliberate click, and without this it could:
-     `confirming` used to stay true while `blocked` was non-null, so a turn starting while the block
-     was open replaced it with the disabled button and then brought it BACK by itself when the turn
-     ended. Anything that blocks the action closes the confirmation instead. */
-  useEffect(() => {
-    if (blocked !== null) setConfirming(false);
-  }, [blocked]);
+  if (!open) return null;
 
-  if (confirming && blocked === null) {
+  if (blocked === null) {
     return (
       <div className="handoff-confirm" data-nav-stop="handoff">
         <p>
@@ -81,15 +73,12 @@ export function ContinueInTerminal({
           </p>
         )}
         <div className="handoff-confirm-buttons">
-          <button
-            onClick={() => {
-              setConfirming(false);
-              onHandoff();
-            }}
-          >
-            Close it and show me the command
-          </button>
-          <button onClick={() => setConfirming(false)}>Cancel</button>
+          {/* Deliberately does NOT call `onClose` -- `handingOff` flips to `true` in the same commit
+              (`App.tsx`'s `handoffToTerminal` sets it synchronously), so `blocked` is non-null on
+              the very next render and this branch is left for the one below on its own; calling
+              `onClose` too would only race that transition for no purpose. */}
+          <button onClick={onHandoff}>Close it and show me the command</button>
+          <button onClick={onClose}>Cancel</button>
         </div>
       </div>
     );
@@ -97,15 +86,7 @@ export function ContinueInTerminal({
 
   return (
     <div className="handoff" data-nav-stop="handoff">
-      <button
-        className="handoff-open"
-        disabled={blocked !== null}
-        title={blocked ?? undefined}
-        onClick={() => setConfirming(true)}
-      >
-        Continue in a terminal…
-      </button>
-      {blocked !== null && <span className="handoff-blocked">{blocked}</span>}
+      <span className="handoff-blocked">{blocked}</span>
     </div>
   );
 }

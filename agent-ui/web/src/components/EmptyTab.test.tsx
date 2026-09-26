@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import type { RenderResult } from "@testing-library/react";
 import { EmptyTab } from "./EmptyTab";
 import type { EmptyTabProps } from "./EmptyTab";
 import type { Hello, ResumableSession, TabInfo } from "../types";
+import { TABLE } from "../testFixtures";
+import { WHICH_KEY_DELAY_MS } from "../leader";
 
 afterEach(cleanup);
 
@@ -13,26 +16,45 @@ const session = (n: number): ResumableSession => ({
 const HELLO: Hello = {
   backend: "sidecar", projectDir: "/p", permissionModes: ["auto", "bypass"],
   resumableSessions: Array.from({ length: 10 }, (_, i) => session(i)), expectedVerdandiRevision: "28a5e4c",
+  account: null,
 };
-const TAB: TabInfo = { id: 1, number: 1, label: "1 new", name: null, state: "not_started", mode: "auto", marker: null, pending: 0, resumable: true, failure: null };
+const TAB: TabInfo = {
+  id: 1, number: 1, label: "1 new", name: null, state: "not_started", mode: "auto",
+  marker: null, pending: 0, resumable: true, failure: null, title: null,
+};
 
 function renderEmpty(over: Partial<EmptyTabProps> = {}) {
   const props: EmptyTabProps = {
-    hello: HELLO, tab: TAB, handoff: null, failure: null, paneFocused: true, focusRequest: 0, restoredDraft: null,
+    hello: HELLO, tab: TAB, handoff: null, failure: null, paneFocused: true, focusRequest: 0, arriveRequest: 0,
+    keysRequest: 0, overlayOpen: false, restoredDraft: null,
     onSend: vi.fn(), onResume: vi.fn(), onCycleMode: vi.fn(), onReset: vi.fn(), onHint: vi.fn(), ...over,
   };
   return { props, ...render(<EmptyTab {...props} />) };
 }
 
+/** Switches to BROWSE without going through the composer's own `Shift+Tab`/`i` routes -- an
+ *  `arrive` bump is the shape a real arrival takes and also resets the dashboard cursor
+ *  to `"new"`, so it doubles as this file's way to get keys to `.empty-tab`'s own
+ *  `onKeyDown` rather than the textarea's. */
+function toBrowse(rendered: RenderResult, props: EmptyTabProps): HTMLElement {
+  rendered.rerender(<EmptyTab {...props} arriveRequest={1} />);
+  return rendered.container.querySelector(".empty-tab")!;
+}
+
 describe("EmptyTab (F3)", () => {
-  it("is Claude Code's fresh prompt: a live composer, at most 8 resume rows", () => {
+  it("is Claude Code's fresh prompt: a live composer, with the dashboard drawn under it", () => {
     // The mode pill moved into the footer `App.tsx` draws; see `App.test.tsx`'s
     // "draws the empty tab's close prompt in the footer" for where it is covered now.
     const { container } = renderEmpty();
     expect(container.querySelector("textarea")).not.toBeNull();
     expect(document.activeElement).toBe(container.querySelector("textarea"));
-    expect(container.querySelectorAll('[data-nav-stop="resume"]').length).toBe(8);
+    // The dashboard shows five actions (`new`, `resume`, `sessions`, `mode`, `keys`) instead of
+    // individual resume rows. `HELLO` has ten sessions, so this checks that the action count is
+    // independent of the session count.
+    expect(container.querySelectorAll('[data-nav-stop="resume"]').length).toBe(0);
+    expect(container.querySelectorAll('[data-nav-stop="dash"]').length).toBe(5);
     expect(container.textContent).not.toContain("about 8");
+    expect(container.querySelector(".dashboard")).not.toBeNull();
   });
   it("sends what is typed, which starts the session lazily in Rust", () => {
     const { container, props } = renderEmpty();
@@ -48,13 +70,6 @@ describe("EmptyTab (F3)", () => {
     expect(props.onCycleMode).not.toHaveBeenCalled();
     fireEvent.keyDown(box, { key: "Tab", shiftKey: true });
     expect(props.onCycleMode).toHaveBeenCalledTimes(1);
-  });
-  it("resumes the row that is activated (Enter on a focused row button is its click)", () => {
-    const { container, props } = renderEmpty();
-    const rows = container.querySelectorAll<HTMLButtonElement>('[data-nav-stop="resume"]');
-    rows[2].focus();
-    fireEvent.click(rows[2]);
-    expect(props.onResume).toHaveBeenCalledWith("id-2-0000000000");
   });
   it("says it is starting while the session connects, with the box live, queueing", () => {
     const onQueue = vi.fn();
@@ -83,16 +98,336 @@ describe("EmptyTab (F3)", () => {
     fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
     expect(onQueue).not.toHaveBeenCalled();
   });
-  it("shows why a failed tab failed, and r starts it over", () => {
+  it("shows why a failed tab failed, and r starts it over, with no dashboard", () => {
     const { container, getByText, props } = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "the gate refused 2.1.999" });
     getByText("the gate refused 2.1.999");
+    expect(container.querySelector(".dashboard")).toBeNull();
     fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "r" });
     expect(props.onReset).toHaveBeenCalled();
+  });
+  it("draws no dashboard while starting", () => {
+    const { container } = renderEmpty({ tab: { ...TAB, state: "starting" } });
+    expect(container.querySelector(".dashboard")).toBeNull();
   });
   it("shows the handoff card of a conversation handed to a terminal", () => {
     const { getByText } = renderEmpty({
       handoff: { command: "cd /p && claude --resume abc", cwd: "/p", providerSessionId: "abc" },
     });
     getByText("cd /p && claude --resume abc");
+  });
+
+  describe("BROWSE: j/k move the dashboard cursor, letters and Enter run items", () => {
+    it("arrive lands BROWSE with the cursor on New session, closing the fresh prompt's default composer", () => {
+      const rendered = renderEmpty();
+      const { props, container } = rendered;
+      expect(container.querySelector("textarea")).not.toBeNull();
+      const root = toBrowse(rendered, props);
+      expect(container.querySelector("textarea")).toBeNull();
+      const items = Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
+      expect(items[0].getAttribute("aria-current")).toBe("true");
+    });
+
+    it("j/k move the cursor, clamped at both ends", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      const current = () => root.querySelector<HTMLElement>('[aria-current="true"]');
+      const items = () => Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
+      expect(items().indexOf(current()!)).toBe(0);
+      fireEvent.keyDown(root, { key: "j" });
+      expect(items().indexOf(current()!)).toBe(1);
+      fireEvent.keyDown(root, { key: "k" });
+      expect(items().indexOf(current()!)).toBe(0);
+      // Clamped, not wrapped: holding k at the top stays put.
+      fireEvent.keyDown(root, { key: "k" });
+      expect(items().indexOf(current()!)).toBe(0);
+      // HELLO above has records, so the table is new/resume/sessions/mode/keys -- 5 items, last index 4.
+      for (let i = 0; i < 10; i++) fireEvent.keyDown(root, { key: "j" });
+      expect(items().indexOf(current()!)).toBe(4);
+    });
+
+    it("Enter runs the item under the cursor", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "j" }); // -> resume
+      fireEvent.keyDown(root, { key: "Enter" });
+      expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
+    });
+
+    it("i opens the composer in INPUT", () => {
+      const rendered = renderEmpty();
+      const { props, container } = rendered;
+      const root = toBrowse(rendered, props);
+      expect(container.querySelector("textarea")).toBeNull();
+      fireEvent.keyDown(root, { key: "i" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    });
+
+    it("r resumes the newest record directly, regardless of the cursor", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "r" });
+      expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
+    });
+
+    it("r does nothing when there is no record to resume", () => {
+      const rendered = renderEmpty({ hello: { ...HELLO, resumableSessions: [] } });
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "r" });
+      expect(props.onResume).not.toHaveBeenCalled();
+    });
+
+    it("w opens the chooser", () => {
+      const onChooseSessions = vi.fn();
+      const rendered = renderEmpty({ onChooseSessions });
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "w" });
+      expect(onChooseSessions).toHaveBeenCalledTimes(1);
+    });
+
+    it("m cycles the mode, same as Shift+Tab", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "m" });
+      expect(props.onCycleMode).toHaveBeenCalledTimes(1);
+    });
+
+    it("? opens the keymap overlay", () => {
+      const onOpenKeymap = vi.fn();
+      const rendered = renderEmpty({ onOpenKeymap });
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "?" });
+      expect(onOpenKeymap).toHaveBeenCalledTimes(1);
+    });
+
+    it("Space is left for the leader system, not swallowed by a dashboard item", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      const event = fireEvent.keyDown(root, { key: " " });
+      // `fireEvent` returns `false` only when `preventDefault()` was called; this component must
+      // never call it for Space, or the leader engine above it never sees the key.
+      expect(event).toBe(true);
+      expect(props.onCycleMode).not.toHaveBeenCalled();
+      expect(props.onResume).not.toHaveBeenCalled();
+    });
+
+    it("a click on a dashboard item runs it, same as its key", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      const items = Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
+      fireEvent.click(items[1]); // "resume"
+      expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
+    });
+
+    /** After mounting and arriving in BROWSE, Space must start the leader sequence and show the
+     *  which-key box after its delay when a table is supplied. */
+    describe("the leader engine", () => {
+      it("shows the which-key box 200ms after Space, once a real table is supplied", () => {
+        vi.useFakeTimers();
+        try {
+          const rendered = renderEmpty({ panelTable: TABLE });
+          const { props, container } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: " " });
+          act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS - 1));
+          expect(container.querySelector(".which-key-box")).toBeNull();
+          act(() => vi.advanceTimersByTime(1));
+          const box = container.querySelector(".which-key-box")!;
+          expect(box).not.toBeNull();
+          expect(box.querySelector(".wk-title")!.textContent).toBe("Space");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** An input method's Space must not start a sequence, whether marked by `isComposing` or
+       *  WebKit's `keyCode` 229. Use the same `isImeKey` guard as the live conversation. */
+      it("an IME Space (isComposing, or keyCode 229) starts no sequence", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props, container } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: " ", isComposing: true });
+          fireEvent.keyDown(root, { key: " ", keyCode: 229 });
+          act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+          expect(container.querySelector(".which-key-box")).toBeNull();
+          // Nothing pending: `b` then `d` alone do not complete `Space b d`.
+          fireEvent.keyDown(root, { key: "b" });
+          fireEvent.keyDown(root, { key: "d" });
+          expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
+          // A real Space still does, so the guard is not simply swallowing Space.
+          fireEvent.keyDown(root, { key: " " });
+          act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+          expect(container.querySelector(".which-key-box")).not.toBeNull();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("Space b d runs the table's tab.close binding through onPanelAction, never a dashboard item", () => {
+        const onPanelAction = vi.fn();
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+        const { props, container } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: " " });
+        fireEvent.keyDown(root, { key: "b" });
+        fireEvent.keyDown(root, { key: "d" });
+        expect(onPanelAction).toHaveBeenCalledWith({ keys: ["<leader>", "b", "d"], action: "tab.close", desc: "close tab", source: "default" });
+        expect(props.onCycleMode).not.toHaveBeenCalled();
+        expect(props.onResume).not.toHaveBeenCalled();
+        expect(container.querySelector(".which-key-box")).toBeNull();
+      });
+
+      /** Handle `[b`/`]b` here because `startSequence` leaves `[`/`]` to `resolveKey`, which this
+       *  screen does not run. */
+      it("[ b and ] b run the table's tab.prev / tab.next, and a stray [ is dropped", () => {
+        const onPanelAction = vi.fn();
+        const table = {
+          ...TABLE,
+          bindings: [...TABLE.bindings, { keys: ["]", "b"], action: "tab.next" as const, desc: "tab.next", source: "default" as const }],
+        };
+        const rendered = renderEmpty({ panelTable: table, onPanelAction });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: "[" });
+        fireEvent.keyDown(root, { key: "b" });
+        expect(onPanelAction).toHaveBeenLastCalledWith(expect.objectContaining({ keys: ["[", "b"], action: "tab.prev" }));
+        fireEvent.keyDown(root, { key: "]" });
+        fireEvent.keyDown(root, { key: "b" });
+        expect(onPanelAction).toHaveBeenLastCalledWith(expect.objectContaining({ keys: ["]", "b"], action: "tab.next" }));
+        expect(onPanelAction).toHaveBeenCalledTimes(2);
+        // `[` then a key with no pair: the prefix is dropped, and a later lone `b` does nothing.
+        fireEvent.keyDown(root, { key: "[" });
+        fireEvent.keyDown(root, { key: "x" });
+        fireEvent.keyDown(root, { key: "b" });
+        expect(onPanelAction).toHaveBeenCalledTimes(2);
+      });
+
+      /** Losing pane focus cancels a pending sequence. */
+      it("losing pane focus cancels a pending sequence", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props, container } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: " " });
+          act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+          expect(container.querySelector(".which-key-box")).not.toBeNull();
+          rendered.rerender(<EmptyTab {...props} arriveRequest={1} paneFocused={false} />);
+          expect(container.querySelector(".which-key-box")).toBeNull();
+          rendered.rerender(<EmptyTab {...props} arriveRequest={1} paneFocused={true} />);
+          fireEvent.keyDown(root, { key: "b" });
+          fireEvent.keyDown(root, { key: "d" });
+          expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("a direct table binding (H) runs immediately, ahead of the dashboard's own fixed keys", () => {
+        const onPanelAction = vi.fn();
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: "H" });
+        expect(onPanelAction).toHaveBeenCalledWith({ keys: ["H"], action: "tab.prev", desc: "tab.prev", source: "default" });
+      });
+
+      /** `i` is one of the reserved fixed BROWSE keys (Global Constraint #4), so it can never START
+       *  a sequence -- but a sequence already pending, mid-typing, swallows any key that does not
+       *  continue it, `i` included.
+       *  This is the exact same rule `App.tsx`'s own describe block pins with `armThenCancel(() =>
+       *  press("i"))`; reproduced here so this screen's copy of the engine agrees with it, rather
+       *  than leaking into the dashboard's `i` (open the composer) underneath. */
+      it("i cancels a pending sequence rather than falling through to the dashboard's own i", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props, container } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: " " });
+          act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+          expect(container.querySelector(".which-key-box")).not.toBeNull();
+          fireEvent.keyDown(root, { key: "i" });
+          expect(container.querySelector(".which-key-box")).toBeNull();
+          expect(container.querySelector("textarea")).toBeNull();
+          expect(onPanelAction).not.toHaveBeenCalled();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
+  });
+
+  it("in INPUT the dashboard's letters type into the composer instead of running an item", () => {
+    const { container, props } = renderEmpty(); // starts in INPUT (mode defaults to "input")
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "w" } });
+    expect(box.value).toBe("w");
+    expect(props.onChooseSessions).toBeUndefined();
+  });
+
+  /** `arrive` must move focus off the textarea before `setMode("browse")`. Then `onBlur` reports
+   *  BROWSE with the root as `relatedTarget`, and focus never gets stranded on `document.body`. */
+  describe("keysRequest / overlayOpen", () => {
+    it("arrive with the textarea focused lands the keys on the root, not body", () => {
+      const rendered = renderEmpty();
+      const { container, props } = rendered;
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+      rendered.rerender(<EmptyTab {...props} arriveRequest={1} />);
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
+    });
+
+    it("a keysRequest bump in BROWSE with focus on body brings the keys back to the root", () => {
+      const rendered = renderEmpty();
+      const { container, props } = rendered;
+      const root = toBrowse(rendered, props);
+      expect(document.activeElement).toBe(root);
+      act(() => (document.activeElement as HTMLElement).blur());
+      expect(document.activeElement).toBe(document.body);
+      rendered.rerender(<EmptyTab {...props} arriveRequest={1} keysRequest={1} />);
+      expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
+    });
+
+    it("a keysRequest bump in INPUT focuses the composer's textarea", () => {
+      const rendered = renderEmpty();
+      const { container, props } = rendered;
+      // Moving real DOM focus away from the textarea normally flips `mode` to browse through
+      // `Composer`'s own `onBlur` -- to keep testing THIS branch (mode stays "input" while the
+      // root does not contain `document.activeElement`) rather than the browse one above, the
+      // `relatedTarget` is given `.history-search`'s own class, the one case `onBlur` itself
+      // already carves out (`Composer.tsx`'s doc comment: "a blur that lands there must not
+      // report BROWSE").
+      const outside = document.createElement("button");
+      outside.className = "history-search";
+      document.body.appendChild(outside);
+      act(() => outside.focus());
+      expect(document.activeElement).toBe(outside);
+      rendered.rerender(<EmptyTab {...props} keysRequest={1} />);
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+      document.body.removeChild(outside);
+    });
+
+    it("overlayOpen stops focusRequest from opening the composer under the chooser", () => {
+      const rendered = renderEmpty();
+      const { container, props } = rendered;
+      toBrowse(rendered, props);
+      expect(container.querySelector("textarea")).toBeNull();
+      rendered.rerender(<EmptyTab {...props} arriveRequest={1} overlayOpen={true} focusRequest={1} />);
+      expect(container.querySelector("textarea")).toBeNull();
+    });
   });
 });

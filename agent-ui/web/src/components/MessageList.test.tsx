@@ -1565,21 +1565,33 @@ describe("MessageList keeps a following view at its end when the list or a row c
   });
 });
 
-describe("MessageList: the R2 pill", () => {
+/** Read the last `(label, jump)` pair passed to `onUnreadChange`. The band in `App.tsx` holds
+ *  this value for the unread indicator. */
+function lastUnread(mock: ReturnType<typeof vi.fn>): { label: string | null; jump: () => void } {
+  const call = mock.mock.calls[mock.mock.calls.length - 1] as [string | null, () => void];
+  return { label: call[0], jump: call[1] };
+}
+
+describe("MessageList: the unread pill (reported upward)", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
   it("counts rows that arrived while reading up, marks a card, and jumps to the end on a click", () => {
-    const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
+    const onUnreadChange = vi.fn();
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("first") })} {...props} onUnreadChange={onUnreadChange} />,
+    );
     const list = container.querySelector(".message-list") as HTMLElement;
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
     noteUserScroll(list, "up");
     list.scrollTop = 1000;
     fireEvent.scroll(list);
-    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ Jump to bottom");
+    // The band's compact form for "shown, nothing counted yet" -- the bare arrow, no "Jump to
+    // bottom" (there is no room for words in a 24px band).
+    expect(lastUnread(onUnreadChange).label).toBe("↓");
     dims.grow(2400);
-    rerender(<MessageList state={state({ transcript: texts("first", "second", "third") })} {...props} />);
-    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ 2 new");
+    rerender(<MessageList state={state({ transcript: texts("first", "second", "third") })} {...props} onUnreadChange={onUnreadChange} />);
+    expect(lastUnread(onUnreadChange).label).toBe("↓2");
     rerender(
       <MessageList
         state={state({
@@ -1587,13 +1599,14 @@ describe("MessageList: the R2 pill", () => {
           pendingPermissions: [{ seq: 9, permissionId: "p", toolUseId: null, toolName: "Bash", input: {} }],
         })}
         {...props}
+        onUnreadChange={onUnreadChange}
       />,
     );
-    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ ⚑ approval");
-    fireEvent.click(container.querySelector(".new-pill")!);
+    expect(lastUnread(onUnreadChange).label).toBe("↓ ⚑");
+    lastUnread(onUnreadChange).jump();
     expect(list.scrollTop).toBe(2000);
     fireEvent.scroll(list);
-    expect(container.querySelector(".new-pill")).toBeNull();
+    expect(lastUnread(onUnreadChange).label).toBeNull();
   });
 
   it("keeps approval after a row resizes -- the observer read the first render's timeline (GUI pass 2026-09-25)", () => {
@@ -1602,7 +1615,10 @@ describe("MessageList: the R2 pill", () => {
     // first render's timeline -- nothing past the reader's mark -- and overwrote the right label the
     // moment the new rows' size settled. jsdom has no observer; the fake below delivers that resize.
     const observers = stubResizeObserver();
-    const { container, rerender } = render(<MessageList state={state({ transcript: texts("the reply") })} {...props} />);
+    const onUnreadChange = vi.fn();
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("the reply") })} {...props} onUnreadChange={onUnreadChange} />,
+    );
     const list = container.querySelector(".message-list") as HTMLElement;
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
@@ -1619,21 +1635,25 @@ describe("MessageList: the R2 pill", () => {
           pendingPermissions: [{ seq: 4, permissionId: "p", toolUseId: "toolu_x", toolName: "Bash", input: {} }],
         })}
         {...props}
+        onUnreadChange={onUnreadChange}
       />,
     );
-    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ ⚑ approval");
+    expect(lastUnread(onUnreadChange).label).toBe("↓ ⚑");
     act(() => resize(observers[observers.length - 1], list.querySelector(".row-permission")!, 300));
-    expect(container.querySelector(".new-pill")!.textContent).toBe("↓ ⚑ approval");
+    expect(lastUnread(onUnreadChange).label).toBe("↓ ⚑");
     vi.unstubAllGlobals();
   });
 
   it("is absent while following, however far a row grows", () => {
-    const { container, rerender } = render(<MessageList state={state({ transcript: texts("a") })} {...props} />);
+    const onUnreadChange = vi.fn();
+    const { container, rerender } = render(
+      <MessageList state={state({ transcript: texts("a") })} {...props} onUnreadChange={onUnreadChange} />,
+    );
     const list = container.querySelector(".message-list") as HTMLElement;
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
     dims.grow(9000);
-    rerender(<MessageList state={state({ transcript: texts("a, much longer") })} {...props} />);
-    expect(container.querySelector(".new-pill")).toBeNull();
+    rerender(<MessageList state={state({ transcript: texts("a, much longer") })} {...props} onUnreadChange={onUnreadChange} />);
+    expect(onUnreadChange.mock.calls.every(([label]) => label === null)).toBe(true);
   });
 });

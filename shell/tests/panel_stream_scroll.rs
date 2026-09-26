@@ -467,6 +467,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
         expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
         resumable: Vec::new(),
+        account: None,
     };
     // This replay uses a single tab.
     let sole_tab = neovibe_core::tabs::TabId(1);

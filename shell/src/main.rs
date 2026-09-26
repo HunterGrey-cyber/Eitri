@@ -12,6 +12,7 @@ mod layout;
 mod layout_state;
 mod lua;
 mod module_grid;
+mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
 mod prefix;
@@ -38,7 +39,7 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
-use neovibe_core::keymap::{Action, SwapTarget};
+use neovibe_core::keymap::{Action, SwapTarget, TabAction};
 use neovibe_core::layout::{
     Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
 };
@@ -143,11 +144,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // `--cmd` must be handed to the editor pane's constructor, and neither can be added to a child
     // that is already running.
     let mut context_feed = editor_context::EditorContextFeed::new();
+    // Build the feed for nvim's `mapleader`, `timeoutlen`, and Normal-mode maps here.
+    // Its `child_env()` and `--cmd` must reach the editor pane's constructor;
+    // neither can be added to an already running child.
+    let mut nvim_keys_feed = neovibe_core::nvim_keys::feed::NvimKeysFeed::new();
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
+    nvim_child_env.extend(nvim_keys_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
+    nvim_extra_args.extend(nvim_keys_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
     // wire 3. Unconditional and stateless -- no socket, no directory, nothing to fail at startup --
     // because the only reload trigger a normal Neovim config installs is `FocusGained`, and nothing
     // in this shell ever tells nvim it lost or gained focus. Without this a `git checkout`, a
@@ -354,12 +361,59 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             std::process::exit(1);
         }
     };
-    // The `?` overlay's window and prefix sections, generated from the keymap.
-    agent_panel_handle.set_keymap_help(neovibe_core::agent_bridge::serialize_keymap_for_js(
-        &keymap.prefix().human(),
-        &neovibe_core::keymap::root::help_rows(),
-        &keymap.help(&module_keys),
-    ));
+    // Generate the `?` overlay's window and prefix sections from the keymap.
+    // The effective panel keymap and new-tab chord travel in the same envelope.
+    // Recompute the panel table when `nvim_keys::listen` reports changes, and resend
+    // only if it changed. Spell `Action::Tab(TabAction::New)` as the readable prefix
+    // followed by the first key bound to that action, like `show_editor` and `way_back`.
+    let new_tab_chord = keymap
+        .keys_for(&Action::Tab(TabAction::New))
+        .first()
+        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()))
+        .unwrap_or_default();
+    // `latest.0` is the last nvim report seen (`None` until the feed's first line, or forever if
+    // the feed could not start); `latest.1` is the last `PanelKeymap` actually sent, so a report
+    // that leaves the merged table unchanged costs no dispatch and no repeated log line.
+    let latest: Rc<
+        RefCell<(
+            Option<neovibe_core::nvim_keys::NvimReport>,
+            Option<neovibe_core::keymap::PanelKeymap>,
+        )>,
+    > = Rc::new(RefCell::new((None, None)));
+    let send_keymap: Rc<dyn Fn()> = {
+        let latest = latest.clone();
+        let keymap = keymap.clone();
+        let module_keys = module_keys.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        let new_tab_chord = new_tab_chord.clone();
+        Rc::new(move || {
+            let mut latest_ref = latest.borrow_mut();
+            let report = latest_ref.0.clone();
+            let (panel_keymap, log) = neovibe_core::keymap::panel::effective(keymap.panel_user(), report.as_ref());
+            for line in log {
+                println!("{line}");
+            }
+            if latest_ref.1.as_ref() != Some(&panel_keymap) {
+                agent_panel_handle.set_keymap_help(neovibe_core::agent_bridge::serialize_keymap_for_js(
+                    &keymap.prefix().human(),
+                    &neovibe_core::keymap::root::help_rows(),
+                    &keymap.help(&module_keys),
+                    &panel_keymap,
+                    &new_tab_chord,
+                ));
+                latest_ref.1 = Some(panel_keymap);
+            }
+        })
+    };
+    send_keymap();
+    if let Some(feed) = nvim_keys_feed.as_mut() {
+        let latest = latest.clone();
+        let send_keymap = send_keymap.clone();
+        nvim_keys::listen(feed, move |report| {
+            latest.borrow_mut().0 = Some(report);
+            send_keymap();
+        });
+    }
     // The layout this window opens with: this project's state file if
     // it can be used, else `init.lua`'s `neovibe.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
@@ -703,16 +757,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         })
     };
 
-    // Where the keys land after a module key or a tray chip. Into the agent: on its oldest pending
-    // card if one waits (`focus_oldest_card`), else into its input field,
-    // as every keyboard arrival there does (`move_focus`).
+    // A module key or tray chip focuses the agent's oldest pending card if one waits
+    // (`focus_oldest_card`). Otherwise it enters BROWSE on the last row, like every
+    // other keyboard arrival through `move_focus`.
     let arrive: Rc<dyn Fn(&ModuleId)> = {
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |id| {
             if id.kind() == ModuleKind::Agent {
                 // The oldest card across every tab: its tab is switched to first (session tabs).
                 if !agent_panel_handle.focus_oldest_card() {
-                    agent_panel_handle.enter_input();
+                    agent_panel_handle.arrive();
                 }
             }
         })
@@ -1080,11 +1134,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 grid.unzoom();
                 let grabbed = focus_module(&to);
                 println!("[pane_switch] {from} {direction:?} -> {to} (grab_focus={grabbed})");
-                // Arriving by keyboard means "I want to type": open the composer with the caret in
-                // it. A click on a row does not come through here and still
-                // lands in BROWSE on that row.
+                // Keyboard arrival enters BROWSE on the last row. Clicking a row bypasses
+                // this path and enters BROWSE on the clicked row.
                 if grabbed && to.kind() == ModuleKind::Agent {
-                    agent_panel_handle.enter_input();
+                    agent_panel_handle.arrive();
                 }
                 true
             }
@@ -1101,6 +1154,86 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             }
         })
     };
+
+    // The prefix's `Action::Tab` chords and the panel's `tab_verb` messages use the
+    // same code, so behavior is shared across both routes. `keymap.ts` resolves the
+    // panel's `<leader>` bindings.
+    let run_tab_action: Rc<dyn Fn(TabAction)> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let window = window.clone();
+        let agent = agent_panel_handle.clone();
+        let focus_module = focus_module.clone();
+        let show_on_screen = show_on_screen.clone();
+        let refused_name = top_bar.app_name.clone();
+        Rc::new(move |tab_action: TabAction| {
+            let chat = ModuleId::agent();
+            let keys_in = pane_focus::focused_module(&window, &grid.hosts())
+                .as_ref()
+                .map(ModuleId::kind);
+            // One terminal today; `n`/`p` there are swallowed.
+            let plan = tab_verbs::plan(tab_action, keys_in, 1);
+            if plan.takes_the_keys {
+                if let Err(err) = show_on_screen(&chat) {
+                    refuse(&refused_name, &err);
+                    return;
+                }
+                focus_module(&chat);
+            }
+            let switched = match plan.verb {
+                tab_verbs::TabVerb::New => {
+                    agent.new_tab();
+                    agent.enter_input();
+                    true
+                }
+                tab_verbs::TabVerb::Step(delta) => agent.step(delta),
+                tab_verbs::TabVerb::Last => agent.select_last(),
+                tab_verbs::TabVerb::Select(n) => agent.select_number(n),
+                tab_verbs::TabVerb::Rename => {
+                    agent.begin_rename();
+                    true
+                }
+                tab_verbs::TabVerb::Close => {
+                    agent.confirm_close();
+                    true
+                }
+                tab_verbs::TabVerb::CloseOthers => {
+                    agent.confirm_close_others();
+                    true
+                }
+                tab_verbs::TabVerb::Choose => {
+                    agent.open_chooser(false);
+                    true
+                }
+                tab_verbs::TabVerb::Info => {
+                    agent.open_detail();
+                    true
+                }
+                tab_verbs::TabVerb::Flash => false,
+                tab_verbs::TabVerb::Nothing => return,
+            };
+            if !switched {
+                // tmux: "can't find window".
+                flash(&refused_name);
+                return;
+            }
+            // A switch from elsewhere shows a hidden chat where it was, keys unmoved;
+            // under a zoom only the tray chip changes.
+            if !plan.takes_the_keys
+                && neovibe_core::tabs::reveal_on_switch(neovibe_core::layout::agent_place(&module_layout.borrow()))
+            {
+                if let Err(err) = grid.show_module(&chat) {
+                    eprintln!("[tabs] could not reveal the chat: {err}");
+                }
+            }
+        })
+    };
+    // `<leader>bd`/`<leader>bo` etc., resolved by the panel's own sequence engine and sent as a
+    // `tab_verb` message -- routed through the very code the prefix's `Action::Tab` arm runs.
+    agent_panel_handle.on_tab_verb({
+        let run_tab_action = run_tab_action.clone();
+        move |tab_action| run_tab_action(tab_action)
+    });
 
     // The prefix. Installed after every other window-level controller that exists
     // at startup, so it sees keys first; HINT's, added when a HINT starts, still comes before it.
@@ -1129,6 +1262,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let strip_layout = module_layout.clone();
         let strip_title = module_title.clone();
         let prefix_strip = prefix_strip.clone();
+        let run_tab_action = run_tab_action.clone();
         let kill_now = kill_now.clone();
         let kill_prompt = kill_prompt.clone();
         let kill_title = module_title.clone();
@@ -1269,63 +1403,9 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         agent.open_keymap();
                     }
                     Action::WindowImmersive => window_modes.toggle_immersive(),
-                    Action::Tab(tab_action) => {
-                        let chat = ModuleId::agent();
-                        let keys_in = focused().as_ref().map(ModuleId::kind);
-                        // One terminal today; `n`/`p` there are swallowed.
-                        let plan = tab_verbs::plan(tab_action, keys_in, 1);
-                        if plan.takes_the_keys {
-                            if let Err(err) = show_on_screen(&chat) {
-                                refuse(&refused_name, &err);
-                                return;
-                            }
-                            focus_module(&chat);
-                        }
-                        let switched = match plan.verb {
-                            tab_verbs::TabVerb::New => {
-                                agent.new_tab();
-                                agent.enter_input();
-                                true
-                            }
-                            tab_verbs::TabVerb::Step(delta) => agent.step(delta),
-                            tab_verbs::TabVerb::Last => agent.select_last(),
-                            tab_verbs::TabVerb::Select(n) => agent.select_number(n),
-                            tab_verbs::TabVerb::Rename => {
-                                agent.begin_rename();
-                                true
-                            }
-                            tab_verbs::TabVerb::Close => {
-                                agent.confirm_close();
-                                true
-                            }
-                            tab_verbs::TabVerb::Choose => {
-                                agent.open_chooser(false);
-                                true
-                            }
-                            tab_verbs::TabVerb::Info => {
-                                agent.open_detail();
-                                true
-                            }
-                            tab_verbs::TabVerb::Flash => false,
-                            tab_verbs::TabVerb::Nothing => return,
-                        };
-                        if !switched {
-                            // tmux: "can't find window".
-                            flash(&refused_name);
-                            return;
-                        }
-                        // A switch from elsewhere shows a hidden chat where it was, keys unmoved;
-                        // under a zoom only the tray chip changes.
-                        if !plan.takes_the_keys
-                            && neovibe_core::tabs::reveal_on_switch(neovibe_core::layout::agent_place(
-                                &module_layout.borrow(),
-                            ))
-                        {
-                            if let Err(err) = grid.show_module(&chat) {
-                                eprintln!("[tabs] could not reveal the chat: {err}");
-                            }
-                        }
-                    }
+                    // `run_tab_action` is shared with the panel's `tab_verb` messages.
+                    // It computes `keys_in` the same way `focused()` does here.
+                    Action::Tab(tab_action) => run_tab_action(tab_action),
                     // The prefix never hands a split key back: it waits for a module key instead.
                     Action::Split(_) => {}
                 }
@@ -1576,9 +1656,14 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     }
     {
         let focus_module = focus_module.clone();
+        let arrive = arrive.clone();
         agent_panel_handle.on_chooser_closed(move |launch| {
-            if launch {
-                focus_module(&ModuleId::editor());
+            // Esc/q at launch hands the keys to the editor. `focus_module` refuses a hidden
+            // or killed editor; in that case, use the normal chat arrival path so the keys
+            // stay in the chat instead of being stranded between panes.
+            if launch && !focus_module(&ModuleId::editor()) {
+                println!("[chooser] the editor cannot take the keys; they stay in the chat");
+                arrive(&ModuleId::agent());
             }
         });
     }
@@ -1666,6 +1751,12 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         // if this is ever missed, but a sweep is a backstop, not a substitute: a leaked directory
         // per window close is how the other two protocols each learned this.
         if let Some(feed) = &context_feed {
+            feed.cleanup();
+        }
+        // The nvim-keys feed, for the same two reasons: left a
+        // local of `build_ui`, its `Drop` removed `k.sock` and `nvim_keys.lua` the moment this
+        // function returned, and nvim's mappings, leader and `timeoutlen` never reached the panel.
+        if let Some(feed) = &nvim_keys_feed {
             feed.cleanup();
         }
         // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never
@@ -1896,6 +1987,20 @@ mod tests {
             found_accelerators(),
             Vec::<(String, String)>::new(),
             "register it through neovibe_core::keymap::root instead"
+        );
+    }
+
+    /// Keyboard arrivals enter BROWSE. A new tab opens the composer instead,
+    /// since an empty tab has nothing to browse.
+    #[test]
+    fn keyboard_arrival_is_browse_and_only_a_new_tab_types() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let calls = src.matches(concat!(".enter", "_input()")).count();
+        assert_eq!(calls, 1, "only the new-tab path may land in INPUT");
+        assert!(
+            src.matches(concat!(".arr", "ive()")).count() >= 2,
+            "move_focus and arrive both use it"
         );
     }
 

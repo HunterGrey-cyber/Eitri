@@ -13,6 +13,7 @@ import { renderToolCall } from "./toolRegistry";
 import { renderMarkdown } from "./markdown";
 import { PermissionCard } from "./components/PermissionCard";
 import { KeymapOverlay } from "./components/KeymapOverlay";
+import { EMPTY_PANEL_TABLE } from "./keymap";
 
 /** Strip CSS comments while preserving comment markers inside strings.
  *
@@ -65,32 +66,29 @@ const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
 /** A selector branch that sits inside the winbar or the status line -- `.winbar`, `.status-line`,
  *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
-/** The solid cursor block: the current row's sign cell, and a focused button with its children
- *  (every control is keyboard-reachable and the selected one is drawn as the cursor). Nothing else. */
-const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?)$/;
+/** The solid cursor block: the current row's sign cell, a focused button with its children (every
+ *  control is keyboard-reachable and the selected one is drawn as the cursor), and the band's own
+ *  `↓N` button.
+ *  Nothing else. */
+const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread)$/;
 /** The global `f` HINT's label, and nothing else. */
 const HINT_BRANCH = /^\.hint-label$/;
+/** The which-key box's own keycap glyph, and nothing else -- a
+ *  selector branch ending in exactly `.wk-key`. */
+const WK_KEY_BRANCH = /(?:^|[\s.])wk-key$/;
+/** The band's `⏵⏵` mode glyph, and nothing else -- a
+ *  selector branch that is `.mode-glyph` optionally followed by a `[data-mode-name="..."]`
+ *  attribute selector, narrowed so it cannot widen to `.band-mode`/`.mode-pill`/anything else the
+ *  glyph sits beside. */
+const MODE_GLYPH_BRANCH = /(?:^|[\s.])mode-glyph(?:\[data-mode-name="[a-z]+"\])?$/;
 
-/**
- * The rule this file actually enforces, in one sentence: **a colour may be used as text only where
- * Rust guards it for text against the surface it sits on.** `tokens.rs` guards `fg`/`muted` for
- * text against `bg` (`TEXT_CONTRAST`, 4.5:1) -- the panel body's surface -- and separately guards
- * `chrome-fg`/`chrome-muted` for text against `chrome` (also 4.5:1, `tokens.rs:209-210`) -- the
- * winbar/status-line's surface, painted in nvim's own `StatusLine` colours rather than the body's.
- * Neither pair is interchangeable with the other: `chrome`-guarded text on the plain body, or
- * `bg`-guarded text on chrome, was never measured against the surface actually under it. The one
- * other exemption (panel-as-document task 4) is `--nv-syn-*` inside a `hljs-*` rule -- deliberately
- * UNguarded, because syntax tokens are meant to be the editor's own colours; see the big comment on
- * the real guard test below for why that one is not a contrast exemption at all.
- *
- * Returns every `color:` declaration in `source` that is NOT one of the three sanctioned pairings
- * above. Shared by the real guard test and the tests proving none of the three exemptions can
- * quietly widen -- on purpose. Before this was hoisted, each test carried its own copy of this
- * logic over its own string literal, so a change to the real guard (say, widening a regex to admit
- * more than intended) had no effect on the proof tests' copies at all. Calling the same function
- * from all of them closes that: a widened regex here is exercised by, and must still satisfy,
- * every proof test too.
- */
+/** Returns text colour declarations that fall outside the allowed token and surface
+ * combinations. tokens.rs guards fg/muted against bg and chrome-fg/chrome-muted against chrome
+ * at 4.5:1. A pair guarded for one surface cannot guarantee contrast on another. Syntax tokens
+ * inside hljs rules preserve the editor's colours without a contrast guarantee. The which-key
+ * box's own .wk-key glyph also permits --nv-syn-keyword. The real guard and its negative
+ * controls share this function, so widening a selector check must still satisfy the tests that
+ * keep each exception narrow. */
 function unguardedTextColorDeclarations(source: string): string[] {
   const rules = source.match(/[^{}]*\{[^{}]*\}/g) ?? [];
   const declarations: string[] = [];
@@ -103,9 +101,21 @@ function unguardedTextColorDeclarations(source: string): string[] {
       everyBranchIsOnSurface(selector, CURSOR_BRANCH) && /(?:^|;)\s*background: var\(--nv-fg\);/.test(body);
     const onHintSurface =
       everyBranchIsOnSurface(selector, HINT_BRANCH) && /(?:^|;)\s*background: var\(--nv-hint-bg\);/.test(body);
+    const onWkKeySurface = everyBranchIsOnSurface(selector, WK_KEY_BRANCH);
+    const onModeGlyphSurface = everyBranchIsOnSurface(selector, MODE_GLYPH_BRANCH);
     for (const declaration of body.match(/(?<![a-z-])color:[^;]*;/g) ?? []) {
       if (onHljsSurface && /^color: var\(--nv-syn-[a-z]+\);$/.test(declaration)) continue;
       if (onChromeSurface && /^color: var\(--nv-chrome-(fg|muted)\);$/.test(declaration)) continue;
+      // The which-key box's own keycap: the same deliberately-
+      // unguarded exemption `--nv-syn-*` gets inside `hljs-*` above, extended to the one place
+      // outside a code block that also wants a "this is a key" glyph -- narrowed to exactly
+      // `.wk-key`, so it cannot widen to `.wk-group`/`.wk-disabled`/anything else in the box.
+      if (onWkKeySurface && /^color: var\(--nv-syn-keyword\);$/.test(declaration)) continue;
+      // The band's own mode glyph: `--nv-warn`/`--nv-error`
+      // as a glyph colour, not text -- `--nv-warn`/`--nv-error` are guarded at `UI_CONTRAST` (3.0)
+      // against `bg`, not the 4.5:1 text needs, the same reasoning every other signal colour in
+      // this file gets kept off text for.
+      if (onModeGlyphSurface && /^color: var\(--nv-(warn|error)\);$/.test(declaration)) continue;
       // The panel's cursor: `--nv-bg` text on an `--nv-fg` fill, the body's own pair reversed.
       // Only where the SAME rule paints that fill, so the exemption cannot outlive the fill.
       if (onCursorSurface && /^color: var\(--nv-bg\);$/.test(declaration)) continue;
@@ -517,12 +527,27 @@ describe("index.css", () => {
     expect(withoutComments.match(/#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(/g)).toBeNull();
   });
 
-  it("names no font family -- both stacks come from Rust", () => {
+  /** `⏵⏵` (U+23F5) is absent from FiraCode Nerd Font, so `.mode-glyph` uses a fallback stack.
+   *  Restrict the literal-stack exemption to that selector and that exact stack so it cannot
+   *  spread to unrelated rules. Other font stacks come from Rust tokens. */
+  const MODE_GLYPH_FONT_STACK =
+    'font-family: "Noto Sans Symbols 2", "Symbola", "Segoe UI Symbol", "Adwaita Mono", var(--nv-font-mono);';
+
+  it("names no font family -- both stacks come from Rust, except the mode glyph's own", () => {
     const families = withoutComments.match(/font-family:[^;]*;/g) ?? [];
     expect(families.length).toBeGreaterThan(0);
     for (const declaration of families) {
+      if (declaration === MODE_GLYPH_FONT_STACK) continue;
       expect(declaration).toMatch(/^font-family: var\(--nv-font-(prose|mono)\);$/);
     }
+  });
+
+  it("the mode-glyph font stack is on .mode-glyph alone, not a grouped or wider selector", () => {
+    const rules = withoutComments.match(/[^{}]*\{[^{}]*\}/g) ?? [];
+    const owning = rules.filter((rule) => rule.includes(MODE_GLYPH_FONT_STACK));
+    expect(owning.length).toBe(1);
+    const selector = owning[0].slice(0, owning[0].indexOf("{")).trim();
+    expect(selector).toBe(".mode-glyph");
   });
 
   it("uses --nv-border only for rules, never as a fill under text", () => {
@@ -585,6 +610,25 @@ describe("index.css", () => {
     );
     expect(declarations).toEqual(["color: var(--nv-syn-keyword);"]);
     expect(declarations[0]).not.toMatch(/^color: var\(--nv-(fg|muted)\);$/);
+  });
+
+  it("exempts --nv-syn-keyword as text only on the which-key box's own keycap", () => {
+    expect(unguardedTextColorDeclarations(".which-key-box .wk-key { color: var(--nv-syn-keyword); }")).toEqual([]);
+    // Anywhere else, and a group with one branch on it, it is refused -- same shape as the hljs-*
+    // and chrome-surface proofs above.
+    expect(unguardedTextColorDeclarations(".wk-title { color: var(--nv-syn-keyword); }")).toEqual([
+      "color: var(--nv-syn-keyword);",
+    ]);
+    expect(
+      unguardedTextColorDeclarations(".session-lost, .which-key-box .wk-key { color: var(--nv-syn-keyword); }"),
+    ).toEqual(["color: var(--nv-syn-keyword);"]);
+  });
+
+  it("still refuses a different signal colour on the which-key box's own keycap", () => {
+    // Proves the narrowed guard did not quietly become "anything inside .wk-key is exempt" -- only
+    // --nv-syn-keyword survives it, the same check the hljs-* proof above makes for that exemption.
+    const declarations = unguardedTextColorDeclarations(".which-key-box .wk-key { color: var(--nv-warn); }");
+    expect(declarations).toEqual(["color: var(--nv-warn);"]);
   });
 
   it("still refuses --nv-chrome-accent as text inside the winbar", () => {
@@ -687,11 +731,10 @@ describe("index.css", () => {
     }
   });
 
-  it("does not dim the status row, the activity line or the footer with opacity either", () => {
-    // Same defect, same fix, same reason: opacity on top of an already-guarded muted text colour
-    // would multiply its contrast back down below what tokens.rs actually guaranteed. The winbar
-    // is gone; these three replace it and the old status line.
-    const rules = withoutComments.match(/\.(?:status-row|activity-line|panel-footer)[^{}]*\{[^}]*\}/g) ?? [];
+  it("does not dim the activity line or the band with opacity either", () => {
+    // Opacity would reduce the contrast of text already guarded by tokens.rs. The activity line
+    // and .status-band must use their text colours without additional dimming.
+    const rules = withoutComments.match(/\.(?:status-band|activity-line)[^{}]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThan(0);
     for (const rule of rules) {
       expect(rule).not.toMatch(/opacity/);
@@ -957,8 +1000,10 @@ describe("index.css cascade (which rule actually wins)", () => {
   // below, and `.selected` exercises `.row-choice.selected`'s own fill -- neither was reachable
   // when this fixture held only the unselected row.
   const CHOICE_ROW = `<div class="mode-selector"><div class="session-choice"><button type="button" class="row row-choice"><span class="row-sign">›</span><span class="row-body">y</span></button><button type="button" class="row row-choice selected"><span class="row-sign">›</span><span class="row-body">z</span></button></div></div>`;
-  const MODE_BLOCK = `<div class="panel-footer"><span class="mode-block" data-mode="input">INPUT</span></div>`;
-  const UNFOCUSED_INPUT_BLOCK = `<div class="panel-footer"><span class="mode-block" data-mode="input" data-focused="false">INPUT</span></div>`;
+  // Use the bare `.band-mode` selector: `StatusBand.tsx` renders it without a `.panel-footer`
+  // wrapper.
+  const MODE_BLOCK = `<div class="status-band"><span class="band-mode" data-mode="input">INPUT</span></div>`;
+  const UNFOCUSED_INPUT_BLOCK = `<div class="status-band"><span class="band-mode" data-mode="input" data-focused="false">INPUT</span></div>`;
 
   // A positional grid-template-rows: auto 1fr auto auto gives the free height to the second
   // child, which can be the fatal-error banner. The list then grows to its content height and
@@ -966,7 +1011,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   // the list grow and scroll by its own class regardless of surrounding panel elements.
   const CONVERSATION = (banner: string) =>
     `<div class="agent-ui-root agent-ui-conversation">${banner}<div class="agent-ui-scroller"><div class="message-list">m</div></div>` +
-    `<div class="activity-line">a</div><div class="composer">c</div><div class="status-row">s</div><div class="panel-footer">f</div></div>`;
+    `<div class="activity-line">a</div><div class="composer">c</div><div class="status-band">s</div></div>`;
 
   it("gives the free height to the message list, fatal banner or not", () => {
     for (const banner of ["", `<div class="fatal-error">e</div>`]) {
@@ -983,7 +1028,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       const root = computed(CONVERSATION(banner), ".agent-ui-conversation");
       expect(root.display).toBe("flex");
       expect(root.gridTemplateRows).toBe("none");
-      for (const other of [".activity-line", ".composer", ".status-row", ".panel-footer", ...(banner ? [".fatal-error"] : [])]) {
+      for (const other of [".activity-line", ".composer", ".status-band", ...(banner ? [".fatal-error"] : [])]) {
         expect(computed(CONVERSATION(banner), other).flexGrow).toBe("0");
       }
     }
@@ -1001,19 +1046,22 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="agent-ui-root agent-ui-conversation">` +
       `<div class="agent-ui-scroller"><div class="message-list">m</div>` +
       `<div class="keymap-overlay"><section><h2>This panel</h2></section></div></div>` +
-      `<div class="activity-line">a</div><div class="status-row">s</div><div class="panel-footer">f</div></div>`;
+      `<div class="activity-line">a</div><div class="status-band">s</div></div>`;
     expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
     expect(computed(markup, ".keymap-overlay").position).toBe("absolute");
     // And the bars are back to taking part in normal painting: nothing has to out-stack the overlay.
-    for (const bar of [".activity-line", ".status-row", ".panel-footer"]) {
+    for (const bar of [".activity-line", ".status-band"]) {
       expect(computed(markup, bar).zIndex).toBe("auto");
     }
   });
 
-  it("puts the R2 pill inside the list's own region", () => {
-    const markup = `<div class="agent-ui-scroller"><div class="message-list">m</div><button class="new-pill">↓</button></div>`;
-    expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
-    expect(computed(markup, ".new-pill").position).toBe("absolute");
+  /** The unread indicator is .band-unread in normal flow at the band's right edge. Its inverted
+   *  colours mark unread content without floating over the conversation text. */
+  it("keeps the R2 pill in normal flow inside the band, not floated over the list", () => {
+    const markup = `<div class="status-band"><div class="band-right"><button class="band-seg band-unread">↓</button></div></div>`;
+    expect(computed(markup, ".band-unread").position).toBe("static");
+    expect(computed(markup, ".band-unread").background).toBe("var(--nv-fg)");
+    expect(computed(markup, ".band-unread").color).toBe("var(--nv-bg)");
   });
 
   it("does not dim the which-key strip with opacity", () => {
@@ -1637,7 +1685,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(specificity(".row-choice")).toEqual([0, 1, 0]);
     expect(specificity(".row-prompt .row-body")).toEqual([0, 2, 0]);
     expect(specificity(".message-list .row-prompt .row-body")).toEqual([0, 3, 0]);
-    expect(specificity('.panel-footer .mode-block[data-mode="input"]')).toEqual([0, 3, 0]);
+    // `.band-mode[data-mode="input"]` has one class and one attribute, with no wrapper prefix.
+    expect(specificity('.band-mode[data-mode="input"]')).toEqual([0, 2, 0]);
     expect(compareSpecificity([0, 3, 0], [0, 2, 0])).toBeGreaterThan(0);
   });
 
@@ -1877,11 +1926,11 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("lets the per-mode border-left-color override the mode block's own border shorthand", () => {
-    expect(computed(MODE_BLOCK, ".mode-block").borderLeftColor).toBe("var(--nv-mode-input)");
+    expect(computed(MODE_BLOCK, ".band-mode").borderLeftColor).toBe("var(--nv-mode-input)");
     const clobbered = computed(
       MODE_BLOCK,
-      ".mode-block",
-      ".panel-footer .mode-block { border-left: 3px solid var(--nv-mode-browse); }",
+      ".band-mode",
+      ".band-mode { border-left: 3px solid var(--nv-mode-browse); }",
     );
     // A later rule at HIGHER specificity than the `[data-mode]` one would be the real defect; this
     // control is the weaker "later, equal-specificity shorthand", which is enough to show the
@@ -1944,22 +1993,22 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("dims an unfocused mode block even in INPUT, whose own rule has equal specificity", () => {
-    // `[data-mode="input"]` and `[data-focused="false"]` are both (0,3,0), so source order decides
+    // `[data-mode="input"]` and `[data-focused="false"]` are both (0,2,0), so source order decides
     // and the unfocused rule must come second. Both sides are `var()` longhands, the combination
     // this engine resolves correctly (see the big comment above).
-    const block = computed(UNFOCUSED_INPUT_BLOCK, ".mode-block");
+    const block = computed(UNFOCUSED_INPUT_BLOCK, ".band-mode");
     expect(block.borderLeftColor).toBe("var(--nv-muted)");
     expect(block.color).toBe("var(--nv-muted)");
     // A focused block keeps its per-mode rule and inherits the bright label colour.
-    const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".mode-block");
+    const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".band-mode");
     expect(focused.borderLeftColor).toBe("var(--nv-mode-input)");
     expect(focused.color).not.toBe("var(--nv-muted)");
     // Negative control: the INPUT rule re-declared after the unfocused one wins it back. That is
     // what swapping the two rules in index.css would do.
     const clobbered = computed(
       UNFOCUSED_INPUT_BLOCK,
-      ".mode-block",
-      '.panel-footer .mode-block[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
+      ".band-mode",
+      '.band-mode[data-mode="input"] { border-left-color: var(--nv-mode-input); }',
     );
     expect(clobbered.borderLeftColor).toBe("var(--nv-mode-input)");
   });
@@ -2125,7 +2174,13 @@ describe("index.css: the ? overlay never scrolls sideways", () => {
     const long = { keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)", what: "Text size reset (both panes)" };
     document.head.innerHTML = `<style>${css}${extraCss}</style>`;
     document.body.innerHTML = renderToStaticMarkup(
-      createElement(KeymapOverlay, { onClose: () => {}, windowKeys: [long], prefixKeys: [], prefixLabel: "Ctrl+b" }),
+      createElement(KeymapOverlay, {
+        onClose: () => {},
+        windowKeys: [long],
+        prefixKeys: [],
+        prefixLabel: "Ctrl+b",
+        panel: EMPTY_PANEL_TABLE,
+      }),
     );
     return Array.from(document.querySelectorAll<HTMLElement>(".keymap-overlay td:first-child"));
   }

@@ -34,10 +34,22 @@ it("counts the queue, names the interrupt key, and names a card that waits (P1)"
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={2} pendingTool={null} />,
   );
-  expect(container.querySelector(".activity-line")!.textContent).toContain("2 queued · Ctrl+c interrupt");
+  // The lowercase interrupt hint is the Stop button's label, so the hint itself is clickable.
+  expect(container.querySelector(".activity-line")!.textContent).toContain("2 queued · ctrl+c interrupt");
+  expect(container.querySelector("button.stop")!.textContent).toBe("ctrl+c interrupt");
   rerender(
-    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" />,
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" mode="input" />,
   );
   expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, then a / d");
   expect(container.textContent).not.toContain("queued");
+});
+
+/** The card hint names `a`/`d` in BROWSE. In INPUT it says Escape first because keys go to the
+ *  composer. Callers that omit the mode get BROWSE wording. */
+it("the card row says a / d alone in BROWSE, and defaults to it", () => {
+  const onInterrupt = vi.fn();
+  const { container } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} pendingTool="Bash" />,
+  );
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — a / d");
 });

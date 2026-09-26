@@ -5,7 +5,7 @@ import type { TabInfo } from "./types";
 
 const tab = (id: number, over: Partial<TabInfo> = {}): TabInfo => ({
   id, number: id, label: `${id} new`, name: null, state: "not_started", mode: "auto",
-  marker: null, pending: 0, resumable: true, failure: null, ...over,
+  marker: null, pending: 0, resumable: true, failure: null, title: null, ...over,
 });
 
 describe("acceptsEnvelope", () => {
@@ -39,6 +39,10 @@ describe("tab helpers", () => {
     expect(modePill("auto", true)).toBe("⏵⏵ auto on (shift+tab to cycle)");
     expect(modePill("bypass", false)).toBe("⏵⏵ bypass on");
   });
+  it("drops the hint and the word 'on' in short form, for the band", () => {
+    expect(modePill("auto", true, true)).toBe("⏵⏵ auto");
+    expect(modePill("bypass", false, true)).toBe("⏵⏵ bypass");
+  });
   it("draws one glyph per marker", () => {
     expect(markerGlyph("needs_input", 1)).toBe("⚑");
     expect(markerGlyph("needs_input", 3)).toBe("⚑3");
@@ -54,7 +58,7 @@ describe("tab helpers", () => {
     expect(showTabBar(1, true)).toBe(true);
   });
   it("finds the active tab", () => {
-    expect(activeTabInfo({ active: 2, tabs: [tab(1), tab(2, { name: "docs" })] })?.name).toBe("docs");
+    expect(activeTabInfo({ active: 2, tabs: [tab(1), tab(2, { name: "docs" })], defaultMode: "auto" })?.name).toBe("docs");
     expect(activeTabInfo(null)).toBeNull();
   });
 });
