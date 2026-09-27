@@ -392,6 +392,7 @@ impl TerminalPane {
         // codes are input. (fcitx5-gtk has no terminal case and treats it as free form.)
         im.set_input_purpose(InputPurpose::Terminal);
         connect_resize(&area, &state, &im);
+        connect_scale_change(&area);
         connect_render(&area, &state);
         connect_keyboard(&area, &state, &im);
         connect_ime(&area, &state, &im);
@@ -795,6 +796,17 @@ fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
         }
         ensure_session(&state, area, &im);
     });
+}
+
+/// D3 (`docs/superpowers/plans/2026-09-27-v1-scale.md`): `connect_resize` above already rescales
+/// correctly on a scale change (`State::allocate` -> `TerminalMetrics::rescale`; cols/rows are
+/// unchanged, e.g. 160x13 in the sandbox, since the scale-only case never changes the logical
+/// size). What is missing is a reason for GTK to *emit* that `resize` at all: it fires only on the
+/// `GLArea`'s next snapshot, and nothing here asks for one while the pane is idle, so the old
+/// framebuffer sits on screen upscaled (blurry) until the next output redraws it. `queue_render`
+/// asks for that snapshot.
+fn connect_scale_change(area: &GLArea) {
+    area.connect_scale_factor_notify(|area| area.queue_render());
 }
 
 fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {

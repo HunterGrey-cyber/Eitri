@@ -506,6 +506,61 @@ fn cell_size_changed(last: Option<(f64, f64)>, now: (f64, f64)) -> bool {
     last != Some(now)
 }
 
+/// The OS-scale value [`sync_os_scale`] should hand `LiveHarness::set_os_scale_factor`, given GTK's
+/// raw `Widget::scale_factor()` right now -- or `None` if `current` (the harness's own
+/// `os_scale_factor()`) already agrees with it (v1 P2, S1/S2). Pure and split out for the same
+/// reason `tick_should_render`/`cell_size_changed` are: no unit test here can construct a real
+/// `LiveHarness`.
+///
+/// `widget_scale_factor` is GTK's own rounded-up integer (S1: the same basis every hit-test in this
+/// crate already uses -- `pixel_to_grid_pos`, `cell_size`, the tick's own `widget_size` computation
+/// -- never `Surface::scale()`'s fraction). A widget not yet realized on a surface reports `0` (and
+/// never negative in practice), so this treats anything below `1` as `1`, matching every other
+/// `.max(1)` in this crate. Compared against `current` by bits, exactly like
+/// `LiveHarness::set_os_scale_factor` compares internally, so this and that call always agree on
+/// whether anything actually changed.
+fn os_scale_to_apply(current: f64, widget_scale_factor: i32) -> Option<f64> {
+    let target = f64::from(widget_scale_factor.max(1));
+    if target.to_bits() == current.to_bits() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// Applies GTK's current `Widget::scale_factor()` to `harness` when it disagrees with the harness's
+/// own record ([`os_scale_to_apply`]) -- S1/S2's whole implementation. Called from the two sites S2
+/// requires, `connect_resize`'s `Ready` branch and the render callback's `Ready` arm, both
+/// **before** any grid is computed from `harness.grid_scale()`: `set_os_scale_factor` moves the
+/// renderer's cell size synchronously, so calling this before the grid read means a scale change and
+/// the framebuffer resize that always accompanies it (GTK reallocates `GtkGLArea`'s buffers and
+/// fires `resize` on its next snapshot) land in the very same GTK callback, and no tick ever computes
+/// a grid from a cell size and a framebuffer that belong to different scales (see `gl_interop`'s
+/// `snap_tests::a_scale_change_applied_with_its_framebuffer_resizes_nothing` for the invariant this
+/// keeps, and its counter-example for the transient grid it prevents).
+///
+/// Returns exactly what `LiveHarness::set_os_scale_factor` returns: `true` only on a real, applied
+/// change. Never called from `connect_scale_factor_notify` itself (S2) -- that handler only asks for
+/// a frame; this runs once GTK actually hands over the matching new framebuffer. Prints one
+/// `[hidpi]` line on an applied change, for a GUI pass to read; the common case (nothing changed
+/// this frame) costs one bit comparison and prints nothing (P11).
+fn sync_os_scale(harness: &mut LiveHarness, widget_scale_factor: i32) -> bool {
+    let Some(new_scale) = os_scale_to_apply(harness.os_scale_factor(), widget_scale_factor) else {
+        return false;
+    };
+    let old_scale = harness.os_scale_factor();
+    if !harness.set_os_scale_factor(new_scale) {
+        return false;
+    }
+    let cell = harness.grid_scale();
+    println!(
+        "[hidpi] os scale {old_scale} -> {new_scale}; cell now {:.2}×{:.2}px",
+        cell.width(),
+        cell.height()
+    );
+    true
+}
+
 /// One tick's [`ScaleWatch::observe`] result: whether `g:neovide_scale_factor` moved since the
 /// last tick, and its current value either way.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -676,6 +731,9 @@ impl NeovideEditorPane {
                 let mut live = live_state.borrow_mut();
                 let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                     session.wants_frame.set(true);
+                    // S2: before any grid is computed from `grid_scale()`, so a scale change and
+                    // the framebuffer this very `resize` signal hands over always land together.
+                    sync_os_scale(&mut session.harness, widget.scale_factor());
                     let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
                         grid_size_for_content_region(&session.harness, r)
                     })
@@ -745,6 +803,30 @@ impl NeovideEditorPane {
                     }
                     widget.queue_render();
                 });
+            });
+        }
+
+        // --- scale-factor notify (v1 P2, D1/S2): `GtkGLArea` reallocates its own buffers and fires
+        // `resize` (with the new framebuffer) only on its NEXT snapshot after this notify fires --
+        // and this pane only ever renders on change (P11) -- so without asking for a frame here the
+        // old frame stays upscaled indefinitely (measured: `s1-after-scale2.png`, `s1.log` has the
+        // notify line and no `[resize]` for 4s). This handler does exactly that and nothing more: it
+        // never touches the harness or `fb_size` itself. The actual scale sync (`sync_os_scale`) runs
+        // in `connect_resize` and the render callback below, where GTK has handed over the matching
+        // new framebuffer in the very same snapshot -- never here, which is why the notify handler
+        // stays this small (S2's "never at notify time").
+        {
+            let live_state = live_state.clone();
+            gl_area.connect_scale_factor_notify(move |widget| {
+                // `try_borrow`, not `borrow`: a GTK signal can fire while a render or tick closure
+                // already holds `live_state` borrowed (the `run_tab_verb` panic of panel round 2 is
+                // the precedent this guards against).
+                if let Ok(live) = live_state.try_borrow() {
+                    if let LiveState::Ready(session) = &*live {
+                        session.wants_frame.set(true);
+                    }
+                }
+                widget.queue_render();
             });
         }
 
@@ -1020,6 +1102,15 @@ impl NeovideEditorPane {
                             session
                                 .animation_clock
                                 .advance(frame_time, refresh_interval, session.last_animating.get());
+                        // S2: covers a re-realized widget, or any GTK whose snapshot does not
+                        // re-emit `resize` -- `connect_resize` above is the OTHER S2 call site, and
+                        // between the two nothing computes a grid from a cell size and a framebuffer
+                        // that belong to different scales. Unlike `connect_resize`, nothing else on
+                        // this path already sets `wants_frame` for a plain scale change, so fold the
+                        // "did this frame actually apply one" result in here.
+                        if sync_os_scale(&mut session.harness, widget.scale_factor()) {
+                            session.wants_frame.set(true);
+                        }
                         // Snapped HERE rather than where `content_region` is computed above,
                         // because the two users want different rects. The grid must sit on whole
                         // cells (see `snap_region_to_grid`), while the placeholder arms below have
@@ -1227,6 +1318,15 @@ impl NeovideEditorPane {
                         // actually drawn. The `note:` line records it if they ever differ on a
                         // drawn widget, which would mean a GTK whose buffers follow some other
                         // size.
+                        //
+                        // v1 P2: a live OS-scale change is exactly this kind of mismatch between GTK's
+                        // `notify::scale-factor` -- which moves `widget.scale_factor()` while the
+                        // harness is still at the old scale and `fb_size` still holds the old
+                        // framebuffer -- and the next snapshot, whose `resize` sets `fb_size` and then
+                        // syncs the harness in the same callback (so the harness never runs ahead of
+                        // `fb_size`). The gap lasts one frame on a drawn widget and longer while the
+                        // pane is hidden. Expected, not the anomaly this note exists for: the added
+                        // `os_scale_factor()` comparison below skips the note while it is open.
                         let (width, height) = fb_size.get();
                         let widget_size = (
                             widget.width() * widget.scale_factor(),
@@ -1239,6 +1339,7 @@ impl NeovideEditorPane {
                             && widget_size.0 > 0
                             && widget_size.1 > 0
                             && widget_size != (width, height)
+                            && session.harness.os_scale_factor() == f64::from(widget.scale_factor().max(1))
                         {
                             layout_note_logged.set(true);
                             println!(
@@ -1572,7 +1673,9 @@ impl NeovideEditorPane {
 
 #[cfg(test)]
 mod tests {
-    use super::{cell_size_changed, nvim_args, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY};
+    use super::{
+        cell_size_changed, nvim_args, os_scale_to_apply, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY,
+    };
     use gtk4::glib;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1751,5 +1854,21 @@ mod tests {
         let observed = watch.observe(1.0);
         assert!(!observed.changed, "the pending write has not been applied to nvim yet");
         assert_eq!(watch.take_pending_for_ready(), Some(1.6));
+    }
+
+    // --- os_scale_to_apply: v1 P2, S1's integer-scale rule and S2's "only when it actually
+    // differs" gate -- the pure half of `sync_os_scale`, which a unit test cannot construct (it
+    // takes a real `&mut LiveHarness`). ---
+
+    /// GTK's `scale_factor()` is the source of truth (S1); a harness already there needs nothing.
+    #[test]
+    fn os_scale_to_apply_follows_gtks_integer_factor() {
+        assert_eq!(os_scale_to_apply(1.0, 2), Some(2.0));
+        assert_eq!(os_scale_to_apply(2.0, 2), None);
+        assert_eq!(os_scale_to_apply(2.0, 1), Some(1.0));
+        // A widget not yet on a surface reports 0 (and never negative in practice): treat as 1, the
+        // same `.max(1)` every other scale read in this crate uses.
+        assert_eq!(os_scale_to_apply(1.0, 0), None);
+        assert_eq!(os_scale_to_apply(f64::NAN, 1), Some(1.0));
     }
 }

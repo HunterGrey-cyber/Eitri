@@ -660,4 +660,42 @@ mod snap_tests {
         assert_eq!(hit, paint);
         assert_eq!((hit.min.y, hit.max.y), (14.0, 1598.0));
     }
+
+    /// S2's whole justification, as arithmetic: a scale change applied TOGETHER with the framebuffer
+    /// resize that always accompanies it -- exactly what `lib.rs`'s `sync_os_scale` guarantees by
+    /// running before any grid is computed, in both `connect_resize` and the render callback --
+    /// resizes nothing in nvim. The measured cell (11.238282x22, `s1.log`, 2026-09-27 sandbox
+    /// investigation) and both sandbox framebuffers from that same run.
+    #[test]
+    fn a_scale_change_applied_with_its_framebuffer_resizes_nothing() {
+        let cell = GridScale::new(PixelSize::new(11.238282, 22.0));
+        let cell_x2 = GridScale::new(PixelSize::new(22.476564, 44.0));
+        for (fb_w, fb_h) in [(760, 721), (760, 480)] {
+            let before = grid_layout(fb_w, fb_h, cell, divide(cell)).grid;
+            let after = grid_layout(fb_w * 2, fb_h * 2, cell_x2, divide(cell_x2)).grid;
+            assert_eq!(
+                before, after,
+                "fb {fb_w}x{fb_h}: scale and framebuffer must move together"
+            );
+        }
+    }
+
+    /// The counter-example that motivated S2 -- exactly the probe's own defect (plan's "The fix, as
+    /// probed"): the new cell size applied WITHOUT its matching framebuffer resize is a *different*
+    /// grid, `33x10` for `760x480`, not the `67x21` the invariant above holds for that same
+    /// framebuffer at the matching cell. This is the transient grid a notify-time apply produces
+    /// before GTK's own `resize` catches up -- documented here as the reason `set_os_scale_factor`
+    /// must never be called from `connect_scale_factor_notify` itself (S2).
+    #[test]
+    fn applying_the_new_cell_before_the_framebuffer_resize_is_a_different_grid() {
+        let cell = GridScale::new(PixelSize::new(11.238282, 22.0));
+        let cell_x2 = GridScale::new(PixelSize::new(22.476564, 44.0));
+        let matched = grid_layout(760, 480, cell, divide(cell)).grid;
+        let mismatched = grid_layout(760, 480, cell_x2, divide(cell_x2)).grid;
+        assert_eq!((mismatched.width, mismatched.height), (33, 10));
+        assert_ne!(
+            matched, mismatched,
+            "the new cell size without its matching framebuffer must not equal the matched grid"
+        );
+    }
 }

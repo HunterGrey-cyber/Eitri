@@ -29,6 +29,7 @@ mod toast;
 mod tray;
 mod wheel_zoom;
 mod window_mode;
+mod xft_dpi;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -131,6 +132,10 @@ fn build_application() -> Application {
 }
 
 fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
+    // Ruling S3 (D4, `docs/superpowers/plans/2026-09-27-v1-scale.md`): before anything else, so
+    // `gtk-xft-dpi` is never unset by the time the agent panel's (or a Lua panel's) `WebView` reads
+    // it. See `xft_dpi`'s module doc.
+    xft_dpi::ensure_xft_dpi();
     // Painted with the built-in fallback until the embedded nvim sends its first snapshot.
     let theme_css = theme::gtk_css::ThemeCss::install(&neovibe_core::theme::ThemeTokens::fallback());
     // Built before the editor pane for the same reason `pane_switch` is: its env and `--cmd` reach
