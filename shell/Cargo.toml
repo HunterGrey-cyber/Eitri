@@ -61,3 +61,10 @@ harness = false
 [[test]]
 name = "close_prompt_placement"
 harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
+# server of its own (see the file's header). Holds the v1-scale GUI pass's defect A (2026-09-27): the
+# band one editor row high in GTK logical px while WebKitGTK zooms the page for `gtk-xft-dpi`.
+[[test]]
+name = "band_xft_zoom"
+harness = false

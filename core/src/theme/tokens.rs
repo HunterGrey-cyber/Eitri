@@ -153,8 +153,10 @@ pub struct ThemeTokens {
     pub font_size_px: f32,
     /// `"light"` or `"dark"`, for CSS `color-scheme`.
     pub color_scheme: &'static str,
-    /// The editor's own cell height, in CSS px, set by `shell` from `neovide-editor`'s
-    /// `connect_cell_size_changed` -- `None` until nvim has reported a font (wave 4, R5: "agent
+    /// The editor's own cell height, in the panel's CSS px, set by `shell` from `neovide-editor`'s
+    /// `connect_cell_size_changed` -- which reports GTK logical px, a different unit whenever
+    /// WebKitGTK zooms the page for the desktop's text scaling (`shell/src/webkit_zoom.rs`
+    /// converts) -- `None` until nvim has reported a font (wave 4, R5: "agent
     /// pane最下面的input >> auto那一行太宽了，最好做到和旁边neovim底下的status一样宽"). Carried
     /// through the `ready` handshake and a reload the same way `font_size_px` is, with no new
     /// envelope: `--nv-editor-row` only appears in `css_vars()` when this is `Some`, so a reload

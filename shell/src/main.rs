@@ -27,6 +27,7 @@ mod text_size;
 mod theme;
 mod toast;
 mod tray;
+mod webkit_zoom;
 mod wheel_zoom;
 mod window_mode;
 mod xft_dpi;
@@ -586,7 +587,13 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // The editor's own cell height (wave 4, R5), reported by `neovide-editor`'s
     // `connect_cell_size_changed` below -- `None` until nvim has reported a font, same as
     // `--nv-editor-row` itself: see `panel_tokens`'s own use of this and the block that fills it in.
-    let editor_row: Rc<std::cell::Cell<Option<f32>>> = Rc::new(std::cell::Cell::new(None));
+    // Kept in the editor's GTK logical px and handed to the panel in its CSS px, which differ by
+    // WebKitGTK's own page zoom whenever `gtk-xft-dpi` is not 96 dpi (`webkit_zoom`'s module doc).
+    // Read here, not earlier: `build_ui` has not returned to the main loop since the panel's
+    // `WebView` was created, so no `gtk-xft-dpi` change can have reached either side in between.
+    let editor_row = Rc::new(std::cell::Cell::new(webkit_zoom::EditorRow::new(
+        gtk4::Settings::default().map_or(xft_dpi::GTK_DEFAULT_XFT_DPI, |s| s.gtk_xft_dpi()),
+    )));
     // One helper, so the startup theme and every later one cannot disagree about the size. The
     // editor's clear colour and the GTK chrome do not take it: it is the panel's text, not the
     // window's.
@@ -604,7 +611,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             // `panel_font_size` (the captured startup base) directly -- that compiles and no test
             // catches it, since this closure is GTK wiring with no headless harness. A GUI pass
             // (change the colorscheme after zooming; the panel must stay zoomed) is what would.
-            tokens.editor_row_px = editor_row.get();
+            tokens.editor_row_px = editor_row.get().css_px();
             tokens
         }
     };
@@ -619,8 +626,26 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let editor_row = editor_row.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         pane.connect_cell_size_changed(move |_, h| {
-            editor_row.set(Some(h as f32));
-            agent_panel_handle.set_editor_row_px(h as f32);
+            let mut row = editor_row.get();
+            let css_px = row.set_cell_height(h as f32);
+            editor_row.set(row);
+            agent_panel_handle.set_editor_row_px(css_px);
+        });
+    }
+    // ...and the moment WebKitGTK re-zooms the panel: it follows `notify::gtk-xft-dpi` live
+    // (`webkit_zoom`'s module doc), so the same row is a different number of CSS px afterwards.
+    // The live value, not the notified one: `xft_dpi`'s own handler may already have replaced it.
+    // No hook on the output scale: WebKit's page zoom does not depend on it.
+    if let Some(settings) = gtk4::Settings::default() {
+        let editor_row = editor_row.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        settings.connect_gtk_xft_dpi_notify(move |settings| {
+            let mut row = editor_row.get();
+            let resend = row.follow_xft_dpi(settings.gtk_xft_dpi());
+            editor_row.set(row);
+            if let Some(css_px) = resend {
+                agent_panel_handle.set_editor_row_px(css_px);
+            }
         });
     }
     if let Some(feed) = theme_feed.as_mut() {

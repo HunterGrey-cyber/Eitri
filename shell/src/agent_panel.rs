@@ -700,7 +700,9 @@ impl AgentPanelHandle {
     /// `--nv-editor-row` (wave 4, R5): updates only the recorded theme's `editor_row_px` and
     /// re-sends it, so both a panel reload and a fresh `ready` handshake pick the editor's cell
     /// height up the same way `font_size_px` already does, with no new envelope. `main.rs` calls
-    /// this from `NeovideEditorPane::connect_cell_size_changed`.
+    /// this from `NeovideEditorPane::connect_cell_size_changed` and on a `gtk-xft-dpi` change, in
+    /// the panel's CSS px -- already converted from the editor's GTK logical px by
+    /// `webkit_zoom::EditorRow`.
     pub(crate) fn set_editor_row_px(&self, editor_row_px: f32) {
         let tokens = {
             let mut tokens = self.state.borrow().theme.clone();
