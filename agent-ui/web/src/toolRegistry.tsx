@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { ToolCallRecord } from "./types";
 import { editPreview } from "./diff";
 import { EditDiff } from "./components/EditDiff";
+import { useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
   label: string;
@@ -13,7 +14,7 @@ export type ToolRenderConfig = {
    * `ToolResult` renders results on one shared path so running and finished calls are distinguished
    * consistently across tools. Keep result handling out of unused invocation parameters.
    * `editConfig` uses `opts.expanded` to show the full diff when true and fold it to 6 lines when false. */
-  renderInvocation: (input: unknown, opts: { expanded: boolean }) => ReactNode;
+  renderInvocation: (input: unknown, opts: { expanded: boolean; createsFile?: boolean }) => ReactNode;
 };
 
 /** How much of a tool result is rendered inline, head and tail respectively.
@@ -147,12 +148,12 @@ function pathOf(input: unknown, key: string): string {
 }
 
 /** A path reachable by `gf` or a click (`MessageList`'s `onClick`, `paths.ts`'s `pathsIn`).
- *  `data-path` carries the raw click target separately from the visible label, so changing the label
- *  cannot change which path opens. The label currently shows the raw path. */
+ *  `data-path` carries the raw click target separately from the visible label, which is relative
+ *  under the project root. This keeps the display transform from changing which path opens. */
 function PathLink({ path }: { path: string }) {
   return (
     <span className="path-link" data-path={path}>
-      {path}
+      {useProjectRelative(path)}
     </span>
   );
 }
@@ -189,7 +190,7 @@ function oneLine(label: string): ToolRenderConfig {
 function editConfig(label: string): ToolRenderConfig {
   return {
     label,
-    renderInvocation: (input, { expanded }) => {
+    renderInvocation: (input, { expanded, createsFile }) => {
       const preview = editPreview(label === "Write file" ? "Write" : "Edit", input);
       if (preview === null)
         return (
@@ -197,7 +198,7 @@ function editConfig(label: string): ToolRenderConfig {
             {label}: <PathLink path={pathOf(input, "file_path")} />
           </div>
         );
-      return <EditDiff preview={preview} maxLines={expanded ? undefined : 6} />;
+      return <EditDiff preview={preview} maxLines={expanded ? undefined : 6} createsFile={createsFile} />;
     },
   };
 }
@@ -337,7 +338,7 @@ export function renderToolCall(
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : config ? (
-    config.renderInvocation(call.input, { expanded: opts.expanded ?? showResult })
+    config.renderInvocation(call.input, { expanded: opts.expanded ?? showResult, createsFile: call.createsFile })
   ) : (
     // For tools without a special view, show the name and a one-line input summary.
     // Avoid "Unrecognized", which reads as a panel error.
@@ -361,16 +362,22 @@ export function renderToolCall(
   // A running call (`result === null`) always reaches `ToolResult` to show the running indicator.
   // Only finished results fold. With the default `showResult = true`, all results stay visible.
   // The detailed view also keeps results open regardless of the row's expansion state.
+  // A folded result draws nothing; `data-folded` exposes the state to `Enter` and tests.
+  // The row itself is the expansion handle. Calls answered by saved prefix rules show a muted note
+  // under the invocation so they can be distinguished from calls approved by the user.
+  // The note includes the rule in permission-rule syntax, such as `Bash(git log *)`.
+  const ruleNote =
+    call.allowedByRule === undefined ? null : (
+      <div className="tool-rule-note">
+        allowed by rule <code>{call.allowedByRule}</code>
+      </div>
+    );
+  const shown = call.result === null || showResult || opts.detailed === true;
   return (
-    <div className="tool-call" data-tool-name={call.name}>
+    <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
       {invocation}
-      {call.result === null || showResult || opts.detailed ? (
-        <ToolResult result={call.result} detailed={opts.detailed === true} />
-      ) : (
-        <div className="tool-result-folded" aria-label="result folded">
-          ▸
-        </div>
-      )}
+      {ruleNote}
+      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} />}
     </div>
   );
 }

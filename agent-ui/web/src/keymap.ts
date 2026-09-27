@@ -178,6 +178,13 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // chord. GTK claims none of these before the WebView (checked against `shell/src/main.rs` and
   // `shell/src/agent_panel.rs`, 2026-09-19): only a user's own Lua `keybinding` could.
   if (mode !== "input") {
+    // Resolve panel-table pairs such as [b before the following chords and the blanket modifier refusal.
+    // One lookup covers all four prefixes. Shifted second keys work too: gT arrives as
+    // key "T" with Shift held. Ctrl never completes a pair because no table key is a Ctrl chord.
+    if (ctx.pending && !event.ctrlKey) {
+      const tableHit = ctx.table?.bindings.find((b) => b.keys.length === 2 && b.keys[0] === ctx.pending && b.keys[1] === event.key);
+      if (tableHit) return { kind: "panel", binding: tableHit };
+    }
     if (event.ctrlKey && !event.shiftKey && (event.key === "d" || event.key === "u")) {
       return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
     }
@@ -219,13 +226,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     if (event.key === "Escape" && !event.isComposing) return { kind: "mode", to: "browse" };
     return null;
   }
-  // Resolve panel-table pairs such as [b once for all four prefixes before the switch.
-  // This lookup follows the blanket Ctrl/Shift refusal, so shifted second keys such as [B
-  // cannot reach it.
-  if (ctx.pending) {
-    const tableHit = ctx.table?.bindings.find((b) => b.keys.length === 2 && b.keys[0] === ctx.pending && b.keys[1] === event.key);
-    if (tableHit) return { kind: "panel", binding: tableHit };
-  }
+  // (A table pair completing a pending prefix, `[b`/`gt`/`gT`, is resolved above, ahead of the
+  // chords and the blanket modifier refusal.)
   // The second key of a two-key sequence (`gg`, `[[`, `]]`). Anything that does not complete the
   // pending one falls through as an ordinary key below: the prefix is simply dropped, as vim drops
   // an unfinished `g`. A mismatched pair (`[` then `]`) is claimed as nothing rather than falling

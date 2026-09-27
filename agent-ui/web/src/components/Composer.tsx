@@ -381,18 +381,11 @@ export function Composer({
           />
         </>
       ) : sessionEnded ? (
-        /* A dead session offers no route into INPUT at all, and says so instead of promising `i`.
-           The textarea above is `disabled` once the session ends, so INPUT there is an empty mode:
-           `autoFocus` cannot take focus, keys keep arriving at the panel root, and `resolveKey`'s
-           "input" branch drops everything but `Escape` -- including `r`, which is the one key the
-           lost/ended rows above genuinely promise. Not focusable and no `onFocus` here, so Tab
-           cannot reach INPUT by the side door either; `resolveKey` refuses `i` on the same
-           condition, and `App.tsx` forces BROWSE for a session that dies while INPUT is already
-           active. The text names only `r`, the key that actually resolves in the mode the user is
-           in. */
-        <div className="composer-browse-hint">
-          This session has ended. Press r to start a new session here.
-        </div>
+        /* An ended session cannot enter INPUT: its textarea is disabled, `resolveKey` refuses `i`,
+           and `App.tsx` forces BROWSE if the session ends during INPUT. This hint has no focus
+           target or `onFocus`, so Tab cannot enter INPUT either. The lost, ended, or failed row
+           above already names `r`, so only state that the session has ended here. */
+        <div className="composer-browse-hint">This session has ended.</div>
       ) : (
         // BROWSE's rendering of the same control: not a textarea at all, so there is nothing here
         // for a stray keystroke to land in. `tabIndex` makes it a real focus target, so three

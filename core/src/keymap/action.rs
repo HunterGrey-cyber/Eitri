@@ -366,8 +366,10 @@ impl Action {
             Action::Even(Axis::Row) => "Every module in one row, at equal sizes".into(),
             Action::Even(Axis::Column) => "Every module in one column, at equal sizes".into(),
             Action::ModuleHide => "Hide this module; it keeps running (not the last one on screen)".into(),
+            // Killing the last module closes the window (`KillScope::Window`), as tmux's `kill-pane` does
+            // on its last pane. Hiding still refuses the last module.
             Action::ModuleKill => {
-                "Close this module and end what runs in it, after y/n (not the last one on screen)".into()
+                "Close this module and end what runs in it, after y/n (the last one on screen closes neovibe)".into()
             }
             Action::Module(id) => match id.kind() {
                 ModuleKind::Editor => "Editor: show and focus it, or hide it when it has the keys".into(),
@@ -486,6 +488,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("module.nope") && err.contains("Lua panel"), "{err}");
+    }
+
+    /// The `?` overlay says killing the last module closes the window.
+    /// Hiding still refuses the last module.
+    #[test]
+    fn the_kill_row_says_the_last_module_closes_neovibe() {
+        let kill = Action::ModuleKill.describe("Ctrl+b", "e / a / t");
+        assert!(kill.contains("the last one on screen closes neovibe"), "{kill}");
+        assert!(!kill.contains("not the last one"), "{kill}");
+        assert!(Action::ModuleHide
+            .describe("Ctrl+b", "e / a / t")
+            .contains("not the last one on screen"));
     }
 
     #[test]

@@ -125,7 +125,17 @@ type InboundHandler = (
     | { kind: "hello" } & Hello
     | { kind: "command_result"; requestId: string; ok: true }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
-    | { kind: "events"; tab: TabId; fromRevision: number; throughRevision: number; events: AgentDomainEvent[] }
+    | {
+        kind: "events";
+        tab: TabId;
+        fromRevision: number;
+        throughRevision: number;
+        events: AgentDomainEvent[];
+        /** Calls in this batch a saved prefix rule answered; absent when none did. */
+        ruleNotes?: { toolUseId: string; rule: string }[];
+        /** `Write` cards in this batch raised over no file; absent when none were. */
+        createsFile?: { permissionId: string; toolUseId: string | null }[];
+      }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
      *  (or absent, from an older build) when none runs. */

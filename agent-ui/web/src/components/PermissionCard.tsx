@@ -40,22 +40,19 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: P
 
   return (
     <div className="permission-card">
-      <div className="permission-card-tool">Permission requested: {request.toolName}</div>
       {/* Which call, not just which tool: a turn can have several Bash calls in flight, and this is
-          the same id `MessageList` keys that call's own block on, so the two can be read together.
-          Rendered only when the request actually carries a USABLE one -- a placeholder here would
-          read as a lookup that failed rather than as an id that was never sent, and "for tool call "
-          with nothing after it is worse than saying nothing. Every permission path in both backends
-          forwards whatever id its own source message carried, so this is normally present; it can
-          still be absent, and the Rust side deliberately does not invent one.
-          `isUsableLink` (`../timeline`) is that question, asked once for the whole panel: it rules
-          out `null` AND the `""` the sidecar's proto3 wire produces for an unset field. This was a
-          bare truthiness test, which happened to agree -- the point of routing it through the
-          shared predicate is that it now cannot stop agreeing. */}
-      {isUsableLink(request.toolUseId) && (
-        <div className="permission-card-tool-use-id">for tool call {request.toolUseId}</div>
-      )}
-      <ToolInput toolName={request.toolName} input={request.input} />
+          the same id `MessageList` keys that call's own block on. It is a
+          tooltip, not a line: "for tool call toolu_01…" was noise to read on every card, and the
+          card already sits beside the call it gates. Only a USABLE id (`isUsableLink`, which rules
+          out `null` and the sidecar's proto3 `""`) -- a tooltip naming nothing is worse than none. */}
+      <div
+        className="permission-card-tool"
+        title={isUsableLink(request.toolUseId) ? `tool call ${request.toolUseId}` : undefined}
+        data-tool-use-id={isUsableLink(request.toolUseId) ? request.toolUseId : undefined}
+      >
+        Permission requested: {request.toolName}
+      </div>
+      <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />
       <input
         type="text"
         data-nav-order={ruleOffer ? 4 : 3}
@@ -96,12 +93,12 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: P
  * File-changing tools use `EditDiff`, which conversation rows can also use for folded previews.
  * Other inputs render as JSON, with `Bash` commands shown as shell text when available.
  * `PreToolUse` already carries the complete input object; these previews need no extra wire fields. */
-function ToolInput({ toolName, input }: { toolName: string; input: unknown }) {
+function ToolInput({ toolName, input, createsFile }: { toolName: string; input: unknown; createsFile?: boolean }) {
   const preview = editPreview(toolName, input);
   if (preview !== null) {
     // No cap here: a card shows the whole change, unlike the folded preview a conversation row gets
     //.
-    return <EditDiff preview={preview} />;
+    return <EditDiff preview={preview} createsFile={createsFile} />;
   }
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;
   if (toolName === "Bash" && fields && typeof fields.command === "string") {

@@ -16,8 +16,8 @@ import { Row } from "./Row";
 import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
-import { classify } from "../problems";
-import { leaderTypingFlash, TypingGuard } from "../typingGuard";
+import { classify, failureEvidence, remedyNamesR } from "../problems";
+import { isModifierKey, leaderTypingFlash, TypingGuard } from "../typingGuard";
 
 /** Below this width the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -461,9 +461,12 @@ export function EmptyTab(props: EmptyTabProps) {
     // A reserved prefix typed a key ago (`[`): its table pair runs (`[b` -> tab.prev); anything
     // else drops the prefix and is read as an ordinary key, as vim drops an unfinished `g` and as
     // `resolveKey` does for a live tab.
+    // A bare modifier's keydown (the Shift of `gT`) waits with the prefix, as vim does.
+    if (pendingPrefixRef.current !== null && isModifierKey(event.key)) return;
     const prefix = pendingPrefixRef.current;
     pendingPrefixRef.current = null;
-    if (prefix !== null && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    // Shift may complete a pair (`gT`, `:help gT`); Ctrl/Alt never do -- no table key is a chord.
+    if (prefix !== null && !event.ctrlKey && !event.altKey) {
       const pair = pendingPairBinding(panelTable, prefix, event.key);
       if (pair !== null) {
         event.preventDefault();
@@ -534,8 +537,9 @@ export function EmptyTab(props: EmptyTabProps) {
       {failed && (
         <Row kind="error" sign="✗" role="alert" problem={failureProblem}>
           <strong>This tab's session did not start.</strong>
-          <pre>{failure ?? "no reason was given"}</pre>
-          <div className="row-hint">Press r to start a new session here.</div>
+          <pre>{failure === null ? "no reason was given" : failureEvidence(failure)}</pre>
+          {/* Omit the retry hint when the remedy already names the same key. */}
+          {!remedyNamesR(failureProblem) && <div className="row-hint">Press r to start a new session here.</div>}
         </Row>
       )}
       {starting && (

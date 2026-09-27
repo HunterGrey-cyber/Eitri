@@ -232,6 +232,15 @@ describe("resolveKey with a panel table", () => {
   it("still runs the fixed [[ prompt-jump even with a table present", () => {
     expect(resolveKey("browse", key("["), { ...ctx, pending: "[", table: TABLE })).toEqual({ kind: "prompt-jump", delta: -1 });
   });
+  /** `gT` (`:help gT`) is typed with Shift held; the pair lookup runs ahead of the
+   *  blanket modifier refusal, but a Ctrl chord never completes a pair. */
+  it("resolves g then Shift+T to the table's gT, but not g then Ctrl+T", () => {
+    const gT: PanelBinding = { keys: ["g", "T"], action: "tab.prev", desc: "previous tab", source: "default" };
+    const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, gT] };
+    expect(resolveKey("browse", key("T", { shiftKey: true }), { ...ctx, pending: "g", table })).toEqual({ kind: "panel", binding: gT });
+    expect(resolveKey("browse", key("T", { ctrlKey: true, shiftKey: true }), { ...ctx, pending: "g", table })).toBeNull();
+    expect(resolveKey("input", key("T", { shiftKey: true }), { ...ctx, pending: "g", table })).toBeNull();
+  });
   it("resolves to null for [b without a table, exactly as today", () => {
     expect(resolveKey("browse", key("b"), { ...ctx, pending: "[" })).toBeNull();
   });

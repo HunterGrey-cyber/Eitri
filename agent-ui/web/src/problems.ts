@@ -87,6 +87,53 @@ function classifySidecarNotLoggedIn(text: string): Problem | null {
   };
 }
 
+/** The opening of `stream_ended_early_reason` in `agent/src/providers/claude_sidecar/watch.rs`.
+ *  It identifies an event stream that ended before the session, because the sidecar stopped or
+ *  its connection could not be reopened. This must be distinguished from a missing conversation
+ *  so the transcript remains available. */
+const SIDECAR_STOPPED_MARKER = "the connection to the provider ended before this session did";
+
+/** Whether `text` says the sidecar stopped under a session (see `SIDECAR_STOPPED_MARKER`). */
+export function sidecarStopped(text: string): boolean {
+  return text.includes(SIDECAR_STOPPED_MARKER);
+}
+
+function classifySidecarStopped(text: string): Problem | null {
+  if (!sidecarStopped(text)) return null;
+  return {
+    headline: "The agent sidecar stopped.",
+    remedy: "The conversation is still in the session list: press r, then w, and pick it to continue it.",
+  };
+}
+
+/** `shell`'s wrapper for a session that reached a terminal state before the provider reported it
+ *  open (`report_sessions_that_never_opened`, shell/src/agent_panel.rs), split at its own words. A
+ *  resumed sidecar session reports itself open only at its first turn, so a sidecar that stops
+ *  before one lands here too, and the wrapper's guess ("it most likely no longer exists") is then
+ *  wrong. Returns the provider's own reason when `text` is exactly that wrapper, else `null`. */
+const NEVER_OPENED_HEAD = "the session ended before it started (";
+const NEVER_OPENED_TAIL =
+  "). If you were continuing a previous conversation, it most likely no longer exists -- start a new session instead.";
+
+export function neverOpenedReason(text: string): string | null {
+  if (!text.startsWith(NEVER_OPENED_HEAD) || !text.endsWith(NEVER_OPENED_TAIL)) return null;
+  return text.slice(NEVER_OPENED_HEAD.length, text.length - NEVER_OPENED_TAIL.length);
+}
+
+/** The text a failure row shows under its headline: the provider's own reason when `shell`
+ *  wrapped it in a guess this module knows to be wrong (a sidecar that stopped), else `text`
+ *  whole -- "never hide the evidence" means the reason, never the inference. */
+export function failureEvidence(text: string): string {
+  const inner = neverOpenedReason(text);
+  return inner !== null && sidecarStopped(inner) ? inner : text;
+}
+
+/** Whether the remedy already tells the reader to press `r`. The failure row omits its own
+ *  restart instruction when the remedy supplies it, avoiding duplicate instructions. */
+export function remedyNamesR(problem: Problem | null): boolean {
+  return problem !== null && /\bpress r\b/i.test(problem.remedy);
+}
+
 /** Order matters only in that each recognizer's own marker is specific enough that at most one
  *  ever matches a real diagnostic; there is no priority contest to get right. */
 const CLASSIFIERS: ((text: string, account: string | null) => Problem | null)[] = [
@@ -94,6 +141,7 @@ const CLASSIFIERS: ((text: string, account: string | null) => Problem | null)[] 
   (text) => classifyCliMissing(text),
   (text) => classifyCliOutOfRange(text),
   (text) => classifySidecarNotLoggedIn(text),
+  (text) => classifySidecarStopped(text),
   (text, account) => classifyNotLoggedIn(text, account),
 ];
 
