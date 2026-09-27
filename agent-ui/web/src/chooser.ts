@@ -54,11 +54,13 @@ export function chooserRows(env: ChooserEnvelope, tabs: TabInfo[], filter: strin
   return [...openRows, ...recordRows].filter((row) => rowSearchText(row).toLowerCase().includes(needle));
 }
 
-/** The right-hand word on an open tab's first line (spec §6.1): "running | done, unread | idle |
- *  ended | failed | new". `state` (failed/ended/not_started) always wins over `marker`, since a
- *  session that has stopped is no longer "running" no matter what its last marker was; `working`
- *  and `unread` are the two markers with their own word, everything else (nothing pending, or a
- *  pending `needs_input` card the chooser already shows as `⚑N`) reads as `idle`. `null` -- the
+/** The right-hand word on an open tab's first line (spec §6.1): "running | waiting | done, unread |
+ *  idle | ended | failed | new". `state` (failed/ended/not_started) always wins over `marker`, since
+ *  a session that has stopped is no longer "running" no matter what its last marker was; `working`,
+ *  `needs_input` and `unread` are the markers with their own word, and nothing pending reads as
+ *  `idle`. `waiting` since v1 polish item 8: a tab holding a card read `⚑ · idle`, when what it is
+ *  doing is waiting on you -- the chooser draws it as `⚑N waiting`, the tray chip's `agent ⚑N` with
+ *  the word the chip leaves out. `null` -- the
  *  defensive race `ChooserRow`'s own doc comment names -- reads as `new`, the same word a
  *  `not_started` tab gets, since neither can say anything more specific yet. */
 export function tabStateWord(info: TabInfo | null): string {
@@ -66,6 +68,7 @@ export function tabStateWord(info: TabInfo | null): string {
   if (info.state === "failed") return "failed";
   if (info.state === "ended") return "ended";
   if (info.marker === "working") return "running";
+  if (info.marker === "needs_input") return "waiting";
   if (info.marker === "unread") return "done, unread";
   return "idle";
 }

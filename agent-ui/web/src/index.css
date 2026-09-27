@@ -896,7 +896,9 @@ body,
 .tool-card-generic pre {
   overflow-x: auto;
 }
-.tool-result-folded {
+/* v1 polish F18: "allowed by rule `Bash(git log *)`" under a call a saved rule answered -- a fact
+   about how it was allowed, never an action waiting on you, so it recedes like the fold marker. */
+.tool-rule-note {
   color: var(--nv-muted);
   font-size: var(--fs-code);
 }
@@ -998,14 +1000,6 @@ body,
   border-radius: 6px;
   padding: 10px;
   margin-bottom: 12px;
-}
-/* Which call, under the tool's name: subdued, because it identifies the request rather than being
-   the thing the user is deciding about. */
-.permission-card-tool-use-id {
-  color: var(--nv-muted);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-xs);
-  margin-bottom: 4px;
 }
 /* The raw-JSON `<pre>` a permission card renders for every NON-Edit tool -- and per CLAUDE.md's
    permission-policy row, the cards this product actually produces are overwhelmingly `Bash`,

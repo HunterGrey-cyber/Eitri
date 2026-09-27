@@ -186,6 +186,16 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // chord. GTK claims none of these before the WebView (checked against `shell/src/main.rs` and
   // `shell/src/agent_panel.rs`, 2026-09-19): only a user's own Lua `keybinding` could.
   if (mode !== "input") {
+    // A second key completing a panel-table two-key sequence whose first half is one of this
+    // switch's own prefixes (`[b`, spec §2.3 -- a prefix listed there may start a longer sequence
+    // than the fixed pairs below know about). Checked once, ahead of every chord and the blanket
+    // modifier refusal, so it applies to all four prefixes (panel round 2 plan, Task 7) and to a
+    // second key typed with Shift held: vim's `gT` (`:help gT`, v1 polish F16) arrives as
+    // `key: "T"` with `shiftKey`. Ctrl never completes a pair -- no table key is a Ctrl chord.
+    if (ctx.pending && !event.ctrlKey) {
+      const tableHit = ctx.table?.bindings.find((b) => b.keys.length === 2 && b.keys[0] === ctx.pending && b.keys[1] === event.key);
+      if (tableHit) return { kind: "panel", binding: tableHit };
+    }
     if (event.ctrlKey && !event.shiftKey && (event.key === "d" || event.key === "u")) {
       return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
     }
@@ -231,17 +241,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     if (event.key === "Escape" && !event.isComposing) return { kind: "mode", to: "browse" };
     return null;
   }
-  // A second key completing a panel-table two-key sequence whose first half is one of this
-  // switch's own prefixes (`[b`, spec §2.3 -- a prefix listed there may start a longer sequence than
-  // the fixed pairs below know about). Checked once, ahead of the switch, so it applies to all four
-  // prefixes without repeating the lookup per case (panel round 2 plan, Task 7). This runs after the
-  // blanket Ctrl/Shift refusal above, so a *shifted* second key after a prefix (`[B`) is not
-  // supported -- a deliberate choice, not an oversight: LazyVim's own which-key table has no such
-  // binding, so there was nothing to reproduce.
-  if (ctx.pending) {
-    const tableHit = ctx.table?.bindings.find((b) => b.keys.length === 2 && b.keys[0] === ctx.pending && b.keys[1] === event.key);
-    if (tableHit) return { kind: "panel", binding: tableHit };
-  }
+  // (A table pair completing a pending prefix, `[b`/`gt`/`gT`, is resolved above, ahead of the
+  // chords and the blanket modifier refusal.)
   // The second key of a two-key sequence (`gg`, `[[`, `]]`). Anything that does not complete the
   // pending one falls through as an ordinary key below: the prefix is simply dropped, as vim drops
   // an unfinished `g`. A mismatched pair (`[` then `]`) is claimed as nothing rather than falling

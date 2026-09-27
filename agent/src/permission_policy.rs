@@ -271,14 +271,26 @@ pub fn classify_with_rules(
     project_root: &Path,
     rules: &crate::permission_rules::PrefixRules,
 ) -> Classification {
-    let classification = classify_permission_request(tool_name, input, project_root);
-    if classification.needs_a_human()
-        && REPLACEABLE_BY_A_RULE.contains(&classification.reason)
-        && rules.matches(tool_name, input)
-    {
+    if rule_that_allows(tool_name, input, project_root, rules).is_some() {
         return allow(REASON_ALLOWED_BY_A_PROJECT_RULE);
     }
-    classification
+    classify_permission_request(tool_name, input, project_root)
+}
+
+/// The rule [`classify_with_rules`] would answer this call with, in Claude Code's own syntax
+/// (`Bash(git log *)`), or `None` when the call is not one a rule answers -- the same condition,
+/// so the two can never disagree. What a transcript row names when a saved rule, not the user,
+/// allowed a call (v1 polish F18).
+pub fn rule_that_allows(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    rules: &crate::permission_rules::PrefixRules,
+) -> Option<String> {
+    let rule = rules.matching_rule(tool_name, input)?;
+    let classification = classify_permission_request(tool_name, input, project_root);
+    (classification.needs_a_human() && REPLACEABLE_BY_A_RULE.contains(&classification.reason))
+        .then(|| rule.to_rule_string())
 }
 
 /// [`classify_permission_request`] with the home directory passed in rather than read from the
@@ -1253,6 +1265,11 @@ mod tests {
                 with_rules, plain,
                 "a rule changed a fail-closed verdict for `{command}`"
             );
+            assert_eq!(
+                rule_that_allows("Bash", &input, ws.path(), &rules_for(command)),
+                None,
+                "no row may name a rule for `{command}`"
+            );
         }
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -1279,10 +1296,28 @@ mod tests {
             let decided = classify_with_rules("Bash", &input, ws.path(), &rules_for(command));
             assert_eq!(decided.verdict, PermissionVerdict::AllowWithoutAsking, "`{command}`");
             assert_eq!(decided.reason, REASON_ALLOWED_BY_A_PROJECT_RULE);
+            // F18: the rule that did it is named, first match first (`rules_for` adds the one-word
+            // rule before the two-word one).
+            let first = command.split_whitespace().next().unwrap();
+            assert_eq!(
+                rule_that_allows("Bash", &input, ws.path(), &rules_for(command)),
+                Some(format!("Bash({first} *)")),
+                "`{command}`"
+            );
         }
         // A rule for other words changes nothing.
         let other = PrefixRules::default().with(PrefixRule::parse("Bash(cargo test *)").unwrap());
         assert!(classify_with_rules("Bash", &json!({ "command": "rm b.txt" }), ws.path(), &other).needs_a_human());
+        assert_eq!(
+            rule_that_allows("Bash", &json!({ "command": "rm b.txt" }), ws.path(), &other),
+            None
+        );
+        // A call the classifier already allows was not answered by a rule, whatever matches it.
+        let ls = PrefixRules::default().with(PrefixRule::parse("Bash(ls *)").unwrap());
+        assert_eq!(
+            rule_that_allows("Bash", &json!({ "command": "ls" }), ws.path(), &ls),
+            None
+        );
         // No rule ever reaches another tool, even one the classifier cards.
         let all = PrefixRules::default().with(PrefixRule::parse("Bash(src *)").unwrap());
         assert!(classify_with_rules("Write", &json!({ "file_path": "src/main.rs" }), ws.path(), &all).needs_a_human());

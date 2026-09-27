@@ -394,10 +394,9 @@ export function Composer({
            cannot reach INPUT by the side door either; `resolveKey` refuses `i` on the same
            condition, and `App.tsx` forces BROWSE for a session that dies while INPUT is already
            active. The text names only `r`, the key that actually resolves in the mode the user is
-           in. */
-        <div className="composer-browse-hint">
-          This session has ended. Press r to start a new session here.
-        </div>
+           in. Since v1 polish item 7 it names no key at all: the lost/ended/failed row just above
+           already says "Press r…", and a failed tab read it twice. */
+        <div className="composer-browse-hint">This session has ended.</div>
       ) : (
         // BROWSE's rendering of the same control: not a textarea at all, so there is nothing here
         // for a stray keystroke to land in. `tabIndex` makes it a real focus target, so THREE

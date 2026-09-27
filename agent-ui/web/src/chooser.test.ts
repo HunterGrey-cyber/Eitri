@@ -75,9 +75,9 @@ describe("tabStateWord", () => {
     expect(tabStateWord({ ...TAB, state: "not_started", marker: "unread" })).toBe("new");
     expect(tabStateWord(null)).toBe("new");
   });
-  it("a live tab with no marker, or a pending card, reads idle", () => {
+  it("a live tab with no marker reads idle, and one holding a card reads waiting (v1 polish item 8)", () => {
     expect(tabStateWord({ ...TAB, marker: null })).toBe("idle");
-    expect(tabStateWord({ ...TAB, marker: "needs_input", pending: 2 })).toBe("idle");
+    expect(tabStateWord({ ...TAB, marker: "needs_input", pending: 2 })).toBe("waiting");
   });
 });
 

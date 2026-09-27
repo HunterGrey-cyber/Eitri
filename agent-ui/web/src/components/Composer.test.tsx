@@ -325,7 +325,8 @@ describe("Composer's BROWSE hint (C1b/S3)", () => {
   it("is not shown on a session that has ended -- that row says r instead", () => {
     const { container } = renderComposer({ mode: "browse", sessionEnded: true });
     expect(container.querySelector(".composer-hint")).toBeNull();
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toContain("Press r to start a new session here.");
+    // v1 polish item 7: the row above says "Press r…"; the composer does not repeat it.
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("This session has ended.");
   });
 
   it("is not shown while a scratch round trip owns the draft (editingInNvim)", () => {

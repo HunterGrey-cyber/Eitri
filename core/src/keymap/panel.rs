@@ -203,9 +203,9 @@ pub fn reserved(seq: &PanelSeq) -> Option<String> {
 /// new tab).
 pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new")];
 
-/// The 13 default rows (spec §2.2), in table order: direct tab-as-buffer keys first, then the
-/// `<leader>` rows. Every row's source is the LazyVim/nvim/which-key line it copies, or
-/// `neovibe-only` with why (spec, "Rule for every line").
+/// The 16 default rows (spec §2.2, plus `gt`/`gT` since v1 polish F16), in table order: direct
+/// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
+/// LazyVim/nvim/which-key line it copies, or `neovibe-only` with why (spec, "Rule for every line").
 pub fn default_bindings() -> Vec<PanelBinding> {
     vec![
         // lazyvim: config/keymaps.lua:34-35 (<S-h>/<S-l> = bprevious/bnext, "Prev/Next Buffer")
@@ -229,6 +229,20 @@ pub fn default_bindings() -> Vec<PanelBinding> {
         PanelBinding {
             seq: parse_seq("]b").unwrap(),
             action: PanelAction::Tab(TabAction::Next),
+            source: PanelSource::Default,
+        },
+        // vim: `:help gt` / `:help gT` (next/previous tab page). v1 polish F16: the owner's walkthrough
+        // pressed them and nothing happened; a session tab is the panel's tab page, so they step like
+        // `L`/`H`. `g` is a reserved prefix, so these reach the table through `resolveKey`'s pending
+        // pair lookup, the same way `[b`/`]b` do.
+        PanelBinding {
+            seq: parse_seq("gt").unwrap(),
+            action: PanelAction::Tab(TabAction::Next),
+            source: PanelSource::Default,
+        },
+        PanelBinding {
+            seq: parse_seq("gT").unwrap(),
+            action: PanelAction::Tab(TabAction::Prev),
             source: PanelSource::Default,
         },
         // lazyvim: keymaps.lua:38 ("Switch to Other Buffer")
@@ -458,6 +472,10 @@ pub fn effective(user: &PanelUserTable, report: Option<&NvimReport>) -> (PanelKe
             }
         }
     }
+    // An `init.lua` `set` replaces whatever is left on its keys (a default, or nvim's): `set` itself
+    // refuses a live default, but a table built another way must not end up with two rows for one
+    // sequence, the first of which would win in the panel.
+    bindings.retain(|b| !user.sets.iter().any(|s| s.seq == b.seq));
     bindings.extend(user.sets.iter().cloned());
     let (timeoutlen_ms, timeout) = report.map_or((1000, true), |r| (r.timeoutlen, r.timeout));
     (
@@ -510,7 +528,7 @@ mod tests {
         }
         assert!(reserved(&parse_seq("g").unwrap()).is_some(), "a lone pending key");
         assert!(reserved(&parse_seq("[bx").unwrap()).is_some(), "three keys after [");
-        for free in ["[b", "]b", "H", "L", "<leader>bd", "<Space>x", "gt", "zb"] {
+        for free in ["[b", "]b", "H", "L", "<leader>bd", "<Space>x", "gt", "gT", "zb"] {
             assert_eq!(reserved(&parse_seq(free).unwrap()), None, "{free}");
         }
     }
@@ -526,6 +544,8 @@ mod tests {
             ("L", "tab.next"),
             ("[ b", "tab.prev"),
             ("] b", "tab.next"),
+            ("g t", "tab.next"),
+            ("g T", "tab.prev"),
             ("Space b b", "tab.last"),
             ("Space b d", "tab.close"),
             ("Space b o", "tab.close-others"),

@@ -238,6 +238,51 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
   }
 }
 
+/** What the events envelope says beyond its events (Rust's `CallNotes`): the saved rule that
+ *  answered a call (v1 polish F18) and the `Write` cards raised over no file (F22). */
+export type CallNotes = {
+  ruleNotes?: readonly { toolUseId: string; rule: string }[];
+  createsFile?: readonly { permissionId: string; toolUseId: string | null }[];
+};
+
+/** Folds an events envelope's `CallNotes` into the state, after that envelope's events, so a call
+ *  or card from the same batch is already there. A note for something this state does not hold is
+ *  dropped; the next snapshot carries it anyway. */
+export function applyCallNotes(state: AgentUiState, notes: CallNotes): AgentUiState {
+  const rules = new Map((notes.ruleNotes ?? []).map((n) => [n.toolUseId, n.rule]));
+  const newFileCards = new Set((notes.createsFile ?? []).map((n) => n.permissionId));
+  const newFileCalls = new Set((notes.createsFile ?? []).flatMap((n) => (n.toolUseId === null ? [] : [n.toolUseId])));
+  if (rules.size === 0 && newFileCards.size === 0) return state;
+  return {
+    ...state,
+    toolCalls: state.toolCalls.map((call) => {
+      const rule = rules.get(call.toolUseId);
+      const creates = newFileCalls.has(call.toolUseId);
+      if (rule === undefined && !creates) return call;
+      return { ...call, ...(rule === undefined ? {} : { allowedByRule: rule }), ...(creates ? { createsFile: true } : {}) };
+    }),
+    pendingPermissions: state.pendingPermissions.map((p) => (newFileCards.has(p.permissionId) ? { ...p, createsFile: true } : p)),
+  };
+}
+
+/** v1 polish item 6: the conversation a tab showed when its sidecar stopped under it, kept on
+ *  screen as a lost session (`reason` in the lost-session row) rather than replaced by an empty
+ *  failed tab. `null` when there is nothing to keep -- no restored history and nothing said yet --
+ *  so a session that never showed anything still fails the ordinary way. The cards go: nothing can
+ *  answer them any more. */
+export function keepAfterSidecarStop(state: AgentUiState, reason: string): AgentUiState | null {
+  const said = state.history !== null || state.userPrompts.length > 0 || state.transcript.length > 0 || state.toolCalls.length > 0;
+  if (!said) return null;
+  return {
+    ...state,
+    status: { kind: "unavailable", reason },
+    activeTurnId: null,
+    pendingPermissions: [],
+    assistantMessageOpen: false,
+    turnThinking: false,
+  };
+}
+
 /**
  * A snapshot is a complete replacement of this state.
  *

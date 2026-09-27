@@ -1,4 +1,5 @@
 import type { EditPreview } from "../diff";
+import { useProjectRelative } from "../projectPath";
 
 /** What an `Edit`/`Write` call would do, rendered for a person to review.
  *
@@ -12,7 +13,8 @@ import type { EditPreview } from "../diff";
  * the same mistake was made in this file's banners. The `+`/`-` gutter carries the colour; the code
  * stays `--nv-fg`, and `indexCss.test.ts` enforces that.
  */
-export function EditDiff({ preview, maxLines }: { preview: EditPreview; maxLines?: number }) {
+export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPreview; maxLines?: number; createsFile?: boolean }) {
+  const shownPath = useProjectRelative(preview.filePath);
   const diff = preview.diff !== null && maxLines !== undefined && preview.diff.length > maxLines ? preview.diff.slice(0, maxLines) : preview.diff;
   return (
     <div className="permission-card-edit">
@@ -21,7 +23,7 @@ export function EditDiff({ preview, maxLines }: { preview: EditPreview; maxLines
             path is also a `gf`/click target; an empty one is not a path to open. */}
         {preview.filePath ? (
           <span className="permission-card-edit-path path-link" data-path={preview.filePath}>
-            {preview.filePath}
+            {shownPath}
           </span>
         ) : (
           <span className="permission-card-edit-path">(no file named)</span>
@@ -30,13 +32,19 @@ export function EditDiff({ preview, maxLines }: { preview: EditPreview; maxLines
           +{preview.added} −{preview.removed}
         </span>
       </div>
-      {preview.wholeFile && (
-        /* Said rather than implied. A Write request carries only what the file WILL contain, so a
-           patch-shaped rendering would suggest the rest of the file survives. It may not. */
-        <div className="permission-card-edit-note">
-          Writes the whole file. The request does not say what is there now.
-        </div>
-      )}
+      {preview.wholeFile &&
+        (createsFile === true ? (
+          /* v1 polish F22: Rust found nothing at the path when the card was raised, so nothing is
+             overwritten -- a plain create is not a danger, and the warning below read as one. */
+          <div className="permission-card-edit-note">Creates a new file.</div>
+        ) : (
+          /* Said rather than implied. A Write request carries only what the file WILL contain, so a
+             patch-shaped rendering would suggest the rest of the file survives. It may not. Also
+             what is shown when nobody looked (a snapshot from before F22, a call no card gated). */
+          <div className="permission-card-edit-note">
+            Writes the whole file. The request does not say what is there now.
+          </div>
+        ))}
       {preview.replaceAll && (
         /* The diff looks identical with and without this, so a reader cannot infer it. */
         <div className="permission-card-edit-note">

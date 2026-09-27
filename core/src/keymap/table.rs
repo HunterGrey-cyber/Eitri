@@ -831,7 +831,9 @@ mod tests {
         assert!(err(&[set("gt", "tab.rename")]).contains("tab.rename"));
         assert!(err(&[set("<C-x>", "tab.new")]).contains("<C-x>"));
         assert!(err(&[del("zz")]).contains("nothing binds"));
-        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("gt", "tab.new")], &[]).unwrap();
+        // `gt` is a default since v1 polish F16, so rebinding it is refused until it is deleted.
+        assert!(err(&[set("gt", "tab.new")]).contains("tab.next (default)"));
+        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zb", "tab.new")], &[]).unwrap();
         assert_eq!(ok.panel_user().sets.len(), 2);
         assert_eq!(ok.panel_user().dels.len(), 1);
     }

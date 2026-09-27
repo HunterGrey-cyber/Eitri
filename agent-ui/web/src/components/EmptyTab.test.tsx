@@ -145,6 +145,19 @@ describe("EmptyTab (F3)", () => {
       "Install it and make sure claude runs in a terminal, then press r.",
     );
   });
+  /** v1 polish item 7: "Press r…" was on screen twice (the row and the composer), three times under
+   *  a remedy that already says it. Once, whichever way. */
+  it("says press r once on a failed tab, with a remedy and without one", () => {
+    const withRemedy = renderEmpty({
+      tab: { ...TAB, state: "failed" },
+      failure: 'could not determine the installed claude CLI version via "/no/such/claude" (spawn error: ENOENT)',
+    });
+    expect(withRemedy.container.textContent!.match(/press r/gi)).toHaveLength(1);
+    cleanup();
+    const plain = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "something unrecognised" });
+    expect(plain.container.textContent!.match(/press r/gi)).toHaveLength(1);
+    expect(plain.container.querySelector(".row-hint")!.textContent).toBe("Press r to start a new session here.");
+  });
   it("draws no dashboard while starting", () => {
     const { container } = renderEmpty({ tab: { ...TAB, state: "starting" } });
     expect(container.querySelector(".dashboard")).toBeNull();
@@ -402,6 +415,30 @@ describe("EmptyTab (F3)", () => {
         fireEvent.keyDown(root, { key: "[" });
         fireEvent.keyDown(root, { key: "x" });
         fireEvent.keyDown(root, { key: "b" });
+        expect(onPanelAction).toHaveBeenCalledTimes(2);
+      });
+
+      /** v1 polish F16: vim's `gt`/`gT` reach the table from the dashboard too, `gT` through a bare
+       *  Shift keydown that must not drop the pending `g`. */
+      it("g t and g Shift T run the table's tab.next / tab.prev", () => {
+        const onPanelAction = vi.fn();
+        const table = {
+          ...TABLE,
+          bindings: [
+            ...TABLE.bindings,
+            { keys: ["g", "t"], action: "tab.next" as const, desc: "tab.next", source: "default" as const },
+            { keys: ["g", "T"], action: "tab.prev" as const, desc: "tab.prev", source: "default" as const },
+          ],
+        };
+        const rendered = renderEmpty({ panelTable: table, onPanelAction });
+        const root = toBrowse(rendered, rendered.props);
+        fireEvent.keyDown(root, { key: "g" });
+        fireEvent.keyDown(root, { key: "t" });
+        expect(onPanelAction).toHaveBeenLastCalledWith(expect.objectContaining({ keys: ["g", "t"], action: "tab.next" }));
+        fireEvent.keyDown(root, { key: "g" });
+        fireEvent.keyDown(root, { key: "Shift", shiftKey: true });
+        fireEvent.keyDown(root, { key: "T", shiftKey: true });
+        expect(onPanelAction).toHaveBeenLastCalledWith(expect.objectContaining({ keys: ["g", "T"], action: "tab.prev" }));
         expect(onPanelAction).toHaveBeenCalledTimes(2);
       });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyEvent, applySnapshot, initialState, resetToStartScreen } from "./reducer";
+import { applyCallNotes, applyEvent, applySnapshot, keepAfterSidecarStop, initialState, resetToStartScreen } from "./reducer";
 import type { AgentDomainEvent, TurnOutcome } from "./types";
 
 describe("applyEvent", () => {
@@ -624,5 +624,49 @@ describe("resetToStartScreen", () => {
     expect(reset.transcript).toEqual([]);
     expect(reset.status).toEqual({ kind: "starting" });
     expect(reset.sessionId).toBeNull();
+  });
+});
+
+describe("applyCallNotes (v1 polish F18, F22)", () => {
+  it("marks the named calls, leaves the rest and ignores a note for no call", () => {
+    let state = initialState();
+    for (const id of ["toolu_1", "toolu_2"]) {
+      state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: id, name: "Bash", input: { command: "x" } });
+    }
+    const other = state.toolCalls[1];
+    const next = applyCallNotes(state, {
+      ruleNotes: [
+        { toolUseId: "toolu_1", rule: "Bash(npm *)" },
+        { toolUseId: "toolu_gone", rule: "Bash(ls *)" },
+      ],
+    });
+    expect(next.toolCalls.map((c) => c.allowedByRule)).toEqual(["Bash(npm *)", undefined]);
+    expect(next.toolCalls[1]).toBe(other);
+    expect(applyCallNotes(state, {})).toBe(state);
+    expect(applyCallNotes(state, { ruleNotes: [], createsFile: [] })).toBe(state);
+  });
+
+  it("marks a Write card raised over no file, and its call", () => {
+    let state = initialState();
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_w", name: "Write", input: { file_path: "/p/a" } });
+    for (const [perm, id] of [["perm-new", "toolu_w"], ["perm-old", "toolu_x"]]) {
+      state = applyEvent(state, { type: "permission_requested", permission_id: perm, tool_use_id: id, tool_name: "Write", input: { file_path: "/p/a" } });
+    }
+    const next = applyCallNotes(state, { createsFile: [{ permissionId: "perm-new", toolUseId: "toolu_w" }] });
+    expect(next.pendingPermissions.map((p) => p.createsFile)).toEqual([true, undefined]);
+    expect(next.toolCalls[0].createsFile).toBe(true);
+  });
+});
+
+describe("keepAfterSidecarStop (v1 polish item 6)", () => {
+  it("keeps a conversation as lost, without its cards; keeps nothing when nothing was said", () => {
+    expect(keepAfterSidecarStop(initialState(), "gone")).toBeNull();
+    let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
+    state = applyEvent(state, { type: "permission_requested", permission_id: "p", tool_use_id: null, tool_name: "Bash", input: {} });
+    const kept = keepAfterSidecarStop(state, "gone")!;
+    expect(kept.status).toEqual({ kind: "unavailable", reason: "gone" });
+    expect(kept.userPrompts).toEqual(state.userPrompts);
+    expect(kept.pendingPermissions).toEqual([]);
+    expect(kept.activeTurnId).toBeNull();
   });
 });

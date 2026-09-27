@@ -40,7 +40,12 @@ function renderLeftSeg(seg: Seg, facts: BandFacts, paneFocused: boolean, glyphMo
         data-testid="mode-block"
         title={paneFocused ? undefined : "This pane does not have keyboard focus (Ctrl+l to focus it)"}
       >
-        {seg.text}
+        {/* v1 polish F24: BROWSE/INPUT is a claim about where typing lands, so it is drawn only while
+            this pane holds the keys. Without them the block stays, dim and empty, as an inactive
+            window's statusline carries no mode (lualine's `inactive_sections` has no `mode`
+            component; vim shows `-- INSERT --` for the current window only, `:h 'showmode'`). An
+            empty tab starts in INPUT at launch with the keys in the editor, and read `INPUT`. */}
+        {paneFocused ? seg.text : ""}
       </span>
     );
   }

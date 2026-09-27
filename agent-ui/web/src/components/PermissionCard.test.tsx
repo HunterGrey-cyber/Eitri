@@ -67,11 +67,16 @@ describe("PermissionCard decisions", () => {
    anything on its own. The id is what ties the card to the exact call above it in the transcript --
    the same id `MessageList` keys that call's block on. */
 describe("PermissionCard and the tool call it gates", () => {
-  it("names the tool call the request belongs to", () => {
+  /** v1 polish F21: in a tooltip on the card's tool line, never as visible text. */
+  it("names the tool call the request belongs to, in a tooltip only", () => {
     const { container } = render(
       <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />,
     );
-    expect(container.querySelector(".permission-card-tool-use-id")?.textContent).toContain("toolu_01ABC");
+    const tool = container.querySelector(".permission-card-tool")!;
+    expect(tool.getAttribute("title")).toBe("tool call toolu_01ABC");
+    expect(tool.getAttribute("data-tool-use-id")).toBe("toolu_01ABC");
+    expect(container.textContent).not.toContain("toolu_01ABC");
+    expect(container.textContent).not.toContain("for tool call");
   });
 
   /* proto3 has no absent scalar: an unset `tool_use_id` reaches Rust as "" and is carried through
@@ -80,7 +85,8 @@ describe("PermissionCard and the tool call it gates", () => {
     const { container } = render(
       <PermissionCard request={{ ...REQUEST, toolUseId: "" }} sessionEnded={false} onAnswer={vi.fn()} />,
     );
-    expect(container.querySelector(".permission-card-tool-use-id")).toBeNull();
+    expect(container.querySelector(".permission-card-tool")!.hasAttribute("title")).toBe(false);
+    expect(container.querySelector("[data-tool-use-id]")).toBeNull();
   });
 
   it("says nothing at all rather than inventing a link when the backend sent none", () => {
@@ -89,7 +95,8 @@ describe("PermissionCard and the tool call it gates", () => {
     const { container } = render(
       <PermissionCard request={{ ...REQUEST, toolUseId: null }} sessionEnded={false} onAnswer={vi.fn()} />,
     );
-    expect(container.querySelector(".permission-card-tool-use-id")).toBeNull();
+    expect(container.querySelector(".permission-card-tool")!.hasAttribute("title")).toBe(false);
+    expect(container.querySelector("[data-tool-use-id]")).toBeNull();
   });
 });
 
@@ -173,5 +180,24 @@ describe("P5 and D7", () => {
     expect(container.querySelector("input")!.getAttribute("data-nav-order")).toBe("4");
     fireEvent.click(always);
     expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, true);
+  });
+});
+
+/** v1 polish F22: a Write over no file (Rust looked when the card was raised) says it creates one;
+ *  over an existing file, or when nobody looked, the overwrite warning stays. */
+describe("PermissionCard for a Write", () => {
+  const write: PermissionRequestRecord = { ...REQUEST, toolName: "Write", input: { file_path: "/p/new.txt", content: "hi\n" } };
+  const WARNING = "Writes the whole file. The request does not say what is there now.";
+
+  it("says it creates a new file, without the overwrite warning", () => {
+    const { container } = render(<PermissionCard request={{ ...write, createsFile: true }} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(container.textContent).toContain("Creates a new file.");
+    expect(container.textContent).not.toContain(WARNING);
+  });
+
+  it("keeps the warning over an existing file", () => {
+    const { container } = render(<PermissionCard request={write} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(container.textContent).toContain(WARNING);
+    expect(container.textContent).not.toContain("Creates a new file.");
   });
 });

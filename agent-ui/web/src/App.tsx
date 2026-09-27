@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { applyEvent, applySnapshot, initialState, resumeAttached } from "./reducer";
+import { ProjectDirContext } from "./projectPath";
+import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterSidecarStop, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
@@ -10,7 +11,7 @@ import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, star
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { isModeCycleKey, isShiftTab, MODE_STARTING_MESSAGE, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { leaderTypingFlash, TypingGuard } from "./typingGuard";
+import { isModifierKey, leaderTypingFlash, TypingGuard } from "./typingGuard";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -43,7 +44,7 @@ import type { RestoredDraft } from "./components/Composer";
 import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
 import { Row } from "./components/Row";
-import { classify } from "./problems";
+import { classify, failureEvidence, remedyNamesR, sidecarStopped } from "./problems";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusBand } from "./components/StatusBand";
 import { QueueLines } from "./components/QueueLines";
@@ -322,7 +323,19 @@ export default function App() {
    *  `failed` tab renders the empty tab too (F3, spec §3.6): it is not "started" until Rust has
    *  really opened a session for it. Derived, not state -- Rust's `tabs` envelope is the only source
    *  of a tab's `state`. */
-  const sessionStarted = activeTab !== null && (activeTab.state === "live" || activeTab.state === "ended");
+  /** v1 polish item 6: the conversation each failed tab showed when its sidecar stopped under it
+   *  (`keepAfterSidecarStop`), so it stays on screen as a lost session -- across a switch away and
+   *  back too, since Rust sends no snapshot for a failed tab. Dropped once the tab is no longer
+   *  failed (`r`) or is closed. Keyed by tab, read during render. */
+  const keptStates = useRef(new Map<TabId, AgentUiState>());
+  /** `state` for the bridge listener (installed once), so the `error` arm can keep what was shown. */
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const sessionStarted =
+    activeTab !== null &&
+    (activeTab.state === "live" ||
+      activeTab.state === "ended" ||
+      (activeTab.state === "failed" && keptStates.current.has(activeTab.id)));
   /** `sessionStarted` for the bridge listener, which is registered once and would otherwise read
    *  its first render's value forever. Assigned during render, so it is current by the time any
    *  later envelope arrives. */
@@ -1678,6 +1691,15 @@ export default function App() {
           setScratchEditing(false);
           setQueueTaken(null);
         }
+        // v1 polish item 6: a kept conversation lives only while its tab is still failed, and comes
+        // back on a switch to it (after the reset above; no snapshot follows for a failed tab).
+        for (const id of [...keptStates.current.keys()]) {
+          if (payload.tabs.find((t) => t.id === id)?.state !== "failed") keptStates.current.delete(id);
+        }
+        if (payload.active !== activeTabRef.current) {
+          const kept = keptStates.current.get(payload.active);
+          if (kept !== undefined) setState(kept);
+        }
         activeTabRef.current = payload.active;
         setTabs({ active: payload.active, tabs: payload.tabs, defaultMode: payload.defaultMode });
         forgetClosed(
@@ -1800,7 +1822,7 @@ export default function App() {
         ) {
           firstTextReceivedAt.current = performance.now();
         }
-        setState((s) => payload.events.reduce((acc, event) => applyEvent(acc, event), s));
+        setState((s) => applyCallNotes(payload.events.reduce((acc, event) => applyEvent(acc, event), s), payload));
       } else if (payload.kind === "command_result") {
         setPendingCommands((prev) => {
           const next = new Set(prev);
@@ -1885,12 +1907,22 @@ export default function App() {
         // and this tab's own `tabs.failure` carries the reason for when it is shown again. This
         // window's other tabs are untouched (spec §3.9).
         setHandoffRequests((current) => withoutHandoff(current, payload.tab));
-        setState(initialState());
+        // v1 polish item 6: a sidecar that stopped under a conversation (a resumed one, before any
+        // new turn, reaches here as "ended before it started") keeps that conversation on screen as
+        // a lost session with the provider's own reason, rather than an empty failed tab guessing
+        // the session "no longer exists". Anything else, or nothing said yet: the ordinary reset.
+        const kept =
+          payload.tab === activeTabRef.current && sidecarStopped(payload.message)
+            ? keepAfterSidecarStop(stateRef.current, failureEvidence(payload.message))
+            : null;
+        if (kept !== null) keptStates.current.set(payload.tab, kept);
+        setState(kept ?? initialState());
         setKeymapOpen(false);
         setHandoffOpen(false);
         // The third of the three whole-state resets, now saying the same thing as the other two.
         setTurnClock(null);
-        setFatalError(payload.message);
+        // A kept conversation says it in its own lost-session row; the banner would say it twice.
+        setFatalError(kept === null ? payload.message : null);
         // No `requestHello()` here (ruling 17): Rust re-sends `hello`, recomputed, whenever the set
         // of open provider sessions changes -- this tab failing (or ending, or resetting) is exactly
         // such a change, so the picker's list is already on its way rather than something this side
@@ -2592,6 +2624,9 @@ export default function App() {
       setHandoffOpen(false);
       return;
     }
+    // A bare modifier's own keydown (the Shift of `gT`, v1 polish F16) is not "the next key": it
+    // must not drop a pending `g`/`z`/`[`/`]`, a count or its which-key box, as vim waits through it.
+    if (pendingRef.current !== null && isModifierKey(event.key)) return;
     const root = containerRef.current;
     const pending = pendingRef.current;
     pendingRef.current = null;
@@ -3070,7 +3105,7 @@ export default function App() {
             always BROWSE: `resolveKey` refuses `i` once the session has ended and the effect near
             the top of this component forces BROWSE if it died while INPUT was active, so this
             sentence cannot be on screen in a mode that drops `r`. */}
-        <div className="row-hint">Press r to start a new session here.</div>
+        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">Press r to start a new session here.</div>}
       </Row>
     ) : state.status.kind === "closed" ? (
       // Deliberately NOT `row-error`/`✗`: an ordinary close (the host closed it, the provider
@@ -3079,7 +3114,7 @@ export default function App() {
       // fuller record of why these two were briefly unified and then split back apart.
       <Row kind="ended" sign="·" problem={sessionEndedProblem}>
         This session has ended ({state.status.reason}).
-        <div className="row-hint">Press r to start a new session here.</div>
+        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">Press r to start a new session here.</div>}
       </Row>
     ) : null;
 
@@ -3101,6 +3136,7 @@ export default function App() {
         : null;
 
   return (
+    <ProjectDirContext.Provider value={hello?.projectDir ?? ""}>
     <div
       className="agent-ui-root agent-ui-conversation"
       ref={containerRef}
@@ -3343,5 +3379,6 @@ export default function App() {
       />
       <HintLayer root={containerRef.current} hints={hints} typed={hintTyped} />
     </div>
+    </ProjectDirContext.Provider>
   );
 }

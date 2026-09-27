@@ -15,8 +15,8 @@ use agent::{AgentDomainEvent, UiDelivery};
 
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind};
 use crate::agent_bridge::{
-    serialize_events_for_js, serialize_handoff_for_js, serialize_snapshot_for_js, serialize_tabs_for_js,
-    SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView,
+    serialize_events_with_notes_for_js, serialize_handoff_for_js, serialize_snapshot_with_notes_for_js,
+    serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView,
 };
 use crate::attention::{Attention, AttentionTracker};
 use crate::tabs::{self, TabFacts, TabId};
@@ -145,6 +145,13 @@ pub struct Tab {
     /// ingestion thread folds into the projection concurrently, so a re-read can already include a
     /// completion the delivery did not carry, and the end was then never reported.
     was_running: bool,
+    /// What the rows and cards say beyond the projection, kept for every later snapshot: the saved
+    /// rule that answered a call (v1 polish F18, `note_rule_answers`), and the `Write` cards whose
+    /// file did not exist when they were raised (F22, `note_new_files`).
+    notes: CallNotes,
+    /// Tool-use id -> the rule that will answer it, for a call started but not yet finished. It
+    /// becomes a note only once the call completes with no card having been kept for it.
+    rule_candidates: std::collections::BTreeMap<String, String>,
     /// The pending permission ids `rule_offers` was last computed for, sorted, so the classifier
     /// (which canonicalizes `Bash` arguments) runs once per change rather than every tick.
     rule_offers_seen: Vec<String>,
@@ -179,6 +186,8 @@ impl Tab {
             editing_draft: None,
             was_running: false,
             rule_offers_seen: Vec::new(),
+            notes: CallNotes::default(),
+            rule_candidates: std::collections::BTreeMap::new(),
             turn_clock: None,
         }
     }
@@ -634,6 +643,21 @@ impl TabSet {
                             _ => {}
                         }
                     }
+                    // Read, never written (the mode code is not this function's): a bypass session
+                    // answers without the classifier, so no rule answered anything there.
+                    let bypass = tab.mode == SessionModeChoice::Bypass
+                        || backend.permission_mode() == Some(agent::PermissionMode::Bypass);
+                    let fresh_notes = CallNotes {
+                        allowed_by_rule: note_rule_answers(
+                            &mut tab.rule_candidates,
+                            &mut tab.notes.allowed_by_rule,
+                            &events,
+                            project_root,
+                            rules,
+                            bypass,
+                        ),
+                        creates_file: note_new_files(&mut tab.notes.creates_file, &events, project_root),
+                    };
                     tab.attention.observe(&events, on_screen);
                     if let Some(trace) = tab.turn_trace.as_mut() {
                         let first_text = trace.observe(&events);
@@ -645,11 +669,12 @@ impl TabSet {
                     }
                     if is_active {
                         let through_revision = backend.projection().last_revision;
-                        out.active_payload = Some(serialize_events_for_js(
+                        out.active_payload = Some(serialize_events_with_notes_for_js(
                             tab.id,
                             from_revision,
                             through_revision,
                             &events,
+                            &fresh_notes,
                         ));
                     } else {
                         tab.stale = true;
@@ -663,10 +688,11 @@ impl TabSet {
                     let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
                     tab.attention.resync(pending);
                     if is_active {
-                        out.active_payload = Some(serialize_snapshot_for_js(
+                        out.active_payload = Some(serialize_snapshot_with_notes_for_js(
                             tab.id,
                             &SnapshotView::of(backend),
                             turn_started_at_ms,
+                            &tab.notes,
                         ));
                     } else {
                         tab.stale = true;
@@ -729,6 +755,8 @@ impl TabSet {
                     tab.backend = TabBackend::Live(backend);
                     tab.was_running = false;
                     tab.attention.restart();
+                    tab.notes = CallNotes::default();
+                    tab.rule_candidates.clear();
                     tab.last_handoff = None;
                     tab.reported_start_failure = false;
                     tab.title = pending.resumed_title;
@@ -760,10 +788,11 @@ impl TabSet {
         tab.stale = false;
         let mut payloads = Vec::new();
         match &tab.backend {
-            TabBackend::Live(backend) => payloads.push(serialize_snapshot_for_js(
+            TabBackend::Live(backend) => payloads.push(serialize_snapshot_with_notes_for_js(
                 tab.id,
                 &SnapshotView::of(backend),
                 tab.turn_clock.as_ref().map(|(_, at)| *at),
+                &tab.notes,
             )),
             TabBackend::NotStarted => payloads.extend(
                 tab.last_handoff
@@ -1034,6 +1063,103 @@ fn choice_of(mode: agent::PermissionMode) -> SessionModeChoice {
         agent::PermissionMode::Auto => SessionModeChoice::Auto,
         agent::PermissionMode::Bypass => SessionModeChoice::Bypass,
     }
+}
+
+/// v1 polish F18: which tool calls in this batch a saved prefix rule answered, as (tool-use id,
+/// `Bash(git log *)`), recorded in the tab's `notes` for later snapshots too.
+///
+/// The auto-answer itself happens in `AgentBackend::take_ui_delivery_with_rules`, which drops the
+/// request and says so only on stderr; this re-asks `agent::rule_that_allows` -- the very condition
+/// `classify_with_rules` answers by -- for each `ToolCallStarted`, and keeps the answer as a
+/// candidate. A card kept for that call (`PermissionRequested` naming its tool-use id: the
+/// auto-answer failed, or the rules changed in between) drops the candidate; the call completing
+/// without one makes it a note, because a gated call cannot complete before its gate is answered.
+/// Never in bypass, where nothing was classified. A card that names no tool-use id cannot drop a
+/// candidate, so a failed auto-answer on such a request could still be noted as the rule's.
+fn note_rule_answers(
+    candidates: &mut std::collections::BTreeMap<String, String>,
+    notes: &mut std::collections::BTreeMap<String, String>,
+    events: &[AgentDomainEvent],
+    project_root: &Path,
+    rules: &agent::PrefixRules,
+    bypass: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut fresh = std::collections::BTreeMap::new();
+    for event in events {
+        match event {
+            AgentDomainEvent::ToolCallStarted {
+                tool_use_id,
+                name,
+                input,
+                ..
+            } if !bypass && !rules.is_empty() => {
+                if let Some(rule) = agent::rule_that_allows(name, input, project_root, rules) {
+                    candidates.insert(tool_use_id.clone(), rule);
+                }
+            }
+            AgentDomainEvent::PermissionRequested {
+                tool_use_id: Some(id), ..
+            } => {
+                candidates.remove(id);
+            }
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
+                if let Some(rule) = candidates.remove(tool_use_id) {
+                    notes.insert(tool_use_id.clone(), rule.clone());
+                    fresh.insert(tool_use_id.clone(), rule);
+                }
+            }
+            _ => {}
+        }
+    }
+    fresh
+}
+
+/// v1 polish F22: the `Write` cards in this batch whose file does not exist now, when the card is
+/// raised -- recorded in `notes` for later snapshots and returned as this batch's own. Nothing at
+/// all at the path counts, a dangling symlink included, since the write would follow it; a relative
+/// `file_path` (the tool asks for an absolute one) is read against the project root. Checked once,
+/// here: after an approval the file exists, and the card must go on meaning what it meant.
+///
+/// Only a lookup that says "not found" counts as no file. Any other failure (a parent directory
+/// this process may not search, a path through a regular file) says nothing about whether the
+/// write would replace something, so the card keeps its overwrite warning: an uncertain answer
+/// resolves toward the warning, as the permission policy's own uncertainties resolve toward a card.
+fn note_new_files(
+    notes: &mut std::collections::BTreeMap<String, Option<String>>,
+    events: &[AgentDomainEvent],
+    project_root: &Path,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let mut fresh = std::collections::BTreeMap::new();
+    for event in events {
+        let AgentDomainEvent::PermissionRequested {
+            permission_id,
+            tool_use_id,
+            tool_name,
+            input,
+        } = event
+        else {
+            continue;
+        };
+        if tool_name != "Write" {
+            continue;
+        }
+        let Some(file_path) = input
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let absent = matches!(
+            std::fs::symlink_metadata(project_root.join(file_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        if absent {
+            notes.insert(permission_id.clone(), tool_use_id.clone());
+            fresh.insert(permission_id.clone(), tool_use_id.clone());
+        }
+    }
+    fresh
 }
 
 /// Recomputes `rule_offers` when the set of pending permission ids changed; `true` if the offers did.
@@ -1950,6 +2076,232 @@ mod tests {
         assert_eq!(offers["perm-cargo"].display(), "cargo test *");
         assert!(changed.contains(&background));
         shut_down_all(&mut set);
+    }
+
+    /// v1 polish F18: a call a saved rule answered is named in the events payload and in every later
+    /// snapshot; a call the user was asked about, and one no rule matched, are not.
+    #[test]
+    fn a_call_a_rule_answered_is_named_in_events_and_snapshots() {
+        let dir = workspace("tabs-rule-notes");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let call = |id: &str, command: &str| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+        };
+        let gate = |perm: &str, id: &str, command: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: perm.into(),
+            tool_use_id: Some(id.into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+        };
+        let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        };
+        provider.queue(started("t1"));
+        provider.queue(call("toolu_npm", "npm ci"));
+        provider.queue(gate("perm-npm", "toolu_npm", "npm ci"));
+        provider.queue(done("toolu_npm"));
+        provider.queue(call("toolu_ls", "ls"));
+        provider.queue(done("toolu_ls"));
+        provider.queue(call("toolu_cargo", "cargo test"));
+        provider.queue(gate("perm-cargo", "toolu_cargo", "cargo test"));
+        provider.queue(done("toolu_cargo"));
+        let mut payloads = Vec::new();
+        until("the three calls to finish", || {
+            payloads.extend(set.pump(&dir, true).active_payload);
+            payloads
+                .iter()
+                .any(|p| p.contains("toolu_cargo") && p.contains("tool_call_completed"))
+        });
+        let notes: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("ruleNotes").cloned())
+            .collect();
+        assert_eq!(
+            notes,
+            vec![serde_json::json!([{ "toolUseId": "toolu_npm", "rule": "Bash(npm ci *)" }])]
+        );
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let calls = snapshot["state"]["toolCalls"].as_array().unwrap();
+        let rule_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c["toolUseId"] == id)
+                .unwrap()
+                .get("allowedByRule")
+                .cloned()
+        };
+        assert_eq!(rule_of("toolu_npm"), Some(serde_json::json!("Bash(npm ci *)")));
+        assert_eq!(rule_of("toolu_ls"), None, "the classifier allowed it, not a rule");
+        assert_eq!(rule_of("toolu_cargo"), None, "a card was shown");
+        shut_down_all(&mut set);
+    }
+
+    /// v1 polish F22: a `Write` card whose file is not there when it is raised says it creates one,
+    /// in the events payload and in later snapshots (on the card and on its call); a card over an
+    /// existing file does not, nor does its file appearing later change what the card said.
+    #[test]
+    fn a_write_card_over_no_file_is_marked_as_creating_one() {
+        let dir = workspace("tabs-new-file");
+        std::fs::write(dir.join("old.txt"), "there").unwrap();
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let write = |perm: &str, id: &str, path: std::path::PathBuf| AgentDomainEvent::PermissionRequested {
+            permission_id: perm.into(),
+            tool_use_id: Some(id.into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": path, "content": "x" }),
+        };
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_new".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": dir.join("new.txt"), "content": "x" }),
+        });
+        provider.queue(write("perm-new", "toolu_new", dir.join("new.txt")));
+        provider.queue(write("perm-old", "toolu_old", dir.join("old.txt")));
+        let mut payloads = Vec::new();
+        until("both cards", || {
+            payloads.extend(set.pump(&dir, true).active_payload);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        let marked: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("createsFile").cloned())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![serde_json::json!([{ "permissionId": "perm-new", "toolUseId": "toolu_new" }])]
+        );
+        std::fs::write(dir.join("new.txt"), "now there").unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let cards = snapshot["state"]["pendingPermissions"].as_array().unwrap();
+        let creates = |id: &str| {
+            cards
+                .iter()
+                .find(|c| c["permissionId"] == id)
+                .unwrap()
+                .get("createsFile")
+                .cloned()
+        };
+        assert_eq!(creates("perm-new"), Some(serde_json::json!(true)));
+        assert_eq!(creates("perm-old"), None);
+        assert_eq!(
+            snapshot["state"]["toolCalls"][0]["createsFile"],
+            serde_json::json!(true)
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// v1 polish F22, the local review: only "not found" is no file. A path this process cannot
+    /// look at (a parent it may not search) or one through a regular file says nothing about what
+    /// the write replaces, so its card keeps the overwrite warning. A dangling symlink is something.
+    #[test]
+    fn only_a_path_that_is_not_found_counts_as_a_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = workspace("tabs-new-file-errors");
+        std::fs::write(dir.join("plain.txt"), "a file").unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).unwrap();
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inside.txt"), "hidden").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let card = |perm: &str, path: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: perm.into(),
+            tool_use_id: Some(format!("toolu_{perm}")),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": path, "content": "x" }),
+        };
+        let events = vec![
+            card("absent", "absent.txt"),
+            card("locked", "locked/inside.txt"),
+            card("through-a-file", "plain.txt/child"),
+            card("dangling", "dangling"),
+            card("existing", "plain.txt"),
+        ];
+        let mut notes = std::collections::BTreeMap::new();
+        let fresh = note_new_files(&mut notes, &events, &dir);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Unmarked either way for `locked`: as a user its lookup is refused (EACCES), and root, who
+        // may search a 000 directory, finds the file there.
+        assert_eq!(fresh.keys().map(String::as_str).collect::<Vec<_>>(), vec!["absent"]);
+        assert_eq!(notes, fresh);
+    }
+
+    /// v1 polish F18, the local review: the paths `a_call_a_rule_answered_is_named_in_events_and_snapshots`
+    /// cannot reach through a fake provider -- a card kept for a call a rule matched (the
+    /// auto-answer failed to send) drops the note, and a bypass session notes nothing.
+    #[test]
+    fn a_kept_card_or_bypass_leaves_a_rule_matched_call_unnoted() {
+        let dir = workspace("tabs-rule-notes-direct");
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
+        let started = |id: &str| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+        };
+        let card = |id: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: format!("perm-{id}"),
+            tool_use_id: Some(id.into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+        };
+        let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        };
+        let mut candidates = std::collections::BTreeMap::new();
+        let mut notes = std::collections::BTreeMap::new();
+        // Spread over two batches, as a card and its answer are: the candidate outlives the first.
+        let first = note_rule_answers(
+            &mut candidates,
+            &mut notes,
+            &[started("toolu_carded"), card("toolu_carded"), started("toolu_ruled")],
+            &dir,
+            &rules,
+            false,
+        );
+        assert!(first.is_empty());
+        let second = note_rule_answers(
+            &mut candidates,
+            &mut notes,
+            &[done("toolu_carded"), done("toolu_ruled")],
+            &dir,
+            &rules,
+            false,
+        );
+        assert_eq!(
+            second.into_iter().collect::<Vec<_>>(),
+            vec![("toolu_ruled".to_string(), "Bash(npm ci *)".to_string())]
+        );
+        assert!(candidates.is_empty());
+        let mut candidates = std::collections::BTreeMap::new();
+        let mut notes = std::collections::BTreeMap::new();
+        let bypassed = note_rule_answers(
+            &mut candidates,
+            &mut notes,
+            &[started("toolu_b"), done("toolu_b")],
+            &dir,
+            &rules,
+            true,
+        );
+        assert!(bypassed.is_empty() && notes.is_empty());
     }
 
     /// Defect 8 (phase 2's sandbox pass): a background tab's turn trace was never observed.

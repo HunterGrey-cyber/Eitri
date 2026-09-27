@@ -293,7 +293,7 @@ describe("MessageList tool calls and permissions", () => {
         onAnswerPermission={vi.fn()}
       />,
     );
-    expect(container.querySelector(".tool-result-folded")).not.toBeNull();
+    expect(container.querySelector('[data-folded="true"]')).not.toBeNull();
     expect(container.querySelector(".tool-result")).toBeNull();
   });
 
@@ -350,7 +350,7 @@ describe("MessageList tool calls and permissions", () => {
     const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
     expect(awaiting).toHaveLength(1);
     expect(awaiting[0].textContent).toContain("waiting for approval");
-    expect(container.querySelector(".permission-card-tool-use-id")!.textContent).toContain("toolu_second");
+    expect(container.querySelector(".permission-card-tool")!.getAttribute("data-tool-use-id")).toBe("toolu_second");
   });
 
   it("marks nothing when the pending permission carries no tool_use_id", () => {

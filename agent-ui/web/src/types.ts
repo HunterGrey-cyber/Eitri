@@ -20,7 +20,18 @@ export type TranscriptMessage = { seq: Seq; text: string };
  * `UserPromptSubmitted`). Rendering the wire text would show the user a file path and a selection
  * they never wrote. */
 export type UserPromptRecord = { seq: Seq; text: string };
-export type ToolCallRecord = { seq: Seq; toolUseId: string; name: string; input: unknown; result: { content: unknown; isError: boolean } | null };
+export type ToolCallRecord = {
+  seq: Seq;
+  toolUseId: string;
+  name: string;
+  input: unknown;
+  result: { content: unknown; isError: boolean } | null;
+  /** v1 polish F18: the saved prefix rule that answered this call's permission request
+   *  (`Bash(git log *)`), when a rule and not the user did. Absent on every other call. */
+  allowedByRule?: string;
+  /** v1 polish F22: this `Write`'s card was raised over no file (see `PermissionRequestRecord`). */
+  createsFile?: boolean;
+};
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
  *
@@ -33,7 +44,16 @@ export type ToolCallRecord = { seq: Seq; toolUseId: string; name: string; input:
  *
  * So `null` means "this request arrived with no usable link", never "this backend cannot supply
  * one". Render it honestly -- never default it, never guess at the most recent call. */
-export type PermissionRequestRecord = { seq: Seq; permissionId: string; toolUseId: string | null; toolName: string; input: unknown };
+export type PermissionRequestRecord = {
+  seq: Seq;
+  permissionId: string;
+  toolUseId: string | null;
+  toolName: string;
+  input: unknown;
+  /** v1 polish F22: a `Write` whose file did not exist when the card was raised (Rust looked).
+   *  Absent when it did, and for every other tool. */
+  createsFile?: boolean;
+};
 export type SessionStatus =
   | { kind: "starting" }
   | { kind: "running" }

@@ -80,13 +80,19 @@ impl PrefixRules {
     }
     /// `Bash` with a string `command` that some rule matches. Nothing else can match.
     pub fn matches(&self, tool_name: &str, input: &Value) -> bool {
+        self.matching_rule(tool_name, input).is_some()
+    }
+
+    /// The first rule [`Self::matches`] would match on, so a transcript row can name the rule that
+    /// answered it (v1 polish F18) rather than only stderr saying "a prefix rule".
+    pub fn matching_rule(&self, tool_name: &str, input: &Value) -> Option<&PrefixRule> {
         if tool_name != "Bash" {
-            return false;
+            return None;
         }
         let Some(Value::String(command)) = input.get("command") else {
-            return false;
+            return None;
         };
-        self.0.iter().any(|rule| rule.matches_command(command))
+        self.0.iter().find(|rule| rule.matches_command(command))
     }
 }
 
@@ -257,5 +263,15 @@ mod tests {
         assert!(!rules.matches("Read", &json!({ "command": "npm ci" })));
         assert!(!rules.matches("Bash", &json!({ "command": ["npm", "ci"] })));
         assert!(!PrefixRules::default().matches("Bash", &json!({ "command": "npm ci" })));
+        let two = PrefixRules::new(vec![
+            PrefixRule::parse("Bash(git log *)").unwrap(),
+            PrefixRule::parse("Bash(npm *)").unwrap(),
+        ]);
+        assert_eq!(
+            two.matching_rule("Bash", &json!({ "command": "npm ci" }))
+                .map(PrefixRule::to_rule_string),
+            Some("Bash(npm *)".to_string())
+        );
+        assert_eq!(two.matching_rule("Bash", &json!({ "command": "ls" })), None);
     }
 }

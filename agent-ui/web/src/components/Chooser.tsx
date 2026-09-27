@@ -424,7 +424,7 @@ function ChooserRowItem({
             </span>
           )}
           <span className="chooser-right">
-            {row.tab.marker === "needs_input" && `⚑${row.tab.pending > 1 ? row.tab.pending : ""} · `}
+            {row.tab.marker === "needs_input" && `⚑${row.tab.pending > 1 ? row.tab.pending : ""} `}
             {word}
           </span>
         </span>

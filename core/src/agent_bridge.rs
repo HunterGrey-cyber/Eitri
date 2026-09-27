@@ -5,6 +5,8 @@
 //! command, and pushes a revisioned `events`/`snapshot` envelope independently of any specific
 //! command. See agent-ui/web/src/types.ts for the exact TS-side shapes these must match.
 
+use std::collections::BTreeMap;
+
 #[cfg(test)]
 use agent::AgentSessionProjection;
 use agent::{AgentDomainEvent, PermissionMode};
@@ -681,14 +683,66 @@ pub fn serialize_events_for_js(
     through_revision: u64,
     events: &[AgentDomainEvent],
 ) -> String {
-    json!({
+    serialize_events_with_notes_for_js(tab, from_revision, through_revision, events, &CallNotes::default())
+}
+
+/// What `TabSet::pump` knows about a tool call that the projection does not, carried beside the
+/// events and in snapshots. Only additive fields on the wire, each left out when it says nothing, so
+/// a payload without notes is byte-identical to one from before they existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallNotes {
+    /// Tool-use id -> the saved prefix rule that answered its permission request (`Bash(git log *)`,
+    /// v1 polish F18).
+    pub allowed_by_rule: BTreeMap<String, String>,
+    /// Permission id -> the call's tool-use id, for a `Write` whose file did not exist when its card
+    /// was raised (v1 polish F22): the card says it creates a file rather than warning about
+    /// overwriting one it cannot see.
+    pub creates_file: BTreeMap<String, Option<String>>,
+}
+
+impl CallNotes {
+    pub fn is_empty(&self) -> bool {
+        self.allowed_by_rule.is_empty() && self.creates_file.is_empty()
+    }
+
+    /// Whether this tool-use id's `Write` created its file (see `creates_file`).
+    fn creates_file_call(&self, tool_use_id: &str) -> bool {
+        self.creates_file.values().any(|id| id.as_deref() == Some(tool_use_id))
+    }
+}
+
+/// [`serialize_events_for_js`], plus what `notes` says about this batch:
+/// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]` (v1 polish F18) and
+/// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]` (F22). Each is left out when empty.
+pub fn serialize_events_with_notes_for_js(
+    tab: crate::tabs::TabId,
+    from_revision: u64,
+    through_revision: u64,
+    events: &[AgentDomainEvent],
+    notes: &CallNotes,
+) -> String {
+    let mut payload = json!({
         "kind": "events",
         "tab": tab.0,
         "fromRevision": from_revision,
         "throughRevision": through_revision,
         "events": events
-    })
-    .to_string()
+    });
+    if !notes.allowed_by_rule.is_empty() {
+        payload["ruleNotes"] = notes
+            .allowed_by_rule
+            .iter()
+            .map(|(tool_use_id, rule)| json!({ "toolUseId": tool_use_id, "rule": rule }))
+            .collect();
+    }
+    if !notes.creates_file.is_empty() {
+        payload["createsFile"] = notes
+            .creates_file
+            .iter()
+            .map(|(permission_id, tool_use_id)| json!({ "permissionId": permission_id, "toolUseId": tool_use_id }))
+            .collect();
+    }
+    payload.to_string()
 }
 
 /// Everything one snapshot needs, gathered from wherever it actually lives.
@@ -744,6 +798,19 @@ pub fn serialize_snapshot_for_js(
     view: &SnapshotView<'_>,
     turn_started_at_ms: Option<u64>,
 ) -> String {
+    serialize_snapshot_with_notes_for_js(tab, view, turn_started_at_ms, &CallNotes::default())
+}
+
+/// [`serialize_snapshot_for_js`], with what `notes` says so a reload or a tab switch keeps it:
+/// `allowedByRule` on each tool call a saved prefix rule answered (v1 polish F18), and
+/// `createsFile: true` on a `Write` card, and on its tool call, whose file did not exist when the
+/// card was raised (F22). Absent on every other entry, as in the events payload.
+pub fn serialize_snapshot_with_notes_for_js(
+    tab: crate::tabs::TabId,
+    view: &SnapshotView<'_>,
+    turn_started_at_ms: Option<u64>,
+    notes: &CallNotes,
+) -> String {
     let projection = &*view.projection;
     // Written out for the same stated reason as `transcript` just below: both field names happen
     // to be single lowercase words today, so the derive would produce the same JSON, but this
@@ -769,7 +836,7 @@ pub fn serialize_snapshot_for_js(
         .tool_calls
         .iter()
         .map(|call| {
-            json!({
+            let mut entry = json!({
                 // Where this call sits among the assistant messages and permission cards. Without
                 // it the frontend had three collections and no way to interleave them, so every
                 // tool card rendered below every message. See `AgentSessionProjection::apply`.
@@ -778,7 +845,14 @@ pub fn serialize_snapshot_for_js(
                 "name": call.name,
                 "input": call.input,
                 "result": call.result.as_ref().map(|r| json!({ "content": r.content, "isError": r.is_error })),
-            })
+            });
+            if let Some(rule) = notes.allowed_by_rule.get(&call.tool_use_id) {
+                entry["allowedByRule"] = json!(rule);
+            }
+            if notes.creates_file_call(&call.tool_use_id) {
+                entry["createsFile"] = json!(true);
+            }
+            entry
         })
         .collect();
 
@@ -798,7 +872,7 @@ pub fn serialize_snapshot_for_js(
     let pending_permissions: Vec<Value> = pending
         .into_iter()
         .map(|p| {
-            json!({
+            let mut entry = json!({
                 // Where this card sits in the conversation. Used when it has no `toolUseId` to
                 // anchor it beside its tool call -- which is every card on the legacy backend.
                 "seq": p.seq,
@@ -806,7 +880,11 @@ pub fn serialize_snapshot_for_js(
                 "toolUseId": p.tool_use_id,
                 "toolName": p.tool_name,
                 "input": p.input,
-            })
+            });
+            if notes.creates_file.contains_key(&p.permission_id) {
+                entry["createsFile"] = json!(true);
+            }
+            entry
         })
         .collect();
 

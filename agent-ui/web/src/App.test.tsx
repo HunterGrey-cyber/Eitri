@@ -187,11 +187,27 @@ describe("pane focus", () => {
     expect(modeBlock(container).dataset.focused).toBe("false");
     dispatch({ kind: "pane_focus", focused: true });
     expect(modeBlock(container).dataset.focused).toBe("true");
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
     dispatch({ kind: "pane_focus", focused: false });
     expect(modeBlock(container).dataset.focused).toBe("false");
-    // The mode itself is untouched: focus is a separate fact from which mode the panel is in.
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    // The mode itself is untouched (focus is a separate fact from which mode the panel is in), but
+    // the band names it only while the panel holds the keys (v1 polish F24).
+    expect(modeBlock(container).dataset.mode).toBe("browse");
+    expect(modeBlock(container).textContent).toBe("");
+  });
+
+  /** v1 polish F24: the empty tab starts in INPUT at launch while the editor holds the keys; its
+   *  band read `INPUT`. It names a mode only once the panel has the keys, as the live tab's does. */
+  it("the empty tab's band names no mode while the keys are elsewhere", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    expect(modeBlock(container).dataset.focused).toBe("false");
+    expect(modeBlock(container).textContent).toBe("");
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(modeBlock(container).dataset.mode).toBe("input");
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(modeBlock(container).textContent).toBe("");
   });
 
   it("opens the composer with the caret in it when shell says the user arrived by keyboard", () => {
@@ -200,7 +216,7 @@ describe("pane focus", () => {
     dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
     dispatch({ kind: "enter_input" });
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
     expect(document.activeElement).toBe(container.querySelector("textarea"));
     expect(container.textContent).not.toContain("按 i 开始输入");
   });
@@ -216,7 +232,7 @@ describe("pane focus", () => {
       events: [{ type: "session_closed", reason: "provider exited" }],
     });
     dispatch({ kind: "enter_input" });
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
   it("does not change the mode or what i does", () => {
@@ -225,9 +241,10 @@ describe("pane focus", () => {
     dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
     enterInputMode(container);
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
     dispatch({ kind: "pane_focus", focused: false });
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
+    expect(modeBlock(container).textContent).toBe("");
     expect(modeBlock(container).dataset.focused).toBe("false");
   });
 });
@@ -253,7 +270,7 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     fireEvent.keyDown(root, { key: "g" });
     expect(container.querySelector(".row-current")!.textContent).toContain("first");
     enterInputMode(container);
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
     const seen: string[] = [];
     const onResume = () => seen.push("resume");
     document.addEventListener(RESUME_FOLLOW_EVENT, onResume, true);
@@ -262,7 +279,7 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     } finally {
       document.removeEventListener(RESUME_FOLLOW_EVENT, onResume, true);
     }
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
     expect(container.querySelector(".row-current")!.textContent).toContain("second");
     expect(seen).toEqual(["resume"]);
     expect(container.querySelector("textarea")).toBeNull();
@@ -284,9 +301,9 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
     dispatch({ kind: "arrive" });
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
   /** GUI pass (2026-09-26, r2-gui), R7: `EmptyTab` read the window's `arrive` counter as a new
@@ -308,7 +325,7 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     const box = container.querySelector("textarea");
     expect(box).not.toBeNull();
     expect(document.activeElement).toBe(box);
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
   });
 
   /** Decision 4: a tab switch lands BROWSE -- onto an empty tab too, where BROWSE is the dashboard
@@ -321,7 +338,7 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "only" }] }) });
     dispatch({ kind: "tabs", active: 2, tabs: two });
     expect(container.querySelector("textarea")).toBeNull();
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
   /** Integration of wave 3's focus route with r2-gui's edge-only requests: the empty tab ignores
@@ -349,10 +366,10 @@ describe("arrive (panel round 2, spec §8, decision 4)", () => {
     dispatch({ kind: "tabs", active: 1, tabs: two });
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "only" }] }) });
     enterInputMode(container);
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
     dispatch({ kind: "tabs", active: 2, tabs: two });
     dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 });
 
@@ -380,7 +397,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
   it("lands in BROWSE on the oldest pending card", () => {
     const { container } = withTwoCards();
     dispatch({ kind: "focus_permission", tab: 1 });
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
     const current = container.querySelector(".row-current")!;
     expect(current.classList.contains("row-permission")).toBe(true);
     expect(current.textContent).toContain("Permission requested: Bash");
@@ -391,9 +408,9 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     try {
       const { container } = withTwoCards();
       enterInputMode(container);
-      expect(modeBlock(container).textContent).toBe("INPUT");
+      expect(modeBlock(container).dataset.mode).toBe("input");
       dispatch({ kind: "focus_permission", tab: 1 });
-      expect(modeBlock(container).textContent).toBe("BROWSE");
+      expect(modeBlock(container).dataset.mode).toBe("browse");
       // The `i` above is a key: a lone `a` is one nothing came near (spec 2026-09-27 §2.1).
       act(() => vi.advanceTimersByTime(300));
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
@@ -410,7 +427,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     dispatchLiveTab(snapshotState(), 1);
     dispatch({ kind: "pane_focus", focused: true });
     dispatch({ kind: "focus_permission", tab: 1 });
-    expect(modeBlock(container).textContent).toBe("INPUT");
+    expect(modeBlock(container).dataset.mode).toBe("input");
   });
 
   // Fix round 1 (reviewer finding): the "no card to land on, treat as an ordinary arrival" fallback
@@ -705,9 +722,9 @@ describe("App event folding", () => {
        including the `r` this very banner promises. The stronger property is that there is no box
        at all and the composer says which key does work. */
     expect(container.querySelector("textarea")).toBeNull();
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toContain(
-      "Press r to start a new session here.",
-    );
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("This session has ended.");
+    // v1 polish item 7: said once, by the row.
+    expect(container.textContent!.match(/press r/gi)).toHaveLength(1);
   });
 
   /* A session that ends normally is not an error, and must not read as one -- distinct row class,
@@ -946,13 +963,44 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "echo hi" } },
       { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_1", content: "hi", is_error: false },
     );
-    expect(container.querySelector(".tool-result-folded")).not.toBeNull();
+    expect(container.querySelector('[data-folded="true"]')).not.toBeNull();
 
     fireEvent.keyDown(conversationRoot(container), { key: "Enter" });
-    expect(container.querySelector(".tool-result-folded")).toBeNull();
+    expect(container.querySelector('[data-folded="true"]')).toBeNull();
 
     fireEvent.keyDown(conversationRoot(container), { key: "Enter" });
-    expect(container.querySelector(".tool-result-folded")).not.toBeNull();
+    expect(container.querySelector('[data-folded="true"]')).not.toBeNull();
+  });
+
+  /** v1 polish F18: a call a saved rule answered says which rule, from the events envelope's
+   *  `ruleNotes` and from a snapshot's `allowedByRule` (a call without one: toolRegistry.test). */
+  it("names the rule that allowed a call, from events and from a snapshot", () => {
+    const { container } = startedApp();
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 0,
+      throughRevision: 2,
+      // One call: consecutive calls fold into a run summary, which draws no per-call lines.
+      events: [
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "git log -3" } },
+        { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_1", content: "abc", is_error: false },
+      ],
+      ruleNotes: [{ toolUseId: "toolu_1", rule: "Bash(git log *)" }],
+    });
+    const notes = () => [...container.querySelectorAll(".tool-rule-note")].map((n) => n.textContent);
+    expect(notes()).toEqual(["allowed by rule Bash(git log *)"]);
+    expect(container.querySelector('[data-tool-name="Bash"] .tool-rule-note code')?.textContent).toBe("Bash(git log *)");
+    dispatchLiveTab(
+      {
+        ...snapshotState(),
+        toolCalls: [
+          { seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "git log -3" }, result: null, allowedByRule: "Bash(git log *)" },
+        ],
+      },
+      1,
+    );
+    expect(notes()).toEqual(["allowed by rule Bash(git log *)"]);
   });
 
   it("does nothing on r while the session is still running", () => {
@@ -1308,7 +1356,8 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(container.querySelector("textarea")).toBeNull();
       const hint = container.querySelector(".composer-browse-hint")!;
       expect(hint.textContent).not.toContain("按 i");
-      expect(hint.textContent).toContain("Press r to start a new session here.");
+      expect(hint.textContent).toBe("This session has ended.");
+      expect(container.textContent!.match(/press r/gi)).toHaveLength(1);
       // Nothing for a Tab to land on either: the hint is a focus route into INPUT while the
       // session lives, and that route is what the `tabIndex` provides.
       expect(hint.hasAttribute("tabindex")).toBe(false);
@@ -1464,6 +1513,27 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
     press("[");
     press("[");
     expect(posted.length).toBe(0);
+  });
+
+  /** v1 polish F16: vim's `gt`/`gT` (`:help gt`) step session tabs like `L`/`H`. `gT` arrives as a
+   *  bare Shift keydown and then `T` with Shift held; the Shift must not drop the pending `g`. */
+  it("g t posts next and g Shift T posts prev; a bare Shift keeps the pending g", () => {
+    const { container } = started();
+    sendTable({ ...TABLE, bindings: [...TABLE.bindings, binding(["g", "t"], "tab.next"), binding(["g", "T"], "tab.prev")] });
+    act(() => root(container).focus());
+    press("g");
+    press("t");
+    expect(tabVerbsPosted()).toEqual(["next"]);
+    posted.length = 0;
+    press("g");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Shift", shiftKey: true });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "T", shiftKey: true });
+    expect(tabVerbsPosted()).toEqual(["prev"]);
+    posted.length = 0;
+    // `gg` is still the fixed jump, not a table key.
+    press("g");
+    press("g");
+    expect(tabVerbsPosted()).toEqual([]);
   });
 
   it("Space with the Approve button focused starts no sequence, and no longer activates it (v1 S5)", () => {
@@ -3057,6 +3127,42 @@ describe("App handoff to a terminal", () => {
     expect(container.querySelector("pre.handoff-command")).toBeNull();
   });
 
+  /** v1 polish item 6: a resumed session whose sidecar stops before any new turn keeps its
+   *  transcript on screen, as a lost session naming the sidecar, across a switch away and back;
+   *  `r` (the tab no longer failed) lets it go. */
+  it("keeps a conversation on screen when its sidecar stops, and says so", () => {
+    const inner =
+      "the connection to the provider ended before this session did, so anything after this point never arrived and the reply above may be incomplete (the provider closed the event stream)";
+    const message = `the session ended before it started (${inner}). If you were continuing a previous conversation, it most likely no longer exists -- start a new session instead.`;
+    const { container } = conversation({ transcript: [{ seq: 1, text: "restored reply" }] });
+    dispatch({ kind: "error", tab: 1, message });
+    const failed = { ...LIVE_TAB, state: "failed", failure: message } as const;
+    const other = { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" } as const;
+    dispatch({ kind: "tabs", active: 1, tabs: [failed, other] });
+    const shown = () => container.textContent ?? "";
+    expect(container.querySelector(".empty-tab")).toBeNull();
+    expect(shown()).toContain("restored reply");
+    expect(shown()).toContain("The agent sidecar stopped.");
+    expect(shown()).not.toContain("most likely no longer exists");
+    expect(container.querySelector(".fatal-error")).toBeNull();
+    dispatch({ kind: "tabs", active: 2, tabs: [failed, other] });
+    expect(shown()).not.toContain("restored reply");
+    dispatch({ kind: "tabs", active: 1, tabs: [failed, other] });
+    expect(shown()).toContain("restored reply");
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }, other] });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    expect(shown()).not.toContain("restored reply");
+  });
+
+  it("still fails the ordinary way when nothing was said before the sidecar stopped", () => {
+    const { container } = conversation({});
+    const message = "the connection to the provider ended before this session did (x)";
+    dispatch({ kind: "error", tab: 1, message });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: message }] });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    expect(container.textContent).toContain("The agent sidecar stopped.");
+  });
+
   /* A stored session that is NOT the one handed over is untouched -- suppressing every offer would
      hide a conversation nobody gave away. */
   it("leaves an unrelated stored session on offer", () => {
@@ -3393,7 +3499,7 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     enterInputMode(container);
     act(() => dispatch({ kind: "open_keymap" }));
     expect(overlay(container)).not.toBeNull();
-    expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.textContent).toBe("BROWSE");
+    expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("browse");
   });
 
   /** Panel round 2 (spec §7) gave the empty tab a `? Keys` item and `?` on an empty draft, so the
@@ -3925,7 +4031,7 @@ describe("P1: the keys land on a card that waits", () => {
   it("Ctrl+l (arrive) with a card waiting lands in BROWSE on it, not in the composer", () => {
     const { container } = oneCard();
     dispatch({ kind: "arrive" });
-    expect(container.querySelector("[data-testid=mode-block]")!.textContent).toBe("BROWSE");
+    expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("browse");
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
@@ -3958,7 +4064,7 @@ describe("P1: the keys land on a card that waits", () => {
       kind: "events", tab: 1, fromRevision: 1, throughRevision: 2,
       events: [{ type: "permission_requested", permission_id: "p", tool_use_id: null, tool_name: "Bash", input: { command: "rm x" } }],
     });
-    expect(container.querySelector("[data-testid=mode-block]")!.textContent).toBe("INPUT");
+    expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("input");
     expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, then a / d");
   });
 
@@ -3994,7 +4100,7 @@ describe("the first message from the empty tab (the phase-3 GUI pass, 2026-09-25
     fireEvent.change(box, { target: { value: "count to 40" } });
     fireEvent.keyDown(box, { key: "Enter" });
     dispatchLiveTab(snapshotState({ activeTurnId: "t1", userPrompts: [{ seq: 1, text: "count to 40" }] }), 1);
-    expect(container.querySelector("[data-testid=mode-block]")!.textContent).toBe("INPUT");
+    expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("input");
     expect(document.activeElement?.tagName).toBe("TEXTAREA");
   });
 });
@@ -4324,15 +4430,15 @@ describe("P2 runs and R3 the detailed view", () => {
     expect(container.querySelector(".row-tool-run")!.textContent).toContain("Read ×2 · Bash ×1");
     fireEvent.keyDown(root, { key: "Enter" });
     expect(container.querySelectorAll(".row-tool")).toHaveLength(3);
-    expect(container.querySelectorAll(".tool-result-folded")).toHaveLength(3);
+    expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(3);
     fireEvent.keyDown(root, { key: "o", ctrlKey: true });
-    expect(container.querySelectorAll(".tool-result-folded")).toHaveLength(0);
+    expect(container.querySelectorAll('[data-folded="true"]')).toHaveLength(0);
     dispatch({ kind: "tabs", active: 2, tabs: two });
     dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
     dispatch({ kind: "tabs", active: 1, tabs: two });
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 5, state });
     expect(container.querySelectorAll(".row-tool")).toHaveLength(3);
-    expect(container.querySelectorAll(".tool-result-folded"), "the detailed view is the tab's own").toHaveLength(0);
+    expect(container.querySelectorAll('[data-folded="true"]'), "the detailed view is the tab's own").toHaveLength(0);
   });
 });
 
@@ -4561,7 +4667,7 @@ describe("takes the keys", () => {
     dispatch({ kind: "enter_input" });
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector(".chooser")).not.toBeNull();
-    expect(modeBlock(container).textContent).toBe("BROWSE");
+    expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
   it("c2. chooser open over an empty tab: enter_input never opens a textarea under it", () => {

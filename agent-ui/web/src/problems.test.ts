@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { classify } from "./problems";
+import { classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
+import watchRs from "../../../agent/src/providers/claude_sidecar/watch.rs?raw";
+import agentPanelRs from "../../../shell/src/agent_panel.rs?raw";
 import cliMissingFixture from "./fixtures/problems/cli-missing.txt?raw";
 import cliOutOfRangeFixture from "./fixtures/problems/cli-out-of-range.txt?raw";
 import notLoggedInFixture from "./fixtures/problems/not-logged-in.txt?raw";
@@ -105,5 +107,50 @@ describe("classify (spec §10.2)", () => {
       "claude CLI version 2.1.283 is inside this sidecar's supported range (>=2.1.252 <3.0.0) but " +
       "untested against it (tested: 2.1.267, 2.1.252, 2.1.270)";
     expect(classify(text)).toBeNull();
+  });
+});
+
+/** v1 polish item 6: a resumed sidecar session whose sidecar stops before any new turn. The inner
+ *  reason is `stream_ended_early_reason`'s; the wrapper is `shell`'s "never opened" guess. */
+describe("a sidecar that stopped under a session", () => {
+  const INNER =
+    "the connection to the provider ended before this session did, so anything after this point never arrived and the reply above may be incomplete (the provider closed the event stream)";
+  const WRAPPED = `the session ended before it started (${INNER}). If you were continuing a previous conversation, it most likely no longer exists -- start a new session instead.`;
+
+  it("is classified as the sidecar stopping, wrapped or not, and says the record is kept", () => {
+    for (const text of [INNER, WRAPPED]) {
+      expect(sidecarStopped(text)).toBe(true);
+      const problem = classify(text)!;
+      expect(problem.headline).toBe("The agent sidecar stopped.");
+      expect(problem.remedy).toContain("session list");
+    }
+  });
+
+  it("shows the provider's own reason, not the wrapper's guess", () => {
+    expect(neverOpenedReason(WRAPPED)).toBe(INNER);
+    expect(failureEvidence(WRAPPED)).toBe(INNER);
+    expect(failureEvidence(INNER)).toBe(INNER);
+    // Any other never-opened reason keeps the whole text: only a stopped sidecar is known to make
+    // the guess wrong.
+    const other = "the session ended before it started (claude exited 1). If you were continuing a previous conversation, it most likely no longer exists -- start a new session instead.";
+    expect(failureEvidence(other)).toBe(other);
+    expect(classify(other)).toBeNull();
+  });
+
+  // Pins the marker against the Rust that writes it, the same way the sidecar-missing test above does.
+  it("matches watch.rs's own wording", () => {
+    expect(watchRs.replace(/\s+\\?\n\s*/g, " ")).toContain("the connection to the provider ended before this session did");
+  });
+
+  // And the wrapper against the `shell` code that writes it (`report_sessions_that_never_opened`):
+  // if its wording drifts, `failureEvidence` silently stops unwrapping and the guess is shown again.
+  // Added by the local review of the cloud session's work (2026-09-27).
+  it("unwraps exactly what agent_panel.rs's never-opened format! writes", () => {
+    const source = agentPanelRs.replace(/\\\n\s*/g, "");
+    const literal = /"(the session ended before it started \(\{reason\}\)[^"]*)"/.exec(source);
+    expect(literal).not.toBeNull();
+    const written = literal![1].replace("{reason}", INNER);
+    expect(neverOpenedReason(written)).toBe(INNER);
+    expect(failureEvidence(written)).toBe(INNER);
   });
 });

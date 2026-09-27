@@ -126,7 +126,9 @@ it("carries no data-nav-stop -- j/k never land here, only click/leader/prefix re
 it("before any measurement (Review Focus 3), only mode and pill show -- no crash on an unmounted ref", () => {
   const { container } = render(<StatusBand facts={RUNNING} paneFocused={false} />);
   const mode = container.querySelector<HTMLElement>('[data-testid="mode-block"]')!;
-  expect(mode.textContent).toBe("INPUT");
+  // v1 polish F24: no mode word while the pane lacks the keys; the block itself stays, dim.
+  expect(mode.textContent).toBe("");
+  expect(mode.dataset.mode).toBe("input");
   expect(mode.dataset.focused).toBe("false");
   expect(container.querySelector(".mode-pill")).not.toBeNull();
   expect(container.querySelector(".band-warn")).toBeNull();

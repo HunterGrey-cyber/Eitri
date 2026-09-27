@@ -55,6 +55,17 @@ function renderChooser(over: Record<string, unknown> = {}) {
 }
 
 describe("Chooser", () => {
+  /** v1 polish item 8: a tab holding cards read `⚑ · idle`. */
+  it("an open tab with waiting cards reads ⚑N waiting, not idle", () => {
+    const waiting = { ...TAB1, marker: "needs_input" as const, pending: 2 };
+    const { container } = renderChooser({
+      tabs: [waiting, TAB2],
+      envelope: { ...ENVELOPE, open: [{ ...ENVELOPE.open[0], marker: "needs_input", pending: 2 }, ENVELOPE.open[1]] },
+    });
+    const right = [...container.querySelectorAll(".chooser-right")].map((n) => n.textContent);
+    expect(right).toContain("⚑2 waiting");
+    expect(right.join("|")).not.toContain("⚑2 · idle");
+  });
   it("takes the keys when it opens; j/k move onto an open tab and Enter switches to it", () => {
     const { root, props } = renderChooser();
     expect(root.contains(document.activeElement)).toBe(true);

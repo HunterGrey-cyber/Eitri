@@ -15,6 +15,7 @@ import {
   truncateResult,
 } from "./toolRegistry";
 import type { ToolCallRecord } from "./types";
+import { ProjectDirContext } from "./projectPath";
 import policyRs from "../../../agent/src/permission_policy.rs?raw";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered. Without
@@ -32,6 +33,32 @@ describe("renderToolCall", () => {
   it("renders a registered tool (Bash) using its own config", () => {
     render(<>{renderToolCall(call({ name: "Bash", input: { command: "echo hi" } }))}</>);
     expect(screen.getByText(/echo hi/)).toBeTruthy();
+  });
+
+  it("names the saved rule that allowed a call, and says nothing of the kind otherwise (F18)", () => {
+    const { container } = render(<>{renderToolCall(call({ allowedByRule: "Bash(echo *)" }))}</>);
+    expect(container.querySelector(".tool-rule-note")?.textContent).toBe("allowed by rule Bash(echo *)");
+    cleanup();
+    const plain = render(<>{renderToolCall(call({}))}</>);
+    expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
+  });
+
+  /** v1 polish F21: a path under the project root is drawn relative, one outside it absolute; the
+   *  click/`gf` target stays the path as sent. A folded result draws no line of its own. */
+  it("draws project paths relative, keeps others absolute, and folds without a lone marker line", () => {
+    const { container } = render(
+      <ProjectDirContext.Provider value="/w/proj">
+        {renderToolCall(call({ name: "Read", input: { file_path: "/w/proj/src/a.rs" }, result: { content: "x", isError: false } }), false)}
+        {renderToolCall(call({ toolUseId: "toolu_2", name: "Read", input: { file_path: "/etc/hosts" } }))}
+        {renderToolCall(call({ toolUseId: "toolu_3", name: "Write", input: { file_path: "/w/proj/b.txt", content: "hi" } }))}
+      </ProjectDirContext.Provider>,
+    );
+    const links = [...container.querySelectorAll(".path-link")];
+    expect(links.map((l) => l.textContent)).toEqual(["src/a.rs", "/etc/hosts", "b.txt"]);
+    expect(links.map((l) => l.getAttribute("data-path"))).toEqual(["/w/proj/src/a.rs", "/etc/hosts", "/w/proj/b.txt"]);
+    const folded = container.querySelector('[data-folded="true"]')!;
+    expect(folded.textContent).not.toContain("▸");
+    expect(folded.querySelector(".tool-result")).toBeNull();
   });
 
   it("special-cases Skill as a one-line 'used skill' summary", () => {
@@ -259,12 +286,12 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect(out).not.toContain("tool-result");
   });
 
-  it("never says Unrecognized, and folds a result behind ▸", () => {
+  it("never says Unrecognized, and folds a result away with no marker line (v1 polish F21)", () => {
     const out = html(renderToolCall({ seq: 1, toolUseId: "t", name: "mcp__x__y", input: { name: "z" }, result: { content: "r", isError: false } }, false));
     expect(out).not.toContain("Unrecognized");
     expect(out).toContain("mcp__x__y");
-    expect(out).toContain('aria-label="result folded"');
-    expect(out).toContain("▸");
+    expect(out).toContain('data-folded="true"');
+    expect(out).not.toContain("▸");
     expect(out).not.toContain("Enter to expand");
   });
 

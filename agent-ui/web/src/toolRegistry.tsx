@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { ToolCallRecord } from "./types";
 import { editPreview } from "./diff";
 import { EditDiff } from "./components/EditDiff";
+import { useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
   label: string;
@@ -20,7 +21,7 @@ export type ToolRenderConfig = {
    *
    * `opts.expanded` is P3's own addition: `editConfig` folds a diff to 6 lines when it is `false`
    * and shows the whole thing when it is `true`, which is the only renderer today that reads it. */
-  renderInvocation: (input: unknown, opts: { expanded: boolean }) => ReactNode;
+  renderInvocation: (input: unknown, opts: { expanded: boolean; createsFile?: boolean }) => ReactNode;
 };
 
 /** How much of a tool result is rendered inline, head and tail respectively.
@@ -157,13 +158,13 @@ function pathOf(input: unknown, key: string): string {
 }
 
 /** N2: a path rendered where `gf`/a click can reach it (`MessageList`'s `onClick`, `paths.ts`'s
- *  `pathsIn`). `data-path` carries the raw string a click reads back, separately from whatever text
- *  transform (if any) the visible label goes through -- there is none today, but the two are kept
- *  apart on purpose rather than relying on `textContent` matching `data-path` by coincidence. */
+ *  `pathsIn`). `data-path` carries the raw string a click reads back, separately from the visible
+ *  label, which is project-relative under the project root since v1 polish F21 -- the two were kept
+ *  apart on purpose so that transform could not break what a click opens. */
 function PathLink({ path }: { path: string }) {
   return (
     <span className="path-link" data-path={path}>
-      {path}
+      {useProjectRelative(path)}
     </span>
   );
 }
@@ -201,7 +202,7 @@ function oneLine(label: string): ToolRenderConfig {
 function editConfig(label: string): ToolRenderConfig {
   return {
     label,
-    renderInvocation: (input, { expanded }) => {
+    renderInvocation: (input, { expanded, createsFile }) => {
       const preview = editPreview(label === "Write file" ? "Write" : "Edit", input);
       if (preview === null)
         return (
@@ -209,7 +210,7 @@ function editConfig(label: string): ToolRenderConfig {
             {label}: <PathLink path={pathOf(input, "file_path")} />
           </div>
         );
-      return <EditDiff preview={preview} maxLines={expanded ? undefined : 6} />;
+      return <EditDiff preview={preview} maxLines={expanded ? undefined : 6} createsFile={createsFile} />;
     },
   };
 }
@@ -353,7 +354,7 @@ export function renderToolCall(
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : config ? (
-    config.renderInvocation(call.input, { expanded: opts.expanded ?? showResult })
+    config.renderInvocation(call.input, { expanded: opts.expanded ?? showResult, createsFile: call.createsFile })
   ) : (
     // Generic fallback for unrecognized tools -- never "Unrecognized" (P2): a name and a one-line
     // summary of its input is honest, where that word reads as an error the panel hit.
@@ -379,16 +380,24 @@ export function renderToolCall(
   // FINISHED call, which is also why the default `showResult = true` reproduces the pre-fold
   // behaviour exactly: `call.result === null || showResult` is then always true. The detailed view
   // (R3) never folds either, whatever the row's own expansion says.
+  // A folded result draws nothing (v1 polish F21): it used to be a line holding only `▸`, under every
+  // finished call. `data-folded` says so for `Enter` and for tests; the row itself is the handle, as
+  // a closed fold in vim is its one line and nothing more.
+  // v1 polish F18: a call a saved prefix rule answered says so, muted, under its invocation -- it
+  // otherwise looked exactly like one the user approved. Claude Code names the rule the same way
+  // (`Bash(git log *)`, its own permission-rule syntax).
+  const ruleNote =
+    call.allowedByRule === undefined ? null : (
+      <div className="tool-rule-note">
+        allowed by rule <code>{call.allowedByRule}</code>
+      </div>
+    );
+  const shown = call.result === null || showResult || opts.detailed === true;
   return (
-    <div className="tool-call" data-tool-name={call.name}>
+    <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
       {invocation}
-      {call.result === null || showResult || opts.detailed ? (
-        <ToolResult result={call.result} detailed={opts.detailed === true} />
-      ) : (
-        <div className="tool-result-folded" aria-label="result folded">
-          ▸
-        </div>
-      )}
+      {ruleNote}
+      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} />}
     </div>
   );
 }
