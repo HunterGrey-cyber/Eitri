@@ -1719,6 +1719,30 @@ fn spawn_connect(
     result_rx
 }
 
+/// `agent-ui/web/src/problems.ts`'s own `SIDECAR_STOPPED_MARKER`, matched the same way (a plain
+/// substring check) and pinned to the same source: `stream_ended_early_reason`'s opening sentence
+/// in `agent/src/providers/claude_sidecar/watch.rs` -- see
+/// `the_sidecar_stopped_marker_is_pinned_to_watch_rs` below. A `reason` carrying this means the
+/// provider's event stream ended under a session that really was open, which is not what
+/// `never_opened_message` below guesses for every other reason.
+const SIDECAR_STOPPED_MARKER: &str = "the connection to the provider ended before this session did";
+
+/// Builds the text `report_sessions_that_never_opened` shows for a `reason`, without a live tab.
+/// A resumed sidecar reports itself open only on its first new turn because attaching
+/// does not replay `SessionReady`. If it stops before then, it reaches this path even
+/// though the conversation and transcript still exist. Give stopped-sidecar reasons
+/// their own wording without the generic guess that the session no longer exists.
+fn never_opened_message(reason: &str) -> String {
+    if reason.contains(SIDECAR_STOPPED_MARKER) {
+        format!("the agent sidecar stopped ({reason})")
+    } else {
+        format!(
+            "the session ended before it started ({reason}). If you were continuing a previous \
+             conversation, it most likely no longer exists -- start a new session instead."
+        )
+    }
+}
+
 /// A session that reached a terminal state without ever opening never worked, and must not be
 /// left on screen as an empty conversation the user cannot act on. Checked for every tab.
 ///
@@ -1737,7 +1761,8 @@ fn spawn_connect(
 /// on stderr with nowhere for this banner to recover it from. `agent::session`'s translation of
 /// `AgentEvent::ProcessExited` now folds the child's own retained stderr tail into
 /// `SessionUnavailable.reason` itself (see `agent/src/session.rs`), so `reason` below is already
-/// the specific one when the provider produced any stderr at all before dying.
+/// the specific one when the provider produced any stderr at all before dying. See
+/// `never_opened_message` for the one exception to the guess it otherwise wraps `reason` in.
 fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webview: &WebView) {
     let failed: Vec<(TabId, String)> = {
         let state_ref = state.borrow();
@@ -1750,10 +1775,7 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, webvi
             .collect()
     };
     for (tab, reason) in failed {
-        let message = format!(
-            "the session ended before it started ({reason}). If you were continuing a previous \
-             conversation, it most likely no longer exists -- start a new session instead."
-        );
+        let message = never_opened_message(&reason);
         eprintln!("[agent_panel] tab {}: {message}", tab.0);
         let (dead, active) = {
             let mut state_ref = state.borrow_mut();
@@ -3069,6 +3091,49 @@ mod tests {
     use neovibe_core::tab_set::{TabBackend, TabSet};
     use neovibe_core::tabs::TabId;
     use neovibe_core::test_providers::RecordingProvider;
+
+    /// Pins `SIDECAR_STOPPED_MARKER` against the Rust that actually produces it, the same way
+    /// `agent-ui/web/src/problems.test.ts`'s own "matches watch.rs's own wording" test pins the
+    /// frontend's copy: if `stream_ended_early_reason`'s opening sentence ever drifts, this fails
+    /// loudly instead of `never_opened_message` silently going back to guessing on every stopped
+    /// sidecar. The marker sits entirely on `stream_ended_early_reason`'s first source line, before
+    /// its `\`-continuation, so no line-join normalisation is needed here (contrast the vitest
+    /// test, which normalises defensively).
+    #[test]
+    fn the_sidecar_stopped_marker_is_pinned_to_watch_rs() {
+        let watch_rs = include_str!("../../agent/src/providers/claude_sidecar/watch.rs");
+        assert!(
+            watch_rs.contains(SIDECAR_STOPPED_MARKER),
+            "watch.rs's stream_ended_early_reason no longer contains {SIDECAR_STOPPED_MARKER:?}"
+        );
+    }
+
+    /// Checks that a stopped-sidecar reason keeps its own wording without the guess that
+    /// the session no longer exists. A stopped connection does not imply the conversation
+    /// or its transcript is gone.
+    #[test]
+    fn a_stopped_sidecar_reason_gets_no_never_opened_guess() {
+        let reason = format!(
+            "{SIDECAR_STOPPED_MARKER}, so anything after this point never arrived and the reply \
+             above may be incomplete (stream closed)"
+        );
+        let message = never_opened_message(&reason);
+        assert!(message.contains("the agent sidecar stopped"), "{message}");
+        assert!(message.contains(&reason), "{message}");
+        assert!(!message.contains("most likely no longer exists"), "{message}");
+        assert!(!message.contains("start a new session instead"), "{message}");
+    }
+
+    /// The unwrapped counterpart: every other `reason` keeps the generic guess unchanged, so a
+    /// session that really never opened still tells the reader to start over.
+    #[test]
+    fn a_generic_reason_keeps_the_never_opened_guess() {
+        let reason = "provider process exited unexpectedly";
+        let message = never_opened_message(reason);
+        assert!(message.contains(reason), "{message}");
+        assert!(message.contains("most likely no longer exists"), "{message}");
+        assert!(message.contains("start a new session instead"), "{message}");
+    }
 
     /// GUI pass, 2026-09-25: every `y` in the panel (a row, a code block, the handoff command, the
     /// `prefix i` popover's line) calls `navigator.clipboard.writeText`, and none of them ever

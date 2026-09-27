@@ -145,4 +145,21 @@ describe("a sidecar that stopped under a session", () => {
     expect(neverOpenedReason(written)).toBe(INNER);
     expect(failureEvidence(written)).toBe(INNER);
   });
+
+  // `never_opened_message` gives a stopped sidecar its own literal without the missing-session guess.
+  // Read that literal from `agent_panel.rs`, substitute a real INNER, and check that classification
+  // reports the stopped sidecar while preserving the evidence without the wrapper guess.
+  it("shell's own never-opened-message literal for a stopped sidecar carries no guess", () => {
+    const source = agentPanelRs.replace(/\\\n\s*/g, "");
+    const literal = /"(the agent sidecar stopped \(\{reason\}\)[^"]*)"/.exec(source);
+    expect(literal).not.toBeNull();
+    const written = literal![1].replace("{reason}", INNER);
+    // Not the wrapped shape any more, so neverOpenedReason must NOT unwrap it -- there is nothing
+    // to unwrap: failureEvidence returns it whole, exactly as `never hide the evidence` requires.
+    expect(neverOpenedReason(written)).toBeNull();
+    expect(failureEvidence(written)).toBe(written);
+    expect(written).not.toContain("most likely no longer exists");
+    const problem = classify(written)!;
+    expect(problem.headline).toBe("The agent sidecar stopped.");
+  });
 });
