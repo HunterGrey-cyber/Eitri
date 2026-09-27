@@ -965,6 +965,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let show_on_screen = show_on_screen.clone();
         let place_and_arrive = place_and_arrive.clone();
         let app_name = top_bar.app_name.clone();
+        let toast = toast.clone();
         Rc::new(move |id, action| {
             println!("[modules] {id}: {action:?}");
             let result = match action {
@@ -975,7 +976,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 KeyAction::Hide => grid.hide_module(id, &*focus_module),
             };
             if let Err(err) = result {
-                refuse(&app_name, &err);
+                refuse(&app_name, &toast, &err);
             }
         })
     };
@@ -1272,6 +1273,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let focus_module = focus_module.clone();
         let show_on_screen = show_on_screen.clone();
         let refused_name = top_bar.app_name.clone();
+        let toast = toast.clone();
         Rc::new(move |tab_action: TabAction| {
             let chat = ModuleId::agent();
             let keys_in = pane_focus::focused_module(&window, &grid.hosts())
@@ -1281,7 +1283,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             let plan = tab_verbs::plan(tab_action, keys_in, 1);
             if plan.takes_the_keys {
                 if let Err(err) = show_on_screen(&chat) {
-                    refuse(&refused_name, &err);
+                    refuse(&refused_name, &toast, &err);
                     return;
                 }
                 focus_module(&chat);
@@ -1373,6 +1375,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let kill_prompt = kill_prompt.clone();
         let kill_title = module_title.clone();
         let kill_refused = top_bar.app_name.clone();
+        let toast = toast.clone();
         prefix::install(
             &window,
             keymap.clone(),
@@ -1381,7 +1384,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 let action = match command {
                     prefix::PrefixCommand::Place { module, axis } => {
                         if let Err(err) = place_and_arrive(&module, axis) {
-                            refuse(&refused_name, &err);
+                            refuse(&refused_name, &toast, &err);
                         }
                         return;
                     }
@@ -1435,7 +1438,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                                 }
                                 terminal::ToggleStep::Hide => {
                                     if let Err(err) = grid.hide_module(&id, &*focus_module) {
-                                        refuse(&refused_name, &err);
+                                        refuse(&refused_name, &toast, &err);
                                     }
                                 }
                             }
@@ -1458,7 +1461,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         let scope = match neovibe_core::layout::can_kill(&module_layout.borrow(), &id) {
                             Ok(scope) => scope,
                             Err(err) => {
-                                refuse(&refused_name, &err);
+                                refuse(&refused_name, &toast, &err);
                                 return;
                             }
                         };
@@ -1502,7 +1505,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     Action::PanelKeymap => {
                         let chat = ModuleId::agent();
                         if let Err(err) = show_on_screen(&chat) {
-                            refuse(&refused_name, &err);
+                            refuse(&refused_name, &toast, &err);
                             return;
                         }
                         focus_module(&chat);
@@ -1934,14 +1937,30 @@ fn flash(app_name: &gtk4::Label) {
     }
 }
 
-/// A layout verb the layout refused -- the last module on screen hidden, a module placed next to
-/// itself: said on stdout, and the top bar's app name shows the prefix indicator's block for
-/// [`REFUSAL_FLASH`]. Its own class, so a prefix armed meanwhile keeps its indicator. A
-/// second refusal inside the flash restarts it rather than being cut short by the first one's timer
-///. One window per process (`NON_UNIQUE`), so one timer per thread.
-fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
+/// Toast text for an editor that cannot reopen because `Reopen::Never` remains in effect for
+/// this window. Returns `Some` only for `LayoutError::Gone` on the editor, so another module
+/// marked gone cannot inherit an editor-specific message.
+fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
+    match err {
+        LayoutError::Gone(id) if *id == ModuleId::editor() => Some(
+            "the editor was closed (:qa or prefix x) and nvim cannot restart in this window \
+             \u{2014} relaunch neovibe to get it back"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Logs a refused layout operation and flashes the top bar's app name for `REFUSAL_FLASH`. A
+/// separate CSS class preserves the prefix indicator if it is armed meanwhile. Another refusal
+/// restarts the flash timer. There is one window per process (`NON_UNIQUE`), so one timer per
+/// thread suffices. A killed editor's `Gone` error also shows a toast.
+fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
     println!("[modules] refused: {err}");
     flash(app_name);
+    if let Some(text) = gone_editor_toast_text(err) {
+        toast.show(&text);
+    }
 }
 
 /// C1's decision, in Rust: only `Ctrl+j` (`Direction::Down`) while the panel's
@@ -2190,5 +2209,24 @@ mod tests {
                 assert_eq!(claims(mirror, dir), expected, "{dir:?} + {mirror:?}");
             }
         }
+    }
+
+    /// `refuse` shows this toast for a killed editor. Other refusals add no toast and keep only the
+    /// flash and stdout message.
+    #[test]
+    fn the_gone_editor_toast_text_matches_the_spec() {
+        assert_eq!(
+            gone_editor_toast_text(&LayoutError::Gone(ModuleId::editor())),
+            Some(
+                "the editor was closed (:qa or prefix x) and nvim cannot restart in this window \
+                 \u{2014} relaunch neovibe to get it back"
+                    .to_string()
+            )
+        );
+        assert_eq!(gone_editor_toast_text(&LayoutError::Gone(ModuleId::agent())), None);
+        assert_eq!(
+            gone_editor_toast_text(&LayoutError::LastVisible(ModuleId::editor())),
+            None
+        );
     }
 }
