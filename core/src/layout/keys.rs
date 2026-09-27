@@ -1,5 +1,7 @@
 //! Keys after `Ctrl+a` select modules: `e` the editor, `a` the agent, `t` the terminal,
 //! and each Lua panel's own `key`. `v` is reserved for the canvas until it is available.
+//! It is unbound in the prefix table but still refused to Lua panels with
+//! `KeyError::Reserved` ([`RESERVED_FOR_CANVAS`]).
 //!
 //! A Lua panel's key is checked against the effective keymap after `init.lua` and against
 //! stock tmux's prefix bindings (`crate::keymap::stock`). This prevents a panel from
@@ -29,6 +31,10 @@ const BUILT_IN: [(char, fn() -> ModuleId); 3] = [
 /// The Shift of each built-in module key, the canvas's `v` included: what the prefix reads as that
 /// key after a split key (this module's doc).
 pub const BUILT_IN_CAPITALS: [char; 4] = ['E', 'A', 'T', 'V'];
+
+/// `v` stays free of the prefix table and every Lua panel so the canvas can use it
+/// without taking a key from an existing configuration.
+pub const RESERVED_FOR_CANVAS: char = 'v';
 
 /// Every module key this window answers to, in the order the prefix strip shows them: the built-ins,
 /// then each Lua panel's in registration order.
@@ -60,6 +66,8 @@ pub enum KeyError {
     Taken { panel: String, key: char, by: String },
     /// The capital of a built-in module's key ([`BUILT_IN_CAPITALS`]).
     ShiftOfBuiltIn { panel: String, key: char },
+    /// [`RESERVED_FOR_CANVAS`]: not bound today, but kept free for the canvas.
+    Reserved { panel: String, key: char },
 }
 
 impl fmt::Display for KeyError {
@@ -103,6 +111,10 @@ impl fmt::Display for KeyError {
                      after a split key neovibe reads it as '{lower}', {whose} key"
                 )
             }
+            KeyError::Reserved { panel, key } => write!(
+                f,
+                "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is reserved for the canvas"
+            ),
         }
     }
 }
@@ -144,6 +156,9 @@ impl ModuleKeys {
                     action: binding.action.name(),
                     source: binding.source,
                 });
+            }
+            if key == RESERVED_FOR_CANVAS {
+                return Err(KeyError::Reserved { panel, key });
             }
             if BUILT_IN_CAPITALS.contains(&key) {
                 return Err(KeyError::ShiftOfBuiltIn { panel, key });
@@ -348,10 +363,13 @@ mod tests {
 
     #[test]
     fn a_stock_tmux_key_neovibe_does_not_bind_stays_reserved() {
+        // `[` and `PPage` are bound to `copy-mode` and `copy-mode -u`, so Lua panels taking them fail
+        // `Bound`, not `StockTmux`.
+        // See `every_character_the_effective_table_binds_refuses_a_lua_panel`.
         for (key, command) in [
             ('s', "choose-tree"),
             ('o', "select-pane"),
-            ('[', "copy-mode"),
+            (']', "paste-buffer"),
             ('C', "customize-mode"),
         ] {
             let err = build_one(&key.to_string(), &Keymap::defaults()).unwrap_err();
@@ -403,6 +421,26 @@ mod tests {
             ModuleKeys::build(&[lua("one", Some("g")), lua("two", Some("G"))], &Keymap::defaults()).is_ok(),
             "a Lua pair is the user's to choose"
         );
+    }
+
+    /// `v` is unbound by default but still reserved for the canvas,
+    /// so a Lua panel cannot take it.
+    #[test]
+    fn a_lua_panel_keyed_v_is_refused_reserved_for_the_canvas() {
+        let keymap = Keymap::defaults();
+        assert!(
+            keymap.lookup(&KeySpec::parse("v").unwrap()).is_none(),
+            "v is unbound by default"
+        );
+        let err = build_one("v", &keymap).unwrap_err();
+        assert_eq!(
+            err,
+            KeyError::Reserved {
+                panel: "notes".into(),
+                key: 'v'
+            }
+        );
+        assert!(err.to_string().contains("reserved for the canvas"), "{err}");
     }
 
     #[test]

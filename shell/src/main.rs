@@ -1517,6 +1517,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     Action::Tab(tab_action) => run_tab_action(tab_action),
                     // The prefix never hands a split key back: it waits for a module key instead.
                     Action::Split(_) => {}
+                    // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
+                    // mode, only while it holds the keys -- elsewhere the same refusal shape as
+                    // every other misdirected prefix action (`Action::Module`, above).
+                    Action::CopyMode { up } => {
+                        if terminal::copy_mode_entry(focused().as_ref().map(ModuleId::kind)) {
+                            terminal.enter_copy_mode(up);
+                        } else {
+                            println!("[prefix] prefix [ scrolls the terminal");
+                            flash(&refused_name);
+                        }
+                    }
                 }
             },
             move |waiting| {

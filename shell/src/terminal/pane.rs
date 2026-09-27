@@ -68,7 +68,7 @@ use super::bell::{self, BellFlash};
 use super::gl::SkiaState;
 use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
 use super::input_queue::{InputQueue, PaneInput, PasteTicket};
-use super::keys::{self, ClipboardChord, DeliveredKeys, RawKey, RepeatTracker};
+use super::keys::{self, ClipboardChord, CopyModeKey, DeliveredKeys, RawKey, RepeatTracker};
 use super::pointer;
 use crate::wheel_zoom::WheelZoom;
 
@@ -126,6 +126,11 @@ struct State {
     /// Which button (if any) a drag or motion is holding, for the live mouse mode's own report
     ///. Reset on a restart: a button held across a restarted shell reports nothing new.
     reports: pointer::ReportTracker,
+    /// `prefix [`/`prefix PageUp` opened copy mode: `connect_keyboard` reads
+    /// this ahead of `scroll_chord`, so a copy-mode key never reaches the shell. Reset on exit or
+    /// restart (`forget_session`), the same as `cursor`/`last_selection` -- a shell that is gone or
+    /// about to be replaced holds nothing left to scroll back through.
+    copy_mode: bool,
     /// The last widget-relative pointer position: a wheel event carries no position of its
     /// own, so a report needs the last one the motion controller (or drag gesture) saw.
     last_pointer: (f64, f64),
@@ -158,6 +163,7 @@ impl State {
             last_selection: None,
             mouse: MouseModes::default(),
             reports: pointer::ReportTracker::default(),
+            copy_mode: false,
             last_pointer: (0.0, 0.0),
             colors: TerminalColors::default(),
             focused: false,
@@ -277,6 +283,24 @@ impl State {
         self.last_selection = None;
         self.mouse = MouseModes::default();
         self.reports = pointer::ReportTracker::default();
+        // Leave copy mode on exit or restart: the old session has no remaining scrollback to use.
+        self.copy_mode = false;
+    }
+
+    /// `prefix [`/`prefix PageUp`, once `main.rs` has already established this
+    /// pane holds the keys (`super::copy_mode_entry`): does nothing without a running shell -- a
+    /// prompt or a message frame with none holds no copy to scroll back through. `up` also asks for
+    /// one page up at once, the one difference between `prefix [` and `prefix PageUp`.
+    fn enter_copy_mode(&mut self, up: bool) {
+        if self.exited {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else { return };
+        session.send(SessionCommand::CopyMode(true));
+        if up {
+            session.send(SessionCommand::Scroll(ScrollRequest::Pages(1)));
+        }
+        self.copy_mode = true;
     }
 
     /// What [`pointer::route`]/[`pointer::wheel_route`] see: the live mode while a shell is running,
@@ -448,6 +472,12 @@ impl TerminalPane {
     pub(crate) fn send(&self, input: NormalizedInput) {
         discard_composition(&self.state, &self.im, &self.area);
         submit(&self.state, PaneInput::Key(input));
+    }
+
+    /// `prefix [`/`prefix PageUp`: `main.rs`'s own prefix arm calls this only
+    /// once `super::copy_mode_entry` has already said this pane holds the keys.
+    pub(crate) fn enter_copy_mode(&self, up: bool) {
+        self.state.borrow_mut().enter_copy_mode(up);
     }
 
     /// `f` runs when the shell ends by itself in a way that closes the module (`super::closes_on_exit`),
@@ -1235,6 +1265,25 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
             if state.borrow().exited {
                 if keys::restarts(keyval, modifier) {
                     restart(&state, &area, &im);
+                }
+                return glib::Propagation::Stop;
+            }
+            // Copy mode, ahead of `scroll_chord`: a copy-mode key never reaches
+            // the shell, whether or not it is also one of `scroll_chord`'s own bindings.
+            if state.borrow().copy_mode {
+                match keys::copy_mode_key(keyval, modifier) {
+                    CopyModeKey::Scroll(req) => {
+                        if let Some(session) = &state.borrow().session {
+                            session.send(SessionCommand::Scroll(req));
+                        }
+                    }
+                    CopyModeKey::Leave => {
+                        if let Some(session) = &state.borrow().session {
+                            session.send(SessionCommand::CopyMode(false));
+                        }
+                        state.borrow_mut().copy_mode = false;
+                    }
+                    CopyModeKey::Swallow => {}
                 }
                 return glib::Propagation::Stop;
             }

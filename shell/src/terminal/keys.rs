@@ -733,6 +733,47 @@ pub(crate) fn scroll_chord(keyval: GdkKey, state: ModifierType) -> Option<Scroll
     }
 }
 
+/// What one key does while copy mode is open: scroll the view, leave copy mode,
+/// or nothing at all -- a copy-mode key never reaches the shell (`connect_keyboard`, ahead of
+/// `scroll_chord`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyModeKey {
+    Scroll(ScrollRequest),
+    /// `q`, or `Esc` -- there is no selection feature yet to clear first.
+    Leave,
+    /// Swallows every unbound key, including plain letters and `Ctrl+b`/`Ctrl+f`.
+    /// `Ctrl+b` is the prefix, so neither vi page chord is bound here.
+    Swallow,
+}
+
+/// tmux `copy-mode`'s own key table (mode-keys vi), reduced to what phase 1 of copy mode needs: no
+/// selection, no search. `k`/`Up` and `j`/`Down` move one line; `Ctrl+u`/`Ctrl+d` half a screen;
+/// `PageUp`/`PageDown` a whole one; `g`/`G` jump to the oldest retained line or back to the live
+/// bottom (both stay in copy mode, unlike `q`/`Esc`).
+pub(crate) fn copy_mode_key(keyval: GdkKey, state: ModifierType) -> CopyModeKey {
+    let chord = ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
+    if state.intersects(chord) {
+        return CopyModeKey::Swallow;
+    }
+    if state.contains(ModifierType::CONTROL_MASK) {
+        return match keyval {
+            GdkKey::u => CopyModeKey::Scroll(ScrollRequest::HalfPages(1)),
+            GdkKey::d => CopyModeKey::Scroll(ScrollRequest::HalfPages(-1)),
+            _ => CopyModeKey::Swallow,
+        };
+    }
+    match keyval {
+        GdkKey::Escape | GdkKey::q => CopyModeKey::Leave,
+        GdkKey::k | GdkKey::Up => CopyModeKey::Scroll(ScrollRequest::Lines(1)),
+        GdkKey::j | GdkKey::Down => CopyModeKey::Scroll(ScrollRequest::Lines(-1)),
+        GdkKey::Page_Up | GdkKey::KP_Page_Up => CopyModeKey::Scroll(ScrollRequest::Pages(1)),
+        GdkKey::Page_Down | GdkKey::KP_Page_Down => CopyModeKey::Scroll(ScrollRequest::Pages(-1)),
+        GdkKey::g => CopyModeKey::Scroll(ScrollRequest::Lines(i32::MAX)),
+        GdkKey::G => CopyModeKey::Scroll(ScrollRequest::Bottom),
+        _ => CopyModeKey::Swallow,
+    }
+}
+
 #[cfg(test)]
 mod neovibe_tests {
     use super::*;
@@ -893,6 +934,83 @@ mod neovibe_tests {
             "Shift-only, unlike clipboard_chord's Ctrl+Shift pair"
         );
         assert_eq!(scroll_chord(GdkKey::a, shift), None, "not a scroll key at all");
+    }
+
+    /// Checks copy-mode bindings, deliberately unbound `Ctrl+b` and `Ctrl+f`, and a plain letter.
+    /// `Esc` leaves copy mode immediately because there is no selection to clear first.
+    #[test]
+    fn copy_mode_key_matches_every_row_of_the_table() {
+        let none = ModifierType::empty();
+        let ctrl = ModifierType::CONTROL_MASK;
+
+        assert_eq!(
+            copy_mode_key(GdkKey::k, none),
+            CopyModeKey::Scroll(ScrollRequest::Lines(1))
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::Up, none),
+            CopyModeKey::Scroll(ScrollRequest::Lines(1))
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::j, none),
+            CopyModeKey::Scroll(ScrollRequest::Lines(-1))
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::Down, none),
+            CopyModeKey::Scroll(ScrollRequest::Lines(-1))
+        );
+
+        assert_eq!(
+            copy_mode_key(GdkKey::u, ctrl),
+            CopyModeKey::Scroll(ScrollRequest::HalfPages(1))
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::d, ctrl),
+            CopyModeKey::Scroll(ScrollRequest::HalfPages(-1))
+        );
+
+        assert_eq!(
+            copy_mode_key(GdkKey::Page_Up, none),
+            CopyModeKey::Scroll(ScrollRequest::Pages(1))
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::Page_Down, none),
+            CopyModeKey::Scroll(ScrollRequest::Pages(-1))
+        );
+
+        assert_eq!(
+            copy_mode_key(GdkKey::g, none),
+            CopyModeKey::Scroll(ScrollRequest::Lines(i32::MAX)),
+            "the oldest retained line"
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::G, none),
+            CopyModeKey::Scroll(ScrollRequest::Bottom),
+            "back to the live bottom, still in copy mode"
+        );
+
+        assert_eq!(copy_mode_key(GdkKey::q, none), CopyModeKey::Leave);
+        assert_eq!(
+            copy_mode_key(GdkKey::Escape, none),
+            CopyModeKey::Leave,
+            "no selection feature yet: nothing to clear first"
+        );
+
+        assert_eq!(
+            copy_mode_key(GdkKey::b, ctrl),
+            CopyModeKey::Swallow,
+            "Ctrl+b is the prefix"
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::f, ctrl),
+            CopyModeKey::Swallow,
+            "Ctrl+f alone would be lopsided"
+        );
+        assert_eq!(
+            copy_mode_key(GdkKey::x, none),
+            CopyModeKey::Swallow,
+            "a plain letter with no binding"
+        );
     }
 
     #[test]

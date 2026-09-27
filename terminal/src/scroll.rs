@@ -18,8 +18,12 @@ pub enum ScrollRequest {
     Lines(i32),
     /// Move by whole screens (`rows` lines each) -- `Shift+PageUp`/`Shift+PageDown`, matching
     /// alacritty's own `ScrollPageUp`/`ScrollPageDown` (`screen_lines`) and foot's
-    /// `scrollback-up-page`/`scrollback-down-page`.
+    /// `scrollback-up-page`/`scrollback-down-page`; also copy mode's own `PageUp`/`PageDown`
+    ///.
     Pages(i32),
+    /// Move by half a screen (`rows / 2` lines, at least one) -- copy mode's `Ctrl+u`/`Ctrl+d`
+    ///. No other caller sends this yet.
+    HalfPages(i32),
     /// Return to the live bottom and end the pin -- `Shift+End`, foot's `scrollback-end`, and any
     /// typed key ([`crate::screen::Screen::note_input`]).
     Bottom,
@@ -56,6 +60,7 @@ impl ScrollView {
         let delta = match req {
             ScrollRequest::Lines(n) => n,
             ScrollRequest::Pages(n) => n.saturating_mul(rows),
+            ScrollRequest::HalfPages(n) => n.saturating_mul((rows / 2).max(1)),
             ScrollRequest::Bottom => unreachable!("handled above"),
         };
         // `unwrap_or(0)`: a request that arrives after the anchor was declared Gone starts a fresh
