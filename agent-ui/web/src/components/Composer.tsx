@@ -11,6 +11,7 @@ import {
 } from "../composerKeys";
 import type { HistoryWalk } from "../promptHistory";
 import { stepHistory } from "../promptHistory";
+import { heldBackSlashCommand, slashCommandFlashText } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
 
 /** A draft the host is putting back into the box after a send was refused.
@@ -130,6 +131,20 @@ export function Composer({
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
   const [searching, setSearching] = useState(false);
+  /* Show a held-back slash command's flash locally, since an overlay can hide the shared band.
+   *  Increment `seq` for each attempt so pressing Enter twice on the same text shows two flashes. */
+  const [slashFlash, setSlashFlash] = useState<{ text: string; seq: number } | null>(null);
+  const slashFlashSeq = useRef(0);
+  useEffect(() => {
+    if (slashFlash === null) return;
+    const seq = slashFlash.seq;
+    const timer = setTimeout(() => setSlashFlash((f) => (f?.seq === seq ? null : f)), 2000);
+    return () => clearTimeout(timer);
+  }, [slashFlash]);
+  function showSlashFlash(text: string) {
+    slashFlashSeq.current += 1;
+    setSlashFlash({ text, seq: slashFlashSeq.current });
+  }
 
   /* The box is cleared optimistically on send, because a round trip's worth of latency in a text
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
@@ -202,6 +217,14 @@ export function Composer({
   function submit(now: boolean) {
     if (disabled || editingInNvim) return;
     const body = text;
+    // Held-back slash commands are neither sent nor queued, including through send-now. This
+    // includes `/login`, `/config`, `/resume` and a bare `/model`. Keep the draft unchanged and
+    // show a flash naming the command.
+    const held = heldBackSlashCommand(body);
+    if (held !== null) {
+      showSlashFlash(slashCommandFlashText(held));
+      return;
+    }
     if (running) {
       if (now) onSendNow(body);
       else if (body.trim()) onQueue(body);
@@ -288,6 +311,11 @@ export function Composer({
         <p className="composer-closing" role="status">
           This conversation is being closed so it can continue in a terminal. Anything still in the
           box has <strong>not</strong> been sent, and is kept.
+        </p>
+      )}
+      {slashFlash !== null && (
+        <p className="composer-slash-flash" role="status">
+          {slashFlash.text}
         </p>
       )}
       {mode === "input" ? (

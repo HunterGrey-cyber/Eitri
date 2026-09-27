@@ -16,6 +16,7 @@ import { Row } from "./Row";
 import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
+import { classify } from "../problems";
 
 /** Below this width the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -134,6 +135,9 @@ export function EmptyTab(props: EmptyTabProps) {
   const arriveAtMount = useRef(props.arriveRequest);
   const starting = tab.state === "starting";
   const failed = tab.state === "failed";
+  // `null` means there is no failure or the classifier does not recognise it. The row then shows
+  // only the raw text.
+  const failureProblem = failed && failure !== null ? classify(failure, hello?.account ?? null) : null;
   const showDashboard = hello !== null && !starting && !failed;
   const prefix = props.prefix ?? "Ctrl+b";
   const [dashCursor, setDashCursor] = useState(0);
@@ -509,7 +513,7 @@ export function EmptyTab(props: EmptyTabProps) {
     <div className="empty-tab" tabIndex={0} onKeyDown={onKeyDown} ref={rootRef}>
       {handoff !== null && <HandoffCommandCard handoff={handoff} />}
       {failed && (
-        <Row kind="error" sign="✗" role="alert">
+        <Row kind="error" sign="✗" role="alert" problem={failureProblem}>
           <strong>This tab's session did not start.</strong>
           <pre>{failure ?? "no reason was given"}</pre>
           <div className="row-hint">Press r to start a new session here.</div>

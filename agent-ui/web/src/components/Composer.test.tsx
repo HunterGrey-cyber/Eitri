@@ -135,6 +135,84 @@ describe("Composer on a session that has ended", () => {
 
 /* The two halves of not eating a typed message: the box refuses while the conversation is closing
    and says so, and a send the host refused comes back. */
+/* A held-back slash command is never sent: keep the draft and show a local flash naming it.
+ *  `slashCommands.test.ts` covers classification; this checks that Enter calls
+ *  `heldBackSlashCommand` and renders the flash where `submit` puts it. */
+describe("Composer and slash commands (P10)", () => {
+  it("does not send a held-back command (/login), keeps the draft, and flashes", () => {
+    const { container, textarea, onSend } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "/login" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("/login");
+    expect(container.querySelector(".composer-slash-flash")!.textContent).toBe(
+      "/login does not work in neovibe — ? lists the ones that do",
+    );
+  });
+
+  it("holds back every interactive-only command the same way: /config, /resume, and /model with no argument", () => {
+    for (const command of ["/config", "/resume", "/model"]) {
+      const { textarea, onSend } = renderComposer();
+      fireEvent.change(textarea, { target: { value: command } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend, command).not.toHaveBeenCalled();
+      expect(textarea.value, command).toBe(command);
+      cleanup();
+    }
+  });
+
+  it("sends /model WITH an argument -- only the bare picker form is interactive-only", () => {
+    const { textarea, onSend } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "/model sonnet" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("/model sonnet");
+    expect(textarea.value).toBe("");
+  });
+
+  it("sends a command classed works (/compact)", () => {
+    const { textarea, onSend } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "/compact" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("/compact");
+    expect(textarea.value).toBe("");
+  });
+
+  it("sends an unknown slash command as today", () => {
+    const { textarea, onSend } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "/unknown-thing" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("/unknown-thing");
+    expect(textarea.value).toBe("");
+  });
+
+  it("never queues or sends-now a held-back command either", () => {
+    const onQueue = vi.fn();
+    const onSendNow = vi.fn();
+    const running = renderComposer({ running: true, onQueue, onSendNow });
+    fireEvent.change(running.textarea, { target: { value: "/login" } });
+    fireEvent.keyDown(running.textarea, { key: "Enter" });
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(running.textarea.value).toBe("/login");
+    cleanup();
+
+    const idle = renderComposer({ running: true, onQueue, onSendNow });
+    fireEvent.change(idle.textarea, { target: { value: "/login" } });
+    fireEvent.keyDown(idle.textarea, { key: "Enter", ctrlKey: true });
+    expect(onSendNow).not.toHaveBeenCalled();
+    expect(idle.textarea.value).toBe("/login");
+  });
+
+  it("flashes again on a second, identical refusal in a row", () => {
+    const { container, textarea } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "/login" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    const first = container.querySelector(".composer-slash-flash")!;
+    expect(first).not.toBeNull();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(container.querySelector(".composer-slash-flash")).not.toBeNull();
+  });
+});
+
 describe("Composer while the conversation is closing", () => {
   it("refuses to send, and explains rather than just going grey", () => {
     const { container, textarea, onSend } = renderComposer({ disabled: true, closing: true });

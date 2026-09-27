@@ -2,6 +2,7 @@ import { forwardRef } from "react";
 import { BROWSE_KEYS, INPUT_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
+import { worksSlashCommands } from "../slashCommands";
 
 type Props = {
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
@@ -92,12 +93,30 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
   );
 }
 
+/** Slash commands use a plain list because they are commands rather than keybindings. This also
+ *  keeps them out of key-table row counts. Names come from `../slashCommands` in table order.
+ *  `worksSlashCommands` includes `/model` and `/config` even though sending them is held back
+ *  separately. */
+function SlashCommands() {
+  return (
+    <section>
+      <h2>Slash commands</h2>
+      <ul>
+        {worksSlashCommands().map((name) => (
+          <li key={name}>
+            <code>/{name}</code>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 /**
- * The full `?` keymap: four groups, each a two-column table. The first two come from the one
- * source of truth `BROWSE_KEYS`/`INPUT_KEYS` in `./keymap`, so this list can neither promise a key
- * the panel does not have nor omit one it does. The last two, "Anywhere in the window" and "After
- * <prefix>", come from `shell`'s own `keymap` envelope, generated from the core crate's keymap:
- * nothing on this page can read what
+ * The full `?` keymap: the two key-table groups come from the one source of truth
+ * `BROWSE_KEYS`/`INPUT_KEYS` in `./keymap`, so this list can neither promise a key the panel does
+ * not have nor omit one it does. "Anywhere in the window" and "After <prefix>" come from `shell`'s
+ * own `keymap` envelope, generated from the core crate's keymap: nothing on this page can read what
  * GTK binds. It draws only; `App.tsx` decides when it is open, swallows every key while it is (so
  * `a`/`d` cannot reach a card hidden underneath) and scrolls it on `j`/`k` through the forwarded
  * ref. The one thing this component decides for itself is a click on its own backdrop, which also
@@ -143,6 +162,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           { keys: "Ctrl+j", what: "The module below" },
         ]}
       />
+      <SlashCommands />
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section title={`After ${prefixLabel}`} rows={prefixKeys} />
     </div>

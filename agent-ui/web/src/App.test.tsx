@@ -3168,7 +3168,7 @@ describe("App: the ? keymap overlay", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
   const overlay = (c: HTMLElement) => c.querySelector<HTMLElement>(".keymap-overlay");
 
-  it("opens on ? and shows all five groups, in the spec's order", () => {
+  it("opens on ? and shows all six groups, in the spec's order", () => {
     const { container } = started();
     act(() => root(container).focus());
     expect(overlay(container)).toBeNull();
@@ -3178,8 +3178,16 @@ describe("App: the ? keymap overlay", () => {
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    // "Leader and tab keys" sits between BROWSE and "Anywhere".
-    expect(titles).toEqual(["This panel", "Leader and tab keys", "Typing", "Anywhere in the window", "After Ctrl+b"]);
+    // "Leader and tab keys" sits between BROWSE and "Typing"; "Slash
+    // commands" sits between "Typing" and "Anywhere".
+    expect(titles).toEqual([
+      "This panel",
+      "Leader and tab keys",
+      "Typing",
+      "Slash commands",
+      "Anywhere in the window",
+      "After Ctrl+b",
+    ]);
   });
 
   it("shows the rows shell sent in its keymap envelope", () => {

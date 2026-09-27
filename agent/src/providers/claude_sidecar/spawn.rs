@@ -370,6 +370,22 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Builds the user-facing message when the sidecar cannot be found, including when the binary
+/// override names a path that is not a file. Reuse this text for the panel's failure message.
+/// `agent-ui/web/src/problems.ts::classify` matches the exact opening sentence and treats the
+/// remainder as the remedy. Changing that sentence requires updating the classifier's marker
+/// to preserve the panel's headline. `problems.test.ts` checks it directly from the Rust source.
+pub fn sidecar_missing_message(searched: &[PathBuf]) -> String {
+    let mut message = String::from("The agent sidecar is not installed. Looked for it at:\n");
+    for path in searched {
+        message.push_str(&format!("  - {}\n", path.display()));
+    }
+    message.push_str(&format!(
+        "Install the neovibe package that ships it ({PACKAGED_SIDECAR_BINARY}), or point NEOVIBE_SIDECAR_BINARY at a real one."
+    ));
+    message
+}
+
 /// The name a PACKAGED sidecar artifact is installed under, beside this binary.
 ///
 /// Versionless on purpose: Verdandi's release output carries its version and architecture in the
@@ -415,7 +431,7 @@ fn resolve_sidecar_program(
         if !path.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("NEOVIBE_SIDECAR_BINARY points at {path:?}, which is not a file"),
+                sidecar_missing_message(std::slice::from_ref(&path)),
             ));
         }
         return Ok(SidecarProgram::Packaged(path));
@@ -735,6 +751,23 @@ mod tests {
             .expect_err("a named artifact that is absent must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains("NEOVIBE_SIDECAR_BINARY"), "{err}");
+        // Keep the shared `sidecar_missing_message` opening sentence and the searched path in the
+        // error, so edits to the error path or message cannot silently remove either.
+        assert!(err.to_string().contains("The agent sidecar is not installed."), "{err}");
+        assert!(err.to_string().contains("/no/such/sidecar/binary"), "{err}");
+    }
+
+    /// The missing-sidecar message names every searched path and the package that supplies it.
+    /// The UI splits the text after the shared opening sentence into the displayed remedy.
+    #[test]
+    fn sidecar_missing_message_names_every_searched_path_and_the_package() {
+        let searched = [PathBuf::from("/a/b/sidecar"), PathBuf::from("/c/d/sidecar")];
+        let message = sidecar_missing_message(&searched);
+        assert!(message.starts_with("The agent sidecar is not installed."), "{message}");
+        assert!(message.contains("/a/b/sidecar"), "{message}");
+        assert!(message.contains("/c/d/sidecar"), "{message}");
+        assert!(message.contains(PACKAGED_SIDECAR_BINARY), "{message}");
+        assert!(message.contains("NEOVIBE_SIDECAR_BINARY"), "{message}");
     }
 
     /// A sibling artifact is used when nothing was named -- the shape a real install has, and the

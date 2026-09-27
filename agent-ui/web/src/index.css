@@ -798,6 +798,17 @@ body,
   color: var(--nv-fg);
   user-select: text;
 }
+/* `Row`'s own `problem` prop draws a headline (inherits `.row-body`'s own text
+   colour -- no `color:` here, so the guard above never has to look at it) and a remedy line ABOVE
+   whatever the row already rendered (`.row-error pre`'s raw text included, unchanged and below).
+   The remedy reads as secondary, the same `--nv-muted` `.row-hint` already uses for "press r". */
+.row-problem {
+  margin-bottom: 6px;
+}
+.row-problem-remedy {
+  color: var(--nv-muted);
+  margin-top: 2px;
+}
 /* An ordinary ending (the host closed it, the provider exited cleanly) -- deliberately NOT
    `row-error`. A clean end is not an error.
    Informational, not alarming -- styling this like a loss would train the eye to ignore the one
@@ -1039,6 +1050,17 @@ body,
    goes inert with no explanation reads as broken, and the specific thing a user needs told here is
    that whatever they had typed is still theirs. */
 .composer-closing {
+  flex: 0 0 100%;
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--nv-fg);
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
+}
+/* A held-back slash command's own local flash (`Composer.tsx`'s `slashFlash`),
+   same shape as `.composer-closing` just above -- transient rather than persistent, so it carries
+   no distinct colour of its own beyond the same `--nv-warn` border-only accent. */
+.composer-slash-flash {
   flex: 0 0 100%;
   margin: 0;
   font-size: var(--fs-sm);

@@ -5,6 +5,7 @@ import { KeymapOverlay } from "./KeymapOverlay";
 import { BROWSE_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS } from "../keymap";
 import type { KeyHelp, PanelTable } from "../keymap";
 import { TABLE } from "../testFixtures";
+import { worksSlashCommands } from "../slashCommands";
 
 afterEach(cleanup);
 
@@ -19,10 +20,17 @@ function overlay(onClose = () => {}, panel: PanelTable = EMPTY_PANEL_TABLE) {
 }
 
 describe("KeymapOverlay", () => {
-  it("renders the five groups, the leader between BROWSE and Anywhere, the last headed by the configured prefix", () => {
+  it("renders the six groups, the leader between BROWSE and Typing, Slash commands between Typing and Anywhere, the last headed by the configured prefix", () => {
     const { container } = overlay();
     const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
-    expect(titles).toEqual(["This panel", "Leader and tab keys", "Typing", "Anywhere in the window", "After Ctrl+b"]);
+    expect(titles).toEqual([
+      "This panel",
+      "Leader and tab keys",
+      "Typing",
+      "Slash commands",
+      "Anywhere in the window",
+      "After Ctrl+b",
+    ]);
   });
 
   it("follows a user's prefix", () => {
@@ -86,6 +94,24 @@ describe("KeymapOverlay", () => {
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.click(container.querySelector(".keymap-overlay")!);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  describe("the slash commands section", () => {
+    function slashSection(container: HTMLElement) {
+      return Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Slash commands"))!;
+    }
+
+    it("lists exactly the works rows, in the table's own order -- model and config included", () => {
+      const section = slashSection(overlay().container);
+      const items = Array.from(section.querySelectorAll("li")).map((li) => li.textContent);
+      expect(items).toEqual(worksSlashCommands().map((name) => `/${name}`));
+    });
+
+    it("adds no <tr> of its own -- it is a plain list, not a key table", () => {
+      const section = slashSection(overlay().container);
+      expect(section.querySelectorAll("tr").length).toBe(0);
+      expect(section.querySelectorAll("table").length).toBe(0);
+    });
   });
 
   describe("the leader and tab keys section", () => {

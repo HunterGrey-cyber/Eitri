@@ -1,5 +1,6 @@
-import { createElement } from "react";
+import { createElement, Fragment } from "react";
 import type { ReactNode } from "react";
+import type { Problem } from "../problems";
 
 /** A row on the shared sign-column grid.
  * Derive both `data-sign` and the visible `.row-sign` from one `sign` argument so they cannot drift.
@@ -37,6 +38,10 @@ type RowProps = {
   /** Makes this row a keyboard stop (`../nav`): `"row"` for a conversation row, which carries the
    *  cursor; any other name for a row that is reached by focusing it, like a start-screen choice. */
   navStop?: string;
+  /** A startup failure's `classify()` result: a headline and remedy drawn above unchanged `children`.
+   *  `null` or omission draws nothing extra, including for unrecognized failures.
+   *  Callers perform classification; this component only renders the supplied result. */
+  problem?: Problem | null;
   children: ReactNode;
 };
 
@@ -51,6 +56,7 @@ export function Row({
   "aria-checked": ariaChecked,
   onClick,
   navStop,
+  problem,
   children,
 }: RowProps) {
   const classes = ["row", `row-${kind}`, current ? "row-current" : null, className ?? null]
@@ -60,12 +66,24 @@ export function Row({
   // two shapes, and writing the cells out twice would put the glyph back in two places -- the exact
   // defect this component exists to make impossible.
   const cellTag = as === "button" ? "span" : "div";
+  const bodyContent =
+    problem == null ? (
+      children
+    ) : (
+      <Fragment>
+        <div className="row-problem">
+          <strong>{problem.headline}</strong>
+          <div className="row-problem-remedy">{problem.remedy}</div>
+        </div>
+        {children}
+      </Fragment>
+    );
   const cells = [
     createElement(cellTag, { key: "sign", className: "row-sign", "aria-hidden": true }, sign),
     createElement(
       cellTag,
       { key: "body", className: bodyClassName === undefined ? "row-body" : `row-body ${bodyClassName}` },
-      children,
+      bodyContent,
     ),
   ];
 

@@ -1,0 +1,89 @@
+/** Classifies failure text into a headline and remedy displayed above the unchanged raw text.
+ *  Unknown failures return `null`, so callers show only the raw text.
+ *
+ *  Recognizers match diagnostic substrings or shapes from captured fixtures. The login recognizer
+ *  uses the interactive authentication diagnostic; a logged-out sidecar fixture is not available.
+ *  The in-range-but-untested compatibility warning stays in the header as `⚠` and must not match
+ *  a startup-failure recognizer here. */
+
+export type Problem = {
+  headline: string;
+  remedy: string;
+};
+
+/** `agent::sidecar_missing_message`'s exact opening sentence (agent/src/providers/claude_sidecar/
+ *  spawn.rs). Recognising it literally, rather than re-deriving it, is deliberate: this text is
+ *  produced by this project's own Rust, not by the sidecar or the CLI, so there is nothing to
+ *  parse -- only to recognise and split into headline / remedy. */
+const SIDECAR_MISSING_HEADLINE = "The agent sidecar is not installed.";
+
+function classifySidecarMissing(text: string): Problem | null {
+  const at = text.indexOf(SIDECAR_MISSING_HEADLINE);
+  if (at === -1) return null;
+  const remedy = text.slice(at + SIDECAR_MISSING_HEADLINE.length).trim();
+  return { headline: SIDECAR_MISSING_HEADLINE, remedy };
+}
+
+/** Captured verbatim in `fixtures/problems/cli-missing.txt`: the sidecar's own
+ *  `cliCompatibility.ts` says this when `spawnSync`ing the configured CLI path fails outright
+ *  (ENOENT), before any version parsing is attempted. */
+const CLI_MISSING_MARKER = "could not determine the installed claude CLI version";
+
+function classifyCliMissing(text: string): Problem | null {
+  if (!text.includes(CLI_MISSING_MARKER)) return null;
+  return {
+    headline: "Claude Code (claude) was not found.",
+    remedy: "Install it and make sure claude runs in a terminal, then press r.",
+  };
+}
+
+/** Captured verbatim in `fixtures/problems/cli-out-of-range.txt`. The sidecar's refusal names the
+ *  host version once, then repeats it against the supported range as `>=A <B` -- captured so the
+ *  headline can name the same two numbers the sidecar refused on, not a guess. Deliberately does
+ *  NOT match the sidecar's other, non-fatal "inside the range but untested" diagnostic: that one
+ *  never says "refusing to start" or "outside". */
+const CLI_OUT_OF_RANGE_RE =
+  /refusing to start: host claude CLI version ([^:]+): .*?is outside this sidecar's supported range \(>=(\S+) <([^)]+)\)/s;
+
+function classifyCliOutOfRange(text: string): Problem | null {
+  const m = CLI_OUT_OF_RANGE_RE.exec(text);
+  if (m === null) return null;
+  const [, version, low, high] = m;
+  return {
+    headline: `Claude Code ${version} is outside the range this build supports (${low} to below ${high}).`,
+    remedy: "Install a supported version, then press r.",
+  };
+}
+
+/** Never captured (the test-account wrapper
+ *  refuses to point at an empty scratch config directory, so making it appear logged out was never
+ *  attempted). Ships on Claude Code's own documented interactive string instead. */
+const NOT_LOGGED_IN_MARKER = "Please run /login";
+
+function classifyNotLoggedIn(text: string, account: string | null): Problem | null {
+  if (!text.includes(NOT_LOGGED_IN_MARKER)) return null;
+  const remedy =
+    account === null
+      ? "Run claude in a terminal and /login, then send again."
+      : `Run claude in a terminal and /login, then send again. (account "${account}": ~/.claude-${account})`;
+  return { headline: "Claude Code is not logged in.", remedy };
+}
+
+/** Order matters only in that each recognizer's own marker is specific enough that at most one
+ *  ever matches a real diagnostic; there is no priority contest to get right. */
+const CLASSIFIERS: ((text: string, account: string | null) => Problem | null)[] = [
+  (text) => classifySidecarMissing(text),
+  (text) => classifyCliMissing(text),
+  (text) => classifyCliOutOfRange(text),
+  (text, account) => classifyNotLoggedIn(text, account),
+];
+
+/** `account` adds its config directory to the login remedy. Other failure types ignore it,
+ *  so callers that do not need that remedy may omit it. */
+export function classify(text: string, account: string | null = null): Problem | null {
+  for (const classifier of CLASSIFIERS) {
+    const problem = classifier(text, account);
+    if (problem !== null) return problem;
+  }
+  return null;
+}

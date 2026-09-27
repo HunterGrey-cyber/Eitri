@@ -123,8 +123,25 @@ describe("EmptyTab (F3)", () => {
     const { container, getByText, props } = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "the gate refused 2.1.999" });
     getByText("the gate refused 2.1.999");
     expect(container.querySelector(".dashboard")).toBeNull();
+    // An unrecognised failure: no headline/remedy block, exactly as before this task.
+    expect(container.querySelector(".row-problem")).toBeNull();
     fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "r" });
     expect(props.onReset).toHaveBeenCalled();
+  });
+  // A recognised startup failure shows a headline and remedy above the unchanged raw error text,
+  // preserving the details needed to diagnose it.
+  it("classifies a recognised startup failure into a plain headline and remedy above the raw text", () => {
+    const { container, getByText } = renderEmpty({
+      tab: { ...TAB, state: "failed" },
+      failure: 'could not determine the installed claude CLI version via "/no/such/claude" (spawn error: ENOENT)',
+    });
+    // The raw text is still there, unchanged.
+    getByText(/could not determine the installed claude CLI version/);
+    const problem = container.querySelector(".row-problem")!;
+    expect(problem.querySelector("strong")!.textContent).toBe("Claude Code (claude) was not found.");
+    expect(problem.querySelector(".row-problem-remedy")!.textContent).toBe(
+      "Install it and make sure claude runs in a terminal, then press r.",
+    );
   });
   it("draws no dashboard while starting", () => {
     const { container } = renderEmpty({ tab: { ...TAB, state: "starting" } });
