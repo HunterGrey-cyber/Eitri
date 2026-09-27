@@ -164,6 +164,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
     nvim_extra_args.extend(nvim_keys_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
+    // v1 spec §5 (P1/P14): the nav fallback's loader, from the pane-switch channel's own directory,
+    // so `Ctrl+h/j/k/l` leave the editor without vim-tmux-navigator and from Visual mode. Only
+    // where the channel exists, because leaving can only work where its socket does.
+    nvim_extra_args.extend(pane_switch.as_ref().map(|ps| ps.nvim_args()).unwrap_or_default());
     // wire 3. Unconditional and stateless -- no socket, no directory, nothing to fail at startup --
     // because the only reload trigger a normal Neovim config installs is `FocusGained`, and nothing
     // in this shell ever tells nvim it lost or gained focus. Without this a `git checkout`, a
@@ -983,6 +987,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let show_on_screen = show_on_screen.clone();
         let place_and_arrive = place_and_arrive.clone();
         let app_name = top_bar.app_name.clone();
+        let toast = toast.clone();
         Rc::new(move |id, action| {
             println!("[modules] {id}: {action:?}");
             let result = match action {
@@ -993,7 +998,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 KeyAction::Hide => grid.hide_module(id, &*focus_module),
             };
             if let Err(err) = result {
-                refuse(&app_name, &err);
+                refuse(&app_name, &toast, &err);
             }
         })
     };
@@ -1273,6 +1278,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         })
     };
 
+    // C1's stale-mirror recovery (spec §3.5): the page could not apply a `nav_key` against its own
+    // current state (the mirror was a keystroke stale, or INPUT is refused on a dead session), so it
+    // asks Rust to do exactly what the chord would have done.
+    agent_panel_handle.on_nav_fallthrough({
+        let move_focus = move_focus.clone();
+        move |direction| {
+            move_focus(&ModuleId::agent(), direction);
+        }
+    });
+
     // The prefix's own `Action::Tab` chord and the panel's own `tab_verb` messages (`<leader>`
     // bindings `keymap.ts` resolves, spec §10.2) run the same code, so a verb behaves the same
     // whichever route sent it (panel round 2 plan Task 6).
@@ -1284,6 +1299,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let focus_module = focus_module.clone();
         let show_on_screen = show_on_screen.clone();
         let refused_name = top_bar.app_name.clone();
+        let toast = toast.clone();
         Rc::new(move |tab_action: TabAction| {
             let chat = ModuleId::agent();
             let keys_in = pane_focus::focused_module(&window, &grid.hosts())
@@ -1293,7 +1309,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             let plan = tab_verbs::plan(tab_action, keys_in, 1);
             if plan.takes_the_keys {
                 if let Err(err) = show_on_screen(&chat) {
-                    refuse(&refused_name, &err);
+                    refuse(&refused_name, &toast, &err);
                     return;
                 }
                 focus_module(&chat);
@@ -1385,6 +1401,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         let kill_prompt = kill_prompt.clone();
         let kill_title = module_title.clone();
         let kill_refused = top_bar.app_name.clone();
+        let toast = toast.clone();
         prefix::install(
             &window,
             keymap.clone(),
@@ -1393,7 +1410,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 let action = match command {
                     prefix::PrefixCommand::Place { module, axis } => {
                         if let Err(err) = place_and_arrive(&module, axis) {
-                            refuse(&refused_name, &err);
+                            refuse(&refused_name, &toast, &err);
                         }
                         return;
                     }
@@ -1447,7 +1464,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                                 }
                                 terminal::ToggleStep::Hide => {
                                     if let Err(err) = grid.hide_module(&id, &*focus_module) {
-                                        refuse(&refused_name, &err);
+                                        refuse(&refused_name, &toast, &err);
                                     }
                                 }
                             }
@@ -1470,7 +1487,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         let scope = match neovibe_core::layout::can_kill(&module_layout.borrow(), &id) {
                             Ok(scope) => scope,
                             Err(err) => {
-                                refuse(&refused_name, &err);
+                                refuse(&refused_name, &toast, &err);
                                 return;
                             }
                         };
@@ -1514,7 +1531,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     Action::PanelKeymap => {
                         let chat = ModuleId::agent();
                         if let Err(err) = show_on_screen(&chat) {
-                            refuse(&refused_name, &err);
+                            refuse(&refused_name, &toast, &err);
                             return;
                         }
                         focus_module(&chat);
@@ -1528,6 +1545,17 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     Action::Tab(tab_action) => run_tab_action(tab_action),
                     // The prefix never hands a split key back: it waits for a module key instead.
                     Action::Split(_) => {}
+                    // `prefix [`/`prefix PageUp` (spec §6.2): the terminal's own read-only copy
+                    // mode, only while it holds the keys -- elsewhere the same refusal shape as
+                    // every other misdirected prefix action (`Action::Module`, above).
+                    Action::CopyMode { up } => {
+                        if terminal::copy_mode_entry(focused().as_ref().map(ModuleId::kind)) {
+                            terminal.enter_copy_mode(up);
+                        } else {
+                            println!("[prefix] prefix [ scrolls the terminal");
+                            flash(&refused_name);
+                        }
+                    }
                 }
             },
             move |waiting| {
@@ -1604,12 +1632,34 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host
     // (`install_module_nav`), one per web module here; a web module added later installs its own.
+    // Only the agent host gets an intercept (C1, spec §3.1, §3.5): `Ctrl+j`/`Ctrl+k` claimed for the
+    // composer, decided from the panel's own `panel_keys` mirror. A Lua panel has no such mode and
+    // passes `None`, so every chord there still goes straight to `move_focus` as before.
     for (id, host) in grid
         .hosts()
         .iter()
         .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
-        install_module_nav(id.clone(), host, move_focus.clone());
+        let intercept: Option<Rc<dyn Fn(Direction) -> bool>> = if id.kind() == ModuleKind::Agent {
+            let agent = agent_panel_handle.clone();
+            Some(Rc::new(move |direction: Direction| {
+                if !claims(agent.panel_keys(), direction) {
+                    return false;
+                }
+                let direction = match direction {
+                    Direction::Down => neovibe_core::agent_bridge::NavKeyDirection::Down,
+                    Direction::Up => neovibe_core::agent_bridge::NavKeyDirection::Up,
+                    Direction::Left | Direction::Right => {
+                        unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
+                    }
+                };
+                agent.nav_key(direction);
+                true
+            }))
+        } else {
+            None
+        };
+        install_module_nav(id.clone(), host, move_focus.clone(), intercept);
     }
 
     // --- Ctrl+h/j/k/l in the terminal: neovibe's, always (owner, 2026-09-23: "neovibe的按键优先").
@@ -1931,14 +1981,47 @@ fn flash(app_name: &gtk4::Label) {
     }
 }
 
+/// P8's toast text (spec §7.2): the one refusal that will keep recurring for the rest of this
+/// window's life, because [`Reopen::Never`] never lifts. `Some` only for `LayoutError::Gone` on the
+/// editor itself -- the one module this window ever marks gone -- so a future second use of `Gone`
+/// on some other module does not inherit a message that names the editor by name.
+fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
+    match err {
+        LayoutError::Gone(id) if *id == ModuleId::editor() => Some(
+            "the editor was closed (:qa or prefix x) and nvim cannot restart in this window \
+             \u{2014} relaunch neovibe to get it back"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// A layout verb the layout refused -- the last module on screen hidden, a module placed next to
 /// itself: said on stdout, and the top bar's app name shows the prefix indicator's block for
 /// [`REFUSAL_FLASH`] (spec §3.2). Its own class, so a prefix armed meanwhile keeps its indicator. A
 /// second refusal inside the flash restarts it rather than being cut short by the first one's timer
 /// (Task 9's review, minor 5). One window per process (`NON_UNIQUE`), so one timer per thread.
-fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
+/// **P8 (spec §7.2):** a killed editor's `Gone` also reaches the window's toast (already installed
+/// in `build_ui`), not only the flash and stdout line every other refusal keeps.
+fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
     println!("[modules] refused: {err}");
     flash(app_name);
+    if let Some(text) = gone_editor_toast_text(err) {
+        toast.show(&text);
+    }
+}
+
+/// C1's decision, in Rust (spec §3.5): only `Ctrl+j` (`Direction::Down`) while the panel's
+/// `panel_keys` mirror reports `Browse`, or `Ctrl+k` (`Direction::Up`) while it reports `Input`, is
+/// claimed for the composer -- every other combination goes to `move_focus` exactly as before. Pure
+/// so the full table is a unit test with no display; `install_module_nav`'s agent-only `intercept`
+/// closure is the only caller.
+fn claims(mirror: neovibe_core::agent_bridge::PanelKeys, dir: Direction) -> bool {
+    use neovibe_core::agent_bridge::PanelKeys;
+    matches!(
+        (dir, mirror),
+        (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
+    )
 }
 
 /// `Ctrl+h/j/k/l` from a web module (the agent panel, a Lua panel), on its host: a capture-phase
@@ -1947,7 +2030,17 @@ fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
 /// itself and would otherwise consume the chord before a bubble-phase controller on the same widget
 /// ran. Only a chord that moves is claimed. Called once per web module host, at startup and for one
 /// added later (modules P2; P3's canvas is the first).
-fn install_module_nav(id: ModuleId, host: &gtk4::Widget, move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool>) {
+///
+/// `intercept` (C1, spec §3.5) is consulted after the `LetThrough` second-delivery check and before
+/// `move_focus`: a chord it claims stops right there, never reaching `move_focus` or the page. Only
+/// the agent host's caller passes one; a Lua panel passes `None`, so it behaves exactly as before
+/// this parameter existed.
+fn install_module_nav(
+    id: ModuleId,
+    host: &gtk4::Widget,
+    move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool>,
+    intercept: Option<Rc<dyn Fn(Direction) -> bool>>,
+) {
     // A chord this controller lets through to the page comes back through it once more if the page
     // does not handle it: WebKit puts the same event back on the queue for GTK's own bindings
     // (`pane_switch::LetThrough`). The second delivery is not a second press.
@@ -1964,6 +2057,9 @@ fn install_module_nav(id: ModuleId, host: &gtk4::Widget, move_focus: Rc<dyn Fn(&
             .is_some_and(|event| let_through.borrow_mut().is_second_delivery(event))
         {
             return glib::Propagation::Proceed;
+        }
+        if intercept.as_ref().is_some_and(|intercept| intercept(direction)) {
+            return glib::Propagation::Stop;
         }
         if move_focus(&id, direction) {
             return glib::Propagation::Stop;
@@ -2155,5 +2251,40 @@ mod tests {
             }
         }
         assert_eq!(taken, 4, "Ctrl+h/j/k/l, and nothing else");
+    }
+
+    /// C1's full decision table (spec §3.5): the two claimed cells (`Down`+`Browse`, `Up`+`Input`)
+    /// and every other combination, which must fall through to `move_focus` unclaimed.
+    #[test]
+    fn claims_only_down_in_browse_and_up_in_input() {
+        use neovibe_core::agent_bridge::PanelKeys;
+        for dir in [Direction::Left, Direction::Down, Direction::Up, Direction::Right] {
+            for mirror in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
+                let expected = matches!(
+                    (dir, mirror),
+                    (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
+                );
+                assert_eq!(claims(mirror, dir), expected, "{dir:?} + {mirror:?}");
+            }
+        }
+    }
+
+    /// P8 (spec §7.2): `refuse` shows this text in the window's toast for a killed editor, and
+    /// says nothing extra for every other refusal (still just the flash and the stdout line).
+    #[test]
+    fn the_gone_editor_toast_text_matches_the_spec() {
+        assert_eq!(
+            gone_editor_toast_text(&LayoutError::Gone(ModuleId::editor())),
+            Some(
+                "the editor was closed (:qa or prefix x) and nvim cannot restart in this window \
+                 \u{2014} relaunch neovibe to get it back"
+                    .to_string()
+            )
+        );
+        assert_eq!(gone_editor_toast_text(&LayoutError::Gone(ModuleId::agent())), None);
+        assert_eq!(
+            gone_editor_toast_text(&LayoutError::LastVisible(ModuleId::editor())),
+            None
+        );
     }
 }

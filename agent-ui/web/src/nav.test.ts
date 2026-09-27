@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { answerTarget, clampStep, controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf, stopsIn } from "./nav";
+import { clampStep, controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf, stopsIn } from "./nav";
 import type { AnswerableItem } from "./nav";
 
 afterEach(() => {
@@ -130,18 +130,13 @@ describe("permissionTarget", () => {
   it("does not link a tool call whose id is empty", () => {
     expect(permissionTarget([{ kind: "tool", toolUseId: "" }, { kind: "permission", toolUseId: "" }], 0)).toBeNull();
   });
-});
 
-describe("answerTarget (P1)", () => {
-  const card = (id: string | null): AnswerableItem => ({ kind: "permission", toolUseId: id });
-  const other: AnswerableItem = { kind: "other" };
-  it("answers the only card from any row", () => {
-    expect(answerTarget([other, card(null), other], 2)).toBe(1);
-    expect(answerTarget([other, card(null), other], 0)).toBe(1);
-  });
-  it("keeps the cursor rule with two or more cards", () => {
-    expect(answerTarget([card(null), other, card(null)], 1)).toBeNull();
-    expect(answerTarget([card(null), other, card(null)], 2)).toBe(2);
+  it("never answers the only card from another row (v1 S4: ruling 26's any-row exception is gone)", () => {
+    const card: AnswerableItem = { kind: "permission", toolUseId: null };
+    const other: AnswerableItem = { kind: "other" };
+    expect(permissionTarget([other, card, other], 0)).toBeNull();
+    expect(permissionTarget([other, card, other], 2)).toBeNull();
+    expect(permissionTarget([other, card, other], 1)).toBe(1);
   });
 });
 

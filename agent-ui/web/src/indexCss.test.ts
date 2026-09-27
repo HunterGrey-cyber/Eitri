@@ -2459,6 +2459,25 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(box.outlineStyle).toBe("none");
   });
 
+  /* The v1-ui GUI pass (2026-09-27): WebKitGTK drew "Ask the agent...— i or Ctrl+j to type" -- the
+     hint span is a flex item of `.composer-browse-hint`, and a flex item's leading white space is
+     removed, so the space `Composer.tsx` puts before the dash never showed. jsdom has no layout; this
+     pins the rule that keeps it. */
+  it("keeps the space before the BROWSE hint's dash (a flex item drops its leading white space)", () => {
+    const hint = computed(
+      `<div class="composer"><div class="composer-browse-hint">Ask the agent...<span class="composer-hint"> — i or Ctrl+j to type</span></div></div>`,
+      ".composer-hint",
+    );
+    expect(hint.whiteSpace).toMatch(/^pre(-wrap)?$/);
+  });
+
+  /* The v1-ui GUI pass (2026-09-27): the missing-sidecar remedy ("Looked for it at:\n  - <path>\n
+     Install ...") ran together into one line. */
+  it("keeps a problem remedy's own line breaks", () => {
+    const remedy = computed(`<div class="row-problem"><div class="row-problem-remedy">a\nb</div></div>`, ".row-problem-remedy");
+    expect(remedy.whiteSpace).toMatch(/^pre(-line|-wrap)?$/);
+  });
+
   it("gives the composer the panel's own font and caps its growth", () => {
     const box = computed(`<div class="composer"><textarea></textarea></div>`, ".composer textarea");
     expect(box.fontFamily).not.toMatch(/-webkit-small-control/);

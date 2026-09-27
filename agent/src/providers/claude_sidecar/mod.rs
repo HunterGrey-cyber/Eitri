@@ -15,7 +15,7 @@ mod watch;
 #[cfg(test)]
 mod runtime_policy_verification;
 
-pub use spawn::{packaged_sidecar_available, EXPECTED_VERDANDI_REVISION, SIDECAR_EXIT_GRACE};
+pub use spawn::{packaged_sidecar_available, sidecar_missing_message, EXPECTED_VERDANDI_REVISION, SIDECAR_EXIT_GRACE};
 
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,

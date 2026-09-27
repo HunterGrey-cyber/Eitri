@@ -90,7 +90,7 @@ use super::bell::{self, BellFlash};
 use super::gl::SkiaState;
 use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
 use super::input_queue::{InputQueue, PaneInput, PasteTicket};
-use super::keys::{self, ClipboardChord, DeliveredKeys, RawKey, RepeatTracker};
+use super::keys::{self, ClipboardChord, CopyModeKey, DeliveredKeys, RawKey, RepeatTracker};
 use super::pointer;
 use crate::wheel_zoom::WheelZoom;
 
@@ -150,6 +150,13 @@ struct State {
     /// Which button (if any) a drag or motion is holding, for the live mouse mode's own report
     /// (Task 9). Reset on a restart: a button held across a restarted shell reports nothing new.
     reports: pointer::ReportTracker,
+    /// `prefix [`/`prefix PageUp` opened copy mode (Task 9, spec §6.2): `connect_keyboard` reads
+    /// this ahead of `scroll_chord`, and the input method's commit and preedit handlers read it too
+    /// ([`Self::route_commit`], [`Self::take_preedit`]) -- that is where every printable key
+    /// arrives -- so a copy-mode key never reaches the shell. Reset on exit or
+    /// restart (`forget_session`), the same as `cursor`/`last_selection` -- a shell that is gone or
+    /// about to be replaced holds nothing left to scroll back through.
+    copy_mode: bool,
     /// The last widget-relative pointer position (Task 9): a wheel event carries no position of its
     /// own, so a report needs the last one the motion controller (or drag gesture) saw.
     last_pointer: (f64, f64),
@@ -159,6 +166,17 @@ struct State {
     /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
     /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
     on_shell_exit: Option<Rc<dyn Fn() -> bool>>,
+}
+
+/// What becomes of an input-method commit ([`State::route_commit`]).
+#[derive(Debug, PartialEq)]
+enum CommitRoute {
+    /// To the shell, through the pane's one door ([`submit`]).
+    Shell(NormalizedInput),
+    /// Copy mode is open: the commit is a copy-mode key or nothing, and never the shell's.
+    CopyMode(CopyModeKey),
+    /// Nothing at all; the gate's reason, for the log.
+    Dropped(&'static str),
 }
 
 impl State {
@@ -184,6 +202,7 @@ impl State {
             last_selection: None,
             mouse: MouseModes::default(),
             reports: pointer::ReportTracker::default(),
+            copy_mode: false,
             last_pointer: (0.0, 0.0),
             colors: TerminalColors::default(),
             focused: false,
@@ -304,6 +323,73 @@ impl State {
         self.last_selection = None;
         self.mouse = MouseModes::default();
         self.reports = pointer::ReportTracker::default();
+        // Task 9, spec §6.2: leaving copy mode on exit/restart too -- a gone or about-to-be-replaced
+        // shell holds nothing left to scroll back through.
+        self.copy_mode = false;
+    }
+
+    /// `prefix [`/`prefix PageUp` (Task 9, spec §6.2), once `main.rs` has already established this
+    /// pane holds the keys (`super::copy_mode_entry`): does nothing without a running shell -- a
+    /// prompt or a message frame with none holds no copy to scroll back through. `up` also asks for
+    /// one page up at once, the one difference between `prefix [` and `prefix PageUp`.
+    fn enter_copy_mode(&mut self, up: bool) {
+        if self.exited {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else { return };
+        session.send(SessionCommand::CopyMode(true));
+        if up {
+            session.send(SessionCommand::Scroll(ScrollRequest::Pages(1)));
+        }
+        self.copy_mode = true;
+    }
+
+    /// One copy-mode key, from either door it can arrive by: `key-pressed` (the arrows, the page keys,
+    /// `Ctrl+u`/`Ctrl+d`, `Esc`) or an input-method commit (every printable key, [`Self::route_commit`]).
+    /// Nothing here reaches the shell: a scroll goes to the view, a leave snaps it back to the bottom.
+    fn apply_copy_mode_key(&mut self, key: CopyModeKey) {
+        match key {
+            CopyModeKey::Scroll(req) => {
+                if let Some(session) = &self.session {
+                    session.send(SessionCommand::Scroll(req));
+                }
+            }
+            CopyModeKey::Leave => {
+                if let Some(session) = &self.session {
+                    session.send(SessionCommand::CopyMode(false));
+                }
+                self.copy_mode = false;
+            }
+            CopyModeKey::Swallow => {}
+        }
+    }
+
+    /// Where an input-method commit goes. The gate decides first, as ever (`ImeGate::commit`: the
+    /// keys, a reset of the pane's own, an empty commit). What it would send goes to the shell --
+    /// **except in copy mode**, where it is a copy-mode key or nothing (`keys::copy_mode_commit`):
+    /// with an input method attached a printable key arrives only as a commit (`ime.rs`), so without
+    /// this `k`, `j`, `g`, `G`, `q` and every other letter would be typed into the shell underneath
+    /// (whole-branch review of v1-ui, Review Focus 4: copy mode never leaks a key to the shell).
+    fn route_commit(&mut self, text: &str, gtk: GtkFocus) -> CommitRoute {
+        match self.ime.commit(text, gtk) {
+            Commit::Dropped(why) => CommitRoute::Dropped(why),
+            Commit::Send(_) if self.copy_mode => CommitRoute::CopyMode(keys::copy_mode_commit(text)),
+            Commit::Send(input) => CommitRoute::Shell(input),
+        }
+    }
+
+    /// A composition started, changed or ended ([`preedit_changed`]'s half that needs no display).
+    /// `true`: it must be thrown away -- copy mode has no composition to draw and nothing to commit it
+    /// to, so a composition that starts there (rime on, and a letter pressed) is never kept, and the
+    /// caller resets the input method. The letter that started it does nothing: with rime composing,
+    /// the key was the input method's, as it would be in any terminal under tmux's copy mode.
+    fn take_preedit(&mut self, text: &str, caret: i32) -> bool {
+        if self.copy_mode {
+            self.ime.preedit_changed("", 0);
+            return !text.is_empty();
+        }
+        self.ime.preedit_changed(text, caret);
+        false
     }
 
     /// What [`pointer::route`]/[`pointer::wheel_route`] see: the live mode while a shell is running,
@@ -477,6 +563,16 @@ impl TerminalPane {
     pub(crate) fn send(&self, input: NormalizedInput) {
         discard_composition(&self.state, &self.im, &self.area);
         submit(&self.state, PaneInput::Key(input));
+    }
+
+    /// `prefix [`/`prefix PageUp` (Task 9, spec §6.2): `main.rs`'s own prefix arm calls this only
+    /// once `super::copy_mode_entry` has already said this pane holds the keys.
+    ///
+    /// A composition in progress is thrown away first, as a paste or a `Ctrl+a` literal throws it
+    /// away: copy mode has nowhere to commit it, and it must not reach the shell once copy mode ends.
+    pub(crate) fn enter_copy_mode(&self, up: bool) {
+        discard_composition(&self.state, &self.im, &self.area);
+        self.state.borrow_mut().enter_copy_mode(up);
     }
 
     /// `f` runs when the shell ends by itself in a way that closes the module (`super::closes_on_exit`),
@@ -1288,6 +1384,15 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
                 }
                 return glib::Propagation::Stop;
             }
+            // Copy mode (Task 9, spec §6.2), ahead of `scroll_chord`: a copy-mode key never reaches
+            // the shell, whether or not it is also one of `scroll_chord`'s own bindings.
+            // Only the keys the input method passes on get here (the arrows, the page keys, `Esc`,
+            // the `Ctrl` chords); every printable one arrives as a commit (`route_commit`).
+            if state.borrow().copy_mode {
+                let key = keys::copy_mode_key(keyval, modifier);
+                state.borrow_mut().apply_copy_mode_key(key);
+                return glib::Propagation::Stop;
+            }
             if let Some(req) = keys::scroll_chord(keyval, modifier) {
                 if let Some(session) = &state.borrow().session {
                     session.send(SessionCommand::Scroll(req));
@@ -1392,10 +1497,11 @@ fn connect_ime(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
                     .and_downcast::<gtk4::Window>()
                     .is_some_and(|window| window.is_active()),
             });
-            let verdict = state.borrow_mut().ime.commit(text, gtk);
-            match verdict {
-                Commit::Send(input) => submit(&state, PaneInput::Key(input)),
-                Commit::Dropped(why) => println!(
+            let route = state.borrow_mut().route_commit(text, gtk);
+            match route {
+                CommitRoute::Shell(input) => submit(&state, PaneInput::Key(input)),
+                CommitRoute::CopyMode(key) => state.borrow_mut().apply_copy_mode_key(key),
+                CommitRoute::Dropped(why) => println!(
                     "[terminal] an input-method commit ({} characters) was dropped: {why}",
                     text.chars().count()
                 ),
@@ -1423,9 +1529,24 @@ fn connect_ime(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
 /// caret. On all three, as the editor does: `start` so the candidate window is in place, `changed`
 /// so it follows the composition, `end` so the next one never starts against a stale place. The
 /// preedit's pango attributes (rime's `HighLight` on the segment being converted) are not drawn.
-fn preedit_changed(im: &IMMulticontext, state: &RefCell<State>, area: &GLArea) {
+///
+/// In copy mode a composition is never kept ([`State::take_preedit`]): it is reset, from an idle
+/// callback rather than from inside this signal -- fcitx5-gtk emits `preedit-start` from inside its
+/// own preedit update and would re-enter it (`fcitximcontext.cpp`'s
+/// `_fcitx_im_context_update_formatted_preedit_cb`). Whatever that reset commits is dropped by the
+/// gate (`ImeGate::begin_reset`), and a commit before it is a copy-mode key or nothing.
+fn preedit_changed(im: &IMMulticontext, state: &Rc<RefCell<State>>, area: &GLArea) {
     let (text, _attributes, caret) = im.preedit_string();
-    state.borrow_mut().ime.preedit_changed(&text, caret);
+    let discard = state.borrow_mut().take_preedit(&text, caret);
+    if discard {
+        let im = im.clone();
+        let state = state.clone();
+        glib::idle_add_local_once(move || {
+            state.borrow_mut().ime.begin_reset();
+            im.reset();
+            state.borrow_mut().ime.end_reset();
+        });
+    }
     point_input_method(im, state, area);
     area.queue_render();
 }
@@ -1922,5 +2043,75 @@ mod tests {
         let failed = state.spawn_size(|_| Err("no fonts".to_string()));
         assert_eq!(failed, Some(Err("no fonts".to_string())));
         assert!(state.metrics.is_none(), "a failed build leaves nothing half-made");
+    }
+
+    const HAS_THE_KEYS: GtkFocus = GtkFocus {
+        widget_has_focus: true,
+        window_is_active: true,
+    };
+
+    /// Review Focus 4 (whole-branch review of v1-ui): with an input method attached every printable
+    /// key arrives as a commit, never as `key-pressed`, so copy mode's letters are decided here.
+    /// In copy mode a commit is a copy-mode key or nothing -- never the shell's, whatever it
+    /// carries -- and once `q` has left, the next commit is typing again.
+    #[test]
+    fn in_copy_mode_a_commit_is_a_copy_mode_key_and_never_reaches_the_shell() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.focused = true;
+        state.ime.set_focused(true);
+        assert!(
+            matches!(state.route_commit("k", HAS_THE_KEYS), CommitRoute::Shell(_)),
+            "outside copy mode a letter is typing"
+        );
+
+        state.copy_mode = true;
+        assert_eq!(
+            state.route_commit("k", HAS_THE_KEYS),
+            CommitRoute::CopyMode(CopyModeKey::Scroll(ScrollRequest::Lines(1)))
+        );
+        assert_eq!(
+            state.route_commit("G", HAS_THE_KEYS),
+            CommitRoute::CopyMode(CopyModeKey::Scroll(ScrollRequest::Bottom))
+        );
+        for swallowed in ["x", "ls", "\u{4f60}\u{597d}", "echo hi\n"] {
+            assert_eq!(
+                state.route_commit(swallowed, HAS_THE_KEYS),
+                CommitRoute::CopyMode(CopyModeKey::Swallow),
+                "{swallowed:?} reaches nothing in copy mode"
+            );
+        }
+        assert!(
+            matches!(state.route_commit("k", GtkFocus::default()), CommitRoute::Dropped(_)),
+            "the gate still decides first: no keys, no key"
+        );
+
+        let leave = state.route_commit("q", HAS_THE_KEYS);
+        assert_eq!(leave, CommitRoute::CopyMode(CopyModeKey::Leave));
+        let CommitRoute::CopyMode(key) = leave else {
+            unreachable!()
+        };
+        state.apply_copy_mode_key(key);
+        assert!(!state.copy_mode, "q left copy mode");
+        assert!(
+            matches!(state.route_commit("k", HAS_THE_KEYS), CommitRoute::Shell(_)),
+            "and the next letter is typing again"
+        );
+    }
+
+    /// With rime on, a letter in copy mode starts a composition instead of committing. It is never
+    /// kept or drawn, and the pane is told to reset the input method, so nothing it composes can be
+    /// committed into the shell once copy mode ends. Outside copy mode a composition is kept as ever.
+    #[test]
+    fn a_composition_started_in_copy_mode_is_never_kept_and_is_thrown_away() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.ime.set_focused(true);
+        state.copy_mode = true;
+        assert!(state.take_preedit("k", 1), "a composition in copy mode is reset");
+        assert!(!state.ime.composing(), "and never kept or drawn");
+        assert!(!state.take_preedit("", 0), "its end asks for nothing more");
+
+        state.copy_mode = false;
+        assert!(!state.take_preedit("ni", 2));
+        assert!(state.ime.composing(), "outside copy mode a composition is kept");
     }
 }

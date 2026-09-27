@@ -249,15 +249,24 @@ fn default_bindings() -> Vec<Binding> {
         Action::SendKeys(KeySpec::parse("C-l").expect("C-l parses")),
         false,
     );
+    // P4: bound like `C-l` above -- the literal chord, to whichever pane holds the keys
+    // (vim-tmux-navigator's README: `bind C-l send-keys 'C-l'`). `Ctrl+h/j/k/l` themselves (with no
+    // prefix) stay neovibe's own navigation (R38), unaffected by these.
+    for name in ["C-h", "C-j", "C-k"] {
+        bind(
+            name,
+            Action::SendKeys(KeySpec::parse(name).expect("a literal chord parses")),
+            false,
+        );
+    }
     bind("F11", Action::WindowImmersive, false);
     bind("e", Action::Module(ModuleId::editor()), false);
     bind("a", Action::Module(ModuleId::agent()), false);
     bind("t", Action::Module(ModuleId::terminal()), false);
-    bind(
-        "v",
-        Action::Module(ModuleId::parse("canvas").expect("canvas is a module name")),
-        false,
-    );
+    // P5 (tmux `copy-mode` / `copy-mode -u`): `v` is deliberately not bound here any more (P6) --
+    // reserved for the canvas (`crate::layout::keys::RESERVED_FOR_CANVAS`), not this table.
+    bind("[", Action::CopyMode { up: false }, false);
+    bind("PPage", Action::CopyMode { up: true }, false);
     out
 }
 
@@ -536,11 +545,15 @@ mod tests {
         ("r", "panel.reload", false),
         ("?", "panel.keymap", false),
         ("C-l", "send-keys keys=C-l", false),
+        ("C-h", "send-keys keys=C-h", false),
+        ("C-j", "send-keys keys=C-j", false),
+        ("C-k", "send-keys keys=C-k", false),
         ("F11", "window.immersive", false),
         ("e", "module.editor", false),
         ("a", "module.agent", false),
         ("t", "module.terminal", false),
-        ("v", "module.canvas", false),
+        ("[", "copy-mode", false),
+        ("PPage", "copy-mode up=true", false),
     ];
 
     fn spelled(action: &Action) -> String {
@@ -549,6 +562,7 @@ mod tests {
             let value = match value {
                 OptValue::Int(i) => i.to_string(),
                 OptValue::Str(s) => s,
+                OptValue::Bool(b) => b.to_string(),
                 other => format!("{other:?}"),
             };
             out.push_str(&format!(" {name}={value}"));
@@ -576,7 +590,9 @@ mod tests {
     /// Every default key is stock tmux's, with stock's `-r`, unless the spec marks it neovibe-only.
     #[test]
     fn every_default_is_a_stock_tmux_key_or_marked_neovibe_only() {
-        const NEOVIBE_ONLY: [&str; 6] = ["C-l", "F11", "e", "a", "t", "v"];
+        // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
+        // bindings), so they need no entry here even though neovibe's action differs from tmux's.
+        const NEOVIBE_ONLY: [&str; 7] = ["C-l", "C-h", "C-j", "C-k", "F11", "e", "a"];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();
             if NEOVIBE_ONLY.contains(&name.as_str()) {

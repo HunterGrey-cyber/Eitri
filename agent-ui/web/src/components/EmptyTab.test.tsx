@@ -125,8 +125,25 @@ describe("EmptyTab (F3)", () => {
     const { container, getByText, props } = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "the gate refused 2.1.999" });
     getByText("the gate refused 2.1.999");
     expect(container.querySelector(".dashboard")).toBeNull();
+    // An unrecognised failure (spec §10.2): no headline/remedy block, exactly as before this task.
+    expect(container.querySelector(".row-problem")).toBeNull();
     fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "r" });
     expect(props.onReset).toHaveBeenCalled();
+  });
+  // Spec §10.2/§10.3 (P11): a recognised startup failure draws a headline and remedy above the
+  // raw text, which stays -- "never hide the evidence".
+  it("classifies a recognised startup failure into a plain headline and remedy above the raw text", () => {
+    const { container, getByText } = renderEmpty({
+      tab: { ...TAB, state: "failed" },
+      failure: 'could not determine the installed claude CLI version via "/no/such/claude" (spawn error: ENOENT)',
+    });
+    // The raw text is still there, unchanged.
+    getByText(/could not determine the installed claude CLI version/);
+    const problem = container.querySelector(".row-problem")!;
+    expect(problem.querySelector("strong")!.textContent).toBe("Claude Code (claude) was not found.");
+    expect(problem.querySelector(".row-problem-remedy")!.textContent).toBe(
+      "Install it and make sure claude runs in a terminal, then press r.",
+    );
   });
   it("draws no dashboard while starting", () => {
     const { container } = renderEmpty({ tab: { ...TAB, state: "starting" } });
@@ -212,11 +229,15 @@ describe("EmptyTab (F3)", () => {
       expect(onChooseSessions).toHaveBeenCalledTimes(1);
     });
 
-    it("m cycles the mode, same as Shift+Tab", () => {
+    it("the Mode item still runs on Enter, and its key column now reads ⇧Tab (V1 S2)", () => {
       const rendered = renderEmpty();
       const { props } = rendered;
       const root = toBrowse(rendered, props);
-      fireEvent.keyDown(root, { key: "m" });
+      // HELLO above has records, so the table is new/resume/sessions/mode/keys -- "mode" is index 3.
+      const items = Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
+      expect(items[3].querySelector(".dash-key")!.textContent).toBe("⇧Tab");
+      for (let i = 0; i < 3; i++) fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "Enter" });
       expect(props.onCycleMode).toHaveBeenCalledTimes(1);
     });
 
@@ -290,10 +311,56 @@ describe("EmptyTab (F3)", () => {
           fireEvent.keyDown(root, { key: "b" });
           fireEvent.keyDown(root, { key: "d" });
           expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
-          // A real Space still does, so the guard is not simply swallowing Space.
+          // A real Space still does, so the guard is not simply swallowing Space -- on its own, after
+          // a pause: in the middle of typing the leader is refused (the v1-ui GUI pass, below).
+          act(() => vi.advanceTimersByTime(300));
           fireEvent.keyDown(root, { key: " " });
           act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
           expect(container.querySelector(".which-key-box")).not.toBeNull();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** The v1-ui GUI pass (2026-09-27): "set up my" typed onto this dashboard ran `<leader>m` and
+       *  flipped the stored mode to bypass -- the thing S2 took the bare `m` away to stop. The leader
+       *  here starts a sequence only on a key that stands alone or ends a quick motion. */
+      it("t Space m at 80 ms a key: <leader>m never runs, and the band is told why", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const onFlash = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction, onFlash });
+          const { props, container } = rendered;
+          const root = toBrowse(rendered, props);
+          act(() => vi.advanceTimersByTime(1000));
+          for (const key of ["t", " ", "m"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          act(() => vi.advanceTimersByTime(1000));
+          expect(onPanelAction).not.toHaveBeenCalled();
+          expect(props.onCycleMode).not.toHaveBeenCalled();
+          expect(container.querySelector(".which-key-box")).toBeNull();
+          expect(onFlash).toHaveBeenCalledWith("Space starts a sequence only on its own — i or Ctrl+j to type");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("j then Space m at 80 ms a key is a quick motion: <leader>m runs", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          act(() => vi.advanceTimersByTime(1000));
+          for (const key of ["j", " ", "m"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          expect(onPanelAction).toHaveBeenCalledWith(expect.objectContaining({ action: "mode.cycle" }));
         } finally {
           vi.useRealTimers();
         }
@@ -506,5 +573,168 @@ describe("EmptyTab (F3)", () => {
       expect(l.defaultPrevented).toBe(true);
       expect(current()).toContain("Resume last");
     });
+  });
+});
+
+describe("v1 S2: the dashboard's bare m is removed (spec §2.4)", () => {
+  it("m in the menu posts nothing and changes no mode", () => {
+    const rendered = renderEmpty();
+    const { props } = rendered;
+    const root = toBrowse(rendered, props);
+    fireEvent.keyDown(root, { key: "m" });
+    expect(props.onCycleMode).not.toHaveBeenCalled();
+  });
+
+  it("typing 'make' changes nothing but the cursor (the k in it)", () => {
+    const rendered = renderEmpty();
+    const { props } = rendered;
+    const root = toBrowse(rendered, props);
+    const current = () => root.querySelector<HTMLElement>('[aria-current="true"]');
+    const items = () => Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
+    // Start away from the top so `k` (cursor up) has something to do, and is not itself clamped
+    // into looking like a no-op the way it would be at index 0.
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyDown(root, { key: "j" });
+    expect(items().indexOf(current()!)).toBe(2);
+    for (const key of ["m", "a", "k", "e"]) fireEvent.keyDown(root, { key });
+    // m, a and e are unbound letters and do nothing; only k -- the cursor-up key -- moved anything.
+    expect(items().indexOf(current()!)).toBe(1);
+    expect(props.onCycleMode).not.toHaveBeenCalled();
+    expect(props.onResume).not.toHaveBeenCalled();
+  });
+});
+
+describe("v1 P11: the starting screen's checkout hint is delayed 10s (F19, spec §10.2)", () => {
+  it("shows no 'fresh Verdandi checkout' text before 10s", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, getByText } = renderEmpty({ tab: { ...TAB, state: "starting" } });
+      getByText(/Starting the agent backend/);
+      expect(container.textContent).not.toContain("Verdandi checkout");
+      act(() => vi.advanceTimersByTime(9_999));
+      expect(container.textContent).not.toContain("Verdandi checkout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the 'still starting' line once 10s have passed", () => {
+    vi.useFakeTimers();
+    try {
+      const { getByText } = renderEmpty({ tab: { ...TAB, state: "starting" } });
+      act(() => vi.advanceTimersByTime(10_000));
+      getByText("still starting — a first start from a Verdandi checkout builds the sidecar");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never shows it once the tab is no longer starting", () => {
+    vi.useFakeTimers();
+    try {
+      const rendered = renderEmpty({ tab: { ...TAB, state: "starting" } });
+      const { container, props } = rendered;
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(container.textContent).toContain("Verdandi checkout");
+      rendered.rerender(<EmptyTab {...props} tab={{ ...TAB, state: "not_started" }} />);
+      expect(container.textContent).not.toContain("Verdandi checkout");
+      expect(container.querySelector(".connecting")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/* Task 3 (v1 v1-ui plan, spec §3.1/§3.5): `App.tsx` bumps `navKeyRequest` only for a `nav_key` it
+   has not already answered with `nav_fallthrough` itself (an overlay it alone knows about, `?`, a
+   y/n) -- this screen decides the rest: a starting/failed tab, or its own menu/composer mode not
+   matching the direction, both report back through `onNavFallthrough` rather than transitioning. */
+describe("EmptyTab: C1's navKeyRequest (v1 spec §3.1, §3.5)", () => {
+  it("menu nav_key down opens the composer", () => {
+    const rendered = renderEmpty();
+    toBrowse(rendered, rendered.props);
+    expect(rendered.container.querySelector("textarea")).toBeNull();
+    rendered.rerender(<EmptyTab {...rendered.props} arriveRequest={1} navKeyRequest={{ seq: 1, direction: "down" }} />);
+    expect(rendered.container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("composer nav_key up goes back to the menu, root focused", () => {
+    const rendered = renderEmpty();
+    expect(rendered.container.querySelector("textarea")).not.toBeNull();
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "up" }} />);
+    expect(rendered.container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(rendered.container.querySelector(".empty-tab"));
+  });
+
+  it("a starting tab falls through rather than transitioning", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onNavFallthrough });
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "down" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledWith("down");
+    // The starting tab's own box stays live regardless (C1: it queues behind the connect) --
+    // falling through changes nothing about it either way.
+    expect(rendered.container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("a failed tab falls through rather than transitioning", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "boom", onNavFallthrough });
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "down" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledWith("down");
+  });
+
+  // Fix round 1 (reviewer finding): a starting tab's composer is live ("C1: it queues behind the
+  // connect", this file's own `onKeyDown` comment), so leaving an already-open INPUT via `Ctrl+k`
+  // must behave the same way `Esc` already does there -- not fall through and hand the keys off this
+  // screen entirely, contradicting `Escape`'s own handling two tests up.
+  it("a starting tab already in INPUT leaves it on nav_key up, like Esc -- the composer stays live", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onNavFallthrough });
+    expect(rendered.container.querySelector("textarea")).not.toBeNull(); // mounts INPUT by default.
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "up" }} />);
+    expect(onNavFallthrough).not.toHaveBeenCalled();
+    expect(rendered.container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(rendered.container.querySelector(".empty-tab"));
+  });
+
+  // A `failed` tab's own `Escape` handling is never exempted the same way (its composer is
+  // `disabled`), so `nav_key up` must not be either -- still a plain fallthrough.
+  it("a failed tab's nav_key up still falls through, matching Esc's own !failed guard", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "boom", onNavFallthrough });
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "up" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledWith("up");
+  });
+
+  it("a stale direction (already in the target mode) falls through", () => {
+    const onNavFallthrough = vi.fn();
+    // Mounts in the composer (INPUT) by default -- "down" only applies from the menu (BROWSE).
+    const rendered = renderEmpty({ onNavFallthrough });
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "down" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledWith("down");
+    expect(rendered.container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("an overlay open (props.overlayOpen) falls through rather than stealing its keys", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ overlayOpen: true, onNavFallthrough });
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "up" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledWith("up");
+  });
+
+  it("a request counted before this screen mounted is not one (requests are edges)", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ navKeyRequest: { seq: 3, direction: "down" }, onNavFallthrough });
+    expect(onNavFallthrough).not.toHaveBeenCalled();
+    expect(rendered.container.querySelector("textarea")).not.toBeNull(); // untouched default (INPUT)
+  });
+
+  it("the same seq twice is one request, not two", () => {
+    const onNavFallthrough = vi.fn();
+    const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onNavFallthrough });
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "down" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledTimes(1);
+    rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "down" }} />);
+    expect(onNavFallthrough).toHaveBeenCalledTimes(1);
   });
 });

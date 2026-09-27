@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
 import { installDispatch, nextRequestId } from "./bridge";
+import type { OutboundMessage } from "./bridge";
 
 describe("nextRequestId", () => {
   it("returns distinct values on successive calls", () => {
@@ -117,6 +118,15 @@ describe("installDispatch", () => {
     expect(seen).toEqual(["tabs", "tab_detail", "chooser", "confirm_close", "begin_rename"]);
   });
 
+  it("demuxes a nav_key envelope, down and up", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "nav_key", direction: "down" }));
+    window.__neovibeDispatch!(JSON.stringify({ kind: "nav_key", direction: "up" }));
+    expect(handler).toHaveBeenNthCalledWith(1, { kind: "nav_key", direction: "down" });
+    expect(handler).toHaveBeenNthCalledWith(2, { kind: "nav_key", direction: "up" });
+  });
+
   it("warns and does not throw on an unrecognized envelope kind", () => {
     const handler = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -188,5 +198,20 @@ describe("installDispatch", () => {
     ];
     for (const envelope of envelopes) window.__neovibeDispatch!(JSON.stringify(envelope));
     expect(handler.mock.calls.map((c) => c[0])).toEqual(envelopes);
+  });
+});
+
+/* V1 §3.5, the plan's own "Interfaces" block: the exact wire strings `panel_keys`/`nav_fallthrough`
+   serialise to, byte for byte -- Task 2 pins the same five in a core test, so the two sides can
+   never silently drift apart on field order or spelling. */
+describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly (Interfaces block)", () => {
+  it.each<[OutboundMessage, string]>([
+    [{ type: "panel_keys", request_id: "req-7", mode: "browse" }, '{"type":"panel_keys","request_id":"req-7","mode":"browse"}'],
+    [{ type: "panel_keys", request_id: "req-8", mode: "input" }, '{"type":"panel_keys","request_id":"req-8","mode":"input"}'],
+    [{ type: "panel_keys", request_id: "req-9", mode: "other" }, '{"type":"panel_keys","request_id":"req-9","mode":"other"}'],
+    [{ type: "nav_fallthrough", request_id: "req-10", direction: "down" }, '{"type":"nav_fallthrough","request_id":"req-10","direction":"down"}'],
+    [{ type: "nav_fallthrough", request_id: "req-11", direction: "up" }, '{"type":"nav_fallthrough","request_id":"req-11","direction":"up"}'],
+  ])("%o -> %s", (message, wire) => {
+    expect(JSON.stringify(message)).toBe(wire);
   });
 });

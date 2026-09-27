@@ -2,6 +2,7 @@ import { forwardRef } from "react";
 import { BROWSE_KEYS, INPUT_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
+import { listedSlashCommands } from "../slashCommands";
 
 type Props = {
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
@@ -94,16 +95,38 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
   );
 }
 
+/** Spec §9.2 (P10): "The `?` overlay gets a 'Slash commands' section listing the **works** row." A
+ *  plain list rather than the two-column `Section` layout above -- nothing here is a keybinding, and
+ *  a bare `<ul>` keeps this section out of every existing `tr`-counting test in this file's own
+ *  test suite (`KeymapOverlay.test.tsx`'s "lists every row..."). Names come from
+ *  `../slashCommands`'s own table (Task 10's real-CLI record), in that table's order, less what Enter
+ *  holds back: `/config` is left out and `/model` reads `/model <name>` (`listedSlashCommands`; the
+ *  v1-ui GUI pass, 2026-09-27, saw the held-back flash send the reader here to find `/config`). */
+function SlashCommands() {
+  return (
+    <section>
+      <h2>Slash commands</h2>
+      <ul>
+        {listedSlashCommands().map((name) => (
+          <li key={name}>
+            <code>/{name}</code>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 /**
- * The full `?` keymap (spec §3): four groups, each a two-column table. The first two come from the
- * one source of truth `BROWSE_KEYS`/`INPUT_KEYS` in `./keymap` -- so this list can neither promise a
- * key the panel does not have (§3.3's `resolveKey` -> table direction) nor omit one it does (the
- * reverse direction). The last two -- "Anywhere in the window" and "After <prefix>" -- come from
- * `shell`'s own `keymap` envelope (keymap spec §2.9), generated from `neovibe_core::keymap`: nothing
- * on this page can read what GTK binds. It draws only; `App.tsx` decides when it is open, swallows
- * every key while it is (so `a`/`d` cannot reach a card hidden underneath -- spec §3.1) and scrolls
- * it on `j`/`k` through the forwarded ref. The one thing this component decides for itself is a
- * click on its own backdrop, which spec §3.1 also calls a close ("点击表外"): `event.target ===
+ * The full `?` keymap (spec §3, plus §9.2's Slash commands section): the two key-table groups come
+ * from the one source of truth `BROWSE_KEYS`/`INPUT_KEYS` in `./keymap` -- so this list can neither
+ * promise a key the panel does not have (§3.3's `resolveKey` -> table direction) nor omit one it
+ * does (the reverse direction). "Anywhere in the window" and "After <prefix>" come from `shell`'s
+ * own `keymap` envelope (keymap spec §2.9), generated from `neovibe_core::keymap`: nothing on this
+ * page can read what GTK binds. It draws only; `App.tsx` decides when it is open, swallows every key
+ * while it is (so `a`/`d` cannot reach a card hidden underneath -- spec §3.1) and scrolls it on
+ * `j`/`k` through the forwarded ref. The one thing this component decides for itself is a click on
+ * its own backdrop, which spec §3.1 also calls a close ("点击表外"): `event.target ===
  * event.currentTarget` is exactly a click that landed on this element and not on anything it
  * contains, so a click inside a table (reading a row, selecting text) never fires it.
  */
@@ -121,16 +144,32 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <Section title="This panel" rows={BROWSE_KEYS} />
+      {/* V1 C1 (spec §3.1): `Ctrl+j` here is Rust's mirror (`install_module_nav`) claiming the chord
+          ahead of `resolveKey`, never `resolveKey` itself -- so it is spliced in here rather than
+          added to `BROWSE_KEYS`, which `keymap.test.ts` ties to `resolveKey` both ways and would fail
+          on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
+          "Typing" section below already does the same for its own two GTK-decided rows. */}
+      <Section title="This panel" rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]} />
       <LeaderAndTabKeys panel={panel} />
       <Section
         title="Typing"
         rows={[
           ...INPUT_KEYS,
-          { keys: "Ctrl+h / j / k / l", what: "Move between panes (neovibe keeps these)" },
+          // Fix round 1 (reviewer finding): narrowed from "Ctrl+h / j / k / l" -- `j`/`k` are no
+          // longer plain pane motion while typing (the two rows below claim them instead), so
+          // listing them here too said two different things about the same key in the same section.
+          { keys: "Ctrl+h / l", what: "Move between panes (neovibe keeps these)" },
           { keys: prefixLabel, what: "The prefix (neovibe keeps it)" },
+          // V1 C1 (spec §3.1, §3.5): Rust's mirror (`install_module_nav`) claims these two ahead of
+          // `Composer` itself, the same reason the two rows above are spliced in here rather than
+          // added to `INPUT_KEYS` -- that constant is tied to `COMPOSER_CHORDS` both ways
+          // (`composerKeys.test.ts`, `Composer.test.tsx`) and would fail on a key `Composer` never
+          // handles.
+          { keys: "Ctrl+k", what: "Back to browsing (as Esc)" },
+          { keys: "Ctrl+j", what: "The module below" },
         ]}
       />
+      <SlashCommands />
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section title={`After ${prefixLabel}`} rows={prefixKeys} />
     </div>

@@ -1,5 +1,6 @@
-import { createElement } from "react";
+import { createElement, Fragment } from "react";
 import type { ReactNode } from "react";
+import type { Problem } from "../problems";
 
 /** One row on the sign-column grid every item in this document renders on (spec §3.2).
  *
@@ -55,6 +56,13 @@ type RowProps = {
   /** Makes this row a keyboard stop (`../nav`): `"row"` for a conversation row, which carries the
    *  cursor; any other name for a row that is reached by focusing it, like a start-screen choice. */
   navStop?: string;
+  /** Spec §10.2 (P11): when `children` carries a startup failure's raw text, `problem` is that
+   *  text's `classify()` result -- a headline and remedy drawn ABOVE `children`, which stays
+   *  exactly as it was ("never hide the evidence"). `null`/omitted (the common case: an
+   *  unrecognised failure, or a row with nothing to classify) draws nothing extra. Callers compute
+   *  `classify()` themselves; this component only knows how to render its result, so it stays
+   *  content-agnostic the same way `sign`/`kind` already are. */
+  problem?: Problem | null;
   children: ReactNode;
 };
 
@@ -69,6 +77,7 @@ export function Row({
   "aria-checked": ariaChecked,
   onClick,
   navStop,
+  problem,
   children,
 }: RowProps) {
   const classes = ["row", `row-${kind}`, current ? "row-current" : null, className ?? null]
@@ -78,12 +87,24 @@ export function Row({
   // two shapes, and writing the cells out twice would put the glyph back in two places -- the exact
   // defect this component exists to make impossible.
   const cellTag = as === "button" ? "span" : "div";
+  const bodyContent =
+    problem == null ? (
+      children
+    ) : (
+      <Fragment>
+        <div className="row-problem">
+          <strong>{problem.headline}</strong>
+          <div className="row-problem-remedy">{problem.remedy}</div>
+        </div>
+        {children}
+      </Fragment>
+    );
   const cells = [
     createElement(cellTag, { key: "sign", className: "row-sign", "aria-hidden": true }, sign),
     createElement(
       cellTag,
       { key: "body", className: bodyClassName === undefined ? "row-body" : `row-body ${bodyClassName}` },
-      children,
+      bodyContent,
     ),
   ];
 

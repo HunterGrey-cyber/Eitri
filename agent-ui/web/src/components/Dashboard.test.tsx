@@ -28,7 +28,9 @@ function session(over: Partial<ResumableSession> = {}): ResumableSession {
   };
 }
 
-function renderDash(over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void } = {}) {
+function renderDash(
+  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; prefix?: string } = {},
+) {
   const onItem = over.onItem ?? vi.fn();
   const props = {
     hello: over.hello ?? HELLO,
@@ -36,6 +38,7 @@ function renderDash(over: { hello?: Hello; mode?: PermissionModeChoice; cursor?:
     cursor: over.cursor ?? 0,
     narrow: over.narrow ?? false,
     onItem,
+    prefix: over.prefix ?? "Ctrl+b",
   };
   return { onItem, ...render(<Dashboard {...props} />) };
 }
@@ -74,11 +77,11 @@ describe("Dashboard (panel round 2 plan, Task 12; spec §7)", () => {
     expect(queryByText(/work/)).toBeNull();
   });
 
-  it("draws every item with its key letter (spec §7's table)", () => {
+  it("draws every item with its key letter (spec §7's table); mode reads ⇧Tab, not a letter (V1 S2)", () => {
     const withRecord: Hello = { ...HELLO, resumableSessions: [session()] };
     const { container } = renderDash({ hello: withRecord });
     const items = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
-    expect(items.map((el) => el.querySelector(".dash-key")!.textContent)).toEqual(["i", "r", "w", "m", "?"]);
+    expect(items.map((el) => el.querySelector(".dash-key")!.textContent)).toEqual(["i", "r", "w", "⇧Tab", "?"]);
   });
 
   it("shows the newest record's title, muted, next to Resume last", () => {
@@ -136,5 +139,33 @@ describe("Dashboard (panel round 2 plan, Task 12; spec §7)", () => {
     const items = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
     fireEvent.click(items[1]);
     expect(onItem).toHaveBeenCalledWith("resume");
+  });
+});
+
+describe("Dashboard's first-run hint line (V1 P11, spec §10.1)", () => {
+  it("shows the stock Ctrl+b prefix by default", () => {
+    const { container } = renderDash();
+    const hint = container.querySelector(".dash-hint")!;
+    expect(hint.textContent).toBe(
+      "Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · Ctrl+b  window keys · ?  all keys",
+    );
+  });
+
+  it("reads a configured prefix instead", () => {
+    const { container } = renderDash({ prefix: "Ctrl+a" });
+    const hint = container.querySelector(".dash-hint")!;
+    expect(hint.textContent).toBe(
+      "Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · Ctrl+a  window keys · ?  all keys",
+    );
+  });
+
+  it("is drawn on every render, not gated behind any first-run state", () => {
+    // No prop for "seen before" exists to gate this -- it is unconditional, per the spec's own
+    // "shown on every empty tab" (this screen is seen only when nothing else is, so it costs
+    // nothing and needs no first-run state file).
+    const first = renderDash();
+    expect(first.container.querySelector(".dash-hint")).not.toBeNull();
+    const second = renderDash();
+    expect(second.container.querySelector(".dash-hint")).not.toBeNull();
   });
 });

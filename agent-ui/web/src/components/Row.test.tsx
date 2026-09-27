@@ -69,6 +69,36 @@ describe("Row", () => {
     expect(row.getAttribute("aria-current")).toBe("true");
   });
 
+  /* Spec §10.2 (P11): a `problem` (a `classify()` result) draws a headline and remedy ABOVE the
+   *  row's own children, which stay exactly as they were -- "never hide the evidence". An error row
+   *  with nothing recognised (`problem` omitted, the common case) draws neither and is unchanged
+   *  from before this prop existed. */
+  it("draws a problem's headline and remedy above the row's own raw text, when given one", () => {
+    const { container } = render(
+      <Row kind="error" sign="✗" problem={{ headline: "Claude Code (claude) was not found.", remedy: "Install it." }}>
+        <pre>the raw failure text</pre>
+      </Row>,
+    );
+    const body = container.querySelector(".row-body")!;
+    const problemBlock = body.querySelector(".row-problem")!;
+    expect(problemBlock.querySelector("strong")!.textContent).toBe("Claude Code (claude) was not found.");
+    expect(problemBlock.querySelector(".row-problem-remedy")!.textContent).toBe("Install it.");
+    // The raw text is still there, unchanged, and still comes after the problem block.
+    expect(body.querySelector("pre")!.textContent).toBe("the raw failure text");
+    const children = Array.from(body.children);
+    expect(children.indexOf(problemBlock)).toBeLessThan(children.indexOf(body.querySelector("pre")!));
+  });
+
+  it("draws nothing extra when no problem was recognised (problem omitted)", () => {
+    const { container } = render(
+      <Row kind="error" sign="✗">
+        <pre>an unrecognised failure</pre>
+      </Row>,
+    );
+    expect(container.querySelector(".row-problem")).toBeNull();
+    expect(container.querySelector("pre")!.textContent).toBe("an unrecognised failure");
+  });
+
   /* The invariant, enforced over the SOURCE rather than over one render: no file may write a row's
      glyph by hand again. `data-sign` and `.row-sign` are the two readings that must agree, and the
      only way they can disagree is a second place that writes them -- so the guard is "there is no

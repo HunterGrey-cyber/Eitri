@@ -8,12 +8,17 @@ export type DashItem = "new" | "resume" | "sessions" | "mode" | "keys";
 
 /** The key each item runs on directly, spec §7's table -- also what `EmptyTab`'s `onKeyDown`
  *  dispatches on. Exported so that file and this one cannot silently disagree about which letter
- *  goes with which item. */
+ *  goes with which item.
+ *
+ *  V1 S2 (spec §2.4): `mode`'s column reads `⇧Tab`, not a letter -- the dashboard no longer claims
+ *  a bare `m` (it collided with a fast typist's ordinary prose, e.g. "make", "mode"). The item is
+ *  still reachable by `j`/`k` + Enter, Shift+Tab (`modeKey.ts`'s document-capture router, untouched
+ *  here) and `<leader>m`; `EmptyTab` never dispatches on this string, it is display only. */
 export const DASH_ITEM_KEY: Record<DashItem, string> = {
   new: "i",
   resume: "r",
   sessions: "w",
-  mode: "m",
+  mode: "⇧Tab",
   keys: "?",
 };
 
@@ -104,6 +109,11 @@ type Props = {
   cursor: number;
   narrow: boolean;
   onItem: (item: DashItem) => void;
+  /** V1 P11 (spec §10.1): the window's own prefix chord, as a person reads it (`"Ctrl+b"` stock,
+   *  `"Ctrl+a"` when `init.lua` reconfigures it) -- `App.tsx`'s `keymapHelp.prefix`, threaded
+   *  through `EmptyTab`. Read live rather than hard-coded so the hint line never lies about a
+   *  reconfigured prefix. */
+  prefix: string;
 };
 
 /** The empty tab's dashboard (panel round 2 plan, Task 12; spec §7): a centred `neovibe`, the
@@ -116,7 +126,7 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem }: Props) {
+export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props) {
   const items = dashItems(hello);
   const consequence = MODE_CONSEQUENCE[mode];
   return (
@@ -151,6 +161,12 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem }: Props) {
         ))}
       </div>
       {consequence !== undefined && <div className="dash-consequence">{consequence}</div>}
+      {/* V1 P11 (spec §10.1): one first-run hint line, shown on every empty tab rather than once --
+          the empty tab is seen only when nothing else is, so it costs nothing and needs no "first
+          run" state file. neovibe's own; the three keys are the audit's §5 item 5. */}
+      <div className="dash-hint">
+        {`Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  window keys · ?  all keys`}
+      </div>
     </div>
   );
 }

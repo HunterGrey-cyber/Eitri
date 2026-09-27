@@ -4,6 +4,11 @@
 //! [`crate::layout::kill::editor_quit_keys`] when a `:confirm qall` it asked nvim for is cancelled.
 //! Toolkit-free.
 //!
+//! Since v1 (spec `2026-09-27-v1-ui-design.md` §5, P1/P14) the same directory also holds
+//! `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l` a way out of the editor
+//! when vim-tmux-navigator is absent, and from Visual mode, writing the same letters to the same
+//! socket as the shim. It lives here because leaving can only work where the socket does.
+//!
 //! The half that is **not** here is the polling driver: `shell::pane_switch` owns the
 //! `glib::timeout_add_local` timer that calls [`accept_pending_messages`] once a tick and hands
 //! each message to a GTK focus grab or a kill-cancellation clear. That split is L2's own
@@ -58,8 +63,24 @@ const SOCKET_NAME: &str = "s.sock";
 /// not merely written down.
 const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME), ("neovibe-pane-switch-", "switch.sock")];
 
-/// A live pane-switch channel: a private directory holding the fake-`tmux` symlink and the Unix
-/// socket, plus the bound listener.
+/// The nav fallback's file name inside the channel's directory. `dofile`d through an environment
+/// variable, never bound, so no `sockaddr_un` limit applies to it.
+const NAV_LUA_NAME: &str = "nav_fallback.lua";
+
+/// The nav fallback itself (spec `2026-09-27-v1-ui-design.md` §5): a Lua copy of
+/// vim-tmux-navigator's `s:TmuxAwareNavigate` for Normal mode, plus a Visual-mode one that keeps the
+/// selection at nvim's edge, installed only where the global slot is empty, nvim's own default or a
+/// plain `<C-W>{dir}` move.
+pub(crate) const NAV_FALLBACK_LUA: &str = include_str!("nav_fallback.lua");
+
+/// The one `--cmd` (spec §5.1), guarded the way `nvim_keys`'s loader is: the path is checked before
+/// `dofile`, because `dofile(nil)` reads stdin -- under `--embed`, the RPC pipe -- and the load is
+/// `pcall`ed, so a broken snippet costs the fallback, never the editor.
+pub(crate) const NAV_LOADER_CMD: &str =
+    "lua local p = vim.env.NEOVIBE_NAV_LUA; if p and p ~= '' then pcall(dofile, p) end";
+
+/// A live pane-switch channel: a private directory holding the fake-`tmux` symlink, the Unix
+/// socket and the nav fallback's snippet, plus the bound listener.
 ///
 /// Both `Drop` and the explicit [`PaneSwitchChannel::cleanup`] remove that whole directory, but
 /// **neither is guaranteed to run**, so this type does not promise that nothing is left behind. In
@@ -71,6 +92,9 @@ const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME), ("neovibe-pane
 pub struct PaneSwitchChannel {
     dir: PathBuf,
     socket_path: PathBuf,
+    /// `None` when the snippet could not be written: the channel still serves the shim, and nvim
+    /// simply gets no fallback (neither `NEOVIBE_NAV_LUA` nor the loader).
+    nav_lua: Option<PathBuf>,
     listener: Option<UnixListener>,
 }
 
@@ -142,6 +166,20 @@ impl PaneSwitchChannel {
             return None;
         }
 
+        // Optional, unlike everything above: without it vim-tmux-navigator still leaves through the
+        // shim, so a failed write costs only the fallback (spec §5), never the channel.
+        let nav_path = dir.join(NAV_LUA_NAME);
+        let nav_lua = match std::fs::write(&nav_path, NAV_FALLBACK_LUA) {
+            Ok(()) => Some(nav_path),
+            Err(e) => {
+                eprintln!(
+                    "[pane_switch] could not write {}: {e} -- no Ctrl+h/j/k/l fallback without vim-tmux-navigator",
+                    nav_path.display()
+                );
+                None
+            }
+        };
+
         println!(
             "[pane_switch] fake tmux at {}, socket at {}",
             fake_tmux.display(),
@@ -150,6 +188,7 @@ impl PaneSwitchChannel {
         Some(Self {
             dir,
             socket_path,
+            nav_lua,
             listener: Some(listener),
         })
     }
@@ -162,13 +201,16 @@ impl PaneSwitchChannel {
     /// ignores `-S` entirely, so only the "non-empty, and does not contain the substring `tmate`"
     /// part is load-bearing (that substring is what the plugin's `s:TmuxOrTmateExecutable` tests
     /// to decide whether to invoke `tmate` instead of `tmux`).
+    ///
+    /// `NEOVIBE_NAV_LUA` names the nav fallback's snippet, which [`Self::nvim_args`]'s loader runs;
+    /// it is absent when the snippet could not be written, and the loader is then a no-op.
     pub fn child_env(&self) -> Vec<(String, String)> {
         let bin_dir = self.dir.join("bin");
         let path = match std::env::var("PATH") {
             Ok(existing) => format!("{}:{}", bin_dir.display(), existing),
             Err(_) => bin_dir.display().to_string(),
         };
-        vec![
+        let mut env = vec![
             (
                 "TMUX".to_string(),
                 format!("{},{},0", self.socket_path.display(), std::process::id()),
@@ -179,7 +221,20 @@ impl PaneSwitchChannel {
                 "NEOVIBE_PANE_SWITCH_SOCKET".to_string(),
                 self.socket_path.display().to_string(),
             ),
-        ]
+        ];
+        if let Some(nav_lua) = &self.nav_lua {
+            env.push(("NEOVIBE_NAV_LUA".to_string(), nav_lua.display().to_string()));
+        }
+        env
+    }
+
+    /// The nav fallback's `--cmd` loader (spec §5.1), for the nvim child only, beside the theme,
+    /// editor-context and nvim-keys feeds' own. Empty when the snippet could not be written.
+    pub fn nvim_args(&self) -> Vec<String> {
+        if self.nav_lua.is_none() {
+            return Vec::new();
+        }
+        vec!["--cmd".to_string(), NAV_LOADER_CMD.to_string()]
     }
 
     /// Hands the bound listener to the host's polling driver. Returns `None` the second time, which
@@ -394,10 +449,13 @@ mod tests {
         let dir = std::env::temp_dir().join("nv-ps-unit-test");
         let channel = PaneSwitchChannel {
             socket_path: dir.join(SOCKET_NAME),
+            nav_lua: Some(dir.join(NAV_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
         };
         let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
+        assert_eq!(env["NEOVIBE_NAV_LUA"], dir.join(NAV_LUA_NAME).display().to_string());
+        assert!(std::env::var_os("NEOVIBE_NAV_LUA").is_none());
 
         assert_eq!(env["TMUX_PANE"], "%0");
         // Non-empty (so `vim-tmux-navigator` takes its tmux-aware branch at all) and free of the
@@ -429,6 +487,76 @@ mod tests {
         // `channel` was built by hand and owns no real directory; make sure Drop's remove_dir_all
         // can't take out anything real if this test's temp path ever happened to exist.
         std::mem::forget(channel);
+    }
+
+    /// A channel whose snippet could not be written still serves the shim, and hands nvim neither
+    /// half of the fallback -- a loader with no `NEOVIBE_NAV_LUA` would be a no-op anyway, but an
+    /// argument that does nothing is one more thing to misread in `ps`.
+    #[test]
+    fn without_its_snippet_the_channel_hands_nvim_no_fallback() {
+        let dir = std::env::temp_dir().join("nv-ps-unit-test-no-nav");
+        let channel = PaneSwitchChannel {
+            socket_path: dir.join(SOCKET_NAME),
+            nav_lua: None,
+            dir: dir.clone(),
+            listener: None,
+        };
+        assert!(channel.child_env().iter().all(|(k, _)| k != "NEOVIBE_NAV_LUA"));
+        assert!(channel.nvim_args().is_empty());
+        std::mem::forget(channel);
+    }
+
+    /// `bind` writes the snippet into the channel's own directory, names it to the child, and
+    /// hands nvim the loader -- and `cleanup` takes it away with the rest of the directory.
+    #[test]
+    fn bind_writes_the_nav_fallback_beside_the_socket() {
+        // The shim is only a symlink's target here; nothing runs it.
+        let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("bind");
+        let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
+        let nav = PathBuf::from(&env["NEOVIBE_NAV_LUA"]);
+        assert_eq!(nav.parent(), channel.socket_path().parent());
+        assert_eq!(nav.file_name().unwrap(), NAV_LUA_NAME);
+        assert_eq!(std::fs::read_to_string(&nav).unwrap(), NAV_FALLBACK_LUA);
+        assert_eq!(
+            channel.nvim_args(),
+            vec!["--cmd".to_string(), NAV_LOADER_CMD.to_string()]
+        );
+        channel.cleanup();
+        assert!(!nav.exists());
+    }
+
+    #[test]
+    fn the_nav_loader_checks_its_path_before_dofile() {
+        assert!(NAV_LOADER_CMD.starts_with("lua "));
+        assert!(NAV_LOADER_CMD.contains("vim.env.NEOVIBE_NAV_LUA"));
+        assert!(NAV_LOADER_CMD.contains("if p and p ~= ''"));
+        assert!(NAV_LOADER_CMD.contains("pcall(dofile, p)"));
+    }
+
+    /// The snippet and this module are one protocol in two languages: the letters it writes are the
+    /// ones [`parse_message`] accepts, to the socket the shim writes to. The real-nvim test
+    /// (`core/tests/nav_fallback_with_real_nvim.rs`) checks what it does with them.
+    #[test]
+    fn the_nav_snippet_writes_what_the_socket_reads() {
+        for (dir, letter) in [("h", 'L'), ("j", 'D'), ("k", 'U'), ("l", 'R')] {
+            let needle = format!("dir = \"{dir}\", letter = \"{letter}\"");
+            assert!(NAV_FALLBACK_LUA.contains(&needle), "missing {needle:?}");
+            assert_eq!(
+                parse_message(&format!("{letter}\n")),
+                Some(PaneMessage::Direction(letter))
+            );
+        }
+        for needle in [
+            "vim.env.NEOVIBE_PANE_SWITCH_SOCKET",
+            "letter .. \"\\n\"",
+            "neovibe: window or pane ",
+            "\"VimEnter\"",
+            "\"VeryLazy\", \"LazyLoad\"",
+            "vim.schedule(",
+            "nvim_get_keymap(",
+        ] {
+            assert!(NAV_FALLBACK_LUA.contains(needle), "missing {needle:?}");
+        }
     }
 
     /// The seam between this crate and the host: everything a driver needs per tick is one call,

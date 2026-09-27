@@ -67,3 +67,13 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
   expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — a / d");
   expect(container.querySelector("button.stop")).not.toBeNull();
 });
+
+/** R34 (spec §4.2): "the activity line already ends in `ctrl+c interrupt` ...; it is kept and
+ *  pinned by a test, including while a card waits." Pins the button's own text, not just its
+ *  presence -- CC's own words, unchanged by a card taking over the rest of the line. */
+it("keeps ctrl+c interrupt as the Stop button's own text, even while a card waits (R34)", () => {
+  const { container } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
+  );
+  expect(container.querySelector("button.stop")!.textContent).toBe("ctrl+c interrupt");
+});

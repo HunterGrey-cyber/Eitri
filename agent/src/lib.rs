@@ -66,6 +66,6 @@ pub use provider::{
     ResumeSessionRequest, SendTurnRequest, SetPermissionModeRequest, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
-    packaged_sidecar_available, BackpressureStats, ClaudeSidecarProvider, CLIENT_IMPLEMENTS_RESUME,
-    CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT,
+    packaged_sidecar_available, sidecar_missing_message, BackpressureStats, ClaudeSidecarProvider,
+    CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT,
 };

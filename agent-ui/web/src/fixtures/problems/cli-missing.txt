@@ -1,0 +1,3 @@
+claude-sidecar exited with exit status: 1 before binding "/tmp/neovibe-sc-a1b2c3d4e5f6789012345678deadbeef.sock"; its stderr said:
+claude account: work (/home/user/.claude-work)
+could not determine the installed claude CLI version via "/home/user/.cache/nv-v1ui-11/none" (spawn error: spawnSync /home/user/.cache/nv-v1ui-11/none ENOENT)

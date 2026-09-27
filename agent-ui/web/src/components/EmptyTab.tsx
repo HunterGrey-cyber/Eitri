@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
+import type { NavKeyDirection } from "../bridge";
 import type { HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
 import { EMPTY_PANEL_TABLE } from "../keymap";
 import type { PanelBinding, PanelMode, PanelTable } from "../keymap";
@@ -15,6 +16,8 @@ import { Row } from "./Row";
 import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
+import { classify } from "../problems";
+import { leaderTypingFlash, TypingGuard } from "../typingGuard";
 
 /** Below this width (spec §7, "At 360 px") the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -22,6 +25,12 @@ import { WhichKeyBox } from "./WhichKeyBox";
  *  frame before its first measurement lands (and the only thing jsdom, which lays nothing out,
  *  ever reports). */
 const DASH_NARROW_PX = 360;
+
+/** V1 C1 (spec §3.5): what `App.tsx` bumps on each `nav_key` it has not already answered with
+ *  `nav_fallthrough` itself (an overlay owning the keys, a y/n, `?`) -- `seq` for the same reason
+ *  `RestoredDraft`/`QueueTaken` carry one: the same direction twice in a row must still re-fire the
+ *  effect below, which a bare boolean or a repeated string would coalesce away. */
+export type NavKeyRequest = { seq: number; direction: NavKeyDirection };
 
 export type EmptyTabProps = {
   hello: Hello | null;
@@ -43,6 +52,15 @@ export type EmptyTabProps = {
    *  same `overlayOpen` `App.tsx` computes, threaded through since this screen has no
    *  `containerRef` of its own for `App` to check. */
   overlayOpen: boolean;
+  /** V1 C1 (spec §3.5): a claimed `Ctrl+j`/`Ctrl+k` `App.tsx` has already checked against its OWN
+   *  overlays (`keymapOpen`, a y/n `confirm`) -- `null`/absent, or a `seq` already seen, is not a
+   *  request. This screen decides the rest itself: a `starting`/`failed` tab, or its own menu
+   *  (`mode === "browse"`) vs. composer (`mode === "input"`) not matching the direction, both answer
+   *  through `onNavFallthrough` rather than transitioning. */
+  navKeyRequest?: NavKeyRequest | null;
+  /** See `navKeyRequest`. Optional, like `onChooseSessions`, so this component's own tests need no
+   *  stand-in. */
+  onNavFallthrough?: (direction: NavKeyDirection) => void;
   /** Where this screen starts when it mounts, or when the window switches it to another empty tab
    *  (GUI pass 2026-09-26, r2-gui): `"browse"` after a tab switch or an arrival, `"input"` after a
    *  new tab's `enter_input` (R7) and at launch. `focusRequest` and `arriveRequest` are the
@@ -111,6 +129,20 @@ export type EmptyTabProps = {
    *  post the same window-level `tab_verb` regardless of which tab held the keys. */
   panelTable?: PanelTable;
   onPanelAction?: (binding: PanelBinding) => void;
+  /** V1 P11 (spec §10.1): the window's own prefix chord, as a person reads it (`App.tsx`'s
+   *  `keymapHelp.prefix`) -- threaded straight through to `Dashboard`'s own first-run hint line,
+   *  which is the only thing here that reads it. Defaults to `"Ctrl+b"`, the same stock default
+   *  `keymapHelp` itself starts at before the `keymap` envelope arrives, so a caller (this
+   *  component's own tests included) that never configured a prefix still gets a truthful hint. */
+  prefix?: string;
+  /** The v1-ui GUI pass (2026-09-27): the panel's one typing guard (`App.tsx`'s own), so the leader
+   *  here starts a sequence only on a key that stands alone or ends a quick motion, as it does over
+   *  a live conversation -- "set up my" typed onto this dashboard ran `<leader>m` and flipped the
+   *  stored mode to bypass, the thing S2 took the bare `m` away to stop. Optional: without one this
+   *  screen keeps its own, so its tests need no stand-in. */
+  typingGuard?: TypingGuard;
+  /** Says a refused leader in the band (`App.tsx`'s `showFlash`); optional for the same reason. */
+  onFlash?: (text: string) => void;
 };
 
 /** An empty session tab: Claude Code's fresh prompt (spec §3.6, F3). The composer is live in INPUT;
@@ -125,9 +157,28 @@ export function EmptyTab(props: EmptyTabProps) {
   const arriveAtMount = useRef(props.arriveRequest);
   const starting = tab.state === "starting";
   const failed = tab.state === "failed";
+  // Spec §10.2 (P11): `null` for a failure this build's classifier does not recognise (or none),
+  // in which case the row below draws exactly what it always did -- the raw text, and nothing more.
+  const failureProblem = failed && failure !== null ? classify(failure, hello?.account ?? null) : null;
   const showDashboard = hello !== null && !starting && !failed;
+  const prefix = props.prefix ?? "Ctrl+b";
   const [dashCursor, setDashCursor] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
+  /** F19 (spec §10.2): "The first start on a fresh Verdandi checkout also builds the sidecar." used
+   *  to be shown unconditionally on every starting screen, which is irrelevant on an installed
+   *  build where nothing gets built at all. It now waits 10s, per THIS tab's own starting spell
+   *  (`tab.id` in the deps below, so a switch to a different starting tab restarts the wait rather
+   *  than inheriting the old tab's elapsed time), and reads differently once it does. No wire
+   *  change: `tab.state` already said "starting", this only delays and rewords one sentence. */
+  const [stillStarting, setStillStarting] = useState(false);
+  useEffect(() => {
+    if (!starting) {
+      setStillStarting(false);
+      return;
+    }
+    const timer = setTimeout(() => setStillStarting(true), 10_000);
+    return () => clearTimeout(timer);
+  }, [starting, tab.id]);
   /** Wave 3 Task 1: what `Composer` actually reads, mirroring `App.tsx`'s own `composerFocusRequest`
    *  -- bumped only from the guarded `focusRequest`/`keysRequest` effects below, so an overlay drawn
    *  over this screen can never have its composer autofocused out from under it. */
@@ -149,6 +200,8 @@ export function EmptyTab(props: EmptyTabProps) {
   }, []);
   const narrow = widthPx > 0 && widthPx <= DASH_NARROW_PX;
   const panelTable = props.panelTable ?? EMPTY_PANEL_TABLE;
+  const [ownGuard] = useState(() => new TypingGuard());
+  const typingGuard = props.typingGuard ?? ownGuard;
   /* The leader/which-key engine (fix round 1, panel round 2 plan Task 12+13): a scoped-down copy of
      `App.tsx`'s own `seqRef`/`seq`/`boxShown`/`applySeqStep`/`clearSequence`, kept local to this
      screen rather than lifted to `App.tsx` -- this tab already keeps its own `mode` locally (BROWSE
@@ -288,6 +341,46 @@ export function EmptyTab(props: EmptyTabProps) {
     else root.focus({ preventScroll: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.keysRequest]);
+  /** V1 C1 (spec §3.1, §3.5): the menu's own `Ctrl+j`/the composer's own `Ctrl+k`, echoed back once
+   *  Rust's mirror has claimed one. Initialized from whatever `props.navKeyRequest` already was
+   *  (the `focusAtMount`/`arriveAtMount` pattern, "requests are edges, not levels" above): a count
+   *  reached before this screen mounted -- another tab's own stale request, still sitting in
+   *  `App.tsx`'s state -- is not a request to this one either. `starting`/`failed` (no box to enter)
+   *  and a `mode` that no longer matches the direction (stale, Review Focus 2) both report back
+   *  through `onNavFallthrough` rather than transitioning. */
+  const navKeySeenRef = useRef<number | null>(props.navKeyRequest?.seq ?? null);
+  useEffect(() => {
+    const req = props.navKeyRequest;
+    if (req === null || req === undefined || req.seq === navKeySeenRef.current) return;
+    navKeySeenRef.current = req.seq;
+    if (props.overlayOpen) {
+      props.onNavFallthrough?.(req.direction);
+      return;
+    }
+    // Fix round 1 (reviewer finding): a starting tab's composer is live ("C1: it queues behind the
+    // connect", this file's own `onKeyDown` comment above), so leaving an already-open INPUT must
+    // behave the same way `Esc` does there -- not fall through to Rust's `move_focus` and hand the
+    // keys off this screen entirely. Checked ahead of the `starting || failed` fallthrough below,
+    // which still owns every other case (entering INPUT while starting/failed at all, and `failed`'s
+    // own dead INPUT, never exempted here either, matching `Esc`'s own `!failed` guard). The root
+    // takes focus first, as `Esc`'s own branch does: `setMode("browse")` unmounts the textarea, and
+    // focusing afterwards would drop the keys onto `document.body` (wave 3 Task 1).
+    if (req.direction === "up" && mode === "input" && !failed) {
+      rootRef.current?.focus({ preventScroll: true });
+      setMode("browse");
+      return;
+    }
+    if (starting || failed) {
+      props.onNavFallthrough?.(req.direction);
+      return;
+    }
+    if (req.direction === "down" && mode === "browse") {
+      setMode("input");
+      return;
+    }
+    props.onNavFallthrough?.(req.direction);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.navKeyRequest]);
   /* Where the keys go when this screen is landed (integration of wave 3's single focus route with
      r2-gui's edge-only requests): the two request effects above now ignore a count reached before
      mount, so a mount or a switch has to put the keys somewhere itself -- otherwise a new tab made
@@ -352,6 +445,10 @@ export function EmptyTab(props: EmptyTabProps) {
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (props.answerConfirm?.(event)) return;
+    // Every other keydown is "a key" to the typing guard, first, as `App.tsx`'s own `onKeyDown` does
+    // (v1 S1): the leader below asks it whether it stood alone.
+    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    typingGuard.onKey(event.key, typedAt);
     // An IME key is never a key of this screen's, the leader engine's below included: the same
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
@@ -427,6 +524,12 @@ export function EmptyTab(props: EmptyTabProps) {
       const start = startSequence(panelTable, event.key, isActivatableControl(event.target));
       if (start.kind !== "none") {
         event.preventDefault();
+        // The v1-ui GUI pass (2026-09-27): in the middle of typed prose the leader is swallowed and
+        // says so, as over a live conversation (`TypingGuard.mayActAfterMotion`).
+        if (event.key === panelTable.leader && !typingGuard.mayActAfterMotion(typedAt, event.repeat)) {
+          props.onFlash?.(leaderTypingFlash(panelTable.leaderLabel));
+          return;
+        }
         applySeqStep(start);
         return;
       }
@@ -451,6 +554,13 @@ export function EmptyTab(props: EmptyTabProps) {
       if (item !== undefined) runItem(item);
       return;
     }
+    // V1 S2 (spec §2.4): `m` used to run `runItem("mode")` here. It collided with ordinary typed
+    // prose starting with `m` (e.g. "make", "mode") landing on the dashboard before `i` was
+    // pressed, so the bare letter is gone -- the item stays reachable by `j`/`k` + Enter (above),
+    // Shift+Tab (`modeKey.ts`'s document-capture router, which runs ahead of this handler and is
+    // untouched here) and `<leader>m` (the leader engine above, `DASH_ITEM_KEY.mode` is display
+    // only). A stray `m` (or the `m` in "make") now falls through this whole chain and does
+    // nothing, exactly like any other unbound letter.
     if (event.key === "i") {
       event.preventDefault();
       runItem("new");
@@ -460,9 +570,6 @@ export function EmptyTab(props: EmptyTabProps) {
     } else if (event.key === "w") {
       event.preventDefault();
       runItem("sessions");
-    } else if (event.key === "m") {
-      event.preventDefault();
-      runItem("mode");
     } else if (event.key === "?") {
       event.preventDefault();
       runItem("keys");
@@ -473,23 +580,28 @@ export function EmptyTab(props: EmptyTabProps) {
     <div className="empty-tab" tabIndex={0} onKeyDown={onKeyDown} ref={rootRef}>
       {handoff !== null && <HandoffCommandCard handoff={handoff} />}
       {failed && (
-        <Row kind="error" sign="✗" role="alert">
+        <Row kind="error" sign="✗" role="alert" problem={failureProblem}>
           <strong>This tab's session did not start.</strong>
           <pre>{failure ?? "no reason was given"}</pre>
           <div className="row-hint">Press r to start a new session here.</div>
         </Row>
       )}
       {starting && (
-        <p className="connecting">
-          Starting the agent backend… The first start on a fresh Verdandi checkout also builds the sidecar.
-        </p>
+        <>
+          <p className="connecting">Starting the agent backend…</p>
+          {/* F19 (spec §10.2): irrelevant on an installed build, where nothing gets built at all --
+              shown only once this tab has been starting for 10s, not on every starting screen. */}
+          {stillStarting && (
+            <p className="connecting">still starting — a first start from a Verdandi checkout builds the sidecar</p>
+          )}
+        </>
       )}
       {/* The empty tab's dashboard (spec §7): replaces the eight resume rows that used to sit below
           the composer. Never drawn while starting or failed (those screens keep their own).
           `hello !== null` (not just `showDashboard`, which TS cannot narrow through) is what lets
           `Dashboard`'s `hello: Hello` prop take it without a non-null assertion. */}
       {hello !== null && showDashboard && (
-        <Dashboard hello={hello} mode={tab.mode} cursor={dashCursor} narrow={narrow} onItem={runItem} />
+        <Dashboard hello={hello} mode={tab.mode} cursor={dashCursor} narrow={narrow} onItem={runItem} prefix={prefix} />
       )}
       <QueueLines items={props.queue ?? []} error={props.queueError ?? null} />
       <Composer

@@ -99,6 +99,10 @@ pub enum SessionCommand {
     /// A host selection gesture (Task 8): a drag's start/extend/finish, or a clear. See
     /// [`crate::select`].
     Select(SelectCommand),
+    /// `prefix [`/`prefix PageUp` opens the terminal's own read-only copy mode; leaving it (`q`,
+    /// `Esc`, or the shell exiting/restarting) always snaps back to the live bottom (Task 9, spec
+    /// §6.2). See [`crate::screen::Screen::set_copy_mode`].
+    CopyMode(bool),
     /// Hang up the child, reap it (killing it after [`HANGUP_GRACE`]), and end the thread.
     Shutdown,
 }
@@ -585,6 +589,7 @@ impl Worker<'_> {
                         self.flush_outbox();
                     }
                 }
+                Ok(SessionCommand::CopyMode(active)) => self.screen.set_copy_mode(active),
                 Ok(SessionCommand::Shutdown) | Err(TryRecvError::Disconnected) => return true,
                 Err(TryRecvError::Empty) => return false,
             }

@@ -70,6 +70,12 @@ pub enum Action {
     WindowImmersive,
     /// The pane with the keys only (spec §2.3: not bound by default).
     Text(TextChange),
+    /// tmux `copy-mode` (`up: false`) / `copy-mode -u` (`up: true`): enter the terminal's read-only
+    /// scrollback view, where the view is or scrolled up one page (spec §6.2, P5). Acts only when the
+    /// terminal holds the keys; elsewhere it flashes the refusal (`shell`, Task 9).
+    CopyMode {
+        up: bool,
+    },
 }
 
 /// An option's value as Lua gave it.
@@ -147,6 +153,7 @@ struct Opts {
     n: Option<i64>,
     keys: Option<String>,
     repeatable: Option<bool>,
+    up: Option<bool>,
 }
 
 fn bad(option: &str, why: impl Into<String>) -> ActionError {
@@ -164,10 +171,13 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
             ("n", OptValue::Int(i)) => out.n = Some(*i),
             ("keys", OptValue::Str(s)) => out.keys = Some(s.clone()),
             ("repeatable", OptValue::Bool(b)) => out.repeatable = Some(*b),
+            ("up", OptValue::Bool(b)) => out.up = Some(*b),
             ("cells" | "n", other) => return Err(bad(name, format!("must be a whole number, not {}", other.kind()))),
             ("keys", other) => return Err(bad(name, format!("must be one tmux key name, not {}", other.kind()))),
-            ("repeatable", other) => return Err(bad(name, format!("must be true or false, not {}", other.kind()))),
-            _ => return Err(bad(name, "is not an option (cells, n, keys, repeatable)")),
+            ("repeatable" | "up", other) => {
+                return Err(bad(name, format!("must be true or false, not {}", other.kind())))
+            }
+            _ => return Err(bad(name, "is not an option (cells, n, keys, repeatable, up)")),
         }
     }
     Ok(out)
@@ -224,6 +234,12 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "text.larger" => (Action::Text(TextChange::Larger), &[]),
         "text.smaller" => (Action::Text(TextChange::Smaller), &[]),
         "text.reset" => (Action::Text(TextChange::Reset), &[]),
+        "copy-mode" => (
+            Action::CopyMode {
+                up: o.up.unwrap_or(false),
+            },
+            &["up"],
+        ),
         _ => {
             if let Some(dir) = name.strip_prefix("resize.") {
                 let dir = direction(dir).ok_or_else(unknown)?;
@@ -262,6 +278,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         (o.cells.is_some(), "cells"),
         (o.n.is_some(), "n"),
         (o.keys.is_some(), "keys"),
+        (o.up.is_some(), "up"),
     ] {
         if given && !takes.contains(&option) {
             return Err(bad(option, format!("is not an option of {name}")));
@@ -312,6 +329,7 @@ impl Action {
             Action::Text(TextChange::Larger) => "text.larger".into(),
             Action::Text(TextChange::Smaller) => "text.smaller".into(),
             Action::Text(TextChange::Reset) => "text.reset".into(),
+            Action::CopyMode { .. } => "copy-mode".into(),
         }
     }
 
@@ -321,6 +339,7 @@ impl Action {
             Action::SendKeys(key) => vec![("keys".into(), OptValue::Str(key.to_string()))],
             Action::Resize { cells, .. } => vec![("cells".into(), OptValue::Int(i64::from(*cells)))],
             Action::Tab(TabAction::Select(n)) => vec![("n".into(), OptValue::Int(i64::from(*n)))],
+            Action::CopyMode { up: true } => vec![("up".into(), OptValue::Bool(true))],
             _ => vec![],
         }
     }
@@ -381,6 +400,7 @@ impl Action {
             Action::Text(TextChange::Larger) => "Text size larger, the pane with the keys only".into(),
             Action::Text(TextChange::Smaller) => "Text size smaller, the pane with the keys only".into(),
             Action::Text(TextChange::Reset) => "Text size reset, the pane with the keys only".into(),
+            Action::CopyMode { .. } => "Scroll the terminal back (copy mode)".into(),
         }
     }
 }
@@ -473,5 +493,32 @@ mod tests {
     fn send_keys_parses_its_key() {
         let parsed = parse("send-keys", &[("keys".into(), OptValue::Str("C-l".into()))], &[]).unwrap();
         assert_eq!(parsed.action, Action::SendKeys(KeySpec::parse("C-l").unwrap()));
+    }
+
+    #[test]
+    fn copy_mode_defaults_up_to_false_and_round_trips_through_name_and_options() {
+        assert_eq!(
+            parse("copy-mode", &[], &[]).unwrap().action,
+            Action::CopyMode { up: false }
+        );
+        for up in [false, true] {
+            let action = Action::CopyMode { up };
+            let parsed = parse(&action.name(), &action.options(), &[]).unwrap();
+            assert_eq!(parsed.action, action);
+        }
+        assert_eq!(
+            parse("copy-mode", &[("up".into(), OptValue::Bool(true))], &[])
+                .unwrap()
+                .action,
+            Action::CopyMode { up: true }
+        );
+        assert_eq!(
+            Action::CopyMode { up: false }.describe("Ctrl+b", "e / a / t"),
+            "Scroll the terminal back (copy mode)"
+        );
+        assert_eq!(
+            Action::CopyMode { up: true }.describe("Ctrl+b", "e / a / t"),
+            "Scroll the terminal back (copy mode)"
+        );
     }
 }

@@ -68,7 +68,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Rgb;
 use terminal_frame::frame::{ColorOverride, Rgb as FrameRgb, PALETTE_LEN};
-use terminal_frame::viewport::project_window;
+use terminal_frame::viewport::{max_scrollback, project_window};
 use terminal_frame::{Projector, TerminalFrame};
 use terminal_input::NormalizedInput;
 use terminal_render::color::{BACKGROUND, BRIGHT_FOREGROUND, CURSOR, DIM_FOREGROUND, FOREGROUND};
@@ -252,6 +252,11 @@ pub struct Screen {
     /// arrive through [`Listener`] the way title/bell/clipboard do, and needs this second slot
     /// merged in at the one place a caller reads events out.
     pending_selection: Option<String>,
+    /// Copy mode (Task 9, spec §6.2): read-only, entered by `prefix [`/`prefix PageUp`. Distinct
+    /// from `self.scroll.scrolled()` -- entering shows the `[N/M]` indicator at once, `[0/M]` at the
+    /// live bottom, where nothing is pinned yet and the plain scrollback keys (Task 7) show nothing
+    /// until the first scroll actually moves the window. See [`Self::copy_mode_indicator`].
+    copy_mode: bool,
 }
 
 impl Screen {
@@ -275,6 +280,7 @@ impl Screen {
             scroll: ScrollView::new(),
             pinned_frame: None,
             pending_selection: None,
+            copy_mode: false,
         }
     }
 
@@ -488,10 +494,39 @@ impl Screen {
             palette: &palette,
             cursor_color: self.cursor_coloring,
         });
-        if let Some((above, history)) = self.scroll.indicator(&self.term) {
+        if let Some((above, history)) = self.copy_mode_indicator() {
             list.ops.extend(indicator_ops(above, history, list.cols, &palette));
         }
         list
+    }
+
+    /// [`Self::render`]'s own `[N/M]` reading (owner ruling R6; spec §6.2 extends it to copy mode).
+    /// Outside copy mode this is exactly [`ScrollView::indicator`] (Task 7's plain scrollback keys):
+    /// `None` until the view is actually pinned. Copy mode additionally reports `Some((0, M))` while
+    /// unpinned -- tmux's own copy mode is visible from the moment it is entered, before any key has
+    /// moved the window, unlike Task 7's keys, which show nothing until the first scroll pins one.
+    fn copy_mode_indicator(&self) -> Option<(usize, usize)> {
+        match self.scroll.indicator(&self.term) {
+            some @ Some(_) => some,
+            None if self.copy_mode => Some((0, max_scrollback(&self.term))),
+            None => None,
+        }
+    }
+
+    /// `prefix [`/`prefix PageUp` opens copy mode; `q`/`Esc`/a shell exit or restart leaves it
+    /// (Task 9, spec §6.2). Entering neither pins nor unpins by itself: at the live bottom the view
+    /// keeps following new output exactly as it always has (module doc, Task 7) -- only
+    /// [`Self::copy_mode_indicator`] treats the toggle specially, so `[0/M]` is visible at once.
+    /// Leaving always snaps back to the bottom, whether or not the view had been scrolled up while
+    /// it was open, and marks the screen dirty either way -- the indicator is part of what a frame
+    /// shows.
+    pub fn set_copy_mode(&mut self, active: bool) {
+        self.copy_mode = active;
+        if active {
+            self.mark_dirty();
+        } else {
+            self.scroll(ScrollRequest::Bottom);
+        }
     }
 
     /// Applies one host scroll gesture ([`ScrollRequest`]): `Shift+PageUp`/`Shift+PageDown`, a wheel
@@ -1266,6 +1301,18 @@ mod tests {
         assert_eq!(screen.top_line(), 0);
     }
 
+    /// (d2) `HalfPages(n)` moves half a screen (`rows / 2` lines, at least one) at a time -- Task 9's
+    /// own `Ctrl+u`/`Ctrl+d` in copy mode.
+    #[test]
+    fn half_pages_move_half_a_screen_at_a_time() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        screen.scroll(ScrollRequest::HalfPages(1));
+        assert_eq!(screen.top_line(), -2, "half of SCROLL_SIZE.rows (5) is 2, rounded down");
+        screen.scroll(ScrollRequest::HalfPages(-1));
+        assert!(!screen.scrolled(), "back down by the same half screen unpins");
+    }
+
     /// (e) The alternate screen keeps no history (`max_scrollback == 0`): every scroll request is a
     /// no-op there. Task 9 turns the wheel into arrow keys for a program running in it instead.
     #[test]
@@ -1303,6 +1350,50 @@ mod tests {
             None,
             "the notice is the one announcement"
         );
+    }
+
+    // ---- copy mode (Task 9) ----
+
+    /// Entering copy mode shows the indicator at once, `[0/M]` at the live bottom where
+    /// `ScrollView::indicator` alone reports nothing because nothing is pinned there; scrolling
+    /// inside copy mode counts exactly as Task 7's plain scrollback keys already do; and leaving
+    /// always snaps back to the bottom and removes the indicator, whether or not the view had been
+    /// scrolled up in between.
+    #[test]
+    fn copy_mode_shows_0_of_m_at_the_bottom_and_leaving_removes_it() {
+        fn indicator_text(frame: &PaintList) -> Option<&str> {
+            frame.ops.iter().find_map(|op| match op {
+                terminal_render::PaintOp::DrawNotice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+        }
+
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..50);
+        assert_eq!(
+            indicator_text(&screen.render(true)),
+            None,
+            "not in copy mode: nothing drawn"
+        );
+
+        screen.set_copy_mode(true);
+        assert_eq!(
+            indicator_text(&screen.render(true)),
+            Some("[0/46]"),
+            "at the bottom, entering copy mode shows [0/M] at once"
+        );
+        assert!(!screen.scrolled(), "entering alone does not pin the view");
+
+        screen.scroll(ScrollRequest::Lines(3));
+        assert_eq!(
+            indicator_text(&screen.render(true)),
+            Some("[3/46]"),
+            "scrolling inside copy mode counts the same way Task 7's own keys do"
+        );
+
+        screen.set_copy_mode(false);
+        assert_eq!(indicator_text(&screen.render(true)), None, "leaving removes it");
+        assert!(!screen.scrolled(), "leaving snaps back to the bottom");
     }
 
     // ---- selection (Task 8) ----

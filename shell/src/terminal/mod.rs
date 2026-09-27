@@ -203,6 +203,13 @@ pub(crate) fn navigation(key: Key, state: ModifierType) -> Option<Direction> {
     crate::pane_switch::nav_direction(key, state)
 }
 
+/// `prefix [`/`prefix PageUp` (Task 9, spec §6.2): the terminal's own copy mode asks exactly the
+/// same question [`literal_target`] already answers for a literal chord -- does this pane hold the
+/// keys right now -- so this names that check rather than adding a second rule beside it.
+pub(crate) fn copy_mode_entry(focused: Option<ModuleKind>) -> bool {
+    matches!(literal_target(focused), LiteralTarget::Terminal)
+}
+
 /// Phase 1 takes two colours from the window's theme -- background and foreground -- so a light
 /// colorscheme does not get a dark box under it. The sixteen ANSI colours follow nvim in phase 4.
 ///
@@ -473,6 +480,16 @@ mod tests {
         assert_eq!(literal_target(Some(ModuleKind::Agent)), LiteralTarget::Panel);
         assert_eq!(literal_target(Some(ModuleKind::Canvas)), LiteralTarget::Neither);
         assert_eq!(literal_target(None), LiteralTarget::Neither, "the top bar");
+    }
+
+    #[test]
+    fn copy_mode_entry_is_exactly_holding_the_keys() {
+        assert!(copy_mode_entry(Some(ModuleKind::Terminal)));
+        assert!(!copy_mode_entry(Some(ModuleKind::Editor)));
+        assert!(!copy_mode_entry(Some(ModuleKind::Agent)));
+        assert!(!copy_mode_entry(Some(ModuleKind::LuaWebview)));
+        assert!(!copy_mode_entry(Some(ModuleKind::Canvas)));
+        assert!(!copy_mode_entry(None), "the top bar");
     }
 
     #[test]

@@ -5,6 +5,7 @@ import { KeymapOverlay } from "./KeymapOverlay";
 import { BROWSE_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS } from "../keymap";
 import type { KeyHelp, PanelTable } from "../keymap";
 import { TABLE } from "../testFixtures";
+import { listedSlashCommands } from "../slashCommands";
 
 afterEach(cleanup);
 
@@ -19,10 +20,17 @@ function overlay(onClose = () => {}, panel: PanelTable = EMPTY_PANEL_TABLE) {
 }
 
 describe("KeymapOverlay", () => {
-  it("renders the five groups, the leader between BROWSE and Anywhere, the last headed by the configured prefix", () => {
+  it("renders the six groups, the leader between BROWSE and Typing, Slash commands between Typing and Anywhere, the last headed by the configured prefix", () => {
     const { container } = overlay();
     const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
-    expect(titles).toEqual(["This panel", "Leader and tab keys", "Typing", "Anywhere in the window", "After Ctrl+b"]);
+    expect(titles).toEqual([
+      "This panel",
+      "Leader and tab keys",
+      "Typing",
+      "Slash commands",
+      "Anywhere in the window",
+      "After Ctrl+b",
+    ]);
   });
 
   it("follows a user's prefix", () => {
@@ -41,11 +49,15 @@ describe("KeymapOverlay", () => {
       expect(text).toContain(row.keys);
       expect(text).toContain(row.what);
     }
-    // Typing carries two rows of its own on top of INPUT_KEYS (C6): the pane-switch chord and the
-    // prefix, both of which neovibe keeps for itself rather than handing to the composer. The
-    // leader section adds none of its own -- `EMPTY_PANEL_TABLE` has no bindings.
+    // Typing carries four rows of its own on top of INPUT_KEYS: the pane-switch chord and the
+    // prefix (C6), plus V1 C1's `Ctrl+k`/`Ctrl+j` -- all four of which neovibe (or Rust's mirror)
+    // keeps for itself rather than handing to the composer. "This panel" carries one of its own on
+    // top of BROWSE_KEYS (V1 C1): `Ctrl+j`, Rust's mirror claiming the chord ahead of `resolveKey`.
+    // Neither GTK-decided pair can live in `BROWSE_KEYS`/`INPUT_KEYS` themselves -- both are tied to
+    // `resolveKey`/`COMPOSER_CHORDS` both ways (`keymap.test.ts`, `composerKeys.test.ts`). The leader
+    // section adds none of its own -- `EMPTY_PANEL_TABLE` has no bindings.
     expect(container.querySelectorAll("tr").length).toBe(
-      BROWSE_KEYS.length + INPUT_KEYS.length + 2 + WINDOW.length + PREFIX.length,
+      BROWSE_KEYS.length + 1 + INPUT_KEYS.length + 4 + WINDOW.length + PREFIX.length,
     );
   });
 
@@ -54,9 +66,24 @@ describe("KeymapOverlay", () => {
       <KeymapOverlay onClose={() => {}} windowKeys={[]} prefixKeys={[]} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} />,
     );
     const typing = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Typing"))!;
-    expect(typing.textContent).toContain("Ctrl+h / j / k / l");
+    // Fix round 1 (reviewer finding): narrowed to h/l -- j/k are claimed by the two rows below
+    // instead, so the pane row no longer claims them too.
+    expect(typing.textContent).toContain("Ctrl+h / l");
     expect(typing.textContent).toContain("Move between panes (neovibe keeps these)");
     expect(typing.textContent).toContain("Ctrl+b");
+    // V1 C1 (spec §3.1, §3.5): the mirror's own Ctrl+k/Ctrl+j, spliced in the same way.
+    expect(typing.textContent).toContain("Back to browsing (as Esc)");
+    expect(typing.textContent).toContain("The module below");
+  });
+
+  // V1 C1 (spec §3.1): the mirror's own `Ctrl+j` in "This panel" is spliced in the same way, since
+  // `resolveKey` never claims it either -- checked against a real panel `<Section>`, not just the
+  // whole-container row count above.
+  it("names the mirror's Ctrl+j in This panel too", () => {
+    const { container } = overlay();
+    const panelSection = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("This panel"))!;
+    expect(panelSection.textContent).toContain("Ctrl+j");
+    expect(panelSection.textContent).toContain("Type (the box below)");
   });
 
   it("closes on a click on its own backdrop, not on a click inside a table", () => {
@@ -67,6 +94,26 @@ describe("KeymapOverlay", () => {
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.click(container.querySelector(".keymap-overlay")!);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  describe("the slash commands section (spec §9.2, P10)", () => {
+    function slashSection(container: HTMLElement) {
+      return Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Slash commands"))!;
+    }
+
+    it("lists the works rows Enter would send, in the table's own order -- no /config, and /model <name>", () => {
+      const section = slashSection(overlay().container);
+      const items = Array.from(section.querySelectorAll("li")).map((li) => li.textContent);
+      expect(items).toEqual(listedSlashCommands().map((name) => `/${name}`));
+      expect(items).not.toContain("/config");
+      expect(items).toContain("/model <name>");
+    });
+
+    it("adds no <tr> of its own -- it is a plain list, not a key table", () => {
+      const section = slashSection(overlay().container);
+      expect(section.querySelectorAll("tr").length).toBe(0);
+      expect(section.querySelectorAll("table").length).toBe(0);
+    });
   });
 
   describe("the leader and tab keys section (panel round 2 plan, Task 8)", () => {

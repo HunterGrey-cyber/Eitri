@@ -11,6 +11,7 @@ import {
 } from "../composerKeys";
 import type { HistoryWalk } from "../promptHistory";
 import { stepHistory } from "../promptHistory";
+import { heldBackSlashCommand, slashCommandFlashText } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
 
 /** A draft the host is putting back into the box after a send was refused.
@@ -53,6 +54,12 @@ type Props = {
    *  textarea that is already mounted is focused again; a fresh one takes focus through
    *  `autoFocus` as before. */
   focusRequest?: number;
+  /** C1a (spec §3.2): which end the NEXT `focusRequest` bump should place the caret at -- `"kept"`
+   *  (the default) leaves `caretRef` alone (wherever the box was last left, or the end of the draft
+   *  the first time), `"end"` is `A`'s own promise (`:h A`) and forces it there regardless of
+   *  `caretRef`. Read once per bump, alongside `focusRequest` itself; a caller that never sets this
+   *  (every existing one before C1a) keeps today's "kept" behaviour exactly. */
+  caretOnFocus?: "kept" | "end";
   /** Whether the global `f` HINT may label this box (`../nav`'s `HINT_COMPOSER_ATTR`). `App.tsx`
    *  passes the negation of `disabled`: a landing on a textarea that cannot take focus would put the
    *  panel in an INPUT with nothing to type into. */
@@ -104,6 +111,7 @@ export function Composer({
   mode,
   onModeChange,
   focusRequest = 0,
+  caretOnFocus = "kept",
   hintTarget = false,
   onSend,
   onDraftChange,
@@ -123,6 +131,23 @@ export function Composer({
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
   const [searching, setSearching] = useState(false);
+  /* Spec §9.2 (P10): a local flash for a held-back slash command, drawn right here rather than
+   *  through the shared footer/band -- see `Chooser`'s own identical `showFlash`/`flash` pair and
+   *  its doc comment for why a local one exists at all (the window's own flash can sit behind
+   *  something drawn over it). `seq` for the same reason `RestoredDraft` has one: hitting Enter on
+   *  the SAME held-back text twice in a row is two flashes, not a no-op second attempt. */
+  const [slashFlash, setSlashFlash] = useState<{ text: string; seq: number } | null>(null);
+  const slashFlashSeq = useRef(0);
+  useEffect(() => {
+    if (slashFlash === null) return;
+    const seq = slashFlash.seq;
+    const timer = setTimeout(() => setSlashFlash((f) => (f?.seq === seq ? null : f)), 2000);
+    return () => clearTimeout(timer);
+  }, [slashFlash]);
+  function showSlashFlash(text: string) {
+    slashFlashSeq.current += 1;
+    setSlashFlash({ text, seq: slashFlashSeq.current });
+  }
 
   /* The box is cleared optimistically on send, because a round trip's worth of latency in a text
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
@@ -153,7 +178,12 @@ export function Composer({
   }
 
   useEffect(() => {
-    if (focusRequest > 0 && mode === "input") focusAtCaret();
+    if (mode === "input") {
+      // C1a: `A` forces the caret to the end regardless of where the box was last left; `i`/`o`
+      // (and every caller that predates C1a) leave `caretRef` alone, i.e. "kept".
+      if (caretOnFocus === "end") caretRef.current = null;
+      focusAtCaret();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRequest, mode]);
 
@@ -190,6 +220,14 @@ export function Composer({
   function submit(now: boolean) {
     if (disabled || editingInNvim) return;
     const body = text;
+    // Spec §9.2: a held-back slash command (no-op/error/hangs classed, or interactive-only --
+    // `/login`, `/config`, `/resume` always, `/model` only without an argument) is never sent, not
+    // even queued or "sent now": the draft stays exactly as typed and the flash names it.
+    const held = heldBackSlashCommand(body);
+    if (held !== null) {
+      showSlashFlash(slashCommandFlashText(held));
+      return;
+    }
     if (running) {
       if (now) onSendNow(body);
       else if (body.trim()) onQueue(body);
@@ -276,6 +314,11 @@ export function Composer({
         <p className="composer-closing" role="status">
           This conversation is being closed so it can continue in a terminal. Anything still in the
           box has <strong>not</strong> been sent, and is kept.
+        </p>
+      )}
+      {slashFlash !== null && (
+        <p className="composer-slash-flash" role="status">
+          {slashFlash.text}
         </p>
       )}
       {mode === "input" ? (
@@ -366,8 +409,14 @@ export function Composer({
         // that does not become active when focus actually reaches it would be the surprising
         // behaviour, not this.
         // It reads like the empty box it stands in for, not like an instruction: the owner asked for
-        // the "按 i 开始输入" line to go (2026-09-19), since Ctrl+l now opens the composer anyway.
-        // `i`, a click and Tab still reach INPUT from here exactly as before.
+        // the "按 i 开始输入" line to go (2026-09-19), when `Ctrl+l` was the only route into it. Its
+        // premise ended with panel round 2's decision 4: `Ctrl+l` (and `prefix a`, and a tab switch)
+        // land BROWSE now, not INPUT, so a reader can once again land here with no on-screen route
+        // into the box at all. C1b/S3 (spec §3.3) restores it: a dim `i or Ctrl+j to type`, after the
+        // placeholder or the draft alike, in BOTH cases -- never in INPUT (the caret is the sign
+        // there), on an ended session (its own branch above says `r` instead), or while a scratch
+        // round trip owns the draft (`editingInNvim`: typing here would only be lost to nvim's own
+        // buffer). `i`, a click and Tab still reach INPUT from here exactly as before.
         // The r2-gui GUI pass (2026-09-26): the same bare `❯` line INPUT draws (`mock: bottom.html`
         // B), so the bottom keeps its shape across `i`/`Esc`; the band's mode block is the mode.
         <>
@@ -379,6 +428,12 @@ export function Composer({
               "Ask the agent..."
             ) : (
               <span className="composer-draft">{twoLines(text)}</span>
+            )}
+            {!editingInNvim && (
+              <span className="composer-hint" aria-hidden="true">
+                {" "}
+                — i or Ctrl+j to type
+              </span>
             )}
             {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
           </div>

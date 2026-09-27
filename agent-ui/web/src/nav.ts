@@ -8,8 +8,10 @@
  * The model:
  *
  * - A **stop** is anything carrying `data-nav-stop`: a conversation row (`"row"`), a banner, the
- *   status line, the terminal-handoff area; on the start screen, each choice row and each mode
- *   button. `j`/`k` walk stops in document order, top to bottom. A stop with no usable control is
+ *   terminal-handoff area; on the start screen, each choice row and each mode button. The bottom
+ *   band is not one since C1c (v1 spec §3.4): `j` on the last stop goes nowhere, and the session's
+ *   details are `<leader>i`, `prefix i` or a click on the band. `j`/`k` walk stops in document
+ *   order, top to bottom. A stop with no usable control is
  *   skipped, except a row: rows carry the conversation cursor and are worth landing on for
  *   `Enter`/`y` even when they hold no button.
  * - A stop's **controls** are its enabled buttons, inputs, textareas and radios. `h`/`l` walk them
@@ -156,6 +158,12 @@ export type AnswerableItem =
  * card is the first permission item after it that names the same `toolUseId`. Any other row has
  * no card to answer, and `a`/`d` there do nothing, rather than reaching for the nearest card:
  * approving the wrong call is exactly what a keyboard shortcut must not make easy.
+ *
+ * v1 S4 (spec `2026-09-27-v1-ui-design.md` §2.2): this is the ONLY rule `a`/`d`/`D` follow. There is
+ * no "exactly one card anywhere, answered from any row" exception any more -- vim's operators act on
+ * what the cursor is on (`:h operator`), and R32 already lands an arrival on the oldest card, so
+ * the common case still needs no movement. With no target the panel says so (F13's flash) rather
+ * than doing nothing silently.
  */
 export function permissionTarget(items: AnswerableItem[], cursor: number): number | null {
   const here = items[cursor];
@@ -168,18 +176,6 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
     if (item.kind !== "permission") break;
   }
   return null;
-}
-
-/** P1 (spec, ruling 26): the card `a`/`d` answer from `cursor` -- the cursor's own
- *  (`permissionTarget`, unchanged), or, when the conversation holds exactly one card, that one from
- *  ANY row. Two or more cards keep the cursor rule: with more than one waiting, guessing which one a
- *  press with the cursor elsewhere meant is exactly the kind of surprise a keyboard shortcut must
- *  not risk (the same reasoning `permissionTarget`'s own doc comment gives). */
-export function answerTarget(items: AnswerableItem[], cursor: number): number | null {
-  const own = permissionTarget(items, cursor);
-  if (own !== null) return own;
-  const cards = items.flatMap((item, index) => (item.kind === "permission" ? [index] : []));
-  return cards.length === 1 ? cards[0] : null;
 }
 
 /** One panel target of the global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md

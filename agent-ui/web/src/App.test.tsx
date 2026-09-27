@@ -386,14 +386,22 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(current.textContent).toContain("Permission requested: Bash");
   });
 
-  it("leaves INPUT for the card, so a and d answer it at once", () => {
-    const { container } = withTwoCards();
-    enterInputMode(container);
-    expect(modeBlock(container).textContent).toBe("INPUT");
-    dispatch({ kind: "focus_permission", tab: 1 });
-    expect(modeBlock(container).textContent).toBe("BROWSE");
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+  it("leaves INPUT for the card, so a lone a answers it (after v1 S1's wait)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = withTwoCards();
+      enterInputMode(container);
+      expect(modeBlock(container).textContent).toBe("INPUT");
+      dispatch({ kind: "focus_permission", tab: 1 });
+      expect(modeBlock(container).textContent).toBe("BROWSE");
+      // The `i` above is a key: a lone `a` is one nothing came near (spec 2026-09-27 §2.1).
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("takes the composer when the card was answered in between", () => {
@@ -403,6 +411,30 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     dispatch({ kind: "pane_focus", focused: true });
     dispatch({ kind: "focus_permission", tab: 1 });
     expect(modeBlock(container).textContent).toBe("INPUT");
+  });
+
+  // Fix round 1 (reviewer finding): the "no card to land on, treat as an ordinary arrival" fallback
+  // above carries the same caret rule `i`/`o` do -- "kept" -- rather than whatever `composerCaret`
+  // was last left at by an earlier `A` press (that press bumps `composerFocusRequest` directly,
+  // never `inputRequest`, so nothing about it should leak into a later arrival here). Reproduced
+  // without this fix: the caret below landed at the end of the draft, not at 3.
+  it("takes the composer with the caret kept, not wherever an earlier A left composerCaret", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    dispatch({ kind: "pane_focus", focused: true });
+    const conversationRoot = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(conversationRoot, { key: "A", shiftKey: true }); // composerCaret -> "end", once.
+    const box1 = container.querySelector("textarea")!;
+    fireEvent.change(box1, { target: { value: "hello world" } });
+    box1.setSelectionRange(3, 3);
+    fireEvent.keyUp(box1, { key: "ArrowLeft" });
+    fireEvent.keyDown(box1, { key: "Escape" });
+    // No pending card by the time this arrives -- the "ordinary arrival" fallback, never i/o/A again.
+    dispatch({ kind: "focus_permission", tab: 1 });
+    const box2 = container.querySelector("textarea")!;
+    expect(box2.selectionStart).toBe(3);
+    expect(box2.selectionEnd).toBe(3);
   });
 
   /* The merge of modules P2 with the streaming-scroll fix (2026-09-24): landing on the card moves the
@@ -459,9 +491,15 @@ describe("literal_key C-a (send-prefix from shell's prefix)", () => {
 describe("App handshake", () => {
   it("announces itself with a `ready` carrying a request id, before anything else", () => {
     render(<App />);
-    expect(posted).toHaveLength(1);
+    // V1 C1 (spec §3.5): `panel_keys` now follows on mount too (the mirror's own "once after ready"),
+    // so this no longer asserts the whole post list is length 1 -- only that `ready` leads it. See
+    // "the composer mirror" describe block below for what that second post actually says.
     expect(posted[0].type).toBe("ready");
     expect(typeof posted[0].request_id).toBe("string");
+    // Fix round 1 (reviewer finding): pin what the second post actually is, rather than leaving the
+    // comment above as the only thing saying so -- before `hello`/`tabs`, `activeTab` is `null` and
+    // there is no box of any kind, so the mirror's first value is `other`.
+    expect(posted[1]).toMatchObject({ type: "panel_keys", mode: "other" });
   });
 
   it("waits for a tabs envelope before showing anything but a connecting message", () => {
@@ -1207,15 +1245,25 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     /* Every control a keyboard user can Tab to inside the conversation, by the label they read.
        Approve and Deny are the two that were reported; the rest share the one handler and would
        have failed the same way. */
-    it("does not preventDefault Enter or Space on any of the card's own buttons", () => {
-      const { container } = withAToolCallAndAPermission();
-      for (const label of ["Approve", "Deny"]) {
-        const button = buttonLabelled(container, label)!;
-        expect(button, `no button labelled ${label}`).toBeDefined();
-        for (const key of ["Enter", " "]) {
+    /* v1 S5 (spec 2026-09-27 §2.3) narrows this on purpose: Enter is still left to a card's own
+       buttons -- the regression this block pins -- but Space on them is now claimed and does
+       nothing. Enter is pressed with no key just before it, since S1 refuses one right after typing
+       (spec §2.1); that half is `v1: typing never answers a card`'s. */
+    it("does not preventDefault Enter on any of the card's own buttons, and claims Space there (v1 S5)", () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = withAToolCallAndAPermission();
+        for (const label of ["Approve", "Deny"]) {
+          const button = buttonLabelled(container, label)!;
+          expect(button, `no button labelled ${label}`).toBeDefined();
+          act(() => vi.advanceTimersByTime(300));
           // fireEvent returns false exactly when the default was prevented.
-          expect(fireEvent.keyDown(button, { key }), `${label} swallowed ${JSON.stringify(key)}`).toBe(true);
+          expect(fireEvent.keyDown(button, { key: "Enter" }), `${label} swallowed Enter`).toBe(true);
+          act(() => vi.advanceTimersByTime(300));
+          expect(fireEvent.keyDown(button, { key: " " }), `${label} left Space to the button`).toBe(false);
         }
+      } finally {
+        vi.useRealTimers();
       }
     });
 
@@ -1230,12 +1278,12 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        (`./nav`), a focused button is an ordinary place for the keys to be, so `h`/`j`/`k`/`l` from
        it must still navigate. What the original regression needs is narrower and is asserted
        directly: Enter and Space from a button are left to the button. */
-    it("leaves Enter and Space on a focused button to the button, and still navigates from it", () => {
+    it("leaves Enter on a focused Approve to the button, claims Space (v1 S5), and still navigates from it", () => {
       const { container } = withAToolCallAndAPermission();
       const approve = buttonLabelled(container, "Approve")!;
       // `fireEvent` returns false when the handler called preventDefault, i.e. claimed the key.
       expect(fireEvent.keyDown(approve, { key: "Enter" })).toBe(true);
-      expect(fireEvent.keyDown(approve, { key: " " })).toBe(true);
+      expect(fireEvent.keyDown(approve, { key: " " })).toBe(false);
       expect(fireEvent.keyDown(approve, { key: "k" })).toBe(false);
     });
 
@@ -1418,7 +1466,7 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
     expect(posted.length).toBe(0);
   });
 
-  it("Space with the Approve button focused activates the button, starting no sequence", () => {
+  it("Space with the Approve button focused starts no sequence, and no longer activates it (v1 S5)", () => {
     vi.useFakeTimers();
     try {
       const { container } = started();
@@ -1430,10 +1478,10 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
       posted.length = 0;
       const approve = buttonLabelled(container, "Approve")!;
       approve.focus();
-      // `fireEvent` returns false only when the handler called `preventDefault` -- true means the
-      // key was left to the button's own native activation (the same convention the Approve-
-      // unreachable regression's own tests use).
-      expect(fireEvent.keyDown(approve, { key: " " })).toBe(true);
+      // `fireEvent` returns false only when the handler called `preventDefault` (the same convention
+      // the Approve-unreachable regression's own tests use). v1 S5 (spec 2026-09-27 §2.3): Space on a
+      // card's answer button is claimed and does nothing -- not the button, not the leader.
+      expect(fireEvent.keyDown(approve, { key: " " })).toBe(false);
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
       expect(container.querySelector(".which-key-box")).toBeNull();
       expect(posted.length).toBe(0);
@@ -1597,27 +1645,369 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
         binding(["<leader>", "t"], "panel.handoff", "terminal"),
       ],
     };
-    const { container } = started();
-    sendTable(withExtras);
-    act(() => root(container).focus());
+    // Fake time, and a pause before each leader: the leader starts a sequence only on a key that
+    // stands alone (the v1-ui GUI pass, `TypingGuard.mayActAfterMotion`), and three sequences fired
+    // back to back in real time would read as typing.
+    vi.useFakeTimers();
+    try {
+      const pause = () => act(() => vi.advanceTimersByTime(300));
+      const { container } = started();
+      sendTable(withExtras);
+      act(() => root(container).focus());
 
-    press(" ");
-    press("/");
-    expect(container.querySelector(".search-bar")).not.toBeNull();
-    act(() => root(container).focus());
+      pause();
+      press(" ");
+      press("/");
+      expect(container.querySelector(".search-bar")).not.toBeNull();
+      act(() => root(container).focus());
 
-    press(" ");
-    press("?");
-    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
-    // Close it so it does not swallow the next press.
-    fireEvent.keyDown(container.querySelector(".keymap-overlay")!, { key: "Escape" });
-    act(() => root(container).focus());
+      pause();
+      press(" ");
+      press("?");
+      expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+      // Close it so it does not swallow the next press.
+      fireEvent.keyDown(container.querySelector(".keymap-overlay")!, { key: "Escape" });
+      act(() => root(container).focus());
 
-    posted.length = 0;
-    press(" ");
+      posted.length = 0;
+      pause();
+      press(" ");
+      press("t");
+      expect(posted.length).toBe(0);
+      expect(container.querySelector(".handoff")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/* v1 S1, S4, S5 and F13 (spec `docs/superpowers/specs/2026-09-27-v1-ui-design.md` §2.1-§2.3): an
+   arrival lands BROWSE with the cursor on a waiting card (R02, R32), and a Claude Code user types at
+   once, so the first letters of a sentence arrive as BROWSE keys. `a`/`d`/`D` answer only when they
+   stand alone (`./typingGuard`), only the cursor's card (S4), and Space on a card button does
+   nothing (S5). Time is vitest's fake clock: jsdom stamps each keydown with `Date.now()`, so a gap
+   here is exactly the gap between two keys. */
+describe("v1: typing never answers a card", () => {
+  const TYPING = "a / d answer a card only on their own — i or Ctrl+j to type";
+  const NO_CARD = "no card here — i, o, A or Ctrl+j to type";
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** A running turn with one card (gating `toolu_1`), then two rows below it, and the keys arrived
+   *  on it the way `Ctrl+l`/`prefix a` bring them (`arrive`, which lands on the oldest card). */
+  function arrivedOnACard() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // `interrupt`, so the activity line has a Stop button: a button that answers no card.
+    dispatchLiveTab(snapshotState({ capabilities: { ...initialState().capabilities, interrupt: true } }), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "tidy up" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "rm build" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "rm build" } },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "meanwhile" },
+      { type: "user_prompt_submitted", text: "and the docs" },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    expect(rendered.container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    return rendered;
+  }
+  /** One keydown wherever focus is, the way a real key arrives. */
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  /** Enter or Space on a focused button, as a browser does it: jsdom never activates a button from
+   *  a keydown (see "the Approve-unreachable regression" above), so the activation is modelled
+   *  here -- a click exactly when the keydown's default was NOT prevented, the same way
+   *  `typeIntoInput` models text insertion. Returns whether the default survived. */
+  const pressOnButton = (key: string) => {
+    const button = document.activeElement as HTMLElement;
+    const notPrevented = fireEvent.keyDown(button, { key });
+    if (notPrevented) fireEvent.click(button);
+    return notPrevented;
+  };
+  const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const band = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+  const answered = () => posted.filter((m) => m.type === "permission_response");
+
+  it("arrive, then a l s o at 80 ms a key: nothing is answered, and the band says how to type", () => {
+    const { container } = arrivedOnACard();
+    for (const key of ["a", "l", "s", "o"]) {
+      press(key);
+      wait(80);
+    }
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+
+  it("a lone a approves the card under the cursor 250 ms later (R32 unchanged, only delayed)", () => {
+    arrivedOnACard();
+    press("a");
+    wait(249);
+    expect(answered()).toEqual([]);
+    wait(1);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+
+  it("a lone d denies it the same way", () => {
+    arrivedOnACard();
+    press("d");
+    wait(250);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
+  });
+
+  it("a then j at 200 ms: the j cancels the answer, flashes, and still moves", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(200);
+    press("j");
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(false);
+  });
+
+  it("a key just before a refuses it at once, and says so", () => {
+    const { container } = arrivedOnACard();
+    press("x");
+    wait(100);
+    press("a");
+    expect(band(container)).toBe(TYPING);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it("a held a's repeat answers nothing", () => {
+    arrivedOnACard();
+    press("a", { repeat: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it.each([
+    ["pane_focus false", () => dispatch({ kind: "pane_focus", focused: false })],
+    ["the ? overlay opening", () => dispatch({ kind: "open_keymap" })],
+    ["a switch to another tab", () => dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] })],
+    [
+      "the card resolving",
+      () =>
+        dispatch({
+          kind: "events", tab: 1, fromRevision: 6, throughRevision: 7,
+          events: [{ type: "permission_resolved", permission_id: "perm-1", outcome: "allowed" }],
+        }),
+    ],
+  ])("a lone a, then %s before 250 ms: nothing is answered", (_name, interrupt) => {
+    arrivedOnACard();
+    press("a");
+    wait(100);
+    interrupt();
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it("two rows below a lone card, a answers nothing and says there is no card here (S4, F13)", () => {
+    const { container } = arrivedOnACard();
+    press("j");
+    press("j");
+    expect(container.querySelector(".row-current")!.textContent).toContain("and the docs");
+    wait(300);
+    press("a");
+    expect(band(container)).toBe(NO_CARD);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it("Space on a focused Approve does nothing: not the button, not the leader (S5)", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    press("l");
+    expect(document.activeElement?.textContent).toBe("Approve");
+    wait(300);
+    expect(pressOnButton(" ")).toBe(false);
+    wait(WHICH_KEY_DELAY_MS + 1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    expect(document.activeElement?.textContent).toBe("Approve");
+  });
+
+  it("Enter on a focused Approve after 300 ms idle approves", () => {
+    arrivedOnACard();
+    press("l");
+    wait(300);
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+
+  it("l then Enter at 100 ms still approves: l is the walk onto the button", () => {
+    arrivedOnACard();
+    press("l");
+    wait(100);
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+
+  it("e then Enter at 100 ms on Approve answers nothing, and says so", () => {
+    const { container } = arrivedOnACard();
+    press("l");
+    wait(300);
+    press("e");
+    wait(100);
+    expect(pressOnButton("Enter")).toBe(false);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+
+  /* Fix round 1: a sentence ending in `l` walks onto Approve (the card's first control), and the
+     walk exception once let its Enter through. Every key of the unbroken run before Enter must now be
+     a walk (`./typingGuard`), so the spec's "…al⏎ lands on Deny" residual is refused instead. */
+  it.each([["cancel"], ["al"], ["deal"]])("arrive, then %s and Enter at 80 ms a key: Approve is focused and nothing is answered", (word) => {
+    const { container } = arrivedOnACard();
+    for (const key of word) {
+      press(key);
+      wait(80);
+    }
+    expect(document.activeElement?.textContent).toBe("Approve");
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+
+  it("l l then Enter at 80 ms a key walks onto Deny and denies", () => {
+    arrivedOnACard();
+    press("l");
+    wait(80);
+    press("l");
+    wait(80);
+    expect(document.activeElement?.textContent).toBe("Deny");
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
+  });
+
+  /* The fire-time check in `waitThenAnswer`: a card that resolved during the wait is never pressed,
+     even though its button object is still held. React never sees a click on a detached button, so
+     a native listener on the button itself is what shows the press did not happen. */
+  it("a lone a, then the card resolving: its Approve button is never pressed", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    const pressed = vi.fn();
+    approve.addEventListener("click", pressed);
+    press("a");
+    wait(100);
+    dispatch({
+      kind: "events", tab: 1, fromRevision: 6, throughRevision: 7,
+      events: [{ type: "permission_resolved", permission_id: "perm-1", outcome: "allowed" }],
+    });
+    expect(approve.isConnected).toBe(false);
+    wait(1000);
+    expect(pressed).not.toHaveBeenCalled();
+    expect(answered()).toEqual([]);
+  });
+
+  it("Enter on a button that answers nothing (Stop) keeps the browser's own activation", () => {
+    arrivedOnACard();
+    press("x");
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    // A key on its own (the v1-ui GUI pass: Stop no longer acts in the middle of typing, below).
+    wait(300);
+    expect(fireEvent.keyDown(stop, { key: "Enter" })).toBe(true);
+    wait(300);
+    expect(fireEvent.keyDown(stop, { key: " " })).toBe(true);
+  });
+
+  /* The v1-ui GUI pass (2026-09-27): `j` from the last row lands on Stop, so "just do it" typed after
+     an arrival interrupted the turn with its first Space (the card was denied with it), and "jl⏎"
+     the same with its Enter. Stop now acts only on a key that stands alone or ends a quick motion. */
+  it.each([[" "], ["Enter"]])("t then %j on Stop at 80 ms interrupts nothing, and says so", (key) => {
+    const { container } = arrivedOnACard();
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    wait(300);
     press("t");
-    expect(posted.length).toBe(0);
-    expect(container.querySelector(".handoff")).not.toBeNull();
+    wait(80);
+    expect(pressOnButton(key)).toBe(false);
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+    expect(band(container)).toBe("Stop takes a key only on its own — i or Ctrl+j to type");
+  });
+
+  it("j onto Stop then Enter at 80 ms is one quick motion: it interrupts", () => {
+    arrivedOnACard();
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    wait(300);
+    press("j");
+    wait(80);
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(posted.some((m) => m.type === "interrupt")).toBe(true);
+  });
+
+  /* The same pass: the leader starts a sequence wherever the row cursor has the keys, so typed prose
+     ran them -- "set up my" `<leader>m` (the mode switch that, on a switch-capable sidecar, approves
+     every waiting card), "the boy" `<leader>bo` and its own `y`. */
+  it("e Space b b at 80 ms a key: no leader sequence runs, and the band says so", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    for (const key of ["e", " ", "b", "b"]) {
+      press(key);
+      wait(80);
+    }
+    wait(1000);
+    expect(posted.filter((m) => m.type === "tab_verb")).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    expect(band(container)).toBe("Space starts a sequence only on its own — i or Ctrl+j to type");
+  });
+
+  it("t Space m at 80 ms a key: <leader>m never runs", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    const before = posted.length;
+    for (const key of ["t", " ", "m"]) {
+      press(key);
+      wait(80);
+    }
+    wait(1000);
+    expect(posted.slice(before).filter((m) => m.type === "cycle_mode" || m.type === "cycle_default_mode")).toEqual([]);
+    expect(band(container)).not.toMatch(/mode is fixed/);
+  });
+
+  it("k k then Space b b at 80 ms a key: a quick motion, so the leader still runs", () => {
+    arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    for (const key of ["k", "k", " ", "b", "b"]) {
+      press(key);
+      wait(80);
+    }
+    expect(posted.filter((m) => m.type === "tab_verb").map((m) => m.verb)).toEqual(["last"]);
+  });
+
+  it("a lone D puts the keys in the card's reason box 250 ms later", () => {
+    const { container } = arrivedOnACard();
+    press("D", { shiftKey: true });
+    const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    expect(document.activeElement).not.toBe(reason);
+    wait(250);
+    expect(document.activeElement).toBe(reason);
+  });
+
+  it("D then o within 250 ms: the reason box is not focused", () => {
+    const { container } = arrivedOnACard();
+    press("D", { shiftKey: true });
+    wait(100);
+    press("o");
+    wait(1000);
+    expect(document.activeElement).not.toBe(container.querySelector(".permission-card input"));
+    expect(band(container)).toBe(TYPING);
   });
 });
 
@@ -1648,17 +2038,32 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     return rendered;
   }
 
+  // `a`/`d` answer after v1 S1's wait, and only when nothing came near them (spec 2026-09-27 §2.1).
   it("a on the tool call answers the card that gates it, without moving onto the card", () => {
-    withACardAndStop();
-    press("a");
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+    vi.useFakeTimers();
+    try {
+      const { container } = withACardAndStop();
+      press("a");
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("d on the card itself denies it", () => {
-    withACardAndStop();
-    press("j");
-    press("d");
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "deny" });
+    vi.useFakeTimers();
+    try {
+      withACardAndStop();
+      press("j");
+      act(() => vi.advanceTimersByTime(300));
+      press("d");
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "deny" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("l walks the card's Approve, Deny and reason box; h and Esc come back to the row", () => {
@@ -1693,11 +2098,19 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   });
 
   it("does not answer a card from Stop, where the row cursor is not what the keys act on", () => {
-    withACardAndStop();
-    press("j");
-    press("j");
-    press("a");
-    expect(lastOfType("permission_response")).toBeUndefined();
+    vi.useFakeTimers();
+    try {
+      withACardAndStop();
+      press("j");
+      press("j");
+      // Long enough that v1 S1's guard is not what refuses it.
+      act(() => vi.advanceTimersByTime(300));
+      press("a");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("permission_response")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("hands a key that lands on <body> back to the panel", () => {
@@ -1782,11 +2195,13 @@ describe("App global HINT: the panel's half", () => {
   }
   /** Where each target of `conversation()` sits in the frozen list, i.e. the index `shell` sends:
    *  rows in document order, each followed by its code blocks and then its controls, the card's in
-   *  `data-nav-order` (Approve, Deny, reason), then the activity line's Stop, then the always-present
-   *  band (panel round 2 plan, Task 10; its one control at width 0 -- `band.ts`'s own
-   *  pre-measurement floor -- is `.band-open`, `data-nav-stop="status-band"`'s own only child that
-   *  matches `controlsOf`'s selector). */
-  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8, band: 9 };
+   *  `data-nav-order` (Approve, Deny, reason), then the activity line's Stop. **Correction (C1c, spec
+   *  §3.4):** the band used to be one more target past `stop` (its `.band-open`, `data-nav-stop=
+   *  "status-band"`'s own only child that matched `controlsOf`'s selector) -- dropping that attribute
+   *  so the band stops being a `j`/`k` stop also drops it out of `hintTargets` (`nav.ts` builds both
+   *  lists from the same `stopsIn`), so HINT no longer reaches it either; its details are still
+   *  reachable on `<leader>i`, `prefix i` and a click, none of which go through this list. */
+  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
 
   it("f in BROWSE asks shell for a HINT, and f in INPUT is just a letter", () => {
     const { container } = conversation();
@@ -1837,13 +2252,21 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("once the HINT it asked for has ended, the keys are the panel's again", () => {
-      const { container } = onTheCard();
-      press("f");
-      collect(2);
-      dispatch({ kind: "hint_end", sessionId: 2 });
-      press("a");
-      expect(lastOfType("permission_response")).toBeDefined();
-      expect(container.querySelector(".row-permission")).not.toBeNull();
+      vi.useFakeTimers();
+      try {
+        const { container } = onTheCard();
+        press("f");
+        collect(2);
+        dispatch({ kind: "hint_end", sessionId: 2 });
+        // The `f` was a key: a lone `a` waits for nothing near it (v1 S1, spec 2026-09-27 §2.1).
+        act(() => vi.advanceTimersByTime(300));
+        press("a");
+        act(() => vi.advanceTimersByTime(250));
+        expect(lastOfType("permission_response")).toBeDefined();
+        expect(container.querySelector(".row-permission")).not.toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("a shell that never answers costs a second of dead keys, not a stuck panel", () => {
@@ -1881,9 +2304,10 @@ describe("App global HINT: the panel's half", () => {
 
   it("labels the composer and landing there enters INPUT with the caret in the box", () => {
     const { container } = idle();
-    // The prompt row, then the composer, then the always-present band (panel round 2 plan, Task 10).
-    expect(collect(1)).toBe(3);
-    show(1, 3);
+    // The prompt row, then the composer (C1c: the band is no longer a target -- see AT's own doc
+    // comment).
+    expect(collect(1)).toBe(2);
+    show(1, 2);
     expect(labels(container)[1].classList.contains("hint-composer")).toBe(true);
     dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
     const textarea = container.querySelector("textarea");
@@ -1892,15 +2316,37 @@ describe("App global HINT: the panel's half", () => {
     expect(lastOfType("send_message")).toBeUndefined();
   });
 
+  // Fix round 1 (reviewer finding): `landOnHint`'s "composer" branch carries the same caret rule
+  // `i`/`o` do -- "kept" -- rather than whatever `composerCaret` was last left at by an earlier `A`
+  // press (that press bumps `composerFocusRequest` directly, never `inputRequest`, so nothing about
+  // it should leak into a later HINT landing). Reproduced without this fix: the caret below landed
+  // at the end of the draft, not at 3.
+  it("landing on the composer via HINT keeps the caret where it was, not wherever an earlier A left composerCaret", () => {
+    const { container } = idle();
+    fireEvent.keyDown(root(container), { key: "A", shiftKey: true }); // composerCaret -> "end", once.
+    const box1 = container.querySelector("textarea")!;
+    fireEvent.change(box1, { target: { value: "hello world" } });
+    box1.setSelectionRange(3, 3);
+    fireEvent.keyUp(box1, { key: "ArrowLeft" });
+    fireEvent.keyDown(box1, { key: "Escape" });
+    // Land back on the composer via HINT, never via i/o/A again.
+    expect(collect(1)).toBe(2);
+    show(1, 2);
+    dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
+    const box2 = container.querySelector("textarea")!;
+    expect(box2.selectionStart).toBe(3);
+    expect(box2.selectionEnd).toBe(3);
+  });
+
   it("offers no composer label only once the session has ended (C1: a running turn no longer disables it)", () => {
     // A running turn no longer disables the composer (C1: it queues a follow-up instead), so it is
-    // a HINT target through the turn too -- one more than `AT`'s ten.
+    // a HINT target through the turn too -- one more than `AT`'s own count.
     const running = conversation();
     box(running.container.querySelector(".composer")!, 900);
     expect(collect(1)).toBe(Object.keys(AT).length + 1);
     cleanup();
     const { container } = idle();
-    expect(collect(2)).toBe(3);
+    expect(collect(2)).toBe(2);
     events({ type: "session_closed", reason: "done" });
     layOut(container);
     box(container.querySelector(".composer")!, 900);
@@ -1946,14 +2392,14 @@ describe("App global HINT: the panel's half", () => {
   it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
     const { container } = conversation();
     // 4 rows (prompt, reply, tool call, card) + the reply's code block + Approve + Deny + the
-    // reason box + Stop + the always-present band (panel round 2 plan, Task 10).
+    // reason box + Stop (C1c: the band no longer counts -- see AT's own doc comment).
     const count = collect(1);
     expect(count).toBe(Object.keys(AT).length);
     // Push the card row (and everything in it) below the list's viewport: it is no longer counted.
     const card = container.querySelector(".row-permission")!;
     box(card, 2000);
     for (const el of card.querySelectorAll("button, input")) box(el, 2000);
-    expect(collect(2)).toBe(6);
+    expect(collect(2)).toBe(5);
   });
 
   it("hint_show draws one label per frozen target, a row's over its sign cell", () => {
@@ -2820,6 +3266,35 @@ describe("App refused commands", () => {
   // specified for it by the plan.
 });
 
+describe("App: a live session's ending classified (spec §10.2, P11)", () => {
+  function ended(type: "session_unavailable" | "session_closed", reason: string) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type, reason }] });
+    return rendered;
+  }
+
+  it("a lost session whose reason is a login failure gets the headline above the unchanged raw text", () => {
+    const reason = "provider failed: Invalid API key · Please run /login";
+    const { container } = ended("session_unavailable", reason);
+    const row = container.querySelector(".row-error")!;
+    expect(row.querySelector(".row-problem strong")!.textContent).toBe("Claude Code is not logged in.");
+    expect(row.querySelector("pre")!.textContent).toBe(reason);
+  });
+
+  it("a closed session is classified the same way", () => {
+    const { container } = ended("session_closed", "Please run /login");
+    expect(container.querySelector(".row-ended .row-problem strong")!.textContent).toBe("Claude Code is not logged in.");
+  });
+
+  it("an unrecognised reason draws exactly what it drew before", () => {
+    const { container } = ended("session_unavailable", "provider exited");
+    expect(container.querySelector(".row-problem")).toBeNull();
+    expect(container.querySelector(".row-error pre")!.textContent).toBe("provider exited");
+  });
+});
+
 describe("App fatal errors", () => {
   it("shows the whole error text on the empty tab, with the dead session's transcript gone", () => {
     // `errorBanner` (`.fatal-error`) is deliberately kept out of the empty-tab render (Step 12): a
@@ -2884,7 +3359,7 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
   const overlay = (c: HTMLElement) => c.querySelector<HTMLElement>(".keymap-overlay");
 
-  it("opens on ? and shows all five groups, in the spec's order", () => {
+  it("opens on ? and shows all six groups, in the spec's order", () => {
     const { container } = started();
     act(() => root(container).focus());
     expect(overlay(container)).toBeNull();
@@ -2894,8 +3369,16 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    // "Leader and tab keys" (panel round 2 plan, Task 8) sits between BROWSE and "Anywhere".
-    expect(titles).toEqual(["This panel", "Leader and tab keys", "Typing", "Anywhere in the window", "After Ctrl+b"]);
+    // "Leader and tab keys" (panel round 2 plan, Task 8) sits between BROWSE and "Typing"; "Slash
+    // commands" (spec §9.2, P10) sits between "Typing" and "Anywhere".
+    expect(titles).toEqual([
+      "This panel",
+      "Leader and tab keys",
+      "Typing",
+      "Slash commands",
+      "Anywhere in the window",
+      "After Ctrl+b",
+    ]);
   });
 
   it("shows the rows shell sent in its keymap envelope", () => {
@@ -3322,19 +3805,26 @@ describe("the session chooser", () => {
 
   /** GUI pass, 2026-09-25: `prefix w` over an empty tab, then `Esc`, left the keys on
    *  `.agent-ui-root` -- the empty layout's anchor, which handles no key. Typing went nowhere and
-   *  not even `i` recovered it; only a click did. The empty tab's live control is its composer.
-   *  Wave 4 R2: D10's launch chooser is gone, so `Esc` here always returns the keys this way,
-   *  entirely locally -- there is no round trip to Rust for it any more. */
-  it("Esc from prefix w over an empty tab gives the composer the keys, in INPUT", () => {
+   *  not even `i` recovered it; only a click did. Wave 4 R2: D10's launch chooser is gone, so `Esc`
+   *  here always returns the keys this way, entirely locally -- there is no round trip to Rust for
+   *  it any more. **Correction (R16, spec §4.1):** the empty tab's live control used to be its
+   *  composer, landing INPUT; over an empty tab `Esc`/`q` now returns to the dashboard menu in
+   *  BROWSE instead (`Esc` never lands INPUT anywhere else in this panel either), reusing the same
+   *  `arrive` pair panel round 2's decision 4 already sends for every other keyboard arrival. */
+  it("Esc from prefix w over an empty tab returns to the dashboard menu, in BROWSE", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
     dispatch(ENV);
     const postsBefore = posted.length;
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
-    expect(posted.length).toBe(postsBefore);
+    // V1 C1 (spec §3.5): the chooser's own close is still local -- no round trip to Rust for IT --
+    // and the mirror posts once, BROWSE: this landing keeps BROWSE throughout (unlike the old
+    // INPUT-landing behaviour this test used to pin), so there is no second, mode-changing post.
+    expect(posted.slice(postsBefore)).toEqual([{ type: "panel_keys", request_id: expect.any(String), mode: "browse" }]);
     expect(container.querySelector(".chooser")).toBeNull();
-    expect(document.activeElement).toBe(container.querySelector("textarea"));
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
   });
 });
 
@@ -3439,13 +3929,24 @@ describe("P1: the keys land on a card that waits", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
-  it("a answers the only card from any row", () => {
-    const { container } = oneCard();
-    const root = container.querySelector(".agent-ui-conversation")!;
-    fireEvent.keyDown(root, { key: "g" });
-    fireEvent.keyDown(root, { key: "g" });
-    fireEvent.keyDown(root, { key: "a" });
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+  /* v1 S4 (spec 2026-09-27 §2.2) reverses P1's "a answers the only card from any row" (ruling 26):
+     `a` acts on the cursor's card only. The flash it shows instead is `v1: typing never answers a
+     card`'s. The wait is long enough that S1's guard is not what refuses it. */
+  it("a from another row does not answer the only card (v1 S4)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = oneCard();
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "g" });
+      fireEvent.keyDown(root, { key: "g" });
+      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(false);
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "a" });
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("permission_response")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a card arriving while typing leaves the mode alone and says how to answer it", () => {
@@ -3886,15 +4387,25 @@ describe("N3 and P5 in the conversation", () => {
     vi.unstubAllGlobals();
   });
 
-  it("D puts the keys in the only card's reason box; Enter there denies with the reason", () => {
-    const { container } = withBash();
-    const root = container.querySelector(".agent-ui-conversation")!;
-    fireEvent.keyDown(root, { key: "D", shiftKey: true });
-    const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
-    expect(document.activeElement).toBe(reason);
-    fireEvent.change(reason, { target: { value: "keep the build" } });
-    fireEvent.keyDown(reason, { key: "Enter" });
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "deny", reason: "keep the build" });
+  it("D puts the keys in the card's reason box; Enter there denies with the reason", () => {
+    // v1 S4/S1 (spec 2026-09-27 §2.1-§2.2): `D` acts on the cursor's card only, after the wait.
+    vi.useFakeTimers();
+    try {
+      const { container } = withBash();
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "j" });
+      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "D", shiftKey: true });
+      act(() => vi.advanceTimersByTime(250));
+      const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
+      expect(document.activeElement).toBe(reason);
+      fireEvent.change(reason, { target: { value: "keep the build" } });
+      fireEvent.keyDown(reason, { key: "Enter" });
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "deny", reason: "keep the build" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("the third button answers with remember, only when Rust offered a rule", () => {
@@ -4574,5 +5085,507 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
       expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
       vi.unstubAllGlobals();
     });
+  });
+});
+
+/* Task 3 (v1 v1-ui plan): the page's own half of C1's mechanism (spec §3.5) -- the `panel_keys`
+   mirror this page posts, and the `nav_key`/`nav_fallthrough` round trip a claimed `Ctrl+j`/`Ctrl+k`
+   takes. Task 2 (Rust) is a sibling task; this file only ever posts/dispatches the wire envelopes
+   the plan's own "Interfaces" block fixes, never anything from `install_module_nav` itself. */
+describe("v1 C1: the composer mirror (spec §3.5)", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // The `a.rs`/`b.rs` transcript line is only exercised by the "gf pick" row below; harmless to
+    // every other case, which never presses `g` then `f`.
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "compare a.rs and b.rs" }] }), 0);
+    return rendered;
+  }
+  function conversationRoot(container: HTMLElement): HTMLElement {
+    return container.querySelector(".agent-ui-conversation")!;
+  }
+  function closeSession(container: HTMLElement) {
+    void container;
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "session_closed", reason: "provider exited" }] });
+  }
+
+  it("posts browse while the live conversation is in BROWSE", () => {
+    startedApp();
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "browse" });
+  });
+
+  it("posts input once the composer is entered", () => {
+    const { container } = startedApp();
+    fireEvent.keyDown(conversationRoot(container), { key: "i" });
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "input" });
+  });
+
+  // Fix round 1 (reviewer finding): the title used to say "five mirrors" while the assertion below
+  // checks four -- `before` is captured already sitting in the first (BROWSE) of the five states, so
+  // only the four transitions AWAY from it post; the title now says what the assertion actually
+  // checks.
+  it("posts only on change: BROWSE -> INPUT -> BROWSE -> INPUT -> BROWSE is four new mirrors, not five", () => {
+    const { container } = startedApp();
+    const before = posted.filter((m) => m.type === "panel_keys").length;
+    const root = conversationRoot(container);
+    fireEvent.keyDown(root, { key: "i" });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    fireEvent.keyDown(root, { key: "i" });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    const mirrors = posted.filter((m) => m.type === "panel_keys").slice(before);
+    expect(mirrors.map((m) => m.mode)).toEqual(["input", "browse", "input", "browse"]);
+  });
+
+  it.each<[string, (container: HTMLElement) => void]>([
+    ["? (the keymap overlay)", (container) => fireEvent.keyDown(conversationRoot(container), { key: "?" })],
+    ["chooser", (container) => {
+      void container;
+      dispatch({ kind: "chooser", open: [], records: [] });
+    }],
+    ["details", (container) => {
+      void container;
+      dispatch({ kind: "tab_detail", tab: 1, rows: [{ label: "account", value: "work" }] });
+    }],
+    ["rename", (container) => {
+      void container;
+      dispatch({ kind: "begin_rename", tab: 1, current: null });
+    }],
+    ["/ (search)", (container) => fireEvent.keyDown(conversationRoot(container), { key: "/" })],
+    ["a y/n", (container) => {
+      void container;
+      dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    }],
+    ["a gf pick", (container) => {
+      const root = conversationRoot(container);
+      fireEvent.keyDown(root, { key: "g" });
+      fireEvent.keyDown(root, { key: "f" });
+    }],
+  ])("posts other with %s open", (_name, openOverlay) => {
+    const { container } = startedApp();
+    openOverlay(container);
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+  });
+
+  it("posts other once the session has ended", () => {
+    const { container } = startedApp();
+    closeSession(container);
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+  });
+
+  // Fix round 1 (reviewer finding): before the first `tabs` envelope, `activeTab` is `null` and the
+  // render shows only "Connecting to the shell…" -- there is no `EmptyTab`, so no box of any kind.
+  // `emptyMode`'s "input" default must not leak into the mirror here (it used to, claiming `Ctrl+k`
+  // for a composer that had never mounted).
+  it("posts other before the first tabs envelope (no box exists yet)", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+  });
+});
+
+describe("v1 C1: nav_key and its fallthrough (spec §3.5, Review Focus 2)", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    return rendered;
+  }
+  function conversationRoot(container: HTMLElement): HTMLElement {
+    return container.querySelector(".agent-ui-conversation")!;
+  }
+
+  it("nav_key down in BROWSE enters INPUT, no fallthrough", () => {
+    const { container } = startedApp();
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).not.toBeNull();
+    expect(posted.slice(before).some((m) => m.type === "nav_fallthrough")).toBe(false);
+  });
+
+  it("nav_key up in INPUT leaves it, cursor unchanged, draft kept, no fallthrough", () => {
+    // Fix round 1 (reviewer finding): a transcript with two rows, so "cursor unchanged" is actually
+    // checkable -- the earlier version of this test had nothing to assert it against.
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
+    const root = conversationRoot(container);
+    const cursorRowBefore = container.querySelector(".row-current")!.textContent;
+    fireEvent.keyDown(root, { key: "i" });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "half a thought" } });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".composer-draft")!.textContent).toBe("half a thought");
+    expect(posted.slice(before).some((m) => m.type === "nav_fallthrough")).toBe(false);
+    expect(container.querySelector(".row-current")!.textContent).toBe(cursorRowBefore);
+    // Fix round 1 (reviewer finding): the panel root, not `document.body`, must hold real DOM focus
+    // afterwards -- the same regression class "returns real DOM focus to the panel root after
+    // Escape" above guards against, but this chord had no assertion of its own.
+    expect(document.activeElement).toBe(root);
+  });
+
+  // Fix round 1 (reviewer finding): `nav_key down` must carry the same caret rule `i`/`o` do --
+  // "kept", spec §3.1's own words for this chord -- rather than whatever `composerCaret` was last
+  // left at by an unrelated `A` press (a bare `setMode("input")` reads that stale state, since
+  // `Composer`'s own effect keys on `mode` alone and does not require a fresh `composerFocusRequest`
+  // to run). Reproduced without this fix: the caret below landed at the end of the draft, not at 3.
+  it("nav_key down places the caret where it was left, not wherever an earlier A left composerCaret", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    fireEvent.keyDown(root, { key: "A", shiftKey: true }); // composerCaret -> "end", once.
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    // Enter INPUT via nav_key down (never i/o/A again), leave the caret at 3, leave via nav_key up --
+    // neither of those two touches composerCaret either.
+    dispatch({ kind: "nav_key", direction: "down" });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "hello world" } });
+    box.setSelectionRange(3, 3);
+    fireEvent.keyUp(box, { key: "ArrowLeft" });
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+    dispatch({ kind: "nav_key", direction: "down" });
+    const box2 = container.querySelector("textarea")!;
+    expect(box2.selectionStart).toBe(3);
+    expect(box2.selectionEnd).toBe(3);
+  });
+
+  // Whole-branch review of v1-ui: GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees a keydown, so
+  // a claimed `nav_key` is a key pressed in between -- exactly why `pane_focus`/`arrive` cancel a
+  // pending `g`/`z`/`[`/`]` prefix or leader sequence. Without that here, `g`, Ctrl+j, a draft,
+  // Ctrl+k left the box drawn over the composer and one later `g` completed the stale `gg`.
+  it("a claimed nav_key cancels a pending g prefix and hides its box", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
+      const root = conversationRoot(container);
+      act(() => root.focus());
+      const lastRow = container.querySelector(".row-current")!.textContent;
+      expect(lastRow).toContain("second");
+      fireEvent.keyDown(root, { key: "g" });
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      expect(container.querySelector(".which-key-box")).not.toBeNull();
+      dispatch({ kind: "nav_key", direction: "down" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      fireEvent.change(container.querySelector("textarea")!, { target: { value: "a draft" } });
+      act(() => vi.advanceTimersByTime(3000));
+      dispatch({ kind: "nav_key", direction: "up" });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      fireEvent.keyDown(root, { key: "g" });
+      expect(container.querySelector(".row-current")!.textContent).toBe(lastRow);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a claimed nav_key cancels a pending leader sequence", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+      const root = conversationRoot(container);
+      act(() => root.focus());
+      posted.length = 0;
+      fireEvent.keyDown(root, { key: " " });
+      fireEvent.keyDown(root, { key: "b" });
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      expect(container.querySelector(".which-key-box")).not.toBeNull();
+      dispatch({ kind: "nav_key", direction: "down" });
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      dispatch({ kind: "nav_key", direction: "up" });
+      fireEvent.keyDown(root, { key: "d" });
+      expect(posted.filter((m) => m.type === "tab_verb")).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("nav_key down while already INPUT (stale) falls through once, no mode change", () => {
+    const { container } = startedApp();
+    fireEvent.keyDown(conversationRoot(container), { key: "i" });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).not.toBeNull();
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+  });
+
+  it("nav_key down on an ended session falls through", () => {
+    const { container } = startedApp();
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "session_closed", reason: "provider exited" }] });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+  });
+
+  it("nav_key with an overlay (?) open falls through, and the overlay keeps the keys", () => {
+    const { container } = startedApp();
+    fireEvent.keyDown(conversationRoot(container), { key: "?" });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+  });
+
+  // Fix round 1 (reviewer finding): before the first `tabs` envelope, `EmptyTab` is not mounted yet
+  // (only "Connecting to the shell…" is on screen) -- a `nav_key` here used to be queued into
+  // `emptyNavKey` and then silently dropped the moment `EmptyTab` DID mount, because its
+  // `navKeySeenRef` seeds itself from that already-stale prop at mount and never fires for it.
+  it("nav_key before the first tabs envelope falls through, not silently dropped once EmptyTab later mounts", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // The "Connecting…" placeholder shares `EmptyTab`'s own `.empty-tab` class name; `.connecting`
+    // (only the placeholder has one) is what actually distinguishes "not mounted yet".
+    expect(container.querySelector(".connecting")).not.toBeNull();
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "up" }]);
+    // A later, real arrival must still work normally: the early fallthrough left no stale request
+    // behind for `EmptyTab`'s own `navKeySeenRef` to seed itself from and swallow.
+    dispatchEmptyTab();
+    expect(container.querySelector("textarea")).not.toBeNull(); // launches INPUT, as it always has.
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+});
+
+describe("v1 C1: nav_key over the empty tab (spec §3.1, §3.5)", () => {
+  it("menu nav_key down opens its composer", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "arrive" }); // lands the dashboard's own menu (BROWSE), not the composer.
+    expect(container.querySelector("textarea")).toBeNull();
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).not.toBeNull();
+    expect(posted.some((m) => m.type === "nav_fallthrough")).toBe(false);
+  });
+
+  it("composer nav_key up goes back to the menu, root focused", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab(); // starts in the composer (INPUT), as a plain launch always has.
+    expect(container.querySelector("textarea")).not.toBeNull();
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
+    expect(posted.some((m) => m.type === "nav_fallthrough")).toBe(false);
+  });
+
+  it("a starting tab falls through, never transitioning mode", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+    expect(container.textContent).toContain("Starting the agent backend");
+  });
+});
+
+/* Task 4 (v1 v1-ui plan): o/A and the caret (C1a, spec §3.2; the BROWSE placeholder hint itself,
+   C1b/S3, is unit-tested in Composer.test.tsx and not repeated here), j on the last stop (C1c, spec
+   §3.4), and Esc while a turn runs (R34, spec §4.2) -- each exercised through a real keydown on the
+   conversation root, confirming `resolveKey`'s action actually reaches `Composer`/the band and not
+   only that the pure table returns the right shape (`keymap.test.ts` already pins that). The
+   chooser's own Esc-over-an-empty-tab landing (R16) is pinned in "the session chooser" above; this
+   adds only its live-tab counterpart, for symmetry. */
+describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "hello" }] }), 0);
+    return rendered;
+  }
+  function conversationRoot(container: HTMLElement): HTMLElement {
+    return container.querySelector(".agent-ui-conversation")!;
+  }
+  /** Types "hello world" into the composer, leaves the caret at 3, then returns to BROWSE -- the
+   *  shared setup for both of `o`'s and `A`'s own caret checks below. */
+  function typeAndLeaveCaretAt3(container: HTMLElement, root: HTMLElement) {
+    fireEvent.keyDown(root, { key: "i" });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "hello world" } });
+    textarea.setSelectionRange(3, 3);
+    fireEvent.keyUp(textarea, { key: "ArrowLeft" });
+    fireEvent.keyDown(textarea, { key: "Escape" });
+  }
+
+  it("o restores the caret left at 3 in 'hello world'", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    typeAndLeaveCaretAt3(container, root);
+    fireEvent.keyDown(root, { key: "o" });
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea!.selectionStart).toBe(3);
+  });
+
+  it("A puts the caret at the end (11), regardless of where it was left", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    typeAndLeaveCaretAt3(container, root);
+    fireEvent.keyDown(root, { key: "A", shiftKey: true });
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    expect(textarea!.selectionStart).toBe("hello world".length);
+  });
+
+  it("o and A are refused on an ended session; O and I stay unbound", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 0,
+      throughRevision: 1,
+      events: [{ type: "session_closed", reason: "provider exited" }],
+    });
+    for (const key of ["o", "O", "I"]) {
+      fireEvent.keyDown(root, { key, shiftKey: key !== key.toLowerCase() });
+      expect(container.querySelector("textarea"), key).toBeNull();
+    }
+    fireEvent.keyDown(root, { key: "A", shiftKey: true });
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("j on the last stop flashes the typing hint once", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    // The one row this conversation has is already both the first and the last stop (a snapshot
+    // lands the cursor on the last row).
+    fireEvent.keyDown(conversationRoot(container), { key: "j" });
+    expect(container.querySelector(".band-message")!.textContent).toBe("i or Ctrl+j to type");
+    vi.unstubAllGlobals();
+  });
+
+  /* The v1-ui GUI pass (2026-09-27): holding `j` to the bottom never flashed -- every step after the
+     first is a repeat. The first repeat that stops after moving now flashes; the ones after it do not. */
+  it("a held j that reaches the last stop by repeat flashes once", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
+      act(() => widen(container));
+      const root = conversationRoot(container);
+      fireEvent.keyDown(root, { key: "k" });
+      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "j", repeat: true });
+      expect(container.querySelector(".band-message")?.textContent).toBe("i or Ctrl+j to type");
+      act(() => vi.advanceTimersByTime(2100));
+      expect(container.querySelector(".band-message")).toBeNull();
+      fireEvent.keyDown(root, { key: "j", repeat: true });
+      expect(container.querySelector(".band-message")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not flash on a held key's repeat -- only a fresh press", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "j", repeat: true });
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("k at the first stop stays silent -- vim's own k on line 1 (:h j)", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "k" });
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("Esc in BROWSE while a turn runs flashes that ctrl+c interrupts, and interrupts nothing", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ activeTurnId: "t1", transcript: [{ seq: 1, text: "hello" }] }), 0);
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "Escape" });
+    expect(container.querySelector(".band-message")!.textContent).toBe("Esc does not interrupt — ctrl+c does");
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it("Esc in BROWSE idle flashes nothing (D1: Esc never interrupts, and there is nothing to say)", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "Escape" });
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  /** R16's own live-tab counterpart (its empty-tab landing is pinned in "the session chooser"
+   *  above): unchanged, the chooser's Esc always returned the conversation its own root. */
+  it("Esc from the chooser over a live tab returns to the conversation root, unchanged", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    dispatch({ kind: "chooser", open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }], records: [] });
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+    expect(container.querySelector(".chooser")).toBeNull();
+    expect(document.activeElement).toBe(root);
+  });
+});
+
+describe("v1 P7: every panel y/n accepts Y too (spec §8)", () => {
+  it("Y confirms a tab close, same as y", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+    expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it("Y confirms close-others, same as y", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close_others", tabs: [2, 3], lines: ["close 2 other tabs? 1 running (y/n)"] });
+    fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+    expect(lastOfType("close_others")).toBeDefined();
+    expect(lastOfType("close_tab")).toBeUndefined();
+  });
+
+  it("n and Escape still cancel, no post", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "n" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+  });
+
+  it("a bare Shift is ignored -- the prompt stays open for the key that follows", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "Shift" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+    // Shift alone neither answered nor cancelled the prompt: the very next key still confirms it.
+    fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+    expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
   });
 });

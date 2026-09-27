@@ -101,7 +101,11 @@ export function StatusBand({ facts, paneFocused, onOpenDetail, onJump }: Props) 
   const glyphMode = pillGlyphMode(facts.pill);
 
   return (
-    <div className="status-band" data-nav-stop="status-band" ref={bandRef}>
+    // C1c (spec §3.4): the band stops being a `j`/`k` stop -- `data-nav-stop="status-band"` is gone
+    // -- because `j` reaching the last stop now flashes `i or Ctrl+j to type` there instead of
+    // landing the cursor on it. Its own details stay reachable on `<leader>i`, `prefix i` and a
+    // click (`onOpenDetail` below), none of which go through `nav.ts`'s stop list.
+    <div className="status-band" ref={bandRef}>
       {/* `aria-hidden`: not content, just this render's ruler. One character, at the band's own
           `--fs-sm`/mono font, so its rendered width IS one mono character's width. */}
       <span className="band-measure" aria-hidden="true" ref={measureRef}>

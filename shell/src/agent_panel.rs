@@ -27,12 +27,14 @@ use gtk4::Application;
 use neovibe_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
-    serialize_hello_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage, SessionModeChoice, TabVerbWire,
+    serialize_hello_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage,
+    NavKeyDirection, PanelKeys, SessionModeChoice, TabVerbWire,
 };
 use neovibe_core::keymap::TabAction;
+use neovibe_core::layout::Direction;
 use neovibe_core::tab_set::{FirstTurn, PendingHandoff, PendingStart, ResumeRoute, StartCollected, Tab, TabBackend};
 use neovibe_core::tabs::TabId;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -499,6 +501,14 @@ struct AgentPanelState {
     /// Where a `tab_verb` message's mapped `TabAction` goes (panel round 2 plan Task 6). `None`
     /// until `main.rs`'s `AgentPanelHandle::on_tab_verb` installs one.
     tab_verb_hook: Option<Rc<dyn Fn(TabAction)>>,
+    /// C1's mirror (spec §3.5): the page's last-reported `panel_keys` mode. Starts, and is reset to,
+    /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
+    /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
+    nav_mode: Cell<PanelKeys>,
+    /// Where a `nav_fallthrough` message's direction goes (C1, spec §3.5): `None` until `main.rs`'s
+    /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
+    /// can be refused.
+    nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
@@ -761,6 +771,20 @@ impl AgentPanelHandle {
         self.dispatch(neovibe_core::agent_bridge::serialize_arrive_for_js(), "arrive");
     }
 
+    /// C1's mirror (spec §3.5): the page's last-reported effective mode, for `main.rs`'s
+    /// `Ctrl+j`/`Ctrl+k` intercept to decide against (`claims`). `Other` before the page has ever
+    /// posted one, and again after every `ready` -- see `PanelKeys::Other`'s own doc.
+    pub(crate) fn panel_keys(&self) -> PanelKeys {
+        self.state.borrow().nav_mode.get()
+    }
+
+    /// C1's decision, dispatched to the page (spec §3.1, §3.5): `Ctrl+j` claimed in BROWSE, or
+    /// `Ctrl+k` claimed in INPUT. Safe before the page loads for the same reason `arrive` is --
+    /// there is no live mirror yet, so `main.rs`'s intercept never calls this before one exists.
+    pub(crate) fn nav_key(&self, direction: NavKeyDirection) {
+        self.dispatch(serialize_nav_key_for_js(direction), "nav-key");
+    }
+
     /// The `?` overlay's rows (`serialize_keymap_for_js`): recorded for every later `ready`, and
     /// sent now to a document that is already up.
     pub(crate) fn set_keymap_help(&self, payload: String) {
@@ -851,6 +875,13 @@ impl AgentPanelHandle {
     /// `main.rs` installs this once.
     pub(crate) fn on_tab_verb(&self, hook: impl Fn(TabAction) + 'static) {
         self.state.borrow_mut().tab_verb_hook = Some(Rc::new(hook));
+    }
+
+    /// Where a `nav_fallthrough` message's direction goes (C1, spec §3.5): `main.rs` wires this to
+    /// `move_focus(&ModuleId::agent(), dir)`, i.e. exactly what the chord would have done had the
+    /// panel never intercepted it. `main.rs` installs this once.
+    pub(crate) fn on_nav_fallthrough(&self, hook: impl Fn(Direction) + 'static) {
+        self.state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(hook));
     }
 }
 
@@ -1196,6 +1227,8 @@ pub(crate) fn build_agent_panel(
         document_ready: false,
         last_context_payload: None,
         tab_verb_hook: None,
+        nav_mode: Cell::new(PanelKeys::Other),
+        nav_fallthrough_hook: None,
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -2021,6 +2054,24 @@ fn ready_payloads(
     payloads
 }
 
+/// C1's mirror (spec §3.5, `AgentPanelState::nav_mode`'s own doc): called from the `Ready` arm on
+/// every `ready` -- the first one and every reload's alike -- so the mirror never survives a
+/// reload holding whatever mode the torn-down document last reported.
+///
+/// Without this, a reload while the composer is open (`nav_mode == Input`) leaves the mirror at
+/// `Input` even though the fresh document starts in BROWSE. Before that document posts its own
+/// first `panel_keys` message, `main.rs`'s `claims(Input, Direction::Down)` is `false`, so a
+/// `Ctrl+j` the user presses to enter the composer is not claimed and falls through to
+/// `move_focus` instead -- the opposite of what BROWSE + `Ctrl+j` must do (spec §3.1).
+///
+/// A plain field write rather than a bigger function only because it is one: kept apart from the
+/// rest of `Ready`'s payload-building so it has its own doc and its own test
+/// (`ready_resets_the_nav_mode_mirror_to_other`), the same reason `ready_payloads` and
+/// `changed_envelope` are pulled out of that arm.
+fn reset_nav_mode_for_ready(state: &AgentPanelState) {
+    state.nav_mode.set(PanelKeys::Other);
+}
+
 /// A window-level envelope for the tick: `Some` when the page can take it and it changed since the
 /// last one sent (phase 3 ruling 38). Recorded as sent only when it is returned.
 fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool) -> Option<String> {
@@ -2219,6 +2270,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let payloads = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
+                // C1's mirror (spec §3.5): "it starts other and returns to other on every ready
+                // (a reload)". A fresh document starts BROWSE-or-dashboard, never whatever mode
+                // the torn-down document last reported, so the mirror must not carry the old
+                // value across -- see `reset_nav_mode_for_ready`'s own doc for the failure this
+                // closes.
+                reset_nav_mode_for_ready(state_ref);
                 let greeting = BackendGreeting::for_kind(state_ref.backend_kind, state_ref.project_dir.clone());
                 let open = state_ref.tabs.open_session_ids();
                 let theme = neovibe_core::agent_bridge::serialize_theme_for_js(&state_ref.theme);
@@ -2829,6 +2886,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 Some(why) => refuse(webview, why),
             }
         }
+        // C1's mirror (spec §3.5): recorded so `main.rs`'s intercept can read it back through
+        // `AgentPanelHandle::panel_keys`. Never refused -- an unrecognised `mode` is a parse
+        // failure in `parse_inbound_message`, not something that reaches here.
+        InboundMessage::PanelKeys { mode, .. } => {
+            state.borrow().nav_mode.set(mode);
+            ok(webview);
+        }
+        InboundMessage::NavFallthrough { direction, .. } => match run_nav_fallthrough(state, direction) {
+            Ok(()) => ok(webview),
+            Err(why) => refuse(webview, why),
+        },
     }
 }
 
@@ -2865,6 +2933,24 @@ fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, verb: TabVerbWire) -> Resu
             Ok(())
         }
         None => Err("tab verbs are not wired"),
+    }
+}
+
+/// `nav_fallthrough`: the hook `main.rs` installs via `on_nav_fallthrough` (C1, spec §3.5), called
+/// with the direction the page could not apply -- or a refusal naming why there is none yet. Never
+/// touches the WebView, so it is tested directly, the same shape as `run_tab_verb`.
+fn run_nav_fallthrough(state: &Rc<RefCell<AgentPanelState>>, direction: NavKeyDirection) -> Result<(), &'static str> {
+    let hook = state.borrow().nav_fallthrough_hook.clone();
+    match hook {
+        Some(hook) => {
+            let direction = match direction {
+                NavKeyDirection::Down => Direction::Down,
+                NavKeyDirection::Up => Direction::Up,
+            };
+            hook(direction);
+            Ok(())
+        }
+        None => Err("nav fallthrough is not wired"),
     }
 }
 
@@ -3256,6 +3342,8 @@ mod tests {
             document_ready: false,
             last_context_payload: None,
             tab_verb_hook: None,
+            nav_mode: Cell::new(PanelKeys::Other),
+            nav_fallthrough_hook: None,
         }))
     }
 
@@ -3312,6 +3400,77 @@ mod tests {
         }
         assert_eq!(run_tab_verb(&state, TabVerbWire::Next), Ok(()));
         assert_eq!(*ran.borrow(), 1);
+    }
+
+    /// C1's mirror (spec §3.5): `handle_inbound_message`'s `PanelKeys` arm is what
+    /// `AgentPanelHandle::panel_keys` reads back, and it starts `Other`.
+    #[test]
+    fn a_panel_keys_message_updates_the_mirror_handle_inbound_message_records() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        assert_eq!(state.borrow().nav_mode.get(), PanelKeys::Other);
+        for mode in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
+            state.borrow().nav_mode.set(mode);
+            assert_eq!(state.borrow().nav_mode.get(), mode);
+        }
+    }
+
+    /// C1's mirror (spec §3.5): "it starts other and returns to other on every ready (a reload)".
+    /// A round trip through `handle_inbound_message`'s `Ready` arm needs a real `WebView`
+    /// (`dispatch_all`/`ok` both take one), so this pins the one-line mutation the arm calls,
+    /// `reset_nav_mode_for_ready`, directly -- the same shape as
+    /// `nav_fallthrough_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction`
+    /// pinning `run_nav_fallthrough` apart from the WebView it is also called from.
+    ///
+    /// Before this fix, nothing reset `nav_mode` on `ready`: a reload while `mode == Input` left
+    /// the mirror at `Input` even though the fresh document starts in BROWSE, so `main.rs`'s
+    /// `claims(PanelKeys::Input, Direction::Down)` was `false` and a `Ctrl+j` meant to open the
+    /// composer fell through to `move_focus` instead.
+    #[test]
+    fn ready_resets_the_nav_mode_mirror_to_other() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        for stale in [PanelKeys::Input, PanelKeys::Browse] {
+            state.borrow().nav_mode.set(stale);
+            reset_nav_mode_for_ready(&state.borrow());
+            assert_eq!(
+                state.borrow().nav_mode.get(),
+                PanelKeys::Other,
+                "stale {stale:?} must clear"
+            );
+        }
+    }
+
+    /// The same shape as `tab_verb_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_action`:
+    /// a refusal naming why until `main.rs` installs a hook, then called with the mapped
+    /// `neovibe_core::layout::Direction` -- both wire values, not just one.
+    #[test]
+    fn nav_fallthrough_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        assert_eq!(
+            run_nav_fallthrough(&state, NavKeyDirection::Down),
+            Err("nav fallthrough is not wired")
+        );
+
+        let seen: Rc<RefCell<Vec<Direction>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |direction| seen.borrow_mut().push(direction)));
+        }
+        for (wire, direction) in [
+            (NavKeyDirection::Down, Direction::Down),
+            (NavKeyDirection::Up, Direction::Up),
+        ] {
+            assert_eq!(run_nav_fallthrough(&state, wire), Ok(()));
+            assert_eq!(seen.borrow_mut().pop(), Some(direction), "{wire:?} -> {direction:?}");
+        }
     }
 
     /// Panel round 2 plan Task 6, spec §6.3: `CycleDefaultMode` moves the window's remembered

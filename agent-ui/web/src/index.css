@@ -799,6 +799,20 @@ body,
   color: var(--nv-fg);
   user-select: text;
 }
+/* Spec §10.2 (P11): `Row`'s own `problem` prop draws a headline (inherits `.row-body`'s own text
+   colour -- no `color:` here, so the guard above never has to look at it) and a remedy line ABOVE
+   whatever the row already rendered (`.row-error pre`'s raw text included, unchanged and below).
+   The remedy reads as secondary, the same `--nv-muted` `.row-hint` already uses for "press r". */
+.row-problem {
+  margin-bottom: 6px;
+}
+.row-problem-remedy {
+  color: var(--nv-muted);
+  margin-top: 2px;
+  /* A remedy can carry its own line breaks ("Looked for it at:" and the paths, one a line, for a
+     missing sidecar): the v1-ui GUI pass (2026-09-27) saw them run together into one line. */
+  white-space: pre-line;
+}
 /* An ordinary ending (the host closed it, the provider exited cleanly) -- deliberately NOT
    `row-error`. Round 1 of this task's review put both branches on `row-error`/`✗` on a misreading
    of spec §3.2's single "会话断开 / 错误" table row: that row is about a session that BROKE, and a
@@ -1049,6 +1063,17 @@ body,
   border-left: 2px solid var(--nv-warn);
   padding-left: 6px;
 }
+/* Spec §9.2 (P10): a held-back slash command's own local flash (`Composer.tsx`'s `slashFlash`),
+   same shape as `.composer-closing` just above -- transient rather than persistent, so it carries
+   no distinct colour of its own beyond the same `--nv-warn` border-only accent. */
+.composer-slash-flash {
+  flex: 0 0 100%;
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--nv-fg);
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 6px;
+}
 /* The shell-prompt glyph (panel round 2 plan, Task 10; spec §5.1, `mock: bottom.html` B `.b-comp`),
    replacing the box's own left border. Plain `--nv-fg`, deliberately NOT `--nv-mode-input`: that
    token is not guarded for text at all (the big comment just below, on `.composer-browse-hint`,
@@ -1099,6 +1124,18 @@ body,
 .composer-queued {
   margin-left: auto;
   padding-left: 8px;
+}
+/* C1b/S3 (spec §3.3): the dim reminder that follows the placeholder or the draft, restoring what
+   2026-09-19 removed on a premise panel round 2's decision 4 ended (`.composer-browse-hint`'s own
+   doc comment in `Composer.tsx`). Dimmer than the already-muted line it sits in, the same way
+   `.empty-tab-resume .detail` steps down from its own `strong` sibling. */
+.composer-hint {
+  opacity: 0.7;
+  /* Its own leading space would otherwise vanish: `.composer-browse-hint` is a flex row, which makes
+     this span a flex item, and a block's leading white space is removed. The v1-ui GUI pass
+     (2026-09-27) saw "Ask the agent...— i or Ctrl+j to type" in WebKitGTK. `pre-wrap` keeps the
+     space and still wraps a narrow panel. */
+  white-space: pre-wrap;
 }
 
 /* C3: the composer uses the panel's own face and scale (WebKitGTK's UA sheet gives form controls
@@ -1238,6 +1275,14 @@ body,
   color: var(--nv-muted);
   font-size: var(--fs-sm);
   margin-top: 4px;
+  max-width: 360px;
+}
+/* V1 P11 (spec §10.1): the first-run hint line, drawn under everything else on the dashboard --
+   same tokens as `.dash-consequence` (existing tokens only, no new ones). */
+.dash-hint {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+  margin-top: 8px;
   max-width: 360px;
 }
 /* The pill (spec §5.2), the `⏵⏵` glyph split into its own `.mode-glyph` span above -- moved into

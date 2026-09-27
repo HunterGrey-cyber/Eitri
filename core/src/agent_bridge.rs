@@ -54,6 +54,31 @@ impl SessionModeChoice {
     }
 }
 
+/// C1's mirror (spec §3.5): what the page currently is, for the `Ctrl+j`/`Ctrl+k` decision this
+/// module makes in Rust. `Browse` is a live tab's BROWSE (or the dashboard menu), with no overlay
+/// open and a box that can take INPUT; `Input` is the live composer (or the dashboard's), with no
+/// overlay open; `Other` is everything else -- an overlay open, an ended/starting/failed tab, and so
+/// on. The page posts a `panel_keys` message whenever the effective mode changes (and once after
+/// `ready`); `shell` keeps only the most recent value, starting (and resetting to) `Other` on every
+/// `ready` so a stale mirror from a torn-down document is never trusted across a reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelKeys {
+    Browse,
+    Input,
+    Other,
+}
+
+/// C1's `Ctrl+j`/`Ctrl+k` direction (spec §3.1): `Down` is `Ctrl+j` (BROWSE -> INPUT), `Up` is
+/// `Ctrl+k` (INPUT -> BROWSE). Only these two travel through this mechanism -- `Ctrl+h`/`Ctrl+l`
+/// never do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavKeyDirection {
+    Down,
+    Up,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
@@ -240,6 +265,19 @@ pub enum InboundMessage {
     CloseOthers {
         request_id: String,
     },
+    /// C1's mirror (spec §3.5), posted whenever the page's effective mode changes and once after
+    /// `ready`. See [`PanelKeys`]'s own doc.
+    PanelKeys {
+        request_id: String,
+        mode: PanelKeys,
+    },
+    /// C1's stale-mirror recovery (spec §3.5): a `nav_key` the page could not apply against its own
+    /// current state. `shell` runs `move_focus(agent, direction)`, i.e. exactly what the chord would
+    /// have done had the panel never intercepted it.
+    NavFallthrough {
+        request_id: String,
+        direction: NavKeyDirection,
+    },
 }
 
 /// A `tab_verb` message's payload (spec §10.2): the same actions the prefix's own `Action::Tab` arm
@@ -281,7 +319,9 @@ impl InboundMessage {
             | InboundMessage::ViewInEditor { .. }
             | InboundMessage::TabVerb { .. }
             | InboundMessage::CycleDefaultMode { .. }
-            | InboundMessage::CloseOthers { .. } => return TabRef::WindowLevel,
+            | InboundMessage::CloseOthers { .. }
+            | InboundMessage::PanelKeys { .. }
+            | InboundMessage::NavFallthrough { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
@@ -361,7 +401,9 @@ impl InboundMessage {
             | InboundMessage::ViewInEditor { request_id, .. }
             | InboundMessage::TabVerb { request_id, .. }
             | InboundMessage::CycleDefaultMode { request_id }
-            | InboundMessage::CloseOthers { request_id } => request_id,
+            | InboundMessage::CloseOthers { request_id }
+            | InboundMessage::PanelKeys { request_id, .. }
+            | InboundMessage::NavFallthrough { request_id, .. } => request_id,
         }
     }
 }
@@ -589,6 +631,18 @@ pub fn serialize_literal_key_for_js(key: &str) -> String {
 /// `{"kind":"open_keymap"}`: `prefix ?` -- open the `?` overlay, in BROWSE.
 pub fn serialize_open_keymap_for_js() -> String {
     json!({ "kind": "open_keymap" }).to_string()
+}
+
+/// `{"kind":"nav_key","direction":"down"}` / `"up"`: C1's decision (spec §3.1, §3.5), made in Rust
+/// from the `panel_keys` mirror -- `Ctrl+j` claimed in BROWSE, or `Ctrl+k` claimed in INPUT. The page
+/// applies it against its own current state and, if that no longer matches, replies
+/// `nav_fallthrough` (`InboundMessage::NavFallthrough`).
+pub fn serialize_nav_key_for_js(direction: NavKeyDirection) -> String {
+    let direction = match direction {
+        NavKeyDirection::Down => "down",
+        NavKeyDirection::Up => "up",
+    };
+    json!({ "kind": "nav_key", "direction": direction }).to_string()
 }
 
 /// Global `f` HINT (spec: docs/superpowers/specs/2026-09-19-global-hint-design.md §3.3). `shell`
@@ -1256,6 +1310,88 @@ mod tests {
         assert_eq!(value, serde_json::json!({ "kind": "literal_key", "key": "C-a" }));
         let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js()).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "open_keymap" }));
+    }
+
+    // Field order isn't pinned byte-for-byte (`serde_json`'s default map isn't insertion-ordered --
+    // the same reason `serializes_focus_permission` and the `confirm_close_others` test above parse
+    // rather than compare raw strings), so this checks the exact two wire spellings the Interfaces
+    // block gives ("down"/"up") through a parsed `Value` rather than a literal byte string.
+    #[test]
+    fn serializes_nav_key_for_both_directions() {
+        let v: serde_json::Value = serde_json::from_str(&serialize_nav_key_for_js(NavKeyDirection::Down)).unwrap();
+        assert_eq!(v, serde_json::json!({ "kind": "nav_key", "direction": "down" }));
+        let v: serde_json::Value = serde_json::from_str(&serialize_nav_key_for_js(NavKeyDirection::Up)).unwrap();
+        assert_eq!(v, serde_json::json!({ "kind": "nav_key", "direction": "up" }));
+    }
+
+    /// The plan's Interfaces block, verbatim: the five page->Rust wire strings, pinned so Task 3's
+    /// `bridge.test.ts` has something to serialise against on the page side.
+    #[test]
+    fn parses_the_five_panel_keys_and_nav_fallthrough_wire_strings() {
+        let msg = parse_inbound_message(r#"{"type":"panel_keys","request_id":"req-7","mode":"browse"}"#).unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "req-7");
+        assert!(matches!(
+            msg,
+            InboundMessage::PanelKeys {
+                mode: PanelKeys::Browse,
+                ..
+            }
+        ));
+
+        let msg = parse_inbound_message(r#"{"type":"panel_keys","request_id":"req-8","mode":"input"}"#).unwrap();
+        assert_eq!(msg.request_id(), "req-8");
+        assert!(matches!(
+            msg,
+            InboundMessage::PanelKeys {
+                mode: PanelKeys::Input,
+                ..
+            }
+        ));
+
+        let msg = parse_inbound_message(r#"{"type":"panel_keys","request_id":"req-9","mode":"other"}"#).unwrap();
+        assert_eq!(msg.request_id(), "req-9");
+        assert!(matches!(
+            msg,
+            InboundMessage::PanelKeys {
+                mode: PanelKeys::Other,
+                ..
+            }
+        ));
+
+        let msg =
+            parse_inbound_message(r#"{"type":"nav_fallthrough","request_id":"req-10","direction":"down"}"#).unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "req-10");
+        assert!(matches!(
+            msg,
+            InboundMessage::NavFallthrough {
+                direction: NavKeyDirection::Down,
+                ..
+            }
+        ));
+
+        let msg =
+            parse_inbound_message(r#"{"type":"nav_fallthrough","request_id":"req-11","direction":"up"}"#).unwrap();
+        assert_eq!(msg.request_id(), "req-11");
+        assert!(matches!(
+            msg,
+            InboundMessage::NavFallthrough {
+                direction: NavKeyDirection::Up,
+                ..
+            }
+        ));
+    }
+
+    /// The dangerous default here is obvious and one-directional (the same reasoning as
+    /// `DecisionChoice`'s own doc): an unrecognised `mode`/`direction` must be a parse failure, never
+    /// silently fall back to `Other`/some direction a later `match` picked for it.
+    #[test]
+    fn an_unknown_panel_keys_mode_or_nav_fallthrough_direction_fails_to_parse() {
+        assert!(parse_inbound_message(r#"{"type":"panel_keys","request_id":"req-7","mode":"sideways"}"#).is_none());
+        assert!(
+            parse_inbound_message(r#"{"type":"nav_fallthrough","request_id":"req-10","direction":"left"}"#).is_none()
+        );
     }
 
     #[test]

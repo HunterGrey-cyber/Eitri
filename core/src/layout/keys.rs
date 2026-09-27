@@ -1,6 +1,7 @@
 //! The keys after `Ctrl+a` that name a module (modules spec §4.3, §6.3-§6.5): `e` the editor, `a`
 //! the agent, `t` the terminal, and each Lua panel's own `key`. `v` is the canvas's once P3 builds
-//! it, and is reserved until then.
+//! it, and is reserved until then ([`RESERVED_FOR_CANVAS`], keymap spec §7.1 P6): unbound in the
+//! prefix table since P6, but still refused to a Lua panel with its own `KeyError::Reserved`.
 //!
 //! **A Lua panel's key is checked against the effective keymap and stock tmux** (keymap spec §2.3
 //! rule 3, 2026-09-25, which replaced the static `RESERVED` list of modules §6.4): a key the prefix
@@ -34,6 +35,10 @@ const BUILT_IN: [(char, fn() -> ModuleId); 3] = [
 /// key after a split key (this module's doc).
 pub const BUILT_IN_CAPITALS: [char; 4] = ['E', 'A', 'T', 'V'];
 
+/// `v`, kept free of the prefix table (P6) and of every Lua panel, so the canvas can take it once P3
+/// builds it (this module's doc) without a v1 config having to give it back up.
+pub const RESERVED_FOR_CANVAS: char = 'v';
+
 /// Every module key this window answers to, in the order the prefix strip shows them: the built-ins,
 /// then each Lua panel's in registration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +69,8 @@ pub enum KeyError {
     Taken { panel: String, key: char, by: String },
     /// The capital of a built-in module's key ([`BUILT_IN_CAPITALS`]).
     ShiftOfBuiltIn { panel: String, key: char },
+    /// [`RESERVED_FOR_CANVAS`]: not bound today, but kept free for the canvas.
+    Reserved { panel: String, key: char },
 }
 
 impl fmt::Display for KeyError {
@@ -107,6 +114,10 @@ impl fmt::Display for KeyError {
                      after a split key neovibe reads it as '{lower}', {whose} key"
                 )
             }
+            KeyError::Reserved { panel, key } => write!(
+                f,
+                "neovibe.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is reserved for the canvas"
+            ),
         }
     }
 }
@@ -148,6 +159,9 @@ impl ModuleKeys {
                     action: binding.action.name(),
                     source: binding.source,
                 });
+            }
+            if key == RESERVED_FOR_CANVAS {
+                return Err(KeyError::Reserved { panel, key });
             }
             if BUILT_IN_CAPITALS.contains(&key) {
                 return Err(KeyError::ShiftOfBuiltIn { panel, key });
@@ -352,10 +366,13 @@ mod tests {
 
     #[test]
     fn a_stock_tmux_key_neovibe_does_not_bind_stays_reserved() {
+        // `[` and `PPage` are stock tmux's `copy-mode`/`copy-mode -u`, and neovibe now binds both
+        // itself (P5) -- so a Lua panel taking either fails `Bound`, not `StockTmux`; see
+        // `every_character_the_effective_table_binds_refuses_a_lua_panel`.
         for (key, command) in [
             ('s', "choose-tree"),
             ('o', "select-pane"),
-            ('[', "copy-mode"),
+            (']', "paste-buffer"),
             ('C', "customize-mode"),
         ] {
             let err = build_one(&key.to_string(), &Keymap::defaults()).unwrap_err();
@@ -407,6 +424,26 @@ mod tests {
             ModuleKeys::build(&[lua("one", Some("g")), lua("two", Some("G"))], &Keymap::defaults()).is_ok(),
             "a Lua pair is the owner's to choose"
         );
+    }
+
+    /// P6: `v` is unbound by default (Task 8's own `default_bindings` change), yet a Lua panel still
+    /// cannot take it -- reserved for the canvas, not merely free.
+    #[test]
+    fn a_lua_panel_keyed_v_is_refused_reserved_for_the_canvas() {
+        let keymap = Keymap::defaults();
+        assert!(
+            keymap.lookup(&KeySpec::parse("v").unwrap()).is_none(),
+            "v is unbound by default"
+        );
+        let err = build_one("v", &keymap).unwrap_err();
+        assert_eq!(
+            err,
+            KeyError::Reserved {
+                panel: "notes".into(),
+                key: 'v'
+            }
+        );
+        assert!(err.to_string().contains("reserved for the canvas"), "{err}");
     }
 
     #[test]

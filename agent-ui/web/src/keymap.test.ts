@@ -22,8 +22,20 @@ function parseKeyToken(token: string): { ev: KeyLike; pending?: PendingPrefix } 
 
 describe("resolveKey", () => {
   it("enters INPUT on i and leaves it on Esc", () => {
-    expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input" });
+    expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input", caret: "kept" });
     expect(resolveKey("input", key("Escape"), ctx)).toEqual({ kind: "mode", to: "browse" });
+  });
+
+  /* C1a (spec §3.2): `o` is an exact alias of `i` -- same caret, same refusal -- and `A` is `i`'s
+     shifted sibling with the caret forced to the end (`:h A`). Neither reaches `O`/`I`, which stay
+     unbound (additive later): the blanket Shift refusal still catches them. */
+  it("adds o as an exact alias of i, and A at the end of the draft (C1a)", () => {
+    expect(resolveKey("browse", key("o"), ctx)).toEqual({ kind: "mode", to: "input", caret: "kept" });
+    expect(resolveKey("browse", key("A", { shiftKey: true }), ctx)).toEqual({ kind: "mode", to: "input", caret: "end" });
+    expect(resolveKey("browse", key("o"), { sessionEnded: true })).toBeNull();
+    expect(resolveKey("browse", key("A", { shiftKey: true }), { sessionEnded: true })).toBeNull();
+    expect(resolveKey("browse", key("O", { shiftKey: true }), ctx), "O stays unbound").toBeNull();
+    expect(resolveKey("browse", key("I", { shiftKey: true }), ctx), "I stays unbound").toBeNull();
   });
 
   it("gives Esc back to the input method while composing", () => {
@@ -61,7 +73,7 @@ describe("resolveKey", () => {
      refuses; `Composer` stops showing its focusable placeholder on the same condition, so nothing on
      screen promises `i` either. */
   it("refuses i on a session that ended, because INPUT there has no box and drops r", () => {
-    expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input" });
+    expect(resolveKey("browse", key("i"), ctx)).toEqual({ kind: "mode", to: "input", caret: "kept" });
     expect(resolveKey("browse", key("i"), { sessionEnded: true })).toBeNull();
     // Still nothing but Escape once in INPUT -- which is why the entrance is what had to close.
     expect(resolveKey("input", key("r"), { sessionEnded: true })).toBeNull();
@@ -174,8 +186,9 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("browse", key("d", { ctrlKey: true }), ctx), "Ctrl+d is still half a page, never exit").toEqual({ kind: "half-page", delta: 1 });
   });
 
-  it("never interrupts or denies on Esc (D1)", () => {
-    expect(resolveKey("browse", key("Escape"), { ...ctx, turnRunning: true })).toBeNull();
+  it("never interrupts or denies on Esc (D1), and flashes rather than acting while a turn runs (R34)", () => {
+    expect(resolveKey("browse", key("Escape"), { ...ctx, turnRunning: true })).toEqual({ kind: "esc-blocked" });
+    expect(resolveKey("browse", key("Escape"), ctx), "idle: unclaimed, exactly as before").toBeNull();
   });
 
   it("opens a search on / and repeats it with n and Shift+N", () => {
@@ -258,6 +271,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "G", ev: key("G", { shiftKey: true }) },
       { token: "Y", ev: key("Y", { shiftKey: true }) },
       { token: "D", ev: key("D", { shiftKey: true }) },
+      { token: "A", ev: key("A", { shiftKey: true }) },
       { token: "Ctrl+d", ev: key("d", { ctrlKey: true }) },
       { token: "Ctrl+u", ev: key("u", { ctrlKey: true }) },
       { token: "gg", ev: key("g"), pending: "g" },
@@ -287,6 +301,10 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
         if ((result.kind === "pending" || result.kind === "count") && !known.has(token)) continue;
         // A table-resolved key is listed by the overlay's own panel section (Task 8), never here.
         if (result.kind === "panel") continue;
+        // R34: `Esc` while a turn runs is a transient reminder, not a discoverable key -- the ?
+        // overlay promises "these keys do this", and Esc genuinely does nothing (D1) except flash
+        // while a reply is in flight (`turnRunning: true` here is what surfaces it at all).
+        if (result.kind === "esc-blocked") continue;
         expect(known.has(token), `"${token}" (sessionEnded=${sessionEnded}) resolves to ${JSON.stringify(result)} but no BROWSE_KEYS row spells it`).toBe(true);
       }
     }

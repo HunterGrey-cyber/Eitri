@@ -60,14 +60,23 @@ export const EMPTY_PANEL_TABLE: PanelTable = {
 };
 
 export type PanelAction =
-  | { kind: "mode"; to: PanelMode }
-  /** `j`/`k`: to the next or previous stop (a row, a banner, the status line, ...), top to bottom.
+  /** `Esc`/`Ctrl+k` leaving INPUT never carries a caret (there is nowhere left to place one); `i`/
+   *  `o`/`A` entering INPUT always does (spec §3.2, C1a): `"kept"` is the caret the box was left at
+   *  (or the end of the draft, the first time), `"end"` is `A`'s own promise (`:h A`). */
+  | { kind: "mode"; to: "browse" }
+  | { kind: "mode"; to: "input"; caret: "kept" | "end" }
+  /** BROWSE `Esc` while a turn runs (spec §4.2, R34): a no-op that says so, rather than silently
+   *  doing nothing -- `Esc` still never interrupts (D1) and the turn keeps running. Idle, plain
+   *  `Escape` resolves to nothing at all (unclaimed), the same as always. */
+  | { kind: "esc-blocked" }
+  /** `j`/`k`: to the next or previous stop (a row, a banner, the handoff area, ...), top to bottom.
    *  Which stop that is depends on the document, so `App.tsx` resolves it (`./nav`'s `nextStop`). */
   | { kind: "move"; delta: 1 | -1 }
   /** `h`/`l`: to the previous or next control inside the current stop (`./nav`'s `nextControl`). */
   | { kind: "control"; delta: 1 | -1 }
-  /** `a`/`d`: answer the permission card under the cursor, or the one gating the tool call under it,
-   *  or (P1, ruling 26) the only card in the conversation, from any row. */
+  /** `a`/`d`: answer the permission card under the cursor, or the one gating the tool call under it
+   *  -- nothing else since v1 S4 (spec 2026-09-27 §2.2; P1's "the only card, from any row" is gone).
+   *  `App.tsx` answers only a key that stands alone (S1, `./typingGuard`). */
   | { kind: "answer"; decision: "allow" | "deny" }
   | { kind: "toggle-expand" }
   | { kind: "copy" }
@@ -196,6 +205,12 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // to have anywhere to put the keys (its own row is refused the same way `i`'s and `r`'s are).
     if (event.shiftKey && !event.ctrlKey && event.key === "Y") return { kind: "copy-output" };
     if (event.shiftKey && !event.ctrlKey && event.key === "D") return ctx.sessionEnded ? null : { kind: "deny-reason" };
+    // C1a: `A` (`:h A`), named ahead of the blanket refusal the same reason G/N/Y/D are -- most
+    // layouts deliver it with Shift held. Refused on an ended session for the same reason `i`/`o`
+    // are just below: INPUT there has no box to place a caret in (spec §3.2).
+    if (event.shiftKey && !event.ctrlKey && event.key === "A") {
+      return ctx.sessionEnded ? null : { kind: "mode", to: "input", caret: "end" };
+    }
     // R3: `Ctrl+g` in BROWSE views the current row in nvim. INPUT's own `Ctrl+g` (the composer's
     // edit-in-nvim) is a different action entirely, which is exactly why this is gated on `mode !==
     // "input"` rather than named unconditionally -- it must never shadow the composer's chord.
@@ -266,11 +281,14 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     case "]":
       return { kind: "pending", prefix: event.key };
     case "i":
+    case "o":
       // Refused on a dead session: the composer's textarea is `disabled` there, so INPUT has no box
       // to type into and resolves nothing but `Escape` -- entering it would drop `r`, the one key
       // the ended/lost rows actually promise. `Composer` stops offering its focusable placeholder at
       // the same moment, so no on-screen text promises a key this table has stopped resolving.
-      return ctx.sessionEnded ? null : { kind: "mode", to: "input" };
+      // C1a: `o` is an exact alias of `i` -- not vim's "open a line below" (`:h o`), decided now
+      // because giving `o` a newline meaning later would change what it does today (spec §3.2).
+      return ctx.sessionEnded ? null : { kind: "mode", to: "input", caret: "kept" };
     case "j":
       return { kind: "move", delta: 1 };
     case "k":
@@ -298,7 +316,9 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     case "n":
       return { kind: "search-next", delta: 1 };
     case "Escape":
-      return null;
+      // R34: `Esc` never interrupts (D1) -- while a reply runs, this says so rather than silently
+      // doing nothing; idle, it is unclaimed exactly as before.
+      return ctx.turnRunning === true ? { kind: "esc-blocked" } : null;
     default:
       return null;
   }
@@ -318,14 +338,15 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "[[ / ]]", what: "Previous / next prompt of yours" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
-  { keys: "a / d", what: "Allow / deny the card under the cursor, or the only card" },
-  { keys: "Enter", what: "Show or hide a tool's result or a collapsed run; on the status row: this session's details" },
+  { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
+  { keys: "Enter", what: "Show or hide a tool's result or a collapsed run" },
   {
     keys: "y / Y",
     what: "Copy the row (message, command, path), or the code block HINT landed on / its whole output",
   },
   { keys: "D", what: "Deny with a reason: into the card's reason box, Enter denies" },
-  { keys: "i", what: "Start typing a message" },
+  { keys: "i / o", what: "Start typing, caret where you left it (C1a: o is an exact alias of i)" },
+  { keys: "A", what: "Start typing at the end of the draft" },
   { keys: "f", what: "HINT: jump anywhere in the window" },
   { keys: "r", what: "New session, once this one has ended" },
   { keys: "/", what: "Search the conversation (Enter keeps the match, Esc goes back)" },

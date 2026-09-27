@@ -115,6 +115,14 @@ it("the showcmd segment carries data-testid=showcmd", () => {
   expect(showcmd.textContent).toBe("Space b…");
 });
 
+/** C1c (spec §3.4): the band stops being a `j`/`k` stop -- its own details stay reachable on
+ *  `<leader>i`, `prefix i` and a click (`onOpenDetail`, exercised above), none of which go through
+ *  `nav.ts`'s `data-nav-stop` list. */
+it("carries no data-nav-stop -- j/k never land here, only click/leader/prefix reach its details", () => {
+  const { container } = renderWide(RUNNING);
+  expect(container.querySelector(".status-band")!.hasAttribute("data-nav-stop")).toBe(false);
+});
+
 it("before any measurement (Review Focus 3), only mode and pill show -- no crash on an unmounted ref", () => {
   const { container } = render(<StatusBand facts={RUNNING} paneFocused={false} />);
   const mode = container.querySelector<HTMLElement>('[data-testid="mode-block"]')!;
