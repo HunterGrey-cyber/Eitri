@@ -106,7 +106,10 @@ impl SpawnedSidecar {
 ///
 /// The baseline protocol includes `SetPermissionMode`, `PermissionModeChanged`,
 /// and `TextDelta.message_id`.
-pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
+///
+/// The baseline sidecar explicitly passes `permissionMode: 'default'` for gated
+/// sessions to prevent local `.claude/settings.json` from widening permissions.
+pub const EXPECTED_VERDANDI_REVISION: &str = "b0f043f";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.
