@@ -599,4 +599,39 @@ mod snap_tests {
         assert_eq!(hit, paint);
         assert_eq!((hit.min.y, hit.max.y), (14.0, 1598.0));
     }
+
+    /// Applying a scale change with its matching framebuffer resize preserves the nvim grid
+    /// size. `sync_os_scale` runs before grid computation in both `connect_resize` and the
+    /// render callback. This checks two framebuffer sizes with a cell of 11.238282 by 22 pixels
+    /// and both dimensions doubled together.
+    #[test]
+    fn a_scale_change_applied_with_its_framebuffer_resizes_nothing() {
+        let cell = GridScale::new(PixelSize::new(11.238282, 22.0));
+        let cell_x2 = GridScale::new(PixelSize::new(22.476564, 44.0));
+        for (fb_w, fb_h) in [(760, 721), (760, 480)] {
+            let before = grid_layout(fb_w, fb_h, cell, divide(cell)).grid;
+            let after = grid_layout(fb_w * 2, fb_h * 2, cell_x2, divide(cell_x2)).grid;
+            assert_eq!(
+                before, after,
+                "fb {fb_w}x{fb_h}: scale and framebuffer must move together"
+            );
+        }
+    }
+
+    /// Applying the new cell size before its matching framebuffer resize changes the grid:
+    /// `760x480` yields `33x10` instead of `67x21`. This transient mismatch lasts until GTK
+    /// resizes the framebuffer, so `set_os_scale_factor` must not run directly from
+    /// `connect_scale_factor_notify`.
+    #[test]
+    fn applying_the_new_cell_before_the_framebuffer_resize_is_a_different_grid() {
+        let cell = GridScale::new(PixelSize::new(11.238282, 22.0));
+        let cell_x2 = GridScale::new(PixelSize::new(22.476564, 44.0));
+        let matched = grid_layout(760, 480, cell, divide(cell)).grid;
+        let mismatched = grid_layout(760, 480, cell_x2, divide(cell_x2)).grid;
+        assert_eq!((mismatched.width, mismatched.height), (33, 10));
+        assert_ne!(
+            matched, mismatched,
+            "the new cell size without its matching framebuffer must not equal the matched grid"
+        );
+    }
 }

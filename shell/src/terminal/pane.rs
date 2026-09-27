@@ -365,6 +365,7 @@ impl TerminalPane {
         // codes are input. (fcitx5-gtk has no terminal case and treats it as free form.)
         im.set_input_purpose(InputPurpose::Terminal);
         connect_resize(&area, &state, &im);
+        connect_scale_change(&area);
         connect_render(&area, &state);
         connect_keyboard(&area, &state, &im);
         connect_ime(&area, &state, &im);
@@ -760,6 +761,15 @@ fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
         }
         ensure_session(&state, area, &im);
     });
+}
+
+/// Queue a snapshot on scale changes so an idle pane can receive `resize`.
+/// `connect_resize` rescales through `State::allocate` and `TerminalMetrics::rescale`; a scale
+/// change alone leaves the logical size and grid dimensions unchanged. GTK emits the resize
+/// only on the next `GLArea` snapshot. Without `queue_render`, the old framebuffer stays
+/// upscaled and blurry until output causes a redraw.
+fn connect_scale_change(area: &GLArea) {
+    area.connect_scale_factor_notify(|area| area.queue_render());
 }
 
 fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {

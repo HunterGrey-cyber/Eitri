@@ -39,3 +39,7 @@ harness = false
 [[test]]
 name = "cursor_animation"
 harness = false
+
+[[test]]
+name = "os_scale_factor"
+harness = false

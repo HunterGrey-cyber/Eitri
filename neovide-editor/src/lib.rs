@@ -442,6 +442,49 @@ fn cell_size_changed(last: Option<(f64, f64)>, now: (f64, f64)) -> bool {
     last != Some(now)
 }
 
+/// The OS scale to pass to `LiveHarness::set_os_scale_factor`, or `None` if `current` already
+/// matches GTK's `Widget::scale_factor()`. Kept pure for tests without a live harness.
+///
+/// Use GTK's integer factor, matching `pixel_to_grid_pos`, `cell_size` and the tick's widget-size
+/// calculation. Clamp values below 1 to 1 for widgets not yet realized on a surface.
+/// Compare bits as `LiveHarness::set_os_scale_factor` does, so both agree on whether to apply it.
+fn os_scale_to_apply(current: f64, widget_scale_factor: i32) -> Option<f64> {
+    let target = f64::from(widget_scale_factor.max(1));
+    if target.to_bits() == current.to_bits() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// Applies GTK's `Widget::scale_factor()` when it differs from the harness's OS scale
+/// ([`os_scale_to_apply`]). Runs in the `Ready` paths of `connect_resize` and the render callback,
+/// before computing a grid from `harness.grid_scale()`.
+///
+/// `set_os_scale_factor` changes cell size synchronously. Applying it with the matching new
+/// framebuffer keeps grid calculations from mixing dimensions from different scales.
+/// The scale-factor notification only requests a frame; GTK supplies the resized framebuffer
+/// on its next snapshot, and scale synchronization happens then.
+///
+/// Returns `true` only when the harness applies a change. Logs one `[hidpi]` line for that change;
+/// an unchanged scale costs one bit comparison and produces no log output.
+fn sync_os_scale(harness: &mut LiveHarness, widget_scale_factor: i32) -> bool {
+    let Some(new_scale) = os_scale_to_apply(harness.os_scale_factor(), widget_scale_factor) else {
+        return false;
+    };
+    let old_scale = harness.os_scale_factor();
+    if !harness.set_os_scale_factor(new_scale) {
+        return false;
+    }
+    let cell = harness.grid_scale();
+    println!(
+        "[hidpi] os scale {old_scale} -> {new_scale}; cell now {:.2}×{:.2}px",
+        cell.width(),
+        cell.height()
+    );
+    true
+}
+
 /// One tick's [`ScaleWatch::observe`] result: whether `g:neovide_scale_factor` moved since the
 /// last tick, and its current value either way.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -609,6 +652,9 @@ impl NeovideEditorPane {
                 let mut live = live_state.borrow_mut();
                 let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                     session.wants_frame.set(true);
+                    // Sync scale before reading `grid_scale()` so the new cell size and the framebuffer supplied
+                    // by this `resize` signal are used together.
+                    sync_os_scale(&mut session.harness, widget.scale_factor());
                     let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
                         grid_size_for_content_region(&session.harness, r)
                     })
@@ -678,6 +724,24 @@ impl NeovideEditorPane {
                     }
                     widget.queue_render();
                 });
+            });
+        }
+
+        // GtkGLArea reallocates its buffers and emits `resize` on the next snapshot after a scale
+        // notification. Request a frame here, or the old image can remain upscaled indefinitely.
+        // Do not change the harness scale or `fb_size` here. `sync_os_scale` runs in `connect_resize`
+        // and the render callback once GTK supplies the matching new framebuffer.
+        {
+            let live_state = live_state.clone();
+            gl_area.connect_scale_factor_notify(move |widget| {
+                // Use `try_borrow`: a GTK signal can run while a render or tick closure already borrows
+                // `live_state`. Skipping that borrow avoids a reentrant `RefCell` panic.
+                if let Ok(live) = live_state.try_borrow() {
+                    if let LiveState::Ready(session) = &*live {
+                        session.wants_frame.set(true);
+                    }
+                }
+                widget.queue_render();
             });
         }
 
@@ -949,6 +1013,13 @@ impl NeovideEditorPane {
                             session
                                 .animation_clock
                                 .advance(frame_time, refresh_interval, session.last_animating.get());
+                        // Sync here too for re-realized widgets or snapshots that do not emit `resize`.
+                        // Together with `connect_resize`, this keeps cell size and framebuffer scale consistent.
+                        // Set `wants_frame` when a scale change is applied here because this path has no resize handler
+                        // to request the next frame.
+                        if sync_os_scale(&mut session.harness, widget.scale_factor()) {
+                            session.wants_frame.set(true);
+                        }
                         // Snapped HERE rather than where `content_region` is computed above,
                         // because the two users want different rects. The grid must sit on whole
                         // cells (see `snap_region_to_grid`), while the placeholder arms below have
@@ -1128,6 +1199,10 @@ impl NeovideEditorPane {
                         // In GTK 4.22.5, buffers and the resize signal use widget dimensions times the scale factor.
                         // They can lag the allocation while hidden or before a snapshot; the next snapshot updates both.
                         // Log a note if the dimensions differ on a drawn widget, since its buffer sizing may differ.
+                        //
+                        // During a scale change, `notify::scale-factor` updates the widget factor before the next
+                        // snapshot supplies a new framebuffer and synchronizes the harness. This gap can last longer
+                        // while hidden. Suppress the note during that expected mismatch by checking `os_scale_factor()`.
                         let (width, height) = fb_size.get();
                         let widget_size = (
                             widget.width() * widget.scale_factor(),
@@ -1140,6 +1215,7 @@ impl NeovideEditorPane {
                             && widget_size.0 > 0
                             && widget_size.1 > 0
                             && widget_size != (width, height)
+                            && session.harness.os_scale_factor() == f64::from(widget.scale_factor().max(1))
                         {
                             layout_note_logged.set(true);
                             println!(
@@ -1458,7 +1534,9 @@ impl NeovideEditorPane {
 
 #[cfg(test)]
 mod tests {
-    use super::{cell_size_changed, nvim_args, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY};
+    use super::{
+        cell_size_changed, nvim_args, os_scale_to_apply, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY,
+    };
     use gtk4::glib;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1633,5 +1711,20 @@ mod tests {
         let observed = watch.observe(1.0);
         assert!(!observed.changed, "the pending write has not been applied to nvim yet");
         assert_eq!(watch.take_pending_for_ready(), Some(1.6));
+    }
+
+    // `os_scale_to_apply` tests the integer scale and skips an already matching harness scale.
+    // It is the pure part of `sync_os_scale`, which needs a live `&mut LiveHarness`.
+
+    /// GTK's `scale_factor()` supplies the target; an already matching harness needs no update.
+    #[test]
+    fn os_scale_to_apply_follows_gtks_integer_factor() {
+        assert_eq!(os_scale_to_apply(1.0, 2), Some(2.0));
+        assert_eq!(os_scale_to_apply(2.0, 2), None);
+        assert_eq!(os_scale_to_apply(2.0, 1), Some(1.0));
+        // A widget not yet on a surface reports 0 (and never negative in practice): treat as 1, the
+        // same `.max(1)` every other scale read in this crate uses.
+        assert_eq!(os_scale_to_apply(1.0, 0), None);
+        assert_eq!(os_scale_to_apply(f64::NAN, 1), Some(1.0));
     }
 }
