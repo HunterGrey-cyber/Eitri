@@ -129,7 +129,9 @@ export type AnswerableItem =
 /** The timeline index of the permission card `a`/`d` should answer from `cursor`, or `null`. The
  * cursor must be on the card or the tool call it gates. From a tool row, choose the matching
  * `toolUseId` among the permission items directly following it. Other rows have no target,
- * preventing a shortcut from approving an unrelated call. */
+ * preventing a shortcut from approving an unrelated call. This is also the targeting rule for
+ * `D`, even when only one card exists. Arrival moves to the oldest card; with no target, the
+ * panel shows a message. */
 export function permissionTarget(items: AnswerableItem[], cursor: number): number | null {
   const here = items[cursor];
   if (here === undefined) return null;
@@ -141,16 +143,6 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
     if (item.kind !== "permission") break;
   }
   return null;
-}
-
-/** The card `a`/`d` answer from `cursor`: use `permissionTarget` first, then the sole card if
- *  the conversation has exactly one. With multiple cards, keep the cursor rule so a shortcut
- *  cannot guess which waiting call to answer. */
-export function answerTarget(items: AnswerableItem[], cursor: number): number | null {
-  const own = permissionTarget(items, cursor);
-  if (own !== null) return own;
-  const cards = items.flatMap((item, index) => (item.kind === "permission" ? [index] : []));
-  return cards.length === 1 ? cards[0] : null;
 }
 
 /** A panel target of global `f` HINT: a conversation row, a code block inside a row, an enabled

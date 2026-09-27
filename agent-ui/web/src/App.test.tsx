@@ -371,14 +371,22 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(current.textContent).toContain("Permission requested: Bash");
   });
 
-  it("leaves INPUT for the card, so a and d answer it at once", () => {
-    const { container } = withTwoCards();
-    enterInputMode(container);
-    expect(modeBlock(container).textContent).toBe("INPUT");
-    dispatch({ kind: "focus_permission", tab: 1 });
-    expect(modeBlock(container).textContent).toBe("BROWSE");
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+  it("leaves INPUT for the card, so a lone a answers it (after v1 S1's wait)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = withTwoCards();
+      enterInputMode(container);
+      expect(modeBlock(container).textContent).toBe("INPUT");
+      dispatch({ kind: "focus_permission", tab: 1 });
+      expect(modeBlock(container).textContent).toBe("BROWSE");
+      // The `i` above counts as a key, so pause before pressing a lone `a`.
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("takes the composer when the card was answered in between", () => {
@@ -1161,15 +1169,24 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     /* Every control a keyboard user can Tab to inside the conversation, by the label they read.
        Approve and Deny are the two that were reported; the rest share the one handler and would
        have failed the same way. */
-    it("does not preventDefault Enter or Space on any of the card's own buttons", () => {
-      const { container } = withAToolCallAndAPermission();
-      for (const label of ["Approve", "Deny"]) {
-        const button = buttonLabelled(container, label)!;
-        expect(button, `no button labelled ${label}`).toBeDefined();
-        for (const key of ["Enter", " "]) {
+    /* Enter is left to a card's own buttons, but Space is claimed and does nothing.
+       Pause before Enter so the typing guard does not refuse it. Typing protection is
+       tested separately. */
+    it("does not preventDefault Enter on any of the card's own buttons, and claims Space there (v1 S5)", () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = withAToolCallAndAPermission();
+        for (const label of ["Approve", "Deny"]) {
+          const button = buttonLabelled(container, label)!;
+          expect(button, `no button labelled ${label}`).toBeDefined();
+          act(() => vi.advanceTimersByTime(300));
           // fireEvent returns false exactly when the default was prevented.
-          expect(fireEvent.keyDown(button, { key }), `${label} swallowed ${JSON.stringify(key)}`).toBe(true);
+          expect(fireEvent.keyDown(button, { key: "Enter" }), `${label} swallowed Enter`).toBe(true);
+          act(() => vi.advanceTimersByTime(300));
+          expect(fireEvent.keyDown(button, { key: " " }), `${label} left Space to the button`).toBe(false);
         }
+      } finally {
+        vi.useRealTimers();
       }
     });
 
@@ -1184,12 +1201,12 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        (`./nav`), a focused button is an ordinary place for the keys to be, so `h`/`j`/`k`/`l` from
        it must still navigate. What the original regression needs is narrower and is asserted
        directly: Enter and Space from a button are left to the button. */
-    it("leaves Enter and Space on a focused button to the button, and still navigates from it", () => {
+    it("leaves Enter on a focused Approve to the button, claims Space (v1 S5), and still navigates from it", () => {
       const { container } = withAToolCallAndAPermission();
       const approve = buttonLabelled(container, "Approve")!;
       // `fireEvent` returns false when the handler called preventDefault, i.e. claimed the key.
       expect(fireEvent.keyDown(approve, { key: "Enter" })).toBe(true);
-      expect(fireEvent.keyDown(approve, { key: " " })).toBe(true);
+      expect(fireEvent.keyDown(approve, { key: " " })).toBe(false);
       expect(fireEvent.keyDown(approve, { key: "k" })).toBe(false);
     });
 
@@ -1371,7 +1388,7 @@ describe("the leader", () => {
     expect(posted.length).toBe(0);
   });
 
-  it("Space with the Approve button focused activates the button, starting no sequence", () => {
+  it("Space with the Approve button focused starts no sequence, and no longer activates it (v1 S5)", () => {
     vi.useFakeTimers();
     try {
       const { container } = started();
@@ -1383,10 +1400,9 @@ describe("the leader", () => {
       posted.length = 0;
       const approve = buttonLabelled(container, "Approve")!;
       approve.focus();
-      // `fireEvent` returns false only when the handler called `preventDefault` -- true means the
-      // key was left to the button's own native activation (the same convention the Approve-
-      // unreachable regression's own tests use).
-      expect(fireEvent.keyDown(approve, { key: " " })).toBe(true);
+      // `fireEvent` returns false when the handler calls `preventDefault`. Space on a card's
+      // answer button is claimed and neither activates the button nor starts a leader sequence.
+      expect(fireEvent.keyDown(approve, { key: " " })).toBe(false);
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
       expect(container.querySelector(".which-key-box")).toBeNull();
       expect(posted.length).toBe(0);
@@ -1574,6 +1590,265 @@ describe("the leader", () => {
   });
 });
 
+/* An arrival lands in BROWSE on a waiting card, so immediate typing arrives as shortcut keys.
+   `a`/`d`/`D` answer only in isolation through `./typingGuard` and only target the cursor's card.
+   Space on a card button does nothing. Vitest's fake clock controls the gap between keydowns,
+   which jsdom stamps with `Date.now()`. */
+describe("v1: typing never answers a card", () => {
+  const TYPING = "a / d answer a card only on their own — i or Ctrl+j to type";
+  const NO_CARD = "no card here — i, o, A or Ctrl+j to type";
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** A running turn with one card (gating `toolu_1`), then two rows below it, and the keys arrived
+   *  on it the way `Ctrl+l`/`prefix a` bring them (`arrive`, which lands on the oldest card). */
+  function arrivedOnACard() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // `interrupt`, so the activity line has a Stop button: a button that answers no card.
+    dispatchLiveTab(snapshotState({ capabilities: { ...initialState().capabilities, interrupt: true } }), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "tidy up" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "rm build" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "rm build" } },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "meanwhile" },
+      { type: "user_prompt_submitted", text: "and the docs" },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    expect(rendered.container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    return rendered;
+  }
+  /** One keydown wherever focus is, the way a real key arrives. */
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  /** Enter or Space on a focused button, as a browser does it: jsdom never activates a button from
+   *  a keydown (see "the Approve-unreachable regression" above), so the activation is modelled
+   *  here -- a click exactly when the keydown's default was NOT prevented, the same way
+   *  `typeIntoInput` models text insertion. Returns whether the default survived. */
+  const pressOnButton = (key: string) => {
+    const button = document.activeElement as HTMLElement;
+    const notPrevented = fireEvent.keyDown(button, { key });
+    if (notPrevented) fireEvent.click(button);
+    return notPrevented;
+  };
+  const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const band = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+  const answered = () => posted.filter((m) => m.type === "permission_response");
+
+  it("arrive, then a l s o at 80 ms a key: nothing is answered, and the band says how to type", () => {
+    const { container } = arrivedOnACard();
+    for (const key of ["a", "l", "s", "o"]) {
+      press(key);
+      wait(80);
+    }
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+
+  it("a lone a approves the card under the cursor 250 ms later (R32 unchanged, only delayed)", () => {
+    arrivedOnACard();
+    press("a");
+    wait(249);
+    expect(answered()).toEqual([]);
+    wait(1);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+
+  it("a lone d denies it the same way", () => {
+    arrivedOnACard();
+    press("d");
+    wait(250);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
+  });
+
+  it("a then j at 200 ms: the j cancels the answer, flashes, and still moves", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(200);
+    press("j");
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(false);
+  });
+
+  it("a key just before a refuses it at once, and says so", () => {
+    const { container } = arrivedOnACard();
+    press("x");
+    wait(100);
+    press("a");
+    expect(band(container)).toBe(TYPING);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it("a held a's repeat answers nothing", () => {
+    arrivedOnACard();
+    press("a", { repeat: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it.each([
+    ["pane_focus false", () => dispatch({ kind: "pane_focus", focused: false })],
+    ["the ? overlay opening", () => dispatch({ kind: "open_keymap" })],
+    ["a switch to another tab", () => dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] })],
+    [
+      "the card resolving",
+      () =>
+        dispatch({
+          kind: "events", tab: 1, fromRevision: 6, throughRevision: 7,
+          events: [{ type: "permission_resolved", permission_id: "perm-1", outcome: "allowed" }],
+        }),
+    ],
+  ])("a lone a, then %s before 250 ms: nothing is answered", (_name, interrupt) => {
+    arrivedOnACard();
+    press("a");
+    wait(100);
+    interrupt();
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it("two rows below a lone card, a answers nothing and says there is no card here (S4, F13)", () => {
+    const { container } = arrivedOnACard();
+    press("j");
+    press("j");
+    expect(container.querySelector(".row-current")!.textContent).toContain("and the docs");
+    wait(300);
+    press("a");
+    expect(band(container)).toBe(NO_CARD);
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  it("Space on a focused Approve does nothing: not the button, not the leader (S5)", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    press("l");
+    expect(document.activeElement?.textContent).toBe("Approve");
+    wait(300);
+    expect(pressOnButton(" ")).toBe(false);
+    wait(WHICH_KEY_DELAY_MS + 1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    expect(document.activeElement?.textContent).toBe("Approve");
+  });
+
+  it("Enter on a focused Approve after 300 ms idle approves", () => {
+    arrivedOnACard();
+    press("l");
+    wait(300);
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+
+  it("l then Enter at 100 ms still approves: l is the walk onto the button", () => {
+    arrivedOnACard();
+    press("l");
+    wait(100);
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+  });
+
+  it("e then Enter at 100 ms on Approve answers nothing, and says so", () => {
+    const { container } = arrivedOnACard();
+    press("l");
+    wait(300);
+    press("e");
+    wait(100);
+    expect(pressOnButton("Enter")).toBe(false);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+
+  /* A sentence ending in `l` can focus Approve, so that last walk alone must not allow Enter.
+     Every key in the unbroken run before Enter must be a walk (`./typingGuard`). */
+  it.each([["cancel"], ["al"], ["deal"]])("arrive, then %s and Enter at 80 ms a key: Approve is focused and nothing is answered", (word) => {
+    const { container } = arrivedOnACard();
+    for (const key of word) {
+      press(key);
+      wait(80);
+    }
+    expect(document.activeElement?.textContent).toBe("Approve");
+    expect(pressOnButton("Enter")).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(band(container)).toBe(TYPING);
+  });
+
+  it("l l then Enter at 80 ms a key walks onto Deny and denies", () => {
+    arrivedOnACard();
+    press("l");
+    wait(80);
+    press("l");
+    wait(80);
+    expect(document.activeElement?.textContent).toBe("Deny");
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
+  });
+
+  /* The fire-time check in `waitThenAnswer`: a card that resolved during the wait is never pressed,
+     even though its button object is still held. React never sees a click on a detached button, so
+     a native listener on the button itself is what shows the press did not happen. */
+  it("a lone a, then the card resolving: its Approve button is never pressed", () => {
+    const { container } = arrivedOnACard();
+    const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
+    const pressed = vi.fn();
+    approve.addEventListener("click", pressed);
+    press("a");
+    wait(100);
+    dispatch({
+      kind: "events", tab: 1, fromRevision: 6, throughRevision: 7,
+      events: [{ type: "permission_resolved", permission_id: "perm-1", outcome: "allowed" }],
+    });
+    expect(approve.isConnected).toBe(false);
+    wait(1000);
+    expect(pressed).not.toHaveBeenCalled();
+    expect(answered()).toEqual([]);
+  });
+
+  it("Enter on a button that answers nothing (Stop) keeps the browser's own activation", () => {
+    arrivedOnACard();
+    press("x");
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    expect(fireEvent.keyDown(stop, { key: "Enter" })).toBe(true);
+    expect(fireEvent.keyDown(stop, { key: " " })).toBe(true);
+  });
+
+  it("a lone D puts the keys in the card's reason box 250 ms later", () => {
+    const { container } = arrivedOnACard();
+    press("D", { shiftKey: true });
+    const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    expect(document.activeElement).not.toBe(reason);
+    wait(250);
+    expect(document.activeElement).toBe(reason);
+  });
+
+  it("D then o within 250 ms: the reason box is not focused", () => {
+    const { container } = arrivedOnACard();
+    press("D", { shiftKey: true });
+    wait(100);
+    press("o");
+    wait(1000);
+    expect(document.activeElement).not.toBe(container.querySelector(".permission-card input"));
+    expect(band(container)).toBe(TYPING);
+  });
+});
+
 describe("App keyboard: every control is reachable with hjkl", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
@@ -1601,17 +1876,32 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     return rendered;
   }
 
+  // `a`/`d` answer after the typing guard's wait, only when no other key is near them.
   it("a on the tool call answers the card that gates it, without moving onto the card", () => {
-    withACardAndStop();
-    press("a");
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+    vi.useFakeTimers();
+    try {
+      const { container } = withACardAndStop();
+      press("a");
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("d on the card itself denies it", () => {
-    withACardAndStop();
-    press("j");
-    press("d");
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "deny" });
+    vi.useFakeTimers();
+    try {
+      withACardAndStop();
+      press("j");
+      act(() => vi.advanceTimersByTime(300));
+      press("d");
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "deny" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("l walks the card's Approve, Deny and reason box; h and Esc come back to the row", () => {
@@ -1646,11 +1936,19 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   });
 
   it("does not answer a card from Stop, where the row cursor is not what the keys act on", () => {
-    withACardAndStop();
-    press("j");
-    press("j");
-    press("a");
-    expect(lastOfType("permission_response")).toBeUndefined();
+    vi.useFakeTimers();
+    try {
+      withACardAndStop();
+      press("j");
+      press("j");
+      // Wait long enough that the typing guard does not cause the refusal.
+      act(() => vi.advanceTimersByTime(300));
+      press("a");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("permission_response")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("hands a key that lands on <body> back to the panel", () => {
@@ -1786,13 +2084,21 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("once the HINT it asked for has ended, the keys are the panel's again", () => {
-      const { container } = onTheCard();
-      press("f");
-      collect(2);
-      dispatch({ kind: "hint_end", sessionId: 2 });
-      press("a");
-      expect(lastOfType("permission_response")).toBeDefined();
-      expect(container.querySelector(".row-permission")).not.toBeNull();
+      vi.useFakeTimers();
+      try {
+        const { container } = onTheCard();
+        press("f");
+        collect(2);
+        dispatch({ kind: "hint_end", sessionId: 2 });
+        // The `f` above counts as a key, so pause before pressing a lone `a`.
+        act(() => vi.advanceTimersByTime(300));
+        press("a");
+        act(() => vi.advanceTimersByTime(250));
+        expect(lastOfType("permission_response")).toBeDefined();
+        expect(container.querySelector(".row-permission")).not.toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("a shell that never answers costs a second of dead keys, not a stuck panel", () => {
@@ -3354,13 +3660,23 @@ describe("P1: the keys land on a card that waits", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
-  it("a answers the only card from any row", () => {
-    const { container } = oneCard();
-    const root = container.querySelector(".agent-ui-conversation")!;
-    fireEvent.keyDown(root, { key: "g" });
-    fireEvent.keyDown(root, { key: "g" });
-    fireEvent.keyDown(root, { key: "a" });
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
+  /* `a` acts only on the cursor's card. On another row it shows a flash instead of answering.
+     The pause is long enough that the typing guard does not cause the refusal. */
+  it("a from another row does not answer the only card (v1 S4)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = oneCard();
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "g" });
+      fireEvent.keyDown(root, { key: "g" });
+      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(false);
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "a" });
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("permission_response")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a card arriving while typing leaves the mode alone and says how to answer it", () => {
@@ -3801,15 +4117,25 @@ describe("N3 and P5 in the conversation", () => {
     vi.unstubAllGlobals();
   });
 
-  it("D puts the keys in the only card's reason box; Enter there denies with the reason", () => {
-    const { container } = withBash();
-    const root = container.querySelector(".agent-ui-conversation")!;
-    fireEvent.keyDown(root, { key: "D", shiftKey: true });
-    const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
-    expect(document.activeElement).toBe(reason);
-    fireEvent.change(reason, { target: { value: "keep the build" } });
-    fireEvent.keyDown(reason, { key: "Enter" });
-    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "deny", reason: "keep the build" });
+  it("D puts the keys in the card's reason box; Enter there denies with the reason", () => {
+    // `D` acts only on the cursor's card, after the typing guard's wait.
+    vi.useFakeTimers();
+    try {
+      const { container } = withBash();
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "j" });
+      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "D", shiftKey: true });
+      act(() => vi.advanceTimersByTime(250));
+      const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
+      expect(document.activeElement).toBe(reason);
+      fireEvent.change(reason, { target: { value: "keep the build" } });
+      fireEvent.keyDown(reason, { key: "Enter" });
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "deny", reason: "keep the build" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("the third button answers with remember, only when Rust offered a rule", () => {

@@ -9,7 +9,8 @@ import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
-import { isModeCycleKey, MODE_STARTING_MESSAGE, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { isModeCycleKey, isShiftTab, MODE_STARTING_MESSAGE, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { TypingGuard } from "./typingGuard";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -18,13 +19,13 @@ import { countCodePoints } from "./toolRegistry";
 import { findMatch } from "./search";
 import { SearchBar } from "./components/SearchBar";
 import {
-  answerTarget,
   controlsOf,
   currentStop,
   hintTargets,
   isActivatableControl,
   nextControl,
   nextStop,
+  permissionTarget,
   rowIndexOf,
   HINT_ALPHABET,
 } from "./nav";
@@ -97,6 +98,16 @@ const TOOL_RESULT_SCROLL_STEP_PX = 40;
  *  `shell` at all) costs a second of dead keys, not a stuck panel -- the same stance as `shell`'s own
  *  300ms wait for this panel's answer. */
 export const HINT_PENDING_TIMEOUT_MS = 1000;
+
+/** The band message when `a`/`d`/`D`, or Enter on a card button, is refused because another key
+ *  came within `TYPING_GUARD_MS` (`./typingGuard`). */
+const TYPING_FLASH = "a / d answer a card only on their own — i or Ctrl+j to type";
+/** The band message when `a`/`d`/`D` have no card under the cursor or gating the tool call
+ *  under it, so the key gives feedback instead of silently doing nothing. */
+const NO_CARD_FLASH = "no card here — i, o, A or Ctrl+j to type";
+/** Envelopes that move keyboard focus or cover the conversation without a keydown
+ *  cancel a waiting `a`/`d`/`D`. GTK handles `nav_key`'s Ctrl+j/Ctrl+k before the page sees a key. */
+const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key"]);
 
 /** Scroll the cursor row's overflow box before applying a pending `j`/`k` cursor move.
  *  This keeps long tool results reachable from the keyboard instead of skipping unseen content.
@@ -820,6 +831,18 @@ export default function App() {
       ),
     [timeline],
   );
+  /** The panel's `TypingGuard` receives every keydown seen by `onKeyDown`. It delays `a`/`d`/`D`
+   *  by `TYPING_GUARD_MS` and checks Enter on a card button. Keep one instance across renders so
+   *  the dispatch handler installed once reads the same guard. */
+  const [typingGuard] = useState(() => new TypingGuard());
+  /* An overlay drawn over the conversation takes the keys from the card a waiting answer was aimed
+     at, whichever route opened it -- a key, an envelope, a click. */
+  useEffect(() => {
+    if (keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null || overlayOpen) {
+      typingGuard.cancel();
+    }
+  }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, confirm, overlayOpen]);
+  useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
   /** Kept focused so BROWSE's keydown handler actually receives keys: a keydown bubbles from
    *  whatever DOM node has real focus, which is a browser fact, not a React one. `Escape` leaving
    *  INPUT removes the composer's textarea from the DOM, which drops focus onto whatever the
@@ -1260,6 +1283,7 @@ export default function App() {
       // the active tab's state, so one for any other tab -- a batch still in flight when the user
       // switched away -- is dropped here, before any of the arms below can touch `state`.
       if (!acceptsEnvelope(payload as { kind: string; tab?: number }, activeTabRef.current)) return;
+      if (CANCELS_WAITING_ANSWER.has(payload.kind)) typingGuard.cancel();
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
       } else if (payload.kind === "pane_focus") {
@@ -1392,6 +1416,8 @@ export default function App() {
         // takes this branch, since `activeTabRef.current` starts `null`.
         if (payload.active !== activeTabRef.current) {
           switchedRef.current = true;
+          // A waiting `a`/`d`/`D` targets the old tab's card, so cancel it on a tab switch.
+          typingGuard.cancel();
           // Cancel sequences from the old tab so a key in the new conversation cannot complete
           // them.
           pendingRef.current = null;
@@ -2167,6 +2193,19 @@ export default function App() {
      input it cannot deliver. */
   const handingOff = tabs !== null && handoffRequests.has(tabs.active);
 
+  /** Delay `a`/`d`/`D` on the target card button or reason box by `TYPING_GUARD_MS`. A null
+   *  target flashes that no card is selected. Answer only if the key stood alone and nothing
+   *  cancelled the wait; the card must still be on screen and the panel in BROWSE. */
+  function waitThenAnswer(event: KeyboardEvent<HTMLDivElement>, typedAt: number, target: HTMLElement | null, run: () => void) {
+    if (target === null) {
+      showFlash(NO_CARD_FLASH);
+      return;
+    }
+    const waiting = typingGuard.defer(typedAt, event.repeat, () => {
+      if (target.isConnected && modeRef.current === "browse") run();
+    });
+    if (!waiting) showFlash(TYPING_FLASH);
+  }
   /** The key table's home: mode + key + context in, an action out, applied here. Only claims what
    *  `resolveKey` claims -- an unrecognised key, or one INPUT leaves to the input method (a
    *  composing Escape), falls straight through with no `preventDefault`. That is what keeps
@@ -2189,6 +2228,11 @@ export default function App() {
     // overlay and everything else below: tmux's own `confirm-before` prompt takes the
     // keys the same way.
     if (answerConfirm(event)) return;
+    // Feed each remaining keydown to the typing guard before overlays, so keys typed into overlays
+    // still cancel a waiting `a`/`d`/`D` and show a band notice. The key then continues normally.
+    // Normalize WebKitGTK's Shift+Tab through `isShiftTab` to the walk key `Tab`.
+    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    if (typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt)) showFlash(TYPING_FLASH);
     // A `gf` picker with several paths takes the next key before other overlays. A valid letter
     // opens its path; Esc or any other key cancels without falling through, so the key cannot also
     // move the cursor.
@@ -2264,10 +2308,26 @@ export default function App() {
       }
       return;
     }
-    // A focused button activates on Enter and Space natively; claiming those would swallow the only
-    // keyboard route to Approve. Every OTHER key still
-    // reaches the table, which is what lets `h`/`j`/`k`/`l` carry on from a focused button.
-    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
+    // Focused buttons activate on Enter and Space natively; claiming those everywhere would remove
+    // the only keyboard route to Approve. Other keys still reach the table, so `h`/`j`/`k`/`l` can
+    // navigate from a focused button. On a card's answer buttons (Approve, Deny, Always allow) Space
+    // is claimed and does nothing, since Claude Code's permission prompt confirms with Enter. Enter
+    // answers only through `mayAnswerNow`: no recent key, except an unbroken `h`/`l`/Tab walk onto
+    // the button that started with an isolated key. Other buttons keep native Enter and Space.
+    // Space during a pending leader sequence goes to that sequence, with its default prevented so
+    // it never activates the answer button.
+    const onAnswerButton =
+      isActivatableControl(event.target) && (event.target as HTMLElement).closest("[data-nav-action]") !== null;
+    if (onAnswerButton && event.key === " ") {
+      event.preventDefault();
+      if (seqRef.current === null) return;
+    }
+    if (onAnswerButton && event.key === "Enter" && !typingGuard.mayAnswerNow("Enter", typedAt, event.repeat)) {
+      event.preventDefault();
+      showFlash(TYPING_FLASH);
+      return;
+    }
+    if (isActivatableControl(event.target) && (event.key === "Enter" || (event.key === " " && !onAnswerButton))) return;
     // The leader engine: a pending sequence owns
     // the next key, and only BROWSE ever starts one. An IME key is never a sequence key (Review
     // Focus 2, C4) -- checked here rather than folded into `startSequence`/`advanceSequence`
@@ -2374,16 +2434,17 @@ export default function App() {
         const target = stop === null ? null : nextControl(stop, action.delta);
         if (target === "stop") root.focus({ preventScroll: true });
         else target?.focus();
-      } else if (!edgeFocused) {
-        // `a`/`d` press the card's own button, so its guard against a second answer applies here
-        // too. Not from a banner's button: the row cursor is hollow there, and not what keys act on.
-        // `answerTarget`, not `permissionTarget`: with exactly one card anywhere in
-        // the conversation, it answers from any row, not only the cursor's own.
-        const target = answerTarget(answerableItems, cursor);
+      } else {
+        // `a`/`d` click the card's own button, preserving its guard against duplicate answers. They target
+        // only the cursor's card or the card gating its tool call through `permissionTarget`. A
+        // focused banner button has no card target.
+        const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
         const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
         const button =
-          target === null ? null : rows[target]?.querySelector<HTMLButtonElement>(`[data-nav-action="${action.decision}"]`);
-        button?.click();
+          target === null
+            ? null
+            : (rows[target]?.querySelector<HTMLButtonElement>(`[data-nav-action="${action.decision}"]`) ?? null);
+        waitThenAnswer(event, typedAt, button, () => button?.click());
       }
       return;
     }
@@ -2434,15 +2495,20 @@ export default function App() {
         break;
       }
       case "deny-reason": {
-        if (root === null || edgeFocused) break;
-        const target = answerTarget(answerableItems, cursor);
+        if (root === null) break;
+        // Uses the same target card and wait as `a`/`d`.
+        const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
         const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
-        const box = target === null ? null : rows[target]?.querySelector<HTMLInputElement>(".permission-card input");
-        if (box) {
-          if (target !== cursor) setCursor(target!);
+        const box = target === null ? null : (rows[target]?.querySelector<HTMLInputElement>(".permission-card input") ?? null);
+        waitThenAnswer(event, typedAt, box, () => {
+          if (box === null) return;
+          // Re-read where the card is now: rows may have arrived above it during the wait.
+          const row = box.closest<HTMLElement>('[data-nav-stop="row"]');
+          const index = row === null ? null : rowIndexOf(root, row);
+          if (index !== null && index !== cursorRef.current) setCursor(index);
           landedControlRef.current = box;
           box.focus();
-        }
+        });
         break;
       }
       case "restart":

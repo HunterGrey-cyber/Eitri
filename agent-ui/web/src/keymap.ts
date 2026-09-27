@@ -64,8 +64,8 @@ export type PanelAction =
   | { kind: "move"; delta: 1 | -1 }
   /** `h`/`l`: to the previous or next control inside the current stop (`./nav`'s `nextControl`). */
   | { kind: "control"; delta: 1 | -1 }
-  /** `a`/`d`: answer the permission card under the cursor, or the one gating the tool call under it,
-   *  or the only card in the conversation, from any row. */
+  /** `a`/`d`: answer only the permission card under the cursor or the one gating its tool call.
+   *  `App.tsx` uses `./typingGuard` to answer only a key that stands alone. */
   | { kind: "answer"; decision: "allow" | "deny" }
   | { kind: "toggle-expand" }
   | { kind: "copy" }
@@ -303,7 +303,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "[[ / ]]", what: "Previous / next prompt of yours" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
-  { keys: "a / d", what: "Allow / deny the card under the cursor, or the only card" },
+  { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
   { keys: "Enter", what: "Show or hide a tool's result or a collapsed run; on the status row: this session's details" },
   {
     keys: "y / Y",
