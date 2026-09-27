@@ -66,7 +66,25 @@ export type OutboundMessage =
   /** `y` to a `confirm_close_others` prompt is window-level, like `TabVerb`.
    *  Rust recomputes every tab except the active one when answering, so this carries no tab list.
    *  Maps to `InboundMessage::CloseOthers` in `core/src/agent_bridge.rs`. */
-  | { type: "close_others"; request_id: string };
+  | { type: "close_others"; request_id: string }
+  /** Mirror the window's effective mode whenever it changes and once after `ready`. Rust keeps one
+   *  value per window because `install_module_nav`, which reads it, is installed once per window.
+   *  The empty tab's menu and composer also count as browse and input. Use other for states that
+   *  are neither live BROWSE nor live INPUT. */
+  | { type: "panel_keys"; request_id: string; mode: PanelKeysMode }
+  /** Return a `nav_key` this page could not apply because the mode mirror was stale, an overlay
+   *  owns the keys, or the session ended. Rust then runs the chord's ordinary `move_focus` instead
+   *  of dropping the key. */
+  | { type: "nav_fallthrough"; request_id: string; direction: NavKeyDirection };
+
+/** The composer mirror's three states. Distinct from `./keymap`'s `PanelMode`, which is
+ *  this component's OWN mode ("hint" included, unreachable yet) -- this type is the wire value Rust
+ *  reads to decide whether a bare `Ctrl+j`/`Ctrl+k` is claimed at all, and "other" has no `PanelMode`
+ *  counterpart (an overlay, a dead session, ... are all folded into it). */
+export type PanelKeysMode = "browse" | "input" | "other";
+
+/** Which way a claimed `Ctrl+j`/`Ctrl+k` moved: `down` is `Ctrl+j`, `up` is `Ctrl+k`. */
+export type NavKeyDirection = "down" | "up";
 
 /** Every decision a backend can actually carry. Verdandi's wire is `bool allow` + `string reason`
  *  and the legacy hook relay is the same shape, so there is no allow-for-session anywhere to send
@@ -180,7 +198,11 @@ type InboundHandler = (
     /** Whether the scratch editor currently has this tab's draft open. */
     | { kind: "scratch"; tab: TabId; editing: boolean }
     /** The footer's transient line, from Rust -- e.g. a `gf` refusal. */
-    | { kind: "notice"; text: string },
+    | { kind: "notice"; text: string }
+    /** `install_module_nav` claimed bare `Ctrl+j`/`Ctrl+k` using the mode mirror last posted by
+     *  this page. This is window-level because it concerns whether BROWSE or INPUT has the keys, so
+     *  it carries no tab id. */
+    | { kind: "nav_key"; direction: NavKeyDirection },
 ) => void;
 
 /** The handler's own payload type, exported so callers (`tabs.ts`'s `acceptsEnvelope`, `App.tsx`)
@@ -231,7 +253,8 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "rule_offers" ||
         obj.kind === "editor_context" ||
         obj.kind === "scratch" ||
-        obj.kind === "notice"
+        obj.kind === "notice" ||
+        obj.kind === "nav_key"
       ) {
         handler(parsed as Parameters<InboundHandler>[0]);
         return;

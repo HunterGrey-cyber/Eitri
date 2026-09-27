@@ -1097,6 +1097,13 @@ body,
   margin-left: auto;
   padding-left: 8px;
 }
+/* The dim reminder that follows the placeholder or the draft;
+   `.composer-browse-hint` describes it in its own
+   doc comment in `Composer.tsx`. Dimmer than the already-muted line it sits in, the same way
+   `.empty-tab-resume .detail` steps down from its own `strong` sibling. */
+.composer-hint {
+  opacity: 0.7;
+}
 
 /* C3: the composer uses the panel's own face and scale (WebKitGTK's UA sheet gives form controls
    `font: -webkit-small-control` otherwise), and grows to its content up to 40% of the panel --
@@ -1234,6 +1241,14 @@ body,
   color: var(--nv-muted);
   font-size: var(--fs-sm);
   margin-top: 4px;
+  max-width: 360px;
+}
+/* The first-run hint line, drawn under everything else on the dashboard --
+   same tokens as `.dash-consequence` (existing tokens only, no new ones). */
+.dash-hint {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+  margin-top: 8px;
   max-width: 360px;
 }
 /* The pill, the `⏵⏵` glyph split into its own `.mode-glyph` span above -- moved into

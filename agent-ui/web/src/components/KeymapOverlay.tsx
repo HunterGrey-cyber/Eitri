@@ -119,14 +119,28 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <Section title="This panel" rows={BROWSE_KEYS} />
+      {/* V1 C1: `Ctrl+j` here is Rust's mirror (`install_module_nav`) claiming the chord
+          ahead of `resolveKey`, never `resolveKey` itself -- so it is spliced in here rather than
+          added to `BROWSE_KEYS`, which `keymap.test.ts` ties to `resolveKey` both ways and would fail
+          on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
+          "Typing" section below already does the same for its own two GTK-decided rows. */}
+      <Section title="This panel" rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]} />
       <LeaderAndTabKeys panel={panel} />
       <Section
         title="Typing"
         rows={[
           ...INPUT_KEYS,
-          { keys: "Ctrl+h / j / k / l", what: "Move between panes (neovibe keeps these)" },
+          // The pane-motion row lists only Ctrl+h/l. Ctrl+j/k have their own meanings in the rows
+          // below, so including them here would give conflicting descriptions.
+          { keys: "Ctrl+h / l", what: "Move between panes (neovibe keeps these)" },
           { keys: prefixLabel, what: "The prefix (neovibe keeps it)" },
+          // V1 C1: Rust's mirror (`install_module_nav`) claims these two ahead of
+          // `Composer` itself, the same reason the two rows above are spliced in here rather than
+          // added to `INPUT_KEYS` -- that constant is tied to `COMPOSER_CHORDS` both ways
+          // (`composerKeys.test.ts`, `Composer.test.tsx`) and would fail on a key `Composer` never
+          // handles.
+          { keys: "Ctrl+k", what: "Back to browsing (as Esc)" },
+          { keys: "Ctrl+j", what: "The module below" },
         ]}
       />
       <Section title="Anywhere in the window" rows={windowKeys} />

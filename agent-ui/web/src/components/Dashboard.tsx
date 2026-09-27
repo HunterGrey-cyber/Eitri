@@ -7,12 +7,14 @@ import type { Hello, PermissionModeChoice } from "../types";
 export type DashItem = "new" | "resume" | "sessions" | "mode" | "keys";
 
 /** Direct keys for dashboard items, shared with `EmptyTab.onKeyDown` so displayed letters and
- *  dispatch stay in sync. */
+ *  dispatch stay in sync. `mode` displays `⇧Tab` only: bare `m` could trigger during typing.
+ *  The item remains reachable by navigation and Enter, Shift+Tab through `modeKey.ts`, or
+ *  `<leader>m`. */
 export const DASH_ITEM_KEY: Record<DashItem, string> = {
   new: "i",
   resume: "r",
   sessions: "w",
-  mode: "m",
+  mode: "⇧Tab",
   keys: "?",
 };
 
@@ -103,6 +105,10 @@ type Props = {
   cursor: number;
   narrow: boolean;
   onItem: (item: DashItem) => void;
+  /** The window's readable prefix chord, passed from `App.tsx`'s `keymapHelp.prefix` through
+   *  `EmptyTab`. Read it live so the hint reflects any reconfiguration in `init.lua`, such as
+   *  Ctrl+a instead of the default Ctrl+b. */
+  prefix: string;
 };
 
 /** The empty tab's dashboard: a centred `neovibe`, the
@@ -115,7 +121,7 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem }: Props) {
+export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props) {
   const items = dashItems(hello);
   const consequence = MODE_CONSEQUENCE[mode];
   return (
@@ -150,6 +156,11 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem }: Props) {
         ))}
       </div>
       {consequence !== undefined && <div className="dash-consequence">{consequence}</div>}
+      {/* Show the key hint on every empty tab. It occupies otherwise empty space and needs no
+          persistent first-run state. */}
+      <div className="dash-hint">
+        {`Ctrl+h / Ctrl+l  editor ⇄ chat · i or Ctrl+j  type · ctrl+c  interrupt · ${prefix}  window keys · ?  all keys`}
+      </div>
     </div>
   );
 }

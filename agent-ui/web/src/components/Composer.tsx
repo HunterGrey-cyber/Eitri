@@ -53,6 +53,12 @@ type Props = {
    *  textarea that is already mounted is focused again; a fresh one takes focus through
    *  `autoFocus` as before. */
   focusRequest?: number;
+  /** C1a: which end the NEXT `focusRequest` bump should place the caret at -- `"kept"`
+   *  (the default) leaves `caretRef` alone (wherever the box was last left, or the end of the draft
+   *  the first time), `"end"` is `A`'s own promise (`:h A`) and forces it there regardless of
+   *  `caretRef`. Read once per bump, alongside `focusRequest` itself; a caller that never sets this
+   *  (every existing one before C1a) keeps today's "kept" behaviour exactly. */
+  caretOnFocus?: "kept" | "end";
   /** Whether the global `f` HINT may label this box (`../nav`'s `HINT_COMPOSER_ATTR`). `App.tsx`
    *  passes the negation of `disabled`: a landing on a textarea that cannot take focus would put the
    *  panel in an INPUT with nothing to type into. */
@@ -104,6 +110,7 @@ export function Composer({
   mode,
   onModeChange,
   focusRequest = 0,
+  caretOnFocus = "kept",
   hintTarget = false,
   onSend,
   onDraftChange,
@@ -153,7 +160,12 @@ export function Composer({
   }
 
   useEffect(() => {
-    if (focusRequest > 0 && mode === "input") focusAtCaret();
+    if (mode === "input") {
+      // C1a: `A` forces the caret to the end regardless of where the box was last left; `i`/`o`
+      // (and every caller that predates C1a) leave `caretRef` alone, i.e. "kept".
+      if (caretOnFocus === "end") caretRef.current = null;
+      focusAtCaret();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRequest, mode]);
 
@@ -360,9 +372,14 @@ export function Composer({
         // (handled by the panel's own keydown table, which moves DOM focus here indirectly by
         // mounting the textarea below with `autoFocus`), and Tab. Tab is deliberate: a focusable
         // control that does not become active when focus reaches it would be the surprising
-        // behaviour. It reads like the empty box it stands in for, not like an instruction, since
-        // Ctrl+l opens the composer anyway. It draws the same bare `❯` line INPUT draws, so the
-        // bottom keeps its shape across `i`/`Esc`; the band's mode block is the mode.
+        // behaviour. It reads like the empty box it stands in for, not like an instruction, but
+        // `Ctrl+l`, `prefix a` and a tab switch all land BROWSE, so a reader can land here with no
+        // other on-screen route into the box. So a dim `i or Ctrl+j to type` follows the placeholder
+        // or the draft alike, but never in INPUT (the caret is the sign there), on an ended session
+        // (its own branch above says `r` instead), or while a scratch round trip owns the draft
+        // (`editingInNvim`: typing here would only be lost to nvim's own buffer). It draws the same
+        // bare `❯` line INPUT draws, so the bottom keeps its shape across `i`/`Esc`; the band's mode
+        // block is the mode.
         <>
           <span className="composer-prompt" aria-hidden="true">
             ❯
@@ -372,6 +389,12 @@ export function Composer({
               "Ask the agent..."
             ) : (
               <span className="composer-draft">{twoLines(text)}</span>
+            )}
+            {!editingInNvim && (
+              <span className="composer-hint" aria-hidden="true">
+                {" "}
+                — i or Ctrl+j to type
+              </span>
             )}
             {queueCount > 0 && <span className="composer-queued">+{queueCount} queued</span>}
           </div>

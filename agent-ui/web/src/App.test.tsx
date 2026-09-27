@@ -398,6 +398,28 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(modeBlock(container).textContent).toBe("INPUT");
   });
 
+  // The no-card fallback keeps the caret, like `i`/`o`. An earlier `A` sets `composerCaret` to the
+  // end through `composerFocusRequest`, so that state must not leak into this arrival through
+  // `inputRequest`.
+  it("takes the composer with the caret kept, not wherever an earlier A left composerCaret", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    dispatch({ kind: "pane_focus", focused: true });
+    const conversationRoot = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(conversationRoot, { key: "A", shiftKey: true }); // composerCaret -> "end", once.
+    const box1 = container.querySelector("textarea")!;
+    fireEvent.change(box1, { target: { value: "hello world" } });
+    box1.setSelectionRange(3, 3);
+    fireEvent.keyUp(box1, { key: "ArrowLeft" });
+    fireEvent.keyDown(box1, { key: "Escape" });
+    // No pending card by the time this arrives -- the "ordinary arrival" fallback, never i/o/A again.
+    dispatch({ kind: "focus_permission", tab: 1 });
+    const box2 = container.querySelector("textarea")!;
+    expect(box2.selectionStart).toBe(3);
+    expect(box2.selectionEnd).toBe(3);
+  });
+
   /* Landing on a card moves the cursor, and the `[cursor]` effect reveals its row.
      This must be announced as a user scroll, like a HINT landing. Otherwise `MessageList` keeps
      following, and the next delta or resize can snap an older card out of view. */
@@ -451,9 +473,14 @@ describe("literal_key C-a (send-prefix from shell's prefix)", () => {
 describe("App handshake", () => {
   it("announces itself with a `ready` carrying a request id, before anything else", () => {
     render(<App />);
-    expect(posted).toHaveLength(1);
+    // V1 C1: `panel_keys` now follows on mount too (the mirror's own "once after ready"),
+    // so this no longer asserts the whole post list is length 1 -- only that `ready` leads it. See
+    // "the composer mirror" describe block below for what that second post actually says.
     expect(posted[0].type).toBe("ready");
     expect(typeof posted[0].request_id).toBe("string");
+    // Before `hello`/`tabs`, `activeTab` is `null` and no composer exists, so the first `panel_keys`
+    // mirror reports `other`.
+    expect(posted[1]).toMatchObject({ type: "panel_keys", mode: "other" });
   });
 
   it("waits for a tabs envelope before showing anything but a connecting message", () => {
@@ -2031,10 +2058,12 @@ describe("App global HINT: the panel's half", () => {
   function show(sessionId: number, count: number) {
     dispatch({ kind: "hint_show", sessionId, labels: LETTERS.slice(0, count) });
   }
-  /** Indices sent by `shell`: rows in document order, each followed by its code blocks and controls.
-   *  Card controls use `data-nav-order` (Approve, Deny, reason), then the activity line's Stop and band.
-   *  At width 0 the band's only matching control is `.band-open`, kept by the pre-measurement floor. */
-  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8, band: 9 };
+  /** Indices sent by `shell` follow document order: each row, its code blocks, then its
+   *  controls. Card controls follow `data-nav-order` (Approve, Deny, reason), followed by
+   *  the activity line's Stop. The band has no `data-nav-stop` attribute, so it appears in
+   *  neither `j`/`k` stops nor `hintTargets`, which both use `stopsIn`.
+   *  Its details remain reachable through `<leader>i`, `prefix i` or a click. */
+  const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
 
   it("f in BROWSE asks shell for a HINT, and f in INPUT is just a letter", () => {
     const { container } = conversation();
@@ -2136,9 +2165,10 @@ describe("App global HINT: the panel's half", () => {
 
   it("labels the composer and landing there enters INPUT with the caret in the box", () => {
     const { container } = idle();
-    // The prompt row, then the composer, then the always-present band.
-    expect(collect(1)).toBe(3);
-    show(1, 3);
+    // The prompt row, then the composer (C1c: the band is no longer a target -- see AT's own doc
+    // comment).
+    expect(collect(1)).toBe(2);
+    show(1, 2);
     expect(labels(container)[1].classList.contains("hint-composer")).toBe(true);
     dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
     const textarea = container.querySelector("textarea");
@@ -2147,15 +2177,35 @@ describe("App global HINT: the panel's half", () => {
     expect(lastOfType("send_message")).toBeUndefined();
   });
 
+  // `landOnHint`'s composer branch keeps the caret, like `i`/`o`. An earlier `A` sets `composerCaret`
+  // to the end through `composerFocusRequest`, so that state must not leak into a HINT landing
+  // through `inputRequest`.
+  it("landing on the composer via HINT keeps the caret where it was, not wherever an earlier A left composerCaret", () => {
+    const { container } = idle();
+    fireEvent.keyDown(root(container), { key: "A", shiftKey: true }); // composerCaret -> "end", once.
+    const box1 = container.querySelector("textarea")!;
+    fireEvent.change(box1, { target: { value: "hello world" } });
+    box1.setSelectionRange(3, 3);
+    fireEvent.keyUp(box1, { key: "ArrowLeft" });
+    fireEvent.keyDown(box1, { key: "Escape" });
+    // Land back on the composer via HINT, never via i/o/A again.
+    expect(collect(1)).toBe(2);
+    show(1, 2);
+    dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
+    const box2 = container.querySelector("textarea")!;
+    expect(box2.selectionStart).toBe(3);
+    expect(box2.selectionEnd).toBe(3);
+  });
+
   it("offers no composer label only once the session has ended (C1: a running turn no longer disables it)", () => {
     // A running turn no longer disables the composer (C1: it queues a follow-up instead), so it is
-    // a HINT target through the turn too -- one more than `AT`'s ten.
+    // a HINT target through the turn too -- one more than `AT`'s own count.
     const running = conversation();
     box(running.container.querySelector(".composer")!, 900);
     expect(collect(1)).toBe(Object.keys(AT).length + 1);
     cleanup();
     const { container } = idle();
-    expect(collect(2)).toBe(3);
+    expect(collect(2)).toBe(2);
     events({ type: "session_closed", reason: "done" });
     layOut(container);
     box(container.querySelector(".composer")!, 900);
@@ -2198,14 +2248,14 @@ describe("App global HINT: the panel's half", () => {
   it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
     const { container } = conversation();
     // 4 rows (prompt, reply, tool call, card) + the reply's code block + Approve + Deny + the
-    // reason box + Stop + the always-present band.
+    // reason box + Stop (C1c: the band no longer counts -- see AT's own doc comment).
     const count = collect(1);
     expect(count).toBe(Object.keys(AT).length);
     // Push the card row (and everything in it) below the list's viewport: it is no longer counted.
     const card = container.querySelector(".row-permission")!;
     box(card, 2000);
     for (const el of card.querySelectorAll("button, input")) box(el, 2000);
-    expect(collect(2)).toBe(6);
+    expect(collect(2)).toBe(5);
   });
 
   it("hint_show draws one label per frozen target, a row's over its sign cell", () => {
@@ -3546,19 +3596,23 @@ describe("the session chooser", () => {
     expect(container.querySelector(".chooser")).toBeNull();
   });
 
-  /** Esc from the chooser over an empty tab returns focus to its composer in INPUT locally.
+  /** Esc or `q` from the chooser over an empty tab returns focus to the dashboard in BROWSE.
    *  Returning it to `.agent-ui-root` would leave the keys on an element that handles no key.
-   *  No request to Rust is needed. */
-  it("Esc from prefix w over an empty tab gives the composer the keys, in INPUT", () => {
+   *  The chooser closes locally and reuses the `arrive` path without waiting for Rust. */
+  it("Esc from prefix w over an empty tab returns to the dashboard menu, in BROWSE", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
     dispatch(ENV);
     const postsBefore = posted.length;
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
-    expect(posted.length).toBe(postsBefore);
+    // V1 C1: the chooser's own close is still local -- no round trip to Rust for IT --
+    // and the mirror posts once, BROWSE: this landing keeps BROWSE throughout (unlike the old
+    // INPUT-landing behaviour this test used to pin), so there is no second, mode-changing post.
+    expect(posted.slice(postsBefore)).toEqual([{ type: "panel_keys", request_id: expect.any(String), mode: "browse" }]);
     expect(container.querySelector(".chooser")).toBeNull();
-    expect(document.activeElement).toBe(container.querySelector("textarea"));
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
   });
 });
 
@@ -4798,5 +4852,412 @@ describe("Shift+Tab anywhere in the chat", () => {
       expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
       vi.unstubAllGlobals();
     });
+  });
+});
+
+/* These tests cover the page's `panel_keys` mirror and the `nav_key`/`nav_fallthrough` exchange
+   for `Ctrl+j`/`Ctrl+k`. They post and dispatch wire envelopes without running Rust's
+   `install_module_nav`. */
+describe("the composer mirror", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // The `a.rs`/`b.rs` transcript line is only exercised by the "gf pick" row below; harmless to
+    // every other case, which never presses `g` then `f`.
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "compare a.rs and b.rs" }] }), 0);
+    return rendered;
+  }
+  function conversationRoot(container: HTMLElement): HTMLElement {
+    return container.querySelector(".agent-ui-conversation")!;
+  }
+  function closeSession(container: HTMLElement) {
+    void container;
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "session_closed", reason: "provider exited" }] });
+  }
+
+  it("posts browse while the live conversation is in BROWSE", () => {
+    startedApp();
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "browse" });
+  });
+
+  it("posts input once the composer is entered", () => {
+    const { container } = startedApp();
+    fireEvent.keyDown(conversationRoot(container), { key: "i" });
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "input" });
+  });
+
+  // `before` already includes the initial BROWSE state, so only the four subsequent mode transitions
+  // post new mirrors.
+  it("posts only on change: BROWSE -> INPUT -> BROWSE -> INPUT -> BROWSE is four new mirrors, not five", () => {
+    const { container } = startedApp();
+    const before = posted.filter((m) => m.type === "panel_keys").length;
+    const root = conversationRoot(container);
+    fireEvent.keyDown(root, { key: "i" });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    fireEvent.keyDown(root, { key: "i" });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    const mirrors = posted.filter((m) => m.type === "panel_keys").slice(before);
+    expect(mirrors.map((m) => m.mode)).toEqual(["input", "browse", "input", "browse"]);
+  });
+
+  it.each<[string, (container: HTMLElement) => void]>([
+    ["? (the keymap overlay)", (container) => fireEvent.keyDown(conversationRoot(container), { key: "?" })],
+    ["chooser", (container) => {
+      void container;
+      dispatch({ kind: "chooser", open: [], records: [] });
+    }],
+    ["details", (container) => {
+      void container;
+      dispatch({ kind: "tab_detail", tab: 1, rows: [{ label: "account", value: "work" }] });
+    }],
+    ["rename", (container) => {
+      void container;
+      dispatch({ kind: "begin_rename", tab: 1, current: null });
+    }],
+    ["/ (search)", (container) => fireEvent.keyDown(conversationRoot(container), { key: "/" })],
+    ["a y/n", (container) => {
+      void container;
+      dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    }],
+    ["a gf pick", (container) => {
+      const root = conversationRoot(container);
+      fireEvent.keyDown(root, { key: "g" });
+      fireEvent.keyDown(root, { key: "f" });
+    }],
+  ])("posts other with %s open", (_name, openOverlay) => {
+    const { container } = startedApp();
+    openOverlay(container);
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+  });
+
+  it("posts other once the session has ended", () => {
+    const { container } = startedApp();
+    closeSession(container);
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+  });
+
+  // Before the first `tabs` envelope, `activeTab` is `null` and no `EmptyTab` composer is mounted.
+  // The mirror must not report `emptyMode`'s default `input` and claim `Ctrl+k` for a nonexistent
+  // box.
+  it("posts other before the first tabs envelope (no box exists yet)", () => {
+    render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
+  });
+});
+
+describe("nav_key and its fallthrough", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    return rendered;
+  }
+  function conversationRoot(container: HTMLElement): HTMLElement {
+    return container.querySelector(".agent-ui-conversation")!;
+  }
+
+  it("nav_key down in BROWSE enters INPUT, no fallthrough", () => {
+    const { container } = startedApp();
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).not.toBeNull();
+    expect(posted.slice(before).some((m) => m.type === "nav_fallthrough")).toBe(false);
+  });
+
+  it("nav_key up in INPUT leaves it, cursor unchanged, draft kept, no fallthrough", () => {
+    // Two transcript rows make it possible to check that the cursor stays on the same row.
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
+    const root = conversationRoot(container);
+    const cursorRowBefore = container.querySelector(".row-current")!.textContent;
+    fireEvent.keyDown(root, { key: "i" });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "half a thought" } });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".composer-draft")!.textContent).toBe("half a thought");
+    expect(posted.slice(before).some((m) => m.type === "nav_fallthrough")).toBe(false);
+    expect(container.querySelector(".row-current")!.textContent).toBe(cursorRowBefore);
+    // Leaving INPUT must return DOM focus to the panel root so it receives subsequent keys.
+    expect(document.activeElement).toBe(root);
+  });
+
+  // `nav_key down` keeps the caret, like `i`/`o`. A bare `setMode("input")` would reuse an earlier
+  // `A`'s stale `composerCaret`: Composer's effect runs on a mode change without needing a fresh
+  // `composerFocusRequest`.
+  it("nav_key down places the caret where it was left, not wherever an earlier A left composerCaret", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    fireEvent.keyDown(root, { key: "A", shiftKey: true }); // composerCaret -> "end", once.
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Escape" });
+    // Enter INPUT via nav_key down (never i/o/A again), leave the caret at 3, leave via nav_key up --
+    // neither of those two touches composerCaret either.
+    dispatch({ kind: "nav_key", direction: "down" });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: "hello world" } });
+    box.setSelectionRange(3, 3);
+    fireEvent.keyUp(box, { key: "ArrowLeft" });
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+    dispatch({ kind: "nav_key", direction: "down" });
+    const box2 = container.querySelector("textarea")!;
+    expect(box2.selectionStart).toBe(3);
+    expect(box2.selectionEnd).toBe(3);
+  });
+
+  it("nav_key down while already INPUT (stale) falls through once, no mode change", () => {
+    const { container } = startedApp();
+    fireEvent.keyDown(conversationRoot(container), { key: "i" });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).not.toBeNull();
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+  });
+
+  it("nav_key down on an ended session falls through", () => {
+    const { container } = startedApp();
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "session_closed", reason: "provider exited" }] });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+  });
+
+  it("nav_key with an overlay (?) open falls through, and the overlay keeps the keys", () => {
+    const { container } = startedApp();
+    fireEvent.keyDown(conversationRoot(container), { key: "?" });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+  });
+
+  // Before the first `tabs` envelope, `EmptyTab` is not mounted. Queuing `nav_key` in `emptyNavKey`
+  // would seed `navKeySeenRef` at mount and silently discard the key.
+  it("nav_key before the first tabs envelope falls through, not silently dropped once EmptyTab later mounts", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    // The "Connecting…" placeholder shares `EmptyTab`'s own `.empty-tab` class name; `.connecting`
+    // (only the placeholder has one) is what actually distinguishes "not mounted yet".
+    expect(container.querySelector(".connecting")).not.toBeNull();
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "up" }]);
+    // A later, real arrival must still work normally: the early fallthrough left no stale request
+    // behind for `EmptyTab`'s own `navKeySeenRef` to seed itself from and swallow.
+    dispatchEmptyTab();
+    expect(container.querySelector("textarea")).not.toBeNull(); // launches INPUT, as it always has.
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+});
+
+describe("nav_key over the empty tab", () => {
+  it("menu nav_key down opens its composer", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    dispatch({ kind: "arrive" }); // lands the dashboard's own menu (BROWSE), not the composer.
+    expect(container.querySelector("textarea")).toBeNull();
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(container.querySelector("textarea")).not.toBeNull();
+    expect(posted.some((m) => m.type === "nav_fallthrough")).toBe(false);
+  });
+
+  it("composer nav_key up goes back to the menu, root focused", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab(); // starts in the composer (INPUT), as a plain launch always has.
+    expect(container.querySelector("textarea")).not.toBeNull();
+    dispatch({ kind: "nav_key", direction: "up" });
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
+    expect(posted.some((m) => m.type === "nav_fallthrough")).toBe(false);
+  });
+
+  it("a starting tab falls through, never transitioning mode", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    const before = posted.length;
+    dispatch({ kind: "nav_key", direction: "down" });
+    expect(posted.slice(before)).toEqual([{ type: "nav_fallthrough", request_id: expect.any(String), direction: "down" }]);
+    expect(container.textContent).toContain("Starting the agent backend");
+  });
+});
+
+/* Exercise o/A caret placement, j on the last stop, and Esc during a running turn through keydowns.
+   This checks that `resolveKey` actions reach `Composer` and the band, beyond the pure keymap tests.
+   The BROWSE hint is covered in Composer.test.tsx; chooser Escape here covers the live-tab landing. */
+describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "hello" }] }), 0);
+    return rendered;
+  }
+  function conversationRoot(container: HTMLElement): HTMLElement {
+    return container.querySelector(".agent-ui-conversation")!;
+  }
+  /** Types "hello world" into the composer, leaves the caret at 3, then returns to BROWSE -- the
+   *  shared setup for both of `o`'s and `A`'s own caret checks below. */
+  function typeAndLeaveCaretAt3(container: HTMLElement, root: HTMLElement) {
+    fireEvent.keyDown(root, { key: "i" });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "hello world" } });
+    textarea.setSelectionRange(3, 3);
+    fireEvent.keyUp(textarea, { key: "ArrowLeft" });
+    fireEvent.keyDown(textarea, { key: "Escape" });
+  }
+
+  it("o restores the caret left at 3 in 'hello world'", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    typeAndLeaveCaretAt3(container, root);
+    fireEvent.keyDown(root, { key: "o" });
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea!.selectionStart).toBe(3);
+  });
+
+  it("A puts the caret at the end (11), regardless of where it was left", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    typeAndLeaveCaretAt3(container, root);
+    fireEvent.keyDown(root, { key: "A", shiftKey: true });
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    expect(textarea!.selectionStart).toBe("hello world".length);
+  });
+
+  it("o and A are refused on an ended session; O and I stay unbound", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 0,
+      throughRevision: 1,
+      events: [{ type: "session_closed", reason: "provider exited" }],
+    });
+    for (const key of ["o", "O", "I"]) {
+      fireEvent.keyDown(root, { key, shiftKey: key !== key.toLowerCase() });
+      expect(container.querySelector("textarea"), key).toBeNull();
+    }
+    fireEvent.keyDown(root, { key: "A", shiftKey: true });
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("j on the last stop flashes the typing hint once", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    // The one row this conversation has is already both the first and the last stop (a snapshot
+    // lands the cursor on the last row).
+    fireEvent.keyDown(conversationRoot(container), { key: "j" });
+    expect(container.querySelector(".band-message")!.textContent).toBe("i or Ctrl+j to type");
+    vi.unstubAllGlobals();
+  });
+
+  it("does not flash on a held key's repeat -- only a fresh press", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "j", repeat: true });
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("k at the first stop stays silent -- vim's own k on line 1 (:h j)", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "k" });
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("Esc in BROWSE while a turn runs flashes that ctrl+c interrupts, and interrupts nothing", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ activeTurnId: "t1", transcript: [{ seq: 1, text: "hello" }] }), 0);
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "Escape" });
+    expect(container.querySelector(".band-message")!.textContent).toBe("Esc does not interrupt — ctrl+c does");
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it("Esc in BROWSE idle flashes nothing (Esc never interrupts, and there is nothing to say)", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    act(() => widen(container));
+    fireEvent.keyDown(conversationRoot(container), { key: "Escape" });
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  /** Esc from the chooser over a live tab returns focus to the conversation root. */
+  it("Esc from the chooser over a live tab returns to the conversation root, unchanged", () => {
+    const { container } = startedApp();
+    const root = conversationRoot(container);
+    dispatch({ kind: "chooser", open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }], records: [] });
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+    expect(container.querySelector(".chooser")).toBeNull();
+    expect(document.activeElement).toBe(root);
+  });
+});
+
+describe("every panel y/n accepts Y too", () => {
+  it("Y confirms a tab close, same as y", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+    expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it("Y confirms close-others, same as y", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close_others", tabs: [2, 3], lines: ["close 2 other tabs? 1 running (y/n)"] });
+    fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+    expect(lastOfType("close_others")).toBeDefined();
+    expect(lastOfType("close_tab")).toBeUndefined();
+  });
+
+  it("n and Escape still cancel, no post", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "n" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+  });
+
+  it("a bare Shift is ignored -- the prompt stays open for the key that follows", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    fireEvent.keyDown(root, { key: "Shift" });
+    expect(lastOfType("close_tab")).toBeUndefined();
+    // Shift alone neither answered nor cancelled the prompt: the very next key still confirms it.
+    fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+    expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
   });
 });

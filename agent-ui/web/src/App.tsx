@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { applyEvent, applySnapshot, initialState, resumeAttached } from "./reducer";
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
-import type { OutboundMessage, PermissionDecision } from "./bridge";
+import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
 import { EMPTY_PANEL_TABLE, resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
@@ -37,6 +37,7 @@ import { PathPick } from "./components/PathPick";
 import { acceptsEnvelope, activeTabInfo, forgetClosed, saveView, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
+import type { NavKeyRequest } from "./components/EmptyTab";
 import { Composer } from "./components/Composer";
 import type { RestoredDraft } from "./components/Composer";
 import { TabBar } from "./components/TabBar";
@@ -404,6 +405,19 @@ export default function App() {
    *  act without the installed handler reading state. The effect uses the current render to
    *  land on a waiting card or enter BROWSE on the last row with following resumed. */
   const [arriveRequest, setArriveRequest] = useState(0);
+  /** V1 C1: bumped by each `nav_key` envelope, direction carried along -- the
+   *  `arriveRequest` pattern (a counter, not a flag), so two arrivals in a row both act and the
+   *  dispatch handler below (installed once) need read no state. The effect that follows this
+   *  declaration decides against the CURRENT render's `mode`/`overlayOpen`/`sessionEnded`/etc., since
+   *  the handler's own closure cannot. */
+  const [navKey, setNavKey] = useState<{ seq: number; direction: NavKeyDirection } | null>(null);
+  const navKeySeqRef = useRef(0);
+  /** What actually reaches `EmptyTab`'s own `navKeyRequest` prop: only a `navKey` the effect below
+   *  found no overlay (`overlayOpen`, `?`, a y/n) already owning the keys for -- EmptyTab has no
+   *  visibility into `keymapOpen`/`confirm` at all (they are this component's own state, drawn over
+   *  its layout rather than passed down), so forwarding `navKey` itself unfiltered would let it act
+   *  on a request that has already been answered with `nav_fallthrough` above it. */
+  const [emptyNavKey, setEmptyNavKey] = useState<NavKeyRequest | null>(null);
   /** The empty tab's landing mode on mount or switch: the latest `enter_input` requests INPUT;
    *  `arrive` or a tab switch requests BROWSE. Launch starts in INPUT. */
   const [emptyLanding, setEmptyLanding] = useState<PanelMode>("input");
@@ -778,9 +792,18 @@ export default function App() {
    *  counter it used to take directly. `Composer`'s own `[focusRequest, mode]` effect focuses the
    *  textarea whenever `mode === "input"`, with no way to gate it from outside -- so a raw
    *  `inputRequest` bump under an open overlay would autofocus a composer drawn underneath it
-   *  (defect 2). Bumped only from the `inputRequest` effect's own pass branch, below, so ordinary
-   *  behaviour (no overlay open) is unchanged. */
+   *  (defect 2). Bumped from the `inputRequest` effect's own pass branch, below, so ordinary
+   *  behaviour (no overlay open) is unchanged; and (C1a) from `resolveKey`'s own `i`/`o`/`A` --
+   *  `mode` alone already re-mounts the textarea (BROWSE's stand-in unmounts, INPUT's own mounts),
+   *  but this is what makes `Composer`'s effect actually run `focusAtCaret` rather than leaving the
+   *  caret to whatever a bare `autoFocus` on a non-empty value happens to land on (defect 1's
+   *  sibling, F12: `i` after an `Esc` re-mounted the box at position 0). */
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
+  /** C1a: which end `composerFocusRequest`'s NEXT bump should place the caret at --
+   *  `"kept"` for `i`/`o` (wherever it was left, `Composer`'s own `caretRef`), `"end"` for `A`.
+   *  Read once, alongside the bump, by `Composer`'s own effect; not itself a `PanelMode`-changing
+   *  request the same way `composerFocusRequest` is, so it carries no `seq` of its own. */
+  const [composerCaret, setComposerCaret] = useState<"kept" | "end">("kept");
   const [keysRequest, setKeysRequest] = useState(0);
   /** The overlay's last two sections and its heading, from `shell`'s `keymap` envelope (sent on
    *  every `ready`, right after the theme). `prefix` defaults to `Ctrl+b`, the stock tmux default,
@@ -1143,6 +1166,10 @@ export default function App() {
     }
     if (!sessionStarted || sessionEnded) return;
     setMode("input");
+    // Every route through `inputRequest` keeps the caret, like `i`/`o` and `Ctrl+j`. Set that
+    // explicitly so an earlier `A` cannot leave `composerCaret` at "end". `A` sets its own caret
+    // and bumps `composerFocusRequest` directly, so it never needs the end-of-draft rule here.
+    setComposerCaret("kept");
     setComposerFocusRequest((n) => n + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inputRequest]);
@@ -1338,6 +1365,11 @@ export default function App() {
         setHandoffOpen(false);
         setChooser(null);
         setPermissionRequest((n) => n + 1);
+      } else if (payload.kind === "nav_key") {
+        // V1 C1: the raw handler only records the request -- see `navKey`'s own doc
+        // comment for why the decision has to live in an effect instead.
+        navKeySeqRef.current += 1;
+        setNavKey({ seq: navKeySeqRef.current, direction: payload.direction });
       } else if (payload.kind === "keymap") {
         // A table that changed while a sequence was pending must never let the OLD table's binding
         // run against the new one -- cancelled before the new table is even
@@ -1754,6 +1786,76 @@ export default function App() {
     requestHello();
   }, []);
 
+  /** Mirrors the composer's key mode. `browse`/`input` describe the live tab or empty tab without
+   *  an overlay; other states, including an ended session, map to `other`. Recomputed each render
+   *  so the posting effect compares current values. Declared after the mount effect because React
+   *  runs effects in source order and `ready` must be posted first.
+   *  Before the first `tabs` envelope, `activeTab` is `null` and `EmptyTab` is not mounted. Map that
+   *  screen to `other` so Rust cannot claim `Ctrl+k` for a composer that does not exist. */
+  const panelKeysMode: PanelKeysMode =
+    overlayOpen || keymapOpen || detail !== null || confirm !== null || pathPick !== null
+      ? "other"
+      : sessionStarted
+        ? sessionEnded
+          ? "other"
+          : mode === "input"
+            ? "input"
+            : "browse"
+        : activeTab === null
+          ? "other"
+          : emptyMode === "input"
+            ? "input"
+            : "browse";
+  useEffect(() => {
+    postToRust({ type: "panel_keys", request_id: nextRequestId(), mode: panelKeysMode });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelKeysMode]);
+  /** V1 C1, "stale mirror, both ways": every `nav_key` this page cannot apply comes back
+   *  as one `nav_fallthrough`, so Rust runs the chord's ordinary `move_focus` instead of dropping the
+   *  key. `keymapOpen`/`confirm` are checked here rather than left to `EmptyTab`:
+   *  they are this component's own state, drawn over its layout, and `EmptyTab` has no prop carrying
+   *  either -- forwarding `navKey` to it unfiltered would let it act on a request this effect has
+   *  already answered. `detail`/`pathPick` are live-tab-only by construction (neither ever renders
+   *  while `!sessionStarted`), so they are read only inside that branch below. */
+  useEffect(() => {
+    if (navKey === null) return;
+    const { direction } = navKey;
+    if (overlayOpen || keymapOpen || confirm !== null) {
+      postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction });
+      return;
+    }
+    // Before the first `tabs` envelope, `EmptyTab` is not mounted. Queuing `nav_key` in `emptyNavKey`
+    // would seed `navKeySeenRef` at mount and silently discard the key. Send `nav_fallthrough`
+    // instead, as for other screens without a composer.
+    if (activeTab === null) {
+      postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction });
+      return;
+    }
+    if (!sessionStarted) {
+      setEmptyNavKey(navKey);
+      return;
+    }
+    if (detail !== null || pathPick !== null || sessionEnded) {
+      postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction });
+      return;
+    }
+    if (direction === "down" && mode === "browse") {
+      // Keep the caret where it was left, as `i`/`o` do. Set `composerCaret` explicitly so this chord
+      // cannot reuse an earlier `A`'s end-of-draft setting.
+      setMode("input");
+      setComposerCaret("kept");
+      setComposerFocusRequest((n) => n + 1);
+      return;
+    }
+    if (direction === "up" && mode === "input") {
+      setMode("browse");
+      return;
+    }
+    // Stale: the mirror said browse/input but this render's `mode` no longer agrees.
+    postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navKey]);
+
   /** Clears every trace of a HINT session: labels, prefix, the frozen list and the session itself,
    *  so no later envelope for it does anything. */
   function endHint() {
@@ -1957,7 +2059,16 @@ export default function App() {
   }
   function onChooserLeave() {
     setChooser(null);
-    returnKeysToRoot();
+    // Closing the chooser returns keys to the conversation root, or to the empty tab's dashboard
+    // menu in BROWSE. Use the same `setEmptyLanding` and `setArriveRequest` pair as an arrival.
+    // `returnKeysToRoot` would request INPUT in the empty layout, giving Esc an unintended composer
+    // landing.
+    if (containerRef.current !== null) {
+      containerRef.current.focus({ preventScroll: true });
+      return;
+    }
+    setEmptyLanding("browse");
+    setArriveRequest((n) => n + 1);
   }
   /** The chooser's own `New session` row: the same
    *  window-level `tab_verb new` the `tab.new` action already posts (`handleAction` above),
@@ -1992,7 +2103,9 @@ export default function App() {
     if (confirm === null) return false;
     if (!["Shift", "Control", "Alt", "Meta"].includes(event.key)) {
       event.preventDefault();
-      if (event.key === "y") {
+      // Panel confirmations accept both `y` and `Y`, matching `close_prompt.rs`. Any other
+      // non-modifier key cancels.
+      if (event.key === "y" || event.key === "Y") {
         if (confirm.kind === "close") {
           postToRust({ type: "close_tab", request_id: nextRequestId(), tab: confirm.tab });
         } else {
@@ -2075,6 +2188,9 @@ export default function App() {
             handoff={handoff}
             failure={activeTab.failure ?? fatalError}
             paneFocused={paneFocused}
+            // Give the dashboard hint the live prefix instead of assuming the default. This is the
+            // same value the `?` overlay shows as `prefixLabel`.
+            prefix={keymapHelp.prefix}
             focusRequest={inputRequest}
             arriveRequest={arriveRequest}
             // `EmptyTab` handles Composer focus and focuses its own root on `keysRequest`. Route focus requests
@@ -2084,6 +2200,11 @@ export default function App() {
             overlayOpen={overlayOpen}
             landing={emptyLanding}
             onModeChange={setEmptyMode}
+            // V1 C1: only a `navKey` the effect above found no overlay owning the keys
+            // for -- this screen decides the rest itself (a starting/failed tab, its own menu vs.
+            // composer), reporting back through `onNavFallthrough` when it cannot apply one either.
+            navKeyRequest={emptyNavKey}
+            onNavFallthrough={(direction) => postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction })}
             restoredDraft={restoredDraft}
             // `EmptyTab` keeps its own leader sequence and box state, alongside its local mode. It shares the
             // pure panel table and `runPanelAction` with the live conversation.
@@ -2423,7 +2544,17 @@ export default function App() {
         if (target === null) return;
         const finalRow = rowIndexOf(root, target);
         if (finalRow !== null) {
-          if (finalRow !== cursor) landingRef.current = action.delta;
+          // C1c: `j` that cannot move -- `nextStop` clamps rather than returning `null`
+          // at a boundary (`clampStep`'s own doc comment), so "the last stop" is `finalRow === cursor`
+          // here, not `target === null` (that case is an EMPTY conversation, handled above and
+          // unrelated). Flashes once per press, never on a held key's repeat; `k` at the FIRST stop
+          // stays silent, as vim's own `k` on the first line does (`:h j`) -- only `j` names a route
+          // the reader might actually want next.
+          if (finalRow === cursor) {
+            if (action.delta === 1 && !event.repeat) showFlash("i or Ctrl+j to type");
+          } else {
+            landingRef.current = action.delta;
+          }
           setCursor(finalRow);
           root.focus({ preventScroll: true });
         } else {
@@ -2452,6 +2583,17 @@ export default function App() {
     switch (action.kind) {
       case "mode":
         setMode(action.to);
+        // C1a: entering INPUT (`i`/`o`/`A`) asks `Composer` to place the caret itself, rather than
+        // leaving it to whatever a bare `autoFocus` on a freshly re-mounted, non-empty box happens
+        // to land on (F12). Leaving BROWSE (`to === "browse"`) carries no caret to place.
+        if (action.to === "input") {
+          setComposerCaret(action.caret);
+          setComposerFocusRequest((n) => n + 1);
+        }
+        break;
+      case "esc-blocked":
+        // `Esc` shows a reminder here; it never interrupts the turn.
+        showFlash("Esc does not interrupt — ctrl+c does");
         break;
       case "toggle-expand": {
         // Keyed on the timeline KEY, not the cursor index -- see the doc comment on `expanded`
@@ -2842,10 +2984,11 @@ export default function App() {
         closing={handingOff}
         restoredDraft={restoredDraft}
         mode={mode}
-        // Pass the gated `composerFocusRequest` to Composer. Its focus effect cannot see overlays, so using
-        // raw `inputRequest` would let it focus the textarea underneath one. The `inputRequest`
-        // effect checks `overlayOpen` before forwarding the request.
+        // `composerFocusRequest` is bumped by the `inputRequest` effect only when no overlay is open,
+        // and by the `i`/`o`/`A` mode actions. Passing the raw request would let `Composer`
+        // focus its textarea under an overlay.
         focusRequest={composerFocusRequest}
+        caretOnFocus={composerCaret}
         // Only while the box can take a message: a landing on a disabled textarea could not focus it.
         hintTarget={!(sessionEnded || handingOff)}
         onModeChange={setMode}

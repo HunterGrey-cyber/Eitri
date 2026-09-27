@@ -41,11 +41,15 @@ describe("KeymapOverlay", () => {
       expect(text).toContain(row.keys);
       expect(text).toContain(row.what);
     }
-    // Typing carries two rows of its own on top of INPUT_KEYS (C6): the pane-switch chord and the
-    // prefix, both of which neovibe keeps for itself rather than handing to the composer. The
-    // leader section adds none of its own -- `EMPTY_PANEL_TABLE` has no bindings.
+    // Typing carries four rows of its own on top of INPUT_KEYS: the pane-switch chord and the
+    // prefix (C6), plus V1 C1's `Ctrl+k`/`Ctrl+j` -- all four of which neovibe (or Rust's mirror)
+    // keeps for itself rather than handing to the composer. "This panel" carries one of its own on
+    // top of BROWSE_KEYS (V1 C1): `Ctrl+j`, Rust's mirror claiming the chord ahead of `resolveKey`.
+    // Neither GTK-decided pair can live in `BROWSE_KEYS`/`INPUT_KEYS` themselves -- both are tied to
+    // `resolveKey`/`COMPOSER_CHORDS` both ways (`keymap.test.ts`, `composerKeys.test.ts`). The leader
+    // section adds none of its own -- `EMPTY_PANEL_TABLE` has no bindings.
     expect(container.querySelectorAll("tr").length).toBe(
-      BROWSE_KEYS.length + INPUT_KEYS.length + 2 + WINDOW.length + PREFIX.length,
+      BROWSE_KEYS.length + 1 + INPUT_KEYS.length + 4 + WINDOW.length + PREFIX.length,
     );
   });
 
@@ -54,9 +58,24 @@ describe("KeymapOverlay", () => {
       <KeymapOverlay onClose={() => {}} windowKeys={[]} prefixKeys={[]} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} />,
     );
     const typing = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Typing"))!;
-    expect(typing.textContent).toContain("Ctrl+h / j / k / l");
+    // The pane row claims only h/l. The two rows below claim j/k, so listing them here too would
+    // give conflicting meanings.
+    expect(typing.textContent).toContain("Ctrl+h / l");
     expect(typing.textContent).toContain("Move between panes (neovibe keeps these)");
     expect(typing.textContent).toContain("Ctrl+b");
+    // V1 C1: the mirror's own Ctrl+k/Ctrl+j, spliced in the same way.
+    expect(typing.textContent).toContain("Back to browsing (as Esc)");
+    expect(typing.textContent).toContain("The module below");
+  });
+
+  // V1 C1: the mirror's own `Ctrl+j` in "This panel" is spliced in the same way, since
+  // `resolveKey` never claims it either -- checked against a real panel `<Section>`, not just the
+  // whole-container row count above.
+  it("names the mirror's Ctrl+j in This panel too", () => {
+    const { container } = overlay();
+    const panelSection = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("This panel"))!;
+    expect(panelSection.textContent).toContain("Ctrl+j");
+    expect(panelSection.textContent).toContain("Type (the box below)");
   });
 
   it("closes on a click on its own backdrop, not on a click inside a table", () => {

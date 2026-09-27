@@ -172,11 +172,12 @@ describe("Composer restoring a refused draft", () => {
    keystroke to land in -- and the two mouse-driven paths that have to agree with the keyboard
    table in `keymap.ts` on what mode the panel is in. */
 describe("Composer's BROWSE/INPUT split", () => {
-  it("shows an empty-looking box instead of a textarea in BROWSE, with no instruction in it", () => {
+  it("shows an empty-looking box instead of a textarea in BROWSE, with the C1b/S3 hint after it", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector("textarea")).toBeNull();
-    // The stand-in uses the textarea's placeholder. `i`, a click and Tab still enter INPUT.
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...");
+    // The stand-in shows the placeholder followed by a dim typing hint. `i`, a click and Tab still
+    // enter INPUT.
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent... — i or Ctrl+j to type");
   });
 
   it("takes focus back when asked, even if it is already mounted", () => {
@@ -217,6 +218,77 @@ describe("Composer's BROWSE/INPUT split", () => {
   });
 });
 
+/** C1b/S3: the dim `i or Ctrl+j to type` that follows the placeholder or the draft in
+ *  BROWSE, restoring what 2026-09-19 removed once that removal's own premise (`Ctrl+l` opening the
+ *  composer directly) ended. */
+describe("Composer's BROWSE hint (C1b/S3)", () => {
+  it("shows the hint after the placeholder, with nothing typed", () => {
+    const { container } = renderComposer({ mode: "browse" });
+    expect(container.querySelector(".composer-hint")!.textContent).toBe(" — i or Ctrl+j to type");
+  });
+
+  it("shows the same hint after an unsent draft too", () => {
+    const { container } = renderComposer({ mode: "browse", restoredDraft: { text: "half a thought", seq: 1 } });
+    const hint = container.querySelector(".composer-browse-hint")!;
+    expect(hint.querySelector(".composer-draft")).not.toBeNull();
+    expect(hint.querySelector(".composer-hint")!.textContent).toBe(" — i or Ctrl+j to type");
+  });
+
+  it("is not shown in INPUT -- the caret is the sign there", () => {
+    const { container } = renderComposer({ mode: "input" });
+    expect(container.querySelector(".composer-hint")).toBeNull();
+  });
+
+  it("is not shown on a session that has ended -- that row says r instead", () => {
+    const { container } = renderComposer({ mode: "browse", sessionEnded: true });
+    expect(container.querySelector(".composer-hint")).toBeNull();
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toContain("Press r to start a new session here.");
+  });
+
+  it("is not shown while a scratch round trip owns the draft (editingInNvim)", () => {
+    const { container } = renderComposer({ mode: "browse", editingInNvim: true });
+    expect(container.querySelector(".composer-hint")).toBeNull();
+  });
+});
+
+/** C1a: where the caret goes on entering INPUT, now that `Composer`'s own
+ *  `[focusRequest, mode]` effect runs `focusAtCaret` on every transition into "input" rather than
+ *  only when `focusRequest` had separately been bumped past 0 (the fix at F12's actual cause: a
+ *  fresh `autoFocus` mount of a non-empty box is not reliable on its own, in this project's own
+ *  measured GUI pass). */
+describe("Composer's caret on entering INPUT (C1a)", () => {
+  it("i restores the caret left at 3 in 'hello world'", () => {
+    const { container, rerender } = renderComposerWithRerender({ mode: "input" });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "hello world" } });
+    textarea.setSelectionRange(3, 3);
+    fireEvent.keyUp(textarea, { key: "ArrowLeft" });
+    // `i`: caret "kept" (the default `caretOnFocus`), the same round trip BROWSE/INPUT always was.
+    rerender({ mode: "browse" });
+    rerender({ mode: "input", focusRequest: 1 });
+    expect(container.querySelector("textarea")!.selectionStart).toBe(3);
+  });
+
+  it("A puts the caret at the end of 'hello world' (11), regardless of where it was left", () => {
+    const { container, rerender } = renderComposerWithRerender({ mode: "input" });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "hello world" } });
+    textarea.setSelectionRange(3, 3);
+    fireEvent.keyUp(textarea, { key: "ArrowLeft" });
+    rerender({ mode: "browse" });
+    rerender({ mode: "input", focusRequest: 1, caretOnFocus: "end" });
+    expect(container.querySelector("textarea")!.selectionStart).toBe(11);
+  });
+
+  /** F12's own start-of-draft case: a box that mounts already carrying a draft (never one the user
+   *  typed into THIS instance first) must not land the caret at 0. */
+  it("a fresh mount with a draft puts the caret at the end, not the start", () => {
+    const { textarea } = renderComposer({ mode: "input", restoredDraft: { text: "existing words", seq: 1 } });
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.selectionStart).toBe("existing words".length);
+  });
+});
+
 describe("Composer in BROWSE (C2)", () => {
   it("shows the unsent draft, muted and cut to two lines, and how many are queued", () => {
     const { container } = renderComposer({
@@ -231,7 +303,7 @@ describe("Composer in BROWSE (C2)", () => {
 
   it("reads like the empty box it stands in for when there is nothing typed", () => {
     const { container } = renderComposer({ mode: "browse" });
-    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...");
+    expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent... — i or Ctrl+j to type");
   });
 
   // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab in every mode before this
