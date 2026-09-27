@@ -153,11 +153,13 @@ pub struct ThemeTokens {
     pub font_size_px: f32,
     /// `"light"` or `"dark"`, for CSS `color-scheme`.
     pub color_scheme: &'static str,
-    /// The editor's cell height in CSS px, set by `shell` from `connect_cell_size_changed`.
-    /// This lets the panel's bottom input row match the editor's status row height.
-    /// `None` until nvim reports a font. Carried through `ready` and reloads like `font_size_px`,
-    /// without a new envelope. `css_vars()` emits `--nv-editor-row` only for `Some`, so a reload
-    /// before the editor's first frame uses the `24px` fallback in `index.css`.
+    /// The editor's cell height in panel CSS px, set by `shell` from `connect_cell_size_changed`.
+    /// This lets the panel's bottom input row match the editor's status row height. The signal
+    /// reports GTK logical px, which differ from CSS px when WebKitGTK applies desktop text
+    /// scaling; `shell/src/webkit_zoom.rs` converts them. `None` until nvim reports a font.
+    /// Carried through `ready` and reloads like `font_size_px`, without a new envelope.
+    /// `css_vars()` emits `--nv-editor-row` only for `Some`, so a reload before the editor's first
+    /// frame uses the `24px` fallback in `index.css`.
     pub editor_row_px: Option<f32>,
 }
 
