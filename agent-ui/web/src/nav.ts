@@ -2,10 +2,11 @@
  * Keyboard navigation follows the panel's document structure. `hjkl` uses known DOM order,
  * avoiding guesses about the nearest control based on pixel positions.
  *
- * A stop carries `data-nav-stop`: a conversation row, banner, status line or terminal-handoff
- * area, or a choice row or mode button on the start screen. `j`/`k` walk stops in document order.
- * Stops without usable controls are skipped except for rows, which hold the conversation cursor
- * for `Enter`/`y` even when they have no button.
+ * A stop carries `data-nav-stop`: a conversation row, banner or terminal-handoff area, or a choice
+ * row or mode button on the start screen. `j`/`k` walk stops in document order. The bottom band is
+ * not a stop: `j` at the last stop stays there. Session details open with `<leader>i`, `prefix i`
+ * or a click on the band. Stops without usable controls are skipped except for rows, which hold
+ * the conversation cursor for `Enter`/`y` even when they have no button.
  *
  * `h`/`l` walk enabled buttons, inputs, textareas and radios within a stop. Document order applies
  * unless `data-nav-order` overrides it. Permission cards put Approve before Deny and the reason

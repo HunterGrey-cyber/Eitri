@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { classify } from "./problems";
 import cliMissingFixture from "./fixtures/problems/cli-missing.txt?raw";
 import cliOutOfRangeFixture from "./fixtures/problems/cli-out-of-range.txt?raw";
+import notLoggedInFixture from "./fixtures/problems/not-logged-in.txt?raw";
 import spawnRs from "../../../agent/src/providers/claude_sidecar/spawn.rs?raw";
 
 describe("classify", () => {
@@ -59,6 +60,23 @@ describe("classify", () => {
       headline: "Claude Code is not logged in.",
       remedy: 'Run claude in a terminal and /login, then send again. (account "work": ~/.claude-work)',
     });
+  });
+
+  /* The v1-ui GUI pass (2026-09-27) captured what a logged-out account really produces: the
+     sidecar's own account check refuses before binding its socket, so no turn is sent and the
+     "Please run /login" string above never appears. Unrecognised, the failed tab showed only the
+     raw text. */
+  it("recognises the captured logged-out sidecar and names the account and its directory", () => {
+    expect(classify(notLoggedInFixture)).toEqual({
+      headline: "Claude Code is not logged in.",
+      remedy: 'Run claude in a terminal and /login, then press r. (account "scratch": /scratch/v1ui-gui/claude-scratch)',
+    });
+  });
+
+  it("recognises it inside the failed tab's own prefix too", () => {
+    expect(classify(`failed to connect to the Verdandi sidecar: ${notLoggedInFixture}`, "other")?.headline).toBe(
+      "Claude Code is not logged in.",
+    );
   });
 
   it("returns null for a failure it does not recognise", () => {

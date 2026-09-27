@@ -69,12 +69,31 @@ function classifyNotLoggedIn(text: string, account: string | null): Problem | nu
   return { headline: "Claude Code is not logged in.", remedy };
 }
 
+/** Captured verbatim in `fixtures/problems/not-logged-in.txt` by the v1-ui GUI pass (2026-09-27): a
+ *  sidecar started for an account whose config directory has no credentials (and no
+ *  `ANTHROPIC_API_KEY`) refuses before it binds its socket -- Verdandi's own account check, ahead of
+ *  the CLI version check, so no turn is ever sent and "Please run /login" never appears. Names the
+ *  account and its directory from the text itself, which already carries both (a
+ *  `VERDANDI_CLAUDE_CONFIG_DIR` override included, which `~/.claude-<name>` would get wrong). */
+const SIDECAR_NOT_LOGGED_IN_RE = /claude account "([^"]+)" is not logged in: (.+?)\/\.credentials\.json is missing/;
+
+function classifySidecarNotLoggedIn(text: string): Problem | null {
+  const m = SIDECAR_NOT_LOGGED_IN_RE.exec(text);
+  if (m === null) return null;
+  const [, account, dir] = m;
+  return {
+    headline: "Claude Code is not logged in.",
+    remedy: `Run claude in a terminal and /login, then press r. (account "${account}": ${dir})`,
+  };
+}
+
 /** Order matters only in that each recognizer's own marker is specific enough that at most one
  *  ever matches a real diagnostic; there is no priority contest to get right. */
 const CLASSIFIERS: ((text: string, account: string | null) => Problem | null)[] = [
   (text) => classifySidecarMissing(text),
   (text) => classifyCliMissing(text),
   (text) => classifyCliOutOfRange(text),
+  (text) => classifySidecarNotLoggedIn(text),
   (text, account) => classifyNotLoggedIn(text, account),
 ];
 

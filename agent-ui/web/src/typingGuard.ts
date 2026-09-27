@@ -13,6 +13,11 @@
  * makes that `l` followed by Enter eligible.
  * A held key's repeat (`event.repeat`) never answers.
  *
+ * `mayActAfterMotion` guards the leader and Enter/Space on Stop. A Space in prose can start
+ * a leader sequence, and `j` from the last row can put the next Space on Stop. These keys act
+ * only after a pause or an unbroken run of `j`/`k`/`h`/`l`/`g`/`G`/Tab that began with a key
+ * standing alone, so quick navigation can still end in an action.
+ *
  * Pure: it never reads the DOM. Timestamps come from the caller (`event.timeStamp`). Timers
  * are injectable and otherwise looked up globally at call time so fake timers apply.
  */
@@ -25,6 +30,11 @@ export const TYPING_GUARD_MS = 250;
  *  typing. Shift+Tab arrives as `Tab` (the caller normalizes WebKitGTK's `Unidentified`/
  *  `code: "Tab"` shape to it). */
 const WALK_KEYS = new Set(["h", "l", "Tab"]);
+
+/** The keys that move the cursor without typing (`keymap.ts`'s BROWSE motions, the empty
+ *  tab's `j`/`k`, and Tab). `mayActAfterMotion` allows the leader or Enter/Space on Stop after
+ *  a run of these keys. `WALK_KEYS` stays narrower for a card's Approve/Deny controls. */
+const MOTION_KEYS = new Set(["h", "j", "k", "l", "g", "G", "Tab", "ArrowUp", "ArrowDown"]);
 
 /** Bare modifiers are not "a key". `key` values from the
  *  UI Events KeyboardEvent key list's modifier section. */
@@ -45,6 +55,15 @@ const MODIFIER_KEYS = new Set([
   "Symbol",
   "SymbolLock",
 ]);
+
+/** What the band says when the leader did not start a sequence because it came in the middle of
+ *  typing (`TypingGuard.mayActAfterMotion`; the v1-ui GUI pass, 2026-09-27: "set up my" ran
+ *  `<leader>m`, "the boy" `<leader>bo` and answered its y/n with its own `y`). `leaderLabel` is the
+ *  leader as a person reads it (`Space`, or nvim's `mapleader`). The live conversation and the empty
+ *  tab's dashboard both say it. */
+export function leaderTypingFlash(leaderLabel: string): string {
+  return `${leaderLabel} starts a sequence only on its own — i or Ctrl+j to type`;
+}
 
 export function isModifierKey(key: string): boolean {
   return MODIFIER_KEYS.has(key);
@@ -72,6 +91,10 @@ export class TypingGuard {
   private latestRunIsWalk = false;
   /** The same, for the run ending at `previous`: what Enter's walk exception asks. */
   private previousRunIsWalk = false;
+  /** Whether every key of the unbroken run ending at `latest` is a motion key (`MOTION_KEYS`). */
+  private latestRunIsMotion = false;
+  /** The same, for the run ending at `previous`: what `mayActAfterMotion` asks. */
+  private previousRunIsMotion = false;
   /** The waiting answer's timer, boxed so a timer handle that happens to be falsy still counts. */
   private pending: { handle: unknown } | null = null;
 
@@ -85,6 +108,8 @@ export class TypingGuard {
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
     this.previousRunIsWalk = this.latestRunIsWalk;
     this.latestRunIsWalk = WALK_KEYS.has(key) && (!continuesRun || this.previousRunIsWalk);
+    this.previousRunIsMotion = this.latestRunIsMotion;
+    this.latestRunIsMotion = MOTION_KEYS.has(key) && (!continuesRun || this.previousRunIsMotion);
     this.previous = this.latest;
     this.latest = { key, t };
     return this.cancel();
@@ -99,6 +124,18 @@ export class TypingGuard {
     const before = this.previous;
     if (before === null || t - before.t >= TYPING_GUARD_MS) return true;
     return key === "Enter" && this.previousRunIsWalk;
+  }
+
+  /** The leader, and Enter/Space on the activity line's Stop (the v1-ui GUI pass, 2026-09-27; this
+   *  file's own doc comment): whether the key `onKey` just recorded (at `t`) may act -- with nothing
+   *  within the window before it, or when the whole unbroken run before it is motion keys back to a
+   *  key that stood alone (`j`⏎ and `jj<Space>` act; "just do it"'s Space and "the boy"'s do not).
+   *  A repeat never may. */
+  mayActAfterMotion(t: number, repeat: boolean): boolean {
+    if (repeat) return false;
+    const before = this.previous;
+    if (before === null || t - before.t >= TYPING_GUARD_MS) return true;
+    return this.previousRunIsMotion;
   }
 
   /** `a`/`d`/`D`: when the key `onKey` just recorded stands alone before, runs `run` after

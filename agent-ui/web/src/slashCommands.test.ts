@@ -3,6 +3,7 @@ import {
   heldBackSlashCommand,
   SLASH_COMMANDS,
   slashCommandFlashText,
+  listedSlashCommands,
   worksSlashCommands,
 } from "./slashCommands";
 import slashCommandsDoc from "../../../docs/2026-09-27-slash-commands.md?raw";
@@ -118,5 +119,31 @@ describe("worksSlashCommands (the ? overlay's list)", () => {
       "doctor",
       "output-style",
     ]);
+  });
+});
+
+/* The v1-ui GUI pass (2026-09-27): `/config` typed and refused said "? lists the ones that do", and `?`
+   listed `/config`. The overlay lists only what Enter sends. */
+describe("listedSlashCommands (the ? overlay's list, what Enter would send)", () => {
+  it("leaves out /config and lists /model in its sendable form", () => {
+    expect(listedSlashCommands()).toEqual([
+      "clear",
+      "compact",
+      "cost",
+      "context",
+      "usage",
+      "model <name>",
+      "mcp",
+      "agents",
+      "doctor",
+      "output-style",
+    ]);
+  });
+
+  it("names nothing Enter holds back", () => {
+    for (const shown of listedSlashCommands()) {
+      const typed = `/${shown.replace(" <name>", " sonnet")}`;
+      expect(heldBackSlashCommand(typed), typed).toBeNull();
+    }
   });
 });

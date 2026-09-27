@@ -1593,27 +1593,39 @@ describe("the leader", () => {
         binding(["<leader>", "t"], "panel.handoff", "terminal"),
       ],
     };
-    const { container } = started();
-    sendTable(withExtras);
-    act(() => root(container).focus());
+    // Fake time, and a pause before each leader: the leader starts a sequence only on a key that
+    // stands alone (the v1-ui GUI pass, `TypingGuard.mayActAfterMotion`), and three sequences fired
+    // back to back in real time would read as typing.
+    vi.useFakeTimers();
+    try {
+      const pause = () => act(() => vi.advanceTimersByTime(300));
+      const { container } = started();
+      sendTable(withExtras);
+      act(() => root(container).focus());
 
-    press(" ");
-    press("/");
-    expect(container.querySelector(".search-bar")).not.toBeNull();
-    act(() => root(container).focus());
+      pause();
+      press(" ");
+      press("/");
+      expect(container.querySelector(".search-bar")).not.toBeNull();
+      act(() => root(container).focus());
 
-    press(" ");
-    press("?");
-    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
-    // Close it so it does not swallow the next press.
-    fireEvent.keyDown(container.querySelector(".keymap-overlay")!, { key: "Escape" });
-    act(() => root(container).focus());
+      pause();
+      press(" ");
+      press("?");
+      expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+      // Close it so it does not swallow the next press.
+      fireEvent.keyDown(container.querySelector(".keymap-overlay")!, { key: "Escape" });
+      act(() => root(container).focus());
 
-    posted.length = 0;
-    press(" ");
-    press("t");
-    expect(posted.length).toBe(0);
-    expect(container.querySelector(".handoff")).not.toBeNull();
+      posted.length = 0;
+      pause();
+      press(" ");
+      press("t");
+      expect(posted.length).toBe(0);
+      expect(container.querySelector(".handoff")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1852,8 +1864,76 @@ describe("v1: typing never answers a card", () => {
     press("x");
     const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
     act(() => stop.focus());
+    // A key on its own (the v1-ui GUI pass: Stop no longer acts in the middle of typing, below).
+    wait(300);
     expect(fireEvent.keyDown(stop, { key: "Enter" })).toBe(true);
+    wait(300);
     expect(fireEvent.keyDown(stop, { key: " " })).toBe(true);
+  });
+
+  /* The v1-ui GUI pass (2026-09-27): `j` from the last row lands on Stop, so "just do it" typed after
+     an arrival interrupted the turn with its first Space (the card was denied with it), and "jl⏎"
+     the same with its Enter. Stop now acts only on a key that stands alone or ends a quick motion. */
+  it.each([[" "], ["Enter"]])("t then %j on Stop at 80 ms interrupts nothing, and says so", (key) => {
+    const { container } = arrivedOnACard();
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    wait(300);
+    press("t");
+    wait(80);
+    expect(pressOnButton(key)).toBe(false);
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+    expect(band(container)).toBe("Stop takes a key only on its own — i or Ctrl+j to type");
+  });
+
+  it("j onto Stop then Enter at 80 ms is one quick motion: it interrupts", () => {
+    arrivedOnACard();
+    const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
+    act(() => stop.focus());
+    wait(300);
+    press("j");
+    wait(80);
+    expect(pressOnButton("Enter")).toBe(true);
+    expect(posted.some((m) => m.type === "interrupt")).toBe(true);
+  });
+
+  /* The same pass: the leader starts a sequence wherever the row cursor has the keys, so typed prose
+     ran them -- "set up my" `<leader>m` (the mode switch that, on a switch-capable sidecar, approves
+     every waiting card), "the boy" `<leader>bo` and its own `y`. */
+  it("e Space b b at 80 ms a key: no leader sequence runs, and the band says so", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    for (const key of ["e", " ", "b", "b"]) {
+      press(key);
+      wait(80);
+    }
+    wait(1000);
+    expect(posted.filter((m) => m.type === "tab_verb")).toEqual([]);
+    expect(container.querySelector(".which-key-box")).toBeNull();
+    expect(band(container)).toBe("Space starts a sequence only on its own — i or Ctrl+j to type");
+  });
+
+  it("t Space m at 80 ms a key: <leader>m never runs", () => {
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    const before = posted.length;
+    for (const key of ["t", " ", "m"]) {
+      press(key);
+      wait(80);
+    }
+    wait(1000);
+    expect(posted.slice(before).filter((m) => m.type === "cycle_mode" || m.type === "cycle_default_mode")).toEqual([]);
+    expect(band(container)).not.toMatch(/mode is fixed/);
+  });
+
+  it("k k then Space b b at 80 ms a key: a quick motion, so the leader still runs", () => {
+    arrivedOnACard();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    for (const key of ["k", "k", " ", "b", "b"]) {
+      press(key);
+      wait(80);
+    }
+    expect(posted.filter((m) => m.type === "tab_verb").map((m) => m.verb)).toEqual(["last"]);
   });
 
   it("a lone D puts the keys in the card's reason box 250 ms later", () => {
@@ -3102,6 +3182,35 @@ describe("App refused commands", () => {
   // such message any more -- a fresh tab's first `send_message` IS the start, and a
   // refusal of it is refused the same way any other send is, with no separate suppression rule
   // specified for it by the plan.
+});
+
+describe("App: a live session's ending classified", () => {
+  function ended(type: "session_unavailable" | "session_closed", reason: string) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type, reason }] });
+    return rendered;
+  }
+
+  it("a lost session whose reason is a login failure gets the headline above the unchanged raw text", () => {
+    const reason = "provider failed: Invalid API key · Please run /login";
+    const { container } = ended("session_unavailable", reason);
+    const row = container.querySelector(".row-error")!;
+    expect(row.querySelector(".row-problem strong")!.textContent).toBe("Claude Code is not logged in.");
+    expect(row.querySelector("pre")!.textContent).toBe(reason);
+  });
+
+  it("a closed session is classified the same way", () => {
+    const { container } = ended("session_closed", "Please run /login");
+    expect(container.querySelector(".row-ended .row-problem strong")!.textContent).toBe("Claude Code is not logged in.");
+  });
+
+  it("an unrecognised reason draws exactly what it drew before", () => {
+    const { container } = ended("session_unavailable", "provider exited");
+    expect(container.querySelector(".row-problem")).toBeNull();
+    expect(container.querySelector(".row-error pre")!.textContent).toBe("provider exited");
+  });
 });
 
 describe("App fatal errors", () => {
@@ -5016,6 +5125,59 @@ describe("nav_key and its fallthrough", () => {
     expect(box2.selectionEnd).toBe(3);
   });
 
+  // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees keydown. A claimed `nav_key` must cancel
+  // pending prefixes and leader sequences, or a later key can complete a stale sequence after
+  // returning from INPUT.
+  it("a claimed nav_key cancels a pending g prefix and hides its box", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
+      const root = conversationRoot(container);
+      act(() => root.focus());
+      const lastRow = container.querySelector(".row-current")!.textContent;
+      expect(lastRow).toContain("second");
+      fireEvent.keyDown(root, { key: "g" });
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      expect(container.querySelector(".which-key-box")).not.toBeNull();
+      dispatch({ kind: "nav_key", direction: "down" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      fireEvent.change(container.querySelector("textarea")!, { target: { value: "a draft" } });
+      act(() => vi.advanceTimersByTime(3000));
+      dispatch({ kind: "nav_key", direction: "up" });
+      expect(container.querySelector("textarea")).toBeNull();
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      fireEvent.keyDown(root, { key: "g" });
+      expect(container.querySelector(".row-current")!.textContent).toBe(lastRow);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a claimed nav_key cancels a pending leader sequence", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+      const root = conversationRoot(container);
+      act(() => root.focus());
+      posted.length = 0;
+      fireEvent.keyDown(root, { key: " " });
+      fireEvent.keyDown(root, { key: "b" });
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      expect(container.querySelector(".which-key-box")).not.toBeNull();
+      dispatch({ kind: "nav_key", direction: "down" });
+      expect(container.querySelector(".which-key-box")).toBeNull();
+      dispatch({ kind: "nav_key", direction: "up" });
+      fireEvent.keyDown(root, { key: "d" });
+      expect(posted.filter((m) => m.type === "tab_verb")).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("nav_key down while already INPUT (stale) falls through once, no mode change", () => {
     const { container } = startedApp();
     fireEvent.keyDown(conversationRoot(container), { key: "i" });
@@ -5169,6 +5331,31 @@ describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
     fireEvent.keyDown(conversationRoot(container), { key: "j" });
     expect(container.querySelector(".band-message")!.textContent).toBe("i or Ctrl+j to type");
     vi.unstubAllGlobals();
+  });
+
+  /* The v1-ui GUI pass (2026-09-27): holding `j` to the bottom never flashed -- every step after the
+     first is a repeat. The first repeat that stops after moving now flashes; the ones after it do not. */
+  it("a held j that reaches the last stop by repeat flashes once", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
+      act(() => widen(container));
+      const root = conversationRoot(container);
+      fireEvent.keyDown(root, { key: "k" });
+      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "j", repeat: true });
+      expect(container.querySelector(".band-message")?.textContent).toBe("i or Ctrl+j to type");
+      act(() => vi.advanceTimersByTime(2100));
+      expect(container.querySelector(".band-message")).toBeNull();
+      fireEvent.keyDown(root, { key: "j", repeat: true });
+      expect(container.querySelector(".band-message")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("does not flash on a held key's repeat -- only a fresh press", () => {

@@ -272,3 +272,54 @@ describe("isModifierKey", () => {
     for (const k of ["a", "Enter", " ", "Tab", "Escape", "Unidentified"]) expect(isModifierKey(k), k).toBe(false);
   });
 });
+
+/* The v1-ui GUI pass (2026-09-27): "set up my" ran `<leader>m` and "the boy" `<leader>bo` (its `y`
+   then answered the y/n), and "just do it" reached Stop with its `j` and interrupted the turn with
+   its first Space. The leader and Enter/Space on Stop now ask `mayActAfterMotion`. */
+describe("TypingGuard.mayActAfterMotion: the leader and Stop", () => {
+  /** `text` a key at a time, `gap` ms apart; returns whether the LAST key may act. */
+  function lastMayAct(text: string, gap: number, repeat = false): boolean {
+    const keys = [...text].map((ch) => (ch === "\n" ? "Enter" : ch));
+    let may = false;
+    keys.forEach((k, i) => {
+      if (i > 0) vi.advanceTimersByTime(gap);
+      const t = Date.now();
+      guard.onKey(k, t);
+      may = guard.mayActAfterMotion(t, i === keys.length - 1 && repeat);
+    });
+    return may;
+  }
+
+  it("a key standing alone may act (a leader pressed on its own)", () => {
+    expect(lastMayAct(" ", 0)).toBe(true);
+  });
+
+  it.each([["set up "], ["the "], ["just "], ["at "]])("the Space in %j typed at 180 ms a key may not", (text) => {
+    expect(lastMayAct(text, 180)).toBe(false);
+  });
+
+  it("a key TYPING_GUARD_MS after the one before it stands alone again", () => {
+    expect(lastMayAct("set ", TYPING_GUARD_MS)).toBe(true);
+  });
+
+  it.each([["jj "], ["j\n"], ["gg "], ["G "], ["kkj "]])("%j at 80 ms a key: a quick motion, so its last key may act", (text) => {
+    expect(lastMayAct(text, 80)).toBe(true);
+  });
+
+  it("a motion run that began inside a word does not count", () => {
+    vi.advanceTimersByTime(1000);
+    expect(lastMayAct("ej ", 80)).toBe(false);
+  });
+
+  it("a held key's repeat never may", () => {
+    expect(lastMayAct(" ", 0, true)).toBe(false);
+  });
+
+  it("leaves a card's Enter exactly as it was: j then Enter at 80 ms is still refused there", () => {
+    vi.advanceTimersByTime(1000);
+    guard.onKey("j", Date.now());
+    vi.advanceTimersByTime(80);
+    guard.onKey("Enter", Date.now());
+    expect(guard.mayAnswerNow("Enter", Date.now(), false)).toBe(false);
+  });
+});

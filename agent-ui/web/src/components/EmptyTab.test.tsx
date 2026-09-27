@@ -307,10 +307,55 @@ describe("EmptyTab (F3)", () => {
           fireEvent.keyDown(root, { key: "b" });
           fireEvent.keyDown(root, { key: "d" });
           expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
-          // A real Space still does, so the guard is not simply swallowing Space.
+          // A real Space still does, so the guard is not simply swallowing Space -- on its own, after
+          // a pause: in the middle of typing the leader is refused (the v1-ui GUI pass, below).
+          act(() => vi.advanceTimersByTime(300));
           fireEvent.keyDown(root, { key: " " });
           act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
           expect(container.querySelector(".which-key-box")).not.toBeNull();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** The leader starts a sequence only for a key pressed alone or at the end of a quick motion.
+       *  A space within typed text must not arm `<leader>m` and change the stored mode to bypass. */
+      it("t Space m at 80 ms a key: <leader>m never runs, and the band is told why", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const onFlash = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction, onFlash });
+          const { props, container } = rendered;
+          const root = toBrowse(rendered, props);
+          act(() => vi.advanceTimersByTime(1000));
+          for (const key of ["t", " ", "m"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          act(() => vi.advanceTimersByTime(1000));
+          expect(onPanelAction).not.toHaveBeenCalled();
+          expect(props.onCycleMode).not.toHaveBeenCalled();
+          expect(container.querySelector(".which-key-box")).toBeNull();
+          expect(onFlash).toHaveBeenCalledWith("Space starts a sequence only on its own — i or Ctrl+j to type");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("j then Space m at 80 ms a key is a quick motion: <leader>m runs", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          act(() => vi.advanceTimersByTime(1000));
+          for (const key of ["j", " ", "m"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          expect(onPanelAction).toHaveBeenCalledWith(expect.objectContaining({ action: "mode.cycle" }));
         } finally {
           vi.useRealTimers();
         }

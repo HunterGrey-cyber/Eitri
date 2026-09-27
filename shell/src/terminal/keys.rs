@@ -774,6 +774,24 @@ pub(crate) fn copy_mode_key(keyval: GdkKey, state: ModifierType) -> CopyModeKey 
     }
 }
 
+/// [`copy_mode_key`] for a key that arrived as an input-method commit. **With an input method
+/// attached, every printable key it does not compose arrives as a commit and never as `key-pressed`**
+/// (`ime.rs`'s `a_printable_key_arriving_as_a_commit_keeps_its_text_and_loses_what_only_a_key_says`,
+/// fcitx5 running or not, even `GTK_IM_MODULE=none`), so `k`, `j`, `g`, `G` and `q` reach copy mode
+/// only through here. Exactly one ASCII letter or digit is that key -- its keysym name is the
+/// character itself (`gdk_keyval_from_name`), and every printable key in the table is a letter --
+/// with no modifier (a `Ctrl`/`Alt` chord takes the key path). Anything else a commit can carry (two
+/// characters at once, composed CJK text, punctuation, a line break) is swallowed like any other
+/// unbound key: in copy mode nothing reaches the shell.
+pub(crate) fn copy_mode_commit(text: &str) -> CopyModeKey {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_alphanumeric() => GdkKey::from_name(c.to_string())
+            .map_or(CopyModeKey::Swallow, |key| copy_mode_key(key, ModifierType::empty())),
+        _ => CopyModeKey::Swallow,
+    }
+}
+
 #[cfg(test)]
 mod neovibe_tests {
     use super::*;
@@ -1011,6 +1029,28 @@ mod neovibe_tests {
             CopyModeKey::Swallow,
             "a plain letter with no binding"
         );
+    }
+
+    /// The letters reach copy mode as commits, not keys (`copy_mode_commit`'s own doc): each commit
+    /// that is one of the table's printable keys does what the key does, and nothing else a commit
+    /// can carry is anything but swallowed -- in particular never text for the shell.
+    #[test]
+    fn a_committed_letter_does_what_its_key_does_in_copy_mode_and_nothing_else_leaks() {
+        assert_eq!(copy_mode_commit("k"), CopyModeKey::Scroll(ScrollRequest::Lines(1)));
+        assert_eq!(copy_mode_commit("j"), CopyModeKey::Scroll(ScrollRequest::Lines(-1)));
+        assert_eq!(
+            copy_mode_commit("g"),
+            CopyModeKey::Scroll(ScrollRequest::Lines(i32::MAX))
+        );
+        assert_eq!(copy_mode_commit("G"), CopyModeKey::Scroll(ScrollRequest::Bottom));
+        assert_eq!(copy_mode_commit("q"), CopyModeKey::Leave);
+        for swallowed in ["x", " ", "kk", "\n", "\u{1b}", "\u{e5ef}", "\u{770b}", ""] {
+            assert_eq!(
+                copy_mode_commit(swallowed),
+                CopyModeKey::Swallow,
+                "{swallowed:?} is not a copy-mode key"
+            );
+        }
     }
 
     #[test]

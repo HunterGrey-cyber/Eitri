@@ -808,6 +808,9 @@ body,
 .row-problem-remedy {
   color: var(--nv-muted);
   margin-top: 2px;
+  /* A remedy can carry its own line breaks ("Looked for it at:" and the paths, one a line, for a
+     missing sidecar): the v1-ui GUI pass (2026-09-27) saw them run together into one line. */
+  white-space: pre-line;
 }
 /* An ordinary ending (the host closed it, the provider exited cleanly) -- deliberately NOT
    `row-error`. A clean end is not an error.
@@ -1125,6 +1128,11 @@ body,
    `.empty-tab-resume .detail` steps down from its own `strong` sibling. */
 .composer-hint {
   opacity: 0.7;
+  /* Its own leading space would otherwise vanish: `.composer-browse-hint` is a flex row, which makes
+     this span a flex item, and a block's leading white space is removed. The v1-ui GUI pass
+     (2026-09-27) saw "Ask the agent...— i or Ctrl+j to type" in WebKitGTK. `pre-wrap` keeps the
+     space and still wraps a narrow panel. */
+  white-space: pre-wrap;
 }
 
 /* C3: the composer uses the panel's own face and scale (WebKitGTK's UA sheet gives form controls

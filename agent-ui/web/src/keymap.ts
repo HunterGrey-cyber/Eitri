@@ -66,7 +66,7 @@ export type PanelAction =
   /** BROWSE `Esc` reports that it does nothing while a turn runs; the turn keeps running.
    *  While idle, `Escape` is unclaimed. */
   | { kind: "esc-blocked" }
-  /** `j`/`k`: to the next or previous stop (a row, a banner, the status line, ...), top to bottom.
+  /** `j`/`k`: to the next or previous stop (a row, a banner, the handoff area, ...), top to bottom.
    *  Which stop that is depends on the document, so `App.tsx` resolves it (`./nav`'s `nextStop`). */
   | { kind: "move"; delta: 1 | -1 }
   /** `h`/`l`: to the previous or next control inside the current stop (`./nav`'s `nextControl`). */
@@ -321,7 +321,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
   { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
-  { keys: "Enter", what: "Show or hide a tool's result or a collapsed run; on the status row: this session's details" },
+  { keys: "Enter", what: "Show or hide a tool's result or a collapsed run" },
   {
     keys: "y / Y",
     what: "Copy the row (message, command, path), or the code block HINT landed on / its whole output",

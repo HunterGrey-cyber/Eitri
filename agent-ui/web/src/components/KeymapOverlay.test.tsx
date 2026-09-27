@@ -5,7 +5,7 @@ import { KeymapOverlay } from "./KeymapOverlay";
 import { BROWSE_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS } from "../keymap";
 import type { KeyHelp, PanelTable } from "../keymap";
 import { TABLE } from "../testFixtures";
-import { worksSlashCommands } from "../slashCommands";
+import { listedSlashCommands } from "../slashCommands";
 
 afterEach(cleanup);
 
@@ -101,10 +101,12 @@ describe("KeymapOverlay", () => {
       return Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Slash commands"))!;
     }
 
-    it("lists exactly the works rows, in the table's own order -- model and config included", () => {
+    it("lists the works rows Enter would send, in the table's own order -- no /config, and /model <name>", () => {
       const section = slashSection(overlay().container);
       const items = Array.from(section.querySelectorAll("li")).map((li) => li.textContent);
-      expect(items).toEqual(worksSlashCommands().map((name) => `/${name}`));
+      expect(items).toEqual(listedSlashCommands().map((name) => `/${name}`));
+      expect(items).not.toContain("/config");
+      expect(items).toContain("/model <name>");
     });
 
     it("adds no <tr> of its own -- it is a plain list, not a key table", () => {

@@ -44,9 +44,10 @@
 //! `wl-copy` wins long before that fallback is reached. Exiting 0 quietly is still the right
 //! failure mode: an unrecognized command must not break the plugin's own control flow.
 
+use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Extracts the pane-switch direction from a real `vim-tmux-navigator` argv, or `None` for any
 /// other command. Kept as a pure function so it can be unit-tested without a socket or a process.
@@ -73,33 +74,60 @@ fn direction_from_args(args: &[String]) -> Option<char> {
 /// The navigation plugin uses piped descriptors through `system()`, so its calls must stay silent
 /// and exit successfully to avoid breaking keystrokes. Only an interactive terminal gets the notice.
 /// This function performs no process exit or environment lookup, so it can be tested directly.
-fn notice_for(args: &[String], stderr_is_tty: bool, path_var: Option<&str>, own_dir: &Path) -> Option<String> {
+fn notice_for(
+    args: &[String],
+    stderr_is_tty: bool,
+    path_var: Option<&str>,
+    own_dir: &Path,
+    shim: Option<&Path>,
+) -> Option<String> {
     if !stderr_is_tty || direction_from_args(args).is_some() {
         return None;
     }
     Some(format!(
         "neovibe: this `tmux` is neovibe's pane-switch shim (TMUX is set for nvim inside neovibe).\n\
          Run the real tmux with:  env -u TMUX {}",
-        real_tmux_after(path_var, own_dir)
+        real_tmux_after(path_var, own_dir, shim)
     ))
 }
 
-/// The first real `tmux` on `path_var` after `own_dir` (the shim's own directory -- always `PATH`'s
-/// leading entry, since `neovibe_core::pane_switch::PaneSwitchChannel::child_env` prepends it), or
-/// `"tmux is not installed"` if none. Only checks the entry is a file, the same bar
-/// `pane_switch::locate_shim_binary` holds this shim's own binary to.
-fn real_tmux_after(path_var: Option<&str>, own_dir: &Path) -> String {
+/// The shim's own directory, from something that does not move: `NEOVIBE_PANE_SWITCH_SOCKET`'s
+/// parent joined with `bin`, the channel's own layout (`neovibe_core::pane_switch`: the socket and
+/// the `bin/tmux` symlink sit in one private directory). `PATH`'s leading entry is only the
+/// fallback when that variable is gone: it is the shim's directory for the nvim child itself
+/// (`PaneSwitchChannel::child_env` prepends it), but not inside nvim's `:terminal` once an
+/// interactive shell's rc file prepends a directory of its own (`export PATH="$HOME/.local/bin:$PATH"`),
+/// which is exactly where a human types `tmux`.
+fn own_dir_from(socket_var: Option<&OsStr>, path_var: Option<&str>) -> PathBuf {
+    if let Some(parent) = socket_var.map(Path::new).and_then(Path::parent) {
+        if !parent.as_os_str().is_empty() {
+            return parent.join("bin");
+        }
+    }
+    path_var
+        .and_then(|p| std::env::split_paths(p).next())
+        .unwrap_or_default()
+}
+
+/// Finds the first real `tmux` on `path_var` after the shim, or returns `"tmux is not installed"`.
+/// The shim's position is `own_dir` or any entry whose `tmux` resolves to `shim` itself.
+/// A candidate resolving to `shim` is never returned: `is_file()` follows the `bin/tmux` symlink,
+/// so a directory prepended by the shell could otherwise make the shim look like the real tmux.
+/// `shim` is this binary's canonical path; if unavailable, only `own_dir` identifies its position.
+/// Candidates need only be files, like the binary accepted by `pane_switch::locate_shim_binary`.
+fn real_tmux_after(path_var: Option<&str>, own_dir: &Path, shim: Option<&Path>) -> String {
     let Some(path_var) = path_var else {
         return "tmux is not installed".to_string();
     };
+    let is_shim = |candidate: &Path| shim.is_some_and(|shim| candidate.canonicalize().is_ok_and(|c| c == shim));
     let mut past_own_dir = false;
     for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join("tmux");
         if !past_own_dir {
-            past_own_dir = dir == own_dir;
+            past_own_dir = dir == own_dir || is_shim(&candidate);
             continue;
         }
-        let candidate = dir.join("tmux");
-        if candidate.is_file() {
+        if candidate.is_file() && !is_shim(&candidate) {
             return candidate.display().to_string();
         }
     }
@@ -110,11 +138,18 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let path_var = std::env::var("PATH").ok();
-    let own_dir = path_var
-        .as_deref()
-        .and_then(|p| std::env::split_paths(p).next())
-        .unwrap_or_default();
-    if let Some(notice) = notice_for(&args, std::io::stderr().is_terminal(), path_var.as_deref(), &own_dir) {
+    let own_dir = own_dir_from(
+        std::env::var_os("NEOVIBE_PANE_SWITCH_SOCKET").as_deref(),
+        path_var.as_deref(),
+    );
+    let shim = std::env::current_exe().ok().and_then(|exe| exe.canonicalize().ok());
+    if let Some(notice) = notice_for(
+        &args,
+        std::io::stderr().is_terminal(),
+        path_var.as_deref(),
+        &own_dir,
+        shim.as_deref(),
+    ) {
         eprintln!("{notice}");
         std::process::exit(1);
     }
@@ -217,8 +252,14 @@ mod tests {
     #[test]
     fn a_pane_switch_call_never_gets_a_notice() {
         let a = args(&["-S", "/s", "select-pane", "-t", "%0", "-R"]);
-        assert_eq!(notice_for(&a, true, Some("/usr/bin"), Path::new("/own/bin")), None);
-        assert_eq!(notice_for(&a, false, Some("/usr/bin"), Path::new("/own/bin")), None);
+        assert_eq!(
+            notice_for(&a, true, Some("/usr/bin"), Path::new("/own/bin"), None),
+            None
+        );
+        assert_eq!(
+            notice_for(&a, false, Some("/usr/bin"), Path::new("/own/bin"), None),
+            None
+        );
     }
 
     /// The plugin's other calls, such as zoom checks and clipboard fallbacks, use `system()`
@@ -226,7 +267,10 @@ mod tests {
     #[test]
     fn a_non_pane_switch_call_off_a_terminal_gets_no_notice() {
         let a = args(&["-S", "/s", "display-message", "-p", "#{window_zoomed_flag}"]);
-        assert_eq!(notice_for(&a, false, Some("/usr/bin"), Path::new("/own/bin")), None);
+        assert_eq!(
+            notice_for(&a, false, Some("/usr/bin"), Path::new("/own/bin"), None),
+            None
+        );
     }
 
     /// The one case that does get a notice: a human types `tmux` at a real prompt inside `:terminal`.
@@ -242,7 +286,7 @@ mod tests {
         let path_var = format!("{}:{}", own_dir.display(), real_dir.display());
 
         let a = args(&["-S", "/s", "display-message", "-p", "x"]);
-        let notice = notice_for(&a, true, Some(&path_var), &own_dir).expect("a notice on a real tty call");
+        let notice = notice_for(&a, true, Some(&path_var), &own_dir, None).expect("a notice on a real tty call");
         assert!(
             notice.starts_with(
                 "neovibe: this `tmux` is neovibe's pane-switch shim (TMUX is set for nvim inside neovibe)."
@@ -271,8 +315,11 @@ mod tests {
         std::fs::create_dir_all(&other_dir).expect("fixture");
         let path_var = format!("{}:{}", own_dir.display(), other_dir.display());
 
-        assert_eq!(real_tmux_after(Some(&path_var), &own_dir), "tmux is not installed");
-        assert_eq!(real_tmux_after(None, &own_dir), "tmux is not installed");
+        assert_eq!(
+            real_tmux_after(Some(&path_var), &own_dir, None),
+            "tmux is not installed"
+        );
+        assert_eq!(real_tmux_after(None, &own_dir, None), "tmux is not installed");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -290,8 +337,71 @@ mod tests {
         std::fs::write(earlier.join("tmux"), b"").expect("fixture");
         let path_var = format!("{}:{}", earlier.display(), own_dir.display());
 
-        assert_eq!(real_tmux_after(Some(&path_var), &own_dir), "tmux is not installed");
+        assert_eq!(
+            real_tmux_after(Some(&path_var), &own_dir, None),
+            "tmux is not installed"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An interactive shell inside nvim's `:terminal` can prepend a directory to `PATH`, moving the
+    /// shim away from the first entry. Starting there could return the shim's own `bin/tmux` symlink
+    /// as the real tmux. The socket identifies the shim's directory, and candidates resolving to the
+    /// shim itself are skipped even if the search starts early.
+    #[test]
+    fn a_directory_the_shell_prepended_never_makes_the_shim_the_real_tmux() {
+        let root = scratch_dir("prepended");
+        let channel = root.join("nv-ps-1");
+        let own_dir = channel.join("bin");
+        let local = root.join("local-bin");
+        let real_dir = root.join("usr-bin");
+        for dir in [&own_dir, &local, &real_dir] {
+            std::fs::create_dir_all(dir).expect("fixture");
+        }
+        let shim = root.join("neovibe-tmux-shim");
+        std::fs::write(&shim, b"").expect("fixture");
+        std::os::unix::fs::symlink(&shim, own_dir.join("tmux")).expect("fixture");
+        std::fs::write(real_dir.join("tmux"), b"").expect("fixture");
+        let shim = shim.canonicalize().expect("fixture");
+        let real = real_dir.join("tmux").display().to_string();
+        let path_var = format!("{}:{}:{}", local.display(), own_dir.display(), real_dir.display());
+
+        let socket = channel.join("s.sock");
+        let derived = own_dir_from(Some(socket.as_os_str()), Some(&path_var));
+        assert_eq!(derived, own_dir, "the socket's directory, not PATH's first entry");
+        assert_eq!(real_tmux_after(Some(&path_var), &derived, Some(&shim)), real);
+
+        // The old derivation (PATH's first entry) with the shim known: its symlink is skipped.
+        assert_eq!(real_tmux_after(Some(&path_var), &local, Some(&shim)), real);
+        // The shim's directory placed by its symlink alone, with no own_dir on PATH at all.
+        assert_eq!(
+            real_tmux_after(Some(&path_var), Path::new("/nowhere"), Some(&shim)),
+            real
+        );
+        // Nothing past the shim but the shim again: none is installed.
+        let only_shim = format!("{}:{}", local.display(), own_dir.display());
+        assert_eq!(
+            real_tmux_after(Some(&only_shim), &local, Some(&shim)),
+            "tmux is not installed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no socket variable (or one with no parent), the shim's directory falls back to
+    /// `PATH`'s leading entry -- what `PaneSwitchChannel::child_env` gives the nvim child itself.
+    #[test]
+    fn without_the_socket_variable_the_shim_dir_is_paths_first_entry() {
+        assert_eq!(own_dir_from(None, Some("/a/bin:/usr/bin")), PathBuf::from("/a/bin"));
+        assert_eq!(
+            own_dir_from(Some(OsStr::new("s.sock")), Some("/a/bin:/usr/bin")),
+            PathBuf::from("/a/bin")
+        );
+        assert_eq!(own_dir_from(None, None), PathBuf::new());
+        assert_eq!(
+            own_dir_from(Some(OsStr::new("/t/nv-ps-9/s.sock")), Some("/x:/y")),
+            PathBuf::from("/t/nv-ps-9/bin")
+        );
     }
 }

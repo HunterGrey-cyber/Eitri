@@ -2,7 +2,7 @@ import { forwardRef } from "react";
 import { BROWSE_KEYS, INPUT_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
-import { worksSlashCommands } from "../slashCommands";
+import { listedSlashCommands } from "../slashCommands";
 
 type Props = {
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
@@ -95,14 +95,13 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
 
 /** Slash commands use a plain list because they are commands rather than keybindings. This also
  *  keeps them out of key-table row counts. Names come from `../slashCommands` in table order.
- *  `worksSlashCommands` includes `/model` and `/config` even though sending them is held back
- *  separately. */
+ *  `listedSlashCommands` omits `/config` and displays `/model <name>`. */
 function SlashCommands() {
   return (
     <section>
       <h2>Slash commands</h2>
       <ul>
-        {worksSlashCommands().map((name) => (
+        {listedSlashCommands().map((name) => (
           <li key={name}>
             <code>/{name}</code>
           </li>

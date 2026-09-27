@@ -17,6 +17,7 @@ import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify } from "../problems";
+import { leaderTypingFlash, TypingGuard } from "../typingGuard";
 
 /** Below this width the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -121,6 +122,12 @@ export type EmptyTabProps = {
    *  `Dashboard`'s key hint. Defaults to Ctrl+b, matching `keymapHelp` before the keymap envelope
    *  arrives, so callers without a configured prefix still get the correct hint. */
   prefix?: string;
+  /** Share `App.tsx`'s typing guard so the dashboard leader starts only for a key pressed alone or
+   *  at the end of a quick motion. A space inside typed text must not arm a mode-changing sequence.
+   *  If omitted, this screen keeps its own guard. */
+  typingGuard?: TypingGuard;
+  /** Says a refused leader in the band (`App.tsx`'s `showFlash`); optional for the same reason. */
+  onFlash?: (text: string) => void;
 };
 
 /** An empty session tab: Claude Code's fresh prompt. The composer is live in INPUT;
@@ -178,6 +185,8 @@ export function EmptyTab(props: EmptyTabProps) {
   }, []);
   const narrow = widthPx > 0 && widthPx <= DASH_NARROW_PX;
   const panelTable = props.panelTable ?? EMPTY_PANEL_TABLE;
+  const [ownGuard] = useState(() => new TypingGuard());
+  const typingGuard = props.typingGuard ?? ownGuard;
   /* The leader/which-key engine stays local because this tab keeps its own `mode`, which
      `App.tsx` cannot see. BROWSE here gives the dashboard the keys. Reserved `g`/`z`/`[`/`]`
      prefixes support table pairs such as `[b`/`]b` for stepping tabs. Fixed `resolveKey` pairs
@@ -400,6 +409,10 @@ export function EmptyTab(props: EmptyTabProps) {
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (props.answerConfirm?.(event)) return;
+    // Pass every other keydown to the typing guard first, as `App.tsx` does.
+    // The leader handler below asks the guard whether the key stood alone.
+    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    typingGuard.onKey(event.key, typedAt);
     // An IME key is never a key of this screen's, the leader engine's below included: the same
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
@@ -467,6 +480,12 @@ export function EmptyTab(props: EmptyTabProps) {
       const start = startSequence(panelTable, event.key, isActivatableControl(event.target));
       if (start.kind !== "none") {
         event.preventDefault();
+        // The v1-ui GUI pass (2026-09-27): in the middle of typed prose the leader is swallowed and
+        // says so, as over a live conversation (`TypingGuard.mayActAfterMotion`).
+        if (event.key === panelTable.leader && !typingGuard.mayActAfterMotion(typedAt, event.repeat)) {
+          props.onFlash?.(leaderTypingFlash(panelTable.leaderLabel));
+          return;
+        }
         applySeqStep(start);
         return;
       }

@@ -94,3 +94,15 @@ export function slashCommandFlashText(name: string): string {
 export function worksSlashCommands(): string[] {
   return SLASH_COMMANDS.filter((entry) => entry.class === "works").map((entry) => entry.name);
 }
+
+/** What the `?` overlay lists (the v1-ui GUI pass, 2026-09-27): the **works** rows that Enter would
+ *  actually send. The pass saw `/config` refused with "does not work in neovibe — ? lists the ones that
+ *  do" while `?` listed `/config`, so the two contradicted each other on one screen. A command held
+ *  back unconditionally (`/config`) is left out; `/model`, sendable only with an argument, is listed
+ *  in that form. `worksSlashCommands` above stays the table's own class, unchanged. */
+export function listedSlashCommands(): string[] {
+  return worksSlashCommands().flatMap((name) => {
+    if (heldBackSlashCommand(`/${name}`) === null) return [name];
+    return name === INTERACTIVE_ONLY_WITHOUT_ARGUMENT ? [`${name} <name>`] : [];
+  });
+}

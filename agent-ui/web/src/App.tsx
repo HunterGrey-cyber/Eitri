@@ -10,7 +10,7 @@ import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, star
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { isModeCycleKey, isShiftTab, MODE_STARTING_MESSAGE, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { TypingGuard } from "./typingGuard";
+import { leaderTypingFlash, TypingGuard } from "./typingGuard";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -43,6 +43,7 @@ import type { RestoredDraft } from "./components/Composer";
 import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
 import { Row } from "./components/Row";
+import { classify } from "./problems";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusBand } from "./components/StatusBand";
 import { QueueLines } from "./components/QueueLines";
@@ -106,6 +107,10 @@ const TYPING_FLASH = "a / d answer a card only on their own — i or Ctrl+j to t
 /** The band message when `a`/`d`/`D` have no card under the cursor or gating the tool call
  *  under it, so the key gives feedback instead of silently doing nothing. */
 const NO_CARD_FLASH = "no card here — i, o, A or Ctrl+j to type";
+/** The v1-ui GUI pass (2026-09-27): what the band says when Enter or Space on the activity line's
+ *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
+ *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
+const STOP_TYPING_FLASH = "Stop takes a key only on its own — i or Ctrl+j to type";
 /** Envelopes that move keyboard focus or cover the conversation without a keydown
  *  cancel a waiting `a`/`d`/`D`. GTK handles `nav_key`'s Ctrl+j/Ctrl+k before the page sees a key. */
 const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key"]);
@@ -548,6 +553,9 @@ export default function App() {
    *  and reset by the cursor-follow effect, and only ever set when the cursor really changes -- an
    *  unchanged cursor runs no effect, and a stale value would misplace some later, unrelated move. */
   const landingRef = useRef<1 | -1 | 0 | "keep">(0);
+  /** C1c: whether the last `j` moved, so the first repeat of a held `j` that then stops at the last
+   *  stop still flashes once (the v1-ui GUI pass, 2026-09-27) -- see the move branch of `onKeyDown`. */
+  const heldMoveRef = useRef(false);
   /** The open `/` prompt and the cursor position when it opened; `lastSearchRef` holds what `n`/`N` repeat. */
   const [search, setSearch] = useState<{ query: string; origin: number } | null>(null);
   const lastSearchRef = useRef("");
@@ -1366,6 +1374,13 @@ export default function App() {
         setChooser(null);
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "nav_key") {
+        // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees a keydown, so this is a key pressed
+        // after any pending `g`/`z`/`[`/`]` prefix or leader sequence -- cancelled here for the same
+        // reason `pane_focus` and `arrive` cancel them, whether the effect below claims the chord or
+        // answers it with `nav_fallthrough`. Left armed, `g`, Ctrl+j, Ctrl+k, `g` ran a stale `gg`
+        //.
+        pendingRef.current = null;
+        clearSequence();
         // V1 C1: the raw handler only records the request -- see `navKey`'s own doc
         // comment for why the decision has to live in an effect instead.
         navKeySeqRef.current += 1;
@@ -2210,6 +2225,8 @@ export default function App() {
             // pure panel table and `runPanelAction` with the live conversation.
             panelTable={panelTable}
             onPanelAction={runPanelAction}
+            typingGuard={typingGuard}
+            onFlash={showFlash}
             // Whoever sends from here is typing, and the conversation this starts must open where
             // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
             // as BROWSE keys (the phase-3 GUI pass, 2026-09-25).
@@ -2448,6 +2465,21 @@ export default function App() {
       showFlash(TYPING_FLASH);
       return;
     }
+    // The activity line's Stop accepts Enter and Space only on a key that stands alone
+    // or ends a quick motion (`j` onto it, then Enter). Since `j` from the last row lands here,
+    // the guard prevents prose such as "just do it" from stopping the turn on its first Space
+    // and denying the waiting card with it.
+    const onStop = isActivatableControl(event.target) && (event.target as HTMLElement).matches(".activity-line .stop");
+    if (
+      onStop &&
+      seqRef.current === null &&
+      (event.key === "Enter" || event.key === " ") &&
+      !typingGuard.mayActAfterMotion(typedAt, event.repeat)
+    ) {
+      event.preventDefault();
+      showFlash(STOP_TYPING_FLASH);
+      return;
+    }
     if (isActivatableControl(event.target) && (event.key === "Enter" || (event.key === " " && !onAnswerButton))) return;
     // The leader engine: a pending sequence owns
     // the next key, and only BROWSE ever starts one. An IME key is never a sequence key (Review
@@ -2465,6 +2497,14 @@ export default function App() {
         const start = startSequence(panelTable, event.key, isActivatableControl(event.target));
         if (start.kind !== "none") {
           event.preventDefault();
+          // The v1-ui GUI pass (2026-09-27): the leader starts a sequence only on a key that stands
+          // alone or ends a quick motion -- in the middle of typed prose it is swallowed and says
+          // so ("set up my" ran `<leader>m`, "the boy" `<leader>bo` and answered it with its `y`).
+          // Only the leader: a single-key table binding (`H`/`L`) runs as before.
+          if (event.key === panelTable.leader && !typingGuard.mayActAfterMotion(typedAt, event.repeat)) {
+            showFlash(leaderTypingFlash(panelTable.leaderLabel));
+            return;
+          }
           applySeqStep(start);
           return;
         }
@@ -2542,19 +2582,25 @@ export default function App() {
           row = nextRow;
         }
         if (target === null) return;
+        // C1c: `j` that cannot move -- `nextStop` clamps rather than returning `null` at
+        // a boundary (`clampStep`'s own doc comment), so "the last stop" is the stop the keys are
+        // already on (the last row, or Stop while a turn runs), not `target === null` (that case is
+        // an EMPTY conversation, handled above and unrelated). Flashes once per press: a fresh `j`
+        // there, or -- the v1-ui GUI pass (2026-09-27) found a held `j` reached the bottom in silence,
+        // since every step after the first is a repeat -- the first repeat that stops after moving.
+        // Never again on the repeats after that. `k` at the FIRST stop stays silent, as vim's own `k`
+        // on the first line does (`:h j`) -- only `j` names a route the reader might actually want next.
+        if (action.delta === 1) {
+          if (target === currentStop(root, cursor)) {
+            if (!event.repeat || heldMoveRef.current) showFlash("i or Ctrl+j to type");
+            heldMoveRef.current = false;
+          } else {
+            heldMoveRef.current = true;
+          }
+        }
         const finalRow = rowIndexOf(root, target);
         if (finalRow !== null) {
-          // C1c: `j` that cannot move -- `nextStop` clamps rather than returning `null`
-          // at a boundary (`clampStep`'s own doc comment), so "the last stop" is `finalRow === cursor`
-          // here, not `target === null` (that case is an EMPTY conversation, handled above and
-          // unrelated). Flashes once per press, never on a held key's repeat; `k` at the FIRST stop
-          // stays silent, as vim's own `k` on the first line does (`:h j`) -- only `j` names a route
-          // the reader might actually want next.
-          if (finalRow === cursor) {
-            if (action.delta === 1 && !event.repeat) showFlash("i or Ctrl+j to type");
-          } else {
-            landingRef.current = action.delta;
-          }
+          if (finalRow !== cursor) landingRef.current = action.delta;
           setCursor(finalRow);
           root.focus({ preventScroll: true });
         } else {
@@ -2788,9 +2834,16 @@ export default function App() {
      -- the transcript above it can be missing its tail, or a piece out of its middle -- so the
      reason text (which says exactly what was lost) is rendered in full and cannot be dismissed.
      A hidden warning about incomplete output is the same thing as no warning. */
+  /* Classify a lost or closed session's reason so the error row can show a headline and remedy
+     above the raw text. A first-turn sidecar failure may end a live session here instead of
+     failing the tab. Unrecognised reasons produce `null` and keep the raw text alone. */
+  const sessionEndedProblem =
+    state.status.kind === "unavailable" || state.status.kind === "closed"
+      ? classify(state.status.reason, hello?.account ?? null)
+      : null;
   const sessionEndedBanner =
     state.status.kind === "unavailable" ? (
-      <Row kind="error" sign="✗" role="alert">
+      <Row kind="error" sign="✗" role="alert" problem={sessionEndedProblem}>
         <strong>This session was lost. What is shown above may be incomplete.</strong>
         <pre>{state.status.reason}</pre>
         {/* `r` is offered only on this banner and the one below, for resetting this tab -- see
@@ -2806,7 +2859,7 @@ export default function App() {
       // exited cleanly) is not an error, and styling it like the lost-session row above would
       // train the eye to ignore the one that matters. See `.row-ended` in index.css for the
       // fuller record of why these two were briefly unified and then split back apart.
-      <Row kind="ended" sign="·">
+      <Row kind="ended" sign="·" problem={sessionEndedProblem}>
         This session has ended ({state.status.reason}).
         <div className="row-hint">Press r to start a new session here.</div>
       </Row>
