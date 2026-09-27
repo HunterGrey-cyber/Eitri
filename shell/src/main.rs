@@ -1247,6 +1247,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         })
     };
 
+    // C1's stale-mirror recovery: the page could not apply a `nav_key` against its own
+    // current state (the mirror was a keystroke stale, or INPUT is refused on a dead session), so it
+    // asks Rust to do exactly what the chord would have done.
+    agent_panel_handle.on_nav_fallthrough({
+        let move_focus = move_focus.clone();
+        move |direction| {
+            move_focus(&ModuleId::agent(), direction);
+        }
+    });
+
     // The prefix's `Action::Tab` chords and the panel's `tab_verb` messages use the
     // same code, so behavior is shared across both routes. `keymap.ts` resolves the
     // panel's `<leader>` bindings.
@@ -1575,12 +1585,34 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host
     // (`install_module_nav`), one per web module here; a web module added later installs its own.
+    // Only the agent host gets an intercept: `Ctrl+j`/`Ctrl+k` claimed for the
+    // composer, decided from the panel's own `panel_keys` mirror. A Lua panel has no such mode and
+    // passes `None`, so every chord there still goes straight to `move_focus` as before.
     for (id, host) in grid
         .hosts()
         .iter()
         .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
-        install_module_nav(id.clone(), host, move_focus.clone());
+        let intercept: Option<Rc<dyn Fn(Direction) -> bool>> = if id.kind() == ModuleKind::Agent {
+            let agent = agent_panel_handle.clone();
+            Some(Rc::new(move |direction: Direction| {
+                if !claims(agent.panel_keys(), direction) {
+                    return false;
+                }
+                let direction = match direction {
+                    Direction::Down => neovibe_core::agent_bridge::NavKeyDirection::Down,
+                    Direction::Up => neovibe_core::agent_bridge::NavKeyDirection::Up,
+                    Direction::Left | Direction::Right => {
+                        unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
+                    }
+                };
+                agent.nav_key(direction);
+                true
+            }))
+        } else {
+            None
+        };
+        install_module_nav(id.clone(), host, move_focus.clone(), intercept);
     }
 
     // --- Ctrl+h/j/k/l in the terminal: neovibe's, always.
@@ -1908,11 +1940,33 @@ fn refuse(app_name: &gtk4::Label, err: &LayoutError) {
     flash(app_name);
 }
 
+/// C1's decision, in Rust: only `Ctrl+j` (`Direction::Down`) while the panel's
+/// `panel_keys` mirror reports `Browse`, or `Ctrl+k` (`Direction::Up`) while it reports `Input`, is
+/// claimed for the composer -- every other combination goes to `move_focus` exactly as before. Pure
+/// so the full table is a unit test with no display; `install_module_nav`'s agent-only `intercept`
+/// closure is the only caller.
+fn claims(mirror: neovibe_core::agent_bridge::PanelKeys, dir: Direction) -> bool {
+    use neovibe_core::agent_bridge::PanelKeys;
+    matches!(
+        (dir, mirror),
+        (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
+    )
+}
+
 /// Installs Ctrl+h/j/k/l navigation on a web module host, both at startup and for modules added
 /// later. Neovim's navigator cannot handle keys focused here. Capture phase runs before the
 /// `WebView` can consume the chord; bubble phase would be too late. A successful focus move
 /// consumes the chord.
-fn install_module_nav(id: ModuleId, host: &gtk4::Widget, move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool>) {
+///
+/// `intercept` runs after the `LetThrough` second-delivery check and before `move_focus`. A
+/// claimed chord reaches neither `move_focus` nor the page. Only the agent host passes an
+/// interceptor; Lua panels pass `None`.
+fn install_module_nav(
+    id: ModuleId,
+    host: &gtk4::Widget,
+    move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool>,
+    intercept: Option<Rc<dyn Fn(Direction) -> bool>>,
+) {
     // A chord this controller lets through to the page comes back through it once more if the page
     // does not handle it: WebKit puts the same event back on the queue for GTK's own bindings
     // (`pane_switch::LetThrough`). The second delivery is not a second press.
@@ -1929,6 +1983,9 @@ fn install_module_nav(id: ModuleId, host: &gtk4::Widget, move_focus: Rc<dyn Fn(&
             .is_some_and(|event| let_through.borrow_mut().is_second_delivery(event))
         {
             return glib::Propagation::Proceed;
+        }
+        if intercept.as_ref().is_some_and(|intercept| intercept(direction)) {
+            return glib::Propagation::Stop;
         }
         if move_focus(&id, direction) {
             return glib::Propagation::Stop;
@@ -2113,5 +2170,21 @@ mod tests {
             }
         }
         assert_eq!(taken, 4, "Ctrl+h/j/k/l, and nothing else");
+    }
+
+    /// C1's full decision table: the two claimed cells (`Down`+`Browse`, `Up`+`Input`)
+    /// and every other combination, which must fall through to `move_focus` unclaimed.
+    #[test]
+    fn claims_only_down_in_browse_and_up_in_input() {
+        use neovibe_core::agent_bridge::PanelKeys;
+        for dir in [Direction::Left, Direction::Down, Direction::Up, Direction::Right] {
+            for mirror in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
+                let expected = matches!(
+                    (dir, mirror),
+                    (Direction::Down, PanelKeys::Browse) | (Direction::Up, PanelKeys::Input)
+                );
+                assert_eq!(claims(mirror, dir), expected, "{dir:?} + {mirror:?}");
+            }
+        }
     }
 }
