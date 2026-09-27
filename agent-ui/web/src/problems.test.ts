@@ -142,9 +142,10 @@ describe("a sidecar that stopped under a session", () => {
     expect(watchRs.replace(/\s+\\?\n\s*/g, " ")).toContain("the connection to the provider ended before this session did");
   });
 
-  // And the wrapper against the `shell` code that writes it (`report_sessions_that_never_opened`):
-  // if its wording drifts, `failureEvidence` silently stops unwrapping and the guess is shown again.
-  // Added by the local review of the cloud session's work (2026-09-27).
+  // And the wrapper against the `shell` code that writes it (`report_sessions_that_never_opened`,
+  // via its `never_opened_message` helper): if its wording drifts, `failureEvidence` silently stops
+  // unwrapping and the guess is shown again. Added by the local review of the cloud session's work
+  // (2026-09-27).
   it("unwraps exactly what agent_panel.rs's never-opened format! writes", () => {
     const source = agentPanelRs.replace(/\\\n\s*/g, "");
     const literal = /"(the session ended before it started \(\{reason\}\)[^"]*)"/.exec(source);
@@ -152,5 +153,24 @@ describe("a sidecar that stopped under a session", () => {
     const written = literal![1].replace("{reason}", INNER);
     expect(neverOpenedReason(written)).toBe(INNER);
     expect(failureEvidence(written)).toBe(INNER);
+  });
+
+  // Owner decision (b), dated record 2026-09-27 ("v1 polish"): `never_opened_message` (shell) no
+  // longer wraps a stopped-sidecar reason in the "most likely no longer exists" guess at all -- it
+  // gets its own literal instead. Pinned the same way as the test above: read the literal out of
+  // `agent_panel.rs`, write it with a real INNER, and check this module's classifier still reads it
+  // as "the sidecar stopped" with no wrapper guess left over.
+  it("shell's own never-opened-message literal for a stopped sidecar carries no guess", () => {
+    const source = agentPanelRs.replace(/\\\n\s*/g, "");
+    const literal = /"(the agent sidecar stopped \(\{reason\}\)[^"]*)"/.exec(source);
+    expect(literal).not.toBeNull();
+    const written = literal![1].replace("{reason}", INNER);
+    // Not the wrapped shape any more, so neverOpenedReason must NOT unwrap it -- there is nothing
+    // to unwrap: failureEvidence returns it whole, exactly as `never hide the evidence` requires.
+    expect(neverOpenedReason(written)).toBeNull();
+    expect(failureEvidence(written)).toBe(written);
+    expect(written).not.toContain("most likely no longer exists");
+    const problem = classify(written)!;
+    expect(problem.headline).toBe("The agent sidecar stopped.");
   });
 });
