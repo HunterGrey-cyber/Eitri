@@ -160,6 +160,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
     nvim_extra_args.extend(nvim_keys_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
+    // Load the navigation fallback from the pane-switch channel's directory so
+    // `Ctrl+h/j/k/l` can leave the editor without vim-tmux-navigator and from Visual mode.
+    // Only add it when the channel exists, since navigation needs its socket.
+    nvim_extra_args.extend(pane_switch.as_ref().map(|ps| ps.nvim_args()).unwrap_or_default());
     // wire 3. Unconditional and stateless -- no socket, no directory, nothing to fail at startup --
     // because the only reload trigger a normal Neovim config installs is `FocusGained`, and nothing
     // in this shell ever tells nvim it lost or gained focus. Without this a `git checkout`, a
