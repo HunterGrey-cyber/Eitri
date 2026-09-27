@@ -8,7 +8,7 @@ publish.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "a2f194a8f309814ec457aebdf07f16e5abf6074b" }
+claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "b0f043f31a453cc667e981d5f9e327b6219e442c" }
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"

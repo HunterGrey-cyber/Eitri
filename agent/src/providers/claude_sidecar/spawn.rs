@@ -136,7 +136,13 @@ impl SpawnedSidecar {
 ///
 /// Bumped 2026-09-26 from 28a5e4c for SetPermissionMode, PermissionModeChanged and
 /// TextDelta.message_id; proto diff +288/−2, both deletions comments.
-pub const EXPECTED_VERDANDI_REVISION: &str = "a2f194a";
+///
+/// Bumped 2026-09-27 from 133dc03 to c0b309e (merge of 39abe9f: gated sessions pass
+/// `permissionMode: 'default'` explicitly, defence in depth against a project's own
+/// `.claude/settings.json` widening it). `git diff 133dc03 c0b309e -- proto crates` is
+/// **empty** — this bump changes no generated type and no capability; it exists only to
+/// track the sidecar artifact this client spawns.
+pub const EXPECTED_VERDANDI_REVISION: &str = "b0f043f";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.
