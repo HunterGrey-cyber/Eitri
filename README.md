@@ -57,7 +57,8 @@ GTK4 shell (gtk4-rs)
 - **The layout is data.** Editor, panel and terminal are modules in a tree: hide, kill, split, swap
   and zoom with tmux's keys; a project reopens the way you left it.
 - **A bottom terminal.** Its own PTY painted with Skia, with IME input, bracketed paste and OSC 52
-  copy. No scrollback, selection or mouse yet.
+  copy, scrollback (`Shift-PageUp`/`PageDown`, the wheel), mouse selection with middle-click paste,
+  and mouse reporting to programs that ask for it (`nvim`, `htop`, `less`).
 - **It inherits, it does not impose.** One `:colorscheme` in Neovim and the chrome, editor and panel
   all follow. Window keys default to stock tmux (prefix `Ctrl-b`) and are rebound in
   `~/.config/neovibe/init.lua`, a real Lua kernel (`neovibe.keymap`, `neovibe.command`,
