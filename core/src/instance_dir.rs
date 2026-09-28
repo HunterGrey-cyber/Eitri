@@ -137,21 +137,14 @@ fn socket_has_a_listener(socket: &Path, uid: u32) -> bool {
 /// (Linux: the listener's accept queue is full), and `EINPROGRESS` (the connection is still being
 /// established). Every other outcome -- `ECONNREFUSED` (a dead socket file nothing is listening on),
 /// `ENOENT`, a `path` too long for `sockaddr_un`, `socket()` itself failing -- answers `false`. The
-/// socket fd is closed before returning in every case.
+/// socket fd is closed before returning in every case. (macOS never blocks here in the first place:
+/// its `connect()` to a full queue fails at once with `ECONNREFUSED`, which reads as no listener --
+/// harmless, since the pid check before this has no pid namespaces there to be fooled by.)
 fn nonblocking_connect_finds_a_listener(path: &Path) -> bool {
     let Some(addr) = sockaddr_for(path) else { return false };
-    // SAFETY: fixed, valid arguments; the returned fd is checked before use and closed below in
-    // every code path before this function returns.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
+    let Some(fd) = nonblocking_unix_socket() else {
         return false;
-    }
+    };
     // SAFETY: `fd` is this call's own, freshly opened and still open; `addr` is a fully
     // initialized `sockaddr_un` and its exact size is passed.
     let rc = unsafe {
@@ -171,11 +164,34 @@ fn nonblocking_connect_finds_a_listener(path: &Path) -> bool {
     has_a_listener
 }
 
+/// A new `AF_UNIX` stream socket, non-blocking and close-on-exec, or `None`. Set with `fcntl`
+/// rather than `SOCK_NONBLOCK | SOCK_CLOEXEC` on `socket()`, since macOS lacks those flags.
+/// The fd is the caller's to close.
+fn nonblocking_unix_socket() -> Option<libc::c_int> {
+    // SAFETY: plain syscalls on fixed arguments; `fd` is checked before use and closed on failure.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return None;
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0
+            || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+            || libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+        {
+            libc::close(fd);
+            return None;
+        }
+        Some(fd)
+    }
+}
+
 /// `path` as a `sockaddr_un`, or `None` if it does not fit `sun_path` (with room left for the
 /// trailing NUL `zeroed()` already provides). The socket paths this crate itself builds are already
 /// checked by `agent::socket_path::in_dir`; a stray, over-long entry someone else left in `TMPDIR`
 /// answers "no listener" here rather than panicking or silently truncating.
 fn sockaddr_for(path: &Path) -> Option<libc::sockaddr_un> {
+    // SAFETY: `sockaddr_un` is plain old data; all-zero is a valid (empty) value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_os_str().as_bytes();
@@ -184,6 +200,17 @@ fn sockaddr_for(path: &Path) -> Option<libc::sockaddr_un> {
     }
     for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
         *dst = *src as libc::c_char;
+    }
+    // The BSDs, macOS among them, carry the address's length in the address itself.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        addr.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
     }
     Some(addr)
 }
@@ -204,7 +231,6 @@ fn pid_is_running(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -403,7 +429,9 @@ mod tests {
     /// listener that never calls `accept` is forever. Filling the queue with non-blocking raw
     /// connects until one answers `EAGAIN`/`EWOULDBLOCK` reproduces exactly that state; the sweep is
     /// then run on its own thread so a hang shows up as the test's `recv_timeout` itself expiring,
-    /// never as the whole `cargo test` process wedging.
+    /// never as the whole `cargo test` process wedging. Linux only: macOS refuses a connect to a full
+    /// queue at once (`ECONNREFUSED`), so it has no hang to reproduce and no `EAGAIN` to fill to.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_full_backlog_never_hangs_the_sweep() {
         let root = std::env::temp_dir().join(format!("nvb{}", std::process::id()));
@@ -456,28 +484,20 @@ mod tests {
     /// `sockaddr_un` for `path`, or panics: every fixture path here is already checked under
     /// [`agent::socket_path::MAX_SOCKET_PATH_BYTES`] by `in_dir`, so this never has to answer "no
     /// listener" for a path that does not fit -- unlike the production probe, which does.
+    #[cfg(target_os = "linux")]
     fn raw_sockaddr(path: &Path) -> libc::sockaddr_un {
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let bytes = path.as_os_str().as_bytes();
-        assert!(
-            bytes.len() < addr.sun_path.len(),
-            "fixture path too long for sockaddr_un"
-        );
-        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
-            *dst = *src as libc::c_char;
-        }
-        addr
+        sockaddr_for(path).expect("fixture path too long for sockaddr_un")
     }
 
     /// A blocking listener at `path` with the given `backlog`, built with raw libc so the test can
     /// pass `backlog = 0` -- `std::os::unix::net::UnixListener::bind` has no way to ask for that.
+    #[cfg(target_os = "linux")]
     fn raw_bind_listen(path: &Path, backlog: i32) -> std::os::raw::c_int {
         let addr = raw_sockaddr(path);
         // SAFETY: a fresh socket fd; `bind`/`listen` are given a valid, fully-initialized
         // `sockaddr_un` and its exact size, and `fd` is returned to the caller to own and close.
         unsafe {
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
             assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
             let rc = libc::bind(
                 fd,
@@ -494,18 +514,19 @@ mod tests {
     /// One non-blocking `connect()` to `path`: `Ok(fd)` (kept open, owned by the caller) on success,
     /// `Err(errno)` otherwise -- closing the fd itself on any error, since the caller only wants a
     /// live one to hold the queue full.
+    #[cfg(target_os = "linux")]
     fn raw_nonblocking_connect(path: &Path) -> Result<std::os::raw::c_int, i32> {
         let addr = raw_sockaddr(path);
         // SAFETY: a fresh non-blocking socket fd; `connect` is given a valid, fully-initialized
         // `sockaddr_un` and its exact size. The fd is closed here on every error path and otherwise
         // handed to the caller to own and close.
         unsafe {
-            let fd = libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            );
+            // Its own `fcntl`, not the probe's `nonblocking_unix_socket`: a fixture that shared the
+            // code under test would hang in its own fill loop, not in the sweep, when that code broke.
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
             assert!(fd >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0);
             let rc = libc::connect(
                 fd,
                 &addr as *const _ as *const libc::sockaddr,

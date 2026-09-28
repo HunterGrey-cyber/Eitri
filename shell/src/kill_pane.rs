@@ -145,8 +145,9 @@ pub(crate) enum NvimState {
     Returned,
     /// nvim's loop has not answered for [`NVIM_QUIT_PATIENCE`]: stuck (a Lua busy loop, a stopped
     /// process), or waiting on an external command (`system()`, `:!`, a formatter a save hook runs),
-    /// during which nvim answers nothing (see [`NvimState::Busy`]). A second request then kills it,
-    /// and [`not_answering_text`] says what that costs.
+    /// during which nvim answers nothing (see [`NvimState::Busy`]). A second request then ends it
+    /// (`editor_quit`'s `QuitHost::end_nvim`: stdin closed, SIGTERM, SIGKILL by pid after the
+    /// patience), and [`not_answering_text`] says so.
     NotAnswering,
     /// Its `:confirm` dialog is up (`nvim_get_mode` says `r?`).
     Asking,
@@ -186,7 +187,8 @@ pub(crate) enum QuitRequest {
     /// nvim has the quit already: a second `:confirm qall` would nest inside the first instead of
     /// answering it (measured), so the user deals with the one in the editor ([`answer_there_text`]).
     AnswerThere(NvimState),
-    /// nvim's loop has not answered for [`NVIM_QUIT_PATIENCE`]: killed, its swap files kept.
+    /// nvim's loop has not answered for [`NVIM_QUIT_PATIENCE`]: ended (never `:qa!`), its swap
+    /// files kept.
     Kill,
 }
 
@@ -226,18 +228,19 @@ pub(crate) fn merge(current: &EditorQuit, incoming: EditorQuit) -> EditorQuit {
     }
 }
 
-/// Toast for nvim's loop not answering for [`NVIM_QUIT_PATIENCE`]. It explains that a second
-/// request kills nvim. SIGKILL keeps the swap file but loses changes not yet written to it;
-/// nvim may be waiting on a long external command rather than stuck.
+/// Toast for nvim's loop not answering for [`NVIM_QUIT_PATIENCE`]. A second request ends
+/// nvim by closing stdin and sending SIGTERM, which lets nvim sync changes to its swap file.
+/// If SIGKILL is needed after 5 s, changes not yet synced are lost. Nvim may be waiting
+/// on a long external command rather than stuck.
 pub(crate) fn not_answering_text(quit: &EditorQuit) -> &'static str {
     match quit {
         EditorQuit::Window { .. } => {
-            "nvim is not responding to the quit \u{2014} close the window again to kill it \
-             (changes not yet in its swap file are lost)"
+            "nvim is not responding to the quit \u{2014} close the window again to end it \
+             (its swap file keeps your changes)"
         }
         EditorQuit::Module => {
-            "nvim is not responding to the quit \u{2014} kill-pane the editor again to kill it \
-             (changes not yet in its swap file are lost)"
+            "nvim is not responding to the quit \u{2014} kill-pane the editor again to end it \
+             (its swap file keeps your changes)"
         }
     }
 }

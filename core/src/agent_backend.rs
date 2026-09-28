@@ -1763,13 +1763,27 @@ mod tests {
         project_root: &Path,
         mode: PermissionMode,
     ) -> Vec<AgentDomainEvent> {
+        // Every batch the ingestion thread folds, not only the first: under a loaded test run three
+        // queued prompts can reach the UI in two deliveries (the same flake `deliver` below had;
+        // `approve_pending_never_answers_a_prompt_only_a_human_answers` failed that way, 2 of 3).
+        // Collected until 100 ms pass after the last delivery; a first delivery that is empty (the
+        // policy answered everything) still returns within those 100 ms.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let quiet = std::time::Duration::from_millis(100);
+        let mut delivered = Vec::new();
+        let mut last: Option<std::time::Instant> = None;
         loop {
-            match backend.take_ui_delivery(project_root, mode) {
-                UiDelivery::Events(events) => return events,
-                _ if std::time::Instant::now() > deadline => return Vec::new(),
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            let now = std::time::Instant::now();
+            if let UiDelivery::Events(events) = backend.take_ui_delivery(project_root, mode) {
+                if !events.is_empty() || last.is_none() {
+                    last = Some(now);
+                }
+                delivered.extend(events);
             }
+            if last.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline {
+                return delivered;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -2422,12 +2436,26 @@ mod tests {
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
     ) -> (Vec<AgentDomainEvent>, Vec<PromptAnsweredForYou>) {
+        // Everything the provider queued, not only the first batch: the ingestion thread folds every
+        // 5 ms, so under a loaded test run the queued events can arrive in two deliveries, and a
+        // helper that returned the first one left a test's later events undelivered (seen failing
+        // about one run in three in the full suite, never alone). Collected until 100 ms pass with
+        // nothing new, as the panel's own pump keeps taking deliveries.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let quiet = std::time::Duration::from_millis(100);
         let mut answered = Vec::new();
+        let mut delivered = Vec::new();
+        let mut last_new: Option<std::time::Instant> = None;
         loop {
+            let now = std::time::Instant::now();
             match backend.take_ui_delivery_with_approvals(dir, rules, mode, host_answered, approvals, &mut answered) {
-                UiDelivery::Events(events) => return (events, answered),
-                _ if std::time::Instant::now() > deadline => return (Vec::new(), answered),
+                UiDelivery::Events(events) if !events.is_empty() => {
+                    delivered.extend(events);
+                    last_new = Some(now);
+                }
+                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
+                    return (delivered, answered)
+                }
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }

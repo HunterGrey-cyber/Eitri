@@ -155,6 +155,23 @@ impl WatchedCall {
     }
 }
 
+impl WatchedCall {
+    /// Waits up to `within` for the request's worker to publish how it ended, then returns the watch.
+    /// Nvim-rs delivers an answer or a closed-pipe error through a oneshot. Nvim's exit can reach the
+    /// host before the worker publishes it. Waiting here lets an exit handler read the completed
+    /// result; a request still outstanding at the bound returns with `done == false`.
+    pub(crate) fn settled(&self, within: Duration) -> CallWatch {
+        let deadline = Instant::now() + within;
+        loop {
+            let watch = self.watch();
+            if watch.done || Instant::now() >= deadline {
+                return watch;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 impl Drop for WatchedCall {
     fn drop(&mut self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
@@ -281,6 +298,28 @@ mod tests {
         assert!(!watch.returned);
         assert_eq!(watch.last_answer, None);
         assert_eq!(watch.last_alive(), watch.sent_at);
+    }
+
+    /// Nvim's answer reaches the worker through a oneshot before the worker publishes it.
+    /// `settled` waits up to its bound for publication so a caller at nvim's exit can read the result.
+    /// A request still outstanding at the bound remains outstanding.
+    #[test]
+    fn settled_waits_for_the_worker_to_publish() {
+        let call = || async {
+            std::thread::sleep(Duration::from_millis(150));
+            true
+        };
+        let probe = || async { None::<(String, bool)> };
+        let watched = WatchedCall::start("late", call, probe).unwrap();
+        assert!(!watched.watch().done, "the case: not published yet");
+        let settled = watched.settled(Duration::from_secs(2));
+        assert!(settled.done && settled.returned, "{settled:?}");
+
+        let pending = WatchedCall::start("never", || std::future::pending::<bool>(), probe).unwrap();
+        let started = Instant::now();
+        let unsettled = pending.settled(Duration::from_millis(100));
+        assert!(!unsettled.done);
+        assert!(started.elapsed() >= Duration::from_millis(100), "it waited the bound");
     }
 
     /// A request ended by nvim exiting without an answer is `done` but not `returned`.

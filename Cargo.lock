@@ -2651,6 +2651,8 @@ dependencies = [
  "libloading 0.9.0",
  "neovide",
  "nvim-rs",
+ "rmpv",
+ "serde_json",
  "skia-safe",
  "tokio",
 ]

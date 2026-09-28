@@ -1,34 +1,29 @@
-//! Holds the embedded nvim process so it can be killed after shutdown times out or nvim
-//! stops answering.
+//! Tracks the embedded nvim process and ends it without discarding unsaved buffers with `:qa!`.
 //!
-//! `LiveHarness::shutdown` asks nvim to quit and waits 5 s for `NeovimExited`. If that event
-//! never arrives, it returns `false` and leaves nvim running. The child pid is not exposed
-//! to the caller of `bridge::NeovimRuntime::launch`, and dropping the fork's
-//! `tokio::process::Child` does not kill it.
+//! `:qa!` discards unsaved buffers and deletes their swap files. Normal quitting uses
+//! `:confirm qall` so the user can respond. Closing stdin with `LiveHarness::hang_up` lets nvim
+//! exit while keeping swap files. If it remains running, [`end`] signals the held process with
+//! SIGTERM, which can also end a dialog that EOF does not. SIGKILL follows when [`SCHEDULE`]
+//! expires.
 //!
-//! [`NvimProcess`] uses nvim's own pid when available, with process discovery as a fallback.
-//! Once the session is up, [`NvimProcess::learn`] asks nvim `getpid()` over RPC on a separate
-//! thread. This identifies nvim even when a shell script on `PATH` or a `NEOVIM_BIN` launcher
-//! starts it without `exec`. The fork's direct child can be that launcher, with `--embed`
-//! in its argv; killing the launcher alone would leave nvim running.
+//! [`NvimProcess`] identifies nvim from two sources, in order of preference:
 //!
-//! Before nvim answers, [`NvimChild::find_new`] compares direct children before and after
-//! `LiveHarness::with_options` to find the new child with `--embed` in its argv. It accepts
-//! that process only if `/proc/<pid>/exe` names `nvim`. Otherwise it looks for that process's
-//! `--embed` child whose executable is `nvim`. If neither can be identified, nothing is
-//! killed and the host reports [`Killed::Unknown`].
+//! 1. Once the session is running, [`NvimProcess::learn`] asks nvim for `getpid()` over RPC on a
+//!    separate thread. This identifies nvim even if a launcher script started it without `exec`.
+//!    Signalling only the direct child could kill that launcher and leave nvim running.
+//! 2. Before nvim can answer, [`NvimChild::find_new`] compares direct children before and after
+//!    `LiveHarness::with_options`. It accepts the new child carrying `--embed` only if its
+//!    `/proc/<pid>/exe` is named `nvim`. Otherwise it looks for that process's single `--embed`
+//!    child whose executable is nvim. It holds this child from launch, since an exiting launcher
+//!    leaves nvim reparented. If neither identifies nvim, [`Ended::Unknown`] signals nothing and
+//!    only the harness report indicates whether nvim ended.
 //!
-//! A pidfd pins the held process, preventing kills from reaching another process that
-//! reuses its pid. Killing a process that has already exited is a no-op (`ESRCH`).
-//! Without a pidfd, as on kernels before 5.3, each kill first checks that the pid still
-//! carries `--embed` and, for the fork's direct child, still belongs to this process.
+//! A pidfd pins the exact process, preventing a signal from reaching a later process that reuses
+//! its pid. Signalling an exited process yields `ESRCH`. Without pidfds, on kernels before 5.3,
+//! each signal first rechecks `--embed` and, for a direct child, that it is still our child.
 //!
-//! SIGKILL prevents nvim from cleaning up its swap files, leaving saved swap contents
-//! available for recovery. The fork's `:qa!` shutdown deletes those files.
-//! `a_killed_nvim_keeps_its_swap_file` checks that the swap file remains.
-//!
-//! Only Linux is implemented. Elsewhere no process is held, so a timed-out shutdown leaves
-//! nvim running and a kill reports [`Killed::Unknown`].
+//! Only Linux implements process tracking. Elsewhere no process is held or signalled, so only
+//! hanging up ends nvim.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -76,11 +71,6 @@ impl NvimChild {
         self.pid
     }
 
-    /// Sends SIGKILL. `true` if it was delivered, i.e. the process was still there.
-    pub(crate) fn kill(&self) -> bool {
-        imp::kill(self)
-    }
-
     /// Waits up to `within` for the killed process to be gone, reaping it if it is this process's
     /// own child: after the fork's own runtime is shut down (`LiveHarness::shutdown` returned)
     /// nothing else will. A launcher's nvim is reaped by the launcher. `true` once it is gone.
@@ -96,32 +86,50 @@ impl NvimChild {
     }
 }
 
-/// What a kill of nvim reached ([`NvimProcess::kill`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Killed {
-    /// SIGKILL was delivered to nvim, this pid.
-    Sent(u32),
-    /// nvim, this pid, was already gone.
-    AlreadyGone(u32),
-    /// No process is known to be nvim: nothing was signalled.
-    Unknown,
-}
-
 /// The embedded nvim's process, as far as it is known (the module doc's two sources).
 #[derive(Debug)]
 pub(crate) struct NvimProcess {
     /// What the fork started (source 2): nvim, or a launcher of it.
     launched: Option<NvimChild>,
+    /// The nvim `--embed` child found beneath a launcher at launch, held by a pidfd.
+    /// Find it while the launcher still runs: once the launcher exits, nvim is re-parented and cannot
+    /// be found beneath it. The held pidfd continues to identify whether nvim lives.
+    found_below: Option<NvimChild>,
+    /// Whether `launched` ran nvim itself when it was found (a process gone since has no `exe`).
+    launched_is_nvim: bool,
     /// nvim's own `getpid()` answer (source 1), held once it came back.
     reported: OnceLock<NvimChild>,
 }
 
 impl NvimProcess {
     pub(crate) fn new(launched: Option<NvimChild>) -> NvimProcess {
+        let launched_is_nvim = launched.as_ref().is_some_and(|child| imp::exe_is_nvim(child.pid));
+        let found_below = launched
+            .as_ref()
+            .filter(|_| !launched_is_nvim)
+            .and_then(|child| imp::nvim_child_of(child.pid));
         NvimProcess {
             launched,
+            found_below,
+            launched_is_nvim,
             reported: OnceLock::new(),
         }
+    }
+
+    /// The best process known to be nvim: its own answer, else the fork's child if that ran nvim,
+    /// else the nvim found under it at launch.
+    fn known_nvim(&self) -> Option<&NvimChild> {
+        self.reported
+            .get()
+            .or(self.launched.as_ref().filter(|_| self.launched_is_nvim))
+            .or(self.found_below.as_ref())
+    }
+
+    /// Whether nvim's own process is still alive, waiting up to `grace` for one that is exiting
+    /// (an nvim whose exit the fork has just reported may take a moment to finish). `None` when no
+    /// process is known to be nvim -- then only the fork's own report says anything.
+    pub(crate) fn alive_within(&self, grace: Duration) -> Option<bool> {
+        self.known_nvim().map(|nvim| imp::alive_within(nvim, grace))
     }
 
     /// The pid the fork started, for the log line at launch.
@@ -141,21 +149,14 @@ impl NvimProcess {
         }
     }
 
-    /// Sends SIGKILL to nvim itself: its own `getpid()` answer, else what the fork started if that
-    /// is nvim, else the nvim a launcher started. Never the launcher.
-    pub(crate) fn kill(&self) -> Killed {
-        self.with_nvim(|nvim| {
-            if nvim.kill() {
-                Killed::Sent(nvim.pid())
-            } else {
-                Killed::AlreadyGone(nvim.pid())
-            }
-        })
-        .unwrap_or(Killed::Unknown)
+    /// The pid [`end`] would watch and signal: nvim itself -- its own `getpid()` answer, else what
+    /// the fork started if that is nvim, else the nvim a launcher started. Never the launcher.
+    pub(crate) fn nvim_pid(&self) -> Option<u32> {
+        self.with_nvim(NvimChild::pid)
     }
 
     fn with_nvim<R>(&self, f: impl FnOnce(&NvimChild) -> R) -> Option<R> {
-        if let Some(nvim) = self.reported.get() {
+        if let Some(nvim) = self.known_nvim() {
             return Some(f(nvim));
         }
         let launched = self.launched.as_ref()?;
@@ -163,37 +164,96 @@ impl NvimProcess {
         if !imp::is_alive(launched) || imp::exe_is_nvim(launched.pid) {
             return Some(f(launched));
         }
+        // A launcher that started nvim only after the launch was looked at.
         let below = imp::nvim_child_of(launched.pid)?;
         Some(f(&below))
     }
 }
 
-/// What happens after `LiveHarness::shutdown` returned `exited_cleanly`: nothing when it did, and
-/// otherwise nvim is killed and reaped. `true` when nvim is known to be gone.
-pub(crate) fn after_shutdown(exited_cleanly: bool, process: &NvimProcess) -> bool {
-    if exited_cleanly {
-        return true;
+/// When [`end`] escalates, counted from the moment nvim's stdin was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Schedule {
+    /// SIGTERM from then on, once per `term_every`, while nvim lives.
+    pub(crate) term_after: Duration,
+    pub(crate) term_every: Duration,
+    /// SIGKILL, once, if nvim still lives.
+    pub(crate) kill_after: Duration,
+}
+
+/// How [`end`] ended nvim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// It exited on the hang-up alone.
+    Exited,
+    /// It exited after SIGTERM.
+    Terminated,
+    /// SIGKILL: its swap files stay, without what it had not written to them yet.
+    Killed,
+    /// No process is known to be nvim: nothing is watched or signalled.
+    Unknown,
+}
+
+/// The signal schedule used by [`end`] after closing nvim's stdin.
+pub(crate) const SCHEDULE: Schedule = Schedule {
+    term_after: Duration::from_secs(1),
+    term_every: Duration::from_secs(1),
+    kill_after: Duration::from_secs(5),
+};
+
+/// Ends nvim after stdin was closed at `hung_up_at` and returns how it ended.
+/// EOF lets nvim preserve modified buffers in swap files instead of discarding them with `:qa!`.
+/// With nvim 0.12.5, EOF also writes edits that were not yet synced into those files.
+/// If EOF does not end nvim, such as in a `:confirm` dialog or after EOF was dropped during an
+/// external command, send SIGTERM from `term_after`, repeated every `term_every`.
+/// Nvim's `preserve_exit` handler preserves edits and swap files and can end the dialog.
+/// At `kill_after`, send SIGKILL to the held pid if needed; unsynced edits may then be lost.
+/// Blocks until exit, at most `kill_after` plus a reap. Returns `Unknown` immediately if no nvim
+/// process is known.
+pub(crate) fn end(process: &NvimProcess, hung_up_at: Instant, schedule: Schedule) -> Ended {
+    process
+        .with_nvim(|nvim| end_one(nvim, hung_up_at, schedule))
+        .unwrap_or(Ended::Unknown)
+}
+
+fn end_one(nvim: &NvimChild, hung_up_at: Instant, schedule: Schedule) -> Ended {
+    let mut terminated = false;
+    let mut next_term = schedule.term_after;
+    loop {
+        let elapsed = hung_up_at.elapsed();
+        let gone = |terminated| if terminated { Ended::Terminated } else { Ended::Exited };
+        if elapsed >= schedule.kill_after {
+            if !imp::alive_within(nvim, Duration::ZERO) {
+                return gone(terminated);
+            }
+            let delivered = imp::signal(nvim, libc::SIGKILL);
+            let reaped = nvim.reap(Duration::from_millis(500));
+            println!(
+                "[live] nvim (pid {}) did not exit within {:?} of its hang-up: SIGKILL {}, {}",
+                nvim.pid(),
+                schedule.kill_after,
+                if delivered { "sent" } else { "not needed" },
+                if reaped { "gone" } else { "not yet gone" },
+            );
+            return Ended::Killed;
+        }
+        let checkpoint = next_term.min(schedule.kill_after);
+        if !imp::alive_within(nvim, checkpoint.saturating_sub(elapsed)) {
+            return gone(terminated);
+        }
+        if hung_up_at.elapsed() >= next_term && next_term < schedule.kill_after {
+            if imp::signal(nvim, libc::SIGTERM) && !terminated {
+                println!("[live] nvim (pid {}) did not exit on its hang-up; SIGTERM", nvim.pid());
+            }
+            terminated = true;
+            next_term += schedule.term_every;
+        }
     }
-    let gone = process.with_nvim(|nvim| {
-        let delivered = nvim.kill();
-        let gone = nvim.reap(Duration::from_millis(500));
-        println!(
-            "[live] nvim (pid {}) did not exit within the shutdown's wait: SIGKILL {}, {}",
-            nvim.pid(),
-            if delivered { "sent" } else { "not needed (already gone)" },
-            if gone { "gone" } else { "not yet gone" },
-        );
-        gone
-    });
-    gone.unwrap_or_else(|| {
-        println!("[live] nvim did not exit and its pid is not known; it may be left running");
-        false
-    })
 }
 
 #[cfg(target_os = "linux")]
 mod imp {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Duration;
 
     use super::NvimChild;
 
@@ -252,6 +312,23 @@ mod imp {
         }
     }
 
+    /// Whether the held process is still running after waiting up to `grace` for it to exit.
+    pub(super) fn alive_within(child: &NvimChild, grace: Duration) -> bool {
+        match &child.pidfd {
+            Some(pidfd) => !exited(pidfd, i32::try_from(grace.as_millis()).unwrap_or(i32::MAX)),
+            None => {
+                let deadline = std::time::Instant::now() + grace;
+                while is_alive(child) {
+                    if std::time::Instant::now() >= deadline {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                false
+            }
+        }
+    }
+
     /// A pidfd polls readable once its process has exited (Linux 5.3), for a child or not.
     fn exited(pidfd: &OwnedFd, timeout_ms: i32) -> bool {
         let mut poll = libc::pollfd {
@@ -284,7 +361,7 @@ mod imp {
         (parent_of(pid) == Some(parent) && argv_has_embed(pid) && exe_is_nvim(pid) && is_alive(&held)).then_some(held)
     }
 
-    pub(super) fn kill(child: &NvimChild) -> bool {
+    pub(super) fn signal(child: &NvimChild, signal: libc::c_int) -> bool {
         match &child.pidfd {
             Some(pidfd) => {
                 // SAFETY: `pidfd` is a live fd we own; a null siginfo is what `kill(2)` would send.
@@ -292,7 +369,7 @@ mod imp {
                     libc::syscall(
                         libc::SYS_pidfd_send_signal,
                         pidfd.as_raw_fd(),
-                        libc::SIGKILL,
+                        signal,
                         std::ptr::null::<libc::siginfo_t>(),
                         0,
                     )
@@ -306,7 +383,7 @@ mod imp {
                     return false;
                 }
                 // SAFETY: plain syscall.
-                unsafe { libc::kill(child.pid as libc::pid_t, libc::SIGKILL) == 0 }
+                unsafe { libc::kill(child.pid as libc::pid_t, signal) == 0 }
             }
         }
     }
@@ -357,13 +434,16 @@ mod imp {
     pub(super) fn is_alive(_child: &NvimChild) -> bool {
         false
     }
+    pub(super) fn alive_within(_child: &NvimChild, _grace: std::time::Duration) -> bool {
+        false
+    }
     pub(super) fn hold_checked(_pid: u32) -> Option<NvimChild> {
         None
     }
     pub(super) fn nvim_child_of(_parent: u32) -> Option<NvimChild> {
         None
     }
-    pub(super) fn kill(_child: &NvimChild) -> bool {
+    pub(super) fn signal(_child: &NvimChild, _signal: i32) -> bool {
         false
     }
     pub(super) fn try_reap(_child: &NvimChild) -> Option<bool> {
@@ -411,7 +491,7 @@ mod tests {
     }
 
     fn running(pid: u32) -> bool {
-        // A zombie is not running: it is waiting to be reaped, and `after_shutdown` reaps.
+        // A zombie is not running: it is waiting to be reaped.
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|stat| {
@@ -446,59 +526,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Codex p1 #2: `LiveHarness::shutdown` returned `false` (it waited 5 s for an nvim that never
-    /// quit). The nvim it leaves is killed and reaped: no nvim process is left.
-    #[test]
-    fn a_timed_out_shutdown_leaves_no_nvim_process() {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("timeout");
-        let before = direct_children();
-        let nvim = spawn_embed(&dir, &[]);
-        let pid = nvim.id();
-        let child = NvimChild::find_new(&before).expect("the nvim --embed child");
-        assert!(running(pid), "the control: nvim is running before the shutdown");
+    /// Short enough for a test; the product's own is [`SCHEDULE`].
+    const QUICK: Schedule = Schedule {
+        term_after: Duration::from_millis(300),
+        term_every: Duration::from_millis(200),
+        kill_after: Duration::from_millis(1500),
+    };
 
-        assert!(
-            after_shutdown(false, &NvimProcess::new(Some(child))),
-            "a timed-out shutdown ends nvim"
-        );
-        assert!(!running(pid), "no nvim process is left");
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "and it was reaped, not left a zombie"
-        );
-        drop(nvim);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A shutdown that saw nvim exit kills nothing.
+    /// An nvim already gone -- exited and reaped by its owner -- is signalled nothing, and `end`
+    /// returns at once: the pidfd pins the process, not the number a new one may have taken.
     #[test]
-    fn a_clean_shutdown_kills_nothing() {
-        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("clean");
-        let before = direct_children();
-        let mut nvim = spawn_embed(&dir, &[]);
-        let child = NvimChild::find_new(&before).expect("the nvim --embed child");
-        assert!(after_shutdown(true, &NvimProcess::new(Some(child))));
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(running(nvim.id()), "nothing was killed");
-        let _ = nvim.kill();
-        let _ = nvim.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A kill after the process is gone and reaped reaches nothing: the pidfd pins the process, not
-    /// the number.
-    #[test]
-    fn a_kill_after_nvim_is_gone_reaches_nothing() {
+    fn an_nvim_already_gone_is_signalled_nothing() {
         let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("gone");
         let before = direct_children();
         let mut nvim = spawn_embed(&dir, &[]);
-        let child = NvimChild::find_new(&before).expect("the nvim --embed child");
+        let process = NvimProcess::new(NvimChild::find_new(&before));
         nvim.kill().expect("kill");
         nvim.wait().expect("reaped by its owner");
-        assert!(!child.kill(), "nothing to signal");
+        let started = Instant::now();
+        assert_eq!(end(&process, Instant::now(), QUICK), Ended::Exited);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "no wait for what is gone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -546,10 +597,10 @@ mod tests {
     }
 
     /// A launcher can be the harness's direct child and carry `--embed` in its arguments while
-    /// running nvim without `exec`. Signals must reach nvim itself, since killing the launcher
+    /// running nvim without `exec`. `end` must watch and signal nvim itself, since killing the launcher
     /// can leave a hung nvim running.
     #[test]
-    fn a_launcher_that_does_not_exec_nvim_is_not_what_a_kill_reaches() {
+    fn a_launcher_that_does_not_exec_nvim_is_not_what_an_end_reaches() {
         let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("wrapper");
         let wrapper = write_wrapper(&dir);
@@ -572,22 +623,24 @@ mod tests {
             Some(launched.id()),
             "the fork's child is the launcher"
         );
-        let killed = process.kill();
+        let watched = process.nvim_pid();
+        // SIGSTOP, so neither the hang-up nor SIGTERM ends it and `end` must reach the pid it holds.
+        // SAFETY: a signal to the nvim this test's own wrapper started.
+        unsafe { libc::kill(nvim as libc::pid_t, libc::SIGSTOP) };
+        drop(launched.stdin.take());
+        let ended = end(&process, Instant::now(), QUICK);
         let nvim_gone = wait_gone(nvim, Duration::from_secs(2));
         // Cleanup first, by the pids this test started, so a failing assert leaves nothing behind.
         if !nvim_gone {
-            // SAFETY: a signal to the nvim this test's own wrapper started.
+            // SAFETY: as above.
             unsafe { libc::kill(nvim as libc::pid_t, libc::SIGKILL) };
         }
         let _ = launched.kill();
         let _ = launched.wait();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            killed,
-            Killed::Sent(nvim),
-            "the signal went to nvim, not to its launcher"
-        );
-        assert!(nvim_gone, "nvim itself was killed");
+        assert_eq!(watched, Some(nvim), "nvim is what is watched, not its launcher");
+        assert_eq!(ended, Ended::Killed);
+        assert!(nvim_gone, "nvim itself was ended");
     }
 
     /// The other half of C2: a new `--embed` child that is not nvim and has no nvim under it (a
@@ -607,25 +660,34 @@ mod tests {
             assert!(Instant::now() < deadline, "sh never started");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let killed = NvimProcess::new(NvimChild::find_new(&before)).kill();
+        let process = NvimProcess::new(NvimChild::find_new(&before));
+        let watched = process.nvim_pid();
+        let ended = end(&process, Instant::now(), QUICK);
         std::thread::sleep(Duration::from_millis(100));
         let alive = running(other.id());
         let _ = other.kill();
         let _ = other.wait();
-        assert_eq!(killed, Killed::Unknown, "nothing is signalled");
+        assert_eq!(watched, None, "no process is known to be nvim");
+        assert_eq!(ended, Ended::Unknown, "nothing is signalled");
         assert!(alive, "and the process that is not nvim is still running");
     }
 
     /// C2's preferred fix: nvim's own `getpid()`, asked over RPC as the pane asks it once the session
-    /// is up, names nvim even under a launcher, and is what a kill reaches -- before, and instead of,
-    /// anything found by looking at processes. A pid that is no longer a live `--embed` process is
-    /// refused.
+    /// is up, names nvim under any launcher, and is what `end` reaches. The case is two launchers
+    /// deep, where looking at processes finds nothing (the fork's child is a shell, and so is its
+    /// `--embed` child): only nvim's own answer reaches it. A pid that is no longer a live `--embed`
+    /// process is refused. The connection keeps nvim's stdin open here, as a still-running fork
+    /// would, so SIGTERM is what ends it.
     #[test]
-    fn nvims_own_pid_is_what_a_kill_reaches() {
+    fn nvims_own_pid_is_what_an_end_reaches() {
         use nvim_rs::rpc::handler::Dummy;
+        use std::os::unix::fs::PermissionsExt;
         let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("reported");
-        let wrapper = write_wrapper(&dir);
+        let inner = write_wrapper(&dir);
+        let wrapper = dir.join("outer-nvim");
+        std::fs::write(&wrapper, format!("#!/bin/sh\n{} \"$@\"\n", inner.display())).expect("write the outer wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -646,15 +708,22 @@ mod tests {
             .expect("the wrapper");
         let launcher = launched.id().expect("pid");
         let process = NvimProcess::new(NvimChild::find_new(&before));
+        assert_eq!(process.launched_pid(), Some(launcher));
         let reported = crate::nvim_rpc::block_on(nvim.call_function("getpid", vec![]))
             .ok()
             .and_then(|pid| pid.as_u64())
             .expect("nvim answers getpid") as u32;
         assert_ne!(reported, launcher, "the case: nvim is not the process the fork started");
+        assert_eq!(
+            process.nvim_pid(),
+            None,
+            "the case: without nvim's answer no process is known to be nvim"
+        );
         assert!(process.learn(reported), "a live --embed process is held");
         assert!(!process.learn(launcher + 1_000_000), "a pid that is no nvim is refused");
+        assert_eq!(process.nvim_pid(), Some(reported));
 
-        let killed = process.kill();
+        let ended = end(&process, Instant::now(), QUICK);
         let nvim_gone = wait_gone(reported, Duration::from_secs(2));
         if !nvim_gone {
             // SAFETY: a signal to the nvim this test's own wrapper started.
@@ -662,45 +731,216 @@ mod tests {
         }
         let _ = runtime.block_on(launched.wait());
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(killed, Killed::Sent(reported));
+        assert_eq!(ended, Ended::Terminated);
         assert!(nvim_gone, "nvim itself is gone");
     }
 
-    /// SIGKILL leaves nvim's swap file available for recovering unsaved changes.
-    /// `:qa!` deletes the swap file.
+    /// Killing a launcher that did not `exec` leaves nvim alive, re-parented and holding the pipes,
+    /// even though the harness reports an exit. Both the pid reported by nvim and the child found
+    /// beneath the launcher must show nvim alive until it is ended, then show it gone.
     #[test]
-    fn a_killed_nvim_keeps_its_swap_file() {
+    fn nvim_outliving_its_launcher_is_seen_alive() {
+        use nvim_rs::rpc::handler::Dummy;
         let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("swap");
+        let dir = scratch("orphan");
+        let wrapper = write_wrapper(&dir);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let before = direct_children();
+        let (nvim, _io, mut launched) = runtime
+            .block_on(async {
+                nvim_rs::create::tokio::new_child_cmd(
+                    tokio::process::Command::new(&wrapper)
+                        .args(["--clean", "--embed", "-n"])
+                        .current_dir(&dir)
+                        .env("XDG_STATE_HOME", dir.join("state")),
+                    Dummy::new(),
+                )
+                .await
+            })
+            .expect("the wrapper");
+        let launcher = launched.id().expect("pid");
+        let reported = crate::nvim_rpc::block_on(nvim.call_function("getpid", vec![]))
+            .ok()
+            .and_then(|pid| pid.as_u64())
+            .expect("nvim answers getpid") as u32;
+        // Found at launch, before nvim's answer: the nvim under the launcher.
+        let found = NvimProcess::new(NvimChild::find_new(&before));
+        // And by nvim's own answer.
+        let told = NvimProcess::new(None);
+        assert!(told.learn(reported));
+
+        // SAFETY: a signal to the launcher this test spawned and still holds.
+        unsafe { libc::kill(launcher as libc::pid_t, libc::SIGKILL) };
+        let _ = runtime.block_on(launched.wait());
+        let orphan_alive = running(reported);
+        let seen_found = found.alive_within(Duration::from_millis(100));
+        let seen_told = told.alive_within(Duration::from_millis(100));
+        let ended = end(&found, Instant::now(), QUICK);
+        let gone_found = found.alive_within(Duration::from_secs(2));
+        let gone_told = told.alive_within(Duration::from_secs(2));
+        if running(reported) {
+            // SAFETY: the nvim this test's own wrapper started.
+            unsafe { libc::kill(reported as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(orphan_alive, "the case: nvim outlives its launcher");
+        assert_eq!(
+            seen_found,
+            Some(true),
+            "the nvim found under the launcher at launch is alive"
+        );
+        assert_eq!(seen_told, Some(true), "nvim by its own answer is alive");
+        assert_eq!(
+            ended,
+            Ended::Terminated,
+            "SIGTERM ends it; its stdin is still open here"
+        );
+        assert_eq!(gone_found, Some(false));
+        assert_eq!(gone_told, Some(false));
+        assert_eq!(
+            NvimProcess::new(None).alive_within(Duration::ZERO),
+            None,
+            "nothing known"
+        );
+    }
+
+    /// Checks ending nvim with an unsaved, unsynced edit after closing stdin.
+    /// Idle nvim exits on EOF. In a `:confirm` dialog, nvim 0.12.5 needs SIGTERM, whose handler writes
+    /// the edit to the swap file. A stopped process needs SIGKILL, which cannot flush the edit.
+    /// The original file is never written and the swap file remains in every case.
+    fn ending(case: &str, dialog: bool, stop: bool) -> (Ended, bool, bool, bool) {
+        use std::io::Write;
+        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch(case);
         let swap = dir.join("swap");
         std::fs::create_dir_all(&swap).expect("swap dir");
         let directory = format!("set directory={}//", swap.display());
         let before = direct_children();
-        let nvim = spawn_embed(
-            &dir,
-            &[
+        // A UI attaches, as the fork's does: `:confirm`'s dialog then waits for that UI's keys.
+        let mut nvim = Command::new("nvim")
+            // The file on the command line, as a launch gives it: its swap file is made when it loads,
+            // so an edit made after that is in the buffer and not yet in the swap file.
+            .args([
+                "--clean",
+                "--embed",
                 "--cmd",
                 &directory,
+                "a.txt",
                 "-c",
-                "edit a.txt",
-                "-c",
-                "call setline(1, 'unsaved text')",
-                "-c",
-                "preserve",
-            ],
-        );
-        let child = NvimChild::find_new(&before).expect("the nvim --embed child");
+                "call setline(1, 'unsynced edit')",
+            ])
+            .current_dir(&dir)
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("nvim must be on PATH for this test");
+        let process = NvimProcess::new(NvimChild::find_new(&before));
+        let mut stdout = nvim.stdout.take().expect("stdout");
+        std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+        let request = |id: u64, method: &str, params: Vec<nvim_rs::Value>| {
+            let mut bytes = Vec::new();
+            let message = nvim_rs::Value::Array(vec![0.into(), id.into(), method.into(), params.into()]);
+            rmpv::encode::write_value(&mut bytes, &message).expect("encode");
+            bytes
+        };
+        let mut stdin = nvim.stdin.take().expect("stdin");
+        let options = nvim_rs::Value::Map(vec![("ext_linegrid".into(), true.into())]);
+        stdin
+            .write_all(&request(1, "nvim_ui_attach", vec![80.into(), 24.into(), options]))
+            .unwrap();
+        stdin.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let swap_files = || std::fs::read_dir(&swap).map(|d| d.count()).unwrap_or(0);
-        while swap_files() == 0 {
-            assert!(Instant::now() < deadline, "nvim never wrote a swap file");
+        while std::fs::read_dir(&swap).map(|d| d.count()).unwrap_or(0) == 0 {
+            if Instant::now() >= deadline {
+                // Not left running behind a failed test.
+                let _ = nvim.kill();
+                let _ = nvim.wait();
+                panic!("nvim never made its swap file");
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-
-        assert!(after_shutdown(false, &NvimProcess::new(Some(child))));
-        assert_eq!(swap_files(), 1, "the swap file is still there");
-        assert!(!dir.join("a.txt").exists(), "and nothing was written over the file");
-        drop(nvim);
+        // Once the file is loaded and edited, never before: a `:confirm qall` over nothing modified
+        // simply quits.
+        if dialog {
+            let lua = "pcall(vim.cmd, 'confirm qall')";
+            stdin
+                .write_all(&request(
+                    3,
+                    "nvim_exec_lua",
+                    vec![lua.into(), nvim_rs::Value::Array(vec![])],
+                ))
+                .unwrap();
+            stdin.flush().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        if stop {
+            // SAFETY: a signal to the child this test spawned and still holds.
+            unsafe { libc::kill(nvim.id() as libc::pid_t, libc::SIGSTOP) };
+        }
+        drop(stdin);
+        let schedule = Schedule {
+            term_after: Duration::from_millis(500),
+            term_every: Duration::from_millis(250),
+            kill_after: Duration::from_millis(2000),
+        };
+        let ended = end(&process, Instant::now(), schedule);
+        let gone = !running(nvim.id());
+        let swap_files: Vec<PathBuf> = std::fs::read_dir(&swap)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        let edit_in_swap = swap_files
+            .iter()
+            .any(|f| std::fs::read(f).is_ok_and(|b| b.windows(13).any(|w| w == b"unsynced edit")));
+        let written = dir.join("a.txt").exists();
+        if !gone {
+            let _ = nvim.kill();
+        }
+        let _ = nvim.wait();
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "{case}: nvim is gone after end() ({ended:?})");
+        assert!(!swap_files.is_empty(), "{case}: the swap file stays ({ended:?})");
+        assert!(!written, "{case}: nothing was written over the file");
+        (ended, gone, !swap_files.is_empty(), edit_in_swap)
+    }
+
+    #[test]
+    fn an_idle_nvim_exits_on_the_hang_up_keeping_its_edit() {
+        let (ended, _, _, edit_in_swap) = ending("end-idle", false, false);
+        assert_eq!(ended, Ended::Exited);
+        assert!(
+            edit_in_swap,
+            "nvim wrote the unsynced edit into its swap file on the way out"
+        );
+    }
+
+    #[test]
+    fn an_nvim_in_a_dialog_is_terminated_keeping_its_edit() {
+        let (ended, _, _, edit_in_swap) = ending("end-dialog", true, false);
+        assert_eq!(ended, Ended::Terminated, "the hang-up alone leaves nvim in its dialog");
+        assert!(edit_in_swap, "SIGTERM's own handler preserved the edit");
+    }
+
+    #[test]
+    fn a_stopped_nvim_is_killed_at_the_patience() {
+        let (ended, _, _, _) = ending("end-stopped", false, true);
+        assert_eq!(ended, Ended::Killed);
+    }
+
+    #[test]
+    fn nothing_known_is_nothing_ended() {
+        let schedule = Schedule {
+            term_after: Duration::ZERO,
+            term_every: Duration::from_millis(10),
+            kill_after: Duration::from_millis(10),
+        };
+        assert_eq!(end(&NvimProcess::new(None), Instant::now(), schedule), Ended::Unknown);
     }
 }

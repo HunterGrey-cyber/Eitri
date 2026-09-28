@@ -4,6 +4,11 @@
 //! [`EditorQuitting`] owns the decisions and their order so they can be tested with a fake
 //! [`QuitHost`]. `main.rs` implements the host over the pane, layout, grid, confirmation prompt,
 //! and toast. The GTK calls in that layer still need GUI verification.
+//!
+//! The quit path uses `:confirm qall`, never `:qa!`. If nvim stops answering or is unreachable,
+//! [`QuitHost::end_nvim`] closes stdin and sends SIGTERM, then SIGKILL by pid after the timeout.
+//! Closing stdin lets nvim exit while keeping swap files. The editor host's shutdown sends no
+//! quit command. Close and retirement actions run once, after the pane reports the process gone.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -19,20 +24,16 @@ use crate::kill_pane::{self, Asked, EditorQuit, QuitInFlight, QuitRequest, Revea
 pub(crate) enum AskedNvim {
     /// nvim was sent `:confirm qall` (or had exited already); its exit, or a cancel, answers.
     Asked,
-    /// nvim's loop had not answered since it was asked (`kill_pane::QuitRequest::Kill`), and it was
-    /// killed (or was found gone): its exit closes what the quit was for.
-    Killed,
-    /// It should have been killed, and no process is known to be nvim (`neovide_editor`'s
-    /// `nvim_child`).
-    Unkillable,
+    /// nvim is being ended ([`QuitHost::end_nvim`]): its loop had not answered the quit for
+    /// `kill_pane::NVIM_QUIT_PATIENCE`, or it is out of reach. Its exit closes what the quit was for.
+    Ending,
 }
 
-/// The refusal for [`AskedNvim::Unkillable`]. A window close also shows it and waits.
-/// Falling back to the fork's `:qa!` could run inside a pending `:confirm qall` dialog and
-/// lose both the file's changes and its swap. Nvim quitting or being ended externally still
-/// closes the window.
-pub(crate) const UNKILLABLE_NVIM: &str = "nvim is not responding and its process is not known, so it cannot be \
-     killed from here \u{2014} the window closes once nvim quits";
+/// The launcher exited without `exec` while nvim's own process still runs. The fork can
+/// no longer send it keys; only ending the process can reach it. The requested action
+/// waits for nvim's exit.
+pub(crate) const UNREACHABLE_NVIM: &str = "nvim's launcher exited and nvim still runs where the editor can no \
+     longer reach it \u{2014} close the window or kill-pane the editor to end it (its swap file keeps your changes)";
 
 /// Text for a retired editor: nvim has ended and cannot restart in this window.
 /// The cause is unknown: `prefix x`, `:qa`, and a crash can all reach this path.
@@ -57,12 +58,19 @@ pub(crate) trait QuitHost {
     fn nvim_running(&self) -> bool;
     /// nvim ran and has exited (`NeovideEditorPane::nvim_exited`).
     fn nvim_exited(&self) -> bool;
+    /// The fork reports nvim gone, and nvim's own process is still alive
+    /// (`NeovideEditorPane::nvim_exit_pending`): its exit is reported once the process is gone.
+    fn nvim_exit_pending(&self) -> bool;
     /// The quit request's watch (`NeovideEditorPane::watched_call`).
     fn watched_call(&self) -> Option<CallWatch>;
+    /// The quit request's watch once its worker has published how it ended, waited for briefly
+    /// (`NeovideEditorPane::settled_watched_call`).
+    fn settled_watch(&self) -> Option<CallWatch>;
     /// Has nvim run `lua` as an RPC request (`NeovideEditorPane::exec_lua_watched`).
     fn send_quit(&self, lua: &str) -> bool;
-    /// `NeovideEditorPane::kill_nvim`.
-    fn kill_nvim(&self) -> bool;
+    /// Ends nvim without `:qa!` (`NeovideEditorPane::end_nvim`): stdin closed, then SIGTERM and
+    /// SIGKILL by pid on the pane's schedule. Idempotent.
+    fn end_nvim(&self) -> bool;
     /// `kill_pane::reveal_for_prompt` over the layout as it stands.
     fn reveal(&self) -> Reveal;
     /// The editor is retired for this window (`Layout::is_gone`).
@@ -127,33 +135,20 @@ impl EditorQuitting {
     /// its swap files. A toast explains this when the timeout is reached.
     pub(crate) fn ask(self: &Rc<Self>, quit: EditorQuit) -> Result<AskedNvim, String> {
         let host = &self.host;
+        if host.nvim_exit_pending() {
+            return Ok(self.end_pending(quit));
+        }
         let reveal = host.reveal();
-        let g = self.generation.get().wrapping_add(1);
         if !host.nvim_running() {
             // nvim exited just now: nothing to ask, and its exit -- seen on the pane's next tick --
-            // does what this request was for, joined to what was already in flight. An editor off
+            // does what this request was for, with what was still in flight. An editor off
             // screen is brought on screen, so that tick runs and nothing waits for a second close.
             if reveal.show {
                 if let Err(err) = host.show_editor() {
                     println!("[modules] editor: nvim exited, and the editor could not be shown ({err})");
                 }
             }
-            let mut in_flight = self.in_flight.borrow_mut();
-            match in_flight.as_mut() {
-                Some(asked) => {
-                    asked.quit = kill_pane::merge(&asked.quit, quit);
-                    asked.revealed |= reveal.rehide;
-                }
-                None => {
-                    self.generation.set(g);
-                    *in_flight = Some(Asked {
-                        generation: g,
-                        quit,
-                        revealed: reveal.rehide,
-                        sent: false,
-                    });
-                }
-            }
+            self.begin_unsent(quit, reveal.rehide);
             return Ok(AskedNvim::Asked);
         }
         let watch = host.watched_call();
@@ -162,12 +157,9 @@ impl EditorQuitting {
             QuitRequest::Ask => {}
             QuitRequest::Kill => {
                 self.join(quit);
-                println!("[modules] editor: nvim has not answered since it was asked to quit; killing it");
-                return Ok(if host.kill_nvim() {
-                    AskedNvim::Killed
-                } else {
-                    AskedNvim::Unkillable
-                });
+                println!("[modules] editor: nvim has not answered since it was asked to quit; ending it");
+                host.end_nvim();
+                return Ok(AskedNvim::Ending);
             }
             QuitRequest::AnswerThere(state) => {
                 self.join(quit);
@@ -180,6 +172,7 @@ impl EditorQuitting {
             host.show_editor().map_err(|e| e.to_string())?;
         }
         host.focus_editor();
+        let g = self.generation.get().wrapping_add(1);
         self.generation.set(g);
         *self.in_flight.borrow_mut() = Some(Asked {
             generation: g,
@@ -201,6 +194,48 @@ impl EditorQuitting {
         let me = self.clone();
         host.every_second(Box::new(move || me.poll(g, Instant::now())));
         Ok(AskedNvim::Asked)
+    }
+
+    /// Handles a request while nvim outlives its launcher and is out of reach of the fork.
+    /// Only ending the process can reach it. The request joins the quit in flight and waits for
+    /// the pane to report that nvim's process is gone. Repeats start no timer or extra ending:
+    /// the pane's ending is idempotent, and only the exit performs the requested action.
+    fn end_pending(&self, quit: EditorQuit) -> AskedNvim {
+        // Brought on screen if it is not, so the pane's tick runs and sees the exit when it comes
+        // (the same reason `ask`'s exited-just-now branch shows it); hidden again after.
+        let reveal = self.host.reveal();
+        if reveal.show {
+            if let Err(err) = self.host.show_editor() {
+                println!("[modules] editor: nvim is out of reach, and the editor could not be shown ({err})");
+            }
+        }
+        self.begin_unsent(quit, reveal.rehide);
+        self.host.end_nvim();
+        println!("[modules] editor: nvim is out of reach; it is being ended, and its exit does what was asked");
+        AskedNvim::Ending
+    }
+
+    /// A request that sends nothing to nvim gets its own entry and generation, whether nvim
+    /// just exited or is out of reach. Reusing an older quit's generation and `sent` state
+    /// could let that quit's cancellation clear the new request and close the whole window
+    /// instead of retiring the editor. A still-pending older quit joins the new request, with
+    /// a window close taking precedence over an editor kill. An answered quit is dropped,
+    /// including the `y` it carried.
+    fn begin_unsent(&self, quit: EditorQuit, rehide: bool) {
+        let answered = self.host.watched_call().is_some_and(|w| w.done && w.returned);
+        let mut in_flight = self.in_flight.borrow_mut();
+        let older = in_flight.take().filter(|asked| !(asked.sent && answered));
+        let g = self.generation.get().wrapping_add(1);
+        self.generation.set(g);
+        *in_flight = Some(Asked {
+            generation: g,
+            quit: match &older {
+                Some(older) => kill_pane::merge(&older.quit, quit),
+                None => quit,
+            },
+            revealed: older.as_ref().is_some_and(|o| o.revealed) || rehide,
+            sent: false,
+        });
     }
 
     /// A second request joining the quit in flight.
@@ -236,19 +271,27 @@ impl EditorQuitting {
         }
     }
 
-    /// Clears the quit in flight when its request returns: nvim ran the Lua without quitting,
-    /// so the user cancelled. Neither the quit nor its `y` may authorize a later unrequested
-    /// exit, even if no cancel letter arrives from the pane-switch shim. Returns the cleared quit.
+    /// Clears a sent quit unless its request is known to have ended with nvim gone. If the Lua
+    /// returned, the user cancelled, so neither the quit nor its `y` may authorize a later exit,
+    /// even without a cancel letter from the pane-switch shim. At exit,
+    /// [`EditorQuitting::nvim_exited`] reads the settled watch. A request still outstanding after
+    /// that wait is cleared too, so the close asks again rather than trusting an old `y`.
+    /// A quit that sent nothing because nvim had already exited is kept. Returns the cleared quit.
     fn settle(&self, watch: Option<&CallWatch>) -> Option<Asked> {
         let mut in_flight = self.in_flight.borrow_mut();
-        let answered = watch.is_some_and(|w| w.returned);
-        if !(answered && in_flight.as_ref().is_some_and(|asked| asked.sent)) {
+        if !in_flight.as_ref().is_some_and(|asked| asked.sent) {
             return None;
         }
+        let why = match watch {
+            // Ended without nvim's answer: nvim went away, which is the quit happening.
+            Some(w) if w.done && !w.returned => return None,
+            Some(w) if w.done => "answered it without quitting",
+            _ => "has not said how it ended",
+        };
         let cleared = in_flight.take();
         if let Some(asked) = &cleared {
             println!(
-                "[modules] editor: nvim answered quit {} without quitting; nothing is in flight",
+                "[modules] editor: quit {}'s request {why}; nothing is in flight",
                 asked.generation
             );
         }
@@ -268,9 +311,10 @@ impl EditorQuitting {
     /// a quit nvim already answered without quitting -- asks the window to close, which asks
     /// whatever the close asks.
     pub(crate) fn nvim_exited(&self) {
-        let watch = self.host.watched_call();
+        // The request's answer may still be on its way to the watch.
+        let watch = self.host.settled_watch();
         if self.settle(watch.as_ref()).is_some() {
-            println!("[modules] editor: nvim exited after it had declined the quit; nothing it said applies");
+            println!("[modules] editor: nvim exited, and the quit in flight is not what ended it");
         }
         let asked = self.in_flight.borrow_mut().take();
         match asked {
@@ -300,6 +344,14 @@ impl EditorQuitting {
         }
     }
 
+    /// The fork reports nvim exited and nvim's own process lives (`NeovideEditorPane::
+    /// on_nvim_unreachable`): said once, since nothing else on screen explains an editor that takes
+    /// no keys. Its exit, when it comes, is reported as any exit.
+    pub(crate) fn nvim_unreachable(&self) {
+        println!("[modules] editor: nvim outlived the fork's report of its exit");
+        self.host.toast(UNREACHABLE_NVIM);
+    }
+
     /// The window close once what it would ask was already asked (`confirmed`, the window close's
     /// prompt as it stood then): no second question unless what is running changed meanwhile
     /// (`kill_pane::close_is_confirmed`).
@@ -326,7 +378,9 @@ impl EditorQuitting {
                 return WindowClose::Wait;
             }
         }
-        if !host.nvim_running() {
+        // Proceed only once nvim's own process is gone, so the window cannot close while it
+        // may still be writing. End a process that outlived the fork's exit report instead.
+        if !host.nvim_running() && !host.nvim_exit_pending() {
             return WindowClose::Proceed;
         }
         // The `y` now travels with `EditorQuit::Window`. Nvim's exit closes the window through
@@ -339,15 +393,8 @@ impl EditorQuitting {
                 println!("[window] close: nvim decides; the window closes when it exits");
                 WindowClose::Wait
             }
-            Ok(AskedNvim::Killed) => {
-                println!("[window] close: nvim was killed; the window closes when it is gone");
-                WindowClose::Wait
-            }
-            // T6-1: never the fork's quit on a live nvim. The quit stays in flight, so nvim quitting
-            // -- or being ended from outside -- still closes the window.
-            Ok(AskedNvim::Unkillable) => {
-                println!("[window] close: {UNKILLABLE_NVIM}");
-                host.refuse(UNKILLABLE_NVIM);
+            Ok(AskedNvim::Ending) => {
+                println!("[window] close: nvim is being ended; the window closes when it is gone");
                 WindowClose::Wait
             }
             Err(refusal) => {
@@ -363,19 +410,15 @@ impl EditorQuitting {
     pub(crate) fn kill_editor(self: &Rc<Self>, scope: KillScope, confirmed: Option<String>) -> Result<(), String> {
         let host = &self.host;
         match scope {
-            KillScope::Window if host.nvim_running() => {
+            KillScope::Window if host.nvim_running() || host.nvim_exit_pending() => {
                 // nvim first, as for any kill of the editor: its exit closes the window.
-                if self.ask(EditorQuit::Window { confirmed })? == AskedNvim::Unkillable {
-                    return Err(UNKILLABLE_NVIM.into());
-                }
+                self.ask(EditorQuit::Window { confirmed })?;
                 println!("[modules] editor: the last module; nvim decides, then the window closes");
             }
             KillScope::Window => self.close_after(confirmed),
             // nvim decides: its own prompt for unsaved buffers, and only its exit closes the module.
-            KillScope::Module if host.nvim_running() => {
-                if self.ask(EditorQuit::Module)? == AskedNvim::Unkillable {
-                    return Err(UNKILLABLE_NVIM.into());
-                }
+            KillScope::Module if host.nvim_running() || host.nvim_exit_pending() => {
+                self.ask(EditorQuit::Module)?;
             }
             // Nvim already exited but the pane has not been released. A `:confirm qall` sent now
             // would never be answered, so retire the editor as its exit would have.
@@ -420,11 +463,14 @@ mod tests {
     struct Fake {
         running: Cell<bool>,
         exited: Cell<bool>,
+        /// The fork reports nvim exited, and nvim's process lives (a launcher exited without it).
+        pending: Cell<bool>,
+        /// What the watch reads once its worker has published (`None`: the watch as it is).
+        settled: RefCell<Option<CallWatch>>,
         gone: Cell<bool>,
         reveal: Cell<Option<Reveal>>,
         watch: RefCell<Option<CallWatch>>,
         send_ok: Cell<bool>,
-        kill_ok: Cell<bool>,
         confirmed: Cell<bool>,
         prompt: RefCell<Option<String>>,
         editor_last_visible: Cell<bool>,
@@ -437,7 +483,6 @@ mod tests {
             let fake = Rc::new(Fake::default());
             fake.running.set(true);
             fake.send_ok.set(true);
-            fake.kill_ok.set(true);
             fake
         }
         fn did(&self, what: impl Into<String>) {
@@ -478,8 +523,27 @@ mod tests {
         fn nvim_exited(&self) -> bool {
             self.exited.get()
         }
+        fn nvim_exit_pending(&self) -> bool {
+            self.pending.get()
+        }
         fn watched_call(&self) -> Option<CallWatch> {
             self.watch.borrow().clone()
+        }
+        /// As nvim-rs settles a request: once nvim's process is gone its IO loop has ended, so a
+        /// request still outstanding comes back unanswered -- unless a test says otherwise.
+        fn settled_watch(&self) -> Option<CallWatch> {
+            if let Some(settled) = self.settled.borrow().clone() {
+                return Some(settled);
+            }
+            let gone = !self.running.get() && !self.pending.get();
+            self.watch.borrow().clone().map(|watch| match watch {
+                CallWatch { done: false, .. } if gone => CallWatch {
+                    done: true,
+                    returned: false,
+                    ..watch
+                },
+                watch => watch,
+            })
         }
         fn send_quit(&self, lua: &str) -> bool {
             assert!(lua.contains("confirm qall"), "{lua}");
@@ -493,9 +557,9 @@ mod tests {
             });
             self.send_ok.get()
         }
-        fn kill_nvim(&self) -> bool {
-            self.did("kill_nvim");
-            self.kill_ok.get()
+        fn end_nvim(&self) -> bool {
+            self.did("end_nvim");
+            true
         }
         fn reveal(&self) -> Reveal {
             self.reveal.get().unwrap_or(Reveal {
@@ -720,48 +784,16 @@ mod tests {
         assert_eq!(fake.log(), ["close_window"]);
     }
 
-    /// T6-1: an nvim that stopped answering and whose process is not known is never handed the
-    /// fork's quit: the close is refused, saying so, and waits -- the quit stays in flight, so nvim
-    /// quitting still closes the window.
+    /// If nvim's loop stops answering, a second close ends it and waits for its exit.
+    /// Ending closes stdin, sends SIGTERM, then SIGKILL by pid on the pane's schedule, keeping
+    /// the swap file. No fork quit or shutdown runs first. Nvim's exit closes the window
+    /// without asking again.
     #[test]
-    fn an_unkillable_nvim_refuses_the_close_instead_of_running_qa() {
+    fn a_second_close_ends_an_nvim_that_stopped_answering_and_waits_for_it() {
         let fake = Fake::new();
         let quitting = flow(&fake);
         quitting.window_close();
         // Not answered since the send, for longer than the patience.
-        *fake.watch.borrow_mut() = Some(CallWatch {
-            sent_at: Instant::now() - kill_pane::NVIM_QUIT_PATIENCE - Duration::from_secs(1),
-            done: false,
-            returned: false,
-            last_answer: None,
-        });
-        fake.kill_ok.set(false);
-        fake.clear();
-        assert_eq!(
-            quitting.window_close(),
-            WindowClose::Wait,
-            "never Proceed: that runs :qa!"
-        );
-        assert_eq!(
-            fake.log(),
-            ["withdraw", "kill_nvim", format!("refuse: {UNKILLABLE_NVIM}").as_str()]
-        );
-        fake.clear();
-        fake.running.set(false);
-        quitting.nvim_exited();
-        assert_eq!(
-            fake.log(),
-            ["close_window_confirmed"],
-            "its later exit closes the window"
-        );
-    }
-
-    /// A killed nvim: the close waits for it to go.
-    #[test]
-    fn a_stuck_nvim_is_killed_by_the_second_close() {
-        let fake = Fake::new();
-        let quitting = flow(&fake);
-        quitting.window_close();
         *fake.watch.borrow_mut() = Some(CallWatch {
             sent_at: Instant::now() - kill_pane::NVIM_QUIT_PATIENCE - Duration::from_secs(1),
             done: false,
@@ -774,8 +806,17 @@ mod tests {
             .iter()
             .any(|l| l.starts_with("toast: nvim is not responding")));
         fake.clear();
-        assert_eq!(quitting.window_close(), WindowClose::Wait);
-        assert_eq!(fake.log(), ["withdraw", "kill_nvim"]);
+        assert_eq!(
+            quitting.window_close(),
+            WindowClose::Wait,
+            "never Proceed while nvim lives"
+        );
+        assert_eq!(fake.log(), ["withdraw", "end_nvim"]);
+        fake.clear();
+        fake.running.set(false);
+        fake.exited.set(true);
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["close_window_confirmed"], "its exit closes the window");
     }
 
     /// A second close while nvim's dialog is up is refused where nvim is, and the editor is given
@@ -894,6 +935,196 @@ mod tests {
         assert!(!RETIRED_EDITOR_TEXT.contains(":qa"));
         assert!(!RETIRED_EDITOR_TEXT.contains("prefix x"));
         assert!(RETIRED_EDITOR_TEXT.contains("relaunch neovibe"));
+    }
+
+    /// A launcher that does not `exec` can exit while nvim is still handling a window close.
+    /// The fork reports an exit, but the pane reports only that nvim is out of reach until its
+    /// own process is gone. Another close ends nvim and waits instead of proceeding to
+    /// shutdown or sending `:qa!`. Nvim's exit performs the requested action once.
+    #[test]
+    fn a_close_never_proceeds_while_nvims_own_process_lives() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        *fake.prompt.borrow_mut() = Some(RUNNING.into());
+        fake.confirmed.set(true);
+        quitting.window_close();
+        // The launcher is gone: the fork says exited, nvim's pidfd says alive.
+        fake.running.set(false);
+        fake.pending.set(true);
+        fake.clear();
+        quitting.nvim_unreachable();
+        assert_eq!(fake.log(), [format!("toast: {UNREACHABLE_NVIM}")]);
+        fake.clear();
+        // The close asks about the running tab again (its `y` travels with the quit), then ends nvim.
+        assert_eq!(quitting.window_close(), WindowClose::Wait);
+        fake.confirmed.set(true);
+        fake.clear();
+        assert_eq!(
+            quitting.window_close(),
+            WindowClose::Wait,
+            "never Proceed while nvim lives"
+        );
+        assert_eq!(fake.log(), ["withdraw", "end_nvim"]);
+        assert!(fake.ticks.borrow().len() <= 1, "no timer of its own");
+        // nvim's process goes; the pane reports its exit, once.
+        fake.pending.set(false);
+        fake.exited.set(true);
+        fake.clear();
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["close_window_confirmed"]);
+    }
+
+    /// If nvim finishes an approved save after its launcher exits, the pending window close
+    /// still completes. The pane reports nvim's exit when the process ends, even without
+    /// another request.
+    #[test]
+    fn a_close_asked_before_the_launcher_went_completes_when_nvim_exits() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        quitting.window_close();
+        fake.running.set(false);
+        fake.pending.set(true);
+        quitting.nvim_unreachable();
+        fake.clear();
+        // Later, nvim's save is done and it quits; the pane reports that exit.
+        fake.pending.set(false);
+        fake.exited.set(true);
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["close_window_confirmed"], "the close that was asked");
+    }
+
+    /// Repeated `prefix x` requests while nvim is out of reach end it once through the pane's
+    /// idempotent ending. They register no timer and retire nothing until the pane reports
+    /// the exit, which retires the editor without closing the window.
+    #[test]
+    fn repeated_prefix_x_while_nvim_is_out_of_reach_retires_the_editor_once() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        fake.running.set(false);
+        fake.pending.set(true);
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        assert_eq!(fake.log(), ["end_nvim", "end_nvim"]);
+        assert!(fake.ticks.borrow().is_empty(), "no timer: the pane reports the exit");
+        fake.clear();
+        fake.pending.set(false);
+        fake.exited.set(true);
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["retire_editor"], "the editor only, never the window");
+    }
+
+    /// The exit of an nvim out of reach is seen by the pane's tick, which runs only while the editor
+    /// is mapped: a close over a hidden editor shows it for that, and hides it again after.
+    #[test]
+    fn a_hidden_editor_is_shown_while_its_nvim_is_ended_and_hidden_again_after() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        fake.running.set(false);
+        fake.pending.set(true);
+        fake.reveal.set(Some(Reveal {
+            show: true,
+            rehide: true,
+        }));
+        assert_eq!(quitting.window_close(), WindowClose::Wait);
+        assert_eq!(fake.log(), ["withdraw", "show_editor", "end_nvim"]);
+        fake.clear();
+        fake.pending.set(false);
+        fake.exited.set(true);
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["hide_editor", "close_window_confirmed"]);
+    }
+
+    /// An older quit that nvim answered without quitting must not clear a newer explicit
+    /// ending, even before its cancel letter or watch update is read. Each request has its
+    /// own generation: `prefix x` while nvim is unreachable retires the editor when it exits
+    /// without reusing a cancelled window close's `y`.
+    #[test]
+    fn an_answered_old_quit_never_takes_a_newer_ending_with_it() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        *fake.prompt.borrow_mut() = Some(RUNNING.into());
+        fake.confirmed.set(true);
+        quitting.window_close();
+        // Cancelled in nvim's prompt: answered, no letter, the check not yet run.
+        fake.answer(true, true, "n");
+        // Its launcher exits; then `prefix x`.
+        fake.running.set(false);
+        fake.pending.set(true);
+        fake.clear();
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        assert_eq!(fake.log(), ["end_nvim"]);
+        fake.clear();
+        fake.pending.set(false);
+        fake.exited.set(true);
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["retire_editor"], "the editor, as asked -- not the window");
+    }
+
+    /// An older window close still pending in nvim's dialog joins a newer kill request when
+    /// the launcher exits. The window close takes precedence, so nvim's exit closes the
+    /// window using the confirmation carried by that close.
+    #[test]
+    fn a_live_old_window_close_still_wins_over_a_newer_kill() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        *fake.prompt.borrow_mut() = Some(RUNNING.into());
+        fake.confirmed.set(true);
+        quitting.window_close();
+        fake.answer(false, false, "r?");
+        fake.running.set(false);
+        fake.pending.set(true);
+        fake.clear();
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        fake.clear();
+        fake.pending.set(false);
+        fake.exited.set(true);
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["close_window_confirmed"]);
+    }
+
+    /// The quit's answer reaches a worker through the RPC oneshot, but nvim's exit does not
+    /// wait for that worker. Cancelling nvim's prompt and immediately typing `:qa` can report
+    /// the exit before the watch says the quit was answered. Read the settled watch at exit
+    /// so the cancelled `y` is not reused.
+    #[test]
+    fn the_exit_waits_for_the_quits_answer_before_using_its_y() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        *fake.prompt.borrow_mut() = Some(RUNNING.into());
+        fake.confirmed.set(true);
+        quitting.window_close();
+        // At the exit the worker has not published yet; once it has, the quit was answered.
+        fake.answer(false, false, "n");
+        let now = Instant::now();
+        *fake.settled.borrow_mut() = Some(CallWatch {
+            sent_at: now,
+            done: true,
+            returned: true,
+            last_answer: None,
+        });
+        fake.running.set(false);
+        fake.exited.set(true);
+        fake.clear();
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["close_window"], "the ordinary close, which asks again");
+    }
+
+    /// If a quit's outcome is still unknown after the wait, do not treat it as approved.
+    /// The window close asks again rather than trusting an old `y`.
+    #[test]
+    fn a_quit_still_unsettled_at_the_exit_is_not_taken_as_approved() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        *fake.prompt.borrow_mut() = Some(RUNNING.into());
+        fake.confirmed.set(true);
+        quitting.window_close();
+        fake.answer(false, false, "n");
+        *fake.settled.borrow_mut() = fake.watch.borrow().clone();
+        fake.running.set(false);
+        fake.exited.set(true);
+        fake.clear();
+        quitting.nvim_exited();
+        assert_eq!(fake.log(), ["close_window"]);
     }
 
     /// A quit nvim could not be sent: nothing is left in flight.

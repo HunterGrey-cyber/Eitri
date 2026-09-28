@@ -1732,8 +1732,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // neovide-editor's own `examples/standalone.rs`), unless nvim was asked to quit: then what it was
     // asked for (`editor_quit::EditorQuitting::nvim_exited`).
     {
+        let editor_quitting_for_exit = editor_quitting.clone();
+        pane.on_exited_unrequested(move || editor_quitting_for_exit.nvim_exited());
         let editor_quitting = editor_quitting.clone();
-        pane.on_exited_unrequested(move || editor_quitting.nvim_exited());
+        pane.on_nvim_unreachable(move || editor_quitting.nvim_unreachable());
     }
 
     // Show nvim startup errors in the editor's area through `editor_start_failure`. Startup is
@@ -1987,14 +1989,20 @@ impl editor_quit::QuitHost for ShellQuitHost {
     fn nvim_exited(&self) -> bool {
         self.pane.nvim_exited()
     }
+    fn nvim_exit_pending(&self) -> bool {
+        self.pane.nvim_exit_pending()
+    }
     fn watched_call(&self) -> Option<neovide_editor::CallWatch> {
         self.pane.watched_call()
+    }
+    fn settled_watch(&self) -> Option<neovide_editor::CallWatch> {
+        self.pane.settled_watched_call()
     }
     fn send_quit(&self, lua: &str) -> bool {
         self.pane.exec_lua_watched(lua)
     }
-    fn kill_nvim(&self) -> bool {
-        self.pane.kill_nvim()
+    fn end_nvim(&self) -> bool {
+        self.pane.end_nvim()
     }
     fn reveal(&self) -> kill_pane::Reveal {
         kill_pane::reveal_for_prompt(&self.module_layout.borrow(), &ModuleId::editor())
