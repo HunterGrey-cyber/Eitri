@@ -545,23 +545,19 @@ fn is_short_option_cluster(argument: &str) -> bool {
     argument.len() > 1 && argument.starts_with('-') && !argument.starts_with("--")
 }
 
-/// Whether every argument that names something on disk under the root resolves inside it.
+/// Whether every argument naming an entry under the root resolves inside it. An argument naming
+/// no entry, such as a grep pattern or git revision, passes. Existing entries, including
+/// dangling symlinks, must resolve inside the root; links out and unresolvable links fail.
 ///
-/// An argument that names nothing under the root -- a grep pattern, an `echo` word, a git revision
-/// -- is not a path this command can read through, and passes. One that names an existing entry
-/// (including a dangling symlink, hence `symlink_metadata` rather than `exists`) must
-/// `canonicalize` inside the root; a link out of the tree, or one that will not resolve, fails.
-///
-/// A short-option cluster is checked at every suffix as well, because an option's value can be
-/// glued to it (`grep -fescape`, where `escape` is a link out); `-la` costs two extra `lstat`s of
-/// names that do not exist.
+/// Each suffix of a short-option cluster is checked because an option value may be attached, as
+/// in `grep -fescape`. The literal argument is checked too: after `--`, `-n` can name a file
+/// rather than an option. Checking only the suffix `n` would miss a symlink named `-n`.
 fn arguments_stay_inside(arguments: &[&str], root: &Path) -> bool {
     arguments.iter().all(|argument| {
-        let candidates: Vec<&str> = if is_short_option_cluster(argument) {
-            (1..argument.len()).filter_map(|i| argument.get(i..)).collect()
-        } else {
-            vec![argument]
-        };
+        let mut candidates: Vec<&str> = vec![argument];
+        if is_short_option_cluster(argument) {
+            candidates.extend((1..argument.len()).filter_map(|i| argument.get(i..)));
+        }
         candidates.into_iter().all(|candidate| {
             let joined = root.join(candidate);
             if joined.symlink_metadata().is_err() {
@@ -1313,9 +1309,16 @@ const REASON_DOT_GIT_NOT_A_REPOSITORY: &str =
     "the project's .git is not a repository git would stop at, so git may use one above it";
 const REASON_GIT_CONFIG_RUNS_A_PROGRAM: &str =
     "the repository's own configuration can make git run a program or use another work tree";
+const REASON_GIT_CONFIG_UNKNOWN_KEY: &str =
+    "the repository sets a configuration key this policy cannot confirm is inert for a read-only command";
+const REASON_GIT_URL_RUNS_A_PROGRAM: &str =
+    "a repository remote URL uses a transport that runs a program (ext::, fd:: or another helper)";
 const REASON_GIT_CONFIG_UNREADABLE: &str = "the repository's configuration could not be read the way git reads it";
 const REASON_GIT_HOOK: &str = "the repository holds a hook git may run under a read-only command";
+const REASON_GIT_HOOKSPATH: &str = "the repository's core.hooksPath points somewhere this policy cannot clear";
 const REASON_GIT_ALTERNATES: &str = "the repository reads objects from another repository (objects/info/alternates)";
+const REASON_GIT_DIR_ESCAPES: &str =
+    "the repository reads objects or refs from a path that leaves its own git directory";
 const REASON_GIT_TOO_MUCH_TO_CHECK: &str = "the repository has too many submodule git directories to check";
 
 /// Checks that the repository git discovers from `root` stays within that boundary
@@ -1355,7 +1358,7 @@ fn git_repository_stays_inside(root: &Path, surroundings: &Surroundings) -> Resu
     }
     let git_dir = git_dir_named_by(&dot_git, root).ok_or(REASON_DOT_GIT_NOT_A_REPOSITORY)?;
     let common = git_directory_git_accepts(&git_dir).ok_or(REASON_DOT_GIT_NOT_A_REPOSITORY)?;
-    repository_runs_nothing_of_its_own(&git_dir, &common, surroundings.home)
+    repository_runs_nothing_of_its_own(&git_dir, &common, root, surroundings.home)
 }
 
 /// A bare repository, or a directory inside one: git's `is_git_directory` asks for a `HEAD` and
@@ -1400,30 +1403,38 @@ fn git_dir_named_by(dot_git: &Path, root: &Path) -> Option<PathBuf> {
 /// (as `ref: refs/...` or a symlink) or a full object id, and `objects/` and `refs/` directories this
 /// process may search, in the directory `commondir` names if there is one.
 fn git_directory_git_accepts(git_dir: &Path) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     if !head_names_a_ref_or_an_object(&git_dir.join("HEAD")) {
         return None;
     }
-    let common = match read_small_file(&git_dir.join("commondir")) {
-        Ok(bytes) => {
-            let named = trim_line_ends(&bytes);
-            if named.is_empty() {
-                return None;
-            }
-            let path = Path::new(std::ffi::OsStr::from_bytes(named));
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                git_dir.join(path)
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => git_dir.to_path_buf(),
-        Err(_) => return None,
-    };
+    let common = commondir_of(git_dir).ok()?;
     ["objects", "refs"]
         .iter()
         .all(|name| is_searchable_directory(&common.join(name)))
         .then_some(common)
+}
+
+/// Returns the common directory named by `gitdir/commondir`, relative to the git directory, or
+/// the git directory itself when that file is absent. Empty or unreadable `commondir` files are
+/// errors. Both the top repository and each submodule need this check because a different
+/// common directory may contain config that runs a program.
+fn commondir_of(git_dir: &Path) -> Result<PathBuf, &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    match read_small_file(&git_dir.join("commondir")) {
+        Ok(bytes) => {
+            let named = trim_line_ends(&bytes);
+            if named.is_empty() {
+                return Err(REASON_GIT_CONFIG_UNREADABLE);
+            }
+            let path = Path::new(std::ffi::OsStr::from_bytes(named));
+            Ok(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                git_dir.join(path)
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
+        Err(_) => Err(REASON_GIT_CONFIG_UNREADABLE),
+    }
 }
 
 fn head_names_a_ref_or_an_object(head: &Path) -> bool {
@@ -1492,18 +1503,26 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
 /// A read-only git command can execute programs or read outside the project because
 /// of repository metadata, even when its arguments contain no unsafe paths.
 /// `diff.external`, `core.fsmonitor` and `post-index-change` hooks can run programs;
-/// `core.worktree` can redirect file reads. [`GitConfigVariable::can_run_a_program`]
-/// checks configuration keys, following includes, and [`hooks_run_nothing_under_a_read`]
-/// cards hooks not known to run only under writing commands.
-/// Submodule git directories under `modules/` need the same config and hook checks,
-/// since the superproject's `git status` and `git diff` use them.
-/// `objects/info/alternates` can expose objects from another repository and cards too.
+/// `core.worktree` can redirect file reads. A promisor remote using `ext::` can run a
+/// helper during lazy fetch, and `blame.ignoreRevsFile` names a file to read.
+/// Configuration therefore uses an allowlist: keys not known to be inert for reads
+/// card through [`config_runs_nothing`], and includes are followed.
+/// [`hooks_run_nothing_under_a_read`] cards hooks not known to require writing commands.
+/// Submodule directories under `modules/` need the same checks; their `commondir` can
+/// also redirect common configuration. `objects/info/alternates` can expose foreign
+/// objects, and symlinked `objects`, `refs` or `packed-refs` can expose foreign data
+/// without an alternates file. [`git_directory_reads_stay_inside`] confines these reads.
 ///
 /// The model cannot write any of this without a card. What can is a directory or archive that
 /// arrives with its own `.git` (`git clone` carries none of it), and there the user's own
 /// git-aware editor plugins would run the same programs. This is stricter than the CLI, which
 /// hardens its own internal git calls but not the Bash tool's.
-fn repository_runs_nothing_of_its_own(git_dir: &Path, common: &Path, home: Option<&Path>) -> Result<(), &'static str> {
+fn repository_runs_nothing_of_its_own(
+    git_dir: &Path,
+    common: &Path,
+    root: &Path,
+    home: Option<&Path>,
+) -> Result<(), &'static str> {
     // `common/config` is what git reads; `git_dir/config` and `config.worktree` are read whether or
     // not `extensions.worktreeConfig` asks for the latter -- a superset.
     let mut config_files = vec![common.join("config")];
@@ -1511,23 +1530,72 @@ fn repository_runs_nothing_of_its_own(git_dir: &Path, common: &Path, home: Optio
         config_files.push(git_dir.join("config"));
     }
     config_files.push(git_dir.join("config.worktree"));
+    // The top repository's working tree is the project root, which is where a relative
+    // `core.hooksPath` and `core.worktree` resolve and the boundary they must stay inside.
+    let scope = ConfigScope {
+        root,
+        git_dir,
+        common,
+        home,
+        is_top_level: true,
+    };
     for file in &config_files {
-        config_runs_nothing(file, home, 0)?;
+        config_runs_nothing(file, &scope, 0)?;
     }
     if common.join("objects/info/alternates").symlink_metadata().is_ok() {
         return Err(REASON_GIT_ALTERNATES);
     }
+    git_directory_reads_stay_inside(common)?;
     hooks_run_nothing_under_a_read(&common.join("hooks"))?;
     let mut budget = MAX_SUBMODULE_GIT_DIRECTORIES;
-    submodule_git_directories_run_nothing(&common.join("modules"), home, &mut budget)
+    submodule_git_directories_run_nothing(&common.join("modules"), root, home, &mut budget)
+}
+
+/// Paths git reads under `objects`, `refs` and `packed-refs` must resolve inside the git
+/// directory; links out can expose another repository. `commondir`, `worktrees/*` and
+/// `modules/*` are checked separately because they can legitimately name other git directories.
+/// Any `objects/info/alternates` file or failure to canonicalize the git directory requires a
+/// card.
+const GIT_DIR_READS_THAT_MUST_STAY_INSIDE: &[&str] = &["objects", "refs", "packed-refs", "info", "logs"];
+
+fn git_directory_reads_stay_inside(common: &Path) -> Result<(), &'static str> {
+    let Ok(canonical_common) = common.canonicalize() else {
+        return Err(REASON_GIT_DIR_ESCAPES);
+    };
+    for name in GIT_DIR_READS_THAT_MUST_STAY_INSIDE {
+        let entry = common.join(name);
+        if entry.symlink_metadata().is_err() {
+            continue;
+        }
+        match entry.canonicalize() {
+            Ok(resolved) if resolved.starts_with(&canonical_common) => {}
+            _ => return Err(REASON_GIT_DIR_ESCAPES),
+        }
+    }
+    Ok(())
+}
+
+/// What a config file is read against: the working-tree root a relative `core.hooksPath` and
+/// `core.worktree` resolve to and must stay inside, the git directory and common directory those
+/// paths resolve relative to, and whether this is the top repository (a submodule's config is not
+/// something git writes `core.hooksPath` into, so any there cards).
+struct ConfigScope<'a> {
+    root: &'a Path,
+    git_dir: &'a Path,
+    common: &'a Path,
+    home: Option<&'a Path>,
+    is_top_level: bool,
 }
 
 /// Git's own limit (`MAX_INCLUDE_DEPTH`); past it git dies, so here it cards.
 const MAX_CONFIG_INCLUDE_DEPTH: usize = 10;
 
 /// A missing file is fine, as it is to git (a repository need not have a config, and a missing
-/// `include.path` is silently skipped). Anything else git could not read or parse is a card.
-fn config_runs_nothing(path: &Path, home: Option<&Path>, depth: usize) -> Result<(), &'static str> {
+/// `include.path` is silently skipped). Anything else git could not read or parse is a card. Every
+/// variable is judged against the allowlist ([`GitConfigVariable`]); `include`s are followed, a
+/// remote URL's transport is checked, and `core.hooksPath`/`core.worktree` are resolved and
+/// contained rather than carded outright.
+fn config_runs_nothing(path: &Path, scope: &ConfigScope, depth: usize) -> Result<(), &'static str> {
     if depth > MAX_CONFIG_INCLUDE_DEPTH {
         return Err(REASON_GIT_CONFIG_UNREADABLE);
     }
@@ -1545,19 +1613,105 @@ fn config_runs_nothing(path: &Path, home: Option<&Path>, depth: usize) -> Result
     };
     let variables = parse_git_config(&bytes).ok_or(REASON_GIT_CONFIG_UNREADABLE)?;
     for variable in &variables {
-        if variable.can_run_a_program() {
-            return Err(REASON_GIT_CONFIG_RUNS_A_PROGRAM);
-        }
         if variable.is_an_include() {
             let target = variable
                 .value
                 .as_deref()
-                .and_then(|value| include_target(value, path, home))
+                .and_then(|value| include_target(value, path, scope.home))
                 .ok_or(REASON_GIT_CONFIG_UNREADABLE)?;
-            config_runs_nothing(&target, home, depth + 1)?;
+            config_runs_nothing(&target, scope, depth + 1)?;
+            continue;
+        }
+        if variable.is_core_hookspath() {
+            hookspath_reads_only_known_hooks(variable.value.as_deref(), scope)?;
+            continue;
+        }
+        if variable.is_core_worktree() {
+            worktree_stays_inside(variable.value.as_deref(), scope)?;
+            continue;
+        }
+        if variable.is_a_url() {
+            if variable.value.as_deref().is_some_and(url_runs_a_program) {
+                return Err(REASON_GIT_URL_RUNS_A_PROGRAM);
+            }
+            continue;
+        }
+        if !variable.is_inert_for_reads() {
+            return Err(REASON_GIT_CONFIG_UNKNOWN_KEY);
         }
     }
     Ok(())
+}
+
+/// Whether a remote URL names a transport that runs a program. Git's `<transport>::<address>`
+/// syntax runs an external `git-remote-<transport>` helper; `ext::` can run an arbitrary
+/// command. A path or scheme URL has a `/` or `:` before any `::` and is not helper syntax.
+fn url_runs_a_program(value: &[u8]) -> bool {
+    let Some(pos) = value.windows(2).position(|w| w == b"::") else {
+        return false;
+    };
+    let transport = &value[..pos];
+    !transport.is_empty()
+        && transport
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
+}
+
+/// Treat repository `core.hooksPath` as the hook directory. Resolve `~/` against home, absolute
+/// paths as written and relative paths against the working-tree root, where git runs hooks. A
+/// directory inside the project or git directory uses the same hook allowlist as `.git/hooks`.
+/// Outside, missing, unreadable, `~user/` or submodule-config paths require cards.
+fn hookspath_reads_only_known_hooks(value: Option<&[u8]>, scope: &ConfigScope) -> Result<(), &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    let value = value.ok_or(REASON_GIT_HOOKSPATH)?;
+    if !scope.is_top_level {
+        return Err(REASON_GIT_HOOKSPATH);
+    }
+    let path = if let Some(rest) = value.strip_prefix(b"~/") {
+        scope
+            .home
+            .ok_or(REASON_GIT_HOOKSPATH)?
+            .join(Path::new(std::ffi::OsStr::from_bytes(rest)))
+    } else if value.starts_with(b"~") || value.is_empty() {
+        return Err(REASON_GIT_HOOKSPATH);
+    } else {
+        let p = Path::new(std::ffi::OsStr::from_bytes(value));
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            scope.root.join(p)
+        }
+    };
+    let canonical = path.canonicalize().map_err(|_| REASON_GIT_HOOKSPATH)?;
+    let inside = canonical.starts_with(scope.root)
+        || scope.git_dir.canonicalize().is_ok_and(|g| canonical.starts_with(g))
+        || scope.common.canonicalize().is_ok_and(|c| canonical.starts_with(c));
+    if !inside {
+        return Err(REASON_GIT_HOOKSPATH);
+    }
+    hooks_run_nothing_under_a_read(&canonical)
+}
+
+/// `core.worktree` relocates the working tree relative to the git directory. A submodule
+/// normally points back inside the superproject. Allow it only when it resolves inside the
+/// project root; outside or unresolvable paths require cards because `git diff` can otherwise
+/// read outside the project.
+fn worktree_stays_inside(value: Option<&[u8]>, scope: &ConfigScope) -> Result<(), &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    let value = value.ok_or(REASON_GIT_CONFIG_RUNS_A_PROGRAM)?;
+    if value.is_empty() {
+        return Err(REASON_GIT_CONFIG_RUNS_A_PROGRAM);
+    }
+    let p = Path::new(std::ffi::OsStr::from_bytes(value));
+    let path = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        scope.git_dir.join(p)
+    };
+    match path.canonicalize() {
+        Ok(resolved) if resolved.starts_with(scope.root) => Ok(()),
+        _ => Err(REASON_GIT_CONFIG_RUNS_A_PROGRAM),
+    }
 }
 
 /// Where an `include.path` value points, as git's `interpolate_path` resolves it: `~/` is the home
@@ -1651,10 +1805,14 @@ fn hooks_run_nothing_under_a_read(hooks: &Path) -> Result<(), &'static str> {
 /// How many directories under `modules/` are walked before the answer is a card.
 const MAX_SUBMODULE_GIT_DIRECTORIES: usize = 1024;
 
-/// Every submodule git directory under `dir` (`modules/<name>/`, where a name may hold `/`, and
-/// each one's own nested `modules/`), held to the same config and hook rules as the repository.
+/// Checks every submodule git directory under `dir`, including names containing `/` and nested
+/// `modules/`, against the repository's config, hook and object-store rules. Resolve each
+/// `commondir` and check the common directory git actually reads: its `core.fsmonitor` can run
+/// under the superproject's `git status`. Unresolvable paths require cards. `root` bounds each
+/// submodule's `core.worktree`, which normally points back inside the superproject.
 fn submodule_git_directories_run_nothing(
     dir: &Path,
+    root: &Path,
     home: Option<&Path>,
     budget: &mut usize,
 ) -> Result<(), &'static str> {
@@ -1679,13 +1837,30 @@ fn submodule_git_directories_run_nothing(
         let is_a_git_dir =
             path.join("HEAD").symlink_metadata().is_ok() || path.join("config").symlink_metadata().is_ok();
         if is_a_git_dir {
+            // git reads a submodule's config and hooks from its COMMON directory, which its own
+            // `commondir` may relocate. Resolve it and check there; an unresolvable one cards.
+            let common = commondir_of(&path)?;
+            let scope = ConfigScope {
+                root,
+                git_dir: &path,
+                common: &common,
+                home,
+                is_top_level: false,
+            };
             for file in ["config", "config.worktree"] {
-                config_runs_nothing(&path.join(file), home, 0)?;
+                config_runs_nothing(&common.join(file), &scope, 0)?;
+                if common != path {
+                    config_runs_nothing(&path.join(file), &scope, 0)?;
+                }
             }
-            hooks_run_nothing_under_a_read(&path.join("hooks"))?;
-            submodule_git_directories_run_nothing(&path.join("modules"), home, budget)?;
+            if common.join("objects/info/alternates").symlink_metadata().is_ok() {
+                return Err(REASON_GIT_ALTERNATES);
+            }
+            git_directory_reads_stay_inside(&common)?;
+            hooks_run_nothing_under_a_read(&common.join("hooks"))?;
+            submodule_git_directories_run_nothing(&common.join("modules"), root, home, budget)?;
         } else {
-            submodule_git_directories_run_nothing(&path, home, budget)?;
+            submodule_git_directories_run_nothing(&path, root, home, budget)?;
         }
     }
     Ok(())
@@ -1701,34 +1876,57 @@ struct GitConfigVariable {
 }
 
 impl GitConfigVariable {
-    /// A variable whose value git runs as a program, or which moves the work tree, under one of the
-    /// read-only subcommands or anything they spawn. The ruling's list (`diff.external`,
-    /// `diff.*.command`, `diff.*.textconv`, `core.fsmonitor`, `core.hooksPath`, `filter.*`,
-    /// `core.sshCommand`, `core.editor`, `core.pager`), plus what reading `git-config(1)` for git
-    /// 2.55.0 added: `core.worktree` (measured above), `hook.*` (config-defined hooks, measured
-    /// above), `pager.*` (per-command pagers, as `core.pager`), `gpg.*` (`log.showSignature` runs
-    /// `gpg.program`), `core.askPass`, `core.gitProxy`, `core.alternateRefsCommand`,
-    /// `sequence.editor` and `interactive.diffFilter`. Matched whatever the subsection, so
-    /// `[core "x"] fsmonitor` cards too -- stricter than git, never looser.
-    fn can_run_a_program(&self) -> bool {
+    /// Allows only configuration keys known to be inert for the permitted read-only commands.
+    /// A denylist can miss file-reading keys such as `blame.ignoreRevsFile` or promisor
+    /// remotes using `ext::`, and new git versions can add more. Unknown keys card through
+    /// [`config_runs_nothing`]. The caller handles `include`, both `*.url` keys,
+    /// `core.hooksPath` and `core.worktree` separately.
+    /// Section and key are lowercased; the subsection does not affect this check.
+    /// `core.repositoryformatversion`, `core.filemode`, `core.bare` and `core.logallrefupdates`
+    /// are format or boolean values, not paths or programs. `core.ignorecase`,
+    /// `core.precomposeunicode` and `core.symlinks` are filesystem-behaviour booleans.
+    /// `remote.<n>.fetch` is a refspec. `remote.<n>.glab-resolved` and
+    /// `branch.<n>.vscode-merge-base` are metadata git does not read.
+    /// `branch.<n>.remote` and `branch.<n>.merge` name a remote and ref.
+    /// `submodule.<n>.active` is a boolean or pathspec. `user.name` and `user.email` are
+    /// identity strings, not paths or programs used by read-only commands.
+    /// `extensions.objectformat`, `extensions.refstorage`, `extensions.worktreeconfig` and
+    /// `extensions.preciousobjects` select repository formats without running programs.
+    /// `extensions.partialclone` is excluded because it names a remote used for lazy fetch.
+    fn is_inert_for_reads(&self) -> bool {
         matches!(
             (self.section.as_str(), self.key.as_str()),
             (
                 "core",
-                "fsmonitor"
-                    | "hookspath"
-                    | "sshcommand"
-                    | "editor"
-                    | "pager"
-                    | "askpass"
-                    | "gitproxy"
-                    | "alternaterefscommand"
-                    | "worktree",
-            ) | ("diff", "external" | "command" | "textconv")
-                | ("filter" | "pager" | "gpg" | "hook", _)
-                | ("sequence", "editor")
-                | ("interactive", "difffilter")
+                "repositoryformatversion" | "filemode" | "bare" | "logallrefupdates"
+            ) | ("core", "ignorecase" | "precomposeunicode" | "symlinks")
+                | ("remote", "fetch" | "glab-resolved")
+                | ("branch", "remote" | "merge" | "vscode-merge-base")
+                | ("submodule", "active")
+                | ("user", "name" | "email")
+                | (
+                    "extensions",
+                    "objectformat" | "refstorage" | "worktreeconfig" | "preciousobjects"
+                )
         )
+    }
+
+    /// `remote.<n>.url` and `submodule.<n>.url`, whose value the caller checks for a program transport.
+    fn is_a_url(&self) -> bool {
+        matches!(
+            (self.section.as_str(), self.key.as_str()),
+            ("remote" | "submodule", "url")
+        )
+    }
+
+    /// `core.hooksPath`, resolved and contained by the caller rather than carded outright.
+    fn is_core_hookspath(&self) -> bool {
+        (self.section.as_str(), self.key.as_str()) == ("core", "hookspath")
+    }
+
+    /// `core.worktree`, resolved and contained by the caller.
+    fn is_core_worktree(&self) -> bool {
+        (self.section.as_str(), self.key.as_str()) == ("core", "worktree")
     }
 
     /// `include.path` and `includeIf.<condition>.path`. Followed whatever the condition says.
@@ -3349,5 +3547,206 @@ mod tests {
         for command in ["git push", "git commit -m x", "git log"] {
             check(command, &outer.path().join("project"));
         }
+    }
+
+
+    /// A promisor remote can make a read-only git command execute a helper during lazy fetch.
+    /// With `promisor`, `partialclonefilter`, an `ext::` URL and `protocol.ext.allow=always`,
+    /// `git show <missing-oid>` can run the configured program. The promisor/filter keys are
+    /// outside the inert allowlist, and the URL check also rejects the helper transport.
+    #[test]
+    fn a_promisor_remote_with_a_program_transport_url_cards_every_git_call() {
+        let ws = Workspace::new();
+        ws.write(
+            ".git/config",
+            "[remote \"audit\"]\n\turl = ext::sh -c id\n\tpromisor = true\n\tpartialclonefilter = blob:none\n\
+             [protocol \"ext\"]\n\tallow = always\n",
+        );
+        let leaks = mismatches(
+            &[
+                "git show 1111111111111111111111111111111111111111",
+                "git status",
+                "git log",
+            ],
+            ws.path(),
+            PermissionVerdict::AskTheUser,
+        );
+        assert!(leaks.is_empty(), "promisor+ext:: allowed without a card: {leaks:#?}");
+
+        // The program transport alone, in an otherwise ordinary remote URL, cards too.
+        let plain = Workspace::new();
+        plain.write(".git/config", "[remote \"origin\"]\n\turl = ext::sh -c id\n");
+        assert_eq!(
+            bash("git log", plain.path()),
+            PermissionVerdict::AskTheUser,
+            "ext:: url"
+        );
+        let fd = Workspace::new();
+        fd.write(".git/config", "[remote \"origin\"]\n\turl = fd::7\n");
+        assert_eq!(bash("git log", fd.path()), PermissionVerdict::AskTheUser, "fd:: url");
+        let helper = Workspace::new();
+        helper.write(".git/config", "[remote \"origin\"]\n\turl = evil::whatever\n");
+        assert_eq!(
+            bash("git log", helper.path()),
+            PermissionVerdict::AskTheUser,
+            "an arbitrary <transport>:: helper"
+        );
+    }
+
+    /// `blame.ignoreRevsFile` can make `git blame` read an outside file and include its first
+    /// line in an error. Config keys outside the inert allowlist require cards even when they
+    /// run no program.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_key_that_reads_an_external_file_or_is_simply_unknown_cards_every_git_call() {
+        for config in [
+            "[blame]\n\tignoreRevsFile = /etc/os-release\n",
+            "[blame]\n\tignoreRevsFile = ../secret\n",
+            // Any key the allowlist does not name is a card, program or not: default-deny.
+            "[core]\n\tuntrackedCache = true\n",
+            "[log]\n\tshowSignature = true\n",
+            "[remote \"origin\"]\n\tpromisor = true\n",
+            "[extensions]\n\tpartialClone = origin\n",
+        ] {
+            let ws = Workspace::new();
+            ws.write(".git/config", config);
+            let leaks = mismatches(
+                &["git blame src/main.rs", "git status", "git log"],
+                ws.path(),
+                PermissionVerdict::AskTheUser,
+            );
+            assert!(leaks.is_empty(), "config {config:?}: {leaks:#?}");
+        }
+    }
+
+    /// An option-shaped argument can be a filename: `cat -- -n` follows a symlink named `-n`
+    /// even when no entry named `n` exists. Check the literal spelling as a path so removing
+    /// the leading dash cannot bypass containment.
+    #[cfg(unix)]
+    #[test]
+    fn a_complete_option_shaped_filename_is_checked_as_a_path() {
+        let ws = Workspace::new();
+        let outside = Outside::new();
+        ws.link("-n", outside.secret());
+        for command in ["cat -- -n", "head -- -n", "wc -c -- -n", "grep x -- -n", "cat -n"] {
+            assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
+        }
+        // A real regular file named `-n` inside the root is fine: the literal check contains it.
+        let inside = Workspace::new();
+        inside.write("-n", "hello\n");
+        assert_eq!(bash("cat -- -n", inside.path()), PermissionVerdict::AllowWithoutAsking);
+        // And an ordinary `-n` option with no such file is untouched.
+        assert_eq!(
+            bash("grep -n main src/main.rs", inside.path()),
+            PermissionVerdict::AllowWithoutAsking
+        );
+    }
+
+    /// A symlink at `.git/objects` or another git read path can expose another repository's
+    /// objects without `objects/info/alternates`. Discovery follows links when testing
+    /// searchability, so containment must be checked separately.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_read_path_that_escapes_the_git_directory_cards() {
+        for escaping in ["objects", "refs", "packed-refs"] {
+            let ws = Workspace::new();
+            let outside = Outside::new();
+            let inside = ws.path().join(".git").join(escaping);
+            let _ = std::fs::remove_dir_all(&inside);
+            let _ = std::fs::remove_file(&inside);
+            std::os::unix::fs::symlink(&outside.dir, &inside).unwrap();
+            assert_eq!(
+                bash("git show HEAD", ws.path()),
+                PermissionVerdict::AskTheUser,
+                "`.git/{escaping}` symlinked out"
+            );
+        }
+    }
+
+    /// A submodule's `commondir` can select a different common directory whose config runs
+    /// `core.fsmonitor` during the superproject's `git status`. Check that common config as
+    /// well as the submodule's own git directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_submodule_commondir_pointing_at_a_foreign_common_config_cards() {
+        let ws = Workspace::new();
+        let foreign = Outside::new();
+        std::fs::write(foreign.dir.join("config"), "[core]\n\tfsmonitor = ./x.sh\n").unwrap();
+        ws.write(".git/modules/sub/HEAD", "ref: refs/heads/main\n");
+        ws.write(".git/modules/sub/commondir", format!("{}\n", foreign.dir.display()));
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "the submodule's commondir points at a foreign common config"
+        );
+        // An unresolvable commondir cards too.
+        let bad = Workspace::new();
+        bad.write(".git/modules/sub/HEAD", "ref: refs/heads/main\n");
+        bad.write(".git/modules/sub/commondir", "\n");
+        assert_eq!(
+            bash("git status", bad.path()),
+            PermissionVerdict::AskTheUser,
+            "empty commondir"
+        );
+    }
+
+    /// The other side of the allowlist: the exact config key sets found in local repositories
+    /// -- and what `git init`/`git clone` write -- read without a card. Built from
+    /// `git config --local --list --name-only` on this host, 2026-09-28.
+    #[test]
+    fn ordinary_repository_configs_stay_card_free() {
+        // Configuration keys left by `git init` and a normal clone.
+        let plain = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+                     \tlogallrefupdates = true\n\tignorecase = true\n\tprecomposeunicode = true\n\
+                     [remote \"origin\"]\n\turl = git@git.example.org:owner/x.git\n\
+                     \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+                     [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n";
+        // The glab CLI writes `remote.<n>.glab-resolved`, which git never reads.
+        let glab = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+                        \tlogallrefupdates = true\n\
+                        [remote \"origin\"]\n\turl = https://git.example.org/owner/tool.git\n\
+                        \tfetch = +refs/heads/*:refs/remotes/origin/*\n\tglab-resolved = base\n\
+                        [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n";
+        for config in [plain, glab] {
+            let ws = Workspace::new();
+            ws.write(".git/config", config);
+            let leaks = mismatches(
+                &["git status", "git log", "git diff", "git show HEAD"],
+                ws.path(),
+                PermissionVerdict::AllowWithoutAsking,
+            );
+            assert!(leaks.is_empty(), "config {config:?} carded: {leaks:#?}");
+        }
+
+        // self-host: core.hooksPath at its own (absolute) .git/hooks, and VS Code's
+        // branch.<n>.vscode-merge-base, which git never reads.
+        let ws = Workspace::new();
+        std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
+        ws.write(".git/hooks/pre-commit.sample", "#!/bin/sh\n");
+        let hooks_abs = ws.path().join(".git/hooks");
+        ws.write(
+            ".git/config",
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+                 \tlogallrefupdates = true\n\thooksPath = {}\n\
+                 [remote \"origin\"]\n\turl = git@git.example.org:owner/infra.git\n\
+                 \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+                 [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n\
+                 \tvscode-merge-base = origin/main\n",
+                hooks_abs.display()
+            ),
+        );
+        let leaks = mismatches(
+            &["git status", "git log", "git diff", "git show HEAD"],
+            ws.path(),
+            PermissionVerdict::AllowWithoutAsking,
+        );
+        assert!(leaks.is_empty(), "self-host style carded: {leaks:#?}");
+
+        // A relative core.hooksPath at the default hooks directory reads without a card too.
+        let rel = Workspace::new();
+        std::fs::create_dir_all(rel.path().join(".git/hooks")).unwrap();
+        rel.write(".git/config", "[core]\n\thooksPath = .git/hooks\n");
+        assert_eq!(bash("git status", rel.path()), PermissionVerdict::AllowWithoutAsking);
     }
 }
