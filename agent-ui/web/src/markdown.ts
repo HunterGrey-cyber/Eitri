@@ -1,4 +1,4 @@
-import { marked } from "marked";
+import { marked, Renderer, type Tokens } from "marked";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
@@ -41,6 +41,41 @@ export { hljs };
    the flag). Confirmed by reproducing the failure first: without this flag every fenced block in
    `markdown.test.ts` rendered as an empty `<pre><code></code></pre>`. Re-check both this flag and
    the token shape if marked is upgraded. */
+/* Images inside link text, including badges and mixed content, must not render their own anchors.
+   Nested anchors are split into siblings by the HTML parser, making the image text point at the
+   image URL instead of the enclosing link. `linkDepth` tracks the synchronous inline parse so
+   the image renderer can detect an enclosing link, even through emphasis.
+   Save `defaultLink` before overriding it to retain marked's href cleaning and title handling.
+   `Renderer.prototype.link` already accepts an object argument, unlike code's legacy shim. */
+const defaultLink = Renderer.prototype.link;
+let linkDepth = 0;
+
+/* marked's own `cleanUrl` (not exported; `marked.esm.js`, used by its default `link` and `image`
+   renderers): `encodeURI`, then un-double the `%` it encoded, and `null` for a destination
+   `encodeURI` refuses (a lone surrogate). Copied so an image's destination is cleaned exactly as a
+   link's is. Re-check against marked's source if marked is upgraded. */
+function cleanUrl(href: string): string | null {
+  try {
+    return encodeURI(href).replace(/%25/g, "%");
+  } catch {
+    return null;
+  }
+}
+
+/* Resolve an image link's destination exactly as an ordinary link would, or return `null` when
+   marked would emit no link. marked puts the cleaned destination into `href` and lets the HTML
+   parser decode entities. Text and attributes decode some entities differently: `&copy=1` stays
+   literal in an attribute but changes in text. Decode once through an inert `<template>`, where
+   nothing loads or runs, then escape the result for both the attribute and label. `encodeURI`
+   escapes quotes and angle brackets in the cleaned destination. */
+function resolvedHref(href: string): string | null {
+  const cleaned = cleanUrl(href);
+  if (cleaned === null) return null;
+  const template = document.createElement("template");
+  template.innerHTML = `<a href="${cleaned}"></a>`;
+  return (template.content.firstElementChild as HTMLAnchorElement).getAttribute("href");
+}
+
 marked.use({
   useNewRenderer: true,
   renderer: {
@@ -54,8 +89,127 @@ marked.use({
           : escapeHtml(text);
       return `<pre class="code-block"><code>${body}</code></pre>`;
     },
+    link(token: Tokens.Link) {
+      linkDepth += 1;
+      try {
+        return defaultLink.call(this, token);
+      } finally {
+        linkDepth -= 1;
+      }
+    },
+    /* Markdown images become plain links showing their alt text and full URL. The sanitizer
+       removes `img`, `picture` and `source` so remote images cannot fetch without a click; the
+       default image renderer would lose the URL entirely. DOMPurify sanitizes this renderer's
+       output like ordinary links, stripping disallowed `href` schemes without a separate
+       cleaning step. */
+    image({ href, text }: { href: string; title?: string | null; text: string }) {
+      /* `text` (the alt) arrives ALREADY html-escaped -- marked's own tokenizer does it at token
+         creation (`outputLink`'s image branch, `text: escape$1(text)`), unlike `href` and unlike
+         the `code` token's `text` above. Escaping it a second time here visibly broke rendering:
+         reproduced in jsdom, `![a & b <c>](url)` rendered the literal characters `a &amp; b &lt;c&gt;`
+         on screen (one layer of entity decoding by the HTML parser leaves the second layer as
+         literal text) instead of `a & b <c>`. `href` arrives raw, and `resolvedHref` above turns it
+         into the URL an ordinary link would go to; that is escaped exactly once, here. */
+      const url = resolvedHref(href);
+      const shownUrl = url === null ? escapeHtml(href) : escapeHtml(url);
+      /* Inside a link: part of that link's own text (see `linkDepth` above) -- the alt text, or,
+         absent that, the image URL, so an alt-less badge still says what it was. */
+      if (linkDepth > 0) return text.length > 0 ? text : shownUrl;
+      const label = text.length > 0 ? `${text}: ${shownUrl}` : shownUrl;
+      /* Where marked's own `image`/`link` would emit no element at all (a destination `encodeURI`
+         refuses), say what it was without a link to nowhere. */
+      if (url === null) return label;
+      return `<a href="${shownUrl}">${label}</a>`;
+    },
+    /* GFM task-list items (`- [ ] x`, `- [x] y`): the default renderer emits a real
+       `<input disabled type="checkbox">`, which `FORBID_TAGS` below now drops (`input` is a
+       zero-click remote-load vector via `type="image"`) -- silently, since `checkbox()`'s return
+       value is spliced into an item's TEXT as a raw string (`listitem()`'s own `checkbox + ' '`),
+       never escaped or passed through a tag-aware renderer, so nothing else catches its removal.
+       Reproduced in jsdom: before this, `- [ ] todo\n- [x] done` rendered
+       `<li> todo</li><li> done</li>` -- indistinguishable, the one piece of information (done or
+       not) silently lost. Inert bracket text keeps that information without reintroducing the
+       forbidden tag. */
+    checkbox({ checked }: Tokens.Checkbox) {
+      return checked ? "[x]" : "[ ]";
+    },
   },
 });
+
+/* Allow only classes emitted by this renderer. A reply must not retain `class="row row-current"`
+   or other panel classes, since DOMPurify otherwise preserves arbitrary class values. */
+const ALLOWED_CLASS_PREFIXES = ["hljs-", "language-"];
+const ALLOWED_CLASSES = new Set(["code-block", "table-scroll"]);
+/* highlight.js's own tiered-scope convention (`core.js`'s `scopeToCSSClass`): a scope name like
+   `title.class` becomes TWO space-separated classes on one element, `hljs-title` and a bare
+   `class_` (one trailing underscore per nesting depth, so `title.function.invoke` -> `hljs-title`,
+   `function_`, `invoke__`) -- collision-avoiding suffixes on JS-reserved words, not `hljs-`
+   prefixed. Without this, the allowlist above silently dropped `class_`/`function_`: reproduced in
+   jsdom, a Rust `struct Point { x: i32 }` lost `class_` off `Point`'s `<span class="hljs-title
+   class_">`, so `index.css`'s `.hljs-title.class_ { color: var(--nv-syn-type); }` stopped matching
+   and the type name was coloured as a function instead. `index.css` only ever compounds `class_`
+   and `function_` onto `hljs-title`, so this stays that exact, closed set rather than a generic
+   "ends in underscore" pattern. A grammar's other modifiers (`invoke__`, `inherited__`,
+   `language_`, ...) are stripped here SILENTLY, which is harmless exactly as long as nothing
+   styles them: a plain `.hljs-<name>` selector still matches the base class. Nothing else
+   notices -- `highlightCoverage.test.ts` deliberately ignores modifiers (see its `hljsClasses`)
+   -- so the guard is `markdown.test.ts`'s "every modifier class index.css compounds onto an
+   hljs-* selector survives sanitizing", which reads `index.css` itself: a rule written for a new
+   modifier without adding it to this set fails there. */
+const ALLOWED_HLJS_MODIFIER_CLASSES = new Set(["class_", "function_"]);
+
+/* Installed lazily, on first sanitize, rather than at module load: `dompurify`'s default export is
+   a factory that only auto-resolves to a live instance (with `.addHook`) when a real `window` is
+   present. `highlightCoverage.test.ts` imports `hljs` from this module under vitest's plain `node`
+   environment (no jsdom, no `window`) and never calls `renderMarkdown` -- a module-scope `addHook`
+   call broke that import even though nothing there ever sanitizes. */
+let sanitizeHooksInstalled = false;
+function installSanitizeHooks(): void {
+  if (sanitizeHooksInstalled) return;
+  sanitizeHooksInstalled = true;
+  DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
+    if (data.attrName !== "class") return;
+    const allowed = (token: string) =>
+      ALLOWED_CLASSES.has(token) ||
+      ALLOWED_HLJS_MODIFIER_CLASSES.has(token) ||
+      ALLOWED_CLASS_PREFIXES.some((prefix) => token.startsWith(prefix));
+    const kept = data.attrValue
+      .split(/\s+/)
+      .filter((token) => token.length > 0)
+      .filter(allowed);
+    data.attrValue = kept.join(" ");
+    if (data.attrValue === "") data.keepAttr = false;
+  });
+}
+
+/* One configuration for reply sanitizing.
+   - Disable `data-` and `aria-` attributes so reply HTML cannot impersonate panel navigation
+     or rendering markers such as `data-nav-stop`, `data-nav-action`, `data-path` and `aria-current`.
+   - Forbid `id`, `name`, `role`, `form` and `formaction` separately: the prefix flags do not
+     cover them. They can imitate controls or redirect a real form submission.
+   - Forbid the `style` tag and attribute. The panel uses inline CSS, so its CSP allows inline
+     styles and cannot prevent a reply from painting over controls.
+   - Forbid media and embedded content that can load remote resources without a click.
+     Include MathML: its namespace permits resource-bearing elements and is not emitted here.
+     Markdown images become links in the image renderer before this sanitizer runs.
+   - Forbid `background`: DOMPurify allows it on table elements, and WebKitGTK turns it into
+     a CSS background image that loads without a click.
+   - Forbid `dialog`: its browser styles let an open dialog cover later rows, including
+     permission cards, without a style attribute. Keep its contents in the reply's normal flow.
+   - Forbid popover and command invoker attributes: their target ids could name panel controls.
+     Markdown does not emit these attributes. Forbid `tabindex` so replies cannot add Tab stops. */
+const SANITIZE_CONFIG = {
+  ALLOW_DATA_ATTR: false,
+  ALLOW_ARIA_ATTR: false,
+  FORBID_TAGS: [
+    "style", "picture", "source", "video", "audio", "input",
+    "iframe", "object", "embed", "svg", "image", "img", "math", "dialog",
+  ],
+  FORBID_ATTR: [
+    "style", "id", "name", "role", "form", "formaction", "background",
+    "popover", "popovertarget", "popovertargetaction", "commandfor", "command", "tabindex",
+  ],
+};
 
 function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) =>
@@ -92,7 +246,8 @@ export function renderMarkdown(text: string): string {
   const hit = cache.get(text);
   if (hit !== undefined) return hit;
   parses += 1;
-  const html = DOMPurify.sanitize(wrapTables(marked.parse(text) as string));
+  installSanitizeHooks();
+  const html = DOMPurify.sanitize(wrapTables(marked.parse(text) as string), SANITIZE_CONFIG);
   if (cache.size >= MARKDOWN_CACHE_LIMIT) cache.delete(cache.keys().next().value as string);
   cache.set(text, html);
   return html;
