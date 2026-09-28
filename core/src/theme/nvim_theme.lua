@@ -58,3 +58,19 @@ end
 local augroup = vim.api.nvim_create_augroup("NeovibeThemeFeed", { clear = true })
 vim.api.nvim_create_autocmd({ "VimEnter", "ColorScheme" }, { group = augroup, callback = send })
 vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont" }, callback = send })
+
+-- nvim has no "a highlight group changed" event at all, so a bare
+-- `nvim_set_hl` call -- or an autocmd registered AFTER this file's own, which therefore fires
+-- after the snapshot above already went out -- never triggers a re-send. Reachable directly from
+-- LazyVim setups, where plugins commonly tweak highlight groups from
+-- post-colorscheme/VimEnter autocmds. A periodic re-snapshot is the cheapest self-healing fix that
+-- needs no new event: it bounds how stale the panel can stay after such a change to
+-- RESNAPSHOT_INTERVAL_MS rather than for the rest of the session. `send` already no-ops safely
+-- (via its own `pcall`s) whenever nothing has changed, so resending an unchanged payload costs one
+-- cheap connect+write+close and nothing else.
+local RESNAPSHOT_INTERVAL_MS = 3000
+local resnapshot_timer = vim.uv.new_timer()
+-- `nvim_get_hl` is not allowed in a fast event (see `snapshot` above), and a libuv timer callback
+-- runs in one -- `vim.schedule_wrap` defers it onto the main loop, same as every other libuv
+-- callback that touches the API in this workspace.
+resnapshot_timer:start(RESNAPSHOT_INTERVAL_MS, RESNAPSHOT_INTERVAL_MS, vim.schedule_wrap(send))

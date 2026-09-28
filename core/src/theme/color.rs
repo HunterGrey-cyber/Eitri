@@ -78,6 +78,32 @@ pub(crate) fn ensure_contrast(color: Rgb, against: Rgb, toward: Rgb, min: f64) -
     toward
 }
 
+/// [`ensure_contrast`], with a black/white pole as the guard of last resort (sw-theme-4).
+///
+/// `ensure_contrast` can hand back a colour that still fails `min`: a scheme's own two colours
+/// cannot always carry text on a mid-luminance surface (rose-pine dawn's `IncSearch`, `#d7827e`,
+/// reaches only 2.60:1 from either of `Normal`'s colours). Black or white always reaches
+/// `TEXT_CONTRAST` on one side of any background, so once the first pass fails, this falls through
+/// to whichever pole contrasts more against `against` and re-runs the same stepped mix toward it --
+/// stopping at the first step that passes, for the same reason `ensure_contrast` does, rather than
+/// jumping straight to a pure black or white that would erase the scheme's own character.
+///
+/// First written for `hint_fg`; sw-theme-4 found `chrome_fg`/`chrome_muted` had been left without
+/// it, extracted here so every surface-guarded text token shares one implementation.
+pub(crate) fn ensure_contrast_with_pole(color: Rgb, against: Rgb, toward: Rgb, min: f64) -> Rgb {
+    let guarded = ensure_contrast(color, against, toward, min);
+    if guarded.contrast(against) >= min {
+        return guarded;
+    }
+    let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(0xff, 0xff, 0xff));
+    let pole = if against.contrast(black) >= against.contrast(white) {
+        black
+    } else {
+        white
+    };
+    ensure_contrast(color, against, pole, min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +162,32 @@ mod tests {
         assert_eq!(
             ensure_contrast(WHITE, WHITE, Rgb::new(200, 200, 200), 30.0),
             Rgb::new(200, 200, 200)
+        );
+    }
+
+    #[test]
+    fn the_pole_variant_leaves_a_passing_colour_alone_too() {
+        assert_eq!(ensure_contrast_with_pole(BLACK, WHITE, BLACK, 4.5), BLACK);
+    }
+
+    /// sw-theme-4's own scenario in miniature: `ensure_contrast` toward a colour that itself never
+    /// reaches `min` against `against` returns that failing colour unchanged; the pole variant must
+    /// fall through to black or white instead.
+    #[test]
+    fn the_pole_variant_falls_through_when_the_plain_target_never_reaches_the_minimum() {
+        // rose-pine dawn's real IncSearch: neither of Normal's two colours (#575279, #faf4ed)
+        // reaches 4.5:1 against it.
+        let ischbg = Rgb::from_u32(0xd7827e);
+        let plain = ensure_contrast(Rgb::from_u32(0xfaf4ed), ischbg, Rgb::from_u32(0x575279), 4.5);
+        assert!(
+            plain.contrast(ischbg) < 4.5,
+            "the plain guard fails here, as documented"
+        );
+
+        let fixed = ensure_contrast_with_pole(Rgb::from_u32(0xfaf4ed), ischbg, Rgb::from_u32(0x575279), 4.5);
+        assert!(
+            fixed.contrast(ischbg) >= 4.5,
+            "the pole fallback must still reach the minimum"
         );
     }
 }
