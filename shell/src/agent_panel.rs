@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use webkit6::prelude::*;
-use webkit6::{UserContentManager, WebView};
+use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
 /// The embedded, single-file `agent-ui/web` production build -- `shell/build.rs`
 /// guarantees this file exists and is current by the time `shell` itself compiles.
@@ -1097,7 +1097,18 @@ pub(crate) fn build_agent_panel(
     scratch: Option<neovibe_core::scratch::ScratchDir>,
 ) -> (gtk4::Widget, AgentPanelHandle) {
     let content_manager = UserContentManager::new();
-    let webview = WebView::builder().user_content_manager(&content_manager).build();
+    // Apply a CSP floor the page cannot loosen, with a proxy to block network requests that pass it.
+    // `PANEL_CONTENT_SECURITY_POLICY` and `PANEL_NETWORK_PROXY_URI` define these constraints.
+    let network_session = NetworkSession::new_ephemeral();
+    network_session.set_proxy_settings(
+        NetworkProxyMode::Custom,
+        Some(&NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI), &[])),
+    );
+    let webview = WebView::builder()
+        .user_content_manager(&content_manager)
+        .network_session(&network_session)
+        .default_content_security_policy(PANEL_CONTENT_SECURITY_POLICY)
+        .build();
     webview.set_hexpand(true);
     webview.set_vexpand(true);
 
@@ -3202,13 +3213,25 @@ fn no_session_error() -> neovibe_core::agent_backend::BackendError {
 /// Inserted directly after the opening `<head>`, not before `</head>`: the single-file build
 /// inlines its script into `<head>`, and that script contains the literal `<head></head>`
 /// (DOMPurify), so the first `</head>` in the file is not the document's.
+///
+/// The CSP `<meta>` goes in first, ahead of even the theme `<style>` -- a `<meta
+/// http-equiv="Content-Security-Policy">` only governs what loads *after* it in the document, so it
+/// must be the very first thing `<head>` contains, before the single-file build's own inlined
+/// `<script>`/`<style>`. See `PANEL_CONTENT_SECURITY_POLICY`.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
     let style = format!("<style id=\"nv-theme\">:root{{{declarations}}}</style>");
+    let csp_meta = format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{PANEL_CONTENT_SECURITY_POLICY}\">");
     match AGENT_UI_HTML.find("<head>") {
         Some(at) => {
             let insert = at + "<head>".len();
-            format!("{}{}{}", &AGENT_UI_HTML[..insert], style, &AGENT_UI_HTML[insert..])
+            format!(
+                "{}{}{}{}",
+                &AGENT_UI_HTML[..insert],
+                csp_meta,
+                style,
+                &AGENT_UI_HTML[insert..]
+            )
         }
         None => {
             eprintln!("[agent_panel] the panel document has no <head>; loading it without an inline theme");
@@ -3234,6 +3257,30 @@ fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::The
 /// 2026-09-25). `.invalid` never resolves (RFC 2606): nothing is ever fetched from it, and a
 /// relative link is still a `LinkClicked` that `connect_decide_policy` hands to the browser.
 const PANEL_BASE_URI: &str = "https://neovibe.invalid/";
+
+/// Rendered model content is untrusted. This CSP sets a floor the page cannot loosen, both as
+/// `WebView`'s `default-content-security-policy` in `build_agent_panel` and as the first element
+/// of `<head>` in `themed_document`. It applies before the single-file build's inline scripts
+/// and styles run, adding protection for content that gets past the sanitizer.
+///
+/// The frontend uses no network connections, dynamic code evaluation, or font resources.
+/// Fonts come from locally installed families through WebKit's font matching, so
+/// `connect-src 'none'` and `media-src 'none'` do not block panel features.
+/// `img-src data:` and `font-src data:` allow inline data without permitting remote loads.
+/// `script-src 'unsafe-inline'` and `style-src 'unsafe-inline'` allow the single-file build's
+/// inline scripts and styles; the build supplies no hashes or nonces to restrict them further.
+/// `frame-src 'none'`, `object-src 'none'`, `form-action 'none'`, and `base-uri 'none'`
+/// complement `connect_decide_policy`, which refuses form and link navigation in this WebView.
+///
+/// Rust's `evaluate_javascript` calls in `evaluate_js_dispatch` bypass CSP, so the panel's
+/// push channel continues to work.
+const PANEL_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
+
+/// The ephemeral `NetworkSession` keeps cookies, cache, and storage in memory for its lifetime
+/// without writing them to disk. Its proxy points to the closed discard port on loopback, so
+/// requests that get past the sanitizer and CSP fail to connect. The CSP remains the security
+/// boundary; the proxy adds a fallback.
+const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!(
@@ -4287,10 +4334,17 @@ mod tests {
     fn the_panel_document_carries_its_theme_before_its_script() {
         let tokens = neovibe_core::theme::ThemeTokens::fallback();
         let html = themed_document(&tokens.css_vars());
+        let csp_at = html
+            .find("<meta http-equiv=\"Content-Security-Policy\"")
+            .expect("the CSP meta is inserted");
         let style_at = html
             .find("<style id=\"nv-theme\">")
             .expect("the theme block is inserted");
         let script_at = html.find("<script").expect("the single-file build inlines its script");
+        assert!(
+            csp_at < style_at,
+            "the CSP must be in force before the theme style, or it would not cover it"
+        );
         assert!(
             style_at < script_at,
             "the theme must be parsed before the script that renders"
@@ -4298,7 +4352,121 @@ mod tests {
         assert_eq!(html.matches("<style id=\"nv-theme\">").count(), 1);
         assert!(html.contains(&format!("--nv-bg:{};", tokens.bg.hex())));
         let end = style_at + html[style_at..].find("</style>").unwrap() + "</style>".len();
-        assert_eq!(format!("{}{}", &html[..style_at], &html[end..]), AGENT_UI_HTML);
+        // The CSP meta and the theme style are inserted back to back at the same point `<head>`
+        // used to sit -- removing both must reconstruct the untouched embedded document.
+        assert_eq!(format!("{}{}", &html[..csp_at], &html[end..]), AGENT_UI_HTML);
+    }
+
+    /// The CSP meta element comes first inside `<head>`, before even the theme style can load.
+    /// Its `content` must match `PANEL_CONTENT_SECURITY_POLICY`, also used by `build_agent_panel`,
+    /// so edits cannot silently make the document policy differ from the builder's policy.
+    #[test]
+    fn the_panel_documents_csp_meta_is_first_in_head_and_matches_the_policy_constant() {
+        let tokens = neovibe_core::theme::ThemeTokens::fallback();
+        let html = themed_document(&tokens.css_vars());
+        let head_at = html.find("<head>").expect("the document has a <head>");
+        let after_head = head_at + "<head>".len();
+        assert!(
+            html[after_head..].starts_with("<meta http-equiv=\"Content-Security-Policy\""),
+            "the CSP meta must be the very first thing after <head>, before even the theme style"
+        );
+        let expected_meta =
+            format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{PANEL_CONTENT_SECURITY_POLICY}\">");
+        assert!(html.contains(&expected_meta), "{html}");
+        assert_eq!(html.matches("Content-Security-Policy").count(), 1);
+    }
+
+    /// Pins the policy string itself against silent drift, and each directive's presence against
+    /// the reasoning in `PANEL_CONTENT_SECURITY_POLICY`'s doc comment: `default-src 'none'` closes
+    /// everything not named, and nothing here reopens network access for the panel (`connect-src`,
+    /// `frame-src`, `object-src`, `media-src` all `'none'`; images/fonts limited to `data:`).
+    #[test]
+    fn the_panel_csp_closes_every_directive_it_does_not_explicitly_reopen() {
+        assert_eq!(
+            PANEL_CONTENT_SECURITY_POLICY,
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; \
+             font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; \
+             form-action 'none'; base-uri 'none'"
+        );
+        assert!(PANEL_CONTENT_SECURITY_POLICY.starts_with("default-src 'none';"));
+        for directive in [
+            "connect-src 'none'",
+            "frame-src 'none'",
+            "object-src 'none'",
+            "media-src 'none'",
+        ] {
+            assert!(
+                PANEL_CONTENT_SECURITY_POLICY.contains(directive),
+                "{directive} missing from {PANEL_CONTENT_SECURITY_POLICY}"
+            );
+        }
+        // No directive allows an https:/http: remote load -- every source list is 'none', an inline
+        // keyword, or `data:`.
+        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains("https:"));
+        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains("http:"));
+        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains('*'));
+    }
+
+    /// The WebView builder applies a CSP floor the page cannot loosen.
+    /// Check the source as for `load_html`, since constructing a WebView requires a running
+    /// WebKitGTK display unavailable to these tests.
+    #[test]
+    fn the_webview_builder_applies_the_content_security_policy() {
+        let source = include_str!("agent_panel.rs");
+        let builder_at = source
+            .find("WebView::builder()")
+            .expect("the panel's WebView is built through WebView::builder()");
+        let build_at = source[builder_at..]
+            .find(".build()")
+            .map(|i| builder_at + i)
+            .expect("the builder chain ends in .build()");
+        let chain = &source[builder_at..build_at];
+        assert!(
+            chain.contains(".default_content_security_policy(PANEL_CONTENT_SECURITY_POLICY)"),
+            "the WebView builder chain never applies the panel's CSP: {chain}"
+        );
+    }
+
+    /// The panel's WebView uses an ephemeral `NetworkSession` with a closed loopback proxy,
+    /// so requests that pass the CSP and sanitizer still cannot leave.
+    /// Check the builder source because constructing a WebView requires a display.
+    #[test]
+    fn the_webview_builder_applies_the_network_proxy_backstop() {
+        assert_eq!(PANEL_NETWORK_PROXY_URI, "http://127.0.0.1:9");
+        let source = include_str!("agent_panel.rs");
+        // Scoped to `build_agent_panel`'s own body, ending at the WebView `.build()` call -- never
+        // the whole file. `source` (the whole file, via `include_str!`) includes this very test's own
+        // string literals, so searching all of `source` for e.g. "NetworkSession::new_ephemeral()"
+        // would always find a match in the assertion below regardless of what the production code
+        // does: a mutation that deleted the real call, or swapped in a persistent `NetworkSession`,
+        // would still leave this test green. `fn_at` keeps the needles below restricted to code that
+        // actually ran before the WebView was built.
+        let fn_at = source
+            .find("fn build_agent_panel(")
+            .expect("the panel is built by build_agent_panel");
+        let builder_at = source[fn_at..]
+            .find("WebView::builder()")
+            .map(|i| fn_at + i)
+            .expect("the panel's WebView is built through WebView::builder()");
+        let build_at = source[builder_at..]
+            .find(".build()")
+            .map(|i| builder_at + i)
+            .expect("the builder chain ends in .build()");
+        let scope = &source[fn_at..build_at];
+        let chain = &source[builder_at..build_at];
+        assert!(
+            chain.contains(".network_session(&network_session)"),
+            "the WebView builder chain never installs the ephemeral network session: {chain}"
+        );
+        assert!(
+            scope.contains("NetworkSession::new_ephemeral()"),
+            "the backstop session must be ephemeral: no cookies, cache or storage"
+        );
+        assert!(
+            scope.contains("NetworkProxyMode::Custom")
+                && scope.contains("NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI)"),
+            "the ephemeral session must be pointed at the unreachable proxy, not left on WebKit's default"
+        );
     }
 
     fn a_command() -> agent::handoff::ClaudeResumeCommand {
