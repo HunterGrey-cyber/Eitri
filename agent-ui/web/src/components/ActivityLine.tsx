@@ -60,7 +60,14 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       {pendingTool === null && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
       {pendingTool !== null ? (
         <span className="activity-card">
-          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, then a / d" : "a / d"}
+          {/* v1 hardening, codex-release-p1 #9 (= R2-10 + R2-3): the old "a / d" / "Esc, then a / d"
+              said neither that `a`/`d` answer only the card under the cursor (S4, `nav.ts`'s
+              `permissionTarget` -- ruling 26's "the only card, from any row" fallback is gone) nor
+              that a key answers only on its own, `TYPING_GUARD_MS` after the last one (S1) -- so a
+              user who followed it literally, cursor elsewhere, or `a` a beat too soon after `Esc`,
+              got "no card here" or the typing flash with no clue why. "j to it" points at S4's
+              route back (`j`/`k`/`G` onto the card); "alone" is `TYPING_FLASH`'s own word for S1. */}
+          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
         </span>
       ) : (
         queued > 0 && <span className="activity-keys">{queued} queued · </span>

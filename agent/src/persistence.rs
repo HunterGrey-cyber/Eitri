@@ -367,7 +367,7 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
         .parent()
         .expect("a record path always has a parent directory")
         .to_path_buf();
-    std::fs::create_dir_all(&dir)?;
+    create_private_state_dir(&dir, crate::state_dirs::conversations_dir()?)?;
     let json = serde_json::to_string_pretty(record).map_err(std::io::Error::other)?;
     write_record(&path, json.as_bytes())?;
     // After the write, never before: a failed prune must not cost the caller its record, and the
@@ -376,7 +376,18 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
     Ok(())
 }
 
+/// Creates `dir`, which lies under `kind_dir` (`conversations_dir()` or `history_dir()`), 0700 all
+/// the way down from neovibe's own state root -- `kind_dir`'s parent, `<state home>/neovibe` -- and
+/// tightens those that an older build left open (`private_fs`'s module doc; ruling R5).
+pub(crate) fn create_private_state_dir(dir: &Path, kind_dir: PathBuf) -> std::io::Result<()> {
+    let root = kind_dir.parent().map(Path::to_path_buf).unwrap_or(kind_dir);
+    crate::private_fs::create_private_dir_all(dir, &root)
+}
+
 /// Writes through a temp file in the SAME directory, then renames over the target.
+///
+/// The temp file is created 0600, so the record the rename puts in place is 0600 too: a record
+/// carries the session's title, its first prompt line (ruling R5).
 ///
 /// `std::fs::write` truncates in place, so a crash (or a reader arriving mid-write) between the
 /// truncate and the last byte leaves a file that parses as nothing -- which `resumable_sessions`
@@ -405,7 +416,7 @@ pub(crate) fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // reader that lists the directory mid-write cannot pick this up as a record.
     let temp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let written = (|| {
-        let mut file = std::fs::File::create(&temp)?;
+        let mut file = crate::private_fs::open_private(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()
     })();
@@ -699,6 +710,25 @@ mod tests {
         let saved = record(&conv, "prov-1", "1000");
         save_conversation_record(&saved).unwrap();
         assert_eq!(load_conversation_record(&conv, "prov-1").unwrap(), saved);
+    }
+
+    /// Local-IPC review finding 8 (ruling R5): a record -- its title is the session's first prompt
+    /// line -- is a 0600 file, in 0700 directories from the state root down, not the umask's
+    /// `0644` in `0755`.
+    #[test]
+    fn a_saved_record_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let conv = unique_conversation_id("private");
+        let mut saved = record(&conv, "prov-1", "1000");
+        saved.title = Some("the first prompt".into());
+        save_conversation_record(&saved).unwrap();
+        let path = record_path(&conv, "prov-1").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700, "the conversation's directory");
+        let conversations = crate::state_dirs::conversations_dir().unwrap();
+        assert_eq!(mode(&conversations), 0o700);
+        assert_eq!(mode(conversations.parent().unwrap()), 0o700, "the state root");
     }
 
     #[test]

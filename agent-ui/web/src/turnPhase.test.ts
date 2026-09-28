@@ -207,7 +207,10 @@ describe("phaseOf", () => {
     state = applyEvent(state, { type: "user_prompt_submitted", text: "never mind, do X" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
 
-    const { assistantMessageOpen: _o, nextSeq: _n, turnThinking: _t, ...wire } = state;
+    // `assistantMessageOpen` stays on `wire`, as Rust now sends it (sw-panel-render-2): `turn_started`
+    // just above already closed it on `state` itself, so this is the wire's true value, not a
+    // stripped one -- `phaseOf` does not read this field regardless.
+    const { nextSeq: _n, turnThinking: _t, ...wire } = state;
     const resynced = applySnapshot(state, wire, state.nextSeq);
     expect(phaseOf(resynced)).toEqual({ kind: "sent" });
   });
@@ -239,8 +242,9 @@ describe("phaseOf", () => {
     expect(phaseOf(state)).toEqual({ kind: "thinking" });
 
     // Take the snapshot Rust would actually send for this state (no `turnThinking` key at all --
-    // it is reducer-internal on both sides) and resync onto it.
-    const { assistantMessageOpen: _open, nextSeq: _seq, turnThinking: _thinking, ...wire } = state;
+    // it is reducer-internal on both sides, unlike `assistantMessageOpen`, which IS on the wire
+    // since sw-panel-render-2's fix and so stays in `wire` here) and resync onto it.
+    const { nextSeq: _seq, turnThinking: _thinking, ...wire } = state;
     const resynced = applySnapshot(state, wire, state.nextSeq);
     expect(phaseOf(resynced)).toEqual({ kind: "sent" });
   });
@@ -261,7 +265,7 @@ describe("phaseOf", () => {
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
     expect(phaseOf(state)).toEqual({ kind: "thinking" });
 
-    const { assistantMessageOpen: _o, nextSeq: _n, turnThinking: _t, ...wire } = state;
+    const { nextSeq: _n, turnThinking: _t, ...wire } = state;
     const resynced = applySnapshot(state, wire, state.nextSeq);
     expect(phaseOf(resynced)).toEqual({ kind: "tool", toolName: "Bash" });
     expect(resynced.turnThinking).toBe(false);

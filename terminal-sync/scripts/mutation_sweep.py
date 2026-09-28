@@ -33,7 +33,7 @@ import time
 
 CRATE = pathlib.Path(__file__).resolve().parent.parent
 SPY = CRATE / "src" / "spy.rs"
-IMPL_RE = re.compile(r"^impl<H: Handler> Handler for SyncSpy<'_, H> \{$", re.M)
+IMPL_RE = re.compile(r"^impl<H: Handler \+ ZeroWidthTarget> Handler for SyncSpy<'_, H> \{$", re.M)
 
 
 def find_impl_block(text):

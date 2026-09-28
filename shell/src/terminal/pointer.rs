@@ -145,6 +145,20 @@ impl ReportTracker {
         self.last = Some(cell);
         mouse_input(MouseKind::Motion(self.held), cell)
     }
+
+    /// Whether a button is currently tracked as held (a press this tracker actually reported).
+    /// **Task 8's fix (codex p1 #4) reads this, not [`route`], to decide whether a release should
+    /// report:** xterm's own convention is that a release follows the press it matches, regardless
+    /// of the Shift state sampled at release. `route` re-derives its answer from *current* Shift
+    /// with no memory of press time, so `pane.rs::connect_drag_end` used to gate its release report
+    /// on `route(shift, modes) == Program` -- correct for the common case, but a release with Shift
+    /// held only at that moment made `route` say `Local`, so `release` was never called and `held`
+    /// stayed stranded (the next ordinary motion then reported a phantom drag). `connect_drag_end`
+    /// now checks `is_held()` before calling and releases unconditionally, the same way
+    /// `connect_cancel` already did (its own doc: "safe to call unconditionally").
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.is_some()
+    }
 }
 
 /// `kind` at `cell` (absolute line, column), turned into the `MouseInput` a report names. `None`:
@@ -301,5 +315,61 @@ mod tests {
         // The button is still remembered even though the press itself was not reported.
         let moved = tracker.motion((0, 0));
         assert_eq!(moved.unwrap().kind, MouseKind::Motion(Some(Button::Left)));
+    }
+
+    #[test]
+    fn is_held_reports_whether_a_button_is_tracked() {
+        let mut tracker = ReportTracker::default();
+        assert!(!tracker.is_held());
+        tracker.press(Button::Left, (0, 0));
+        assert!(tracker.is_held());
+        tracker.release((0, 0));
+        assert!(!tracker.is_held());
+    }
+
+    /// Reproduces Task 8's finding (codex p1 #4): a press with no Shift routes to the program and
+    /// the tracker starts holding the button; if Shift is held only at release, `route()` alone
+    /// says `Local` for that moment. Gating the release report on `route()` there (the old
+    /// `pane.rs::connect_drag_end`, `if route(shift, modes) == Program { report_release(..) }`)
+    /// skips `ReportTracker::release` entirely and strands `held` -- so an ordinary hover motion
+    /// right after reports a phantom left-button drag. The fix reads `is_held()` instead and calls
+    /// release unconditionally once it knows a button is tracked (xterm's own convention: the
+    /// release follows the press, not the Shift state sampled at release). This test pins that
+    /// corrected decision at the `ReportTracker`/`route()` level, which is what `pane.rs` calls
+    /// through a GTK gesture this crate cannot unit-test without a display.
+    #[test]
+    fn a_release_reports_even_when_shift_is_held_only_at_release() {
+        let mut tracker = ReportTracker::default();
+        let live_modes = modes(true, false, false); // the program has asked for reports (DECSET 1002)
+
+        // Press with no Shift: routed to the program, the tracker starts holding the button --
+        // mirrors `pane.rs::connect_drag_begin` calling `report_press`.
+        assert_eq!(route(false, live_modes), PointerRoute::Program);
+        let press = tracker.press(Button::Left, (2, 4)).unwrap();
+        assert_eq!(press.kind, MouseKind::Press(Button::Left));
+        assert!(tracker.is_held());
+
+        // At release, Shift is held: `route()` alone says Local -- the old, buggy gate would have
+        // skipped the release report here.
+        assert_eq!(route(true, live_modes), PointerRoute::Local);
+
+        // The fix: decide from `is_held()`, not `route()`, and release unconditionally once a
+        // button really is tracked.
+        assert!(
+            tracker.is_held(),
+            "a real press was reported, so the release must be too"
+        );
+        let release = tracker.release((2, 4)).unwrap();
+        assert_eq!(release.kind, MouseKind::Release(Button::Left));
+        assert!(
+            !tracker.is_held(),
+            "the tracker must heal: nothing left held after the release"
+        );
+
+        // An ordinary hover motion with no button held must report Motion(None), never a phantom
+        // Motion(Some(Left)) drag -- the symptom the finding named ("ordinary pointer movement sends
+        // left-button drag reports").
+        let moved = tracker.motion((3, 4)).unwrap();
+        assert_eq!(moved.kind, MouseKind::Motion(None));
     }
 }

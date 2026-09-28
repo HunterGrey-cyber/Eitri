@@ -13,7 +13,8 @@
  *   details are `<leader>i`, `prefix i` or a click on the band. `j`/`k` walk stops in document
  *   order, top to bottom. A stop with no usable control is
  *   skipped, except a row: rows carry the conversation cursor and are worth landing on for
- *   `Enter`/`y` even when they hold no button.
+ *   `Enter`/`y` even when they hold no button. **A stop inside another stop is content, not a
+ *   stop** (`isOwnStop` below): that is what keeps a model reply's own HTML from adding rows.
  * - A stop's **controls** are its enabled buttons, inputs, textareas and radios. `h`/`l` walk them
  *   left to right. Order is document order unless a control sets `data-nav-order`, which the
  *   permission card uses to put Approve before Deny before the reason box: the most frequent action
@@ -85,31 +86,95 @@ export function controlsOf(stop: HTMLElement): HTMLElement[] {
     .map(({ el }) => el);
 }
 
+/**
+ * **A stop is never inside another stop** (v1 hardening, ruling R2). An element carrying
+ * `data-nav-stop` inside a stop is that stop's CONTENT, not a stop of its own.
+ *
+ * The panel's own stops never nest: every conversation row is a direct child of `.message-list`,
+ * and the banners, the activity line, the handoff area and the empty tab's items sit beside them.
+ * What can nest is model content: an assistant reply is rendered as HTML inside its row
+ * (`MessageList`'s `renderMarkdown`, the one raw-HTML sink in this panel), so a reply carrying
+ * `<div data-nav-stop="row" hidden>` put extra "rows" in a subtree-wide `querySelectorAll`. Every
+ * row below them then sat at a DOM index that no longer matched its timeline index, and `a` on the
+ * card the cursor visibly showed answered the card above it (the verdict's probe: `echo` shown,
+ * `rm -rf` approved). Whatever the sanitizer strips, a reply can only ever add elements INSIDE its
+ * own row, so this rule excludes all of them by structure.
+ *
+ * The walk stops at `root`: a stop is judged only by its ancestors inside the region being walked.
+ */
+function isOwnStop(root: HTMLElement, el: HTMLElement): boolean {
+  for (let a = el.parentElement; a !== null && a !== root; a = a.parentElement) {
+    if (a.hasAttribute(STOP_ATTR)) return false;
+  }
+  return true;
+}
+
+/** Every stop under `root`, in document order, whether or not it is worth landing on. */
+function ownStops(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}]`)).filter((stop) => isOwnStop(root, stop));
+}
+
+/** The conversation rows under `root`, in document order: index `i` here is timeline index `i`.
+ *  Only real rows -- a `data-nav-stop="row"` inside another stop (a reply's own HTML) is never
+ *  one. Every site that turns the cursor into an element goes through this (ruling R2). */
+export function conversationRows(root: HTMLElement): HTMLElement[] {
+  return ownStops(root).filter((stop) => stop.getAttribute(STOP_ATTR) === "row");
+}
+
+/** The stop `el` sits in (or is), or `null`: the OUTERMOST `data-nav-stop` between `el` and
+ *  `root`, so an element inside a reply's own HTML belongs to the reply's row, never to a "stop"
+ *  the reply drew. */
+export function stopOf(root: HTMLElement, el: Element): HTMLElement | null {
+  let found: HTMLElement | null = null;
+  for (let a: Element | null = el; a !== null && a !== root; a = a.parentElement) {
+    if (a instanceof HTMLElement && a.hasAttribute(STOP_ATTR)) found = a;
+  }
+  return found;
+}
+
+/** The conversation row `el` sits in (or is), or `null` when it is in none. */
+export function rowOf(root: HTMLElement, el: Element): HTMLElement | null {
+  const stop = stopOf(root, el);
+  return stop !== null && stop.getAttribute(STOP_ATTR) === "row" ? stop : null;
+}
+
 /** Every stop under `root` worth landing on, in document order. */
 export function stopsIn(root: HTMLElement): HTMLElement[] {
-  return Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}]`)).filter(
-    (stop) => stop.getAttribute(STOP_ATTR) === "row" || controlsOf(stop).length > 0,
-  );
+  return ownStops(root).filter((stop) => stop.getAttribute(STOP_ATTR) === "row" || controlsOf(stop).length > 0);
 }
 
 /** The stop that currently holds the keyboard: the one containing the focused element, if focus
  *  is inside one; otherwise the conversation row at `cursor`, if there is one. `null` on a start
- *  screen before anything has been selected. */
-export function currentStop(root: HTMLElement, cursor: number | null): HTMLElement | null {
+ *  screen before anything has been selected.
+ *
+ *  `rows` is `conversationRows(root)` when the caller already holds it (`countedStop`), so the row
+ *  lookup costs no second scan of the whole tree; every other caller leaves it out. */
+export function currentStop(
+  root: HTMLElement,
+  cursor: number | null,
+  rows?: readonly HTMLElement[],
+): HTMLElement | null {
   const active = document.activeElement;
   if (active instanceof HTMLElement && active !== root && root.contains(active)) {
-    const stop = active.closest<HTMLElement>(`[${STOP_ATTR}]`);
+    const stop = stopOf(root, active);
     if (stop !== null) return stop;
   }
   if (cursor === null) return null;
-  const rows = Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}="row"]`));
-  return rows[cursor] ?? null;
+  return (rows ?? conversationRows(root))[cursor] ?? null;
 }
 
 /** Where `j` (+1) or `k` (-1) goes from the current stop. With nothing current (a start screen
- *  nobody has moved on yet), both land on the first stop. */
-export function nextStop(root: HTMLElement, cursor: number | null, delta: 1 | -1): HTMLElement | null {
-  const stops = stopsIn(root);
+ *  nobody has moved on yet), both land on the first stop.
+ *
+ *  `stops` defaults to a fresh `stopsIn(root)` (a DOM query). A caller that already holds that list
+ *  may pass it; a counted repeat no longer calls this per step at all (`countedStop`, below, whose
+ *  doc says why passing `stops` alone did not bound it). */
+export function nextStop(
+  root: HTMLElement,
+  cursor: number | null,
+  delta: 1 | -1,
+  stops: HTMLElement[] = stopsIn(root),
+): HTMLElement | null {
   if (stops.length === 0) return null;
   const current = currentStop(root, cursor);
   const index = current === null ? -1 : stops.indexOf(current);
@@ -117,12 +182,67 @@ export function nextStop(root: HTMLElement, cursor: number | null, delta: 1 | -1
   return stops[clampStep(stops.length, index, delta)];
 }
 
-/** The index of `stop` among the conversation rows, or `null` if it is not a row. */
+/** The index of `stop` among the conversation rows (`conversationRows`), or `null` if it is not
+ *  one -- including an element that merely carries `data-nav-stop="row"` inside another stop. */
 export function rowIndexOf(root: HTMLElement, stop: HTMLElement): number | null {
   if (stop.getAttribute(STOP_ATTR) !== "row") return null;
-  const rows = Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}="row"]`));
-  const index = rows.indexOf(stop);
+  const index = conversationRows(root).indexOf(stop);
   return index === -1 ? null : index;
+}
+
+/** Where a counted `j`/`k` (`3j`, `1000j`) lands, and where it started. */
+export interface CountedLanding {
+  /** The stop the walk ends on. */
+  stop: HTMLElement;
+  /** Its index among the conversation rows, or `null` when it is not a row (a banner, Stop). */
+  row: number | null;
+  /** The stop the walk started from (`currentStop` before the first step), or `null`. */
+  from: HTMLElement | null;
+}
+
+/**
+ * A counted `j` (+1) or `k` (-1): `times` steps of `nextStop`, each from the stop the previous step
+ * landed on. The walk ends early on a stop that is not a conversation row (a banner, Stop while a
+ * turn runs) -- the same place a single `j`/`k` onto it would leave the keys -- and at a boundary,
+ * where a step makes no progress (`clampStep` clamps rather than failing there). `null` when the
+ * region has no stop at all.
+ *
+ * **One scan of the tree, whatever `times` is** (v1 audit R4, P2-A4 round 2). The first fix fetched
+ * `stopsIn` once but still called `nextStop` per step, and each step went back to the tree twice:
+ * `nextStop` -> `currentStop` -> `conversationRows`, then `rowIndexOf` -> `conversationRows`.
+ * `1000j` from the first of 1,001 rows was 2,001 full-tree queries and about 2.3 s in jsdom (the
+ * Codex whole-branch review). Here the stops, the rows and each row's index are read once and the
+ * walk moves along the index, so a step costs no DOM work at all.
+ *
+ * Every step after the first starts from where the walk is, never from `document.activeElement`.
+ * Per-step `currentStop` re-read focus each time, so with focus on a control inside a stop (after
+ * `l` onto a card's Approve) every step re-started from that control's stop and `3j` moved once.
+ */
+export function countedStop(
+  root: HTMLElement,
+  cursor: number | null,
+  delta: 1 | -1,
+  times: number,
+): CountedLanding | null {
+  const own = ownStops(root);
+  const rows = own.filter((stop) => stop.getAttribute(STOP_ATTR) === "row");
+  const rowIndex = new Map(rows.map((row, i) => [row, i] as const));
+  const stops = own.filter((stop) => rowIndex.has(stop) || controlsOf(stop).length > 0);
+  if (stops.length === 0) return null;
+  const from = currentStop(root, cursor, rows);
+  let index = from === null ? -1 : stops.indexOf(from);
+  let landed: HTMLElement | null = null;
+  for (let n = 0; n < times; n++) {
+    const next = index === -1 ? 0 : clampStep(stops.length, index, delta);
+    // No progress: already at the boundary. The first step still lands (on the stop it started
+    // from), which is what tells the caller `j` could not move.
+    if (landed !== null && next === index) break;
+    landed = stops[next];
+    index = next;
+    if (!rowIndex.has(landed)) break;
+  }
+  if (landed === null) return null;
+  return { stop: landed, row: rowIndex.get(landed) ?? null, from };
 }
 
 /**
@@ -232,14 +352,19 @@ export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
  *  order among the stops. "Visible" is `hintVisible` above. */
 export function hintTargets(root: HTMLElement): HintTarget[] {
   const targets: HintTarget[] = [];
-  const composerEl = root.querySelector<HTMLElement>(`[${HINT_COMPOSER_ATTR}]`);
+  // The composer is in no stop; a marker inside one is a reply's own HTML, not the composer.
+  const markers = Array.from(root.querySelectorAll<HTMLElement>(`[${HINT_COMPOSER_ATTR}]`));
+  const composerEl = markers.find((el) => stopOf(root, el) === null) ?? null;
   let composer = composerEl !== null && hintVisible(composerEl, root) ? composerEl : null;
+  // Once, not per stop: a row's index is its place in this list (ruling R2).
+  const rows = conversationRows(root);
   for (const stop of stopsIn(root)) {
     if (composer !== null && composer.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING) {
       targets.push({ kind: "composer", el: composer });
       composer = null;
     }
-    const rowIndex = stop.getAttribute(STOP_ATTR) === "row" ? rowIndexOf(root, stop) : null;
+    const found = rows.indexOf(stop);
+    const rowIndex = found === -1 ? null : found;
     if (rowIndex !== null && hintVisible(stop, root)) targets.push({ kind: "row", el: stop, rowIndex });
     if (rowIndex !== null) {
       for (const block of stop.querySelectorAll<HTMLElement>("pre.code-block")) {

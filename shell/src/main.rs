@@ -8,6 +8,8 @@ mod agent_panel;
 mod chrome;
 mod close_prompt;
 mod editor_context;
+mod editor_quit;
+mod editor_start_failure;
 mod hint;
 mod kill_pane;
 mod layout;
@@ -28,6 +30,7 @@ mod theme;
 mod toast;
 mod tray;
 mod webkit_zoom;
+mod webview_crash_guard;
 mod wheel_zoom;
 mod window_mode;
 mod xft_dpi;
@@ -342,14 +345,30 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         .map(|entry| (ModuleId::lua(&entry.id), entry.slot, entry.widget.clone()))
         .collect();
     // Each Lua panel's page, for `prefix x`: a killed panel's web process is ended and its key loads
-    // this again (`kill_pane`).
-    let lua_pages: Rc<Vec<(ModuleId, gtk4::Widget, String)>> = Rc::new(
+    // this again (`kill_pane`). The 4th element is the same panel's crash-loop guard (fix round 1,
+    // `lua::panel::PanelEntry::crash_guard`'s own doc): the revive path below resets it, the same
+    // manual-recovery re-arming `AgentPanelHandle::reload_document_by_hand` does for the chat panel.
+    let lua_pages: Rc<
+        Vec<(
+            ModuleId,
+            gtk4::Widget,
+            String,
+            Rc<RefCell<webview_crash_guard::WebViewCrashGuard>>,
+        )>,
+    > = Rc::new(
         lua_engine
             .panels
             .borrow()
             .entries()
             .iter()
-            .map(|entry| (ModuleId::lua(&entry.id), entry.widget.clone(), entry.url.clone()))
+            .map(|entry| {
+                (
+                    ModuleId::lua(&entry.id),
+                    entry.widget.clone(),
+                    entry.url.clone(),
+                    entry.crash_guard.clone(),
+                )
+            })
             .collect(),
     );
     let decls: Vec<ModuleDecl> = lua_panels
@@ -472,7 +491,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     let layout_saver = layout_state::LayoutSaver::new(state_dir, project_root, module_layout.clone(), decls.clone());
     // Every module's host, added once and never reparented (`module_grid`'s module doc).
     let grid = ModuleGrid::new(module_layout.clone());
-    grid.add(ModuleId::editor(), pane.widget(), HostKind::Direct);
+    // R1-4: the editor's host is a small overlay carrying a hidden failure-message label, not the
+    // bare `GtkGLArea` -- see `editor_start_failure`'s own doc for why this has to wrap the widget
+    // before it is ever handed to the grid.
+    let (editor_host, editor_start_failure_label) = editor_start_failure::install(pane.widget());
+    grid.add(ModuleId::editor(), &editor_host, HostKind::Direct);
     grid.add(ModuleId::agent(), &agent_widget, HostKind::Web);
     // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to zero
     // reports a 1-row grid to its shell.
@@ -943,7 +966,9 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             if module_layout.borrow().is_gone(&ModuleId::editor()) {
                 return Err(LayoutError::Gone(ModuleId::editor()).to_string());
             }
-            if !pane.is_ready() {
+            // `is_running`, not `is_ready`: an nvim that exited is not ready either, and keys sent
+            // to it would reach nothing (R1-2).
+            if !pane.is_running() {
                 return Err("the editor is not ready yet".to_string());
             }
             show_on_screen(&ModuleId::editor()).map_err(|e| e.to_string())?;
@@ -1005,79 +1030,65 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
 
     // `prefix x`, tmux's `kill-pane` (owner, 2026-09-26; `kill_pane`'s module doc has the rulings).
     // `killed` holds the modules killed and not shown since: a show brings each back fresh (the hook
-    // below). The editor never is -- it cannot come back (`Reopen::Never`). `editor_quitting` is set
-    // once the editor has been asked to `:confirm qall`, paired with that kill's own generation, and
-    // says what nvim's exit then does: take the module (`EditorQuit::Module`) or close the window
-    // (`EditorQuit::Window`, the editor was the last module on screen). Cancelled in nvim, the letter
-    // nvim sends back on the pane-switch socket clears it if its generation matches (Task 4 of the
-    // 2026-09-26 wave); with no shim (no letters ever arrive) it stays set as before, and a later
-    // `:qa` does what the kill would have. `kill_prompt` is the window's y/n, installed after the
-    // prefix below so its controller sees keys first.
+    // below). The editor never is -- it cannot come back (`Reopen::Never`). `kill_prompt` is the
+    // window's y/n, installed after the prefix below so its controller sees keys first.
     let killed: Rc<RefCell<std::collections::BTreeSet<ModuleId>>> = Rc::default();
-    let editor_quitting: Rc<RefCell<kill_pane::QuitInFlight>> = Rc::default();
     let kill_prompt: Rc<std::cell::OnceCell<Rc<close_prompt::ClosePrompt>>> = Rc::default();
-    // The last module's kill, once nothing is left to ask (tmux: the last pane's kill closes the
-    // window): `confirmed` is the window close's prompt as it stood when `x` asked, so the close does
-    // not ask again unless what is running changed (`kill_pane::close_is_confirmed`).
-    let close_after_kill: Rc<dyn Fn(Option<String>)> = {
-        let agent = agent_panel_handle.clone();
-        let kill_prompt = kill_prompt.clone();
-        let window = window.clone();
-        Rc::new(move |confirmed| {
-            let now = neovibe_core::tabs::window_close_prompt(agent.running_count(), agent.queued_count());
-            match kill_prompt.get() {
-                Some(prompt) if kill_pane::close_is_confirmed(confirmed.as_deref(), now.as_deref()) => {
-                    println!("[modules] the last module was killed; closing the window");
-                    prompt.close_window_confirmed();
+    // The editor closed for the rest of this window once nvim is gone (`Reopen::Never`: it cannot
+    // come back, `kill_pane`), the keys going to its neighbour, and the pane released on the next
+    // turn of the loop so nothing reaches the closed connection. Refused as a hide is (the editor is
+    // the last module on screen); the caller decides what then.
+    let retire_editor: Rc<dyn Fn() -> Result<(), LayoutError>> = {
+        let grid = grid.downgrade();
+        let focus_module = focus_module.clone();
+        let released = Rc::downgrade(&pane);
+        Rc::new(move || {
+            let Some(grid) = grid.upgrade() else { return Ok(()) };
+            grid.kill_module(&ModuleId::editor(), Reopen::Never, &*focus_module)?;
+            println!("[modules] editor: nvim quit; the editor is closed for this window");
+            let released = released.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(pane) = released.upgrade() {
+                    pane.release_exited();
                 }
-                _ => {
-                    println!("[modules] the last module was killed; closing the window, which asks again");
-                    window.close();
-                }
-            }
+            });
+            Ok(())
         })
     };
-    // Whether a cancelled `:confirm qall` can ever be told apart from a genuine quit: without the
-    // shim (`pane_switch::open()` returned `None`), `editor_quit_keys`'s generation never comes
-    // back, so the guard below would lock a kill out forever the first time nvim's dialog was
-    // cancelled. Captured once, before `kill_now` is built.
-    let quit_letters = pane_switch.is_some();
+    // Every quit of the editor -- `prefix x` on it, every window close -- and what nvim's exit, a
+    // cancel and a declined window close then do (R3, v1 hardening Task 6): `editor_quit`'s flow,
+    // carried out here through `ShellQuitHost`, one GTK call per method.
+    let editor_quitting = editor_quit::EditorQuitting::new(Rc::new(ShellQuitHost {
+        pane: pane.clone(),
+        module_layout: module_layout.clone(),
+        grid: grid.downgrade(),
+        show_on_screen: show_on_screen.clone(),
+        focus_module: focus_module.clone(),
+        retire_editor: retire_editor.clone(),
+        prompt: kill_prompt.clone(),
+        agent: agent_panel_handle.clone(),
+        window: window.clone(),
+        app_name: top_bar.app_name.clone(),
+        toast: toast.clone(),
+    }));
     let kill_now: Rc<dyn Fn(&ModuleId, Option<String>) -> Result<(), String>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
         let terminal = terminal.clone();
         let agent = agent_panel_handle.clone();
-        let pane = pane.clone();
         let lua_pages = lua_pages.clone();
         let decls = decls.clone();
         let killed = killed.clone();
         let editor_quitting = editor_quitting.clone();
-        let close_after_kill = close_after_kill.clone();
-        // Only `kill_now` bumps or reads this, so it needs no `Rc`.
-        let quit_generation = std::cell::Cell::new(0u32);
         Rc::new(move |id, confirmed| {
             let scope = neovibe_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
             if scope == KillScope::Window {
-                if id.kind() == ModuleKind::Editor && pane.is_ready() {
-                    // A second `:confirm qall` while one is already up nests instead of answering
-                    // the first (measured): refuse rather than let a cancel of the inner one clear
-                    // the flag while the outer dialog, which the user still sees, is unanswered.
-                    if editor_quitting.borrow().is_some() && quit_letters {
-                        focus_module(id);
-                        return Err("nvim is already asking whether to quit; answer it there".into());
-                    }
-                    let g = quit_generation.get().wrapping_add(1);
-                    quit_generation.set(g);
+                if id.kind() == ModuleKind::Editor {
                     // nvim first, as for any kill of the editor: its exit closes the window.
-                    *editor_quitting.borrow_mut() = Some((g, kill_pane::EditorQuit::Window { confirmed }));
-                    focus_module(id);
-                    pane.send_keys(&kill_pane::editor_quit_keys(g));
-                    println!(
-                        "[modules] {id}: the last module; asked nvim to :confirm qall (kill {g}), then the window closes"
-                    );
+                    editor_quitting.kill_editor(KillScope::Window, confirmed)?;
                 } else {
-                    close_after_kill(confirmed);
+                    editor_quitting.close_after(confirmed);
                 }
                 return Ok(());
             }
@@ -1092,7 +1103,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 ModuleKind::LuaWebview => {
                     grid.kill_module(id, reopen, &*focus_module)
                         .map_err(|e| e.to_string())?;
-                    if let Some((_, widget, _)) = lua_pages.iter().find(|(m, _, _)| m == id) {
+                    if let Some((_, widget, _, _)) = lua_pages.iter().find(|(m, _, _, _)| m == id) {
                         if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
                             use webkit6::prelude::*;
                             webview.terminate_web_process();
@@ -1107,27 +1118,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                     println!("[modules] {id}: killed, {closed} session tab(s) closed");
                     killed.borrow_mut().insert(id.clone());
                 }
-                ModuleKind::Editor if pane.is_ready() => {
-                    // A second `:confirm qall` while one is already up nests instead of answering
-                    // the first (measured): refuse rather than let a cancel of the inner one clear
-                    // the flag while the outer dialog, which the user still sees, is unanswered.
-                    if editor_quitting.borrow().is_some() && quit_letters {
-                        focus_module(id);
-                        return Err("nvim is already asking whether to quit; answer it there".into());
-                    }
-                    let g = quit_generation.get().wrapping_add(1);
-                    quit_generation.set(g);
-                    // nvim decides: its own prompt for unsaved buffers, and only its exit closes the
-                    // module (`on_exited_unrequested` below). The keys go to it for that prompt.
-                    *editor_quitting.borrow_mut() = Some((g, kill_pane::EditorQuit::Module));
-                    focus_module(id);
-                    pane.send_keys(&kill_pane::editor_quit_keys(g));
-                    println!("[modules] {id}: asked nvim to :confirm qall (kill {g})");
-                }
-                // No nvim to quit (never started, or it failed to): nothing ends, and it can show again.
-                ModuleKind::Editor => grid
-                    .kill_module(id, Reopen::InPlace, &*focus_module)
-                    .map_err(|e| e.to_string())?,
+                // nvim decides, through its own `:confirm qall` (`editor_quit::EditorQuitting::
+                // kill_editor`): a running nvim is asked, an exited one retired, one that never ran
+                // hidden in place.
+                ModuleKind::Editor => editor_quitting.kill_editor(KillScope::Module, None)?,
                 ModuleKind::Canvas => return Err(format!("{id} is not in this window yet")),
             }
             Ok(())
@@ -1161,11 +1155,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 match id.kind() {
                     ModuleKind::Agent => agent.open_chooser(),
                     ModuleKind::LuaWebview => {
-                        if let Some((_, widget, url)) = lua_pages.iter().find(|(m, _, _)| *m == id) {
+                        if let Some((_, widget, url, crash_guard)) = lua_pages.iter().find(|(m, _, _, _)| *m == id) {
                             if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
                                 use webkit6::prelude::*;
                                 webview.load_uri(url);
                             }
+                            // This IS the manual recovery a give-up message points the owner at
+                            // (`prefix x`, then this panel's own key): re-arm the guard so a later,
+                            // unrelated crash is caught fresh rather than silently dropped as
+                            // `CrashResponse::AlreadyGivenUp` (fix round 1).
+                            crash_guard.borrow_mut().reset();
                         }
                     }
                     _ => {}
@@ -1527,7 +1526,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                         text_size::TextSizeTarget::Neither => {}
                     },
                     Action::Hint => hint_coordinator.toggle_from_prefix(keycode),
-                    Action::PanelReload => agent.reload_document(),
+                    Action::PanelReload => agent.reload_document_by_hand(),
                     Action::PanelKeymap => {
                         let chat = ModuleId::agent();
                         if let Err(err) = show_on_screen(&chat) {
@@ -1598,6 +1597,13 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         top_bar.strip.upcast_ref::<gtk4::Widget>(),
     );
     let _ = kill_prompt.set(close_prompt.clone());
+    // R1-2: the window close was declined, and nvim may already be gone -- it exited on its own
+    // (`:q`, a crash) and that exit is what asked to close the window: the editor is retired then
+    // (`editor_quit::EditorQuitting::window_close_declined`).
+    {
+        let editor_quitting = editor_quitting.clone();
+        close_prompt.connect_window_close_declined(move || editor_quitting.window_close_declined());
+    }
 
     // --- From the editor: decided by Neovim itself, or a cancelled `:confirm qall` clearing its
     // own kill.
@@ -1618,15 +1624,20 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 }
                 None => println!("[pane_switch] unknown direction {letter:?}, ignoring"),
             },
-            // Kept inside this call: it must not live across anything that can re-enter
-            // `on_exited_unrequested`, which borrows the same cell.
-            pane_switch::PaneMessage::QuitCancelled(g) => {
-                if kill_pane::clear_if_cancelled(&mut editor_quitting.borrow_mut(), g) {
-                    println!("[modules] editor: nvim's quit was cancelled; a later :qa closes the window");
-                } else {
-                    println!("[modules] editor: a quit-cancelled letter for kill {g}, not the one in flight; ignored");
+            pane_switch::PaneMessage::QuitCancelled(g) => match editor_quitting.cancelled(g) {
+                editor_quit::Cancel::Cleared => {
+                    // The window close's `y`, if it had one, was already taken back when the close
+                    // handed the quit to nvim (`EditorQuitting::window_close`), so a later exit asks.
+                    println!("[modules] editor: nvim's quit {g} was cancelled; nothing is in flight");
                 }
-            }
+                editor_quit::Cancel::CloseWithdrawn => println!(
+                    "[modules] editor: nvim's quit {g}, a window close a later kill joined, was cancelled; \
+                     nvim's exit retires the editor only"
+                ),
+                editor_quit::Cancel::Ignored => {
+                    println!("[modules] editor: a quit-cancelled letter for quit {g}, not the one in flight; ignored")
+                }
+            },
         });
     }
 
@@ -1686,6 +1697,29 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         terminal.widget().add_controller(controller);
     }
 
+    // --- Ctrl+h/j/k/l on an editor with no nvim in it (the Opus review's T7-1): the shell's, as from
+    // every other module, since nothing inside the editor can resolve them then
+    // (`editor_start_failure::navigation`, vim-tmux-navigator's own tmux-side rule). Capture phase on
+    // the pane's widget, so it runs before the pane's own key controller, which swallows every key;
+    // while nvim runs, nothing is claimed and nvim's navigator decides, as before.
+    {
+        let move_focus = move_focus.clone();
+        let pane_for_nav = Rc::downgrade(&pane);
+        let controller = EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+            let running = pane_for_nav.upgrade().is_some_and(|pane| pane.is_running());
+            match editor_start_failure::navigation(key, state, running) {
+                Some(direction) => {
+                    move_focus(&ModuleId::editor(), direction);
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
+            }
+        });
+        pane.widget().add_controller(controller);
+    }
+
     // --- The top bar, from the keyboard. `h`/`l` move between its items, `Enter`/`Space`
     // activate one (a GTK button's own behaviour), and `Ctrl+j` or `Esc` go back to the pane that
     // last had the keys. Capture phase on the bar, so the chords are seen before a focused button
@@ -1729,49 +1763,48 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         top_bar.widget.add_controller(controller);
     }
 
-    // nvim exiting on its own (e.g. `:qa!`) has no window to close by itself -- ask this
-    // host's window to close, which in turn drives the connect_close_request handler below.
-    // Mirrors neovide-editor's own `examples/standalone.rs` exactly.
-    //
-    // Unless `prefix x` asked it to quit (`kill_pane`): then the editor closes for the rest of this
-    // window (`Reopen::Never`), the keys going to its neighbour, and the pane is released on the next
-    // turn of the loop so nothing reaches the closed connection. If the layout refuses (the editor
-    // became the last module on screen meanwhile), the window closes, as it always did. And if the
-    // kill was of the last module on screen (`EditorQuit::Window`), the window closes without asking
-    // what `x` already asked (`close_after_kill`).
+    // nvim exiting on its own (e.g. `:qa!`) has no window to close by itself -- ask this host's
+    // window to close, which in turn drives the connect_close_request handler below (mirrors
+    // neovide-editor's own `examples/standalone.rs`), unless nvim was asked to quit: then what it was
+    // asked for (`editor_quit::EditorQuitting::nvim_exited`).
+    {
+        let editor_quitting_for_exit = editor_quitting.clone();
+        pane.on_exited_unrequested(move || editor_quitting_for_exit.nvim_exited());
+        let editor_quitting = editor_quitting.clone();
+        pane.on_nvim_unreachable(move || editor_quitting.nvim_unreachable());
+    }
+
+    // R1-4: nvim failed to start (missing, or older than the fork's floor) -- say why in the
+    // editor's own area (`editor_start_failure`) instead of leaving an unexplained dark-red block.
+    // Construction is asynchronous (`neovide_editor::LiveState`'s own doc: `NotStarted` ->
+    // `Starting` -> `Ready`/`Failed` happens across render callbacks, after the window is already
+    // shown and the initial focus already chosen), so the editor can hold the keys when this fires.
+    // A pane that cannot accept input must not keep holding them, with only a mouse click or the
+    // invisible prefix as a way out -- move the keys to the chat (`editor_start_failure::
+    // keys_after_failure`), the same fallback the declined-close handler above uses for "the editor
+    // is unusable right now". Reached again later, it lets `Ctrl+h/j/k/l` out (below).
     {
         let window = window.clone();
         let grid = grid.downgrade();
-        let focus_module = focus_module.clone();
-        let editor_quitting = editor_quitting.clone();
-        let released = Rc::downgrade(&pane);
-        let close_after_kill = close_after_kill.clone();
-        pane.on_exited_unrequested(move || {
-            let quit = editor_quitting.borrow().clone();
-            if let Some((_, kill_pane::EditorQuit::Window { confirmed })) = quit {
-                close_after_kill(confirmed);
+        let focus_and_arrive = focus_and_arrive.clone();
+        let show_on_screen = show_on_screen.clone();
+        let editor_start_failure_label = editor_start_failure_label.clone();
+        pane.on_start_failed(move |message| {
+            editor_start_failure::show(&editor_start_failure_label, message);
+            let Some(grid) = grid.upgrade() else { return };
+            let focused = pane_focus::focused_module(&window, &grid.hosts());
+            if editor_start_failure::keys_after_failure(focused.as_ref())
+                == editor_start_failure::KeysAfterFailure::Stay
+            {
+                // The keys were already elsewhere (or nowhere) when nvim failed: leave them there.
                 return;
             }
-            if matches!(quit, Some((_, kill_pane::EditorQuit::Module))) {
-                if let Some(grid) = grid.upgrade() {
-                    match grid.kill_module(&ModuleId::editor(), Reopen::Never, &*focus_module) {
-                        Ok(()) => {
-                            println!("[modules] editor: nvim quit; the editor is closed for this window");
-                            let released = released.clone();
-                            glib::idle_add_local_once(move || {
-                                if let Some(pane) = released.upgrade() {
-                                    pane.release_exited();
-                                }
-                            });
-                            return;
-                        }
-                        Err(err) => {
-                            println!("[modules] editor: nvim quit and could not be closed ({err}); closing the window")
-                        }
-                    }
-                }
+            if let Err(err) = show_on_screen(&ModuleId::agent()) {
+                println!("[modules] editor: start failed, and the chat could not be shown ({err})");
             }
-            window.close();
+            if let Err(err) = focus_and_arrive(&ModuleId::agent()) {
+                println!("[modules] editor: start failed, and the keys could not move to the chat ({err})");
+            }
         });
     }
 
@@ -1873,26 +1906,24 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in
     // outright rather than cloned again. (`pane` is an `Rc<NeovideEditorPane>` because the side
     // panel's Ctrl+h handler above needs it too; `NeovideEditorPane` doesn't derive `Clone`, and
-    // every use here only ever needs `&self` methods.) Same connect_close_request -> shutdown()
-    // -> unconditional glib::Propagation::Proceed pattern as standalone.rs: the app is exiting
-    // either way, regardless of whether a clean `NeovimExited` was actually observed.
+    // every use here only ever needs `&self` methods.) Once nvim is gone, the same
+    // connect_close_request -> shutdown() -> glib::Propagation::Proceed pattern as standalone.rs.
     let app_for_close = app.clone();
     window.connect_close_request(move |_window| {
-        // D11 A (spec §3.5): a running tab is worth one y/n. `y` calls `close()` again and lands
-        // here with the prompt confirmed.
-        if !close_prompt.confirmed() {
-            if let Some(text) = neovibe_core::tabs::window_close_prompt(
-                agent_panel_handle.running_count(),
-                agent_panel_handle.queued_count(),
-            ) {
-                close_prompt.ask_to_close_window(&text);
-                return glib::Propagation::Stop;
-            }
+        // D11 A (spec §3.5), then R3 (v1 hardening Task 6): a running tab is worth one y/n, and then
+        // nvim decides through its own `:confirm qall` -- the route `prefix x` on the editor takes --
+        // and the window closes when nvim exits (`editor_quit::EditorQuitting::window_close`).
+        // `pane.shutdown()` below runs the fork's `:qa!`, which discards unsaved buffers and deletes
+        // their swap files, so this is reached only once nvim is gone or never ran -- never for an
+        // nvim that could not be killed (T6-1: the close is refused instead).
+        if editor_quitting.window_close() == editor_quit::WindowClose::Wait {
+            return glib::Propagation::Stop;
         }
         // First, and synchronously (spec §4.6): the debounce may still be waiting on an arrangement
         // change. With none unwritten this writes nothing -- a click never does (`layout_state`'s
         // module doc says what is written when).
         layout_saver.save_now();
+        // Kills nvim by its pid if it does not exit within the fork's wait (codex p1 #2).
         pane.shutdown();
         // Hangs the terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
         // the process exit first, the kernel closing the PTY master hangs it up anyway.
@@ -1942,9 +1973,10 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         //
         // Not the whole handler, and the distinction matters to anyone debugging a slow close:
         // `pane.shutdown()` above runs FIRST and on this thread, and it spins until nvim exits
-        // (`LiveHarness::shutdown` in the fork). A slow `:qa!` therefore still holds the window on
-        // screen, with nothing below involved. Pre-existing, out of scope here, and named because
-        // three consecutive reviews of this path died on a comment that over-claimed.
+        // (`LiveHarness::shutdown` in the fork). Since v1 hardening Task 6 nvim has exited before it
+        // runs (the close waits for nvim's own `:confirm qall`, and an nvim that cannot be killed
+        // refuses the close rather than reaching here), so it returns at once. Named because three
+        // consecutive reviews of this path died on a comment that over-claimed.
         agent_panel_handle.shutdown(&app_for_close);
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
         // here is what keeps its `Rc` alive for the life of the window rather than dropping as
@@ -1981,17 +2013,127 @@ fn flash(app_name: &gtk4::Label) {
     }
 }
 
+/// [`editor_quit::QuitHost`] over the real window: one GTK call per method, and the only part of the
+/// editor's quit flow no test reaches (`editor_quit`'s module doc; the GUI checklist covers it).
+struct ShellQuitHost {
+    pane: Rc<NeovideEditorPane>,
+    module_layout: Rc<RefCell<neovibe_core::layout::Layout>>,
+    grid: glib::WeakRef<ModuleGrid>,
+    show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>>,
+    focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
+    retire_editor: Rc<dyn Fn() -> Result<(), LayoutError>>,
+    /// The window's y/n, set once it is installed (after the prefix, so its controller sees keys
+    /// first); every call before that finds none.
+    prompt: Rc<std::cell::OnceCell<Rc<close_prompt::ClosePrompt>>>,
+    agent: agent_panel::AgentPanelHandle,
+    window: ApplicationWindow,
+    app_name: gtk4::Label,
+    toast: Rc<toast::Toast>,
+}
+
+impl editor_quit::QuitHost for ShellQuitHost {
+    fn nvim_running(&self) -> bool {
+        self.pane.is_running()
+    }
+    fn nvim_exited(&self) -> bool {
+        self.pane.nvim_exited()
+    }
+    fn nvim_exit_pending(&self) -> bool {
+        self.pane.nvim_exit_pending()
+    }
+    fn watched_call(&self) -> Option<neovide_editor::CallWatch> {
+        self.pane.watched_call()
+    }
+    fn settled_watch(&self) -> Option<neovide_editor::CallWatch> {
+        self.pane.settled_watched_call()
+    }
+    fn send_quit(&self, lua: &str) -> bool {
+        self.pane.exec_lua_watched(lua)
+    }
+    fn end_nvim(&self) -> bool {
+        self.pane.end_nvim()
+    }
+    fn reveal(&self) -> kill_pane::Reveal {
+        kill_pane::reveal_for_prompt(&self.module_layout.borrow(), &ModuleId::editor())
+    }
+    fn editor_gone(&self) -> bool {
+        self.module_layout.borrow().is_gone(&ModuleId::editor())
+    }
+    fn show_editor(&self) -> Result<(), LayoutError> {
+        (self.show_on_screen)(&ModuleId::editor())
+    }
+    fn focus_editor(&self) {
+        (self.focus_module)(&ModuleId::editor());
+    }
+    fn hide_editor(&self) -> Result<(), LayoutError> {
+        match self.grid.upgrade() {
+            Some(grid) => grid.hide_module(&ModuleId::editor(), &*self.focus_module),
+            None => Ok(()),
+        }
+    }
+    fn retire_editor(&self) -> Result<(), LayoutError> {
+        (self.retire_editor)()
+    }
+    fn kill_editor_in_place(&self) -> Result<(), LayoutError> {
+        match self.grid.upgrade() {
+            Some(grid) => grid.kill_module(&ModuleId::editor(), Reopen::InPlace, &*self.focus_module),
+            None => Ok(()),
+        }
+    }
+    fn show_chat(&self) -> Result<(), LayoutError> {
+        (self.show_on_screen)(&ModuleId::agent())
+    }
+    fn close_confirmed(&self) -> bool {
+        self.prompt.get().is_some_and(|prompt| prompt.confirmed())
+    }
+    fn window_close_prompt(&self) -> Option<String> {
+        neovibe_core::tabs::window_close_prompt(self.agent.running_count(), self.agent.queued_count())
+    }
+    fn ask_to_close_window(&self, text: &str) {
+        match self.prompt.get() {
+            Some(prompt) => prompt.ask_to_close_window(text),
+            None => eprintln!("[window] BUG: the close asked {text:?} before the window's y/n existed"),
+        }
+    }
+    fn withdraw_close_confirmation(&self) {
+        if let Some(prompt) = self.prompt.get() {
+            prompt.withdraw_confirmation();
+        }
+    }
+    fn close_window_confirmed(&self) {
+        match self.prompt.get() {
+            Some(prompt) => prompt.close_window_confirmed(),
+            None => self.window.close(),
+        }
+    }
+    fn close_window(&self) {
+        self.window.close();
+    }
+    fn refuse(&self, text: &str) {
+        flash(&self.app_name);
+        self.toast.show(text);
+    }
+    fn toast(&self, text: &str) {
+        self.toast.show(text);
+    }
+    fn every_second(&self, mut tick: Box<dyn FnMut() -> bool>) {
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            if tick() {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            }
+        });
+    }
+}
+
 /// P8's toast text (spec §7.2): the one refusal that will keep recurring for the rest of this
 /// window's life, because [`Reopen::Never`] never lifts. `Some` only for `LayoutError::Gone` on the
 /// editor itself -- the one module this window ever marks gone -- so a future second use of `Gone`
 /// on some other module does not inherit a message that names the editor by name.
 fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
     match err {
-        LayoutError::Gone(id) if *id == ModuleId::editor() => Some(
-            "the editor was closed (:qa or prefix x) and nvim cannot restart in this window \
-             \u{2014} relaunch neovibe to get it back"
-                .to_string(),
-        ),
+        LayoutError::Gone(id) if *id == ModuleId::editor() => Some(editor_quit::RETIRED_EDITOR_TEXT.to_string()),
         _ => None,
     }
 }
@@ -2272,12 +2414,13 @@ mod tests {
     /// P8 (spec §7.2): `refuse` shows this text in the window's toast for a killed editor, and
     /// says nothing extra for every other refusal (still just the flash and the stdout line).
     #[test]
+    /// P8's toast, reworded by the Opus review's T6-5: the spec's "the editor was closed (:qa or
+    /// prefix x)" was shown for a crash too, and a relaunch now does bring the editor back.
     fn the_gone_editor_toast_text_matches_the_spec() {
         assert_eq!(
             gone_editor_toast_text(&LayoutError::Gone(ModuleId::editor())),
             Some(
-                "the editor was closed (:qa or prefix x) and nvim cannot restart in this window \
-                 \u{2014} relaunch neovibe to get it back"
+                "nvim exited and cannot restart in this window \u{2014} relaunch neovibe to get the editor back"
                     .to_string()
             )
         );

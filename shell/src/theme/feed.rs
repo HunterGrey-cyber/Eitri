@@ -10,12 +10,13 @@
 use gtk4::glib;
 
 pub(crate) use neovibe_core::theme::feed::ThemeFeed;
-use neovibe_core::theme::feed::{accept_pending_lines, latest_payload, POLL_INTERVAL};
+use neovibe_core::theme::feed::{ThemePayloadReader, POLL_INTERVAL};
 use neovibe_core::theme::payload::NvimThemePayload;
 
 /// Polls the feed's socket on the GTK main loop and calls `on_payload` with the newest valid
 /// payload each tick. `VimEnter` and `ColorScheme` often fire back to back; only the last one
-/// matters.
+/// matters. `ThemePayloadReader` never blocks this thread (sw-theme-1): a stalled or oversized
+/// sender is bounded rather than read on a blocking socket.
 ///
 /// Takes the feed's listener, so a second call on the same feed logs and does nothing rather than
 /// installing a second timer that would race the first for every connection.
@@ -24,8 +25,9 @@ pub(crate) fn listen(feed: &mut ThemeFeed, on_payload: impl Fn(NvimThemePayload)
         eprintln!("[theme] listen() called twice -- ignoring");
         return;
     };
+    let mut reader = ThemePayloadReader::new(listener);
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        if let Some(payload) = latest_payload(accept_pending_lines(&listener)) {
+        if let Some(payload) = reader.poll() {
             on_payload(payload);
         }
         glib::ControlFlow::Continue

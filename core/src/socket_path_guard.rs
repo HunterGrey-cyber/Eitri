@@ -26,6 +26,19 @@ const NEVER_BOUND: &[(&str, &str)] = &[
         "src/instance_dir.rs",
         "sweep_stale_instance_dirs(&root, BIND_PREFIX, \"s.sock\"",
     ),
+    // The owner-check test's two sweeps (v1 hardening Task 9): the same file-name argument.
+    (
+        "src/instance_dir.rs",
+        "sweep_entries_owned_by(&root, BIND_PREFIX, \"s.sock\"",
+    ),
+    // The full-backlog test (v1 hardening C4) runs the sweep on its own thread so a hang shows up
+    // as `recv_timeout` expiring rather than wedging the whole test process; the thread's clone of
+    // `root` is named differently so the closure can move it while the original stays usable after
+    // `thread::spawn` returns.
+    (
+        "src/instance_dir.rs",
+        "sweep_stale_instance_dirs(&root_for_thread, BIND_PREFIX, \"s.sock\"",
+    ),
     // Deliberately a plain file, not a socket: the fixture for "this directory's socket answers
     // nothing", which is the case the sweep must reclaim.
     ("src/instance_dir.rs", "std::fs::write(silent.join(\"s.sock\")"),

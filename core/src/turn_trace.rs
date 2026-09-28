@@ -75,6 +75,11 @@ pub struct TurnTrace {
     /// The first text arrived while this turn's tab was not the one on screen (phase 3 ruling 39):
     /// no paint will be reported, so the trace completes without one.
     background: bool,
+    /// The turn's start or its first text reached the panel inside a snapshot, not as `events`
+    /// (P1-A2 round 2, `observe_in_snapshot`): the panel measures a paint only for text it received
+    /// as events, and resets that measurement only on a `turn_started` it received as events, so a
+    /// paint report for this turn may never come and the trace completes without waiting for one.
+    in_snapshot: bool,
 }
 
 impl TurnTrace {
@@ -96,6 +101,7 @@ impl TurnTrace {
             completed: None,
             emitted: false,
             background: false,
+            in_snapshot: false,
         }
     }
 
@@ -154,6 +160,21 @@ impl TurnTrace {
         carried_first_text
     }
 
+    /// Folds a batch the panel received inside a snapshot rather than as `events`: the part of a
+    /// drained delivery the last switch/reload or resync snapshot already carried, which `TabSet::pump`
+    /// leaves out of its payload. Marked as `observe` marks any batch -- the turn's end included, so
+    /// its line still prints -- and, when the batch holds the turn's start or its first text, the
+    /// trace stops waiting for a paint (`in_snapshot`).
+    pub fn observe_in_snapshot(&mut self, events: &[AgentDomainEvent]) {
+        let first_text = self.observe(events);
+        let started = events
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::TurnStarted { .. }));
+        if first_text || started {
+            self.in_snapshot = true;
+        }
+    }
+
     /// Records when the payload carrying the first assistant text was handed to the WebView.
     pub fn mark_first_text_dispatched(&mut self) {
         if self.first_text_dispatched.is_none() {
@@ -182,7 +203,10 @@ impl TurnTrace {
     /// whose text arrived while its tab was in the background (`mark_background`).
     pub fn is_complete(&self) -> bool {
         self.is_finished()
-            && (self.first_paint_frame.is_some() || self.first_presentation_delta.is_none() || self.background)
+            && (self.first_paint_frame.is_some()
+                || self.first_presentation_delta.is_none()
+                || self.background
+                || self.in_snapshot)
     }
 
     /// Prints the line. Idempotent: the caller emits on completion and again on a deadline, and only
@@ -195,7 +219,8 @@ impl TurnTrace {
         eprintln!("{}", self.line());
     }
 
-    /// The line `emit` prints. A background turn with no paint reads `first_paint_frame=bg`.
+    /// The line `emit` prints. A background turn with no paint reads `first_paint_frame=bg`, and one
+    /// whose start or first text the panel got inside a snapshot `first_paint_frame=snapshot`.
     pub fn line(&self) -> String {
         let mark = |d: Option<Duration>| match d {
             Some(d) => format!("{:.0}ms", ms(d)),
@@ -203,6 +228,8 @@ impl TurnTrace {
         };
         let paint = if self.background && self.first_paint_frame.is_none() {
             "bg".to_string()
+        } else if self.in_snapshot && self.first_paint_frame.is_none() {
+            "snapshot".to_string()
         } else {
             mark(self.first_paint_frame)
         };
@@ -226,17 +253,7 @@ mod tests {
     /// Built directly rather than through `start()`, which is env-gated: these tests are about the
     /// folding, not about whether the flag is set.
     fn trace() -> TurnTrace {
-        TurnTrace {
-            submitted_at: Instant::now(),
-            turn_id: None,
-            first_provider_event: None,
-            first_presentation_delta: None,
-            first_paint_frame: None,
-            first_text_dispatched: None,
-            completed: None,
-            emitted: false,
-            background: false,
-        }
+        TurnTrace::started_now()
     }
 
     fn text(s: &str) -> AgentDomainEvent {
@@ -372,6 +389,44 @@ mod tests {
         assert!(!trace.is_emitted());
         trace.emit();
         assert!(trace.is_emitted());
+    }
+
+    /// P1-A2 round 2: a turn whose start or first text reached the panel inside a snapshot gets no
+    /// paint report (the panel measures only text it received as events), so its line must not wait
+    /// for one -- and a batch seen only through a snapshot still marks the turn's end.
+    #[test]
+    fn a_turn_the_panel_got_inside_a_snapshot_is_complete_without_a_paint() {
+        let mut trace = trace();
+        trace.observe_in_snapshot(&[AgentDomainEvent::TurnStarted { turn_id: "t1".into() }]);
+        assert!(trace.observe(&[text("hi")]), "the first text still reports itself");
+        trace.mark_first_text_dispatched();
+        trace.observe_in_snapshot(&[AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        }]);
+        assert!(
+            trace.is_finished(),
+            "an end seen only in a snapshot still ends the trace"
+        );
+        assert!(trace.is_complete(), "no paint report is coming for this turn");
+        assert!(trace.line().contains("first_paint_frame=snapshot"), "{}", trace.line());
+
+        // A batch with neither the start nor the first text changes nothing about the paint.
+        let mut trace = self::trace();
+        trace.observe(&[AgentDomainEvent::TurnStarted { turn_id: "t1".into() }, text("hi")]);
+        trace.mark_first_text_dispatched();
+        trace.observe_in_snapshot(&[text(" more")]);
+        trace.observe(&[AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        }]);
+        assert!(!trace.is_complete(), "the paint of text sent as events is still owed");
     }
 
     #[test]

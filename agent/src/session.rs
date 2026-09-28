@@ -167,11 +167,21 @@ impl AgentSession {
     /// translates -- e.g. a `ToolStarted` arriving right after the `TurnStarted` this same batch
     /// already folded), appends each to `event_log`, and returns the whole batch.
     pub fn pump(&mut self) -> Vec<AgentDomainEvent> {
+        self.pump_revised().into_iter().map(|(_, event)| event).collect()
+    }
+
+    /// [`Self::pump`], with each event's revision: `projection.last_revision` read right after that
+    /// event's own fold -- the tag the sidecar's ingestion queue carries too
+    /// (`crate::ingestion::RevisedDelivery`), so a caller compares both backends' events against a
+    /// snapshot's revision the same way. Here every event is folded in this very call, so none can
+    /// already be in a snapshot read before it; the tag is for uniformity, not because this backend
+    /// has the race.
+    pub fn pump_revised(&mut self) -> Vec<(u64, AgentDomainEvent)> {
         let mut produced = Vec::new();
         for wire_event in self.process.poll_events() {
             for domain_event in self.translate_event(wire_event) {
                 self.fold(domain_event.clone());
-                produced.push(domain_event);
+                produced.push((self.projection.last_revision, domain_event));
             }
         }
         produced

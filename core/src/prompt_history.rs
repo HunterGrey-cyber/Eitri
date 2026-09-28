@@ -66,7 +66,7 @@ pub fn load(dir: &Path, project_root: &Path) -> Loaded {
 /// dropped), keeps the newest [`HISTORY_LIMIT`], and rewrites it atomically. Returns every entry,
 /// oldest first. An unreadable file is set aside first and the append starts from empty.
 pub fn append(dir: &Path, project_root: &Path, texts: &[String]) -> std::io::Result<Vec<String>> {
-    std::fs::create_dir_all(dir)?;
+    crate::layout::persist::create_state_dir(dir)?;
     let file = path(dir, project_root);
     let mut lines = match read_lines(&file) {
         Ok(lines) => lines.unwrap_or_default(),
@@ -92,7 +92,9 @@ pub fn append(dir: &Path, project_root: &Path, texts: &[String]) -> std::io::Res
         .map(|l| serde_json::to_string(l).expect("a history line always serializes") + "\n")
         .collect();
     let tmp = temporary(&file);
-    if let Err(err) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &file)) {
+    if let Err(err) =
+        agent::private_fs::write_private(&tmp, body.as_bytes()).and_then(|()| std::fs::rename(&tmp, &file))
+    {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }

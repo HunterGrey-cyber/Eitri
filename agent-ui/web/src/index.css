@@ -67,8 +67,11 @@ body,
    guarded at UI_CONTRAST (3.0, WCAG 1.4.11's non-text threshold), never at the 4.5:1 text needs
    (the same reason `indexCss.test.ts`'s real guard test still refuses it inside the winbar) -- so
    it has no contrast guarantee for THIS use, and the group's own `+` prefix is left to carry the
-   "this opens more keys" signal instead of a colour nothing promises. */
+   "this opens more keys" signal instead of a colour nothing promises.
+   Its text is `--nv-surface-fg`/`--nv-surface-muted`, never the body's `--nv-fg`/`--nv-muted`:
+   those are guarded against `bg`, and the box is painted `--nv-surface` (sw-theme-2). */
 .which-key-box {
+  color: var(--nv-surface-fg);
   position: absolute;
   right: 10px;
   bottom: 0;
@@ -88,7 +91,7 @@ body,
   padding: 0 5px;
   font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
-  color: var(--nv-fg);
+  color: var(--nv-surface-fg);
 }
 .which-key-box .wk-entry {
   display: grid;
@@ -110,13 +113,13 @@ body,
 .which-key-box .wk-sep {
   font-family: var(--nv-font-mono);
   font-size: var(--fs-xs);
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
 }
 .which-key-box .wk-group {
-  color: var(--nv-fg);
+  color: var(--nv-surface-fg);
 }
 .which-key-box .wk-disabled {
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
 }
 .which-key-box .wk-foot {
   margin-top: 6px;
@@ -124,7 +127,7 @@ body,
   border-top: 1px solid var(--nv-border);
   font-family: var(--nv-font-mono);
   font-size: var(--fs-xs);
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
   display: flex;
   gap: 10px;
 }
@@ -933,8 +936,11 @@ body,
   font-size: var(--fs-code);
 }
 
+/* Text on a card is `--nv-surface-fg`/`--nv-surface-muted`, guarded against the card's own fill;
+   the body's `--nv-fg`/`--nv-muted` are guarded against `bg` (sw-theme-2). */
 .tool-card {
   background: var(--nv-surface);
+  color: var(--nv-surface-fg);
   border-left: 3px solid var(--nv-mode-browse);
   padding: 6px 10px;
   border-radius: 4px;
@@ -959,12 +965,12 @@ body,
 /* P2: ToolSearch's line, and a collapsed run, recede -- neither is an action waiting on you. */
 .tool-card-muted,
 .tool-card-run {
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
 }
 /* P4: a gated call's own line stays full-strength text (unlike the muted rows above) -- it is not
    receding, it is the reason a card is on screen at all. */
 .tool-card-gated {
-  color: var(--nv-fg);
+  color: var(--nv-surface-fg);
 }
 /* A `Bash` call's command is a `<pre>` (`toolRegistry.tsx`), and a `<pre>` keeps the UA's
    `white-space: pre` -- no wrapping at all, not even at its spaces -- so a long command was the
@@ -982,6 +988,13 @@ body,
   font-size: var(--fs-sm);
 }
 .tool-result-pending {
+  color: var(--nv-muted);
+  font-style: italic;
+}
+/* sw-panel-render-6: a `null` result the panel knows can never arrive -- not a rerun of
+   `.tool-result-pending`'s "still running" claim, so it gets its own class even though today it
+   reads identically. */
+.tool-result-abandoned {
   color: var(--nv-muted);
   font-style: italic;
 }
@@ -1026,6 +1039,7 @@ body,
 
 .permission-card {
   background: var(--nv-surface);
+  color: var(--nv-surface-fg);
   border: 1px solid var(--nv-warn);
   border-radius: 6px;
   padding: 10px;
@@ -1043,6 +1057,8 @@ body,
    box begins 11px inside `.row-body`'s own left edge. */
 .permission-card-input {
   background: var(--nv-bg);
+  /* Its own `bg` fill inside the surface-painted card, so the body's pair again. */
+  color: var(--nv-fg);
   padding: 6px;
   border-radius: 4px;
   overflow-x: auto;
@@ -1059,18 +1075,18 @@ body,
   font-size: var(--fs-code);
 }
 .permission-card-description {
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
 }
 /* O3: the CLI's own prompt -- a small label naming whose question it is, then the CLI's sentence. */
 .permission-card-provider {
   margin: 4px 0 6px;
   font-size: var(--fs-sm);
-  color: var(--nv-fg);
+  color: var(--nv-surface-fg);
   overflow-wrap: anywhere;
 }
 .permission-card-provider-label {
   font-size: var(--fs-xs);
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
   border: 1px solid var(--nv-border);
   border-radius: 3px;
   padding: 0 4px;
@@ -1808,7 +1824,7 @@ body,
 .permission-card-stale {
   margin-top: 8px;
   font-size: var(--fs-xs);
-  color: var(--nv-muted);
+  color: var(--nv-surface-muted);
 }
 
 /* The empty tab's resume rows (spec §3.6: "up to 8"), under the fresh prompt -- moved here from
@@ -1929,7 +1945,7 @@ body,
   white-space: pre-wrap;
   word-break: break-all;
   font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
+  color: var(--nv-surface-fg);
   user-select: text;
 }
 
@@ -2016,9 +2032,10 @@ body,
 .permission-card-edit-head {
   display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
   padding: 6px 8px; background: var(--nv-surface); border-bottom: 1px solid var(--nv-border);
+  color: var(--nv-surface-fg);
 }
-.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-fg); word-break: break-all; }
-.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-muted); white-space: nowrap; }
+.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-surface-fg); word-break: break-all; }
+.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: var(--fs-sm); color: var(--nv-surface-muted); white-space: nowrap; }
 .permission-card-edit-note {
   padding: 6px 8px; font-size: var(--fs-sm); color: var(--nv-muted);
   border-bottom: 1px solid var(--nv-border); border-left: 3px solid var(--nv-warn);
@@ -2029,6 +2046,10 @@ body,
 .diff-added { border-left: 3px solid var(--nv-ok); }
 .diff-removed { border-left: 3px solid var(--nv-error); }
 .diff-context { border-left: 3px solid transparent; }
+/* The same diff inside a permission card sits on the card's `--nv-surface`, not on `bg`. */
+.permission-card .diff-line { color: var(--nv-surface-fg); }
+.permission-card .diff-gutter,
+.permission-card .permission-card-edit-note { color: var(--nv-surface-muted); }
 
 /* --- syntax highlighting (panel-as-document, task 4) -------------------------------------------
    highlight.js emits plain `hljs-*` classes; these are the only place they get colour, and it comes
@@ -2040,8 +2061,10 @@ body,
   line-height: 18px;
   /* --nv-surface, not --nv-bg: the --nv-syn-* colours below are derived against Normal's
      background, so painting them on --nv-surface is a small (~4%) departure from an exact editor
-     match. A visually distinct code block is worth that. */
+     match. A visually distinct code block is worth that. Its plain text follows the fill: the
+     surface-guarded `--nv-surface-fg`, not the body's `--nv-fg` (sw-theme-2). */
   background: var(--nv-surface);
+  color: var(--nv-surface-fg);
   border: 1px solid var(--nv-border);
   border-radius: 3px;
   padding: 8px 10px;

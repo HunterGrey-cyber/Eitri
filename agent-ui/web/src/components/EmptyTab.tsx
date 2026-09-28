@@ -17,7 +17,7 @@ import { Dashboard, dashItems } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify, failureEvidence, remedyNamesR } from "../problems";
-import { isModifierKey, leaderTypingFlash, TypingGuard } from "../typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "../typingGuard";
 
 /** Below this width (spec §7, "At 360 px") the dashboard's where-line cuts the cwd and drops the
  *  account. Measured the same way `StatusBand` measures its own box: a `ResizeObserver` on this
@@ -152,12 +152,27 @@ export type EmptyTabProps = {
 export function EmptyTab(props: EmptyTabProps) {
   const { hello, tab, handoff, failure } = props;
   const [mode, setMode] = useState<PanelMode>(props.landing === "browse" ? "browse" : "input");
+  /** Fix round 1 (reviewer finding, blocking): what a deferred `f`/single-key table binding below
+   *  reads at fire time, mirroring `App.tsx`'s own `modeRef` -- a plain `mode`/`failed` read inside
+   *  `typingGuard.defer`'s callback would close over the render that scheduled it, not the one at
+   *  the moment it actually runs `TYPING_GUARD_MS` later. */
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
   // The counts this screen mounted with (see `landing`'s doc): the two request effects below act
   // only on a count that changed after that.
   const focusAtMount = useRef(props.focusRequest);
   const arriveAtMount = useRef(props.arriveRequest);
   const starting = tab.state === "starting";
   const failed = tab.state === "failed";
+  /** See `modeRef`: `f`/`H`/`L` must still fire on a `failed` tab even though `mode` reads "input"
+   *  there (`onKeyDown`'s own "Once the composer is disabled (failed) there is nothing left to type
+   *  into" reasoning, just below -- there is no live composer to disturb once the tab has failed). */
+  const failedRef = useRef(failed);
+  failedRef.current = failed;
+  /** See `modeRef`: a deferred `r`/`w` runs only while this is still the dashboard, which a
+   *  `starting` tab does not draw. */
+  const startingRef = useRef(starting);
+  startingRef.current = starting;
   // Spec §10.2 (P11): `null` for a failure this build's classifier does not recognise (or none),
   // in which case the row below draws exactly what it always did -- the raw text, and nothing more.
   const failureProblem = failed && failure !== null ? classify(failure, hello?.account ?? null) : null;
@@ -184,6 +199,11 @@ export function EmptyTab(props: EmptyTabProps) {
    *  -- bumped only from the guarded `focusRequest`/`keysRequest` effects below, so an overlay drawn
    *  over this screen can never have its composer autofocused out from under it. */
   const [composerFocus, setComposerFocus] = useState(0);
+  /** v1 hardening, codex-release-p1 #7 (C1a): mirrors `App.tsx`'s own `composerCaret` -- `A` forces
+   *  the caret to the end of the draft, every other route into INPUT (`i`/`o`, `Ctrl+j`, a landing)
+   *  explicitly resets it to "kept" rather than leaving whatever an earlier `A` last set (the same
+   *  reproduced fix-round-1 bug App.tsx's own doc comments on this state name). */
+  const [composerCaret, setComposerCaret] = useState<"kept" | "end">("kept");
   const [widthPx, setWidthPx] = useState(0);
   /* The dashboard's own narrow breakpoint (spec §7, "At 360 px"), measured the same way
      `StatusBand` measures its own box: jsdom lays nothing out, so `widthPx` stays 0 and `narrow`
@@ -277,6 +297,11 @@ export function EmptyTab(props: EmptyTabProps) {
   // let the OLD table's binding run against the new one.
   useEffect(() => {
     clearSequence();
+    // v1 audit P2-A6, this screen's own copy: `clearSequence` drops only a pending MULTI-key
+    // sequence -- a single-key table binding deferred by `typingGuard.defer` (H's default tab.prev,
+    // R2-2's own copy for this screen) closes over the OLD table's `binding` at keydown time and
+    // stayed armed to run it against whatever the table now says even after being replaced.
+    typingGuard.cancel();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelTable]);
   // Leaving BROWSE by any route other than a key this engine itself consumed (a click into the
@@ -306,6 +331,7 @@ export function EmptyTab(props: EmptyTabProps) {
     if (props.overlayOpen) return;
     if (props.focusRequest !== focusAtMount.current && !starting && !failed) {
       setMode("input");
+      setComposerCaret("kept");
       setComposerFocus((n) => n + 1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -377,6 +403,7 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     if (req.direction === "down" && mode === "browse") {
       setMode("input");
+      setComposerCaret("kept");
       return;
     }
     props.onNavFallthrough?.(req.direction);
@@ -412,6 +439,7 @@ export function EmptyTab(props: EmptyTabProps) {
     // The root first, as `arrive` does: `setMode("browse")` unmounts the focused textarea.
     land(where, false);
     setMode(where);
+    setComposerCaret("kept");
     setDashCursor(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id]);
@@ -426,6 +454,10 @@ export function EmptyTab(props: EmptyTabProps) {
     switch (item) {
       case "new":
         setMode("input");
+        // C1a's own default: `i`/`o` (and a click, and `Enter` on this item) place the caret where
+        // it was left, never forced to the end -- only the `A` branch below overrides this after
+        // calling `runItem("new")` itself.
+        setComposerCaret("kept");
         break;
       case "resume": {
         const newest = hello?.resumableSessions[0];
@@ -449,7 +481,10 @@ export function EmptyTab(props: EmptyTabProps) {
     // Every other keydown is "a key" to the typing guard, first, as `App.tsx`'s own `onKeyDown` does
     // (v1 S1): the leader below asks it whether it stood alone.
     const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
-    typingGuard.onKey(event.key, typedAt);
+    // A key that cancelled a waiting `f`, `H`/`L`, `r` or `w` says so, with that key's own words --
+    // this used to be dropped, so the dashboard said nothing at all (the whole-branch review).
+    const cancelled = typingGuard.onKey(event.key, typedAt);
+    if (cancelled !== null) props.onFlash?.(cancelled);
     // An IME key is never a key of this screen's, the leader engine's below included: the same
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
@@ -471,6 +506,29 @@ export function EmptyTab(props: EmptyTabProps) {
       }
       return;
     }
+    // v1 hardening, codex-release-p1 #5: a pending sequence's own continuation must run BEFORE the
+    // unconditional single-key handlers below, matching `App.tsx`'s own ordering (leader engine
+    // before other single-key handling: `f` there reaches HINT only through `resolveKey`, well
+    // after this same check). Without this, `f` alone unconditionally intercepted every `f`
+    // keydown -- including the second key of an armed `<leader>fn` -- so that binding could never
+    // complete here. `isActivatableControl`'s Enter/Space guard moves with it: both exist to keep
+    // the sequence engine from swallowing keys it must not (a focused button's own Enter/Space, or a
+    // continuation key `r`/`f`/`y` also happen to claim on their own below).
+    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
+    if (seqRef.current !== null) {
+      // v1 hardening, codex-release-p1 #6 (R25): mirrors `App.tsx`'s own guard just below -- a bare
+      // modifier's own keydown is not "the next key" and must not cancel a pending sequence here
+      // either, the same reasoning as `pendingPrefixRef`'s guard a few lines down.
+      if (isModifierKey(event.key)) return;
+      event.preventDefault();
+      // Fix round 1 (reviewer finding, codex-release-p1 #3): mirrors `App.tsx`'s own fix just above
+      // -- a real Ctrl/Alt chord is unbound here by definition (no table key carries a modifier), so
+      // it must not complete a binding `advanceSequence` would otherwise match on `event.key` alone.
+      applySeqStep(
+        event.ctrlKey || event.altKey ? { kind: "cancel" } : advanceSequence(panelTable, seqRef.current.typed, event.key),
+      );
+      return;
+    }
     if (event.key === "r" && failed) {
       event.preventDefault();
       props.onReset();
@@ -478,7 +536,21 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     if (event.key === "f") {
       event.preventDefault();
-      props.onHint(event.repeat);
+      // Fix round 1 (reviewer finding, blocking; codex-release-p1 review, R2-1's own copy for this
+      // screen): `f` used to intercept every keydown unconditionally here, so "fix the dashboard
+      // layout⏎" typed on a fresh window's own first screen started a HINT on its own `f`, same as
+      // the live conversation's `case "hint"` (`App.tsx`) before its own R2-1 fix. Mirrors that fix
+      // exactly: defer `TYPING_GUARD_MS`, only firing if nothing else was typed meanwhile and this
+      // screen is still somewhere `f` may act (`modeRef`/`failedRef`, above).
+      const waiting = typingGuard.defer(
+        typedAt,
+        event.repeat,
+        () => {
+          if (modeRef.current !== "input" || failedRef.current) props.onHint(false);
+        },
+        hintTypingFlash(),
+      );
+      if (!waiting && !event.repeat) props.onFlash?.(hintTypingFlash());
       return;
     }
     if (event.key === "y" && handoff !== null) {
@@ -498,12 +570,6 @@ export function EmptyTab(props: EmptyTabProps) {
     // owner's table has them) takes it before the dashboard's own fixed `j`/`k`/`Enter`/letters
     // below ever see it -- the reserved-key list (Global Constraint) is what keeps those from ever
     // colliding with a real table entry.
-    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
-    if (seqRef.current !== null) {
-      event.preventDefault();
-      applySeqStep(advanceSequence(panelTable, seqRef.current.typed, event.key));
-      return;
-    }
     // A reserved prefix typed a key ago (`[`): its table pair runs (`[b` -> tab.prev); anything
     // else drops the prefix and is read as an ordinary key, as vim drops an unfinished `g` and as
     // `resolveKey` does for a live tab.
@@ -533,6 +599,27 @@ export function EmptyTab(props: EmptyTabProps) {
         // says so, as over a live conversation (`TypingGuard.mayActAfterMotion`).
         if (event.key === panelTable.leader && !typingGuard.mayActAfterMotion(typedAt, event.repeat)) {
           props.onFlash?.(leaderTypingFlash(panelTable.leaderLabel));
+          return;
+        }
+        // Fix round 1 (reviewer finding, blocking; codex-release-p1 review, R2-2's own copy for this
+        // screen): any OTHER single-key table binding that runs on its very first press -- `H`/`L`'s
+        // default tab.prev/tab.next, or an nvim-read binding on some other plain letter -- used to run
+        // at once, so "Looks good, now add tests⏎" typed on a fresh window's own first screen switched
+        // tabs on its own `L`. Mirrors `App.tsx`'s own R2-2 fix exactly: `mayActAfterMotion` cannot
+        // help (there is never a motion run behind the very first key), so this defers the same way
+        // `a`/`d`/`f` above do.
+        if (start.kind === "run") {
+          const { binding } = start;
+          const flash = tableKeyTypingFlash(event.key, binding.desc);
+          const waiting = typingGuard.defer(
+            typedAt,
+            event.repeat,
+            () => {
+              if (modeRef.current !== "input" || failedRef.current) applySeqStep({ kind: "run", binding });
+            },
+            flash,
+          );
+          if (!waiting && !event.repeat) props.onFlash?.(flash);
           return;
         }
         applySeqStep(start);
@@ -566,15 +653,36 @@ export function EmptyTab(props: EmptyTabProps) {
     // untouched here) and `<leader>m` (the leader engine above, `DASH_ITEM_KEY.mode` is display
     // only). A stray `m` (or the `m` in "make") now falls through this whole chain and does
     // nothing, exactly like any other unbound letter.
-    if (event.key === "i") {
+    // v1 hardening, codex-release-p1 #7 (C1a, keymap.ts:284-292): `o` is an exact alias of `i`
+    // here too, and `A` opens the same composer with the caret forced to the end of the draft --
+    // this screen had never grown either of the live tab's two frozen aliases.
+    if (event.key === "i" || event.key === "o") {
       event.preventDefault();
       runItem("new");
-    } else if (event.key === "r" && items.includes("resume")) {
+    } else if (event.key === "A") {
       event.preventDefault();
-      runItem("resume");
-    } else if (event.key === "w") {
+      runItem("new");
+      setComposerCaret("end");
+    } else if ((event.key === "r" && items.includes("resume")) || event.key === "w") {
+      // v1 hardening (the whole-branch review, the class of R2-1/R2-2): an arrival lands this
+      // dashboard in BROWSE, so typed prose reached these at once -- "run the tests" resumed the
+      // newest record into this tab on its own `r`, "what's next" opened the chooser on its `w`,
+      // which then took `j`/`k`/`x`/Enter from the rest of the sentence. Deferred exactly as `f` and
+      // `H`/`L` above are: each still does what it did, `TYPING_GUARD_MS` later, only if nothing
+      // else was typed meanwhile and the dashboard is still here in BROWSE. S2 dropped the bare `m`
+      // for the same collision; these keep their meaning.
       event.preventDefault();
-      runItem("sessions");
+      const item: DashItem = event.key === "r" ? "resume" : "sessions";
+      const flash = tableKeyTypingFlash(event.key, item === "resume" ? "resume the newest session" : "all sessions");
+      const waiting = typingGuard.defer(
+        typedAt,
+        event.repeat,
+        () => {
+          if (modeRef.current !== "input" && !failedRef.current && !startingRef.current) runItem(item);
+        },
+        flash,
+      );
+      if (!waiting && !event.repeat) props.onFlash?.(flash);
     } else if (event.key === "?") {
       event.preventDefault();
       runItem("keys");
@@ -617,6 +725,7 @@ export function EmptyTab(props: EmptyTabProps) {
         restoredDraft={props.restoredDraft}
         mode={mode}
         focusRequest={composerFocus}
+        caretOnFocus={composerCaret}
         hintTarget={!failed}
         onModeChange={setMode}
         onSend={props.onSend}

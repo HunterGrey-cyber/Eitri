@@ -5,7 +5,7 @@
 //! know when to ask. It never touches the RPC pipe the keyboard path uses, and needs no fork change.
 //!
 //! The half that is **not** here is the polling driver: `shell::theme::feed` owns the
-//! `glib::timeout_add_local` timer that calls [`accept_pending_lines`] once a tick and repaints.
+//! `glib::timeout_add_local` timer that calls [`ThemePayloadReader::poll`] once a tick and repaints.
 //! Same split, and the same reason, as [`crate::pane_switch`] -- L2's "协议搬进核心，轮询驱动留在
 //! 壳里" (`docs/superpowers/specs/2026-09-16-macos-path-design.md`).
 //!
@@ -13,13 +13,21 @@
 //! [`NVIM_THEME_LUA`] is `nvim_theme.lua` beside this file, and the two tests that pin it against
 //! `tokens::GROUPS_READ` and [`crate::theme::payload::PAYLOAD_VERSION`] are below.
 //! They used to sit in `shell`, one crate away from everything they assert about.
+//!
+//! **sw-theme-1 (2026-09-27):** the accept path used to put every accepted stream back into
+//! BLOCKING mode and `read_line` it with only a per-syscall `SO_RCVTIMEO`, so a sender trickling
+//! bytes slower than that timeout -- or simply several silent connections in a row -- blocked the
+//! GTK thread that polls this feed for as long as it kept going, with no cap on a line's size at
+//! all. It now shares [`crate::line_feed::NewestLineReader`] with `editor_context` and `nvim_keys`:
+//! non-blocking, a bounded per-poll read budget, a bounded line size and a bounded connection
+//! lifetime. See that module's doc for the bounds themselves.
 
-use std::io::{BufRead, BufReader};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::line_feed::NewestLineReader;
 use crate::theme::payload::{parse_payload, NvimThemePayload};
 
 /// The directory-name prefix [`crate::instance_dir`] keys this module's directories on.
@@ -45,17 +53,10 @@ const LUA_NAME: &str = "theme.lua";
 /// `the_sweep_still_reclaims_a_pre_l2_t5_directory` pins that the legacy row is really swept.
 const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME), ("neovibe-theme-", "theme.sock")];
 
-/// How often a host should call [`accept_pending_lines`]. A colorscheme change is not
+/// How often a host should call [`ThemePayloadReader::poll`]. A colorscheme change is not
 /// latency-sensitive the way a keypress is; 100ms is imperceptible and an idle poll of a
 /// non-blocking `accept()` costs one failing syscall.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Bound on how long one accepted connection may block the caller. The snippet connects and writes
-/// synchronously inside one autocommand (see `send` in `nvim_theme.lua`), so the line is normally
-/// already in the socket when the connection is accepted; this only bounds a misbehaving writer.
-/// It is consulted only by a *blocking* socket, which is why [`accept_pending_lines`] sets each
-/// accepted stream's mode explicitly first.
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The Lua half of this protocol, compiled in and written into the feed's own directory at startup.
 pub(crate) const NVIM_THEME_LUA: &str = include_str!("nvim_theme.lua");
@@ -174,67 +175,39 @@ impl Drop for ThemeFeed {
     }
 }
 
-/// One line per pending connection, in accept order.
-///
-/// **Each accepted stream is put back into blocking mode explicitly, and that line is the macOS
-/// fix (L2 T5, 2026-09-17).** `listener` is non-blocking, because the host polls it from a main
-/// loop that must not stall. Linux clears `O_NONBLOCK` on the fd `accept()` returns; **macOS copies
-/// it from the listener** (rust-lang/rust#67027). On macOS, therefore, the `read_line` below ran on
-/// a non-blocking socket and returned `WouldBlock` -- "Resource temporarily unavailable (os error
-/// 35)" -- whenever nvim had not finished writing its line yet, and the snapshot was silently
-/// dropped, leaving the window on `ThemeTokens::fallback()` with nothing but one stderr line to say
-/// so. `READ_TIMEOUT` cannot help: a read timeout is only consulted by a *blocking* socket, so
-/// setting one on a non-blocking stream is a no-op dressed as a bound. `agent` paid for exactly this
-/// bug in M1 (`fd095b6`); this is the same fix at this workspace's other two listeners. **No Linux
-/// test can catch it**, because on Linux the accepted stream is blocking whether or not this line
-/// is here.
-pub fn accept_pending_lines(listener: &UnixListener) -> Vec<String> {
-    accept_pending_lines_within(listener, READ_TIMEOUT)
+/// The theme-feed reader: [`NewestLineReader`]'s bounded, newest-wins polling with
+/// [`parse_payload`] as its acceptance test (sw-theme-1). A malformed newer payload never discards
+/// the last valid one; the bounds and freshness rules are documented, and tested, in
+/// [`crate::line_feed`]. **The macOS accept-mode fix (L2 T5, 2026-09-17: an accepted stream copies
+/// its listener's non-blocking flag there, unlike Linux, so it must be set explicitly) now lives
+/// once in `NewestLineReader` itself rather than once per protocol.**
+pub struct ThemePayloadReader(NewestLineReader);
+
+impl ThemePayloadReader {
+    pub fn new(listener: UnixListener) -> Self {
+        Self(NewestLineReader::new(listener, "theme"))
+    }
+
+    /// Returns the newest valid payload available without waiting, or `None` for no news. The
+    /// caller must read `None` as "no news", never as "no theme": the host keeps whatever
+    /// `ThemeTokens` it last derived.
+    pub fn poll(&mut self) -> Option<NvimThemePayload> {
+        self.0
+            .poll_with(|line| match parse_bytes(line) {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[theme] ignoring a payload: {e}");
+                    false
+                }
+            })
+            .and_then(|line| parse_bytes(&line).ok())
+    }
 }
 
-/// [`accept_pending_lines`] with the per-connection read timeout as a parameter.
-///
-/// Private, and it exists for the tests rather than for a second production caller: the macOS
-/// regression test below has to let a connection sit accepted-but-silent for a measurable moment,
-/// and with `READ_TIMEOUT` fixed at 100ms that test's only lever was a sleep short enough to race
-/// its own bound. See `a_payload_written_after_the_reader_is_already_waiting_still_arrives`.
-fn accept_pending_lines_within(listener: &UnixListener, read_timeout: Duration) -> Vec<String> {
-    let mut lines = Vec::new();
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(e) = stream.set_nonblocking(false) {
-                    eprintln!("[theme] could not make an accepted connection blocking: {e} -- ignoring it");
-                    continue;
-                }
-                let _ = stream.set_read_timeout(Some(read_timeout));
-                let mut line = String::new();
-                match BufReader::new(stream).read_line(&mut line) {
-                    Ok(_) => lines.push(line),
-                    Err(e) => eprintln!("[theme] failed to read a payload: {e}"),
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                eprintln!("[theme] accept failed: {e}");
-                break;
-            }
-        }
-    }
-    lines
-}
-
-/// The last line that parses. A malformed line is logged and skipped; it never discards an
-/// earlier good payload, and it never applies partially.
-pub fn latest_payload(lines: Vec<String>) -> Option<NvimThemePayload> {
-    let mut latest = None;
-    for line in lines {
-        match parse_payload(&line) {
-            Ok(payload) => latest = Some(payload),
-            Err(e) => eprintln!("[theme] ignoring a payload: {e}"),
-        }
-    }
-    latest
+fn parse_bytes(line: &[u8]) -> Result<NvimThemePayload, String> {
+    std::str::from_utf8(line)
+        .map_err(|e| e.to_string())
+        .and_then(parse_payload)
 }
 
 #[cfg(test)]
@@ -284,16 +257,26 @@ mod tests {
         assert!(LOADER_CMD.starts_with("lua "));
     }
 
+    fn reader_for(feed: &mut ThemeFeed) -> ThemePayloadReader {
+        ThemePayloadReader::new(feed.take_listener().unwrap())
+    }
+
     #[test]
-    fn only_the_latest_valid_payload_in_a_tick_is_applied() {
-        let got = latest_payload(vec![line("a"), "garbage".into(), line("b")]).unwrap();
-        assert_eq!(got.options.colors_name, "b");
-        let got = latest_payload(vec![line("a"), "garbage".into()]).unwrap();
-        assert_eq!(
-            got.options.colors_name, "a",
-            "a bad line never discards an earlier good one"
-        );
-        assert!(latest_payload(Vec::new()).is_none());
+    fn a_malformed_payload_never_discards_the_last_valid_one() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
+        let mut good = UnixStream::connect(feed.socket_path()).unwrap();
+        good.write_all(format!("{}\n", line("a")).as_bytes()).unwrap();
+        assert_eq!(reader.poll().unwrap().options.colors_name, "a");
+
+        let mut bad = UnixStream::connect(feed.socket_path()).unwrap();
+        bad.write_all(b"garbage\n").unwrap();
+        assert!(reader.poll().is_none(), "a malformed payload is not news");
+
+        let mut good_again = UnixStream::connect(feed.socket_path()).unwrap();
+        good_again.write_all(format!("{}\n", line("b")).as_bytes()).unwrap();
+        assert_eq!(reader.poll().unwrap().options.colors_name, "b");
+        feed.cleanup();
     }
 
     #[test]
@@ -314,66 +297,63 @@ mod tests {
         assert!(!feed.dir.exists());
     }
 
+    /// sw-theme-1's own probe: four connections that never write anything used to cost this feed's
+    /// old accept loop the full per-syscall `READ_TIMEOUT` (100ms) each, one after another, because
+    /// it put every accepted stream back into BLOCKING mode and `read_line`'d it in turn -- ~400ms
+    /// total for four, and unboundedly more for a writer that trickles bytes slower than the
+    /// timeout. `NewestLineReader` never blocks the caller at all.
     #[test]
-    fn every_pending_connection_is_drained_in_one_pass() {
-        let feed = ThemeFeed::new().expect("feed");
+    fn four_silent_connections_do_not_block_a_poll() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
+        let clients: Vec<_> = (0..4)
+            .map(|_| UnixStream::connect(feed.socket_path()).unwrap())
+            .collect();
+        let before = Instant::now();
+        assert!(reader.poll().is_none());
+        let elapsed = before.elapsed();
+        eprintln!("theme-feed poll with four silent clients: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(200), "poll blocked for {elapsed:?}");
+        drop(clients);
+        feed.cleanup();
+    }
+
+    #[test]
+    fn a_single_poll_picks_the_newest_of_several_already_written_lines() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
         for name in ["one", "two"] {
             let mut stream = UnixStream::connect(feed.socket_path()).expect("connect");
             stream.write_all(format!("{}\n", line(name)).as_bytes()).unwrap();
         }
-        let lines = accept_pending_lines(feed.listener.as_ref().unwrap());
-        assert_eq!(lines.len(), 2);
-        assert_eq!(latest_payload(lines).unwrap().options.colors_name, "two");
+        assert_eq!(reader.poll().unwrap().options.colors_name, "two");
         feed.cleanup();
     }
 
-    /// The macOS regression test for PART B, and it is honest about being untestable here.
-    ///
-    /// The listener is non-blocking. Linux clears `O_NONBLOCK` on the fd `accept()` returns, so on
-    /// Linux this passes with or without the explicit `set_nonblocking(false)` -- **this test cannot
-    /// fail on this machine.** On macOS, where XNU copies the listener's flag, a `read_line` reached
-    /// before nvim has written returns `WouldBlock` and the snapshot is dropped; every other test
-    /// here writes before the accept, which is exactly why none of them discriminates. This one
-    /// connects, gives the reader long enough to have reached `read_line` with nothing to read, and
-    /// then writes a payload over 16 KiB -- larger than macOS's 8 KiB AF_UNIX stream buffer, so the
-    /// line cannot arrive in one read either.
-    ///
-    /// **The two directions of that race are not symmetric, and only one of them is harmless.**
-    ///  - Writer **early** (it wins, and the line is already buffered when the read runs): the test
-    ///    still passes, on both platforms. Here it even keeps discriminating on macOS, because
-    ///    32 KiB cannot sit in an 8 KiB buffer -- the read must come back for more either way.
-    ///  - Writer **late**, past the read timeout: the read times out, the payload is dropped and the
-    ///    assertion goes red -- **on either platform, with the fix in place**. That is a false red,
-    ///    and it would land where it costs most: the Mac mini has 8 GB and is the environment's only
-    ///    Xcode build machine, so a scheduling hiccup there is not hypothetical. Writing 32 KiB
-    ///    through an 8 KiB buffer makes it likelier still, since the writer blocks until the reader
-    ///    drains and the whole exchange has to finish inside one bound.
-    ///
-    /// So the read timeout is a parameter here, and generous: `SLACK` is three orders of magnitude
-    /// past `SLEEP`, where production's `READ_TIMEOUT` is only five times it. Widening the bound
-    /// costs this test nothing -- what it is *about* is whether a blocking read happens at all, not
-    /// how long one is allowed to take.
+    /// sw-theme-1's other half: there used to be no cap at all on an unterminated line's size, so a
+    /// contiguous multi-megabyte line with no newline was read and parsed in full. `NewestLineReader`
+    /// closes an oversized connection instead, without discarding an earlier good payload or blocking
+    /// a later good connection.
     #[test]
-    fn a_payload_written_after_the_reader_is_already_waiting_still_arrives() {
-        /// Long enough that the reader has reached `read_line` with nothing to read.
-        const SLEEP: Duration = Duration::from_millis(20);
-        /// The per-connection bound for this test only. Nothing here is measuring latency, so it is
-        /// set far past any plausible scheduling hiccup rather than near `READ_TIMEOUT`.
-        const SLACK: Duration = Duration::from_secs(10);
+    fn an_oversized_unterminated_line_is_dropped_rather_than_read_whole() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
+        let mut client = UnixStream::connect(feed.socket_path()).expect("connect");
+        // Chunked with a poll between writes, so this does not depend on the OS socket send-buffer
+        // capacity; no newline is ever sent, so the size bound must apply to a partial line too.
+        for _ in 0..crate::line_feed::MAX_LINE_BYTES / 4096 {
+            client.write_all(&[b'x'; 4096]).unwrap();
+            assert!(reader.poll().is_none());
+        }
+        client.write_all(b"x").unwrap();
+        assert!(
+            reader.poll().is_none(),
+            "an oversized unterminated line must not be read whole"
+        );
 
-        let feed = ThemeFeed::new().expect("feed");
-        let big = line(&"z".repeat(32 * 1024));
-        assert!(big.len() > 16 * 1024);
-        let mut stream = UnixStream::connect(feed.socket_path()).expect("connect");
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(SLEEP);
-            stream.write_all(format!("{big}\n").as_bytes()).unwrap();
-        });
-
-        let lines = accept_pending_lines_within(feed.listener.as_ref().unwrap(), SLACK);
-        let payload = latest_payload(lines).expect("the delayed payload must still be read");
-        assert_eq!(payload.options.colors_name.len(), 32 * 1024);
-        writer.join().unwrap();
+        let mut good = UnixStream::connect(feed.socket_path()).unwrap();
+        good.write_all(format!("{}\n", line("after-limit")).as_bytes()).unwrap();
+        assert_eq!(reader.poll().unwrap().options.colors_name, "after-limit");
         feed.cleanup();
     }
 
@@ -439,7 +419,8 @@ mod tests {
     #[test]
     #[ignore = "spawns a real nvim; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
     fn a_real_nvim_pushes_its_colorscheme() {
-        let feed = ThemeFeed::new().expect("feed");
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
         let mut child = std::process::Command::new("nvim")
             .args(["--headless", "--clean"])
             .args(feed.nvim_args())
@@ -451,11 +432,10 @@ mod tests {
             .spawn()
             .expect("nvim on PATH");
 
-        let listener = feed.listener.as_ref().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = None;
         while Instant::now() < deadline && seen.is_none() {
-            seen = latest_payload(accept_pending_lines(listener)).filter(|p| p.options.colors_name == "retrobox");
+            seen = reader.poll().filter(|p| p.options.colors_name == "retrobox");
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = child.kill();
@@ -472,9 +452,16 @@ mod tests {
     #[ignore = "spawns a real nvim; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
     fn a_busy_nvim_main_loop_does_not_lose_a_payload() {
         // A user's own VimEnter handler (session restore, a dashboard) runs after ours, which `--cmd`
-        // registered first. A write that waits for nvim's loop to turn would arrive after this 400ms
-        // handler -- past READ_TIMEOUT -- and the poll below would drop the connection.
-        let feed = ThemeFeed::new().expect("feed");
+        // registered first. `nvim_theme.lua`'s own `send` is synchronous specifically so its write
+        // finishes before this handler's 400ms sleep even starts (Task 7's own fix; an async write
+        // lost the payload entirely under the old design). `NewestLineReader`'s "newest wins"
+        // semantics mean the ColorScheme and VimEnter payloads -- both fired within a few
+        // milliseconds of each other, well before the first poll -- may collapse to whichever one
+        // is accepted last, and the older one is dropped unread rather than superseding it back; that
+        // is expected and harmless here since both carry the same colours. So this asserts the
+        // payload is SEEN at all despite the busy loop, not a raw count of how many arrived.
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
         let mut child = std::process::Command::new("nvim")
             .args(["--headless", "--clean"])
             .args(feed.nvim_args())
@@ -491,16 +478,54 @@ mod tests {
             .spawn()
             .expect("nvim on PATH");
 
-        let listener = feed.listener.as_ref().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut received = Vec::new();
+        let mut seen = None;
         // Polled at POLL_INTERVAL, exactly as `shell::theme::feed::listen` polls on the GTK main loop.
-        while Instant::now() < deadline && received.len() < 2 {
-            received.extend(
-                accept_pending_lines(listener)
-                    .iter()
-                    .filter_map(|line| parse_payload(line).ok()),
-            );
+        while Instant::now() < deadline && seen.is_none() {
+            seen = reader.poll().filter(|p| p.options.colors_name == "retrobox");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        feed.cleanup();
+
+        assert!(seen.is_some(), "the busy main loop must not lose the payload entirely");
+    }
+
+    /// sw-theme-5's own probe: nvim has no "a highlight group changed" event, so a bare
+    /// `nvim_set_hl` from an autocmd registered after this loader's own -- reachable from the
+    /// owner's own LazyVim setup, where plugins commonly tweak highlight groups post-colorscheme --
+    /// never triggered a re-snapshot. Reproduced against a real nvim: `colorscheme retrobox`, then a
+    /// SECOND `++once VimEnter` handler (registered after `--cmd`'s own, so it fires after the first
+    /// snapshot already went out) overrides `Normal.fg`. The periodic re-snapshot must catch it
+    /// within a bounded window rather than leaving the panel on `retrobox`'s real colour forever.
+    #[test]
+    #[ignore = "spawns a real nvim, and sleeps past the resnapshot interval; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    fn a_late_highlight_override_is_eventually_caught_by_the_periodic_resnapshot() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let mut reader = reader_for(&mut feed);
+        let mut child = std::process::Command::new("nvim")
+            .args(["--headless", "--clean"])
+            .args(feed.nvim_args())
+            .args([
+                "-c",
+                "colorscheme retrobox",
+                "-c",
+                "autocmd VimEnter * ++once lua vim.api.nvim_set_hl(0, 'Normal', {fg = 0x123456})",
+            ])
+            .envs(feed.child_env())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("nvim on PATH");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut seen = None;
+        while Instant::now() < deadline && seen.is_none() {
+            seen = reader
+                .poll()
+                .filter(|p| p.groups.get("Normal").and_then(|a| a.fg) == Some(0x123456));
             std::thread::sleep(POLL_INTERVAL);
         }
         let _ = child.kill();
@@ -508,10 +533,60 @@ mod tests {
         feed.cleanup();
 
         assert!(
-            received.len() >= 2,
-            "expected the ColorScheme and the VimEnter payload, got {}",
-            received.len()
+            seen.is_some(),
+            "a highlight group changed after startup was never re-sent to the panel"
         );
-        assert!(received.iter().all(|p| p.options.colors_name == "retrobox"));
+    }
+    /// sw-theme-5, whole-branch review: the periodic re-snapshot must not re-send a payload that
+    /// has not changed. Every payload the shell receives restyles the whole window, re-themes the
+    /// panel's WebView and queues a render of the editor and the terminal on the GTK thread, and the
+    /// shell does not deduplicate -- so an unconditional timer did all of that every 3 s in every
+    /// idle window (measured: connections at 0.01/3.01/6.01/9.01 s, one distinct payload). With
+    /// nothing changing after startup, no connection may arrive after the startup sends.
+    #[test]
+    #[ignore = "spawns a real nvim, and waits past two resnapshot intervals; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    fn an_unchanged_theme_is_not_resent_by_the_periodic_resnapshot() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let listener = feed.take_listener().expect("listener");
+        let mut child = std::process::Command::new("nvim")
+            .args(["--headless", "--clean"])
+            .args(feed.nvim_args())
+            .args(["-c", "colorscheme retrobox"])
+            .envs(feed.child_env())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("nvim on PATH");
+
+        let started = Instant::now();
+        let mut arrivals = Vec::new();
+        while started.elapsed() < Duration::from_millis(7_500) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut line = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stream, &mut line);
+                    arrivals.push((started.elapsed(), line));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        feed.cleanup();
+
+        assert!(!arrivals.is_empty(), "nvim never sent its startup payload");
+        let late: Vec<_> = arrivals
+            .iter()
+            .filter(|(at, _)| *at > Duration::from_millis(2_000))
+            .map(|(at, _)| *at)
+            .collect();
+        assert!(
+            late.is_empty(),
+            "an unchanged theme was re-sent at {late:?} ({} connections in all)",
+            arrivals.len()
+        );
     }
 }

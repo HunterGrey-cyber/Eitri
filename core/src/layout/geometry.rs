@@ -184,6 +184,58 @@ fn subtree_min(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame) ->
     }
 }
 
+/// sw-layout-1 (2026-09-27 Codex sweep): a shown leaf's floor for [`place`]'s own clamp accounting,
+/// never for [`min_size`]'s report to the window manager -- that report must stay exact at 0 when a
+/// module truly registers none (`the_layouts_minimum_is_what_is_on_screen_needs` pins the numbers).
+/// A `GtkGLArea` editor host normally registers no minimum at all, so without this floor a split
+/// whose ratio-driven `wanted` is overridden by a *sibling's* real minimum (`place`'s trailing
+/// `.max(min_a.min(avail))`) can leave a still-shown, still-focused leaf exactly 0 pixels wide or
+/// tall while giving every pixel to the sibling -- reachable through ordinary nested splits and
+/// resizes, not just a contrived minimum.
+///
+/// **32, not the first version's 1** (whole-branch review): a 1px editor is as invisible and as
+/// impossible to click as a 0px one, and a shown module has no tray chip to bring it back. 32 logical
+/// px holds a row of editor text at the default font and is a target a pointer lands on; it is below
+/// the 5% the ratio band already guarantees a directly placed leaf at any ordinary window size (36px
+/// of a 721px column), so it only bites where a sibling's own minimum overrides the band, as here.
+const MIN_VISIBLE_LEAF_PX: i32 = 32;
+
+/// Same recursion as [`subtree_min`], but every shown leaf's own minimum is floored to
+/// [`MIN_VISIBLE_LEAF_PX`] along both axes first. Used only inside [`place`]'s clamp math (both the
+/// `(None, None)` visibility check, unaffected by the floor, and the numeric `min_a`/`min_b`), so a
+/// visible sibling's true zero-size registration can still starve a ratio the way `MIN_RATIO` bounds
+/// it -- everywhere except all the way down to zero.
+fn subtree_min_for_place(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame) -> Option<Size> {
+    match node {
+        Node::Leaf(id) => shown(id).then(|| {
+            let m = (frame.min)(id);
+            Size {
+                w: m.w.max(MIN_VISIBLE_LEAF_PX),
+                h: m.h.max(MIN_VISIBLE_LEAF_PX),
+            }
+        }),
+        Node::Split {
+            axis, first, second, ..
+        } => match (
+            subtree_min_for_place(first, shown, frame),
+            subtree_min_for_place(second, shown, frame),
+        ) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (Some(a), Some(b)) => Some(match axis {
+                Axis::Row => Size {
+                    w: a.w + frame.handle_px + b.w,
+                    h: a.h.max(b.h),
+                },
+                Axis::Column => Size {
+                    w: a.w.max(b.w),
+                    h: a.h + frame.handle_px + b.h,
+                },
+            }),
+        },
+    }
+}
+
 fn along(axis: Axis, size: Size) -> i32 {
     match axis {
         Axis::Row => size.w,
@@ -212,7 +264,10 @@ fn place(
             first,
             second,
         } => {
-            let (min_a, min_b) = (subtree_min(first, shown, frame), subtree_min(second, shown, frame));
+            let (min_a, min_b) = (
+                subtree_min_for_place(first, shown, frame),
+                subtree_min_for_place(second, shown, frame),
+            );
             let (min_a, min_b) = match (min_a, min_b) {
                 (None, None) => return,
                 (Some(_), None) => {
@@ -622,6 +677,55 @@ mod tests {
         assert_eq!(a.dividers[0].min_second, 80);
         // Dragging the divider further down is held at the same place.
         assert_eq!(a.dividers[0].ratio_for(700), 640.0 / 720.0);
+    }
+
+    /// sw-layout-1 (2026-09-27 Codex sweep): a nested split whose outer ratio is pushed toward
+    /// `MAX_RATIO` can compute a shown, focused leaf's rect to zero height even though nothing
+    /// hides it. `agent | (terminal / editor)`, terminal's own minimum 80px and editor's 0 (as a
+    /// `GtkGLArea` editor host normally reports): the outer split, capped at the inner subtree's
+    /// combined minimum, hands the inner split exactly enough room for terminal's floor and no
+    /// slack, and the inner split's own clamp then gives terminal all of it. Editor never
+    /// disappears from `is_shown`/focus -- it is simply drawn, and clickable, over 0 pixels.
+    #[test]
+    fn a_nested_split_never_collapses_a_shown_focused_leaf_to_zero_pixels() {
+        let root = Node::split(
+            Axis::Column,
+            MAX_RATIO,
+            Node::Leaf(agent()),
+            Node::split(
+                Axis::Column,
+                0.5,
+                Node::Leaf(ModuleId::terminal()),
+                Node::Leaf(editor()),
+            ),
+        );
+        let layout = Layout::new(root, editor()).unwrap();
+        let min = |id: &ModuleId| {
+            if *id == ModuleId::terminal() {
+                Size { w: 0, h: 80 }
+            } else {
+                Size::default()
+            }
+        };
+        let f = Frame {
+            size: WINDOW,
+            handle_px: HANDLE,
+            min: &min,
+        };
+        let a = arrange(&layout, &f);
+        let editor_rect = a.rect_of(&editor()).expect("editor is shown");
+        // Not merely more than zero (whole-branch review): the first floor was 1px, and a 1px
+        // editor is as invisible and as impossible to click as a 0px one.
+        assert!(
+            editor_rect.h >= 24,
+            "editor is shown and focused, but its rect is {editor_rect:?}"
+        );
+        assert_eq!(
+            editor_rect.h, MIN_VISIBLE_LEAF_PX,
+            "the floor, and no more: the rest is the ratio's"
+        );
+        let terminal_rect = a.rect_of(&ModuleId::terminal()).expect("terminal is shown");
+        assert_eq!(terminal_rect.h, 80, "the terminal keeps its own real minimum");
     }
 
     /// The grid reports this as its own minimum (`ModuleGrid::measure`), so the window cannot be made

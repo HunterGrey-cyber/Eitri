@@ -20,12 +20,16 @@ mod frame_clock;
 mod gl_interop;
 mod keyboard;
 mod mouse;
+mod nvim_child;
+mod nvim_rpc;
 mod stdin;
 
+pub use nvim_rpc::{CallWatch, NvimMode};
 pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gtk4::glib;
@@ -205,10 +209,28 @@ pub struct LiveSession {
     /// it, so the line is printed when the layout changes and never per frame. Bits, not f32, so
     /// a NaN cell before nvim reports a font does not count as a change every frame.
     last_logged_layout: Cell<Option<LayoutLogKey>>,
+    /// The `nvim --embed` process itself (`nvim_child`'s module doc): what a shutdown that timed out
+    /// ends, and what [`NeovideEditorPane::end_nvim`] ends. Holds what the fork started from the
+    /// launch on, and nvim's own `getpid()` answer once it comes back ([`ask_nvim_for_its_pid`]);
+    /// shared with the thread that asks.
+    nvim_process: Arc<nvim_child::NvimProcess>,
+    /// The last [`NeovideEditorPane::exec_lua_watched`] request and its watch (`nvim_rpc`).
+    watched: Option<nvim_rpc::WatchedCall>,
+    /// When the ending started, and on which schedule ([`NeovideEditorPane::end_nvim`]), so a
+    /// second ending -- the window's shutdown after it -- keeps to the first one's schedule and
+    /// starts no second watch.
+    ending: Cell<Option<(Instant, nvim_child::Schedule)>>,
+    /// Whether [`NeovideEditorPane::on_nvim_unreachable`]'s callback has fired for this session.
+    unreachable_said: Cell<bool>,
 }
 
 impl LiveSession {
-    fn new(harness: LiveHarness, grid_size: GridSize<u32>, fb_size: Rc<Cell<(i32, i32)>>) -> Self {
+    fn new(
+        harness: LiveHarness,
+        grid_size: GridSize<u32>,
+        fb_size: Rc<Cell<(i32, i32)>>,
+        nvim_process: Arc<nvim_child::NvimProcess>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             harness,
@@ -228,7 +250,31 @@ impl LiveSession {
             last_fullscreen_setting: Cell::new(false),
             fb_size,
             last_logged_layout: Cell::new(None),
+            nvim_process,
+            watched: None,
+            ending: Cell::new(None),
+            unreachable_said: Cell::new(false),
         }
+    }
+
+    /// The fork reports nvim exited, and nvim's own process is still alive. The fork's report
+    /// follows the process IT started: a `nvim` launcher that does not `exec` exits -- or crashes
+    /// -- and 500 ms later the fork says nvim exited (`bridge::run` waits that long for the IO
+    /// stream, then reports regardless), while nvim runs on, re-parented, perhaps still writing a
+    /// file. The fork takes no keys for it from then on. Round 4: this is not an exit, and nothing
+    /// that follows an exit -- the window's close, the editor's retirement -- happens until the
+    /// process is gone ([`exit_events`]). `false` when no process is known to be nvim: then the
+    /// fork's report is all there is.
+    fn exit_pending(&self) -> bool {
+        self.harness.has_neovim_exited() && self.nvim_process.alive_within(Duration::ZERO) == Some(true)
+    }
+
+    /// The schedule an ending starting now takes (`nvim_child::schedule`): nvim may be in a prompt
+    /// when its `:confirm qall` request -- the only prompt this pane knows of -- has not come back.
+    /// Without a process known to be nvim there is nothing to signal, and the hang-up comes first.
+    fn ending_schedule(&self) -> nvim_child::Schedule {
+        let quit_outstanding = self.watched.as_ref().is_some_and(|call| !call.watch().done);
+        nvim_child::schedule(quit_outstanding && self.nvim_process.nvim_pid().is_some())
     }
 
     /// Prints `[layout] fb=WxH cell=W×H grid=CxR band_top=Npx` when the layout differs from the
@@ -326,9 +372,13 @@ impl TickStats {
 /// in `NeovideEditorPane::new()`. Factored into a named alias purely to satisfy
 /// `clippy::type_complexity` -- no behavior difference from writing the nested type out inline.
 type ExitedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// See [`NeovideEditorPane::on_nvim_unreachable`].
+type UnreachableCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 type FullscreenCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
 type ScaleFactorCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f32)>>>>;
 type CellSizeCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f64, f64)>>>>;
+/// See [`NeovideEditorPane::on_start_failed`].
+type StartFailedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(&str)>>>>;
 
 /// The embeddable Neovide/Skia editor surface. Wraps a single `GtkGLArea` driving a real
 /// `nvim --embed` connection (`neovide::live_harness::LiveHarness`), with resize/IME/keyboard/
@@ -346,6 +396,7 @@ pub struct NeovideEditorPane {
     im_context: IMMulticontext,
     live_state: Rc<RefCell<LiveState>>,
     exited_callback: ExitedCallbackSlot,
+    unreachable_callback: UnreachableCallbackSlot,
     /// Shared with the render callback. See [`NeovideEditorPane::set_clear_color`].
     clear_color: Rc<Cell<Color4f>>,
     /// The focus state the host last reported, shared with the render callback so a report that
@@ -364,6 +415,8 @@ pub struct NeovideEditorPane {
     scale_watch: Rc<ScaleWatch>,
     /// See [`NeovideEditorPane::connect_cell_size_changed`].
     cell_size_callback: CellSizeCallbackSlot,
+    /// See [`NeovideEditorPane::on_start_failed`].
+    start_failed_callback: StartFailedCallbackSlot,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -504,6 +557,193 @@ fn tick_should_render(
 /// `LiveSession` types no unit test can construct -- for the same reason `tick_should_render` is.
 fn cell_size_changed(last: Option<(f64, f64)>, now: (f64, f64)) -> bool {
     last != Some(now)
+}
+
+/// The nvim version floor this pane's pinned fork enforces (`NEOVIM_REQUIRED_VERSION` in
+/// `bridge/mod.rs`) -- restated here because the fork's own too-old error names it as bare numbers
+/// with no context of what *this project* needs, and R1-4 wants the pane's own message to say so
+/// plainly rather than making the host go read the fork's source.
+const NVIM_VERSION_FLOOR: &str = "0.10";
+
+/// Where to get a newer nvim -- the same URL the fork's own too-old error already links
+/// (`bridge/mod.rs:197`), restated here so the missing-nvim case (whose error text never names a
+/// URL at all) gets one too.
+const NVIM_INSTALL_URL: &str = "https://github.com/neovim/neovim/wiki/Installing-Neovim";
+
+/// R1-4: the message [`NeovideEditorPane::on_start_failed`] hands the host and [`LiveState::Failed`]
+/// stores, built from the raw error `LiveHarness::with_options` returned (`format!("{err:#}")`, the
+/// fork's own `anyhow` chain -- still logged to stdout verbatim by the caller, unchanged). Two shapes
+/// the pinned fork's `bridge::create_neovim_session` produces:
+///
+/// - **too old**: `"Neovide requires nvim version {major}.{minor}.{patch} or higher, but {found} was
+///   detected. Download the latest version here <url>"` -- [`detected_nvim_version`] pulls `{found}`
+///   back out, since the raw text names the *fork's* floor as bare numbers with no mention of what
+///   neovibe itself needs.
+/// - **missing, or any other launch failure** (`nvim` absent from `PATH`, a spawn error, a socket
+///   that never opens): `.context("Could not locate or start neovim process")`'s own chain, which
+///   never names a version or a place to get one at all.
+///
+/// Split out for the same reason `tick_should_render` is: no unit test here can construct a real
+/// `LiveHarness::with_options` error, so the raw text is the fixture instead.
+fn build_start_failure_message(raw_error: &str) -> String {
+    match detected_nvim_version(raw_error) {
+        Some(found) => format!(
+            "nvim {found} is older than neovibe's floor ({NVIM_VERSION_FLOOR} or newer). Get a newer \
+             nvim: {NVIM_INSTALL_URL}"
+        ),
+        None => format!(
+            "nvim could not be started (neovibe needs {NVIM_VERSION_FLOOR} or newer): {raw_error}. \
+             Install it: {NVIM_INSTALL_URL}"
+        ),
+    }
+}
+
+/// Pulls the detected version out of the fork's own too-old sentence ("... but {found} was detected.
+/// ..."), or `None` for any other shape -- a missing/unspawnable nvim never mentions a detected
+/// version at all.
+fn detected_nvim_version(raw_error: &str) -> Option<&str> {
+    let after_but = raw_error.split_once("but ")?.1;
+    let (version, _) = after_but.split_once(" was detected")?;
+    // The fork's {found} is `:version`'s first line, "NVIM v0.9.5" (the GUI pass, F1): the number.
+    let version = version.strip_prefix("NVIM ").unwrap_or(version);
+    Some(version.strip_prefix('v').unwrap_or(version))
+}
+
+/// What the tick reports about nvim's end (round 4): the fork's own report is `fork_exited`, and
+/// `nvim_alive` is what the pidfd on nvim's process says (`None`: no process is known to be nvim).
+/// An exit is reported only once nvim's process is gone -- or, with none known, on the fork's word
+/// -- so what a host does on it (close the window, retire the editor) never runs while an nvim we
+/// started may still be writing, and it is reported once however often the tick asks (`said`, the
+/// pane's latches). While the fork says exited and the process lives, the host is told once that
+/// nvim is out of reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ExitEvents {
+    unreachable: bool,
+    exited: bool,
+}
+
+fn exit_events(fork_exited: bool, nvim_alive: Option<bool>, unreachable_said: bool, exit_said: bool) -> ExitEvents {
+    if !fork_exited {
+        return ExitEvents::default();
+    }
+    match nvim_alive {
+        Some(true) => ExitEvents {
+            unreachable: !unreachable_said,
+            exited: false,
+        },
+        _ => ExitEvents {
+            unreachable: false,
+            exited: !exit_said,
+        },
+    }
+}
+
+/// How long [`NeovideEditorPane::settled_watched_call`] waits for a request's worker to publish
+/// how it ended. At nvim's exit nvim-rs's IO loop has already resolved the request, so this is only
+/// ever the worker thread's own scheduling; the bound is a backstop.
+const SETTLE_WAIT: Duration = Duration::from_millis(500);
+
+/// A job for a thread of its own.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Starts `job` on a named thread (`std::thread::Builder`).
+fn spawn_named(name: &'static str) -> impl FnOnce(Job) -> std::io::Result<()> {
+    move |job| std::thread::Builder::new().name(name.into()).spawn(job).map(|_| ())
+}
+
+/// Runs `job` on a thread `spawn` starts, or -- when none can be started (`EAGAIN` under a process
+/// limit) -- here, inline, so what it does is never simply dropped (round 5, codex finding 2: the
+/// ending of nvim was, and every later close then waited for it forever). `true` when it went to a
+/// thread. A failed `Builder::spawn` consumes its closure, so the job travels in a slot both sides
+/// can take from.
+fn run_detached(job: Job, spawn: impl FnOnce(Job) -> std::io::Result<()>) -> bool {
+    let slot = Arc::new(std::sync::Mutex::new(Some(job)));
+    let theirs = slot.clone();
+    let spawned = spawn(Box::new(move || {
+        let job = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(job) = job {
+            job();
+        }
+    }));
+    match spawned {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("[live] could not start a thread ({err}); running its job here instead");
+            let job = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(job) = job {
+                job();
+            }
+            false
+        }
+    }
+}
+
+/// Asks nvim, over the fork's own connection and on a thread of its own, for its pid (`getpid()`),
+/// and holds the answer in `process` -- the process that answers on nvim's pipe is nvim, whatever
+/// launched it (codex finding C2, the Opus review's T6-2: a `nvim` wrapper that does not `exec`
+/// is the fork's direct child, and a kill of that left the hung nvim running). A thread, not the
+/// GTK thread: nvim answers requests only once its loop runs, which is after the user's whole
+/// config has been sourced -- and never, for an nvim that hung in it (then `process` keeps only
+/// what the fork started, `nvim_child`'s source 2). The request is never abandoned: nvim-rs ends
+/// the whole connection when a response arrives for a dropped request (`nvim_rpc`'s module doc),
+/// and nvim exiting resolves it with an error.
+fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimProcess>) {
+    let Some(nvim) = harness.neovim_handler().clone_current_neovim() else {
+        println!("[live] no nvim connection to ask for its pid");
+        return;
+    };
+    let process = process.clone();
+    let spawned = std::thread::Builder::new()
+        .name("nvim-rpc getpid".into())
+        .spawn(move || {
+            let answer = nvim_rpc::block_on(nvim.call_function("getpid", vec![]));
+            match answer
+                .ok()
+                .and_then(|pid| pid.as_u64())
+                .and_then(|pid| u32::try_from(pid).ok())
+            {
+                Some(pid) if process.learn(pid) => println!("[live] nvim is pid {pid} (its own answer)"),
+                Some(pid) => println!("[live] nvim answered pid {pid}, which is not a live nvim --embed; not held"),
+                None => {
+                    println!("[live] nvim did not answer getpid(); a forced kill falls back to what the fork started")
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!("[live] could not start the thread that asks nvim for its pid ({err})");
+    }
+}
+
+/// Whether the tick callback should ask for one more frame while [`LiveState::Failed`]: exactly
+/// once -- the frame that actually paints [`FAILED_COLOR`] and the message. R1-4's "a Failed pane
+/// should render once and stop", replacing the old unconditional `true` (`queue_render()` at display
+/// refresh rate for the rest of the window's life, since `Failed` never leaves itself). Split out for
+/// the same reason `tick_should_render` is.
+fn failed_tick_should_render(already_painted: bool) -> bool {
+    !already_painted
+}
+
+/// Whether the tick callback asks for a frame for a pane with no live session -- every state but
+/// [`LiveState::Ready`], which the tick decides itself ([`tick_should_render`]). Split out so the
+/// `Failed` arm is a test's (the Opus review's T7-2: `Failed(_) => true` in the tick left the whole
+/// suite green, since only [`failed_tick_should_render`] was tested).
+fn sessionless_tick_should_render(state: &LiveState, failed_painted: bool) -> bool {
+    match state {
+        // The placeholder-frame dance and the one blocking `LiveHarness::with_options` call both
+        // happen *inside* the render callback and only run when a render is actually requested --
+        // keep rendering here so that state machine can advance.
+        LiveState::NotStarted | LiveState::Starting => true,
+        // R1-4: Failed is a terminal state that paints the same fill and message every time, so
+        // unlike NotStarted/Starting it does NOT keep asking for frames forever -- only until the
+        // render callback has actually painted it once (the `Failed` arm there sets
+        // `failed_painted`). Before R1-4 the pane asked for a frame every tick for the rest of the
+        // window's life.
+        LiveState::Failed(_) => failed_tick_should_render(failed_painted),
+        // Nothing will ever change: no frame is needed.
+        LiveState::Exited => false,
+        // Not sessionless: never asked here (the tick's own `Ready` arm decides).
+        LiveState::Ready(_) => true,
+    }
 }
 
 /// The OS-scale value [`sync_os_scale`] should hand `LiveHarness::set_os_scale_factor`, given GTK's
@@ -684,11 +924,18 @@ impl NeovideEditorPane {
         let clear_color = Rc::new(Cell::new(OUTSIDE_COLOR));
         let focused: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
+        let unreachable_callback: UnreachableCallbackSlot = Rc::new(RefCell::new(None));
         let fullscreen_callback: FullscreenCallbackSlot = Rc::new(RefCell::new(None));
         let pending_fullscreen: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let scale_factor_callback: ScaleFactorCallbackSlot = Rc::new(RefCell::new(None));
         let scale_watch: Rc<ScaleWatch> = Rc::new(ScaleWatch::new(1.0));
         let cell_size_callback: CellSizeCallbackSlot = Rc::new(RefCell::new(None));
+        let start_failed_callback: StartFailedCallbackSlot = Rc::new(RefCell::new(None));
+        // R1-4: set once, the first time the `Failed` arm below actually paints `FAILED_COLOR` and
+        // the message -- read by the tick callback ([`failed_tick_should_render`]) to stop asking for
+        // more frames once that one paint has happened. `Failed` never leaves itself, so this is
+        // never reset.
+        let failed_painted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Only the render closure below ever reads this -- not stored on `Self`, unlike
         // `cell_size_callback`, which a host registers *after* construction.
         let last_cell_size: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
@@ -905,6 +1152,8 @@ impl NeovideEditorPane {
             let fb_size = fb_size.clone();
             let cell_size_callback_for_render = cell_size_callback.clone();
             let last_cell_size = last_cell_size.clone();
+            let start_failed_callback_for_render = start_failed_callback.clone();
+            let failed_painted_for_render = failed_painted.clone();
             gl_area.connect_render(move |widget, _gl_ctx| {
                 let mut state_slot = skia_state.borrow_mut();
 
@@ -964,6 +1213,10 @@ impl NeovideEditorPane {
                 // dropped -- the same reentrancy rule the tick callback's `fullscreen_callback_for_tick`
                 // follows (a host's handler can call straight back into this pane).
                 let mut cell_size_changed_to: Option<(f64, f64)> = None;
+                // R1-4: set from inside the `Starting` arm's `Err` case below, fired only *after*
+                // `live` is dropped -- same reentrancy rule. Unlike `cell_size_changed_to` this fires
+                // at most once per pane, since `Starting` -> `Failed` happens exactly once.
+                let mut start_failed_message: Option<String> = None;
 
                 let mut live = live_state.borrow_mut();
                 match &mut *live {
@@ -1027,6 +1280,8 @@ impl NeovideEditorPane {
                              clean={clean}, cwd={cwd:?}) -- this performs a real, synchronous nvim \
                              launch and WILL block the GTK main loop until it returns"
                         );
+                        // Before the launch, so the one new `--embed` child after it is nvim.
+                        let children_before = nvim_child::direct_children();
                         let t0 = Instant::now();
                         match LiveHarness::with_options(options) {
                             Ok(mut harness) => {
@@ -1035,6 +1290,20 @@ impl NeovideEditorPane {
                                     "[live] LiveHarness::with_options returned after {elapsed:?} \
                                      (blocked the GTK main loop for that long)"
                                 );
+                                let nvim_process = Arc::new(nvim_child::NvimProcess::new(
+                                    nvim_child::NvimChild::find_new(&children_before),
+                                ));
+                                match nvim_process.launched_pid() {
+                                    Some(pid) => println!(
+                                        "[live] the fork started pid {pid} (nvim, or a launcher of \
+                                         it); asking nvim for its own pid"
+                                    ),
+                                    None => println!(
+                                        "[live] the process the fork started was not found; asking \
+                                         nvim for its own pid"
+                                    ),
+                                }
+                                ask_nvim_for_its_pid(&harness, &nvim_process);
                                 // The P2 frozen-scroll-bug fix: `LiveHarnessOptions::grid_size`
                                 // (left `None` above, so `DEFAULT_GRID_SIZE` 100x50) only ever
                                 // sets nvim's grid size at `nvim_ui_attach` time and has no
@@ -1075,14 +1344,23 @@ impl NeovideEditorPane {
                                 if let Some(scale_factor) = scale_watch_for_ready.take_pending_for_ready() {
                                     harness.set_scale_factor_setting(scale_factor);
                                 }
-                                *live =
-                                    LiveState::Ready(Box::new(LiveSession::new(harness, grid_size, fb_size.clone())));
+                                *live = LiveState::Ready(Box::new(LiveSession::new(
+                                    harness,
+                                    grid_size,
+                                    fb_size.clone(),
+                                    nvim_process,
+                                )));
                             }
                             Err(err) => {
                                 let elapsed = t0.elapsed();
-                                let message = format!("{err:#}");
-                                println!("[live] LiveHarness::with_options failed after {elapsed:?}: {message}");
-                                *live = LiveState::Failed(message);
+                                let raw = format!("{err:#}");
+                                println!("[live] LiveHarness::with_options failed after {elapsed:?}: {raw}");
+                                // R1-4: the raw chain above is what stdout gets (unchanged); the
+                                // pane's own state, and what a host is handed, is the built message
+                                // -- what failed, the version floor, where to get a newer nvim.
+                                let message = build_start_failure_message(&raw);
+                                *live = LiveState::Failed(message.clone());
+                                start_failed_message = Some(message);
                             }
                         }
                     }
@@ -1190,14 +1468,23 @@ impl NeovideEditorPane {
                             );
                         }
                     }
-                    LiveState::Failed(message) => {
+                    LiveState::Failed(_) => {
+                        // The text is drawn by the host's own label, not this canvas.
                         fill_content_region(canvas, &content_region, FAILED_COLOR);
-                        let _ = message; // already logged once when the transition happened
+                        // R1-4: this is the one paint `sessionless_tick_should_render` is waiting
+                        // for -- once it is set, the tick callback stops asking for more frames.
+                        failed_painted_for_render.set(true);
                     }
                     // Only the clear above: a host that released the pane does not show it.
                     LiveState::Exited => {}
                 }
                 drop(live);
+
+                if let Some(message) = start_failed_message {
+                    if let Some(cb) = start_failed_callback_for_render.borrow().as_ref() {
+                        cb(&message);
+                    }
+                }
 
                 if let Some((width, height)) = cell_size_changed_to {
                     if let Some(cb) = cell_size_callback_for_render.borrow().as_ref() {
@@ -1238,6 +1525,7 @@ impl NeovideEditorPane {
             // that reentrant borrow would hit a `RefCell` `BorrowMutError` panic. See
             // `should_fire_exited_callback` below for how that's kept safe.
             let exited_callback_for_tick = exited_callback.clone();
+            let unreachable_callback_for_tick = unreachable_callback.clone();
             // Fired after `live` is dropped, for the same reentrancy reason as the exited callback:
             // the host's handler calls straight back into `set_fullscreen_setting`.
             let fullscreen_callback_for_tick = fullscreen_callback.clone();
@@ -1249,12 +1537,16 @@ impl NeovideEditorPane {
             let fb_size = fb_size.clone();
             // One-shot: `[layout] note:` is printed at most once per pane.
             let layout_note_logged = Cell::new(false);
+            // R1-4: read (never written) here -- the render callback's `Failed` arm is the only
+            // writer. See `failed_tick_should_render`.
+            let failed_painted_for_tick = failed_painted.clone();
             gl_area.add_tick_callback(move |widget, _clock| {
                 let mut live = live_state.borrow_mut();
                 // Set from inside the `Ready` arm below, then acted on only *after* `live` is
                 // dropped -- see the comment on `exited_callback_for_tick` above for why the
                 // ordering matters.
                 let mut should_fire_exited_callback = false;
+                let mut should_fire_unreachable_callback = false;
                 let mut fullscreen_changed: Option<bool> = None;
                 let mut scale_factor_changed: Option<f32> = None;
                 let issued = match &mut *live {
@@ -1383,7 +1675,27 @@ impl NeovideEditorPane {
                         // did. `close_requested.replace(true)` is the one-shot guard documented on
                         // `LiveSession::close_requested`; only the tick that flips it false->true
                         // actually fires the callback.
-                        if session.harness.has_neovim_exited() && !session.close_requested.replace(true) {
+                        //
+                        // Round 4: only once nvim's own process is gone (`exit_events`).
+                        let fork_exited = session.harness.has_neovim_exited();
+                        let events = exit_events(
+                            fork_exited,
+                            fork_exited
+                                .then(|| session.nvim_process.alive_within(Duration::ZERO))
+                                .flatten(),
+                            session.unreachable_said.get(),
+                            session.close_requested.get(),
+                        );
+                        if events.unreachable {
+                            session.unreachable_said.set(true);
+                            should_fire_unreachable_callback = true;
+                            println!(
+                                "[live] the fork reports nvim exited, and nvim's own process is still alive \
+                                 (its launcher exited without it); its exit is reported once it is gone"
+                            );
+                        }
+                        if events.exited {
+                            session.close_requested.set(true);
                             should_fire_exited_callback = true;
                         }
 
@@ -1394,15 +1706,7 @@ impl NeovideEditorPane {
                             scale_factor_changed_now,
                         )
                     }
-                    // NotStarted/Starting: the placeholder-frame dance and the one blocking
-                    // `LiveHarness::with_options` call both happen *inside* the render callback
-                    // and only run when a render is actually requested -- keep rendering
-                    // continuously here so that state machine can advance. Failed: a rare
-                    // terminal state; keep rendering rather than risk the one remaining
-                    // Starting->Failed state-transition frame never actually getting painted.
-                    LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => true,
-                    // Nothing will ever change: no frame is needed.
-                    LiveState::Exited => false,
+                    other => sessionless_tick_should_render(other, failed_painted_for_tick.get()),
                 };
                 drop(live);
 
@@ -1417,6 +1721,12 @@ impl NeovideEditorPane {
                     println!("[live] g:neovide_scale_factor is now {scale_factor}");
                     if let Some(cb) = scale_factor_callback_for_tick.borrow().as_ref() {
                         cb(scale_factor);
+                    }
+                }
+
+                if should_fire_unreachable_callback {
+                    if let Some(cb) = unreachable_callback_for_tick.borrow().as_ref() {
+                        cb();
                     }
                 }
 
@@ -1445,6 +1755,7 @@ impl NeovideEditorPane {
             im_context,
             live_state,
             exited_callback,
+            unreachable_callback,
             clear_color,
             focused,
             fullscreen_callback,
@@ -1452,6 +1763,7 @@ impl NeovideEditorPane {
             scale_factor_callback,
             scale_watch,
             cell_size_callback,
+            start_failed_callback,
         }
     }
 
@@ -1583,6 +1895,166 @@ impl NeovideEditorPane {
         matches!(&*self.live_state.borrow(), LiveState::Ready(_))
     }
 
+    /// Whether nvim is up and has not exited, as of the last tick's pump. Unlike
+    /// [`is_ready`](Self::is_ready), which stays `true` from an unrequested exit until the host
+    /// [`release_exited`](Self::release_exited) the pane: a host deciding whether nvim can still be
+    /// asked something (a window close's `:confirm qall`) asks this.
+    pub fn is_running(&self) -> bool {
+        matches!(&*self.live_state.borrow(), LiveState::Ready(session) if !session.harness.has_neovim_exited())
+    }
+
+    /// Whether nvim ran and has exited: seen exited and not yet released, or released
+    /// ([`LiveState::Exited`]). `false` for an nvim that never started, and -- round 3 -- for one
+    /// the fork reports exited while nvim's own process is still alive
+    /// ([`nvim_exit_pending`](Self::nvim_exit_pending)).
+    pub fn nvim_exited(&self) -> bool {
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) => session.harness.has_neovim_exited() && !session.exit_pending(),
+            LiveState::Exited => true,
+            LiveState::NotStarted | LiveState::Starting | LiveState::Failed(_) => false,
+        }
+    }
+
+    /// The fork reports nvim exited, yet nvim's own process lives -- its launcher exited without it
+    /// (`LiveSession::exit_pending`'s doc). Neither running (the fork takes no keys and no request
+    /// for it) nor exited: its exit is reported once the process is gone, and a host that wants it
+    /// gone sooner [`end_nvim`](Self::end_nvim)s it.
+    pub fn nvim_exit_pending(&self) -> bool {
+        matches!(&*self.live_state.borrow(), LiveState::Ready(session) if session.exit_pending())
+    }
+
+    /// Has nvim run `code` through `nvim_exec_lua` -- an RPC request, never typed keys, so a key nvim
+    /// is waiting for (after `f`, inside `getchar()`) cannot swallow it (`nvim_rpc`'s module doc) --
+    /// made from a thread of its own, returning at once. Until the request comes back, a second thread
+    /// asks nvim's fast `nvim_get_mode` every 250 ms, so a host can tell an nvim showing a dialog from
+    /// one whose loop is stuck ([`watched_call`](Self::watched_call)). Replaces the previous watch
+    /// (whose request still runs to its end). `false`, sending nothing, when nvim is not running.
+    pub fn exec_lua_watched(&self, code: &str) -> bool {
+        let mut live = self.live_state.borrow_mut();
+        let LiveState::Ready(session) = &mut *live else {
+            return false;
+        };
+        if session.harness.has_neovim_exited() {
+            return false;
+        }
+        let Some(nvim) = session.harness.neovim_handler().clone_current_neovim() else {
+            println!("[live] exec_lua_watched: no nvim connection -- nothing sent");
+            return false;
+        };
+        let call = {
+            let nvim = nvim.clone();
+            let code = code.to_owned();
+            move || async move {
+                match nvim.exec_lua(&code, vec![]).await {
+                    Ok(_) => {
+                        println!("[live] exec_lua_watched: the Lua returned");
+                        true
+                    }
+                    Err(err) => {
+                        println!("[live] exec_lua_watched: no return (nvim exited?): {err}");
+                        false
+                    }
+                }
+            }
+        };
+        let probe = move || {
+            let nvim = nvim.clone();
+            async move {
+                let pairs = nvim.get_mode().await.ok()?;
+                let field = |name: &str| pairs.iter().find(|(k, _)| k.as_str() == Some(name)).map(|(_, v)| v);
+                Some((
+                    field("mode").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    field("blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+                ))
+            }
+        };
+        match nvim_rpc::WatchedCall::start("exec_lua", call, probe) {
+            Ok(watched) => {
+                session.watched = Some(watched);
+                session.wants_frame.set(true);
+                true
+            }
+            Err(err) => {
+                eprintln!("[live] exec_lua_watched: could not start its thread ({err}) -- nothing sent");
+                false
+            }
+        }
+    }
+
+    /// The last [`exec_lua_watched`](Self::exec_lua_watched) request as it stands: sent when, back
+    /// yet, and nvim's last `nvim_get_mode` answer since. `None` before one, or once nvim is released.
+    pub fn watched_call(&self) -> Option<CallWatch> {
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) => session.watched.as_ref().map(nvim_rpc::WatchedCall::watch),
+            _ => None,
+        }
+    }
+
+    /// [`watched_call`](Self::watched_call) once its worker has published how the request ended,
+    /// waited for up to [`SETTLE_WAIT`] (round 3, codex finding 2): nvim-rs hands the answer to the
+    /// worker through a oneshot, and nvim's exit reaches the host without waiting for it. For a
+    /// host deciding, at nvim's exit, whether nvim had answered its quit.
+    pub fn settled_watched_call(&self) -> Option<CallWatch> {
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) => session.watched.as_ref().map(|call| call.settled(SETTLE_WAIT)),
+            _ => None,
+        }
+    }
+
+    /// Ends nvim without `:qa!` (the round-4 ruling): closes its stdin (the fork's
+    /// `LiveHarness::hang_up`), on which nvim exits keeping its swap files, and escalates on a thread
+    /// by the pid this pane holds (`nvim_child::end`: SIGTERM, which nvim answers the same way and
+    /// which ends a dialog EOF does not; SIGKILL after 5 s) -- never the launcher that started it
+    /// (`nvim_child`'s module doc). The order is `nvim_child::schedule`'s: stdin closed now and
+    /// SIGTERM from 1 s; or, while this pane's `:confirm qall` has not come back and nvim may be in
+    /// its prompt, SIGTERM now and stdin closed at 1 s, by a timer on this thread, since the
+    /// harness lives here (the quit follow-up). Its exit then reaches the host as any exit does,
+    /// once the process is gone ([`on_exited_unrequested`](Self::on_exited_unrequested)).
+    /// Idempotent: a second call starts no second watch. `false`, doing nothing, when there is no
+    /// session.
+    pub fn end_nvim(&self) -> bool {
+        let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() else {
+            return false;
+        };
+        if session.ending.get().is_some() {
+            return true;
+        }
+        let at = Instant::now();
+        let schedule = session.ending_schedule();
+        session.ending.set(Some((at, schedule)));
+        let watched = session.nvim_process.nvim_pid();
+        if schedule.hang_up_after.is_zero() {
+            session.harness.hang_up();
+            println!("[live] end_nvim: nvim's stdin is closed; watching pid {watched:?} until it has gone");
+        } else {
+            let live = Rc::downgrade(&self.live_state);
+            glib::timeout_add_local_once(schedule.hang_up_after, move || {
+                let Some(live) = live.upgrade() else { return };
+                let mut live = live.borrow_mut();
+                if let LiveState::Ready(session) = &mut *live {
+                    // Idempotent, and harmless once nvim has gone.
+                    session.harness.hang_up();
+                    println!("[live] end_nvim: nvim's stdin is closed");
+                }
+            });
+            println!(
+                "[live] end_nvim: nvim may be in its prompt: SIGTERM first, stdin closed in {:?}; watching pid \
+                 {watched:?} until it has gone",
+                schedule.hang_up_after
+            );
+        }
+        let process = session.nvim_process.clone();
+        run_detached(
+            Box::new(move || {
+                // The hang-up is this thread's timer's, above: the harness is not `Send`.
+                let ended = nvim_child::end(&process, at, schedule, &mut || {});
+                println!("[live] end_nvim: {ended:?}");
+            }),
+            spawn_named("nvim end"),
+        );
+        true
+    }
+
     /// One grid cell's size in logical pixels (the unit GTK sizes and positions widgets in), or
     /// `None` before nvim is ready. For a host that moves a divider by whole cells.
     pub fn cell_size(&self) -> Option<(f64, f64)> {
@@ -1616,6 +2088,27 @@ impl NeovideEditorPane {
         *self.exited_callback.borrow_mut() = Some(Box::new(callback));
     }
 
+    /// Registers a callback fired (at most once per session) when the fork reports nvim exited while
+    /// nvim's own process is still alive -- a `nvim` launcher that does not `exec` exited without it
+    /// ([`nvim_exit_pending`](Self::nvim_exit_pending)). nvim is then out of the editor's reach (the
+    /// fork takes no keys for it), and its exit is reported only once its process is gone, so a
+    /// host can say so. Fired from the tick, after `live` is dropped. Replaces any earlier callback.
+    pub fn on_nvim_unreachable(&self, callback: impl Fn() + 'static) {
+        *self.unreachable_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// R1-4: registers `callback`, called at most once, with the human-readable reason
+    /// ([`build_start_failure_message`]) if `LiveHarness::with_options` ever returns `Err` -- nvim
+    /// missing from `PATH`, or older than this fork's floor. Before this there was no way for a host
+    /// to learn *why* the pane went [`LiveState::Failed`] at all; only a `[live] ... failed` line on
+    /// stdout, which a launch from a menu never shows. Fired from the render callback, after `live`
+    /// is dropped -- the same reentrancy rule [`NeovideEditorPane::on_exited_unrequested`]'s own
+    /// callback follows, so a host's handler (`shell` drawing a label over this pane and moving focus
+    /// elsewhere) is free to call back into this pane's own methods. Replaces any earlier callback.
+    pub fn on_start_failed(&self, callback: impl Fn(&str) + 'static) {
+        *self.start_failed_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
     /// After nvim quit on its own ([`NeovideEditorPane::on_exited_unrequested`]), for a host that
     /// keeps its window open without the editor (`shell`'s `prefix x`): shuts the harness down --
     /// nvim is already gone, so this does not wait for it -- drops it, and leaves the pane
@@ -1629,6 +2122,11 @@ impl NeovideEditorPane {
         if !session.harness.has_neovim_exited() {
             return false;
         }
+        // Released, the pane forgets the pidfd on nvim's process: not while that process lives.
+        if session.exit_pending() {
+            println!("[live] release refused: nvim's process is still alive although the fork reported it exited");
+            return false;
+        }
         session.close_requested.set(true);
         session.harness.shutdown();
         *live = LiveState::Exited;
@@ -1636,34 +2134,34 @@ impl NeovideEditorPane {
         true
     }
 
-    /// Cleanly shuts down the live `nvim --embed` connection, if one was ever started. Mirrors
-    /// the reference probe's `connect_close_request` handler body exactly: the host wires this to
-    /// its own window's `connect_close_request`. Returns `LiveHarness::shutdown()`'s own return
-    /// value (`true` if a real `NeovimExited` was observed, `false` if it timed out waiting for
-    /// one and the nvim child may be orphaned) -- or `true` if `LiveState` never reached `Ready`
-    /// at all, since there is no live connection to shut down in that case.
+    /// Shuts down the live `nvim --embed` connection, if one was ever started: the host wires this
+    /// to its own window's `connect_close_request`. **Never `:qa!`** (round 4; until then this ran
+    /// the fork's quit, which is `:qa!`: unsaved buffers discarded, swap files deleted). Closes
+    /// nvim's stdin and ends it as [`end_nvim`](Self::end_nvim) does, in the same order -- here on
+    /// this thread, on the first ending's schedule if one was already under way -- so it returns
+    /// once nvim's process is gone, at most the schedule's 5 s later; then tears the fork's harness down
+    /// (`LiveHarness::shutdown`, which closes stdin too and sends nothing). A host asks nvim first
+    /// (`shell` sends `:confirm qall` and calls this once nvim has exited), so it normally returns at
+    /// once. Returns whether the fork saw nvim exit -- `true` if `LiveState` never reached `Ready`.
     pub fn shutdown(&self) -> bool {
         let mut live = self.live_state.borrow_mut();
         if let LiveState::Ready(session) = &mut *live {
-            // Set before calling `LiveHarness::shutdown()` below so the tick callback's own
-            // `close_requested.replace(true)` guard (see `LiveSession::close_requested`'s doc) is
-            // already tripped by the time nvim actually exits -- without this, a host-initiated
-            // shutdown wouldn't stop a later tick from independently noticing
-            // `has_neovim_exited() == true` and firing `on_exited_unrequested` a second time, for
-            // a shutdown the host itself already initiated.
+            // Set before anything below so the tick callback's own guard (see
+            // `LiveSession::close_requested`'s doc) is already tripped when nvim actually exits: a
+            // shutdown the host itself initiated must not also reach it as an unrequested exit.
             session.close_requested.set(true);
-            println!("[live] shutdown() called: calling LiveHarness::shutdown()...");
+            let (at, schedule) = session
+                .ending
+                .get()
+                .unwrap_or_else(|| (Instant::now(), session.ending_schedule()));
+            session.ending.set(Some((at, schedule)));
+            // On this thread, blocking: `end` closes stdin itself when the schedule says, since an
+            // earlier `end_nvim`'s timer cannot run until this returns.
+            let harness = &mut session.harness;
+            let ended = nvim_child::end(&session.nvim_process, at, schedule, &mut || harness.hang_up());
+            println!("[live] shutdown(): nvim's stdin is closed ({ended:?}); tearing the harness down");
             let exited_cleanly = session.harness.shutdown();
-            println!(
-                "[live] LiveHarness::shutdown() returned {exited_cleanly} \
-                 ({})",
-                if exited_cleanly {
-                    "real NeovimExited observed"
-                } else {
-                    "timed out waiting for NeovimExited -- nvim child may be orphaned, see \
-                     LiveHarness::shutdown's own doc"
-                }
-            );
+            println!("[live] LiveHarness::shutdown() returned {exited_cleanly}");
             exited_cleanly
         } else {
             true
@@ -1674,7 +2172,9 @@ impl NeovideEditorPane {
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_size_changed, nvim_args, os_scale_to_apply, tick_should_render, RemapKick, ScaleWatch, REMAP_RENDER_DELAY,
+        build_start_failure_message, cell_size_changed, exit_events, failed_tick_should_render, nvim_args,
+        os_scale_to_apply, run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, ExitEvents,
+        LiveState, RemapKick, ScaleWatch, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -1870,5 +2370,136 @@ mod tests {
         // same `.max(1)` every other scale read in this crate uses.
         assert_eq!(os_scale_to_apply(1.0, 0), None);
         assert_eq!(os_scale_to_apply(f64::NAN, 1), Some(1.0));
+    }
+
+    // --- build_start_failure_message: R1-4's "what failed, the version floor, where to get one",
+    // built from the raw `anyhow` chain `LiveHarness::with_options` returns. No unit test here can
+    // construct a real one, so the two raw shapes the pinned fork actually produces (bridge/mod.rs)
+    // are the fixtures. ---
+
+    /// The too-old shape: the fork's own sentence names the found version; the built message must
+    /// name it too, plus neovibe's own floor and where to get a newer nvim.
+    #[test]
+    fn a_too_old_nvim_names_the_version_that_was_found() {
+        // The real shape: the fork puts `:version`'s whole first line, "NVIM v0.9.5", into {found}
+        // (the GUI pass of 2026-09-27, finding F1: the message read "nvim NVIM v0.9.5 is older").
+        let raw = "Neovide requires nvim version 0.10.0 or higher, but NVIM v0.9.5 was detected. Download \
+                    the latest version here https://github.com/neovim/neovim/wiki/Installing-Neovim";
+        let message = build_start_failure_message(raw);
+        assert!(message.starts_with("nvim 0.9.5 is older"), "message: {message}");
+        assert!(!message.contains("NVIM"), "message: {message}");
+        assert!(message.contains(NVIM_VERSION_FLOOR), "message: {message}");
+        assert!(message.contains(NVIM_INSTALL_URL), "message: {message}");
+    }
+
+    /// The missing shape: no version is named at all (this is what `.context("Could not locate or
+    /// start neovim process")`'s own chain looks like), so nothing to extract -- the message still
+    /// names the floor and where to get a newer nvim, and keeps the raw detail for anyone who wants
+    /// it.
+    #[test]
+    fn a_missing_nvim_still_names_the_floor_and_where_to_get_one() {
+        let raw = "Could not locate or start neovim process: No such file or directory (os error 2)";
+        let message = build_start_failure_message(raw);
+        assert!(message.contains(NVIM_VERSION_FLOOR), "message: {message}");
+        assert!(message.contains(NVIM_INSTALL_URL), "message: {message}");
+        assert!(message.contains(raw), "message: {message}");
+    }
+
+    // --- failed_tick_should_render: R1-4's "render once and stop" -- the tick callback's own
+    // decision for LiveState::Failed, split out for the same reason `tick_should_render` is (no
+    // unit test here can construct a real GLArea tick callback). ---
+
+    #[test]
+    fn the_tick_still_renders_once_more_right_after_a_start_failure() {
+        assert!(failed_tick_should_render(false));
+    }
+
+    #[test]
+    fn the_tick_reports_idle_once_the_failed_frame_has_been_painted() {
+        assert!(!failed_tick_should_render(true));
+    }
+
+    /// Round 4 (and codex's round-3 findings (c) and (d)): an exit is reported only once nvim's own
+    /// process is gone, exactly once however often the tick asks; while the fork says exited and
+    /// the process lives, the host is told once that nvim is out of reach; with no process known,
+    /// the fork's report is all there is.
+    #[test]
+    fn an_exit_is_reported_once_nvims_process_is_gone_and_only_once() {
+        let nothing = ExitEvents::default();
+        assert_eq!(exit_events(false, None, false, false), nothing, "running");
+        assert_eq!(exit_events(false, Some(true), false, false), nothing);
+        let unreachable = ExitEvents {
+            unreachable: true,
+            exited: false,
+        };
+        assert_eq!(
+            exit_events(true, Some(true), false, false),
+            unreachable,
+            "the launcher's exit"
+        );
+        assert_eq!(exit_events(true, Some(true), true, false), nothing, "said once");
+        let exited = ExitEvents {
+            unreachable: false,
+            exited: true,
+        };
+        assert_eq!(exit_events(true, Some(false), true, false), exited, "then its own exit");
+        assert_eq!(exit_events(true, Some(false), true, true), nothing, "reported once");
+        assert_eq!(
+            exit_events(true, None, false, false),
+            exited,
+            "nothing known: the fork's word"
+        );
+    }
+
+    /// Round 5, codex finding 2: a thread that cannot be started (`EAGAIN` under a process limit,
+    /// reproduced by the reviewer) must not leave nvim's ending unscheduled -- the pane had marked
+    /// it hung up, so every later close returned early and the window waited forever. The job then
+    /// runs here, inline.
+    #[test]
+    fn a_job_whose_thread_cannot_start_runs_inline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let ran = Arc::new(AtomicBool::new(false));
+        let job = {
+            let ran = ran.clone();
+            Box::new(move || ran.store(true, Ordering::SeqCst))
+        };
+        let detached = run_detached(job, |_job| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(!detached);
+        assert!(ran.load(Ordering::SeqCst), "the job ran inline");
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let job = {
+            let ran = ran.clone();
+            Box::new(move || ran.store(true, Ordering::SeqCst))
+        };
+        assert!(run_detached(job, spawn_named("test job")));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ran.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the thread ran it");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The Opus review's T7-2: the tick's own decision for every state without a live session, so
+    /// the `Failed` arm is pinned where the tick reads it -- after a start failure the render loop
+    /// asks for the one frame that paints the message, then reports idle.
+    #[test]
+    fn after_a_start_failure_the_render_loop_goes_idle() {
+        let failed = LiveState::Failed("nvim could not start".into());
+        assert!(
+            sessionless_tick_should_render(&failed, false),
+            "the frame that paints it"
+        );
+        assert!(!sessionless_tick_should_render(&failed, true), "then idle");
+        assert!(
+            sessionless_tick_should_render(&LiveState::NotStarted, true),
+            "starting still advances"
+        );
+        assert!(sessionless_tick_should_render(&LiveState::Starting, true));
+        assert!(
+            !sessionless_tick_should_render(&LiveState::Exited, false),
+            "a released pane never draws"
+        );
     }
 }

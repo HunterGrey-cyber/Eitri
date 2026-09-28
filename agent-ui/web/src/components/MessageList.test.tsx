@@ -3,8 +3,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { MessageList } from "./MessageList";
 import { noteUserScroll, resumeFollowing } from "../follow";
-import { initialState } from "../reducer";
-import type { AgentUiState } from "../types";
+import { applyEvent, initialState } from "../reducer";
+import type { AgentDomainEvent, AgentUiState } from "../types";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -43,13 +43,15 @@ describe("MessageList row structure", () => {
       <MessageList
         state={{
           ...initialState(),
+          // `◐` is a call still running inside the active turn (an ended turn's is `·`).
+          activeTurnId: "t1",
           userPrompts: [{ seq: 1, text: "do the thing" }],
           transcript: [
             { seq: 2, text: "on it" },
             { seq: 5, text: "now the other" },
           ],
           toolCalls: [
-            { seq: 3, toolUseId: "a", name: "Read", input: {}, result: null },
+            { seq: 3, toolUseId: "a", name: "Read", input: {}, result: null, turnId: "t1" },
             { seq: 4, toolUseId: "b", name: "Read", input: {}, result: { content: "ok", isError: false } },
             { seq: 6, toolUseId: "c", name: "Read", input: {}, result: { content: "boom", isError: true } },
           ],
@@ -255,8 +257,9 @@ describe("MessageList tool calls and permissions", () => {
     const { container } = render(
       <MessageList
         state={state({
+          activeTurnId: "t1",
           toolCalls: [
-            { seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null },
+            { seq: 0, toolUseId: "toolu_1", name: "Bash", input: { command: "echo one" }, result: null, turnId: "t1" },
             { seq: 1, toolUseId: "toolu_2", name: "Bash", input: { command: "echo two" }, result: { content: "two", isError: false } },
           ],
         })}
@@ -427,6 +430,124 @@ describe("MessageList tool calls and permissions", () => {
     expect(approve.disabled).toBe(true);
     fireEvent.click(approve);
     expect(onAnswerPermission).not.toHaveBeenCalled();
+  });
+});
+
+/* sw-panel-render-6: a `null` result used to mean "still running" unconditionally, so a tool call
+   abandoned by session end or a resume that restored a call from before its own history boundary
+   rendered a permanent spinner. `MessageList` is what has both the call's `seq` and `state.history`
+   /`sessionEnded` in scope, so it is where the "can this ever complete?" verdict is actually made
+   (`isAbandonedCall`) before it reaches `renderToolCall`/`ToolResult`. */
+describe("MessageList: an abandoned tool result never spins forever (sw-panel-render-6)", () => {
+  const restoredTo = (uptoSeq: number) => ({
+    source: "claude_transcript" as const,
+    restoredItems: uptoSeq,
+    omittedItems: 0,
+    uptoSeq,
+    sourcePath: "/claude/projects/p/sess.jsonl",
+    attemptedTranscriptPath: null,
+    fallbackReason: null,
+    writerVersion: "2.1.272",
+  });
+
+  it("draws a static notice, not a spinner, for a null result that predates the restored-history boundary", () => {
+    // Probe lifted from the verdict: `history.uptoSeq=3`, a tool call at seq 2 with `result:null` --
+    // a resume/reload can never see a `tool_call_completed` for a call that already existed when
+    // history was cut, so this can never complete.
+    const { container } = render(
+      <MessageList
+        state={state({
+          history: restoredTo(3),
+          toolCalls: [{ seq: 2, toolUseId: "toolu_1", name: "Bash", input: { command: "long-running" }, result: null }],
+        })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    const result = container.querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state")).toBe("none");
+    expect(result.getAttribute("aria-busy")).toBeNull();
+    expect(result.textContent).toContain("no result recorded");
+  });
+
+  it("draws the same static notice once the session has ended, regardless of the history boundary", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          toolCalls: [{ seq: 9, toolUseId: "toolu_1", name: "Bash", input: { command: "long-running" }, result: null }],
+        })}
+        sessionEnded={true}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    const result = container.querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state")).toBe("none");
+  });
+
+  /* Codex, whole-branch review: an INTERRUPTED turn in a fresh session -- `tool_call_started`, then
+     `turn_completed` with no result -- left `activeTurnId` null but `status` running and `history`
+     null, so the call kept its `◐` and `Running…` forever. A call's result only ever arrives inside
+     its own turn; once that turn is not the active one, it never will, and that must hold after
+     the next turn starts too. Folded through the real reducer, not a hand-built state. */
+  it("stops spinning once the call's own turn has ended, and stays stopped when the next turn starts", () => {
+    const events: AgentDomainEvent[] = [
+      { type: "session_opened", session_id: "s1", provider_session_id: "c1", model: "m", cwd: "/p" },
+      { type: "user_prompt_submitted", text: "run it" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "sleep 100" } },
+    ];
+    const running = events.reduce(applyEvent, initialState());
+    const rendered = (s: AgentUiState) =>
+      render(<MessageList state={s} sessionEnded={false} expanded={{}} cursor={-1} onAnswerPermission={vi.fn()} />)
+        .container;
+    expect(rendered(running).querySelector(".tool-result")!.getAttribute("data-state")).toBe("running");
+    cleanup();
+
+    const interrupted = applyEvent(running, {
+      type: "turn_completed",
+      turn_id: "t1",
+      outcome: "interrupted",
+      result_text: "",
+      stop_reason: null,
+      usage: null,
+    });
+    let result = rendered(interrupted).querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state")).toBe("none");
+    expect(result.getAttribute("aria-busy")).toBeNull();
+    cleanup();
+
+    const nextTurn: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "again" },
+      { type: "turn_started", turn_id: "t2" },
+    ];
+    const next = nextTurn.reduce(applyEvent, interrupted);
+    result = rendered(next).querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state"), "the next turn does not bring the old call back to life").toBe("none");
+  });
+
+  it("keeps the running spinner for a null result still inside the live, unfinished session", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          history: restoredTo(3),
+          activeTurnId: "t1",
+          toolCalls: [
+            { seq: 5, toolUseId: "toolu_1", name: "Bash", input: { command: "long-running" }, result: null, turnId: "t1" },
+          ],
+        })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    const result = container.querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state")).toBe("running");
+    expect(result.getAttribute("aria-busy")).toBe("true");
   });
 });
 

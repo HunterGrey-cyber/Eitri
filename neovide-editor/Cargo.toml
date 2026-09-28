@@ -22,6 +22,19 @@ skia-safe = { version = "0.153.3", features = ["gl"] }
 # `rev` deliberately (and re-verify) when the fork gains something this crate needs.
 neovide = { path = "../neovide" }
 
+# `nvim_rpc`'s real-nvim test: a request and its watch made from plain threads over an nvim-rs
+# connection that lives on a tokio runtime, as the fork's does. Both crates are already in the tree
+# through the fork (nvim-rs 0.9.2 with `use_tokio`, tokio "full"), so this adds no package.
+[dev-dependencies]
+nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process"] }
+# `tests/no_force_quit.rs` reads `cargo metadata` to find the pinned fork's source. Already in
+# Cargo.lock through `neovibe-core`, so nothing new is downloaded.
+serde_json = "1"
+# msgpack for `nvim_child`'s ending tests, which talk to nvim over a pipe they can close. In
+# Cargo.lock through the fork already.
+rmpv = "1"
+
 # A plain `main`, not libtest: winit allows one `EventLoop` per process and only on the main
 # thread, so each real `LiveHarness` case runs in a fresh child copy of this binary.
 [[test]]

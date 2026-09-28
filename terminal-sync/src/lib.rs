@@ -28,7 +28,7 @@ mod spy;
 pub use barrier::{PublishReason, SyncBarrier};
 pub use driver::SyncDriver;
 pub use never_buffer::NeverBuffer;
-pub use spy::SyncSpy;
+pub use spy::{SyncSpy, ZeroWidthTarget, MAX_ZERO_WIDTH_MARKS_PER_CELL};
 
 /// The exact vte re-exported by alacritty_terminal, so a two-vte-versions mistake is impossible.
 pub use alacritty_terminal::vte;

@@ -262,6 +262,44 @@ pub fn build_paint_list(input: &RenderInput<'_>) -> PaintList {
         }
     }
 
+    // ---- selection over cells the frame did not supply ----
+    //
+    // sw-terminal-6. The frame only carries the cells `Projector` chose to report: a wholly
+    // blank row is dropped from `rows_changed` entirely (`full_rows` skips a line with no
+    // non-default cell at all), and a short row is truncated right after its last non-default
+    // cell. Both are ordinary, unselected DEFAULT cells in the terminal's own model -- a
+    // selection spanning past what was supplied must still highlight them, or the live
+    // (unscrolled) view stops short of where the actual selection (and its copied text) extends,
+    // while the scrolled-back view (`project_window`, which always supplies every column of
+    // every row) draws it correctly. Fill exactly the DEFAULT cell's own selected colour, so the
+    // highlight is seamless with what the cell loop above already drew for a covered default
+    // cell in the same span.
+    if !input.selection.is_empty() {
+        let default_selected = resolve_cell(&FrameCell::default(), true, input.palette);
+        for span in input.selection {
+            let Some(row) = to_row(span.line) else { continue };
+            let covered = frame.rows_changed.iter().find(|r| r.line == span.line);
+            let (covered_left, covered_right) = covered
+                .map(|r| (r.left, r.left + r.cells.len() as u16))
+                .unwrap_or((0, 0));
+            let end_col = span.end_col.min(cols.saturating_sub(1));
+            if span.start_col > end_col {
+                continue;
+            }
+            for col in span.start_col..=end_col {
+                if col >= covered_left && col < covered_right {
+                    continue; // already painted by the cell loop above
+                }
+                backgrounds.push(PaintOp::FillCells {
+                    row,
+                    col,
+                    cols: 1,
+                    color: default_selected.bg,
+                });
+            }
+        }
+    }
+
     let mut ops = backgrounds;
     ops.append(&mut texts);
 

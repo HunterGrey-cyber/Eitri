@@ -19,7 +19,7 @@
 //! on every build (see that file for why a build script and not a checked-in list). If vte grows
 //! a method, this test grows a case; if `SyncSpy` lacks the forward, the case fails.
 
-use terminal_sync::{SyncBarrier, SyncSpy};
+use terminal_sync::{SyncBarrier, SyncSpy, ZeroWidthTarget, MAX_ZERO_WIDTH_MARKS_PER_CELL};
 
 include!(concat!(env!("OUT_DIR"), "/generated_handler_methods.rs"));
 
@@ -120,6 +120,101 @@ fn ordinary_private_modes_do_not_drive_the_barrier() {
     assert_eq!(barrier.esu_count(), 0);
     assert!(!barrier.in_sync());
     assert_eq!(inner.log.len(), 4, "all four must still forward");
+}
+
+/// `RecordingHandler` has no cells, so no cell is ever full: every zero-width `input` reaches it,
+/// which is what the exhaustive forwarding tests above need.
+impl ZeroWidthTarget for RecordingHandler {
+    fn zerowidth_at_input_target(&self) -> usize {
+        0
+    }
+}
+
+/// A handler with a single cell: a character with a width starts a new cell, a zero-width one
+/// piles onto it. It reports the pile to `SyncSpy` the way `Term` reports its target cell's.
+#[derive(Default)]
+struct OneCell {
+    marks: usize,
+    received: Vec<char>,
+}
+
+impl terminal_sync::vte::ansi::Handler for OneCell {
+    fn input(&mut self, c: char) {
+        if c == '\u{0301}' {
+            self.marks += 1;
+        } else {
+            self.marks = 0;
+        }
+        self.received.push(c);
+    }
+}
+
+impl ZeroWidthTarget for OneCell {
+    fn zerowidth_at_input_target(&self) -> usize {
+        self.marks
+    }
+}
+
+/// sw-terminal-2. `Term::input` (alacritty_terminal 0.26.0) pushes every zero-width character
+/// onto a cell's `Vec` with no cap of its own. `SyncSpy::input` forwards a zero-width character
+/// only while the handler reports fewer than `MAX_ZERO_WIDTH_MARKS_PER_CELL` on the cell it would
+/// land on; one it drops is not a dispatch. The count comes from the handler, so a new cell gets a
+/// full allowance and nothing else can renew an old one (`tests/zerowidth_cap.rs` drives the real
+/// `Term` with every separator that renewed the dispatch-counting versions of this cap).
+#[test]
+fn zero_width_input_is_capped_by_what_the_target_cell_already_holds() {
+    use terminal_sync::vte::ansi::Handler as _;
+
+    let cap = MAX_ZERO_WIDTH_MARKS_PER_CELL as usize;
+    let mut inner = OneCell::default();
+    let mut barrier = SyncBarrier::new();
+    {
+        let mut spy = SyncSpy::new(&mut inner, &mut barrier);
+        spy.input('a');
+        for _ in 0..1_000 {
+            spy.input('\u{0301}');
+        }
+    }
+    assert_eq!(
+        inner.received.len(),
+        1 + cap,
+        "the base character plus exactly the cap's worth of marks"
+    );
+    assert_eq!(
+        barrier.dispatch_count(),
+        1 + cap as u64,
+        "a dropped mark changes nothing, so it is not a dispatch"
+    );
+
+    // A bell between marks is still forwarded; the marks around it are still dropped.
+    {
+        let mut spy = SyncSpy::new(&mut inner, &mut barrier);
+        spy.bell();
+        spy.input('\u{0301}');
+    }
+    assert_eq!(
+        inner.received.len(),
+        1 + cap,
+        "a full cell stays full whatever is dispatched between marks"
+    );
+
+    // A character that starts a new cell gets that cell a full allowance of its own.
+    {
+        let mut spy = SyncSpy::new(&mut inner, &mut barrier);
+        spy.input('b');
+        for _ in 0..1_000 {
+            spy.input('\u{0301}');
+        }
+    }
+    assert_eq!(inner.received.len(), 2 + 2 * cap);
+
+    // A character with no width at all (DEL) is not a zero-width mark: forwarded, for `Term` to
+    // ignore, never capped.
+    {
+        let mut spy = SyncSpy::new(&mut inner, &mut barrier);
+        spy.input('\u{7f}');
+    }
+    assert_eq!(inner.received.last(), Some(&'\u{7f}'));
 }
 
 /// The two intercepted methods must do BOTH things: drive the barrier AND still forward.

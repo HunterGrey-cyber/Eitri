@@ -170,8 +170,11 @@ impl PanelSeq {
     }
 }
 
-/// Alone in BROWSE these already mean something (keymap.ts `resolveKey`, spec §2.3).
-const FIXED: &str = "jkhladiyYDfrnNG/?0123456789";
+/// Alone in BROWSE these already mean something (keymap.ts `resolveKey`, spec §2.3). `o` and `A`
+/// (C1a, v1 hardening codex-release-p1 #8 = R2-5) joined `i` the same day as its own two INPUT
+/// aliases but were never added here, so a `neovibe.keymap.set("panel", "o"/"A", ...)` -- or an
+/// nvim `mapleader`/mapping on either -- silently shadowed a frozen key instead of being refused.
+const FIXED: &str = "jkhladioAyYDfrnNG/?0123456789";
 const PENDING: &str = "gz[]";
 const TAKEN_PAIRS: &[&str] = &["gg", "gf", "zh", "zl", "[[", "]]", "[]", "]["];
 
@@ -517,8 +520,12 @@ mod tests {
 
     #[test]
     fn the_fixed_browse_keys_are_reserved() {
+        // v1 hardening, codex-release-p1 #8 (= R2-5, v1-release-review.md): `o` and `A` became
+        // fixed BROWSE keys the same day as `i` (C1a: `o` is `i`'s exact alias, `A` opens INPUT with
+        // the caret at the end) but FIXED was never updated, so `neovibe.keymap.set("panel", "o",
+        // ...)` -- or an nvim `mapleader`/mapping of `o`/`A` -- silently shadowed a frozen key.
         for key in [
-            "j", "k", "h", "l", "a", "d", "i", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", "5",
+            "j", "k", "h", "l", "a", "d", "i", "o", "A", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", "5",
         ] {
             assert!(reserved(&parse_seq(key).unwrap()).is_some(), "{key} alone");
             assert!(reserved(&parse_seq(&format!("{key}x")).unwrap()).is_some(), "{key}x");
@@ -531,6 +538,17 @@ mod tests {
         for free in ["[b", "]b", "H", "L", "<leader>bd", "<Space>x", "gt", "gT", "zb"] {
             assert_eq!(reserved(&parse_seq(free).unwrap()), None, "{free}");
         }
+    }
+
+    /// v1 hardening, codex-release-p1 #8 (= R2-5): the review's own reproduction, at the public API
+    /// surface a real `neovibe.keymap.set("panel", "o", ...)` reaches -- before the fix this
+    /// silently succeeded for both `o` and `A`.
+    #[test]
+    fn o_and_a_are_refused_by_set_the_same_way_i_is() {
+        let mut table = PanelUserTable::default();
+        assert!(table.set("o", "tab.next").is_err(), "o");
+        assert!(table.set("A", "tab.next").is_err(), "A");
+        assert!(table.set("i", "tab.next").is_err(), "i, for comparison");
     }
 
     #[test]

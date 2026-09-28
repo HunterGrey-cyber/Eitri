@@ -12,7 +12,13 @@ export function runSummary(calls: ToolCallRecord[]): string {
 
 /** P2 (ruling 21): consecutive finished, ungated tool calls -- two or more, with something after
  *  them or a turn that is over -- become one `run` row. Expanded runs and the detailed view keep
- *  every call. */
+ *  every call.
+ *
+ * A failed call never joins a run (sw-panel-render-5): every run row draws a fixed `✓` sign and
+ * `runSummary` names only counts, so a failing call folded in among successes vanished behind a
+ * success sign until the reader expanded the row. Excluding it from the loop below ends the run at
+ * the failure -- the failing call falls out to the single-item path just below, and its own row
+ * draws `✗` exactly as an unfolded failed call always has (`MessageList.tsx`'s `toolSign`). */
 export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineItem[] {
   if (opts.detailed) return timeline;
   const gated = new Set(
@@ -24,7 +30,7 @@ export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineI
     const start = i;
     while (i < timeline.length) {
       const item = timeline[i];
-      if (item.kind !== "tool" || item.call.result === null || gated.has(item.call.toolUseId)) break;
+      if (item.kind !== "tool" || item.call.result === null || item.call.result.isError || gated.has(item.call.toolUseId)) break;
       i++;
     }
     const length = i - start;

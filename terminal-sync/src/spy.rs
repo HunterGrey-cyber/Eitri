@@ -19,7 +19,69 @@ use alacritty_terminal::vte::ansi::{
     Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 
+use alacritty_terminal::event::EventListener;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::Term;
+use unicode_width::UnicodeWidthChar;
+
 use crate::barrier::SyncBarrier;
+
+/// sw-terminal-2. `Term::input` (alacritty_terminal 0.26.0) pushes every zero-width character
+/// (a combining mark) onto a cell's `Vec` with **no cap of its own**: a crafted stream of one base
+/// character followed by millions of a combining mark (e.g. U+0301) grows that `Vec` unbounded,
+/// which then costs an unbounded copy in every frame `terminal-frame` projects and an unbounded
+/// glyph run in the renderer -- both on the GTK main thread (`shell/src/terminal/pane.rs`) -- and
+/// memory at several times the input's size. `SyncSpy::input` drops a zero-width character when
+/// the cell it would land on already holds this many; `terminal_frame::project::project_cell`'s
+/// own clamp is the second, independent guard, in case `Term` is ever reached some other way.
+///
+/// ~16-32, matching other terminals' own combining-mark limits: enough that a real accented
+/// character or an emoji with several modifiers still renders in full, nowhere near enough for
+/// a crafted file to cost anything.
+pub const MAX_ZERO_WIDTH_MARKS_PER_CELL: u32 = 16;
+
+/// `Term::input`'s own rule for "is this a combining mark pushed onto a cell rather than a
+/// character written to its own": `c.width() == Some(0)`. A character whose width is `None` (DEL,
+/// a C1 control) is neither: `Term::input` returns without touching anything.
+fn is_zero_width(c: char) -> bool {
+    c.width() == Some(0)
+}
+
+/// What [`SyncSpy`] asks of the handler it wraps to cap zero-width characters per cell
+/// (sw-terminal-2).
+///
+/// **Why the cap asks the handler instead of counting dispatches.** The first two versions of
+/// this cap counted zero-width `input`s since the last dispatch that could move the cursor, and
+/// each had a way around it: a dispatch counted as "moves the cursor" can leave it exactly where it
+/// was (`ESC[1;2H` to the current position, `ESC[?25h`, DEL or a C1 control reaching `input` with
+/// no width, a wide character DECAWM-off `Term` cannot write), and every such separator granted
+/// the SAME cell a fresh allowance -- 160,000 marks on one cell from 10,000 separated batches.
+/// Only the handler knows which cell the next mark lands on and what that cell already holds, so
+/// the count is read from there and no sequence of dispatches can renew it.
+pub trait ZeroWidthTarget {
+    /// How many zero-width characters the cell that a zero-width `input` would be pushed onto
+    /// right now already holds.
+    fn zerowidth_at_input_target(&self) -> usize;
+}
+
+/// Mirrors `Term::input`'s own zero-width branch (alacritty_terminal 0.26.0, `term/mod.rs`,
+/// `fn input`): the cell left of the cursor, or the cursor's own cell while `input_needs_wrap`,
+/// moved one further left onto a wide character's first half when it lands on its spacer.
+impl<L: EventListener> ZeroWidthTarget for Term<L> {
+    fn zerowidth_at_input_target(&self) -> usize {
+        let grid = self.grid();
+        let cursor = &grid.cursor;
+        let line = cursor.point.line;
+        let mut column = cursor.point.column;
+        if !cursor.input_needs_wrap {
+            column.0 = column.0.saturating_sub(1);
+        }
+        if grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            column.0 = column.0.saturating_sub(1);
+        }
+        grid[line][column].zerowidth().map_or(0, <[char]>::len)
+    }
+}
 
 /// Wraps the authoritative `Term` (or any other `Handler`) for the duration of one parser run.
 ///
@@ -52,11 +114,17 @@ impl<'a, H: Handler> SyncSpy<'a, H> {
 }
 
 #[rustfmt::skip]
-impl<H: Handler> Handler for SyncSpy<'_, H> {
+impl<H: Handler + ZeroWidthTarget> Handler for SyncSpy<'_, H> {
     fn set_title(&mut self, a0: Option<String>) { self.barrier.note_dispatch(); self.inner.set_title(a0); }
     fn set_cursor_style(&mut self, a0: Option<CursorStyle>) { self.barrier.note_dispatch(); self.inner.set_cursor_style(a0); }
     fn set_cursor_shape(&mut self, a0: CursorShape) { self.barrier.note_dispatch(); self.inner.set_cursor_shape(a0); }
-    fn input(&mut self, a0: char) { self.barrier.note_dispatch(); self.inner.input(a0); }
+    fn input(&mut self, a0: char) {
+        // sw-terminal-2: a zero-width character the target cell has no room for is dropped --
+        // neither forwarded nor counted as a dispatch (nothing about `Term` changed, so there is
+        // nothing new to publish).
+        if is_zero_width(a0) && self.inner.zerowidth_at_input_target() >= MAX_ZERO_WIDTH_MARKS_PER_CELL as usize { return; }
+        self.barrier.note_dispatch(); self.inner.input(a0);
+    }
     fn goto(&mut self, a0: i32, a1: usize) { self.barrier.note_dispatch(); self.inner.goto(a0, a1); }
     fn goto_line(&mut self, a0: i32) { self.barrier.note_dispatch(); self.inner.goto_line(a0); }
     fn goto_col(&mut self, a0: usize) { self.barrier.note_dispatch(); self.inner.goto_col(a0); }

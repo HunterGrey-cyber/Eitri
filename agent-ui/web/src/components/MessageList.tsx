@@ -43,6 +43,12 @@ type Props = {
    *  reads the current key. */
   yankedKey?: string | null;
   onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
+  /** v1 hardening (ruling R2): the cards already answered from this panel, by `permissionId` --
+   *  `App.tsx` owns the set, since `a`/`d` answer a card by its id rather than through its buttons.
+   *  Absent: none. */
+  answeredPermissions?: ReadonlySet<string>;
+  /** Each card's reason box as it is typed into, so `App.tsx`'s `d` can send it (ruling R2). */
+  onPermissionReason?: (permissionId: string, reason: string) => void;
   /** N2: a click on a path link or an inline code span that parses as a path opens it -- the same
    *  target `gf` reaches from the keyboard (`App.tsx`'s `open-path` action). Absent, clicks inside
    *  the list do nothing beyond React's own defaults (a permission card's buttons, say). */
@@ -70,12 +76,34 @@ type Props = {
   unseenSeed?: { afterSeq: number; tick: number } | null;
 };
 
-/** Whether a finished tool call succeeded, failed, or is still running -- the state a row's sign
- * glyph carries. A call with no result yet is never "done with nothing to say"; see `ToolResult`
- * in `toolRegistry.tsx`, which draws the same three-way distinction in the body. */
-function toolSign(call: ToolCallRecord): string {
-  if (call.result === null) return "◐";
+/** Whether a finished tool call succeeded, failed, is still running, or was abandoned -- the state a
+ * row's sign glyph carries. A call with no result yet is never "done with nothing to say"; see
+ * `ToolResult` in `toolRegistry.tsx`, which draws the matching distinction in the body.
+ *
+ * `abandoned` (sw-panel-render-6) reuses the `·` glyph `App.tsx` already draws for an ended session
+ * row (`<Row kind="ended" sign="·" ...>`), rather than inventing a second "this is over" mark. */
+function toolSign(call: ToolCallRecord, abandoned: boolean): string {
+  if (call.result === null) return abandoned ? "·" : "◐";
   return call.result.isError ? "✗" : "✓";
+}
+
+/** Whether a `null` result can never arrive: the call predates the restored-history boundary (a
+ * resume/reload only ever replays what a transcript actually recorded, so a call from before that
+ * cut that has no result now never will), the session itself has ended, or the call's own turn is
+ * no longer the active one. Without this, `null`
+ * meant only "still running" -- so a tool call abandoned by a killed/interrupted session, or one
+ * that outlived the transcript it was restored from, rendered a permanent spinner (sw-panel-render-6).
+ * A call still genuinely running (an active turn, inside the live span) is untouched: this is never
+ * true for it, matching the pre-fix "◐" rendering exactly. */
+function isAbandonedCall(call: ToolCallRecord, state: AgentUiState, sessionEnded: boolean): boolean {
+  if (call.result !== null) return false;
+  if (sessionEnded) return true;
+  if (state.history !== null && call.seq < state.history.uptoSeq) return true;
+  // A result only ever arrives inside the call's own turn (both backends stamp every event of a
+  // turn with its id). Once that turn is not the active one -- interrupted, failed, or followed by
+  // another -- it never will (Codex, whole-branch review: an interrupted turn left `◐ Running…`
+  // forever). A call with no turn id on it falls back to "no turn is in flight at all".
+  return call.turnId ? call.turnId !== state.activeTurnId : state.activeTurnId === null;
 }
 
 /** How close to the true bottom of `.message-list` still counts as "following the tail," for the
@@ -157,6 +185,8 @@ export function MessageList({
   ruleOffers,
   yankedKey = null,
   onAnswerPermission,
+  answeredPermissions,
+  onPermissionReason,
   onOpenPath,
   onUnreadChange,
   unseenSeed,
@@ -757,8 +787,9 @@ export function MessageList({
             }
             case "tool": {
               const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              const abandoned = isAbandonedCall(item.call, state, sessionEnded);
               return (
-                <Row key={item.key} kind="tool" sign={toolSign(item.call)} current={current} className={yanked} navStop="row">
+                <Row key={item.key} kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yanked} navStop="row">
                   <div data-awaiting-permission={awaitingPermission.has(item.call.toolUseId) ? "true" : undefined}>
                     {/* P4: a call a card is waiting on no longer repeats its own invocation below the
                         card too -- the gated line above says "waiting for approval" already, so the
@@ -768,6 +799,7 @@ export function MessageList({
                       gated: awaitingPermission.has(item.call.toolUseId),
                       detailed,
                       expanded: expanded[item.key] === true,
+                      abandoned,
                     })}
                   </div>
                 </Row>
@@ -781,7 +813,9 @@ export function MessageList({
                     request={item.request}
                     sessionEnded={sessionEnded}
                     ruleOffer={ruleOffers?.[item.request.permissionId] ?? null}
+                    alreadyAnswered={answeredPermissions?.has(item.request.permissionId) ?? false}
                     onAnswer={onAnswerPermission}
+                    onReasonChange={onPermissionReason}
                   />
                 </Row>
               );

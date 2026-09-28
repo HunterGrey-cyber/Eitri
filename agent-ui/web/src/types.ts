@@ -26,6 +26,10 @@ export type ToolCallRecord = {
   name: string;
   input: unknown;
   result: { content: unknown; isError: boolean } | null;
+  /** The turn the call started in (`tool_call_started`'s `turn_id`, and the snapshot's `turnId`). A
+   *  result only ever arrives inside its own turn, so a `null` result whose turn is not the active
+   *  one never will (`MessageList`'s `isAbandonedCall`). Absent only where nothing carried it. */
+  turnId?: string;
   /** v1 polish F18: the saved prefix rule that answered this call's permission request
    *  (`Bash(git log *)`), when a rule and not the user did. Absent on every other call. */
   allowedByRule?: string;
@@ -240,8 +244,17 @@ export type AgentUiState = {
    * restored nothing -- which is every fresh session. On the wire, so it survives a resync and a
    * panel reload exactly as the four collections do. */
   history: HistoryNotice | null;
-  /** Reducer-internal, never on the wire: true while the last folded event was assistant text, so
-   * the next chunk continues the same message. See `reducer.ts`'s `content_delta` case. */
+  /** True while the last folded event was assistant text, so the next chunk continues the same
+   * message. See `reducer.ts`'s `content_delta` case.
+   *
+   * **On the wire since sw-panel-render-2's fix.** It used to be reducer-internal and
+   * `applySnapshot` forced it to `false` regardless of what a snapshot said, on the theory that a
+   * snapshot always meant "start fresh" -- but Rust's own `AgentSessionProjection` keeps this bit
+   * (`assistant_message_open`) and keeps appending to the open message underneath a snapshot taken
+   * mid-reply, so the two sides disagreed about whether the last message was still open. Forcing
+   * `false` split a streaming reply into two transcript rows -- with broken markdown at the seam --
+   * on every snapshot landing mid-reply: a tab switch back to a streaming reply, `prefix r`, and a
+   * bounded-queue Resync. `applySnapshot` now takes this from the snapshot like every other field. */
   assistantMessageOpen: boolean;
   /** Reducer-internal, never on the wire: the `seq` the next locally-folded item will take.
    *
@@ -273,15 +286,19 @@ export type AgentUiState = {
 
 /** A snapshot as it ACTUALLY arrives from Rust, which is not an `AgentUiState`.
  *
- * `serialize_snapshot_for_js` emits neither of the three reducer-internal fields above -- they are
- * marked "never on the wire" for a reason and Rust has no key for any of them. Typing the inbound
- * envelope as a full `AgentUiState` asserted all three were present and `number`/`boolean` when all
- * three are `undefined` at runtime; `applySnapshot` overrides them immediately so nothing broke, but
- * anything that read `payload.state.nextSeq` before that -- a resync-diffing path, say, which is
- * exactly the kind of thing this area attracts -- would have got `undefined` with the compiler
- * insisting on a number. Subtracting them is the honest shape: what is missing is now missing in the
- * type too. */
-export type AgentUiSnapshot = Omit<AgentUiState, "assistantMessageOpen" | "nextSeq" | "turnThinking">;
+ * `serialize_snapshot_for_js` emits neither `nextSeq` nor `turnThinking` -- both are
+ * reducer-internal and Rust has no key for either. Typing the inbound envelope as a full
+ * `AgentUiState` asserted both were present and `number`/`boolean` when both are `undefined` at
+ * runtime; `applySnapshot` overrides them immediately so nothing broke, but anything that read
+ * `payload.state.nextSeq` before that -- a resync-diffing path, say, which is exactly the kind of
+ * thing this area attracts -- would have got `undefined` with the compiler insisting on a number.
+ * Subtracting them is the honest shape: what is missing is now missing in the type too.
+ *
+ * `assistantMessageOpen` is deliberately NOT in this `Omit` (sw-panel-render-2's fix, 2026-09-27):
+ * it used to be, on the theory that it was reducer-internal like the other two, but Rust's own
+ * projection carries the same bit and disagreeing about it split a mid-stream reply across a
+ * snapshot -- see that field's own doc comment on `AgentUiState`. */
+export type AgentUiSnapshot = Omit<AgentUiState, "nextSeq" | "turnThinking">;
 
 /** How long a turn has been running, tracked in `App.tsx` alongside `AgentUiState` rather than
  * inside it: it is a UI-local clock, not part of the projection Rust serializes, and it does not

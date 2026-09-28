@@ -20,7 +20,7 @@
 use agent::{
     AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
-    ResumableSession, UiDelivery,
+    ResumableSession, RevisedDelivery, UiDelivery,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -579,19 +579,62 @@ impl AgentBackend {
         approvals: &mut HumanApprovals,
         answered_for_you: &mut Vec<PromptAnsweredForYou>,
     ) -> UiDelivery {
+        self.take_revised_ui_delivery(project_root, rules, mode, host_answered, approvals, answered_for_you)
+            .without_revisions()
+    }
+
+    /// Records that the panel was just handed a snapshot of this backend read at `revision`, for the
+    /// next drain to take back ([`Self::take_ui_snapshot_revision`]) and leave every event tagged at
+    /// or below it out of its `events` payload (P1-A2 round 2). Kept by the backend itself, never by
+    /// the tab, so a snapshot's revision cannot outlive the session it was read from, whichever way
+    /// that session is replaced.
+    ///
+    /// Only the sidecar has anything to record. Legacy folds only inside `take_revised_ui_delivery`
+    /// (`AgentSession::pump_revised`), so a snapshot read between two drains holds nothing the next
+    /// drain returns: every event that drain folds is newer than the snapshot.
+    pub fn note_ui_snapshot(&mut self, revision: u64) {
+        match self {
+            AgentBackend::Legacy(_) => {}
+            AgentBackend::Sidecar(conversation) => conversation.note_ui_snapshot(revision),
+        }
+    }
+
+    /// Takes what [`Self::note_ui_snapshot`] recorded since the last take; always `None` on legacy.
+    pub fn take_ui_snapshot_revision(&mut self) -> Option<u64> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Sidecar(conversation) => conversation.take_ui_snapshot_revision(),
+        }
+    }
+
+    /// `take_ui_delivery_with_approvals`, keeping each event's fold revision (`agent::RevisedDelivery`)
+    /// -- what `TabSet` calls, because it also sends snapshots and must leave out of its next `events`
+    /// payload whatever the last one already carried (P1-A2 round 2, [`Self::note_ui_snapshot`]).
+    /// Both backends tag an event with the projection's `last_revision` right after its own fold, so
+    /// the tags compare directly with a snapshot's. An event answered here without a card is dropped
+    /// with its tag; the others keep theirs, in order.
+    pub fn take_revised_ui_delivery(
+        &mut self,
+        project_root: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+        approvals: &mut HumanApprovals,
+        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+    ) -> RevisedDelivery {
         let delivery = match self {
             AgentBackend::Legacy(session) => {
-                let events = session.pump();
+                let events = session.pump_revised();
                 if events.is_empty() {
-                    UiDelivery::Nothing
+                    RevisedDelivery::Nothing
                 } else {
-                    UiDelivery::Events(events)
+                    RevisedDelivery::Events(events)
                 }
             }
-            AgentBackend::Sidecar(conversation) => conversation.take_ui_delivery(),
+            AgentBackend::Sidecar(conversation) => conversation.take_revised_ui_delivery(),
         };
         match delivery {
-            UiDelivery::Events(events) => {
+            RevisedDelivery::Events(events) => {
                 let kept = self.answer_what_needs_no_human(
                     events,
                     project_root,
@@ -604,9 +647,9 @@ impl AgentBackend {
                     },
                 );
                 if kept.is_empty() {
-                    UiDelivery::Nothing
+                    RevisedDelivery::Nothing
                 } else {
-                    UiDelivery::Events(kept)
+                    RevisedDelivery::Events(kept)
                 }
             }
             // A `Resync` carries no events to filter: the UI is about to rebuild from the
@@ -674,12 +717,15 @@ impl AgentBackend {
     /// kind is unknown to this build -- is a card in every mode: the SDK's guidance is that a host
     /// auto-approving must not approve a rule-forced ask (ruling 4; review #3 for the unknown kind).
     /// Each answered without a card goes into `answered_for_you` with its row's note.
+    ///
+    /// Each event travels with its fold revision (`take_revised_ui_delivery`), untouched: a kept
+    /// event keeps its own, a dropped one takes its with it.
     fn answer_what_needs_no_human(
         &mut self,
-        events: Vec<AgentDomainEvent>,
+        events: Vec<(u64, AgentDomainEvent)>,
         project_root: &Path,
         cx: AnswerContext<'_>,
-    ) -> Vec<AgentDomainEvent> {
+    ) -> Vec<(u64, AgentDomainEvent)> {
         let AnswerContext {
             rules,
             mode,
@@ -691,7 +737,7 @@ impl AgentBackend {
         // the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK freeze).
         let mut tripped = self.projection().ungated_cli_mode.is_some();
         let mut kept = Vec::with_capacity(events.len());
-        for event in events {
+        for (revision, event) in events {
             tripped |= matches!(event, AgentDomainEvent::UngatedCliMode { .. });
             let AgentDomainEvent::PermissionRequested {
                 permission_id,
@@ -701,12 +747,12 @@ impl AgentBackend {
                 provider_prompt,
             } = &event
             else {
-                kept.push(event);
+                kept.push((revision, event));
                 continue;
             };
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode (D12)");
-                kept.push(event);
+                kept.push((revision, event));
                 continue;
             }
             if let Some(prompt) = provider_prompt {
@@ -718,7 +764,7 @@ impl AgentBackend {
                         "[permission] asking the user: {tool_name} (the CLI's own prompt, only you answer it: {:?})",
                         prompt.label()
                     );
-                    kept.push(event);
+                    kept.push((revision, event));
                     continue;
                 }
                 if host_answered.contains(permission_id) {
@@ -735,7 +781,7 @@ impl AgentBackend {
                         "[permission] asking the user: {tool_name} (the CLI's own prompt: {:?})",
                         prompt.reason.as_deref().unwrap_or("no reason given")
                     );
-                    kept.push(event);
+                    kept.push((revision, event));
                     continue;
                 };
                 let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
@@ -759,7 +805,7 @@ impl AgentBackend {
                             "[permission] could not allow the CLI's own prompt for {tool_name}, showing a card instead: {}",
                             error.message
                         );
-                        kept.push(event);
+                        kept.push((revision, event));
                     }
                 }
                 continue;
@@ -781,7 +827,7 @@ impl AgentBackend {
                             "[permission] could not allow {tool_name} in bypass, showing a card instead: {}",
                             error.message
                         );
-                        kept.push(event);
+                        kept.push((revision, event));
                     }
                 }
                 continue;
@@ -796,7 +842,7 @@ impl AgentBackend {
                 // reading the classifier against the CLI's own `system/init`. One line per card,
                 // with the policy's own fixed reason, never anything the model wrote.
                 eprintln!("[permission] asking the user: {tool_name} ({})", classification.reason);
-                kept.push(event);
+                kept.push((revision, event));
                 continue;
             }
             // Cloned before the mutable borrow below, not for tidiness: `event` borrows from the
@@ -818,7 +864,7 @@ impl AgentBackend {
                         "[permission] could not auto-answer {tool_name}, showing a card instead: {}",
                         error.message
                     );
-                    kept.push(event);
+                    kept.push((revision, event));
                 }
             }
         }
@@ -1828,18 +1874,34 @@ mod tests {
         dir
     }
 
-    /// Drives the pump until it yields something or the deadline passes. The sidecar's events cross
-    /// the ingestion thread, so the first call after a queue is normally empty.
+    /// Drives the pump until what the provider queued has been delivered, or the deadline passes.
+    /// The sidecar's events cross the ingestion thread, so the first call after a queue is normally
+    /// empty.
+    ///
+    /// Everything queued, not only the first batch (P1-B2, 2026-09-28): the ingestion thread folds
+    /// every 5 ms, so under a loaded test run events queued together can arrive in two deliveries,
+    /// and a helper that returned the first left a test's later events undelivered -- a forced 30 ms
+    /// pause between two `queue` calls reproduced `left: 1, right: 3` in
+    /// `approve_pending_never_answers_a_prompt_only_a_human_answers`. Collected until 100 ms pass
+    /// with nothing new, as the panel's own pump keeps taking deliveries; the same fix `deliver()`
+    /// got in `5c70398`.
     fn pump_until_delivery(
         backend: &mut AgentBackend,
         project_root: &Path,
         mode: PermissionMode,
     ) -> Vec<AgentDomainEvent> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let quiet = std::time::Duration::from_millis(100);
+        let mut delivered = Vec::new();
+        let mut last_new: Option<std::time::Instant> = None;
         loop {
+            let now = std::time::Instant::now();
             match backend.take_ui_delivery(project_root, mode) {
-                UiDelivery::Events(events) => return events,
-                _ if std::time::Instant::now() > deadline => return Vec::new(),
+                UiDelivery::Events(events) if !events.is_empty() => {
+                    delivered.extend(events);
+                    last_new = Some(now);
+                }
+                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => return delivered,
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
@@ -2500,12 +2562,26 @@ mod tests {
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
     ) -> (Vec<AgentDomainEvent>, Vec<PromptAnsweredForYou>) {
+        // Everything the provider queued, not only the first batch: the ingestion thread folds every
+        // 5 ms, so under a loaded test run the queued events can arrive in two deliveries, and a
+        // helper that returned the first one left a test's later events undelivered (seen failing
+        // about one run in three in the full suite, never alone). Collected until 100 ms pass with
+        // nothing new, as the panel's own pump keeps taking deliveries.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let quiet = std::time::Duration::from_millis(100);
         let mut answered = Vec::new();
+        let mut delivered = Vec::new();
+        let mut last_new: Option<std::time::Instant> = None;
         loop {
+            let now = std::time::Instant::now();
             match backend.take_ui_delivery_with_approvals(dir, rules, mode, host_answered, approvals, &mut answered) {
-                UiDelivery::Events(events) => return (events, answered),
-                _ if std::time::Instant::now() > deadline => return (Vec::new(), answered),
+                UiDelivery::Events(events) if !events.is_empty() => {
+                    delivered.extend(events);
+                    last_new = Some(now);
+                }
+                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
+                    return (delivered, answered)
+                }
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }

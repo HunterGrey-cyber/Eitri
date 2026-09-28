@@ -412,6 +412,10 @@ pub struct Layout {
     /// Hidden modules that can never be shown again in this window (`super::kill`'s
     /// `Reopen::Never`). A subset of `hidden`; never read from or written to a state file.
     gone: BTreeSet<ModuleId>,
+    /// The gone modules that were shown when they were retired: hidden now only because what ran in
+    /// them ended, not because the user hid them, so the state file writes them shown
+    /// ([`Layout::saved_hidden`]). A subset of `gone`.
+    retired_shown: BTreeSet<ModuleId>,
 }
 
 impl Layout {
@@ -447,6 +451,7 @@ impl Layout {
             focus,
             mru,
             gone: BTreeSet::new(),
+            retired_shown: BTreeSet::new(),
         })
     }
 
@@ -505,6 +510,14 @@ impl Layout {
 
     pub fn hidden(&self) -> &BTreeSet<ModuleId> {
         &self.hidden
+    }
+
+    /// What the state file keeps as hidden: [`Layout::hidden`] without the modules that were on
+    /// screen when they were retired (`super::kill`'s `Reopen::Never` -- the editor after nvim
+    /// ended). Their retirement is about the process, not the arrangement, so a relaunch shows them
+    /// where they were (the Opus review's T6-5); one the user had hidden stays hidden.
+    pub fn saved_hidden(&self) -> BTreeSet<ModuleId> {
+        self.hidden.difference(&self.retired_shown).cloned().collect()
     }
 
     pub fn zoomed(&self) -> Option<&ModuleId> {
@@ -654,10 +667,14 @@ impl Layout {
         self.root = root;
     }
 
-    /// Marks the hidden module `id` gone, for `super::kill`, which has just hidden it.
-    pub(super) fn retire(&mut self, id: &ModuleId) {
+    /// Marks the hidden module `id` gone, for `super::kill`, which has just hidden it; `was_shown`
+    /// says whether it was shown before that hide ([`Layout::saved_hidden`]).
+    pub(super) fn retire(&mut self, id: &ModuleId, was_shown: bool) {
         debug_assert!(self.hidden.contains(id), "only a hidden module can be gone");
         self.gone.insert(id.clone());
+        if was_shown {
+            self.retired_shown.insert(id.clone());
+        }
     }
 
     /// Takes `id` out of `hidden` without the checks [`Layout::show`] makes, for `super::ops`,

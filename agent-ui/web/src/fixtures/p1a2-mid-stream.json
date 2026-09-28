@@ -1,0 +1,120 @@
+{
+  "foldAfterADrain": {
+    "nextEvents": [
+      {
+        "kind": "text",
+        "text": "<after>",
+        "turn_id": "t1",
+        "type": "content_delta"
+      }
+    ],
+    "nextEventsUnfiltered": [
+      {
+        "kind": "text",
+        "text": "<between>",
+        "turn_id": "t1",
+        "type": "content_delta"
+      },
+      {
+        "kind": "text",
+        "text": "<after>",
+        "turn_id": "t1",
+        "type": "content_delta"
+      }
+    ],
+    "snapshot": {
+      "activeTurnId": "t1",
+      "assistantMessageOpen": true,
+      "backend": "sidecar",
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": false,
+        "resume": false
+      },
+      "conversationId": "fixture-conversation-id",
+      "cwd": null,
+      "history": null,
+      "model": null,
+      "pendingPermissions": [],
+      "provider": {
+        "buildDescription": null,
+        "claudeAgentSdkVersion": "",
+        "claudeCodeVersion": "",
+        "protocol": "0.0",
+        "sidecarVersion": "",
+        "startupDiagnostics": []
+      },
+      "providerSessionId": null,
+      "sessionId": "fake-session",
+      "status": {
+        "kind": "starting"
+      },
+      "toolCalls": [],
+      "transcript": [
+        {
+          "seq": 1,
+          "text": "<first><between>"
+        }
+      ],
+      "userPrompts": []
+    },
+    "text": "<between>",
+    "throughRevision": 3
+  },
+  "midStream": {
+    "nextEvents": [],
+    "nextEventsUnfiltered": [
+      {
+        "turn_id": "t1",
+        "type": "turn_started"
+      },
+      {
+        "kind": "text",
+        "text": "P1-unique-text",
+        "turn_id": "t1",
+        "type": "content_delta"
+      }
+    ],
+    "snapshot": {
+      "activeTurnId": "t1",
+      "assistantMessageOpen": true,
+      "backend": "sidecar",
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": false,
+        "resume": false
+      },
+      "conversationId": "fixture-conversation-id",
+      "cwd": null,
+      "history": null,
+      "model": null,
+      "pendingPermissions": [],
+      "provider": {
+        "buildDescription": null,
+        "claudeAgentSdkVersion": "",
+        "claudeCodeVersion": "",
+        "protocol": "0.0",
+        "sidecarVersion": "",
+        "startupDiagnostics": []
+      },
+      "providerSessionId": null,
+      "sessionId": "fake-session",
+      "status": {
+        "kind": "starting"
+      },
+      "toolCalls": [],
+      "transcript": [
+        {
+          "seq": 1,
+          "text": "P1-unique-text"
+        }
+      ],
+      "userPrompts": []
+    },
+    "text": "P1-unique-text",
+    "throughRevision": 2
+  },
+  "writtenBy": "core/src/tab_set.rs, tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both -- compared on every run; NEOVIBE_WRITE_FIXTURES=1 rewrites it"
+}

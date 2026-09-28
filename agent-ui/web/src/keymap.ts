@@ -128,8 +128,79 @@ export type PanelAction =
 
 /** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
  *  without a DOM. `keyCode` is read only for C4's legacy-WebKit IME check (some builds report an
- *  IME commit as `keyCode === 229` rather than `isComposing`); absent it is simply not that. */
-export type KeyLike = { key: string; ctrlKey: boolean; shiftKey: boolean; isComposing: boolean; keyCode?: number };
+ *  IME commit as `keyCode === 229` rather than `isComposing`); absent it is simply not that.
+ *  `altKey`/`metaKey` (v1 audit P2-A1): optional, absent meaning "not held" for every existing
+ *  caller and test that never mentions them -- the real `KeyboardEvent` App.tsx casts through this
+ *  type always carries both at runtime; this type just used to drop them on the floor. Read only by
+ *  the card-answer keys (`a`/`d`/`D`, ruling R2): the two-key sequence pair lookup above (`gT` etc.)
+ *  is deliberately untouched, a previously accepted exception scoped to that lookup alone (dated
+ *  record, 2026-09-27), not to permission answers.
+ *  `getModifierState` (fix round 1, v1 audit review, "R2's Super clause"): Super and Hyper are a
+ *  THIRD GDK modifier, not a spelling of Meta -- `shell/src/prefix.rs`'s own
+ *  `SUPER_MASK | HYPER_MASK | META_MASK` treats all three as distinct, and a first version of this
+ *  comment (and of `App.test.tsx`'s R2 test) wrongly claimed "Linux's Super arrives as `metaKey`
+ *  too". `KeyboardEvent.getModifierState("Super"/"Hyper")` (the UI Events spec's names for the key)
+ *  is the only signal this layer has for it, and the real `KeyboardEvent` App.tsx casts through this
+ *  type carries the method natively, so no call site needs to change -- optional here only so a
+ *  plain test object that never mentions it keeps meaning "not held". **Not a closed gap**: whether
+ *  WebKitGTK's own `WebEventFactory::modifiersForEvent` populates ANY DOM-visible modifier for a
+ *  physical Super/Hyper press was not re-checked here (no GUI in this task's scope) -- if it does
+ *  not, `getModifierState` is a no-op on that engine too and a real fix needs a shell-side key
+ *  controller ahead of the WebView, outside `agent-ui/web`. Fix round 2 reads `getModifierState`
+ *  once more, for `"AltGraph"` (`hasAltGraph`) -- the identical caveat applies to it: not re-checked
+ *  against real WebKitGTK either. */
+export type KeyLike = {
+  key: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  isComposing: boolean;
+  keyCode?: number;
+  altKey?: boolean;
+  metaKey?: boolean;
+  getModifierState?: (key: string) => boolean;
+};
+
+/** Fix round 1 (v1 audit review, "R2's Super clause"): whether Super or Hyper is held, read the only
+ *  way this layer can (see `KeyLike`'s own doc comment on `getModifierState` for the honest caveat
+ *  about whether WebKitGTK ever actually sets either). */
+function hasSuperOrHyper(event: KeyLike): boolean {
+  return event.getModifierState?.("Super") === true || event.getModifierState?.("Hyper") === true;
+}
+
+/** Fix round 2 (v1 audit review, "the AltGraph clause"): whether AltGr is held, read the same way
+ *  `hasSuperOrHyper` reads Super/Hyper -- `getModifierState` is the only signal this layer has, and
+ *  it carries the identical, honest caveat about real WebKitGTK. AltGr is a level-3 shift some
+ *  layouts use to type an ordinary character (`@`, `€`); `typingGuard.ts`'s own `MODIFIER_KEYS`
+ *  already lists a BARE `AltGraph` keydown as a modifier rather than a typed key, so treating a key
+ *  held alongside it the same way `Ctrl`/`Alt`/`Meta` are is this predicate catching up to a
+ *  decision this project had already made elsewhere, not a new one. */
+function hasAltGraph(event: KeyLike): boolean {
+  return event.getModifierState?.("AltGraph") === true;
+}
+
+/** v1 audit fixes, 2026-09-28: the single rule for "is this key a plain answer" -- no Ctrl, Alt,
+ *  Meta, Super/Hyper or AltGraph held, and not a key an input method is still composing. Before
+ *  this, the card-answer switch below (`a`/`d`/`D`, R2 and its Super follow-up) and `App.tsx`'s
+ *  bypass-confirm `y` handler (325e007, a whole-branch codex review on `feat/v1-dist--D`) each
+ *  hand-wrote their own version of this list; 325e007's never checked Super/Hyper at all, which is
+ *  exactly the kind of drift two independent lists invite. Composing is folded in here too,
+ *  duplicating `composerKeys.ts`'s `isImeKey` rather than importing it, the same reason
+ *  `resolveKey`'s own top-of-function check does (`KeyLike` stays a plain object with no dependency
+ *  of its own). AltGraph joined this list in fix round 2, closing a gap neither surface had checked
+ *  (a same-day review, run after the reconciliation above already shipped). Shift is deliberately
+ *  absent: it is not a "modifier" for this predicate's purposes -- `D` answers with Shift held, and
+ *  the bypass `y`'s own `Y` still counts, both decided by their own callers. */
+export function isPlainAnswerKey(event: KeyLike): boolean {
+  return (
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    !hasSuperOrHyper(event) &&
+    !hasAltGraph(event) &&
+    !event.isComposing &&
+    event.keyCode !== 229
+  );
+}
 
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
  *  screen) and what REFUSES `i` (a dead session's composer is disabled, so INPUT has no box). The
@@ -214,7 +285,14 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // reason as `G`/`N`/`?` -- most layouts deliver both with Shift held. `D` needs a live session
     // to have anywhere to put the keys (its own row is refused the same way `i`'s and `r`'s are).
     if (event.shiftKey && !event.ctrlKey && event.key === "Y") return { kind: "copy-output" };
-    if (event.shiftKey && !event.ctrlKey && event.key === "D") return ctx.sessionEnded ? null : { kind: "deny-reason" };
+    // R2 (v1 audit P2-A1): Alt/Meta/Super held alongside Shift+D must not reach a card-answer key
+    // -- checked here, ahead of the blanket ctrl/shift-only refusal below, since that refusal never
+    // looks at altKey/metaKey (or Super/Hyper/AltGraph) at all. `isPlainAnswerKey` (v1 audit fixes,
+    // 2026-09-28) is what actually reads all of Ctrl/Alt/Meta/Super/Hyper/AltGraph here -- there is
+    // no separate `!event.ctrlKey` in this condition any more, only the predicate.
+    if (event.shiftKey && isPlainAnswerKey(event) && event.key === "D") {
+      return ctx.sessionEnded ? null : { kind: "deny-reason" };
+    }
     // C1a: `A` (`:h A`), named ahead of the blanket refusal the same reason G/N/Y/D are -- most
     // layouts deliver it with Shift held. Refused on an ended session for the same reason `i`/`o`
     // are just below: INPUT there has no box to place a caret in (spec §3.2).
@@ -300,6 +378,18 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return { kind: "control", delta: -1 };
     case "a":
     case "d":
+      // R2 (v1 audit P2-A1): Alt+a/Meta+a must not authorize or deny a card -- a common OS chord
+      // (e.g. "select all" muscle memory) held with `a` used to reach here unchecked, since the
+      // blanket ctrl/shift-only refusal above never looks at altKey/metaKey and this switch is keyed
+      // on `event.key` alone.
+      // Fix round 1 (v1 audit review, "R2's Super clause"): Super/Hyper is a THIRD, separate GDK
+      // modifier -- it does not "arrive as metaKey", the claim an earlier version of this comment
+      // made and this project's own shell-side code (`SUPER_MASK`/`HYPER_MASK`/`META_MASK` as three
+      // distinct masks, `shell/src/prefix.rs`) disproves. `isPlainAnswerKey` is the shared check for
+      // this (v1 audit fixes, 2026-09-28); see `KeyLike`'s own doc comment for the honest caveat that
+      // Super may be a no-op on WebKitGTK if it never surfaces as a DOM modifier at all, in which case
+      // a real fix needs a shell-side key controller (out of this task's touches list; not built here).
+      if (!isPlainAnswerKey(event)) return null;
       // A dead session's cards are inert: there is nobody left to answer.
       return ctx.sessionEnded ? null : { kind: "answer", decision: event.key === "a" ? "allow" : "deny" };
     case "Enter":

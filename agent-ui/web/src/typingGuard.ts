@@ -32,6 +32,15 @@
  *   denied with it). So the leader and Enter/Space on Stop act only on a key that stands alone, or
  *   at the end of an unbroken run of motion keys (`j`/`k`/`h`/`l`/`g`/`G`/Tab) that itself began
  *   with one: `jj<Space>bd` and `j`⏎ onto Stop stay one quick motion, a word does not.
+ * - **v1 hardening (review `2026-09-27-v1-hardening/v1-release-review.md`, R2-1/R2-2) found two more,
+ *   and neither can use `mayActAfterMotion`**: `f` (the global HINT trigger) and a single-key table
+ *   binding that runs on its very first press (H/L's default tab.prev/tab.next, or an nvim-read
+ *   binding on some other plain letter) are each always the FIRST key of whatever typed them, so
+ *   they never have a motion run behind them to check -- "fix the dashboard layout⏎" started a HINT
+ *   on its own `f` and "Looks good, now add tests⏎" switched tabs on its own `L`, sending the rest of
+ *   the sentence into nvim, a shell or another session's composer. These use `defer` instead, the
+ *   same forward-looking wait `a`/`d` already use (the review's "after-half of S1's rule"): the key
+ *   acts `TYPING_GUARD_MS` later, only if nothing else was typed meanwhile.
  *
  * Pure: it never reads the DOM. Timestamps are the caller's (`event.timeStamp`); the timers are
  * injectable and default to the global ones, looked up at call time so a test's fake timers apply.
@@ -81,6 +90,26 @@ export function leaderTypingFlash(leaderLabel: string): string {
   return `${leaderLabel} starts a sequence only on its own — i or Ctrl+j to type`;
 }
 
+/** v1 hardening R2-1: what the band says when `f` did not ask `shell` for a HINT because another
+ *  key came within `TYPING_GUARD_MS` of it (`TypingGuard.defer`, the same wait `a`/`d` use -- `f` is
+ *  always the first key of whatever typed it, so `mayActAfterMotion`'s backward-only check cannot
+ *  cover it). */
+export function hintTypingFlash(): string {
+  return "f starts HINT only on its own — i or Ctrl+j to type";
+}
+
+/** v1 hardening R2-2: what the band says when a single-key table binding that runs on its very
+ *  first press -- H/L's default tab.prev/tab.next, or an nvim-read binding on some other plain
+ *  letter -- did not run, for the same reason `hintTypingFlash` does not. `key` is the key as a
+ *  person reads it (already human: a table's single-key bindings are never the leader or a space);
+ *  `desc` is the binding's own which-key description (`PanelBinding.desc`: "next tab", "close tab",
+ *  ...), so the band names what did not happen rather than assuming every such key steps tabs (the
+ *  whole-branch review: an nvim-read delete binding was flashed as "switches tabs"). The empty tab's
+ *  own single letters (`r`, `w`) say theirs the same way. */
+export function tableKeyTypingFlash(key: string, desc: string): string {
+  return `${key} (${desc}) runs only on its own — i or Ctrl+j to type`;
+}
+
 export function isModifierKey(key: string): boolean {
   return MODIFIER_KEYS.has(key);
 }
@@ -111,16 +140,19 @@ export class TypingGuard {
   private latestRunIsMotion = false;
   /** The same, for the run ending at `previous`: what `mayActAfterMotion` asks. */
   private previousRunIsMotion = false;
-  /** The waiting answer's timer, boxed so a timer handle that happens to be falsy still counts. */
-  private pending: { handle: unknown } | null = null;
+  /** The waiting action's timer, boxed so a timer handle that happens to be falsy still counts, and
+   *  what the band says should a key cancel it (`defer`'s `cancelledFlash`). */
+  private pending: { handle: unknown; flash: string } | null = null;
 
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
 
   /** Every keydown the panel sees, FIRST, before anything acts on it. A bare modifier is ignored.
-   *  Any other key cancels a waiting answer ("the key that cancelled it still does whatever it
-   *  does"), and returns whether it did, so the caller can flash. */
-  onKey(key: string, t: number): boolean {
-    if (isModifierKey(key)) return false;
+   *  Any other key cancels a waiting action ("the key that cancelled it still does whatever it
+   *  does"), and returns what the band should say about the one it cancelled -- the flash its own
+   *  `defer` named, so a cancelled `f` or `L` says what did not happen instead of talking about
+   *  `a`/`d` (the whole-branch review) -- or `null` when nothing was waiting. */
+  onKey(key: string, t: number): string | null {
+    if (isModifierKey(key)) return null;
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
     this.previousRunIsWalk = this.latestRunIsWalk;
     this.latestRunIsWalk = WALK_KEYS.has(key) && (!continuesRun || this.previousRunIsWalk);
@@ -128,7 +160,7 @@ export class TypingGuard {
     this.latestRunIsMotion = MOTION_KEYS.has(key) && (!continuesRun || this.previousRunIsMotion);
     this.previous = this.latest;
     this.latest = { key, t };
-    return this.cancel();
+    return this.drop();
   }
 
   /** Whether the key `onKey` just recorded (at `t`) may answer now: with nothing within the window
@@ -154,13 +186,14 @@ export class TypingGuard {
     return this.previousRunIsMotion;
   }
 
-  /** `a`/`d`/`D`: when the key `onKey` just recorded stands alone before, runs `run` after
-   *  `TYPING_GUARD_MS` unless another key (`onKey`) or `cancel` comes first, and returns true.
-   *  Otherwise runs nothing and returns false -- the caller flashes. */
-  defer(t: number, repeat: boolean, run: () => void): boolean {
+  /** `a`/`d`/`D`, `f`, a single-key table binding: when the key `onKey` just recorded stands alone
+   *  before, runs `run` after `TYPING_GUARD_MS` unless another key (`onKey`) or `cancel` comes
+   *  first, and returns true. Otherwise runs nothing and returns false -- the caller flashes.
+   *  `cancelledFlash` is what `onKey` hands back should a key cancel this wait. */
+  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string): boolean {
     this.cancel();
     if (!this.mayAnswerNow("", t, repeat)) return false;
-    const waiting: { handle: unknown } = { handle: null };
+    const waiting: { handle: unknown; flash: string } = { handle: null, flash: cancelledFlash };
     waiting.handle = this.timers.setTimeout(() => {
       if (this.pending !== waiting) return;
       this.pending = null;
@@ -170,12 +203,18 @@ export class TypingGuard {
     return true;
   }
 
-  /** Drops a waiting answer, if any, and says whether there was one. Also called for the non-key
+  /** Drops a waiting action, if any, and says whether there was one. Also called for the non-key
    *  cancellations (spec §2.1): `pane_focus`, a tab switch, an overlay opening. */
   cancel(): boolean {
-    if (this.pending === null) return false;
+    return this.drop() !== null;
+  }
+
+  /** Drops a waiting action, returning its `cancelledFlash`, or `null` when none was waiting. */
+  private drop(): string | null {
+    if (this.pending === null) return null;
+    const { flash } = this.pending;
     this.timers.clearTimeout(this.pending.handle);
     this.pending = null;
-    return true;
+    return flash;
   }
 }

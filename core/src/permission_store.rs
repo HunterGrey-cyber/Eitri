@@ -77,7 +77,7 @@ pub fn load(dir: &Path, project_root: &Path) -> LoadedRules {
 /// Adds `rule` (read-modify-write, atomic) and returns the project's rules after it. An unusable
 /// file is set aside first, so the new rule is not lost behind it.
 pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Result<PrefixRules> {
-    std::fs::create_dir_all(dir)?;
+    crate::layout::persist::create_state_dir(dir)?;
     let current = match load(dir, project_root) {
         LoadedRules::Rules(rules) => rules,
         LoadedRules::Missing => PrefixRules::default(),
@@ -96,7 +96,9 @@ pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Resul
     };
     let tmp = temporary(&file);
     let text = serde_json::to_string_pretty(&body).expect("a rules file always serializes");
-    if let Err(err) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &file)) {
+    if let Err(err) =
+        agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &file))
+    {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }

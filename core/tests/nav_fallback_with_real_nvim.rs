@@ -23,7 +23,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use neovibe_core::pane_switch::PaneSwitchChannel;
+use neovibe_core::pane_switch::{PaneMessage, PaneSwitchChannel, PaneSwitchReader};
 use rmpv::Value;
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -536,4 +536,96 @@ fn without_its_environment_the_loader_installs_nothing() {
         }
         nvim.quit();
     }
+}
+
+/// P5-A1, the pane half (`the private review notes`, "P5-A1"): `send()`'s
+/// `pipe:connect` is asynchronous, so the actual write is queued for a *later* turn of nvim's event
+/// loop rather than happening inside the mapping's own call. [`PaneSwitchReader`] (Task 5/R5) already
+/// retains an accepted-but-empty connection across polls rather than dropping it on a short timeout,
+/// which closes the *eventual-delivery* half of the verdict's own probe on its own (a busy-then-idle
+/// nvim still gets its write out, and this crate's reader is patient enough to wait for it) -- so this
+/// test does not repeat that probe. It isolates what only a synchronous sender can guarantee: the
+/// write must be **on the wire before the mapping call returns**, not merely before some later
+/// deadline. A marker file, written by the same callback right after issuing the key and the send,
+/// pins the moment nvim's Lua has returned from running the mapping; the real nvim process is SIGKILLed
+/// the instant that marker appears, cutting off event-loop turns after that point but not before it.
+/// Async `pipe:connect`'s write is scheduled on exactly such a later turn, so it is provably never
+/// written; a synchronous `chansend` inside the mapping has already completed, and the bytes already
+/// sit in the kernel's own socket buffer, unaffected by the sender's death.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_right_after() {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("nav-sync-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let marker = scratch.join("mapping-returned");
+
+    let mut channel =
+        PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("the channel must bind");
+    let listener = channel.take_listener().expect("a fresh channel has its listener");
+    let mut reader = PaneSwitchReader::new(listener);
+
+    // <C-l> fires from a deferred callback (as a real keypress would dispatch through nvim's own
+    // input queue); the marker is written the instant that call returns, i.e. after `send()` --
+    // synchronous or not -- has already been called and, if synchronous, has already completed. The
+    // busy-wait after the marker only keeps the process alive long enough for the harness to observe
+    // the marker and deliver the kill signal before nvim would otherwise move on.
+    let trigger = format!(
+        "lua vim.defer_fn(function() \
+           vim.cmd.normal(vim.api.nvim_replace_termcodes('<C-l>', true, false, true)) \
+           local f = io.open({marker:?}, 'w') \
+           f:write('x') \
+           f:close() \
+           local start = vim.uv.hrtime() \
+           while vim.uv.hrtime() - start < 5000 * 1000000 do end \
+         end, 10)"
+    );
+
+    let mut child = Command::new("nvim")
+        .args(["--clean", "--headless", "-n", "-i", "NONE"])
+        .args(channel.nvim_args())
+        .envs(channel.child_env())
+        .current_dir(&scratch)
+        .env("XDG_STATE_HOME", scratch.join("state"))
+        .env("XDG_DATA_HOME", scratch.join("data"))
+        .env("XDG_CONFIG_HOME", scratch.join("config"))
+        // -c commands precede VimEnter; exercise the same scheduled installer this file's other
+        // tests do, and the same case comment on why.
+        .args(["-c", "doautocmd VimEnter"])
+        .args(["-c", &trigger])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("nvim must be on PATH for this test");
+
+    let deadline = Instant::now() + DEADLINE;
+    while !marker.exists() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the mapping never returned (marker file never appeared) within {DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Cut nvim off mid-busy-loop, well before its own 5s busy-wait would end on its own: a pending
+    // (not yet run) `pipe:connect` write callback never gets another event-loop turn to run in.
+    child.kill().expect("SIGKILL the nvim child");
+    let status = child.wait().expect("wait for nvim");
+    assert!(!status.success(), "expected nvim to die by signal, got {status}");
+
+    let poll_deadline = Instant::now() + Duration::from_millis(300);
+    let mut messages = Vec::new();
+    while Instant::now() < poll_deadline {
+        messages.extend(reader.poll());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        messages,
+        vec![PaneMessage::Direction('R')],
+        "the letter must already be on the wire before the mapping returns, even though nvim was \
+         killed immediately afterward"
+    );
+
+    channel.cleanup();
+    let _ = std::fs::remove_dir_all(&scratch);
 }

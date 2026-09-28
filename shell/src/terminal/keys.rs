@@ -128,6 +128,16 @@ impl RepeatTracker {
 /// fixes all three at once, and does not depend on re-reading the modifier state at release time
 /// the way re-checking `clipboard_chord` there did.
 ///
+/// **A fourth shape (P3-A2, 2026-09-27 Codex audit):** a release whose press WAS forwarded can
+/// still arrive under a different keyval than the press. GDK derives a release's keyval from the
+/// modifier state at release time, not the press's -- a forwarded `Ctrl+Shift+x` whose Shift is
+/// let go before the letter reports the press as the shifted keyval (`X`) and the release as the
+/// unshifted one (`x`), Ctrl still held throughout. Matching the raw keyval missed this and
+/// silently dropped the release, desyncing the child's view of which keys are down under the
+/// kitty keyboard protocol's key-release reporting. [`mark`](Self::mark)/[`take`](Self::take) key
+/// on `keyval.to_lower()` for exactly this reason -- the same normalisation [`clipboard_chord`]
+/// already applies to its own match, for the same underlying GDK behaviour.
+///
 /// A small `Vec`, not a `HashSet`: at most a handful of keys are ever down on a keyboard at once.
 #[derive(Debug, Default)]
 pub struct DeliveredKeys {
@@ -139,16 +149,21 @@ impl DeliveredKeys {
         Self::default()
     }
 
-    /// Records that this keyval's press was forwarded to the child.
+    /// Records that this keyval's press was forwarded to the child. Stored lower-cased (P3-A2):
+    /// see the struct's own doc.
     pub fn mark(&mut self, keyval: GdkKey) {
+        let keyval = keyval.to_lower();
         if !self.held.contains(&keyval) {
             self.held.push(keyval);
         }
     }
 
     /// Whether this keyval's press was forwarded -- and forgets it either way, since a release
-    /// (delivered or not) ends that keyval's story until its next press.
+    /// (delivered or not) ends that keyval's story until its next press. Compared lower-cased
+    /// (P3-A2): a release reported under a different case than its press (Shift let go first)
+    /// still matches -- see the struct's own doc.
     pub fn take(&mut self, keyval: GdkKey) -> bool {
+        let keyval = keyval.to_lower();
         match self.held.iter().position(|&held| held == keyval) {
             Some(index) => {
                 self.held.remove(index);
@@ -658,6 +673,31 @@ mod tests {
         delivered.reset();
         assert!(!delivered.take(GdkKey::a));
         assert!(!delivered.take(GdkKey::b));
+    }
+
+    /// P3-A2 (2026-09-27 Codex audit, verdicts P3): a forwarded `Ctrl+Shift+letter` press marks its
+    /// keyval as GDK reports it while Shift is still held -- the uppercase form. GDK derives a
+    /// release's keyval from the modifier state *at release time*, independent of the press: a user
+    /// who lets go of Shift before the letter has the letter's release reported in lowercase, with
+    /// Ctrl still held. Matching `take()` on the raw keyval therefore missed it and the release was
+    /// silently swallowed (`pane.rs`'s `if !was_delivered { return; }`), desyncing the child's view
+    /// of which keys are down -- a real defect for a program that negotiated the kitty keyboard
+    /// protocol's key-release reporting.
+    #[test]
+    fn a_release_is_matched_even_if_shift_was_let_go_first() {
+        let mut delivered = DeliveredKeys::new();
+        // Ctrl+Shift+x pressed: GDK reports the shifted (uppercase) keyval while Shift is down.
+        delivered.mark(GdkKey::X);
+        // Shift released first, then the letter: GDK now reports the unshifted (lowercase) keyval
+        // for the very same physical key, Ctrl still down. This must still count as its release.
+        assert!(
+            delivered.take(GdkKey::x),
+            "the release must match the press despite Shift's case flip"
+        );
+        // The entry is consumed either way -- a second release of the same physical key (in either
+        // case) finds nothing left to take.
+        assert!(!delivered.take(GdkKey::x));
+        assert!(!delivered.take(GdkKey::X));
     }
 }
 

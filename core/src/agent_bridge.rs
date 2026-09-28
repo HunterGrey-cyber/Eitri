@@ -916,6 +916,9 @@ pub fn serialize_snapshot_with_notes_for_js(
                 // it the frontend had three collections and no way to interleave them, so every
                 // tool card rendered below every message. See `AgentSessionProjection::apply`.
                 "seq": call.seq,
+                // The turn it started in: a `null` result whose turn is no longer the active one
+                // can never arrive, and the panel stops drawing it as running (sw-panel-render-6).
+                "turnId": call.turn_id,
                 "toolUseId": call.tool_use_id,
                 "name": call.name,
                 "input": call.input,
@@ -1048,6 +1051,12 @@ pub fn serialize_snapshot_with_notes_for_js(
         "status": status,
         "activeTurnId": projection.active_turn_id,
         "pendingPermissions": pending_permissions,
+        // sw-panel-render-2 (2026-09-27): this used to be missing entirely, and `applySnapshot`
+        // forced its own copy of the flag to `false` regardless -- but this projection keeps
+        // appending to the open message underneath a snapshot taken mid-reply, so the two sides
+        // disagreed about whether the last transcript entry was still open. Sending the real bit
+        // is what lets `applySnapshot` take it from the wire instead of guessing "closed".
+        "assistantMessageOpen": projection.assistant_message_open,
         "capabilities": {
             "resume": capabilities.resume,
             "fork": capabilities.fork,
@@ -1864,6 +1873,9 @@ mod tests {
         );
         assert_eq!(parsed["state"]["toolCalls"][0]["toolUseId"], "toolu_1");
         assert_eq!(parsed["state"]["toolCalls"][0]["result"]["isError"], true);
+        // The turn it started in, so a panel rehydrated from this snapshot can tell a call of the
+        // active turn from one its ended turn abandoned, as the live reducer can (sw-panel-render-6).
+        assert_eq!(parsed["state"]["toolCalls"][0]["turnId"], "t1");
 
         // The three identities reach the frontend as three separate fields. If any two of these
         // ever collapse to the same source, a consumer will eventually send Claude's id where
@@ -1888,6 +1900,74 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("untested"));
+    }
+
+    /// sw-panel-render-2 (2026-09-27): a snapshot taken mid-reply used to say nothing at all about
+    /// whether the last transcript entry was still open -- `applySnapshot` forced its own copy of
+    /// the bit to `false` regardless, splitting a streaming reply into two rows on every snapshot
+    /// landing mid-stream. This projection's own bit (`assistant_message_open`) is genuinely `true`
+    /// here (a `ContentDelta` with no tool call or turn boundary after it), and the wire must say so.
+    #[test]
+    fn a_snapshot_mid_reply_carries_the_open_message_bit() {
+        let capabilities = agent::ProviderCapabilities {
+            resume: false,
+            fork: false,
+            interrupt: true,
+            bypass_permission_mode: true,
+            interactive_permission_mode: true,
+        };
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-1".into(),
+            provider_session_id: "claude-1".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/tmp".into(),
+        });
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        projection.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: "Use **strong".into(),
+        });
+        assert!(
+            projection.assistant_message_open,
+            "the projection's own bit must be true here"
+        );
+        {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities,
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            assert_eq!(parsed["state"]["assistantMessageOpen"], true);
+        }
+
+        // And the other direction: a tool call closes it, on both sides, and the wire says so too.
+        projection.apply(&AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: json!({}),
+        });
+        assert!(!projection.assistant_message_open);
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities,
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        assert_eq!(parsed["state"]["assistantMessageOpen"], false);
     }
 
     /// The link from a permission card back to the tool call it gates.

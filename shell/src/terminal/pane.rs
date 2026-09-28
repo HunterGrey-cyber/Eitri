@@ -1057,10 +1057,20 @@ fn connect_pointer(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontex
                 return;
             };
             let (x, y) = (start_x + offset_x, start_y + offset_y);
-            let modes = state.borrow().routing_modes();
-            let shift = shift_held(gesture);
-            if pointer::route(shift, modes) == pointer::PointerRoute::Program {
-                report_release(&state, gesture.current_event_state(), x, y);
+            // Task 8 fix (codex p1 #4): decide from `reports.is_held()`, never from `route()`
+            // sampled at release. `route` re-derives its answer from *current* Shift state with no
+            // memory of press time, so gating the release report on `route(shift, modes) ==
+            // Program` (the old code) missed a release with Shift held only at that moment --
+            // `report_release` was skipped, `ReportTracker::held` stayed stranded, and the next
+            // ordinary motion reported a phantom left-button drag (`is_held`'s own doc,
+            // `pointer::tests::a_release_reports_even_when_shift_is_held_only_at_release`). A button
+            // `report_press` reported is real regardless of the Shift state at release (xterm's own
+            // convention: the release follows the press it matches), so `report_release` runs
+            // unconditionally here too -- it is already a no-op if nothing is held, the same fact
+            // `connect_cancel` below already relies on.
+            let was_held = state.borrow().reports.is_held();
+            report_release(&state, gesture.current_event_state(), x, y);
+            if was_held {
                 return;
             }
             if gesture.current_button() == BUTTON_PRIMARY {

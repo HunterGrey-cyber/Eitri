@@ -5,13 +5,13 @@ import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterSidec
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
-import { EMPTY_PANEL_TABLE, resolveKey } from "./keymap";
+import { EMPTY_PANEL_TABLE, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { isModifierKey, leaderTypingFlash, TypingGuard } from "./typingGuard";
+import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "./typingGuard";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -21,13 +21,16 @@ import { findMatch } from "./search";
 import { SearchBar } from "./components/SearchBar";
 import {
   controlsOf,
+  conversationRows,
+  countedStop,
   currentStop,
   hintTargets,
   isActivatableControl,
   nextControl,
-  nextStop,
   permissionTarget,
   rowIndexOf,
+  rowOf,
+  stopOf,
   HINT_ALPHABET,
 } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
@@ -104,12 +107,38 @@ const TOOL_RESULT_SCROLL_STEP_PX = 40;
  *  300ms wait for this panel's answer (spec §3.3). */
 export const HINT_PENDING_TIMEOUT_MS = 1000;
 
+/** R4 (v1 audit P2-A4): the highest count a digit prefix (`3j`, `1000j`, …) accumulates to before a
+ *  motion repeats it. Vim itself never errors on an absurd count -- it silently caps it (a headless
+ *  `nvim --headless -u NONE -c "call feedkeys('99999999999999999999j', 'xt')" -c "echo v:count"`
+ *  probe against this host's real nvim reports `999999999`, vim's own internal `long` overflow
+ *  clamp, whatever the typed digit string). This panel's cap is far smaller and purpose-fit rather
+ *  than matching that number: even repeating a cheap DOM lookup `MAX_MOTION_COUNT` times is already
+ *  more than any real motion needs, and the cap exists only as a second bound underneath the
+ *  boundary early-exit below (the loop stopping the moment a repeat makes no further progress) --
+ *  belt and suspenders, not the primary fix. */
+export const MAX_MOTION_COUNT = 9999;
+
+/** Folds one more typed digit into a count-in-progress, capped at `MAX_MOTION_COUNT` on every step
+ *  (not only at the end) so an arbitrarily long run of digits -- someone holding a number key --
+ *  never builds a number past the cap even transiently. A pure function so R4's cap is testable
+ *  without a DOM: see `onKeyDown`'s `action.kind === "count"` branch for the one call site. */
+export function accumulateMotionCount(count: number | null, digit: number): number {
+  return Math.min(MAX_MOTION_COUNT, (count ?? 0) * 10 + digit);
+}
+
 /** v1 S1 (spec §2.1): what the band says when a typed `a`/`d`/`D`, or an Enter on a card button,
- *  did not answer because another key came within `TYPING_GUARD_MS` of it (`./typingGuard`). */
-const TYPING_FLASH = "a / d answer a card only on their own — i or Ctrl+j to type";
+ *  did not answer because another key came within `TYPING_GUARD_MS` of it (`./typingGuard`). v1
+ *  hardening (R2-3): it says to pause, since `Esc` then `a` -- the route the activity line names --
+ *  is refused the same way when the two come close together, and "type" alone read as if the user
+ *  had been typing. */
+const TYPING_FLASH = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
 /** v1 S4/F13 (spec §2.2): what the band says when `a`/`d`/`D` have no card under the cursor, nor a
- *  card gating the tool call under it -- instead of doing nothing silently. */
+ *  card gating the tool call under it, and no card waits anywhere -- instead of doing nothing
+ *  silently. */
 const NO_CARD_FLASH = "no card here — i, o, A or Ctrl+j to type";
+/** v1 hardening (R2-10): the same refusal while a card IS waiting, just not under the cursor -- it
+ *  points back to the card, as the activity line's "j to it" does, instead of only suggesting typing. */
+const CARD_ELSEWHERE_FLASH = "a / d answer the card under the cursor — j / k onto it, then a / d";
 /** The v1-ui GUI pass (2026-09-27): what the band says when Enter or Space on the activity line's
  *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
  *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
@@ -117,7 +146,14 @@ const STOP_TYPING_FLASH = "Stop takes a key only on its own — i or Ctrl+j to t
 /** Envelopes that move the keys, or put something over the conversation, with no keydown this panel
  *  sees: each drops a waiting `a`/`d`/`D` (spec §2.1's cancel list -- `pane_focus`, an arrival, an
  *  overlay). `nav_key` is the v1 plan's `Ctrl+j`/`Ctrl+k` (its "Interfaces" section), which GTK
- *  claims before the page sees a key; a Set of strings, so naming it needs no type from that task. */
+ *  claims before the page sees a key; a Set of strings, so naming it needs no type from that task.
+ *  **The mode cycle key (Shift+Tab, R3, v1 audit P2-A2) is spec §2.1's cancel list too, but is NOT a
+ *  member of this Set**: it is a real keydown, not an inbound envelope with no keydown of its own,
+ *  so it cannot be named here -- `onModeKey`'s document-capture handler calls `typingGuard.onKey`
+ *  directly instead (fix round 1: not a bare `cancel()`, which would drop a pending answer but never
+ *  record the key itself, leaving Shift+Tab invisible to the guard's own "before" half), since its
+ *  own `stopPropagation` (needed to keep Shift+Tab from WebKit's backward focus navigation) means the
+ *  bubble-phase `onKeyDown` that feeds every OTHER key to `typingGuard.onKey` never runs for it. */
 const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key"]);
 
 /** Whether a pending `j`/`k` cursor move should instead scroll the CURSOR ROW's own overflow box
@@ -142,9 +178,9 @@ const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "
  *  jsdom implements no layout, so `scrollHeight`/`clientHeight` both read 0 for every element and
  *  this always returns `false` there unless a test overrides them -- `App.test.tsx`'s own tests
  *  for this function do exactly that to reach the `true` branch at all. */
-function scrollCursorRowBox(container: HTMLDivElement | null, direction: 1 | -1): boolean {
-  const box = container?.querySelector<HTMLElement>(".row-current .tool-result-body") ?? null;
-  if (box === null) return false;
+function scrollCursorRowBox(row: HTMLElement | null, direction: 1 | -1): boolean {
+  const box = row?.querySelector<HTMLElement>(".tool-result-body") ?? null;
+  if (row == null || box === null) return false;
   // The box can be off screen: the user mouse-scrolled the list elsewhere while the cursor stayed
   // on this row. Scrolling it then changes nothing visible, and since the cursor does not move the
   // cursor-follow effect never brings it back -- `j` would look dead for many presses, the very
@@ -157,7 +193,7 @@ function scrollCursorRowBox(container: HTMLDivElement | null, direction: 1 | -1)
     const b = box.getBoundingClientRect();
     const l = list.getBoundingClientRect();
     if (b.bottom <= l.top || b.top >= l.bottom) {
-      box.closest(".row-current")?.scrollIntoView({ block: "nearest" });
+      row.scrollIntoView({ block: "nearest" });
       return true;
     }
   }
@@ -241,10 +277,9 @@ function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1
  *  Returns `false` when there is no layout to judge (a list with no height -- jsdom, or a panel not
  *  laid out yet), or when writing `scrollTop` did not move anything (already at the list's end):
  *  a press that can make no progress must fall through to the ordinary move, never be eaten. */
-function scrollCursorRow(container: HTMLDivElement | null, direction: 1 | -1): boolean {
-  const row = container?.querySelector<HTMLElement>(".row-current") ?? null;
+function scrollCursorRow(row: HTMLElement | null, direction: 1 | -1): boolean {
   const list = row?.closest<HTMLElement>(".message-list") ?? null;
-  if (row === null || list === null) return false;
+  if (row == null || list === null) return false;
   const r = row.getBoundingClientRect();
   const l = list.getBoundingClientRect();
   if (l.bottom - l.top <= 0) return false;
@@ -262,7 +297,7 @@ function scrollCursorRow(container: HTMLDivElement | null, direction: 1 | -1): b
 /** The conversation rows inside `list` that are at least partly on screen. */
 function visibleRows(list: HTMLElement): HTMLElement[] {
   const l = list.getBoundingClientRect();
-  return Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')).filter((row) => {
+  return conversationRows(list).filter((row) => {
     const r = row.getBoundingClientRect();
     return r.bottom > l.top && r.top < l.bottom;
   });
@@ -385,18 +420,21 @@ export default function App() {
   /** What each in-flight request actually was, so its reply can be handled as that thing. A ref: it
    *  is bookkeeping, never rendered, and a render per outgoing command would be pure cost.
    *
-   *  Only the kinds whose replies need special handling are recorded. An interrupt or a permission
-   *  response has no entry and comes back as `undefined`, which is correct rather than a gap: its
-   *  refusal takes the plain "show the reason" path. Every recorded request gets exactly one
+   *  Only the kinds whose replies need special handling are recorded. An interrupt has no entry and
+   *  comes back as `undefined`, which is correct rather than a gap: its refusal takes the plain
+   *  "show the reason" path. A permission response is recorded (`"permission"`, with its card's id)
+   *  since Codex's whole-branch review: Rust refuses one and leaves the card waiting (an "Always
+   *  allow" whose rule could not be saved, ruling 16), and the card must then take an answer again
+   *  instead of staying answered here for good. Every recorded request gets exactly one
    *  `command_result` and is deleted there, so this cannot grow.
    *
    *  `"editor"` covers `edit_draft`/`open_path`/`view_in_editor` (Task 8/15): all three reach the
    *  scratch editor in Rust, and a refusal of any of them is a footer flash (`showFlash`), not the
    *  banner -- a scratch-editor round trip that a `gf` or `Ctrl+g` failed to start is a footer
    *  nicety, not something that should fill the space a real conversation error gets. */
-  const inFlight = useRef<Map<string, { kind: "send" | "handoff" | "editor"; tab: TabId; text?: string }>>(
-    new Map(),
-  );
+  const inFlight = useRef<
+    Map<string, { kind: "send" | "handoff" | "editor" | "permission"; tab: TabId; text?: string; permissionId?: string }>
+  >(new Map());
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
   /** Bumped only when the `snapshot` arm actually applies a saved view's cursor/mode/expanded
@@ -526,6 +564,20 @@ export default function App() {
   const [queueError, setQueueError] = useState<string | null>(null);
   const [history, setHistory] = useState<string[]>([]);
   const [ruleOffers, setRuleOffers] = useState<Record<string, string>>({});
+  /** v1 hardening (ruling R2): the cards this tab has answered from this panel, by `permissionId`,
+   *  whichever way -- a card's own button or `a`/`d`. This is the card's old `answered` guard lifted
+   *  out of `PermissionCard`, because `a`/`d` no longer press the card's button (a DOM query for it
+   *  could find a button a model reply drew): they call `answerPermission` with the card's id, and
+   *  the double-answer protection has to hold on that path too. `answeredRef` is the same set,
+   *  current between renders, for the check `answerPermission` makes and for a wait `a`/`d` are
+   *  still in. Tab-scoped like `ruleOffers`: reset on a switch, and an id leaves it once its card
+   *  is no longer pending (the effect after `answerableItems`). */
+  const [answeredPermissions, setAnsweredPermissions] = useState<ReadonlySet<string>>(() => new Set());
+  const answeredRef = useRef<ReadonlySet<string>>(answeredPermissions);
+  /** The reason typed so far into each pending card's box, reported by the card as it changes, so
+   *  `d` sends it exactly as the card's own Deny does (ruling R2). A ref, not state: typing in the
+   *  box must not re-render the whole panel. */
+  const permissionReasons = useRef(new Map<string, string>());
   const [editorContext, setEditorContext] = useState<ContextSummary | null>(null);
   /** R2's pill, reported up by `MessageList` (panel round 2 plan, Task 10) rather than floated over
    *  the last line by a `NewPill` this component owned itself -- see `MessageList`'s own
@@ -982,6 +1034,18 @@ export default function App() {
       ),
     [timeline],
   );
+  /* An answered card leaves `answeredPermissions` (and its typed reason `permissionReasons`) once it
+     is no longer pending: nothing can answer it any more, and an id the provider hands out again
+     later names a new card. `state` is always the active tab's (a switch resets it, and both of
+     these, in the same dispatch), so this never drops another tab's entry. */
+  useEffect(() => {
+    const pending = new Set(state.pendingPermissions.map((p) => p.permissionId));
+    for (const id of permissionReasons.current.keys()) if (!pending.has(id)) permissionReasons.current.delete(id);
+    const kept = [...answeredRef.current].filter((id) => pending.has(id));
+    if (kept.length === answeredRef.current.size) return;
+    answeredRef.current = new Set(kept);
+    setAnsweredPermissions(answeredRef.current);
+  }, [state.pendingPermissions]);
   /** v1 S1 (spec §2.1, `./typingGuard`): every keydown `onKeyDown` sees is fed to it first; `a`/`d`/
    *  `D` wait `TYPING_GUARD_MS` through it, and Enter on a card button asks it. One per panel, kept
    *  across renders (the dispatch below is installed once and reads this same instance). */
@@ -1084,6 +1148,32 @@ export default function App() {
       });
       if (route === "overlay") return;
       event.stopPropagation();
+      // R3 (v1 audit P2-A2): this capture-phase handler runs AHEAD of the bubble-phase `onKeyDown`
+      // that would otherwise feed Shift+Tab to `typingGuard.onKey` (the same mechanism
+      // `answerConfirm` uses for a `confirm_bypass` prompt, this file's own `answerConfirm`) -- and
+      // the `stopPropagation` just above means that bubble handler never runs at all for either route
+      // reached from here, "cycle" or "fixed". Without recording it here directly, a card answer
+      // `a`/`d` deferred moments earlier stayed armed and fired `TYPING_GUARD_MS` later even though
+      // the user had already moved on by pressing Shift+Tab. `EmptyTab` has no permission cards (it
+      // only mounts for a `not_started`/`starting` tab), so this class of bug does not reach it; its
+      // own doc comment on this same key (`EmptyTab.tsx`'s `onKeyDown`) already says this handler
+      // claims Shift+Tab before EmptyTab's bubble handler ever sees it.
+      // Fix round 1 (v1 audit review, codex finding 2): `typingGuard.onKey("Tab", ...)`, not a bare
+      // `cancel()` -- `cancel()` only drops a pending deferred `a`/`d` and never updates the guard's
+      // own "last key" bookkeeping, so a typed key immediately before this route's Shift+Tab kept
+      // ending the run, but Shift+Tab itself stayed invisible to it: `a` pressed moments AFTER a
+      // Shift+Tab (spec §2.1's "before" half) used to answer at once instead of refusing, exactly the
+      // asymmetry `answerConfirm` (below) does not have, since it already calls `onKey` for this same
+      // key. `onKey`'s own return is the flash for whatever it cancelled (mirroring the bubble-phase
+      // `onKeyDown`'s own `typingGuard.onKey` call), so a deferred `f`/`L` cancelled by a Shift+Tab
+      // now says so instead of leaving the band silent about a swallowed `a`. The `event.timeStamp >
+      // 0 ? ... : performance.now()` fallback matches every other `onKey`/`defer` call site in this
+      // file (`onKeyDown`, `answerConfirm`) -- the two clocks are NOT interchangeable under a test's
+      // faked timers (`event.timeStamp` tracks the faked `Date`; `performance.now()` does not), so
+      // using the wrong one here would silently compare a real timestamp against a faked one and
+      // always read as "long ago".
+      const cancelled = typingGuard.onKey("Tab", event.timeStamp > 0 ? event.timeStamp : performance.now());
+      if (cancelled !== null) showFlash(cancelled);
       if (route === "cycle") post({ type: "cycle_mode" });
       // "r" (not a rebindable panel-table action, so nothing on the wire names it): reaching
       // "fixed" always means the tab has already ended or failed.
@@ -1191,7 +1281,9 @@ export default function App() {
    *  the viewport around on every single step even when nothing needed to move.
    *
    *  Reads through `containerRef` -- already queried above for focus -- rather than a second ref
-   *  into `MessageList`'s own DOM, since `.row-current` is always a descendant of it.
+   *  into `MessageList`'s own DOM, since every row is a descendant of it. The row is the cursor's
+   *  own (`conversationRows`), never the first `.row-current` in the DOM: a model reply's HTML could
+   *  draw one of those above the real row (v1 hardening, ruling R2).
    *
    *  Kept from fighting `MessageList`'s own follow-the-newest-message effect (`MessageList.tsx`,
    *  the `bottomRef` effect -- the GUI pass, 2026-09-24: there is no `bottomRef` any more; the follow
@@ -1210,8 +1302,9 @@ export default function App() {
     const landing = landingRef.current;
     landingRef.current = 0;
     if (landing === "keep") return;
-    const row = containerRef.current?.querySelector<HTMLElement>(".row-current");
-    if (row == null) return;
+    const root = containerRef.current;
+    const row = root === null ? undefined : conversationRows(root)[cursor];
+    if (row === undefined) return;
     revealRow(row.closest<HTMLElement>(".message-list"), row, landing);
   }, [cursor]);
   /** R1: a scroll the panel did not cause by moving the cursor -- a wheel, a drag, the browser's own
@@ -1225,7 +1318,7 @@ export default function App() {
     const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
     if (!list) return;
     const onListScroll = () => {
-      const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+      const rows = conversationRows(list);
       const next = clampCursorToView(list, rows, cursorRefForScroll.current);
       if (next !== null && next !== cursorRefForScroll.current) {
         landingRef.current = "keep";
@@ -1427,7 +1520,8 @@ export default function App() {
     // effect, so the row is revealed here -- after the restore's own scroll, which is a layout effect.
     landingRef.current = 0;
     if (index === cursorRef.current) {
-      const row = containerRef.current?.querySelector<HTMLElement>(".row-current");
+      const root = containerRef.current;
+      const row = root === null ? undefined : conversationRows(root)[index];
       if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
     } else setCursor(index);
     containerRef.current?.focus();
@@ -1602,6 +1696,13 @@ export default function App() {
         // run against the new one (Review Focus 1) -- cancelled before the new table is even
         // stored, so nothing between these two statements could read a mismatched pair.
         clearSequence();
+        // v1 audit P2-A6: `clearSequence` only drops a pending MULTI-key sequence (`seqRef`) -- a
+        // single-key table binding deferred by `typingGuard.defer` (H/L's default tab.prev/tab.next,
+        // or an nvim-read binding on some other plain letter, R2-2) closes over the OLD table's
+        // `binding` at keydown time, and stayed armed to run it `TYPING_GUARD_MS` later against
+        // whatever the table now says even after being replaced. Cancelled here too, before the new
+        // table is stored, for the same reason as the line above.
+        typingGuard.cancel();
         setKeymapHelp({
           prefix: payload.prefix,
           window: payload.window,
@@ -1737,6 +1838,11 @@ export default function App() {
           setDetail(null);
           setHandoffOpen(false);
           setChooser(null);
+          // v1 audit P2-A5: a `gf` picker waiting over the OLD tab's conversation names paths that
+          // mean nothing over the new one -- left set, its very next letter opened one of them
+          // regardless of which tab now has the keys (the keydown handler's `pathPick !== null`
+          // branch runs ahead of everything else and does not itself check the active tab).
+          setPathPick(null);
           cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list: a DIFFERENT active tab only
           // R4: a `/` prompt was over the OLD tab's conversation and means nothing over the new one.
           setSearch(null);
@@ -1747,6 +1853,9 @@ export default function App() {
           setQueue([]);
           setQueueError(null);
           setRuleOffers({});
+          answeredRef.current = new Set();
+          setAnsweredPermissions(answeredRef.current);
+          permissionReasons.current.clear();
           // The OLD tab's unread pill means nothing over a fresh, empty timeline. A tab with no saved
           // view (never parked, or a reload's/fresh mount's first snapshot) or one left following
           // starts with no threshold to remember -- the `snapshot` arm's restore block below sets a
@@ -1912,8 +2021,21 @@ export default function App() {
             if (record.tab === activeTabRef.current) {
               // The composer cleared this optimistically. Rust refused it, so it goes back — a
               // message that vanishes with no trace is the outcome this exists to prevent.
+              // R1 (P2-A3, v1 audit): `draftRef.current` is mirrored on every keystroke (including
+              // the optimistic clear itself), so it names exactly what the box holds right now. If
+              // nothing was typed since that clear it is still "", and the refused text is restored
+              // alone; if the user typed since, what they typed is kept and the refused text goes
+              // BEFORE it, separated by a newline, so neither is lost. Mirrored to Rust here, once,
+              // through the same `mirrorDraft` ordinary typing uses (not inside `Composer`'s generic
+              // restore effect, which also fires on a plain tab-switch clear and on Rust's own
+              // `draft` echo -- mirroring unconditionally there re-echoed both of those back out as
+              // a spurious empty `draft` post, caught by an unrelated leader-sequence test that
+              // types nothing at all), so a later tab switch brings the recovered text back too.
+              const typedSince = draftRef.current;
+              const recovered = typedSince === "" ? (record.text ?? "") : `${record.text ?? ""}\n${typedSince}`;
               restoreSeq.current += 1;
-              setRestoredDraft({ text: record.text ?? "", seq: restoreSeq.current });
+              setRestoredDraft({ text: recovered, seq: restoreSeq.current });
+              mirrorDraft(recovered);
               setCommandNotice(`That message was not sent (${payload.error}). It is back in the box.`);
             } else {
               // The tab this was sent from is no longer the active one (the user switched away
@@ -1927,6 +2049,18 @@ export default function App() {
             // something that should fill the banner reserved for conversation-breaking errors.
             showFlash(payload.error);
           } else {
+            if (record?.kind === "permission" && record.permissionId !== undefined && record.tab === activeTabRef.current) {
+              // Refused, so not answered: Rust leaves the card waiting ("the card stays and `a` still
+              // works", ruling 16), and so must this panel -- `a`/`d` and the card's own buttons were
+              // dead until a reset (Codex's whole-branch review, reproduced against these handlers).
+              const permissionId = record.permissionId;
+              if (answeredRef.current.has(permissionId)) {
+                const next = new Set(answeredRef.current);
+                next.delete(permissionId);
+                answeredRef.current = next;
+                setAnsweredPermissions(next);
+              }
+            }
             setCommandNotice(payload.error);
           }
         }
@@ -2209,7 +2343,7 @@ export default function App() {
       // A control inside a conversation row (a card's Approve) also brings the row cursor to that
       // row, the same place `l` would have reached it from: otherwise `h` from it would hand the
       // keys back to some other row, and `a`/`d` would answer a different card.
-      const row = target.el.closest<HTMLElement>('[data-nav-stop="row"]');
+      const row = root === null ? null : rowOf(root, target.el);
       const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
       if (rowIndex !== null) setCursor(rowIndex);
       landedControlRef.current = target.el;
@@ -2221,7 +2355,7 @@ export default function App() {
     // index is read now, from the element, never taken from `target.rowIndex`: rows can be added
     // above it while the labels are up (a permission card is anchored right after its tool call),
     // and the index frozen at `hint_collect` would then name a different row.
-    const row = target.kind === "row" ? target.el : target.el.closest<HTMLElement>('[data-nav-stop="row"]');
+    const row = target.kind === "row" ? target.el : root === null ? null : rowOf(root, target.el);
     const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
     if (rowIndex === null) return;
     if (target.kind === "code") copyCodeRef.current = target.el;
@@ -2322,9 +2456,34 @@ export default function App() {
     post({ type: "interrupt" });
   }
 
+  /** `r` on an ended tab (ruling 12). Fix round 1 (v1 audit, codex): `TabSet::reset` (Rust) folds
+   *  `tab.queue` and Rust's OWN `tab.draft` together as the tab's fresh draft -- reading whatever
+   *  Rust currently has on file, not whatever this box shows. A refusal's recovered text is mirrored
+   *  through the same 300ms debounce ordinary typing uses (`mirrorDraft`), so pressing `r` inside
+   *  that window used to send `reset_tab` while Rust's copy was still stale: the `draft` echo that
+   *  came back both wiped the composer and nulled `pendingDraftRef`, silently dropping the mirror
+   *  that debounce would otherwise have sent. `flushDraft()` here delivers whatever is still pending
+   *  FIRST, the same way a real tab switch already does (ruling 6's `tabs` handler) -- a no-op when
+   *  nothing is pending. */
+  function resetTab() {
+    flushDraft();
+    post({ type: "reset_tab" });
+  }
+
+  /** Every answer to a card goes through here -- its own buttons, Enter in its reason box, and
+   *  `a`/`d` (ruling R2) -- so one card is answered once, whichever of them gets there first. */
   function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) {
-    post({
+    const tab = activeTabRef.current;
+    if (answeredRef.current.has(permissionId) || tab === null) return;
+    answeredRef.current = new Set(answeredRef.current).add(permissionId);
+    setAnsweredPermissions(answeredRef.current);
+    // Recorded, so a refusal gives the card back (`inFlight`'s doc).
+    const requestId = nextRequestId();
+    inFlight.current.set(requestId, { kind: "permission", tab, permissionId });
+    postToRust({
       type: "permission_response",
+      request_id: requestId,
+      tab,
       permission_id: permissionId,
       decision,
       reason,
@@ -2502,7 +2661,18 @@ export default function App() {
       typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
       if (confirm.kind === "bypass") {
         if (event.key === "y" || event.key === "Y") {
+          // Whole-branch review (codex, 2026-09-28): a y with Ctrl/Alt/Meta held, or one an input
+          // method is composing, is an editing keystroke, never D11's lone y -- the timing guard
+          // alone let `Ctrl+y` or a pinyin syllable's first letter enter bypass. Shift stays (`Y`).
+          // v1 audit fixes (2026-09-28): reconciled with keymap.ts's card-answer R2 rule onto one
+          // shared predicate, `isPlainAnswerKey` -- this file's own original hand-written check
+          // (superseded, not visible above any more) never tested Super/Hyper, the same gap R2's own
+          // fix round 1 closed on `a`/`d`/`D`; fix round 2 closed a further gap neither side had,
+          // AltGraph. `event.nativeEvent` is what carries a real `getModifierState`, the same cast
+          // `resolveKey`'s own call site uses.
+          const plain = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike);
           if (
+            plain &&
             !event.repeat &&
             bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
           ) {
@@ -2646,7 +2816,7 @@ export default function App() {
             }}
             onResume={(id) => post({ type: "resume", provider_session_id: id })}
             onCycleMode={() => post({ type: "cycle_mode" })}
-            onReset={() => post({ type: "reset_tab" })}
+            onReset={resetTab}
             onHint={requestHint}
             // The dashboard's `w` item (panel round 2 plan, Task 12; spec §7): the same window-level
             // `tab_verb choose` `runPanelAction`'s `tab.choose` case posts for `prefix w`.
@@ -2745,19 +2915,70 @@ export default function App() {
      input it cannot deliver. */
   const handingOff = tabs !== null && handoffRequests.has(tabs.active);
 
-  /** v1 S1/S4 (spec §2.1-§2.2): `a`/`d`/`D` on `target` -- the card's own button or reason box, or
-   *  `null` when there is no card for the cursor (F13's flash). The answer runs `TYPING_GUARD_MS`
-   *  later, only if the key stood alone before and nothing cancels the wait; by then the card must
-   *  still be on screen (a resolved card's row is gone) and the panel still in BROWSE. */
-  function waitThenAnswer(event: KeyboardEvent<HTMLDivElement>, typedAt: number, target: HTMLElement | null, run: () => void) {
-    if (target === null) {
-      showFlash(NO_CARD_FLASH);
+  /** v1 S1/S4 (spec §2.1-§2.2): `a`/`d`/`D` on a card. `stillThere` says whether the card the key
+   *  was aimed at can still take it, or is `null` when there is no card for the cursor (F13's
+   *  flash). The answer runs `TYPING_GUARD_MS` later, only if the key stood alone before and nothing
+   *  cancels the wait; by then the card must still be there (`stillThere`) and the panel still in
+   *  BROWSE. */
+  function waitThenAnswer(
+    event: KeyboardEvent<HTMLDivElement>,
+    typedAt: number,
+    stillThere: (() => boolean) | null,
+    run: () => void,
+  ) {
+    if (stillThere === null) {
+      const waitingElsewhere = stateRef.current.pendingPermissions.some((p) => !answeredRef.current.has(p.permissionId));
+      showFlash(waitingElsewhere ? CARD_ELSEWHERE_FLASH : NO_CARD_FLASH);
       return;
     }
-    const waiting = typingGuard.defer(typedAt, event.repeat, () => {
-      if (target.isConnected && modeRef.current === "browse") run();
-    });
+    const waiting = typingGuard.defer(
+      typedAt,
+      event.repeat,
+      () => {
+        if (stillThere() && modeRef.current === "browse") run();
+      },
+      TYPING_FLASH,
+    );
     if (!waiting) showFlash(TYPING_FLASH);
+  }
+
+  /** v1 hardening, ruling R2: `a`/`d` answer the card at timeline index `target` by its own
+   *  `permissionId`, through `answerPermission` -- the path the card's buttons take -- never by
+   *  clicking a button a DOM query found. The query this replaced indexed every
+   *  `[data-nav-stop="row"]` in the subtree with a TIMELINE index, so rows a model reply drew shifted
+   *  it, and `a` on the card the cursor showed approved the one above it (review
+   *  `2026-09-27-v1-hardening/codex-sec-panel-content-verdicts.md`, finding 1). The timeline item
+   *  is the card the cursor is drawn on, by construction (`MessageList` draws `.row-current` on
+   *  `timeline[cursor]`). `d` sends the reason already typed into the card's box, as its Deny does. */
+  function answerCardByKey(
+    event: KeyboardEvent<HTMLDivElement>,
+    typedAt: number,
+    target: number | null,
+    decision: "allow" | "deny",
+  ) {
+    const item = target === null ? undefined : timeline[target];
+    const permissionId = item?.kind === "permission" ? item.request.permissionId : null;
+    const tab = activeTabRef.current;
+    const stillThere =
+      permissionId === null
+        ? null
+        : () => {
+            // The same card, in the same tab, still pending and not yet answered; a card whose
+            // session ended is inert (its buttons are disabled), so the key is too.
+            const now = stateRef.current;
+            return (
+              activeTabRef.current === tab &&
+              !answeredRef.current.has(permissionId) &&
+              now.status.kind !== "unavailable" &&
+              now.status.kind !== "closed" &&
+              now.pendingPermissions.some((p) => p.permissionId === permissionId)
+            );
+          };
+    waitThenAnswer(event, typedAt, stillThere, () => {
+      if (permissionId === null) return;
+      const reason = decision === "deny" ? permissionReasons.current.get(permissionId) || undefined : undefined;
+      answerPermission(permissionId, decision, reason);
+    });
   }
   /** The key table's home: mode + key + context in, an action out, applied here. Only claims what
    *  `resolveKey` claims -- an unrecognised key, or one INPUT leaves to the input method (a
@@ -2786,7 +3007,10 @@ export default function App() {
     // so in the band -- and this key still does whatever it does. Shift+Tab as WebKitGTK delivers
     // it (`isShiftTab`) is the walk key `Tab`, like the standard shape.
     const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
-    if (typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt)) showFlash(TYPING_FLASH);
+    // The flash is the cancelled wait's own (`TypingGuard.defer`'s `cancelledFlash`): a cancelled
+    // `f` or `L` says what did not happen, never the `a`/`d` text (the whole-branch review).
+    const cancelled = typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt);
+    if (cancelled !== null) showFlash(cancelled);
     // The chooser is modal (Codex v1-mode finding 5): it is drawn inside this root, and a key it does
     // not handle itself (`a`, `d`, anything but its own j/k/Enter/x/`/`/q/Esc/g/G/Ctrl+r/Shift+Tab)
     // bubbled here and reached `resolveKey`, whose `a`/`d` pressed the Approve/Deny of a card the
@@ -2924,8 +3148,23 @@ export default function App() {
     // `g`/`z`/`[`/`]` to `resolveKey`'s own reserved two-key prefixes (`./leader`'s own doc comment).
     if (mode === "browse" && !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) {
       if (seqRef.current !== null) {
+        // v1 hardening, codex-release-p1 #6 (R25): a bare modifier's own keydown (the Control of a
+        // Ctrl+c combo) is not "the next key" -- it must not cancel a pending sequence, the same way
+        // `pendingRef`'s own `g`/`z`/`[`/`]` prefix is guarded just below and `TypingGuard.onKey`
+        // ignores it. Without this, the bare `Control` cancelled the sequence and the `c` that
+        // followed fell through to `resolveKey`'s Ctrl+c interrupt arm instead of being swallowed.
+        if (isModifierKey(event.key)) return;
         event.preventDefault();
-        applySeqStep(advanceSequence(panelTable, seqRef.current.typed, event.key));
+        // Fix round 1 (reviewer finding, codex-release-p1 #3): `advanceSequence` compares `event.key`
+        // alone, so a real Ctrl/Alt chord (Ctrl+d after the bare Control above left the sequence
+        // armed) reached it as plain "d" and could complete a binding no vim mapping would ever match
+        // -- `<leader>bd` for Ctrl+d, not the bare `d` the table actually names. `startSequence`
+        // already refuses to START a sequence on a Ctrl/Alt chord (just below); a chord arriving as a
+        // CONTINUATION gets the same refusal, R25's "unbound key after the leader is swallowed" (a
+        // chord matches no table key, modifier included, so it is unbound here by definition).
+        applySeqStep(
+          event.ctrlKey || event.altKey ? { kind: "cancel" } : advanceSequence(panelTable, seqRef.current.typed, event.key),
+        );
         return;
       }
       if (!event.ctrlKey && !event.altKey) {
@@ -2935,9 +3174,30 @@ export default function App() {
           // The v1-ui GUI pass (2026-09-27): the leader starts a sequence only on a key that stands
           // alone or ends a quick motion -- in the middle of typed prose it is swallowed and says
           // so ("set up my" ran `<leader>m`, "the boy" `<leader>bo` and answered it with its `y`).
-          // Only the leader: a single-key table binding (`H`/`L`) runs as before.
           if (event.key === panelTable.leader && !typingGuard.mayActAfterMotion(typedAt, event.repeat)) {
             showFlash(leaderTypingFlash(panelTable.leaderLabel));
+            return;
+          }
+          // v1 hardening R2-2: any OTHER single-key table binding that runs on this very first key
+          // -- H/L's default tab.prev/tab.next, or an nvim-read binding on some other plain letter --
+          // used to run at once ("Only the leader ... runs as before"), so "Looks good, now add
+          // tests⏎" switched tabs on its own `L` and sent the rest into another session's composer.
+          // `mayActAfterMotion` cannot help here (the review: "L is the first key" -- there is never
+          // a motion run behind it), so this defers the same way `a`/`d` do: it runs
+          // `TYPING_GUARD_MS` later, only if nothing else was typed meanwhile and the panel is still
+          // in BROWSE (typingGuard.ts's own doc comment).
+          if (start.kind === "run") {
+            const { binding } = start;
+            const flash = tableKeyTypingFlash(event.key, binding.desc);
+            const waiting = typingGuard.defer(
+              typedAt,
+              event.repeat,
+              () => {
+                if (modeRef.current === "browse") applySeqStep({ kind: "run", binding });
+              },
+              flash,
+            );
+            if (!waiting && !event.repeat) showFlash(flash);
             return;
           }
           applySeqStep(start);
@@ -2956,9 +3216,11 @@ export default function App() {
     // R4: a digit accumulates into the count the NEXT `j`/`k`/`[[`/`]]` repeats -- read back out of
     // `countRef` (as `count`, above) by that key, once it arrives. Handled first, and returns at
     // once, so a bare digit never falls into the scroll-announcing or row-motion code below it.
+    // Capped by `accumulateMotionCount` (v1 audit R4) on every digit, not only at the end, so a long
+    // run of digits never accumulates past `MAX_MOTION_COUNT` even transiently.
     if (action.kind === "count") {
       event.preventDefault();
-      countRef.current = (count ?? 0) * 10 + action.digit;
+      countRef.current = accumulateMotionCount(count, action.digit);
       return;
     }
     // How many times THIS key repeats its move: the count just accumulated (cleared above, so this
@@ -2981,6 +3243,10 @@ export default function App() {
     // A code block HINT landed on is "the item" for exactly the next `y`; any other key moves on.
     const landedCode = copyCodeRef.current;
     copyCodeRef.current = null;
+    // The row the cursor is on, found by structure (`conversationRows`), never as the first
+    // `.row-current` or the `cursor`-th `[data-nav-stop="row"]` in the subtree: a model reply's own
+    // HTML can carry either (v1 hardening, ruling R2). Read only by the keys that need it.
+    const cursorRow = () => (root === null ? null : (conversationRows(root)[cursor] ?? null));
     // `j`/`k` scroll the cursor row's own overflow box (a long tool result) before they move off it
     // -- the vim behaviour the owner expected; `scrollCursorRowBox`'s own doc says why this cannot
     // live in `resolveKey`. Failing that, they scroll the conversation through a current row that
@@ -2989,7 +3255,7 @@ export default function App() {
     if (
       action.kind === "move" &&
       !edgeFocused &&
-      (scrollCursorRowBox(root, action.delta) || scrollCursorRow(root, action.delta))
+      (scrollCursorRowBox(cursorRow(), action.delta) || scrollCursorRow(cursorRow(), action.delta))
     ) {
       event.preventDefault();
       // `j`/`k` are row motions. If a control inside the row had the keys (after `l` onto a card's
@@ -3007,18 +3273,13 @@ export default function App() {
       if (action.kind === "move") {
         // R4's count repeats the step `times` times, each from the row the PREVIOUS step landed on
         // -- not `times` cells in one leap, so a stop with no row (a banner, the status line) still
-        // ends the walk exactly where `nextStop` says it must, same as a single `j`/`k` would.
-        let target: HTMLElement | null = null;
-        let row = cursor;
-        for (let n = 0; n < times; n++) {
-          const next = nextStop(root, row, action.delta);
-          if (next === null) break;
-          target = next;
-          const nextRow = rowIndexOf(root, next);
-          if (nextRow === null) break;
-          row = nextRow;
-        }
-        if (target === null) return;
+        // ends the walk exactly where a single `j`/`k` onto it would. v1 audit R4 (P2-A4): the walk
+        // is `countedStop`, which reads the tree once whatever `times` is (up to `MAX_MOTION_COUNT`)
+        // and stops at a boundary, where a step makes no progress (`clampStep` clamps rather than
+        // returning `null` -- the C1c comment below). Its own doc has the measurements.
+        const landing = countedStop(root, cursor, action.delta, times);
+        if (landing === null) return;
+        const target = landing.stop;
         // C1c (spec §3.4): `j` that cannot move -- `nextStop` clamps rather than returning `null` at
         // a boundary (`clampStep`'s own doc comment), so "the last stop" is the stop the keys are
         // already on (the last row, or Stop while a turn runs), not `target === null` (that case is
@@ -3028,14 +3289,14 @@ export default function App() {
         // Never again on the repeats after that. `k` at the FIRST stop stays silent, as vim's own `k`
         // on the first line does (`:h j`) -- only `j` names a route the reader might actually want next.
         if (action.delta === 1) {
-          if (target === currentStop(root, cursor)) {
+          if (target === landing.from) {
             if (!event.repeat || heldMoveRef.current) showFlash("i or Ctrl+j to type");
             heldMoveRef.current = false;
           } else {
             heldMoveRef.current = true;
           }
         }
-        const finalRow = rowIndexOf(root, target);
+        const finalRow = landing.row;
         if (finalRow !== null) {
           if (finalRow !== cursor) landingRef.current = action.delta;
           setCursor(finalRow);
@@ -3049,18 +3310,14 @@ export default function App() {
         if (target === "stop") root.focus({ preventScroll: true });
         else target?.focus();
       } else {
-        // `a`/`d` press the card's own button, so its guard against a second answer applies here
-        // too. Not from a banner's button: the row cursor is hollow there, and not what keys act on,
+        // `a`/`d` answer the card by its id (ruling R2, `answerCardByKey`), through the same
+        // `answerPermission` its buttons use, so one guard against a second answer covers both.
+        // Not from a banner's button: the row cursor is hollow there, and not what keys act on,
         // so there is no card for it (F13's flash). v1 S4 (spec §2.2): only the cursor's card or the
         // card gating its tool call (`permissionTarget`) -- ruling 26's "the only card, from any row"
         // is gone.
         const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
-        const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
-        const button =
-          target === null
-            ? null
-            : (rows[target]?.querySelector<HTMLButtonElement>(`[data-nav-action="${action.decision}"]`) ?? null);
-        waitThenAnswer(event, typedAt, button, () => button?.click());
+        answerCardByKey(event, typedAt, target, action.decision);
       }
       return;
     }
@@ -3095,7 +3352,7 @@ export default function App() {
         break;
       case "table-scroll": {
         // T1: `zh`/`zl` scroll the CURRENT row's own table, never the conversation.
-        const table = root?.querySelector<HTMLElement>(".row-current .table-scroll") ?? null;
+        const table = cursorRow()?.querySelector<HTMLElement>(".table-scroll") ?? null;
         if (table !== null) table.scrollLeft += action.delta * TOOL_RESULT_SCROLL_STEP_PX;
         break;
       }
@@ -3103,8 +3360,7 @@ export default function App() {
         // After HINT landed on a code block: that block's code, not the whole message. Only while it
         // is still in the DOM and still inside the row under the cursor -- anything else and the
         // user is looking at something else now.
-        const cursorRow = root?.querySelectorAll<HTMLElement>('[data-nav-stop="row"]')[cursor];
-        if (landedCode !== null && landedCode.isConnected && cursorRow?.contains(landedCode)) {
+        if (landedCode !== null && landedCode.isConnected && cursorRow()?.contains(landedCode)) {
           copied(landedCode.querySelector("code")?.textContent ?? landedCode.textContent ?? "", timeline[cursor]?.key);
           break;
         }
@@ -3125,12 +3381,16 @@ export default function App() {
         if (root === null) break;
         // v1 S4 and S1 (spec §2.1-§2.2): the same card `a`/`d` would answer, and the same wait.
         const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
-        const rows = root.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
-        const box = target === null ? null : (rows[target]?.querySelector<HTMLInputElement>(".permission-card input") ?? null);
-        waitThenAnswer(event, typedAt, box, () => {
+        // The card's row by structure (ruling R2): `conversationRows(root)[target]` is timeline item
+        // `target`, which a card row holds no model HTML inside.
+        const box =
+          target === null
+            ? null
+            : (conversationRows(root)[target]?.querySelector<HTMLInputElement>(".permission-card input") ?? null);
+        waitThenAnswer(event, typedAt, box === null ? null : () => box.isConnected, () => {
           if (box === null) return;
           // Re-read where the card is now: rows may have arrived above it during the wait.
-          const row = box.closest<HTMLElement>('[data-nav-stop="row"]');
+          const row = rowOf(root, box);
           const index = row === null ? null : rowIndexOf(root, row);
           if (index !== null && index !== cursorRef.current) setCursor(index);
           landedControlRef.current = box;
@@ -3142,7 +3402,7 @@ export default function App() {
         // `r` on an ended tab resets it to `NotStarted` IN PLACE (ruling 12): the tab keeps its
         // number and its rename, and the `tabs` envelope that follows is what actually drops this
         // render back to the empty tab -- there is no local start-screen reset any more.
-        post({ type: "reset_tab" });
+        resetTab();
         break;
       case "keymap":
         // Only ever reached with the overlay closed -- the `keymapOpen` branch above returns
@@ -3150,12 +3410,26 @@ export default function App() {
         // opening only, never a toggle-closed here.
         setKeymapOpen(true);
         break;
-      case "hint":
-        // `shell` owns the HINT session: it collects targets across the whole window and asks this
-        // panel for its own with `hint_collect`. Until the HINT ends, this panel's keys are swallowed
-        // (`hintPendingRef`); nothing else changes here.
-        requestHint(event.repeat);
+      case "hint": {
+        // v1 hardening R2-1: `f` is always the first key of whatever typed it ("fix the dashboard
+        // layout⏎" started a HINT on its own `f`), so `mayActAfterMotion`'s backward-only check
+        // cannot guard it -- this defers the same way `a`/`d` do (typingGuard.ts's own doc comment):
+        // it asks `shell` for a HINT `TYPING_GUARD_MS` later, only if nothing else was typed
+        // meanwhile and the panel is still in BROWSE. `shell` owns the HINT session once it starts:
+        // it collects targets across the whole window and asks this panel for its own with
+        // `hint_collect`. Until the HINT ends, this panel's keys are swallowed (`hintPendingRef`);
+        // nothing else changes here.
+        const waiting = typingGuard.defer(
+          typedAt,
+          event.repeat,
+          () => {
+            if (modeRef.current === "browse") requestHint(false);
+          },
+          hintTypingFlash(),
+        );
+        if (!waiting && !event.repeat) showFlash(hintTypingFlash());
         break;
+      }
       case "pending":
         // Claimed (so the key does nothing else) and remembered for exactly one more key.
         pendingRef.current = action.prefix;
@@ -3189,7 +3463,7 @@ export default function App() {
         list.scrollTop += action.delta * Math.max(1, Math.floor(list.clientHeight / 2));
         const l = list.getBoundingClientRect();
         if (l.bottom - l.top <= 0) break;
-        const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+        const rows = conversationRows(list);
         const current = rows[cursor];
         const onScreen = visibleRows(list);
         if (current === undefined || onScreen.includes(current) || onScreen.length === 0) break;
@@ -3338,7 +3612,9 @@ export default function App() {
       onKeyDownCapture={(event) => void answerConfirm(event)}
       onKeyDown={onKeyDown}
       onFocus={(event) => {
-        const stop = (event.target as HTMLElement).closest("[data-nav-stop]");
+        // The outermost stop (`stopOf`): a link inside a reply is in the reply's row, whatever the
+        // reply's own HTML claims to be (v1 hardening, ruling R2).
+        const stop = containerRef.current === null ? null : stopOf(containerRef.current, event.target as HTMLElement);
         setEdgeFocused(stop !== null && stop.getAttribute("data-nav-stop") !== "row");
       }}
     >
@@ -3372,6 +3648,11 @@ export default function App() {
           ruleOffers={ruleOffers}
           yankedKey={yanked?.key ?? null}
           onAnswerPermission={answerPermission}
+          answeredPermissions={answeredPermissions}
+          onPermissionReason={(permissionId, reason) => {
+            if (reason === "") permissionReasons.current.delete(permissionId);
+            else permissionReasons.current.set(permissionId, reason);
+          }}
           onOpenPath={openPath}
           onUnreadChange={(label, jump, afterSeq) => {
             setUnread({ label, jump });

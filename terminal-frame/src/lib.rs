@@ -73,7 +73,7 @@ pub use frame::{
     CellExtras, CellFlags, ColorOverride, FrameCell, FrameColor, FrameCursor, FrameCursorShape, FrameError, FrameKind,
     Rgb, RowUpdate, TerminalFrame, TerminalModes, PALETTE_LEN,
 };
-pub use project::{Compensation, FrameStats, Projector, SpanPolicy};
+pub use project::{Compensation, FrameStats, Projector, SpanPolicy, MAX_ZERO_WIDTH_MARKS_PER_CELL};
 pub use viewport::{max_scrollback, project_scrollback, project_window};
 
 /// The exact `vte` `alacritty_terminal` was compiled against, so a

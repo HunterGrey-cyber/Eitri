@@ -312,8 +312,26 @@ export function lookupTool(name: string): ToolRenderConfig | undefined {
  * `applySnapshot`, which replaces the whole state object graph -- so every result re-stringifies
  * and re-truncates once per `UiDelivery::Resync` and once per panel reload. Those are rare and
  * bounded, which is why this is recorded rather than worked around. */
-const ToolResult = memo(function ToolResult({ result, detailed = false }: { result: ToolCallRecord["result"]; detailed?: boolean }) {
+const ToolResult = memo(function ToolResult({
+  result,
+  detailed = false,
+  abandoned = false,
+}: {
+  result: ToolCallRecord["result"];
+  detailed?: boolean;
+  abandoned?: boolean;
+}) {
   if (result === null) {
+    // sw-panel-render-6: a `null` result the panel knows can never arrive -- the call predates the
+    // restored-history boundary, or the session has ended -- draws a static notice instead of the
+    // spinner below. `data-state="none"` (not "running") and no `aria-busy`: nothing is in flight.
+    if (abandoned) {
+      return (
+        <div className="tool-result tool-result-abandoned" data-state="none">
+          no result recorded
+        </div>
+      );
+    }
     return (
       <div className="tool-result tool-result-pending" data-state="running" aria-busy="true">
         Running…
@@ -344,11 +362,13 @@ const ToolResult = memo(function ToolResult({ result, detailed = false }: { resu
  * card asking whether to run it, read as approved already. `opts.detailed` (R3, `Ctrl+o`) widens
  * the result's own cut and never folds it. `opts.expanded` (P3) is `Enter`'s own per-row toggle,
  * read by `editConfig` to show a folded diff's remaining lines; it defaults to `showResult` so a
- * caller that only ever passed the old two arguments keeps the old behaviour exactly. */
+ * caller that only ever passed the old two arguments keeps the old behaviour exactly. `opts.abandoned`
+ * (sw-panel-render-6) tells `ToolResult` a `null` result is never coming, rather than still running --
+ * `MessageList.tsx`'s `isAbandonedCall` is what decides it, from state this function does not see. */
 export function renderToolCall(
   call: ToolCallRecord,
   showResult = true,
-  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean } = {},
+  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
   const invocation = opts.gated ? (
@@ -403,7 +423,7 @@ export function renderToolCall(
       {invocation}
       {ruleNote}
       {promptNote}
-      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} />}
+      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
     </div>
   );
 }

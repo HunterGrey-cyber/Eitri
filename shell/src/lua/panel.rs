@@ -37,6 +37,16 @@ pub(crate) struct PanelEntry<W = gtk4::Widget> {
     /// afresh when its key reopens it (2026-09-26).
     pub(crate) url: String,
     pub(crate) widget: W,
+    /// This panel's crash-loop guard (fix round 1, v1 hardening review, R1-5). `main.rs`'s
+    /// revive-on-next-show path (`prefix x`, then this panel's own key) resets it right where it
+    /// reruns `load_uri` -- the manual recovery the panel's own give-up message tells the user to
+    /// try -- the same way `AgentPanelHandle::reload_document_by_hand` resets the chat's own guard.
+    /// Without that, a guard that already gave up stays terminal forever (see
+    /// `WebViewCrashGuard::reset`'s own doc), so a LATER, unrelated crash after a successful manual
+    /// recovery would be silently swallowed with no reload and no message. `Rc<RefCell<_>>` because
+    /// `install_crash_recovery`'s own closure, connected on the `WebView`, holds the other handle to
+    /// the same guard.
+    pub(crate) crash_guard: Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>>,
 }
 
 /// The Lua panels, in registration order -- the order `Layout::initial` places them in.
@@ -84,6 +94,7 @@ pub(crate) fn install(
         webview.load_uri(&resolved_url);
         webview.set_hexpand(true);
         webview.set_vexpand(true);
+        let crash_guard = install_crash_recovery(&webview, parsed.id.clone(), resolved_url.clone());
         registry.borrow_mut().register(PanelEntry {
             id: parsed.id,
             title: parsed.title,
@@ -91,12 +102,66 @@ pub(crate) fn install(
             key: parsed.key,
             url: resolved_url,
             widget: webview.upcast(),
+            crash_guard,
         });
         Ok(())
     })?;
     panel_table.set("register", register_fn)?;
     neovibe.set("panel", panel_table)?;
     Ok(())
+}
+
+/// R1-5 (v1 hardening review): a Lua panel's `WebView` had no `web-process-terminated` handling at
+/// all, so a crashed web process left the panel blank until the user found `prefix x` then the
+/// panel's own key by hand (the only thing that reruns `load_uri` -- `main.rs`'s revive-on-next-show
+/// path). Reload it automatically instead, guarded against a crash loop the same way
+/// `shell::agent_panel` guards the chat's own `WebView` (`crate::webview_crash_guard`); see that
+/// module's own doc for why `TerminatedByApi` is skipped before the guard is ever asked -- it is
+/// `main.rs`'s `kill_pane` calling `terminate_web_process()` on a deliberate `prefix x`, which
+/// already reloads this same `WebView` when the module is shown again and must not also trigger
+/// this automatic path. `id` is only for the log line.
+///
+/// Returns the guard so `main.rs`'s revive-on-next-show path can reset it (`PanelEntry::crash_guard`'s
+/// own doc) -- the caller owns the other handle to the same `Rc<RefCell<_>>`.
+///
+/// **The closure below takes its `WebView` from the signal callback's own first argument, and never
+/// captures an owned clone of `webview` itself** (fix round 1, an independent reviewer's finding): a
+/// `webview.clone()` captured inside a closure that `connect_web_process_terminated` attaches to that
+/// SAME `webview` is a reference cycle -- the `WebView`'s own signal-handler storage would then hold
+/// a strong reference back to itself -- so a panel replaced by a second `register()` call for the
+/// same id (`PanelRegistry::register`'s own doc) could never be freed even once nothing else in the
+/// registry or the widget tree still points at it. The signal's own callback argument is exactly the
+/// same `WebView`, valid for the call, so nothing is lost by using it instead.
+fn install_crash_recovery(
+    webview: &webkit6::WebView,
+    id: String,
+    url: String,
+) -> Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>> {
+    let guard = Rc::new(RefCell::new(
+        crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+    ));
+    let guard_for_signal = guard.clone();
+    webview.connect_web_process_terminated(move |webview, reason| {
+        if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
+            return;
+        }
+        use crate::webview_crash_guard::CrashResponse;
+        match guard_for_signal.borrow_mut().on_crash() {
+            CrashResponse::Reload => {
+                eprintln!("[lua] panel '{id}': the web process terminated ({reason:?}); reloading it");
+                webview.load_uri(&url);
+            }
+            CrashResponse::GiveUp => {
+                eprintln!("[lua] panel '{id}': the web process kept terminating; giving up on automatic reload");
+                let html = crate::webview_crash_guard::crash_message_html(
+                    "Close and reopen this panel (prefix x, then its key) to try again.",
+                );
+                webview.load_html(&html, None);
+            }
+            CrashResponse::AlreadyGivenUp => {}
+        }
+    });
+    guard
 }
 
 #[cfg(test)]
@@ -111,6 +176,12 @@ mod tests {
             key: None,
             url: format!("file:///{id}.html"),
             widget,
+            // `WebViewCrashGuard` is GTK-free (`shell::webview_crash_guard`'s own doc), so these
+            // registry-only tests -- which deliberately never touch a real `WebView` -- can still
+            // construct a real one rather than needing an `Option`.
+            crash_guard: Rc::new(RefCell::new(
+                crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+            )),
         }
     }
 

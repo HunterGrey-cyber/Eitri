@@ -487,6 +487,15 @@ fn full_rows(grid: &Grid<Cell>, rows: usize, cols: usize) -> Vec<RowUpdate> {
     out
 }
 
+/// sw-terminal-2's second, independent guard. `Term::input` (alacritty_terminal 0.26.0) pushes
+/// every zero-width combining mark onto a cell's `Vec` with no cap of its own;
+/// `terminal_sync::SyncSpy::input` already caps what reaches `Term` at the same limit for a
+/// `Term` driven through it, but this clamp holds regardless of how `Term` was reached (directly,
+/// or through `Term::grid_mut()`, which this engine's own module doc names as a gap nothing here
+/// can detect) -- a projection must never copy an unbounded `Vec` merely because something
+/// upstream did.
+pub const MAX_ZERO_WIDTH_MARKS_PER_CELL: usize = 16;
+
 /// One `alacritty_terminal` cell -> one frame cell.
 pub(crate) fn project_cell(cell: &Cell) -> FrameCell {
     let zerowidth = cell.zerowidth().unwrap_or(&[]);
@@ -495,7 +504,7 @@ pub(crate) fn project_cell(cell: &Cell) -> FrameCell {
         None
     } else {
         Some(Box::new(CellExtras {
-            zerowidth: zerowidth.to_vec(),
+            zerowidth: zerowidth.iter().take(MAX_ZERO_WIDTH_MARKS_PER_CELL).copied().collect(),
             underline_color,
         }))
     };

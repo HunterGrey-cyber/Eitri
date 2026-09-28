@@ -13,6 +13,7 @@ import { renderToolCall } from "./toolRegistry";
 import { renderMarkdown } from "./markdown";
 import { PermissionCard } from "./components/PermissionCard";
 import { KeymapOverlay } from "./components/KeymapOverlay";
+import { WhichKeyBox } from "./components/WhichKeyBox";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 
 /** Strip CSS comments, but never a `/*` that is inside a string.
@@ -86,6 +87,12 @@ const WK_KEY_BRANCH = /(?:^|[\s.])wk-key$/;
  *  attribute selector, narrowed so it cannot widen to `.band-mode`/`.mode-pill`/anything else the
  *  glyph sits beside. */
 const MODE_GLYPH_BRANCH = /(?:^|[\s.])mode-glyph(?:\[data-mode-name="[a-z]+"\])?$/;
+/** A selector branch inside one of the boxes painted `--nv-surface` (sw-theme-2): the which-key box,
+ *  a tool card, a permission card, the terminal handoff's command, a fenced code block. Where the
+ *  text under such a selector actually lands is proven by rendering, in "text on a --nv-surface
+ *  fill" at the bottom of this file; this only keeps the surface pair from being declared anywhere
+ *  else. */
+const SURFACE_BRANCH = /(?:^|[\s.])(?:which-key-box|tool-card(?:-[a-z]+)?|permission-card(?:-[a-z-]+)?|handoff-command|code-block)\b/;
 
 /**
  * The rule this file actually enforces, in one sentence: **a colour may be used as text only where
@@ -123,9 +130,13 @@ function unguardedTextColorDeclarations(source: string): string[] {
       everyBranchIsOnSurface(selector, HINT_BRANCH) && /(?:^|;)\s*background: var\(--nv-hint-bg\);/.test(body);
     const onWkKeySurface = everyBranchIsOnSurface(selector, WK_KEY_BRANCH);
     const onModeGlyphSurface = everyBranchIsOnSurface(selector, MODE_GLYPH_BRANCH);
+    const onCardSurface = everyBranchIsOnSurface(selector, SURFACE_BRANCH);
     for (const declaration of body.match(/(?<![a-z-])color:[^;]*;/g) ?? []) {
       if (onHljsSurface && /^color: var\(--nv-syn-[a-z]+\);$/.test(declaration)) continue;
       if (onChromeSurface && /^color: var\(--nv-chrome-(fg|muted)\);$/.test(declaration)) continue;
+      // Text on a card: `--nv-surface-fg`/`--nv-surface-muted`, guarded against `surface` in Rust
+      // (sw-theme-2), and only inside the boxes that paint it.
+      if (onCardSurface && /^color: var\(--nv-surface-(fg|muted)\);$/.test(declaration)) continue;
       // The which-key box's own keycap (panel round 2 plan, Task 8): the same deliberately-
       // unguarded exemption `--nv-syn-*` gets inside `hljs-*` above, extended to the one place
       // outside a code block that also wants a "this is a key" glyph -- narrowed to exactly
@@ -635,6 +646,19 @@ describe("index.css", () => {
     for (const declaration of declarations) {
       expect(declaration).toMatch(/^color: var\(--nv-(fg|muted)\);$/);
     }
+  });
+
+  it("admits the surface pair as text only inside a surface-painted box, every branch of it", () => {
+    expect(unguardedTextColorDeclarations(".permission-card-stale { color: var(--nv-surface-muted); }")).toEqual([]);
+    expect(unguardedTextColorDeclarations(".which-key-box .wk-group { color: var(--nv-surface-fg); }")).toEqual([]);
+    expect(unguardedTextColorDeclarations(".session-lost { color: var(--nv-surface-fg); }")).toEqual([
+      "color: var(--nv-surface-fg);",
+    ]);
+    expect(
+      unguardedTextColorDeclarations(".session-lost, .permission-card-stale { color: var(--nv-surface-muted); }"),
+    ).toEqual(["color: var(--nv-surface-muted);"]);
+    // And a card is not a licence for an unguarded colour.
+    expect(unguardedTextColorDeclarations(".tool-card { color: var(--nv-warn); }")).toEqual(["color: var(--nv-warn);"]);
   });
 
   it("still refuses a signal colour as text, even inside an hljs-* rule", () => {
@@ -2709,4 +2733,139 @@ it("draws no scrollbar on the tab bar, so a click anywhere on a tab reaches it",
   expect(bar?.body).toMatch(/scrollbar-width:\s*none/);
   const webkit = rulesMatching(sheet, ".tab-bar::-webkit-scrollbar");
   expect(webkit.map((r) => r.body).join(";")).toMatch(/display:\s*none/);
+});
+
+/** sw-theme-2, whole-branch review: `tokens.rs` derives `--nv-surface-fg` (and `--nv-surface-muted`)
+ *  guarded against `--nv-surface`, but nothing read them, so every card still drew the body's own
+ *  `--nv-fg`/`--nv-muted` -- guarded against `bg`, not against the fill under them. Under the
+ *  shipped `zaibatsu` colorscheme (`NormalFloat` bg = Normal's fg) that is white text on a white
+ *  card. This renders the panel's real surface-painted boxes, finds each text's nearest fill, and
+ *  requires every text on a `--nv-surface` fill to be drawn in a surface-guarded colour (or a
+ *  `--nv-syn-*` token, the deliberately unguarded syntax exemption). Declarations, not rendered
+ *  colour: jsdom inherits `color` but never resolves `var()`, which is exactly what makes the token
+ *  name comparable here. */
+describe("text on a --nv-surface fill (sw-theme-2)", () => {
+  afterEach(() => {
+    document.head.innerHTML = "";
+    document.body.innerHTML = "";
+  });
+
+  /** The nearest fill behind `el`: its own or an ancestor's `background` token. `null` for the body. */
+  function nearestFill(el: Element | null): string | null {
+    for (let node = el; node !== null; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      for (const value of [style.background, style.backgroundColor]) {
+        if (/var\(--nv-[a-z-]+\)/.test(value ?? "")) return value.match(/var\(--nv-[a-z-]+\)/)![0];
+      }
+    }
+    return null;
+  }
+
+  function surfaceFixtures(): string {
+    const call = (seq: number, name: string, input: unknown, gated = false) =>
+      renderToStaticMarkup(
+        createElement(
+          "div",
+          null,
+          renderToolCall({ seq, toolUseId: `t${seq}`, name, input, result: { content: "ok", isError: false } }, true, {
+            gated,
+          }),
+        ),
+      );
+    const card = (seq: number, toolName: string, input: unknown, extra: Record<string, unknown> = {}) =>
+      renderToStaticMarkup(
+        createElement(PermissionCard, {
+          request: { seq, permissionId: `p${seq}`, toolUseId: null, toolName, input, ...extra },
+          sessionEnded: extra.sessionEnded === true,
+          onAnswer: () => {},
+        }),
+      );
+    const rows = [
+      call(1, "Bash", { command: "cargo test" }),
+      call(2, "Read", { file_path: "/p/a.rs" }),
+      call(3, "ToolSearch", { query: "x" }),
+      call(4, "mcp__demo__lookup", { k: "v" }),
+      call(5, "Bash", { command: "cargo test" }, true),
+      call(6, "Edit", { file_path: "/p/a.rs", old_string: "a\n", new_string: "b\n" }),
+      // `MessageList`'s collapsed run row (a component-internal element, drawn here as it renders).
+      `<div class="tool-card tool-card-run">Bash ×2 · Read ×1</div>`,
+      renderMarkdown("```\nplain code\n```"),
+      renderMarkdown("```rust\nfn main() {}\n```"),
+      card(7, "Bash", { command: "cargo test" }),
+      card(8, "Edit", { file_path: "/p/a.rs", old_string: "a\n", new_string: "b\n" }),
+      card(9, "Write", { file_path: "/p/b.rs", content: "x\n" }),
+      card(10, "mcp__demo__lookup", { k: "v" }),
+      card(11, "Write", { file_path: "/p/.git/config", content: "x\n" }, {
+        providerPrompt: {
+          reason: "writes inside .git",
+          description: null,
+          blockedPath: null,
+          matchedAskRule: null,
+          unrecognizedOrigin: null,
+        },
+      }),
+      card(12, "Bash", { command: "ls" }, { sessionEnded: true }),
+      `<div class="handoff-card"><pre class="handoff-command">claude --resume abc</pre></div>`,
+    ];
+    const whichKey = renderToStaticMarkup(
+      createElement(WhichKeyBox, {
+        title: "Space b",
+        entries: [
+          { key: "b", label: "other tab", group: false, disabled: false },
+          { key: "d", label: "close tab", group: false, disabled: true },
+          { key: "g", label: "+goto", group: true, disabled: false },
+        ],
+        onPick: () => {},
+      }),
+    );
+    return (
+      `<div class="agent-ui-root"><div class="agent-ui-scroller"><div class="message-list">` +
+      rows.map((row) => `<div class="row"><span class="row-sign"></span><div class="row-body">${row}</div></div>`).join("") +
+      `</div>${whichKey}</div></div>`
+    );
+  }
+
+  it("draws every text on a surface fill in a colour Rust guards against that surface", () => {
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = surfaceFixtures();
+    const offenders: string[] = [];
+    let onSurface = 0;
+    for (const el of Array.from(document.body.querySelectorAll("*"))) {
+      const ownText = Array.from(el.childNodes)
+        .filter((n) => n.nodeType === Node.TEXT_NODE)
+        .map((n) => n.textContent ?? "")
+        .join("")
+        .trim();
+      if (ownText === "" || nearestFill(el) !== "var(--nv-surface)") continue;
+      onSurface += 1;
+      const color = getComputedStyle(el).color;
+      if (!/^var\(--nv-(surface-fg|surface-muted|syn-[a-z]+)\)$/.test(color)) {
+        offenders.push(`<${el.tagName.toLowerCase()} class="${el.className}"> "${ownText.slice(0, 24)}": ${color || "(none)"}`);
+      }
+    }
+    expect(onSurface, "the fixture must actually put text on a surface fill").toBeGreaterThan(15);
+    expect(offenders).toEqual([]);
+  });
+
+  it("never draws the surface pair on any other fill", () => {
+    // The other direction: `.permission-card-input` paints its own `bg` inside the card, and the
+    // diff a tool call renders in the transcript sits on `bg` too. Text there must be the body's pair.
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = surfaceFixtures();
+    const offenders: string[] = [];
+    let offSurface = 0;
+    for (const el of Array.from(document.body.querySelectorAll("*"))) {
+      const ownText = Array.from(el.childNodes)
+        .filter((n) => n.nodeType === Node.TEXT_NODE)
+        .map((n) => n.textContent ?? "")
+        .join("")
+        .trim();
+      if (ownText === "" || nearestFill(el) === "var(--nv-surface)") continue;
+      offSurface += 1;
+      const color = getComputedStyle(el).color;
+      if (/surface/.test(color)) offenders.push(`<${el.tagName.toLowerCase()} class="${el.className}"> "${ownText.slice(0, 24)}": ${color}`);
+    }
+    expect(offSurface, "the fixture must put text on another fill too").toBeGreaterThan(3);
+    expect(offenders).toEqual([]);
+  });
 });

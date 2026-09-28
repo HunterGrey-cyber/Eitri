@@ -2544,6 +2544,7 @@ name = "neovibe-core"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "libc",
  "mlua",
  "rmpv",
  "serde",
@@ -2649,7 +2650,11 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "neovide",
+ "nvim-rs",
+ "rmpv",
+ "serde_json",
  "skia-safe",
+ "tokio",
 ]
 
 [[package]]
@@ -4444,6 +4449,7 @@ dependencies = [
  "alacritty_terminal",
  "libc",
  "rustix-openpty",
+ "unicode-width",
 ]
 
 [[package]]

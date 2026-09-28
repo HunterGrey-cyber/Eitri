@@ -418,19 +418,40 @@ describe("partial assistant streaming", () => {
     expect(state.transcript.map((m) => m.text)).toEqual(["before after"]);
   });
 
-  it("a snapshot resets the open-message flag rather than appending into a closed message", () => {
+  it("a snapshot with a closed message starts a new entry, never appending into it", () => {
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, delta("streaming"));
-    expect(state.assistantMessageOpen).toBe(true);
-    // Built as the WIRE carries it: `serialize_snapshot_for_js` emits neither reducer-internal
-    // field, so the two are stripped here rather than handed in. This test used to pass
-    // `assistantMessageOpen: true` explicitly, which asserted a key Rust has never sent -- the
-    // reset it checks is of the flag on `state`, not of one inside the snapshot.
-    const { assistantMessageOpen: _open, nextSeq: _seq, ...wire } = { ...state, transcript: [{ seq: 0, text: "an earlier reply" }] };
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
+    expect(state.assistantMessageOpen).toBe(false);
+    // Built as the WIRE now genuinely carries it (sw-panel-render-2's fix): `assistantMessageOpen`
+    // is on `AgentUiSnapshot`, and here it is truthfully `false` -- the tool call closed the
+    // message before this snapshot was ever taken, on both sides.
+    const { nextSeq: _seq, turnThinking: _think, ...wire } = { ...state, transcript: [{ seq: 0, text: "an earlier reply" }] };
     const restored = applySnapshot(state, wire, 1);
     expect(restored.assistantMessageOpen).toBe(false);
     const next = applyEvent(restored, delta("new message"));
     expect(next.transcript.map((m) => m.text)).toEqual(["an earlier reply", "new message"]);
+  });
+
+  it("sw-panel-render-2: a mid-stream snapshot keeps the message open, so the next delta continues it rather than splitting it", () => {
+    // The defect this pins: `applySnapshot` used to force `assistantMessageOpen: false`
+    // unconditionally, on the theory a snapshot always meant "start fresh" -- but Rust's own
+    // projection keeps appending to the open message underneath a snapshot taken mid-reply
+    // (a tab switch back to a streaming reply, `prefix r`, a bounded-queue Resync), so forcing
+    // `false` here split one streaming reply into two transcript rows with broken markdown at the
+    // seam. Probe lifted from the verdict: fold `session_opened, turn_started, text 'Use **strong'`,
+    // apply a snapshot mid-message, then fold `text ' emphasis** here.'`.
+    let state = applyEvent(initialState(), opened);
+    state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, delta("Use **strong"));
+    expect(state.assistantMessageOpen).toBe(true);
+    // The wire as Rust now sends it mid-stream: `assistantMessageOpen` present and `true`, matching
+    // the live projection this state was folded from.
+    const { nextSeq: _seq, turnThinking: _think, ...wire } = state;
+    const restored = applySnapshot(initialState(), wire, state.nextSeq);
+    expect(restored.assistantMessageOpen).toBe(true);
+    const next = applyEvent(restored, delta(" emphasis** here."));
+    expect(next.transcript.map((m) => m.text)).toEqual(["Use **strong emphasis** here."]);
   });
 });
 

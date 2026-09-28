@@ -73,7 +73,7 @@ pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> st
             "D3: bypass is never written to disk",
         ));
     }
-    std::fs::create_dir_all(dir)?;
+    crate::layout::persist::create_state_dir(dir)?;
     let path = dir.join(file_name(project_root));
     let tmp = temporary(&path);
     let file = PrefsFile {
@@ -82,7 +82,7 @@ pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> st
         permission_mode: mode,
     };
     let text = serde_json::to_string_pretty(&file).expect("prefs always serialize");
-    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
+    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(err) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);

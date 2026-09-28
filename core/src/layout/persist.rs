@@ -168,6 +168,15 @@ pub fn state_subdir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>, sub: &
     }
 }
 
+/// Creates `dir` -- a [`state_subdir`], `<state home>/neovibe/<sub>` -- and anything missing above
+/// it 0700, and tightens `dir` and its `neovibe` parent to 0700 where an older build left either
+/// open (ruling R5; `agent::private_fs`'s module doc). Every writer of neovibe's own state in this
+/// crate creates its directory through this, and writes its files 0600
+/// (`agent::private_fs::write_private`).
+pub fn create_state_dir(dir: &Path) -> std::io::Result<()> {
+    agent::private_fs::create_private_dir_all(dir, dir.parent().unwrap_or(dir))
+}
+
 /// `<state home>/neovibe/layout`, from the two variables that decide it: `XDG_STATE_HOME`, else
 /// `$HOME/.local/state` (the XDG spec's own default). An `XDG_STATE_HOME` that is empty or not an
 /// absolute path is ignored, as the XDG spec says to. A `HOME` that is empty or not absolute is
@@ -189,7 +198,7 @@ pub fn encode(layout: &Layout, project_root: &Path) -> String {
         version: VERSION,
         project_root: project_root.to_string_lossy().into_owned(),
         root: NodeFile::of(layout.root()),
-        hidden: layout.hidden().iter().map(|id| id.as_str().to_string()).collect(),
+        hidden: layout.saved_hidden().iter().map(|id| id.as_str().to_string()).collect(),
         focus: layout.focus().as_str().to_string(),
     };
     serde_json::to_string_pretty(&file).expect("a layout always serializes")
@@ -253,10 +262,11 @@ pub fn load(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> Loaded {
 /// nothing sweeps those: telling a dead window's from a live one's would mean asking whether its
 /// process still runs, for a file of a few hundred bytes that `load` never reads.
 pub fn save(dir: &Path, project_root: &Path, layout: &Layout) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    create_state_dir(dir)?;
     let path = dir.join(file_name(project_root));
     let tmp = temporary(&path);
-    let written = std::fs::write(&tmp, encode(layout, project_root)).and_then(|()| std::fs::rename(&tmp, &path));
+    let written = agent::private_fs::write_private(&tmp, encode(layout, project_root).as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(err) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
@@ -328,6 +338,32 @@ mod tests {
         assert!(back.notes.is_empty(), "{:?}", back.notes);
         let text = encode(&layout, &root());
         assert!(text.contains("\"px\": 240"), "the pinned height is in the file: {text}");
+    }
+
+    /// The Opus review's T6-5: an editor retired because nvim ended (`prefix x`, `:qa`, a crash) is
+    /// saved as it was before -- shown -- so a relaunch opens with the editor, not without it until
+    /// `prefix e`. One the user had hidden stays hidden: the retirement is not an arrangement choice,
+    /// the hide was (the rule `kill_pane::Reveal::rehide` keeps for nvim's quit prompt).
+    #[test]
+    fn a_retired_editor_is_saved_as_it_was_before_nvim_ended() {
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        let mut layout = Layout::initial(&[]).unwrap();
+        super::super::kill(&mut layout, &ModuleId::editor(), super::super::Reopen::Never, &frame).unwrap();
+        assert!(layout.is_gone(&ModuleId::editor()), "the case");
+        let back = decode(&encode(&layout, &root()), &root(), &[]).unwrap();
+        assert!(
+            !back.layout.hidden().contains(&ModuleId::editor()),
+            "a relaunch shows the editor"
+        );
+
+        let mut layout = Layout::initial(&[]).unwrap();
+        super::super::geometry::hide(&mut layout, &ModuleId::editor(), &frame).unwrap();
+        super::super::kill(&mut layout, &ModuleId::editor(), super::super::Reopen::Never, &frame).unwrap();
+        let back = decode(&encode(&layout, &root()), &root(), &[]).unwrap();
+        assert!(
+            back.layout.hidden().contains(&ModuleId::editor()),
+            "one the user had hidden stays hidden"
+        );
     }
 
     /// Spec §4.6: "zoom is not stored".
@@ -411,6 +447,46 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(names_in(&dir), [file_name(&root())]);
+    }
+
+    /// Local-IPC review finding 8 (ruling R5): every writer of neovibe's own state in this crate --
+    /// the layout, the prompt history, the permission rules, the empty tab's mode -- creates its
+    /// directory 0700 and its file 0600, and tightens the `neovibe` root an older build left at
+    /// `0755`. Under the usual umask 022 each of these was `0755`/`0644` before, readable by every
+    /// local user wherever the path down to the state home is traversable.
+    #[test]
+    fn every_state_writer_here_keeps_its_directory_and_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let state = a_dir("state-modes").join("neovibe");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (layout, _) = left_as();
+
+        let layout_file = save(&state.join("layout"), &root(), &layout).unwrap();
+        crate::prompt_history::append(&state.join("history"), &root(), &["a prompt".to_string()]).unwrap();
+        let history_file = crate::prompt_history::path(&state.join("history"), &root());
+        crate::permission_store::add(
+            &state.join("permissions"),
+            &root(),
+            &agent::PrefixRule::parse("Bash(git push *)").unwrap(),
+        )
+        .unwrap();
+        let rules_file = crate::permission_store::path(&state.join("permissions"), &root());
+        let mode_file = crate::agent_prefs::save_mode(
+            &state.join("agent"),
+            &root(),
+            crate::agent_bridge::SessionModeChoice::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(mode(&state), 0o700, "the neovibe root an older build left open");
+        for sub in ["layout", "history", "permissions", "agent"] {
+            assert_eq!(mode(&state.join(sub)), 0o700, "{sub}/");
+        }
+        for file in [&layout_file, &history_file, &rules_file, &mode_file] {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
     }
 
     /// The `.tmp` is this process's own (the whole-branch review's M2, a shared `json.tmp`, failed

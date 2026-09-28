@@ -128,7 +128,7 @@ impl Arrangement {
     fn of(layout: &Layout) -> Arrangement {
         Arrangement {
             root: layout.root().clone(),
-            hidden: layout.hidden().clone(),
+            hidden: layout.saved_hidden(),
         }
     }
 }

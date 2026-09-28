@@ -1,9 +1,43 @@
 import { describe, expect, it } from "vitest";
-import { BROWSE_KEYS, INPUT_KEYS, resolveKey } from "./keymap";
+import { BROWSE_KEYS, INPUT_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
-const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; isComposing: boolean; keyCode: number }> = {}) =>
-  ({ key: k, ctrlKey: false, shiftKey: false, isComposing: false, ...over });
+const key = (
+  k: string,
+  over: Partial<{
+    ctrlKey: boolean;
+    shiftKey: boolean;
+    isComposing: boolean;
+    keyCode: number;
+    altKey: boolean;
+    metaKey: boolean;
+    /** Fix round 1 (v1 audit review, "R2's Super clause"): shorthand for a `KeyLike` whose
+     *  `getModifierState` reports Super/Hyper held, the only shape a real `KeyboardEvent` can put it
+     *  in (see `keymap.ts`'s own `KeyLike` doc comment). */
+    superKey: boolean;
+    /** v1 audit fixes, finding 1 (review of the reconciliation, 2026-09-28): `superKey` above
+     *  reports BOTH Super and Hyper at once (that is what `hasSuperOrHyper` checks), which cannot
+     *  tell a Super-only regression from a Hyper-only one -- this isolates Hyper alone, the way a
+     *  real Hyper-only keypress would actually report it. */
+    hyperKey: boolean;
+    /** Fix round 2 (v1 audit review, "the AltGraph clause"): shorthand for a `KeyLike` whose
+     *  `getModifierState` reports AltGraph held -- the level-3 shift some layouts use to type an
+     *  ordinary character (`@`, `€`), the same shape a real `KeyboardEvent` reports it in. */
+    altGraphKey: boolean;
+  }> = {},
+) => {
+  const { superKey, hyperKey, altGraphKey, ...rest } = over;
+  return {
+    key: k,
+    ctrlKey: false,
+    shiftKey: false,
+    isComposing: false,
+    ...rest,
+    ...(superKey ? { getModifierState: (m: string) => m === "Super" || m === "Hyper" } : {}),
+    ...(hyperKey ? { getModifierState: (m: string) => m === "Hyper" } : {}),
+    ...(altGraphKey ? { getModifierState: (m: string) => m === "AltGraph" } : {}),
+  };
+};
 const ctx = { sessionEnded: false };
 
 /** Turns one `BROWSE_KEYS[i].keys` TOKEN (after splitting on " / ") into what a person actually
@@ -60,6 +94,35 @@ describe("resolveKey", () => {
     expect(resolveKey("input", key("a"), ctx)).toBeNull();
   });
 
+  /* v1 audit P2-A1, ruling R2: Alt/Meta held alongside a card-answer key must never authorize or
+     deny a card -- Alt+A and Cmd/Meta+A are common OS-level chords (e.g. "select all" muscle
+     memory), and before this fix `KeyLike` had no `altKey`/`metaKey` fields at all, so neither the
+     blanket ctrl/shift-only refusal nor this switch's own `case "a":` ever looked at them. Bare
+     `a`/`d` (the control) must keep working. Super is its own, separate case just below: it is a
+     THIRD GDK modifier, not a spelling of Meta (an earlier version of this comment wrongly said
+     "Linux's Super arrives as `metaKey` too" -- fix round 1, v1 audit review). */
+  it("refuses Alt or Meta on a/d, but bare a/d still answer (R2)", () => {
+    expect(resolveKey("browse", key("a", { altKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a", { metaKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { altKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { metaKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
+    expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+  });
+
+  /* Fix round 1 (v1 audit review, "R2's Super clause"): R2's own ruling names Super explicitly
+     ("refuse any Alt, Meta or Super"), and the code above it checked only `altKey`/`metaKey` --
+     confirmed missing before this fix by reading `resolveKey`'s `case "a":` at the base of this
+     round. `getModifierState("Super"/"Hyper")` is the only signal this pure layer can read it
+     through (see `keymap.ts`'s `KeyLike` doc comment for the caveat on whether WebKitGTK ever
+     actually sets it). */
+  it("refuses Super (or Hyper) on a/d, but bare a/d still answer (R2, fix round 1)", () => {
+    expect(resolveKey("browse", key("a", { superKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { superKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
+    expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+  });
+
   it("offers restart only on a session that ended", () => {
     expect(resolveKey("browse", key("r"), ctx)).toBeNull();
     expect(resolveKey("browse", key("r"), { sessionEnded: true })).toEqual({ kind: "restart" });
@@ -96,6 +159,12 @@ describe("resolveKey", () => {
     // The three chords it DOES name (below) are named exactly: every other modifier set on the
     // same letters, and every other Ctrl/Shift letter a vim user might reach for, is still refused.
     expect(resolveKey("browse", key("d", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    // Fix round 2 (v1 audit review): `a`/`d` name no Ctrl chord of their own (unlike `d`'s Ctrl+d/
+    // half-page just below), so Ctrl+a already falls to the blanket refusal above the switch before
+    // `isPlainAnswerKey` is ever consulted -- recorded directly rather than left implicit, since
+    // `resolveKey("browse", key("a", { altKey: true }), ...)` above tests the same card only for
+    // Alt/Meta/Super, never Ctrl.
+    expect(resolveKey("browse", key("a", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("U", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("G", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
@@ -123,6 +192,40 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("Y", { shiftKey: true }), ctx)).toEqual({ kind: "copy-output" });
     expect(resolveKey("browse", key("D", { shiftKey: true }), ctx)).toEqual({ kind: "deny-reason" });
     expect(resolveKey("browse", key("D", { shiftKey: true }), { sessionEnded: true })).toBeNull();
+  });
+
+  /* v1 audit P2-A1, ruling R2: Shift+D is checked ahead of the blanket modifier refusal (the test
+     above), which is exactly why Alt or Meta held alongside it needs its own guard here -- that
+     refusal never runs for this chord at all. */
+  it("refuses Alt or Meta on Shift+D (R2)", () => {
+    expect(resolveKey("browse", key("D", { shiftKey: true, altKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true, metaKey: true }), ctx)).toBeNull();
+  });
+
+  /* Fix round 1 (v1 audit review, "R2's Super clause"): same gap as the a/d test above, on the
+     Shift+D chord's own separate guard. */
+  it("refuses Super (or Hyper) on Shift+D (R2, fix round 1)", () => {
+    expect(resolveKey("browse", key("D", { shiftKey: true, superKey: true }), ctx)).toBeNull();
+  });
+
+  /* v1 audit fixes, 2026-09-28: reconciling the 325e007 cherry-pick (App.tsx's bypass-confirm `y`,
+     a whole-branch codex review on `feat/v1-dist--D`) with this branch's R2 put both card-answer
+     checks and the bypass check on one shared predicate, `isPlainAnswerKey`. Checking this side of
+     that reconciliation: a/d/D already refused a composing key before this cherry-pick, by way of
+     `resolveKey`'s own top-of-function C4 check (the `if (event.isComposing || event.keyCode ===
+     229) return null;` guarded ahead of every chord and switch below it -- fix round 2 (v1 audit
+     review) found a prior version of this comment cited a specific line number for it, which had
+     already drifted once and is dropped rather than repeated) rather than anything specific to the
+     answer switch -- this pins that so the claim is proven, not merely believed, now that both
+     paths are read as making one promise. `keyCode === 229` is the same legacy-WebKit signal
+     `composerKeys.ts`'s `isImeKey` treats as composing too. */
+  it("refuses a/d/D while an input method is composing (C4, reconciled with the bypass y fix)", () => {
+    expect(resolveKey("browse", key("a", { isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true, isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a", { keyCode: 229 }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { keyCode: 229 }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true, keyCode: 229 }), ctx)).toBeNull();
   });
 
   /* The table keeps no memory: whether a `g` is the second of `gg` is the caller's fact, passed in. */
@@ -326,5 +429,120 @@ describe("the ? keymap tables", () => {
       expect(table.length).toBeGreaterThan(0);
       expect(new Set(table.map((row) => row.keys)).size).toBe(table.length);
     }
+  });
+});
+
+/* v1 audit fixes, 2026-09-28: `isPlainAnswerKey` is the one predicate this switch's a/d/D cases and
+   `App.tsx`'s bypass-confirm `y` now both call, reconciling this branch's R2 rule with the 325e007
+   cherry-pick (App.tsx's own fix for the same class of bug, found by a whole-branch codex review on
+   `feat/v1-dist--D`). Tested directly, not just through `resolveKey`, so a future caller of either
+   side can trust the contract without re-deriving it from the switch statements above. */
+describe("isPlainAnswerKey", () => {
+  it("is true for a bare key, and Shift alone does not disqualify it", () => {
+    expect(isPlainAnswerKey(key("a"))).toBe(true);
+    expect(isPlainAnswerKey(key("D", { shiftKey: true }))).toBe(true);
+  });
+
+  it("is false with Ctrl, Alt, or Meta held", () => {
+    expect(isPlainAnswerKey(key("a", { ctrlKey: true }))).toBe(false);
+    expect(isPlainAnswerKey(key("a", { altKey: true }))).toBe(false);
+    expect(isPlainAnswerKey(key("a", { metaKey: true }))).toBe(false);
+  });
+
+  it("is false with Super or Hyper held (the gap 325e007 had, before this reconciliation)", () => {
+    expect(isPlainAnswerKey(key("a", { superKey: true }))).toBe(false);
+  });
+
+  /* v1 audit fixes, finding 1: `superKey` above reports Super and Hyper together (that is what
+     `hasSuperOrHyper` itself checks for), so it alone cannot catch `hasSuperOrHyper` narrowing to
+     "Super only" -- confirmed by mutation: that exact change leaves the test above green. This is a
+     direct, independent oracle on `isPlainAnswerKey` (not routed through `resolveKey`, which would
+     just call the same broken `hasSuperOrHyper` to compute its own "expected" value and agree with
+     the bug), for Hyper alone. */
+  it("is false with Hyper held alone, not only together with Super (v1 audit fixes, finding 1)", () => {
+    expect(isPlainAnswerKey(key("a", { hyperKey: true }))).toBe(false);
+  });
+
+  /* Fix round 2 (v1 audit review, "the AltGraph clause"): AltGr is a level-3 shift key, not one of
+     the four modifiers R2 named -- `getModifierState("Super"/"Hyper")` is the only signal read for
+     Super/Hyper, and before this fix AltGraph had no analogous check at all, so a key typed while
+     holding AltGr (rather than composed by it -- see `typingGuard.ts`'s own `MODIFIER_KEYS`, which
+     already treats a BARE AltGraph press as a modifier, not a typed key) answered a card or
+     confirmed bypass like a bare key. Not verified against real WebKitGTK, the same caveat every
+     other `getModifierState` read here carries. */
+  it("is false with AltGraph held (fix round 2, the AltGraph clause)", () => {
+    expect(isPlainAnswerKey(key("a", { altGraphKey: true }))).toBe(false);
+  });
+
+  it("is false while an input method is composing, by either signal", () => {
+    expect(isPlainAnswerKey(key("a", { isComposing: true }))).toBe(false);
+    expect(isPlainAnswerKey(key("a", { keyCode: 229 }))).toBe(false);
+  });
+});
+
+/** v1 audit fixes, finding 1 (a review of the reconciliation above, 2026-09-28): nothing so far
+ *  actually held `resolveKey`'s own `case "a"/"d":` and the `Shift+D` arm to routing their decision
+ *  through `isPlainAnswerKey`, clause by clause, rather than a same-shaped hand-written check --
+ *  three mutations at those two call sites (reverting `case "a"/"d":` to its pre-round-1 form,
+ *  `if (event.altKey || event.metaKey || hasSuperOrHyper(event)) return null;`; reverting the
+ *  `Shift+D` arm to its own pre-round-2 hand-written list; or dropping just the Ctrl clause from the
+ *  `Shift+D` arm) each left every test above, and `App.test.tsx`'s h3/h3b, green. This computes
+ *  `isPlainAnswerKey` on the exact event `resolveKey` is given and checks the two never disagree,
+ *  modifier by modifier -- Super and Hyper each alone (the `superKey` shorthand above reports BOTH
+ *  at once, so it alone cannot tell a Super-only regression from a Hyper-only one), and a real
+ *  Ctrl+Shift+D (`key: "D"`, `ctrlKey: true` -- not the existing `key("d", { ctrlKey: true, shiftKey:
+ *  true })` case above, whose lowercase `key` never reaches the `Shift+D` arm's own `event.key ===
+ *  "D"` check at all, so it never exercised this). `d`'s own `Ctrl` case is left out of its list on
+ *  purpose: Ctrl+d is a different, deliberate chord (half-page scroll, pinned above) claimed before
+ *  the switch is ever reached, not a modifier the switch itself refuses.
+ *
+ *  What this matrix cannot catch, confirmed by mutation: it derives its own "expected" value from
+ *  calling the real `isPlainAnswerKey`, so a bug inside `isPlainAnswerKey` itself (e.g.
+ *  `hasSuperOrHyper` narrowed to check only "Super") computes the same wrong answer on both sides and
+ *  the row still agrees with itself. `isPlainAnswerKey`'s own describe block above pins that directly
+ *  with a hardcoded `false`, not derived from anything under test; `App.test.tsx`'s h3 table pins it a
+ *  third way, against a hardcoded absence of `confirm_bypass`. */
+type ModifierCase = [
+  string,
+  Partial<{
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+    superKey: boolean;
+    hyperKey: boolean;
+    altGraphKey: boolean;
+    isComposing: boolean;
+    keyCode: number;
+  }>,
+];
+const MODIFIER_CASES: ModifierCase[] = [
+  ["bare", {}],
+  ["Ctrl", { ctrlKey: true }],
+  ["Alt", { altKey: true }],
+  ["Meta", { metaKey: true }],
+  ["Super alone", { superKey: true }],
+  ["Hyper alone", { hyperKey: true }],
+  ["AltGraph", { altGraphKey: true }],
+  ["composing", { isComposing: true }],
+  ["keyCode 229", { keyCode: 229 }],
+];
+
+describe("resolveKey's a/d/Shift+D agree with isPlainAnswerKey on every modifier it reads (v1 audit fixes, finding 1)", () => {
+  it.each(MODIFIER_CASES)("a: %s", (_name, mod) => {
+    const ev = key("a", mod);
+    const expected = isPlainAnswerKey(ev) ? { kind: "answer", decision: "allow" } : null;
+    expect(resolveKey("browse", ev, ctx)).toEqual(expected);
+  });
+
+  it.each(MODIFIER_CASES.filter(([name]) => name !== "Ctrl"))("d: %s", (_name, mod) => {
+    const ev = key("d", mod);
+    const expected = isPlainAnswerKey(ev) ? { kind: "answer", decision: "deny" } : null;
+    expect(resolveKey("browse", ev, ctx)).toEqual(expected);
+  });
+
+  it.each(MODIFIER_CASES)("Shift+D: %s", (_name, mod) => {
+    const ev = key("D", { ...mod, shiftKey: true });
+    const expected = isPlainAnswerKey(ev) ? { kind: "deny-reason" } : null;
+    expect(resolveKey("browse", ev, ctx)).toEqual(expected);
   });
 });

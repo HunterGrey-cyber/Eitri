@@ -145,7 +145,14 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return { ...state, transcript: [...state.transcript, { seq, text: event.text }], assistantMessageOpen: true };
     }
     case "tool_call_started": {
-      const record: ToolCallRecord = { seq, toolUseId: event.tool_use_id, name: event.name, input: event.input, result: null };
+      const record: ToolCallRecord = {
+        seq,
+        toolUseId: event.tool_use_id,
+        name: event.name,
+        input: event.input,
+        result: null,
+        turnId: event.turn_id,
+      };
       // A tool call only happens between assistant messages, so the streaming text ended here.
       return { ...state, toolCalls: [...state.toolCalls, record], assistantMessageOpen: false };
     }
@@ -318,18 +325,25 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
-  // The snapshot carries neither `assistantMessageOpen`, `nextSeq` nor `turnThinking` -- all three
-  // are reducer-internal on both sides and deliberately not on the wire, which is why the parameter
-  // is typed `AgentUiSnapshot` (the `Omit` of exactly those three) rather than a full `AgentUiState`
-  // that would claim Rust sent them. Supplying them here is the only reason this function exists.
+  // The snapshot carries neither `nextSeq` nor `turnThinking` -- both are reducer-internal on both
+  // sides and deliberately not on the wire, which is why the parameter is typed `AgentUiSnapshot`
+  // (the `Omit` of exactly those two) rather than a full `AgentUiState` that would claim Rust sent
+  // them. Supplying them here is the only reason this function exists.
   //
-  // Resetting `assistantMessageOpen` is the safe direction: the next content event starts a new
-  // transcript entry rather than appending to a message that may have been closed before the
-  // snapshot was taken. Resetting `turnThinking` is the same direction for the same reason -- a
-  // thinking delta folded before the snapshot was taken must not still read as "thinking now"; the
-  // in-flight-motion design's invariant (§8.2) is that this bit can only ever be LOST, and a
-  // resync/reload is one more way to lose it, degrading `thinking` to `sent` (design §8.4).
-  return { ...snapshot, assistantMessageOpen: false, nextSeq: throughRevision, turnThinking: false };
+  // `assistantMessageOpen` is NOT forced here (sw-panel-render-2, 2026-09-27): it comes from the
+  // spread of `snapshot` below like every other field. It used to be force-reset to `false` on the
+  // theory that a snapshot always meant "start fresh" -- but Rust's own `AgentSessionProjection`
+  // keeps appending to the open message underneath a snapshot taken mid-reply, so forcing `false`
+  // here split one streaming reply into two transcript rows, with broken markdown at the seam, on
+  // every snapshot landing mid-reply (a tab switch back to a streaming reply, `prefix r`, a
+  // bounded-queue Resync). See that field's own doc comment on `AgentUiState`.
+  //
+  // Resetting `turnThinking` IS still forced: a thinking delta folded before the snapshot was taken
+  // must not still read as "thinking now"; the in-flight-motion design's invariant (§8.2) is that
+  // this bit can only ever be LOST, and a resync/reload is one more way to lose it, degrading
+  // `thinking` to `sent` (design §8.4). Unlike `assistantMessageOpen`, Rust never sends this one at
+  // all, so there is nothing on `snapshot` to take it from.
+  return { ...snapshot, nextSeq: throughRevision, turnThinking: false };
 }
 
 /** Whether a `resume_outcome` confirms the session that was actually asked for -- the same

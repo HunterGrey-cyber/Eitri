@@ -4,7 +4,7 @@ use alacritty_terminal::vte::ansi::{Handler, Processor, Timeout};
 
 use crate::barrier::{PublishReason, SyncBarrier};
 use crate::never_buffer::NeverBuffer;
-use crate::spy::SyncSpy;
+use crate::spy::{SyncSpy, ZeroWidthTarget};
 
 /// Drives one `vte::ansi::Processor` over an authoritative `Handler` (normally
 /// `alacritty_terminal::Term`) and calls back at every publication point.
@@ -69,7 +69,7 @@ impl<T: Timeout> SyncDriver<T> {
     /// `tests/throughput.rs` measures what that costs.
     pub fn feed<H, F>(&mut self, inner: &mut H, bytes: &[u8], mut publish: F)
     where
-        H: Handler,
+        H: Handler + ZeroWidthTarget,
         F: FnMut(&mut H, PublishReason),
     {
         for &byte in bytes {

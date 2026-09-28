@@ -72,6 +72,37 @@ pub enum UiDelivery {
     Resync,
 }
 
+/// [`UiDelivery`], with each event's revision: the projection's `last_revision` right after that
+/// event was folded, read under the same lock as the fold itself.
+///
+/// **What it is for (P1-A2 round 2).** A caller that also hands the UI a snapshot needs to know
+/// which queued events that snapshot already contains. Folding and queueing happen on the ingestion
+/// thread, so between the caller's last drain and the moment it reads a snapshot, more events can be
+/// folded (and so be in the snapshot) and queued (and so reach the next drain) -- the same event,
+/// twice. The snapshot's own `last_revision` and these tags compare directly, because
+/// `AgentSessionProjection::apply` bumps `last_revision` by exactly one per fold and nothing else
+/// moves it: an event tagged at or below a snapshot's revision is already in that snapshot. The
+/// caller notes that revision on the conversation (`AgentConversation::note_ui_snapshot`) and its
+/// next drain takes it back, so a revision never outlives the session it was read from.
+#[derive(Debug)]
+pub enum RevisedDelivery {
+    Nothing,
+    /// In fold order, so the tags strictly increase.
+    Events(Vec<(u64, AgentDomainEvent)>),
+    Resync,
+}
+
+impl RevisedDelivery {
+    /// The same delivery, for a caller that never reads a snapshot against it.
+    pub fn without_revisions(self) -> UiDelivery {
+        match self {
+            RevisedDelivery::Nothing => UiDelivery::Nothing,
+            RevisedDelivery::Events(events) => UiDelivery::Events(events.into_iter().map(|(_, event)| event).collect()),
+            RevisedDelivery::Resync => UiDelivery::Resync,
+        }
+    }
+}
+
 /// Counters for what ingestion is costing. Read by the slow-consumer tests, which need to prove
 /// boundedness rather than merely observe that nothing crashed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -117,7 +148,8 @@ struct IngestState {
     /// filesystem, and doing that on a GTK tick is exactly the kind of thing that causes the stalls
     /// this module exists to tolerate.
     lease: Option<SessionLease>,
-    pending_ui: VecDeque<AgentDomainEvent>,
+    /// Each with the projection revision its fold produced (see [`RevisedDelivery`]).
+    pending_ui: VecDeque<(u64, AgentDomainEvent)>,
     resync_pending: bool,
     resume_outcome: Option<ResumeOutcomeRecord>,
     stats: IngestStats,
@@ -180,7 +212,7 @@ impl IngestState {
             // never going to read.
             return;
         }
-        self.pending_ui.push_back(event);
+        self.pending_ui.push_back((self.projection.last_revision, event));
         self.stats.ui_backlog = self.pending_ui.len();
         self.stats.max_ui_backlog = self.stats.max_ui_backlog.max(self.pending_ui.len());
         if self.pending_ui.len() > UI_EVENT_QUEUE_CAPACITY {
@@ -193,16 +225,20 @@ impl IngestState {
     }
 
     fn take_delivery(&mut self) -> UiDelivery {
+        self.take_revised_delivery().without_revisions()
+    }
+
+    fn take_revised_delivery(&mut self) -> RevisedDelivery {
         if self.resync_pending {
             self.resync_pending = false;
-            return UiDelivery::Resync;
+            return RevisedDelivery::Resync;
         }
         if self.pending_ui.is_empty() {
-            return UiDelivery::Nothing;
+            return RevisedDelivery::Nothing;
         }
-        let events: Vec<AgentDomainEvent> = self.pending_ui.drain(..).collect();
+        let events: Vec<(u64, AgentDomainEvent)> = self.pending_ui.drain(..).collect();
         self.stats.ui_backlog = 0;
-        UiDelivery::Events(events)
+        RevisedDelivery::Events(events)
     }
 }
 
@@ -343,6 +379,11 @@ impl ConversationIngest {
     /// What the UI should apply. Called from the GTK tick.
     pub fn take_delivery(&self) -> UiDelivery {
         self.state.lock().unwrap().take_delivery()
+    }
+
+    /// [`Self::take_delivery`], with each event's fold revision ([`RevisedDelivery`]).
+    pub fn take_revised_delivery(&self) -> RevisedDelivery {
+        self.state.lock().unwrap().take_revised_delivery()
     }
 
     /// Folds an event this side produced rather than the provider.

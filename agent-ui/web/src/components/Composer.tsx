@@ -197,6 +197,13 @@ export function Composer({
 
   useEffect(() => {
     if (restoredDraft === null) return;
+    // P2-A3 (v1 audit, ruling R1): this effect only ever shows what the host already decided to put
+    // in the box -- it does NOT mirror it back to Rust itself. `restoredDraft` fires on every tab
+    // switch too (cleared to "", `App.tsx`'s `tabs` arm) and on every inbound `draft` echo from
+    // Rust, and mirroring unconditionally here re-echoed both of those back out as a fresh `draft`
+    // post nobody asked for (found by a regression this task's own fix first introduced: a leader
+    // sequence test with no composer in play at all started posting one). The host mirrors the
+    // RECOVERED text itself, once, right where it computes it (`App.tsx`'s send-refusal handler).
     setText(restoredDraft.text);
     caretRef.current = null;
     setWalk({ index: null, stash: "" });

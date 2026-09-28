@@ -3,7 +3,7 @@
 //! **This is the only place a fallback is decided.** The WebView and the GTK stylesheet both
 //! receive a complete set, so neither ever needs a default of its own.
 
-use super::color::{ensure_contrast, Rgb};
+use super::color::{ensure_contrast, ensure_contrast_against_both, ensure_contrast_with_pole, Rgb};
 use super::payload::{HlAttrs, NvimThemePayload};
 
 /// nvim's own built-in default colorscheme (`NvimDarkGrey2` / `NvimLightGrey2`). Used only when
@@ -106,6 +106,19 @@ pub struct ThemeTokens {
     pub bg: Rgb,
     pub fg: Rgb,
     pub surface: Rgb,
+    /// Text drawn on `surface` (sw-theme-2): the global `fg` is guarded against `bg`, not against
+    /// `surface`, and a scheme whose floating background is not close to `bg` -- the shipped
+    /// `zaibatsu`'s `NormalFloat` is `fg=#0e0024/bg=#ffffff` against a `Normal` of
+    /// `fg=#ffffff/bg=#0e0024` -- can make `fg` on `surface` unreadable (1.0:1, measured). Derived
+    /// the way `chrome_fg` is derived from `StatusLine`: `NormalFloat`/`Pmenu`'s own foreground,
+    /// guarded toward whichever of `bg`/`fg` reads better against `surface`, with the same
+    /// black/white pole fallback `hint_fg` has for when neither does.
+    pub surface_fg: Rgb,
+    /// Secondary text drawn on `surface` (a card's description, a diff gutter, the which-key box's
+    /// footer): `muted` is guarded against `bg` and `cursorline`, never against `surface`, so under
+    /// `zaibatsu` it is as unreadable on a card as `fg` is. Derived the way `chrome_muted` is: the
+    /// Comment colour guarded against `surface`, toward `surface_fg`, with the pole fallback.
+    pub surface_muted: Rgb,
     pub chrome: Rgb,
     pub chrome_fg: Rgb,
     /// Secondary text drawn on `chrome`. Guarded against `chrome`, not `bg`: a reversed StatusLine
@@ -240,27 +253,28 @@ impl ThemeTokens {
             fg
         };
         // Normal's two colours cannot always carry text on a mid-luminance IncSearch: on rose-pine
-        // dawn's real `#d7827e`, the best either reaches is 2.60:1, and `ensure_contrast` would
-        // hand back that failing colour. Black or white always reaches 4.5:1 on one side of any
-        // background, so the guard falls through to whichever pole stands out more.
-        let hint_fg = {
-            let toward_normal = ensure_contrast(hint_fg_raw, hint_bg, hint_toward, TEXT_CONTRAST);
-            if toward_normal.contrast(hint_bg) >= TEXT_CONTRAST {
-                toward_normal
-            } else {
-                let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(0xff, 0xff, 0xff));
-                let pole = if hint_bg.contrast(black) >= hint_bg.contrast(white) {
-                    black
-                } else {
-                    white
-                };
-                ensure_contrast(hint_fg_raw, hint_bg, pole, TEXT_CONTRAST)
-            }
-        };
+        // dawn's real `#d7827e`, the best either reaches is 2.60:1. `ensure_contrast_with_pole`
+        // falls through to a black/white pole for exactly this case; see its own doc.
+        let hint_fg = ensure_contrast_with_pole(hint_fg_raw, hint_bg, hint_toward, TEXT_CONTRAST);
         let signal =
             |names: &[&str], fallback: Rgb| ensure_contrast(g.fg_of(names).unwrap_or(fallback), bg, fg, UI_CONTRAST);
         let comment = g.fg_of(&["Comment"]);
         let function = g.fg_of(&["Function"]);
+
+        // Text on surface is guarded against surface itself (sw-theme-2), toward whichever of
+        // Normal's colours stands out more from it -- the same idiom `chrome_fg` uses against
+        // `chrome` just below, with the same pole fallback `hint_fg` needs.
+        let surface_toward = if surface.contrast(bg) >= surface.contrast(fg) {
+            bg
+        } else {
+            fg
+        };
+        let surface_fg = ensure_contrast_with_pole(
+            g.fg_of(&["NormalFloat", "Pmenu"]).unwrap_or(fg),
+            surface,
+            surface_toward,
+            TEXT_CONTRAST,
+        );
 
         // Text on chrome is guarded against chrome itself, toward whichever of Normal's colours
         // stands out more from it. Never against `bg`: a reversed StatusLine makes chrome Normal's fg.
@@ -270,7 +284,10 @@ impl ThemeTokens {
         } else {
             fg
         };
-        let chrome_fg = ensure_contrast(
+        // sw-theme-4: `chrome_fg`/`chrome_muted` used to call plain `ensure_contrast`, which can
+        // hand back a failing colour when neither of Normal's own colours reaches TEXT_CONTRAST
+        // against `chrome` -- `hint_fg` already had the pole fallback these two were missing.
+        let chrome_fg = ensure_contrast_with_pole(
             g.fg_of(&["StatusLine"]).unwrap_or(fg),
             chrome,
             chrome_toward,
@@ -293,13 +310,33 @@ impl ThemeTokens {
             TEXT_CONTRAST,
         );
 
+        // sw-theme-3: `muted` used to be guarded only against `bg`, though `index.css` also paints
+        // it directly on a `cursorline` fill (the detail popover's and chooser's current row). It is
+        // guarded against both at once: a second guard run after the first, toward `fg`, walked a
+        // Comment colour sitting on the far side of `bg` from `fg` back across `bg` (whole-branch
+        // review: black on a `#767676` bg became `#e6e6e6`, 3.64:1 there).
+        let muted = ensure_contrast_against_both(
+            comment.unwrap_or_else(|| bg.mix(fg, 0.5)),
+            bg,
+            cursorline,
+            fg,
+            TEXT_CONTRAST,
+        );
+
         ThemeTokens {
             bg,
             fg,
             surface,
+            surface_fg,
+            surface_muted: ensure_contrast_with_pole(
+                comment.unwrap_or_else(|| surface.mix(surface_fg, 0.5)),
+                surface,
+                surface_fg,
+                TEXT_CONTRAST,
+            ),
             chrome,
             chrome_fg,
-            chrome_muted: ensure_contrast(
+            chrome_muted: ensure_contrast_with_pole(
                 comment.unwrap_or_else(|| chrome.mix(chrome_fg, 0.5)),
                 chrome,
                 chrome_fg,
@@ -309,7 +346,7 @@ impl ThemeTokens {
             border: g
                 .fg_of(&["WinSeparator", "VertSplit"])
                 .unwrap_or_else(|| bg.mix(fg, 0.15)),
-            muted: ensure_contrast(comment.unwrap_or_else(|| bg.mix(fg, 0.5)), bg, fg, TEXT_CONTRAST),
+            muted,
             cursorline,
             hint_bg,
             hint_fg,
@@ -335,6 +372,8 @@ impl ThemeTokens {
             ("bg", self.bg),
             ("fg", self.fg),
             ("surface", self.surface),
+            ("surface-fg", self.surface_fg),
+            ("surface-muted", self.surface_muted),
             ("chrome", self.chrome),
             ("chrome-fg", self.chrome_fg),
             ("chrome-muted", self.chrome_muted),
@@ -428,13 +467,13 @@ mod tests {
         assert_eq!(t.fg.hex(), "#e0e2ea");
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
-        assert_eq!(vars.len(), 34);
+        assert_eq!(vars.len(), 36);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 34, "no duplicate variable names");
-        // The count alone would be satisfied by any 34th variable, and this one carries a UNIT --
+        assert_eq!(names.len(), 36, "no duplicate variable names");
+        // The count alone would be satisfied by any 36th variable, and this one carries a UNIT --
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
         assert_eq!(
@@ -676,6 +715,119 @@ mod tests {
         assert_eq!(
             mono_font_stack("evil\";}body{x"),
             "\"evilbodyx\", \"FiraCode Nerd Font\", monospace"
+        );
+    }
+
+    /// sw-theme-2's own probe: the shipped `zaibatsu` colorscheme's real highlight data (measured
+    /// via headless nvim: `Normal` fg=#ffffff/bg=#0e0024, `NormalFloat` linking through `Pmenu` to
+    /// fg=#0e0024/bg=#ffffff). `surface` picks up the floating background but nothing ever guards a
+    /// foreground for text drawn on it, so a tool/permission card painted `--nv-surface` under
+    /// `--nv-fg` text renders white on white.
+    #[test]
+    fn a_surface_guarded_foreground_stays_readable_on_zaibatsu() {
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xffffff), Some(0x0e0024))),
+                ("NormalFloat", hl(Some(0x0e0024), Some(0xffffff))),
+                ("Pmenu", hl(Some(0x0e0024), Some(0xffffff))),
+            ],
+        ));
+        assert_eq!(t.surface.hex(), "#ffffff");
+        assert_eq!(t.fg.hex(), "#ffffff");
+        assert!(
+            (t.surface.contrast(t.fg) - 1.0).abs() < 1e-9,
+            "the bug: the global fg is unguarded against surface"
+        );
+        assert!(
+            t.surface_fg.contrast(t.surface) >= TEXT_CONTRAST,
+            "surface_fg must read against surface, got {}",
+            t.surface_fg.contrast(t.surface)
+        );
+        assert!(
+            t.surface_muted.contrast(t.surface) >= TEXT_CONTRAST,
+            "surface_muted must read against surface, got {}",
+            t.surface_muted.contrast(t.surface)
+        );
+    }
+
+    /// sw-theme-3's own probe: the shipped `pablo` colorscheme's real highlight data (`Comment`
+    /// fg=#808080, `Visual` bg=#a9a9a9 not-reverse, `Normal` fg=#ffffff/bg=#000000). `cursorline` is
+    /// guarded only against `fg` and `muted` only against `bg` -- never against each other, though
+    /// `index.css` paints `muted` text directly on a `cursorline` fill (the detail popover's current
+    /// row, the chooser's current row).
+    #[test]
+    fn muted_text_stays_readable_on_the_real_cursorline_fill_on_pablo() {
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xffffff), Some(0x000000))),
+                ("Comment", hl(Some(0x808080), None)),
+                ("Visual", hl(None, Some(0xa9a9a9))),
+            ],
+        ));
+        assert!(t.cursorline.contrast(t.fg) >= TEXT_CONTRAST, "cursorline's own guard");
+        assert!(t.muted.contrast(t.bg) >= TEXT_CONTRAST, "muted's own guard");
+        assert!(
+            t.muted.contrast(t.cursorline) >= TEXT_CONTRAST,
+            "muted must also read on cursorline, got {}",
+            t.muted.contrast(t.cursorline)
+        );
+    }
+
+    /// sw-theme-3, whole-branch review (Codex): the second stage that guards `muted` against
+    /// `cursorline` mixed toward `fg` on the claim that this can only move it further from `bg`.
+    /// That holds only while `muted` sits on `fg`'s side of `bg`. Here the Comment colour (black) is
+    /// on the OTHER side of a mid-grey `bg` (4.62:1, passing the first stage untouched), so mixing
+    /// it toward white to clear `cursorline` walks it back across `bg`: `#e6e6e6`, 4.60:1 on
+    /// `cursorline` and 3.64:1 on `bg`. Muted text is painted on both, so it must read on both.
+    #[test]
+    fn muted_reads_on_bg_and_cursorline_at_once_when_the_comment_sits_across_bg() {
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xffffff), Some(0x767676))),
+                ("Comment", hl(Some(0x000000), None)),
+                ("Visual", hl(None, Some(0x666666))),
+            ],
+        ));
+        assert!(
+            t.muted.contrast(t.bg) >= TEXT_CONTRAST && t.muted.contrast(t.cursorline) >= TEXT_CONTRAST,
+            "muted {} must read on bg {} ({:.2}) and on cursorline {} ({:.2})",
+            t.muted.hex(),
+            t.bg.hex(),
+            t.muted.contrast(t.bg),
+            t.cursorline.hex(),
+            t.muted.contrast(t.cursorline)
+        );
+    }
+
+    /// sw-theme-4's own probe: the real payload the verifier fed through `ThemeTokens::derive`
+    /// (rose-pine dawn's `Normal` fg=#575279/bg=#faf4ed, `StatusLine` fg=#faf4ed/bg=#d7827e).
+    /// Neither of Normal's own colours reaches 4.5:1 against this `chrome`, and `ensure_contrast`'s
+    /// own doc says it "returns toward when no step does" -- so without a pole fallback, `chrome_fg`
+    /// (and `chrome_muted`, which is guarded toward `chrome_fg`) is returned unchanged, below
+    /// `TEXT_CONTRAST`. `hint_fg` in this same file already has exactly this fallback; chrome text
+    /// needs the same guarantee.
+    #[test]
+    fn chrome_text_reaches_text_contrast_even_when_normals_colours_cannot_carry_it() {
+        let t = ThemeTokens::derive(&payload(
+            "light",
+            &[
+                ("Normal", hl(Some(0x575279), Some(0xfaf4ed))),
+                ("StatusLine", hl(Some(0xfaf4ed), Some(0xd7827e))),
+            ],
+        ));
+        assert_eq!(t.chrome.hex(), "#d7827e");
+        assert!(
+            t.chrome_fg.contrast(t.chrome) >= TEXT_CONTRAST,
+            "chrome_fg must fall back to a pole, got {}",
+            t.chrome_fg.contrast(t.chrome)
+        );
+        assert!(
+            t.chrome_muted.contrast(t.chrome) >= TEXT_CONTRAST,
+            "chrome_muted must fall back to a pole too, got {}",
+            t.chrome_muted.contrast(t.chrome)
         );
     }
 }

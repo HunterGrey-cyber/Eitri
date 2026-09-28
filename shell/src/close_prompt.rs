@@ -20,6 +20,12 @@ pub(crate) enum PromptKey {
     Ignore,
 }
 
+/// Whether a `No` runs the window close's decline hook ([`ClosePrompt::connect_window_close_declined`]):
+/// only for the window close's own question, never for `prefix x`'s.
+pub(crate) fn runs_decline_hook(answer: PromptKey, closes_window: bool) -> bool {
+    answer == PromptKey::No && closes_window
+}
+
 pub(crate) fn classify(key: Key, is_modifier: bool) -> PromptKey {
     if is_modifier {
         PromptKey::Ignore
@@ -41,10 +47,74 @@ pub(crate) fn prompt_origin(bar_shown: bool, strip_x: i32, bar_height: i32, labe
     }
 }
 
-pub(crate) struct ClosePrompt {
-    label: gtk4::Label,
+/// The y/n's state without its label: what an answer does (tmux's `confirm-before`). GTK-free, so
+/// the decline hook's wiring is a test's, not only the GUI checklist's (the Opus review's T6-4: the
+/// hook's call could be deleted with every test green while it sat inside the key controller).
+#[derive(Default)]
+pub(crate) struct PromptState {
     open: Cell<bool>,
     confirmed: Cell<bool>,
+    /// What `y` runs; taken when the prompt closes either way.
+    on_yes: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// The open prompt is the window close's: `y` sets `confirmed` before it closes again.
+    closes_window: Cell<bool>,
+    /// Runs when the window close's own question is answered with anything but `y`: the window
+    /// stays, and what the close was about to end may already be gone (nvim exited on its own,
+    /// R1-2). Set once by `main.rs`.
+    on_window_close_declined: RefCell<Option<Rc<dyn Fn()>>>,
+}
+
+impl PromptState {
+    /// Opens the prompt, replacing one already open: `y` runs `on_yes`, and `closes_window` marks it
+    /// as the window close's own question.
+    pub(crate) fn open(&self, on_yes: Box<dyn FnOnce()>, closes_window: bool) {
+        *self.on_yes.borrow_mut() = Some(on_yes);
+        self.closes_window.set(closes_window);
+        self.open.set(true);
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.get()
+    }
+
+    /// `answer` while the prompt is open. `false`, changing nothing, when it is not open or the key
+    /// is a bare modifier: the key goes on. Otherwise the prompt closes -- `hide` runs first, since
+    /// what runs next may ask again -- and `y` runs what was asked (confirming a window close first),
+    /// anything else cancels it and, for the window close's own question only, runs the decline hook.
+    pub(crate) fn answer(&self, answer: PromptKey, hide: impl FnOnce()) -> bool {
+        if !self.open.get() || answer == PromptKey::Ignore {
+            return false;
+        }
+        self.open.set(false);
+        hide();
+        // Taken out before anything runs: what runs may ask again.
+        let on_yes = self.on_yes.borrow_mut().take();
+        match answer {
+            PromptKey::Yes => {
+                if self.closes_window.get() {
+                    self.confirmed.set(true);
+                }
+                if let Some(on_yes) = on_yes {
+                    on_yes();
+                }
+            }
+            PromptKey::No | PromptKey::Ignore => {
+                if runs_decline_hook(answer, self.closes_window.get()) {
+                    // Cloned out first: the hook changes the layout, which may ask again.
+                    let declined = self.on_window_close_declined.borrow().clone();
+                    if let Some(declined) = declined {
+                        declined();
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+pub(crate) struct ClosePrompt {
+    label: gtk4::Label,
+    state: PromptState,
     window: gtk4::ApplicationWindow,
     /// The top bar: hidden in Immersive mode ([`prompt_origin`]'s `bar_shown`).
     bar: gtk4::Widget,
@@ -52,10 +122,6 @@ pub(crate) struct ClosePrompt {
     strip: gtk4::Widget,
     /// The overlay both the label and `strip` are positioned within, for `compute_point`.
     overlay: gtk4::Overlay,
-    /// What `y` runs; taken when the prompt closes either way.
-    on_yes: RefCell<Option<Box<dyn FnOnce()>>>,
-    /// The open prompt is the window close's: `y` sets `confirmed` before it closes again.
-    closes_window: Cell<bool>,
 }
 
 impl ClosePrompt {
@@ -79,14 +145,11 @@ impl ClosePrompt {
         overlay.add_overlay(&label);
         let prompt = Rc::new(ClosePrompt {
             label,
-            open: Cell::new(false),
-            confirmed: Cell::new(false),
+            state: PromptState::default(),
             window: window.clone(),
             bar: bar.clone(),
             strip: strip.clone(),
             overlay: overlay.clone(),
-            on_yes: RefCell::new(None),
-            closes_window: Cell::new(false),
         });
         let controller = gtk4::EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -96,32 +159,21 @@ impl ClosePrompt {
                 let Some(prompt) = prompt.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if !prompt.open.get() {
+                if !prompt.state.is_open() {
                     return glib::Propagation::Proceed;
                 }
                 let is_modifier = event
                     .current_event()
                     .and_then(|e| e.downcast::<gtk4::gdk::KeyEvent>().ok())
                     .is_some_and(|e| e.is_modifier());
-                match classify(key, is_modifier) {
-                    PromptKey::Ignore => return glib::Propagation::Proceed,
-                    PromptKey::No => {
-                        prompt.hide();
-                        prompt.on_yes.borrow_mut().take();
-                    }
-                    PromptKey::Yes => {
-                        prompt.hide();
-                        if prompt.closes_window.get() {
-                            prompt.confirmed.set(true);
-                        }
-                        // Taken out before it runs: what it does may ask again.
-                        let on_yes = prompt.on_yes.borrow_mut().take();
-                        if let Some(on_yes) = on_yes {
-                            on_yes();
-                        }
-                    }
+                if prompt
+                    .state
+                    .answer(classify(key, is_modifier), || prompt.label.set_visible(false))
+                {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
                 }
-                glib::Propagation::Stop
             });
         }
         window.add_controller(controller);
@@ -132,28 +184,42 @@ impl ClosePrompt {
     /// [`ClosePrompt::confirmed`] and does not ask. For a question already asked and answered in
     /// another form (`prefix x` on the last module, `kill_pane`).
     pub(crate) fn close_window_confirmed(&self) {
-        self.confirmed.set(true);
+        self.state.confirmed.set(true);
         self.window.close();
     }
 
     pub(crate) fn confirmed(&self) -> bool {
-        self.confirmed.get()
+        self.state.confirmed.get()
+    }
+
+    /// Takes back a `y` the window close had, once the close hands the decision to nvim: from then
+    /// on the answer travels with the quit (`kill_pane::EditorQuit::Window`), so a close after nvim
+    /// exits asks again if what is running changed meanwhile (`kill_pane::close_is_confirmed`), and
+    /// a close after nvim's prompt was cancelled asks again at all.
+    pub(crate) fn withdraw_confirmation(&self) {
+        self.state.confirmed.set(false);
+    }
+
+    /// `hook` runs whenever the window close's own y/n is answered with anything but `y`.
+    pub(crate) fn connect_window_close_declined(&self, hook: impl Fn() + 'static) {
+        *self.state.on_window_close_declined.borrow_mut() = Some(Rc::new(hook));
     }
 
     /// The window close's y/n: `y` closes the window again, and the close handler sees
     /// [`ClosePrompt::confirmed`].
     pub(crate) fn ask_to_close_window(&self, text: &str) {
         let window = self.window.clone();
-        self.ask(text, move || window.close());
-        self.closes_window.set(true);
+        self.show(text, Box::new(move || window.close()), true);
     }
 
     /// Shows `text` and runs `on_yes` if the next key is `y`. A second ask while one is open
     /// replaces it. ASSUMES the strip is empty/hidden while the prompt is open (the prefix is done
     /// by then) -- if the strip can still hold pieces, hide it while the prompt is open.
     pub(crate) fn ask(&self, text: &str, on_yes: impl FnOnce() + 'static) {
-        self.closes_window.set(false);
-        *self.on_yes.borrow_mut() = Some(Box::new(on_yes));
+        self.show(text, Box::new(on_yes), false);
+    }
+
+    fn show(&self, text: &str, on_yes: Box<dyn FnOnce()>, closes_window: bool) {
         self.label.set_label(text);
         let strip_x = self
             .strip
@@ -168,12 +234,7 @@ impl ClosePrompt {
         let (x, y) = prompt_origin(self.bar.is_visible(), strip_x, self.bar.height(), label_height.max(0));
         self.label.set_margin_start(x);
         self.label.set_margin_top(y);
-        self.open.set(true);
-    }
-
-    fn hide(&self) {
-        self.label.set_visible(false);
-        self.open.set(false);
+        self.state.open(on_yes, closes_window);
     }
 }
 
@@ -190,6 +251,66 @@ mod tests {
         assert_eq!(classify(Key::Escape, false), PromptKey::No);
         assert_eq!(classify(Key::Return, false), PromptKey::No, "Enter is not yes");
         assert_eq!(classify(Key::Shift_L, true), PromptKey::Ignore);
+    }
+
+    /// R1-2: only a `No` to the window close's own question reaches its decline hook -- not a `y`,
+    /// not a bare modifier, and not a `No` to `prefix x`'s kill-pane question.
+    #[test]
+    fn only_a_declined_window_close_runs_the_decline_hook() {
+        assert!(runs_decline_hook(PromptKey::No, true));
+        assert!(!runs_decline_hook(PromptKey::Yes, true));
+        assert!(!runs_decline_hook(PromptKey::Ignore, true));
+        assert!(!runs_decline_hook(PromptKey::No, false));
+    }
+
+    /// The Opus review's T6-4 (its fifth mutation, the decline hook disabled): a `No` to the window
+    /// close's own question hides the prompt and then runs the hook; a `y` confirms the close and
+    /// runs what was asked; `prefix x`'s question declined runs no hook; a bare modifier leaves the
+    /// prompt open; a key with no prompt open goes on untouched.
+    #[test]
+    fn the_prompts_answers_run_what_they_say() {
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let state = PromptState::default();
+        {
+            let log = log.clone();
+            *state.on_window_close_declined.borrow_mut() = Some(Rc::new(move || log.borrow_mut().push("declined")));
+        }
+        let on_yes = |log: &Rc<RefCell<Vec<&'static str>>>| -> Box<dyn FnOnce()> {
+            let log = log.clone();
+            Box::new(move || log.borrow_mut().push("yes"))
+        };
+        let hide = |log: &Rc<RefCell<Vec<&'static str>>>| {
+            let log = log.clone();
+            move || log.borrow_mut().push("hide")
+        };
+
+        assert!(
+            !state.answer(PromptKey::No, hide(&log)),
+            "no prompt open: the key goes on"
+        );
+        assert!(log.borrow().is_empty());
+
+        state.open(on_yes(&log), true);
+        assert!(!state.answer(PromptKey::Ignore, hide(&log)), "a bare modifier waits");
+        assert!(state.is_open());
+        assert!(state.answer(PromptKey::No, hide(&log)));
+        assert_eq!(*log.borrow(), ["hide", "declined"]);
+        assert!(!state.confirmed.get() && !state.is_open());
+
+        log.borrow_mut().clear();
+        state.open(on_yes(&log), true);
+        assert!(state.answer(PromptKey::Yes, hide(&log)));
+        assert_eq!(*log.borrow(), ["hide", "yes"]);
+        assert!(state.confirmed.get(), "the window close's y confirms it");
+
+        log.borrow_mut().clear();
+        state.confirmed.set(false);
+        state.open(on_yes(&log), false);
+        assert!(state.answer(PromptKey::No, hide(&log)));
+        assert_eq!(*log.borrow(), ["hide"], "prefix x's question declined runs no hook");
+        state.open(on_yes(&log), false);
+        assert!(state.answer(PromptKey::Yes, hide(&log)));
+        assert!(!state.confirmed.get(), "and its y confirms no window close");
     }
 
     /// Task 5(b): the prompt sits in the top bar's strip while the bar is drawn (the owner reads

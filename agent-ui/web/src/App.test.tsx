@@ -1,15 +1,20 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import App, { HINT_PENDING_TIMEOUT_MS, statusWarning } from "./App";
+import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, MAX_MOTION_COUNT, statusWarning } from "./App";
 import { initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
+// Fix round 2 (v1 audit review, mutation resistance): a namespace import so `h3b` below can spy on
+// the real `isPlainAnswerKey` export and prove the bypass-y handler actually calls it, rather than
+// a same-shaped hand-written copy -- see that test's own comment for what this can and cannot catch.
+import * as keymapModule from "./keymap";
 import { binding, TABLE } from "./testFixtures";
 import { modeFixedMessage } from "./modeKey";
+import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "./typingGuard";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -1499,20 +1504,147 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
     }
   });
 
-  it("H posts tab_verb prev, [ b posts prev via the table, [ [ is still a prompt jump", () => {
-    const { container } = started();
-    sendTable();
-    act(() => root(container).focus());
-    press("H");
-    expect(tabVerbsPosted()).toEqual(["prev"]);
-    posted.length = 0;
-    press("[");
-    press("b");
-    expect(tabVerbsPosted()).toEqual(["prev"]);
-    posted.length = 0;
-    press("[");
-    press("[");
-    expect(posted.length).toBe(0);
+  /** v1 hardening R2-2: `H`/`L` (like `f`, below) are always the first key of whatever typed them,
+   *  so they defer the same `TYPING_GUARD_MS` `a`/`d` do rather than running at once -- a lone `H`
+   *  still runs, just `TYPING_GUARD_MS` later. `[ b`/`[ [` are a different path entirely (the
+   *  reserved two-key prefix `resolveKey` itself owns, completed on the SECOND key), so they are
+   *  untouched and still run at once. */
+  it("H posts tab_verb prev TYPING_GUARD_MS later, [ b posts prev via the table at once, [ [ is still a prompt jump", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("H");
+      expect(tabVerbsPosted()).toEqual([]);
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual(["prev"]);
+      posted.length = 0;
+      press("[");
+      press("b");
+      expect(tabVerbsPosted()).toEqual(["prev"]);
+      posted.length = 0;
+      press("[");
+      press("[");
+      expect(posted.length).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** v1 hardening R2-2's own reproduction: two or more tabs open, on tab 2, `Ctrl+l` back to BROWSE
+   *  and then "Looks good, now add tests⏎" typed at typing speed used to switch to tab 1 on the very
+   *  first `L` (`mayActAfterMotion` cannot catch this: `L` is always the first key). Here the `o`
+   *  that follows within `TYPING_GUARD_MS` cancels the deferred `L` before it ever posts, and the
+   *  band says what did not happen in `L`'s own words -- the whole-branch review found it flashing
+   *  the `a`/`d` text for every cancelled key, card or no card (`TypingGuard.defer`'s
+   *  `cancelledFlash`). */
+  it('"Looks good" at 80 ms a key posts no tab_verb, and the band names L, not a / d', () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      sendTable();
+      act(() => root(container).focus());
+      for (const key of ["L", "o", "o", "k", "s"]) {
+        press(key);
+        act(() => vi.advanceTimersByTime(80));
+      }
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(tabVerbsPosted()).toEqual([]);
+      expect(container.querySelector(".band-message")?.textContent).toBe(tableKeyTypingFlash("L", "tab.next"));
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** `L` itself arriving soon after another key (rather than being cancelled by one that follows)
+   *  refuses at once and says so with its own message: `k` (an ordinary move) then `L` within the
+   *  window. */
+  it("k then L at 80 ms a key: L refuses at once, and the band names it", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      sendTable();
+      act(() => root(container).focus());
+      press("k");
+      act(() => vi.advanceTimersByTime(80));
+      press("L");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(tabVerbsPosted()).toEqual([]);
+      expect(container.querySelector(".band-message")?.textContent).toBe(tableKeyTypingFlash("L", "tab.next"));
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** The same key alone after a pause still works: a real deliberate `L`, nothing else typed near
+   *  it, runs `TYPING_GUARD_MS` later exactly as the fixed test above already pins for `H`. */
+  it("a lone L still posts tab_verb next, just TYPING_GUARD_MS later", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("L");
+      expect(tabVerbsPosted()).toEqual([]);
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual(["next"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** v1 audit P2-A6: `L`'s single-key binding defers `TYPING_GUARD_MS` (the test above); a `keymap`
+   *  envelope arriving inside that window used to leave the deferred callback armed, closed over the
+   *  OLD table's `binding` -- so replacing the table did not merely fail to run the NEW binding, it
+   *  still ran the STALE one once the wait elapsed. `clearSequence` (Review Focus 1) only ever
+   *  cancelled a pending multi-key sequence, never this. Codex's saved probe reproduces this exactly
+   *  (`/scratch/v1-audit-probes/neovibe-p2/P2.audit.test.tsx`, "P2 drops a delayed table binding
+   *  when the table is replaced"). */
+  it("a table replaced mid-guard-window drops the deferred L binding entirely (P2-A6)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("L");
+      expect(tabVerbsPosted()).toEqual([]);
+      sendTable({
+        ...TABLE,
+        bindings: TABLE.bindings.map((b) => (b.keys.join("") === "L" ? { ...b, action: "tab.prev" as const } : b)),
+      });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** `H`/`L` use `defer` (both directions), not `mayActAfterMotion`: unlike the leader, a preceding
+   *  run of motion keys does not exempt them -- the review's own reason not to reuse
+   *  `mayActAfterMotion` here (there is no motion run behind the FIRST key of anything). */
+  it("k k then H at 80 ms a key still defers (no motion-run exception, unlike the leader)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("k");
+      act(() => vi.advanceTimersByTime(80));
+      press("k");
+      act(() => vi.advanceTimersByTime(80));
+      press("H");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   /** v1 polish F16: vim's `gt`/`gT` (`:help gt`) step session tabs like `L`/`H`. `gT` arrives as a
@@ -1534,6 +1666,50 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
     press("g");
     press("g");
     expect(tabVerbsPosted()).toEqual([]);
+  });
+
+  /** v1 hardening, codex-release-p1 #6 (R25 "an unbound key after the leader is swallowed",
+   *  leader.ts:76-84): a pending sequence's own keydown handler had no `isModifierKey` guard, unlike
+   *  `pendingRef`'s `g`/`z`/`[`/`]` prefix (the test just above) and `TypingGuard.onKey`. The bare
+   *  `Control` keydown of a `Ctrl+c` combo found no match, `advanceSequence` returned `cancel`, and
+   *  the FOLLOWING keydown (`c`, `ctrlKey: true`) then saw `seqRef.current === null`, fell out of the
+   *  leader block and reached `resolveKey`'s own `ctrlKey && event.key === "c"` arm -- interrupting a
+   *  running turn instead of being swallowed as an unbound continuation. */
+  it("a bare Ctrl keydown keeps a pending leader sequence alive, so Ctrl+c is swallowed rather than interrupting", () => {
+    const { container } = started({ activeTurnId: "t1", capabilities: { ...initialState().capabilities, interrupt: true } });
+    sendTable();
+    act(() => root(container).focus());
+    press(" "); // arms <leader>; TABLE's own bindings start with m/b/f, never c
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Control", ctrlKey: true });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "c", ctrlKey: true });
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+  });
+
+  /** Fix round 1 (reviewer finding, codex-release-p1 #3): the #6 fix above keeps a bare Control
+   *  keydown from cancelling the pending sequence, but the REAL character keydown that follows it
+   *  (`d`, carrying `ctrlKey: true`) used to reach `advanceSequence` as plain "d", completing
+   *  `<leader>bd` (tab.close) for a Ctrl+d chord no table entry actually names. */
+  it("Space b Ctrl+d (the Control keydown included) does not run tab.close", () => {
+    const { container } = started();
+    sendTable();
+    act(() => root(container).focus());
+    press(" ");
+    press("b");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Control", ctrlKey: true });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "d", ctrlKey: true });
+    expect(tabVerbsPosted()).toEqual([]);
+  });
+
+  /** The control for the test above: with no modifier at all, Space b d still runs tab.close -- the
+   *  fix narrows what a chord may complete, it does not touch the bare-key path. */
+  it("Space b d (no modifier) still runs tab.close", () => {
+    const { container } = started();
+    sendTable();
+    act(() => root(container).focus());
+    press(" ");
+    press("b");
+    press("d");
+    expect(tabVerbsPosted()).toEqual(["close"]);
   });
 
   it("Space with the Approve button focused starts no sequence, and no longer activates it (v1 S5)", () => {
@@ -1756,8 +1932,10 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
    nothing (S5). Time is vitest's fake clock: jsdom stamps each keydown with `Date.now()`, so a gap
    here is exactly the gap between two keys. */
 describe("v1: typing never answers a card", () => {
-  const TYPING = "a / d answer a card only on their own — i or Ctrl+j to type";
+  const TYPING = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
   const NO_CARD = "no card here — i, o, A or Ctrl+j to type";
+  /** v1 hardening (R2-10): the same refusal while the card waits elsewhere points back to it. */
+  const ELSEWHERE = "a / d answer the card under the cursor — j / k onto it, then a / d";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1818,6 +1996,44 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(TYPING);
   });
 
+  it("with no card waiting anywhere, a says there is no card here (F13)", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(1000);
+    expect(answered()).toHaveLength(1);
+    press("j");
+    wait(300);
+    press("a");
+    expect(band(container)).toBe(NO_CARD);
+  });
+
+  /** Codex's whole-branch review: Rust refused the answer ("Always allow" with its rule unsavable)
+   *  and left the card waiting, but this panel kept the id as answered for good -- `a`/`d` and the
+   *  buttons stayed dead until a reset. A refusal now gives the card back. */
+  it("a refused permission_response gives the card back: a and its buttons answer again", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(1000);
+    const first = answered();
+    expect(first).toHaveLength(1);
+    const approve = () =>
+      Array.from(container.querySelectorAll<HTMLButtonElement>(".permission-card button")).find(
+        (b) => b.textContent === "Approve",
+      )!;
+    expect(approve().disabled).toBe(true);
+    dispatch({
+      kind: "command_result",
+      requestId: first[0].request_id as string,
+      ok: false,
+      error: "could not save the rule: Permission denied",
+    });
+    expect(approve().disabled).toBe(false);
+    press("a");
+    wait(1000);
+    expect(answered()).toHaveLength(2);
+    expect(answered()[1]).toEqual(expect.objectContaining({ permission_id: "perm-1", decision: "allow" }));
+  });
+
   it("a lone a approves the card under the cursor 250 ms later (R32 unchanged, only delayed)", () => {
     arrivedOnACard();
     press("a");
@@ -1832,6 +2048,84 @@ describe("v1: typing never answers a card", () => {
     press("d");
     wait(250);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
+  });
+
+  /* v1 audit P2-A1, ruling R2: before `KeyLike` gained `altKey`/`metaKey`, an Alt or Meta held
+     alongside `a` reached `resolveKey`'s `case "a":` unchecked -- a common OS chord (Cmd/Ctrl+A
+     "select all" muscle memory) that must never authorize a real tool call. Each modifier gets its
+     own fresh card: two presses in the same test would have the second cancel the first's deferred
+     answer regardless of this fix (`TypingGuard.onKey` cancels on every keydown), which would pass
+     even with the bug still there. */
+  it.each([{ altKey: true }, { metaKey: true }])(
+    "a modified a is not permission approval: %j (v1 audit P2-A1)",
+    (modifier) => {
+      arrivedOnACard();
+      press("a", modifier);
+      wait(1000);
+      expect(answered()).toEqual([]);
+    },
+  );
+
+  /* Fix round 1 (v1 audit review, "R2's Super clause"): R2's own ruling names Super explicitly, and
+     the fix that landed for Alt/Meta only ever checked `event.altKey`/`event.metaKey` -- a real
+     `KeyboardEvent`'s `getModifierState("Super")` (jsdom honours `KeyboardEventInit`'s
+     `modifierSuper`, and `fireEvent.keyDown` forwards it through) is the only signal this layer has
+     for a physical Super/Hyper press; see `keymap.ts`'s own `KeyLike` doc comment for the honest
+     caveat that this may still be a no-op on real WebKitGTK if it never surfaces Super as any DOM
+     modifier at all. */
+  it("a modified a is not permission approval: Super (v1 audit P2-A1, fix round 1)", () => {
+    arrivedOnACard();
+    press("a", { modifierSuper: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  /* Fix round 2 (v1 audit review, "the AltGraph clause"): AltGr is a level-3 shift some layouts use
+     to type an ordinary character, not one of the four modifiers R2 and fix round 1 named -- jsdom
+     honours `KeyboardEventInit`'s `modifierAltGraph` the same way it honours `modifierSuper`. */
+  it("a modified a is not permission approval: AltGraph (v1 audit fixes, finding 1)", () => {
+    arrivedOnACard();
+    press("a", { modifierAltGraph: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  /* v1 audit P2-A2, ruling R3: Shift+Tab is claimed by `App.tsx`'s document-capture `onModeKey`
+     ahead of the bubble-phase `onKeyDown` that would otherwise feed it to `typingGuard.onKey` --
+     and `onModeKey` calls `event.stopPropagation()` on the very route (`cycle`) this reproduces, so
+     that bubble handler never runs at all. Before R3's fix, a card answer deferred moments earlier
+     stayed armed and still fired `TYPING_GUARD_MS` later even though the user had moved on. */
+  it("Shift+Tab cancels a card answer deferred moments earlier (v1 audit P2-A2)", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(100);
+    press("Tab", { code: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    // Fix round 1 (codex finding 2): the cancelled wait's own flash now shows, the same as any other
+    // key cancelling a deferred `a`/`d` (`onModeKey` used to call a bare `typingGuard.cancel()`,
+    // which drops the pending answer but discards its flash -- nothing told the user their `a` had
+    // been discarded).
+    expect(band(container)).toBe(TYPING);
+    wait(TYPING_GUARD_MS);
+    expect(answered()).toEqual([]);
+  });
+
+  /* Fix round 1 (v1 audit review, codex finding 2): before this fix, `onModeKey` cancelled a pending
+     answer with a bare `typingGuard.cancel()`, which never records Shift+Tab as a key the guard has
+     seen -- so a `a` pressed shortly AFTER a Shift+Tab (with nothing pending to cancel) skipped the
+     guard's "before" half entirely and answered at once, unlike every other key (see "a key just
+     before a refuses it at once" below, which is the same scenario with `x` in place of Shift+Tab).
+     `typingGuard.onKey("Tab", ...)` closes it: Shift+Tab now counts as typing for the key that comes
+     after it too. */
+  it("Shift+Tab counts as typing for the guard's before-half too (v1 audit P2-A2, fix round 1)", () => {
+    const { container } = arrivedOnACard();
+    press("Tab", { code: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    wait(100);
+    press("a");
+    expect(band(container)).toBe(TYPING);
+    wait(1000);
+    expect(answered()).toEqual([]);
   });
 
   it("a then j at 200 ms: the j cancels the answer, flashes, and still moves", () => {
@@ -1883,14 +2177,14 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  it("two rows below a lone card, a answers nothing and says there is no card here (S4, F13)", () => {
+  it("two rows below a lone card, a answers nothing and points back to the card (S4, F13, R2-10)", () => {
     const { container } = arrivedOnACard();
     press("j");
     press("j");
     expect(container.querySelector(".row-current")!.textContent).toContain("and the docs");
     wait(300);
     press("a");
-    expect(band(container)).toBe(NO_CARD);
+    expect(band(container)).toBe(ELSEWHERE);
     wait(1000);
     expect(answered()).toEqual([]);
   });
@@ -2271,18 +2565,73 @@ describe("App global HINT: the panel's half", () => {
    *  reachable on `<leader>i`, `prefix i` and a click, none of which go through this list. */
   const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
 
-  it("f in BROWSE asks shell for a HINT, and f in INPUT is just a letter", () => {
-    const { container } = conversation();
-    press("f");
-    expect(lastOfType("hint_request")).toMatchObject({ type: "hint_request" });
-    expect(typeof lastOfType("hint_request")!.request_id).toBe("string");
-    // shell answers and the HINT ends; only then are the panel's keys its own again.
-    collect(1);
-    dispatch({ kind: "hint_end", sessionId: 1 });
-    posted = [];
-    fireEvent.keyDown(root(container), { key: "i" });
-    fireEvent.keyDown(container.querySelector("textarea")!, { key: "f" });
-    expect(lastOfType("hint_request")).toBeUndefined();
+  it("f in BROWSE asks shell for a HINT TYPING_GUARD_MS later, and f in INPUT is just a letter", () => {
+    // v1 hardening R2-1: `f` is always the first key of whatever typed it, so it defers the same
+    // `TYPING_GUARD_MS` `a`/`d` do rather than asking `shell` at once -- a lone `f` still asks, just
+    // that much later.
+    vi.useFakeTimers();
+    try {
+      const { container } = conversation();
+      press("f");
+      expect(lastOfType("hint_request")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(lastOfType("hint_request")).toMatchObject({ type: "hint_request" });
+      expect(typeof lastOfType("hint_request")!.request_id).toBe("string");
+      // shell answers and the HINT ends; only then are the panel's keys its own again.
+      collect(1);
+      dispatch({ kind: "hint_end", sessionId: 1 });
+      posted = [];
+      fireEvent.keyDown(root(container), { key: "i" });
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "f" });
+      expect(lastOfType("hint_request")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** v1 hardening R2-1's own reproduction: "fix the dashboard layout⏎" typed at typing speed used to
+   *  start a HINT on its own `f` (`mayActAfterMotion` cannot catch this: `f` is always the first
+   *  key). Here the `i` that follows within `TYPING_GUARD_MS` cancels the deferred `f` before it
+   *  ever posts, and the band says so in `f`'s own words, not the `a`/`d` text it used to show with
+   *  no card anywhere (the whole-branch review). */
+  it('"fix this" at 80 ms a key asks shell for no HINT, and the band names f, not a / d', () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = conversation();
+      act(() => widen(container));
+      for (const key of ["f", "i", "x", " ", "t", "h", "i", "s"]) {
+        press(key);
+        act(() => vi.advanceTimersByTime(80));
+      }
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("hint_request")).toBeUndefined();
+      expect(container.querySelector(".band-message")?.textContent).toBe(hintTypingFlash());
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** `f` itself arriving soon after another key (rather than being cancelled by one that follows)
+   *  refuses at once and says so with its own message: `j` (an ordinary move) then `f` within the
+   *  window. */
+  it("j then f at 80 ms a key: f refuses at once, and the band names it", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = conversation();
+      act(() => widen(container));
+      press("j");
+      act(() => vi.advanceTimersByTime(80));
+      press("f");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("hint_request")).toBeUndefined();
+      expect(container.querySelector(".band-message")?.textContent).toBe(hintTypingFlash());
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 
   /* Whole-branch review: between `f` posting `hint_request` and shell attaching its window key
@@ -2309,14 +2658,22 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("i does not open the composer, j does not move, a second f asks nothing", () => {
-      const { container } = onTheCard();
-      press("f");
-      press("i");
-      press("j");
-      press("f");
-      expect(container.querySelector("textarea")).toBeNull();
-      expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
-      expect(posted.filter((m) => m.type === "hint_request")).toHaveLength(1);
+      vi.useFakeTimers();
+      try {
+        const { container } = onTheCard();
+        // The first `f` stands alone and is left to run for real (v1 hardening R2-1's own defer,
+        // TYPING_GUARD_MS later) before the round-trip gap this test is actually about begins.
+        press("f");
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+        press("i");
+        press("j");
+        press("f");
+        expect(container.querySelector("textarea")).toBeNull();
+        expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
+        expect(posted.filter((m) => m.type === "hint_request")).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("once the HINT it asked for has ended, the keys are the panel's again", () => {
@@ -2342,6 +2699,9 @@ describe("App global HINT: the panel's half", () => {
       try {
         const { container } = onTheCard();
         press("f");
+        // The lone `f` runs for real (v1 hardening R2-1's own defer) before the dead-key window
+        // this test is actually about starts counting.
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
         act(() => vi.advanceTimersByTime(HINT_PENDING_TIMEOUT_MS - 1));
         press("i");
         expect(container.querySelector("textarea")).toBeNull();
@@ -2446,15 +2806,29 @@ describe("App global HINT: the panel's half", () => {
     // banners' `r`. Deviation from the brief's own parenthetical ("pressing Escape first"): `EmptyTab`
     // has no `Escape` handling of its own (only `keymap.ts`'s conversation-root table does), so this
     // uses the same blur `Composer`'s own BROWSE/INPUT split already relies on everywhere else.
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
-    const textarea = container.querySelector("textarea")!;
-    fireEvent.keyDown(textarea, { key: "f" });
-    expect(lastOfType("hint_request")).toBeUndefined();
-    fireEvent.blur(textarea);
-    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "f" });
-    expect(lastOfType("hint_request")).toBeDefined();
+    // Fix round 1 (R2-1's own copy for `EmptyTab`): `f` there now defers `TYPING_GUARD_MS` too, the
+    // same as the live conversation's own `f` (`typingGuard.ts`'s own doc comment) -- a lone `f`
+    // still asks, just that much later. The composer's own `f` still reaches `typingGuard.onKey`
+    // (called unconditionally, ahead of the mode check, this file's own doc comment) even though
+    // the mode gate swallows it, so the SECOND `f` below needs a real gap behind it too, or the
+    // guard reads it as arriving too soon after the first -- the thing it exists to catch.
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.keyDown(textarea, { key: "f" });
+      expect(lastOfType("hint_request")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      fireEvent.blur(textarea);
+      fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "f" });
+      expect(lastOfType("hint_request")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(lastOfType("hint_request")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
@@ -3319,6 +3693,150 @@ describe("App refused commands", () => {
     }
   });
 
+  /* P2-A3 (v1 audit), ruling R1: the composer is unchanged since the optimistic clear (nothing was
+     typed while the reply was in flight), so the refused text is restored alone -- and it is
+     mirrored back to Rust in the same `draft` envelope ordinary typing sends, which is what this
+     panel needs before a later tab switch can bring it back (`shell::tabs::set_draft` keeps
+     whatever it is told regardless of how the send that produced it was refused). */
+  it("mirrors a restored refused send back to Rust when the box was left untouched", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "please keep me" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+      expect(box.value).toBe("please keep me");
+      expect(lastOfType("draft")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "please keep me" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* R1's "keep both": text typed into the box while the send was still in flight must not be
+     destroyed by the refused text coming back -- the refused text goes BEFORE what was typed,
+     separated by a newline, and the combined text is what reaches Rust. */
+  it("keeps text typed while a send was refused, with the refused text placed before it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      // Typed after the optimistic clear, before Rust's refusal arrives.
+      fireEvent.change(box, { target: { value: "second unsent draft" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "transport refused" });
+      expect(box.value).toBe("first prompt\nsecond unsent draft");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent draft" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* The queue_message path (a refusal while a turn is showing as running) goes through the exact
+     same restore code as send_message -- this is the probe's own second case, unchanged-since-send
+     on that path. */
+  it("mirrors a restored refused queue_message back to Rust", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = runningApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "unqueued text" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("queue_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "session ended" });
+      expect(box.value).toBe("unqueued text");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "unqueued text" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* The point of mirroring the recovered text to Rust at all: a later tab switch brings it back,
+     the same way any other draft does (`"takes each tab's draft from Rust, never from the tab it
+     left"` in the tabs describe block, exercised here starting from a refusal instead of plain
+     typing). Switches INSIDE the refusal's own 300ms debounce, before advancing any timer -- fix
+     round 1 (v1 audit, codex): the previous version of this test advanced the debounce first, so it
+     only ever pinned a hand-dispatched `draft` echo (already covered by the tabs block's "takes
+     each tab's draft from Rust" test), never the actual race where `flushDraft` in the `tabs`
+     handler (ruling 6) is what has to deliver the recovered text on a switch nobody waited out. */
+  it("shows the recovered text again after switching tabs and back", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "transport refused" });
+      expect(box.value).toBe("first prompt");
+      // Not yet flushed -- the refusal's own debounce has not fired, and nothing has been posted.
+      expect(lastOfType("draft")).toBeUndefined();
+
+      const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+      dispatch({ kind: "tabs", active: 2, tabs: two });
+      // The switch itself flushed the still-pending mirror -- no timer was advanced.
+      const mirrored = lastOfType("draft");
+      expect(mirrored).toMatchObject({ tab: 1, text: "first prompt" });
+      dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
+      dispatch({ kind: "tabs", active: 1, tabs: two });
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
+      // Rust echoing back exactly what the switch mirrored to it -- the contract this task closes.
+      dispatch({ kind: "draft", tab: 1, text: mirrored!.text as string });
+      enterInputMode(container);
+      expect(container.querySelector("textarea")!.value).toBe("first prompt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* [important, codex] fix round 1: `reset_tab` (the `r` restart on an ended tab) used to read
+     Rust's own, possibly stale `tab.draft` (`TabSet::reset` joins `tab.queue` and `tab.draft` --
+     see core/src/tab_set.rs) without first delivering whatever recovery mirror was still sitting in
+     the 300ms debounce this panel just armed. Pressing `r` inside that window sent `reset_tab`
+     first, and the `draft` echo that came back (Rust's stale copy) both wiped the composer AND
+     nulled `pendingDraftRef`, so the debounce's own later firing posted nothing -- the recovered
+     text reached neither the box nor Rust. Fixed by flushing the pending mirror before `reset_tab`,
+     the same way a real tab switch already does (ruling 6). */
+  it("flushes a still-pending recovered draft before reset_tab, so a restart cannot erase it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      // Typed after the optimistic clear, before Rust's refusal arrives -- R1's "keep both".
+      fireEvent.change(box, { target: { value: "second unsent draft" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+      expect(box.value).toBe("first prompt\nsecond unsent draft");
+      // Not yet flushed -- the refusal's own `mirrorDraft` debounce has not fired.
+      expect(lastOfType("draft")).toBeUndefined();
+
+      // The same failure that refused the send also ended the tab, so `r` is on offer; pressed
+      // inside the still-pending debounce window, before any timer fires on its own.
+      dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "session_closed", reason: "provider exited" }] });
+      fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "r" });
+
+      // The recovered text reached Rust before reset_tab, not after it, and not a stray empty one.
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent draft" });
+      expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+      expect(posted.indexOf(lastOfType("draft")!)).toBeLessThan(posted.indexOf(lastOfType("reset_tab")!));
+
+      // The now-superseded timer firing later must not post a second, stale (or empty) draft.
+      act(() => vi.advanceTimersByTime(300));
+      expect(posted.filter((m) => m.type === "draft")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   function runningApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -4064,7 +4582,7 @@ describe("P1: the keys land on a card that waits", () => {
       events: [{ type: "permission_requested", permission_id: "p", tool_use_id: null, tool_name: "Bash", input: { command: "rm x" } }],
     });
     expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("input");
-    expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, then a / d");
+    expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, j to it, a / d alone");
   });
 
   it("a switch to a tab holding a card lands on it while the panel has the keys", () => {
@@ -4239,6 +4757,29 @@ describe("a switch back to a tab whose reply streams (the small-defects GUI pass
   });
 });
 
+/** v1 audit P2-A4/R4: a digit prefix must not cost `O(count)` work, and must not simply keep
+ *  growing forever either. Pure, DOM-free -- the accumulation function itself, not the keyboard
+ *  wiring around it (that's the boundary-scan tests inside "BROWSE: counts…" below). */
+describe("accumulateMotionCount (v1 audit R4)", () => {
+  function typeCount(digits: string): number {
+    let count: number | null = null;
+    for (const ch of digits) count = accumulateMotionCount(count, Number(ch));
+    return count!;
+  }
+
+  it("keeps an ordinary count exact", () => {
+    expect(typeCount("3")).toBe(3);
+    expect(typeCount("12")).toBe(12);
+  });
+
+  it("caps a count past MAX_MOTION_COUNT, far below vim's own silent overflow cap", () => {
+    expect(typeCount("99999")).toBe(MAX_MOTION_COUNT);
+    // Capped on every digit, not only once the whole string is read: a long run of the same digit
+    // (someone holding a number key) never transiently builds a number past the cap either.
+    expect(typeCount("9".repeat(50))).toBe(MAX_MOTION_COUNT);
+  });
+});
+
 describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
   it("3j moves three rows, and ]] / [[ go from prompt to prompt", () => {
     const { container } = render(<App />);
@@ -4263,6 +4804,93 @@ describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
     fireEvent.keyDown(root, { key: "[" });
     fireEvent.keyDown(root, { key: "[" });
     expect(current()).toContain("first ask");
+  });
+
+  /** v1 audit P2-A4/R4: Codex's probe measured 3,004 DOM scans for `1000j` sitting at a one-row
+   *  boundary (`nextStop`/`clampStep` clamp rather than returning `null` there, so the old loop's
+   *  only early-exit condition never fired and it ran all `times` iterations). Fixed by "no
+   *  progress = stop": once a repeat lands back on the stop the previous repeat already reached,
+   *  the walk is over regardless of how many repeats are left. `querySelectorAll` is the DOM
+   *  operation `stopsIn`/`conversationRows` (both walked by `nextStop`/`rowIndexOf`) actually run,
+   *  same technique the saved audit probe used. */
+  it("a large count at a one-row boundary does O(1) DOM scans, not O(count)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "the only row" }] }), 2);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    gg(container);
+    const scans = vi.spyOn(root, "querySelectorAll");
+    for (const key of "1000") fireEvent.keyDown(root, { key });
+    scans.mockClear();
+    fireEvent.keyDown(root, { key: "j" });
+    expect(scans.mock.calls.length).toBeLessThan(50);
+    scans.mockRestore();
+  });
+
+  /** The same shape, past MAX_MOTION_COUNT -- proves the boundary early-exit alone already tames an
+   *  even larger count (the cap above is the second, independent bound, tested in isolation). */
+  it("an even larger count (past the cap) still does O(1) DOM scans", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "the only row" }] }), 2);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    gg(container);
+    const scans = vi.spyOn(root, "querySelectorAll");
+    for (const key of "99999") fireEvent.keyDown(root, { key });
+    scans.mockClear();
+    fireEvent.keyDown(root, { key: "j" });
+    expect(scans.mock.calls.length).toBeLessThan(50);
+    scans.mockRestore();
+  });
+
+  /** v1 audit P2-A4/R4, round 2 (the Codex whole-branch review): the boundary tests above only
+   *  prove a count that CANNOT move is cheap. A count that really walks was still `O(count)`: every
+   *  step called `nextStop` -> `currentStop` -> `conversationRows` and then `rowIndexOf` ->
+   *  `conversationRows`, so `1000j` from the first of 1,001 rows made 2,001 full-tree queries
+   *  (about 2.3 s in jsdom). `countedStop` reads the tree once per motion. */
+  it("1000j from the first of 1,001 rows reads the tree a bounded number of times and lands on the last", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const transcript = Array.from({ length: 1001 }, (_, i) => ({ seq: i + 1, text: `row ${i + 1}` }));
+    dispatchLiveTab(snapshotState({ transcript }), 1002);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    const current = () => container.querySelector(".row-current")!.textContent;
+    gg(container);
+    expect(current()).toContain("row 1");
+    const scans = vi.spyOn(root, "querySelectorAll");
+    for (const key of "1000") fireEvent.keyDown(root, { key });
+    scans.mockClear();
+    fireEvent.keyDown(root, { key: "j" });
+    expect(scans.mock.calls.length).toBeLessThan(50);
+    scans.mockRestore();
+    expect(current()).toContain("row 1001");
+  });
+
+  /** Found writing `countedStop`: every step of the old walk re-read `document.activeElement`, so
+   *  with the keys on a control inside a row (after `l` onto a card's Approve) each step started
+   *  again from that row, and `3j` moved once. Vim's `3j` moves three. */
+  it("3j from a card's Approve moves three stops, not one", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(
+      snapshotState({
+        transcript: [{ seq: 1, text: "alpha" }, { seq: 3, text: "bravo" }, { seq: 4, text: "charlie" }, { seq: 5, text: "delta" }],
+        pendingPermissions: [{ seq: 2, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "cargo fmt" } }],
+      }),
+      6,
+    );
+    const root = container.querySelector(".agent-ui-conversation")!;
+    const current = () => container.querySelector(".row-current")!;
+    gg(container);
+    fireEvent.keyDown(root, { key: "j" });
+    expect(current().classList.contains("row-permission")).toBe(true);
+    fireEvent.keyDown(root, { key: "l" });
+    const approve = document.activeElement as HTMLElement;
+    expect(approve.tagName).toBe("BUTTON");
+    expect(current().contains(approve)).toBe(true);
+    fireEvent.keyDown(approve, { key: "3" });
+    fireEvent.keyDown(approve, { key: "j" });
+    expect(current().textContent).toContain("delta");
   });
 
   it("Ctrl+c interrupts a running turn in BROWSE, even over a text selection", () => {
@@ -4552,6 +5180,26 @@ describe("N2 and R3: the editor round trips", () => {
     fireEvent.keyDown(root, { key: "Escape" });
     expect(container.querySelector(".path-pick")).toBeNull();
     expect(posted.filter((m) => m.type === "open_path")).toHaveLength(1);
+  });
+
+  /** v1 audit P2-A5: a `gf` picker left open over tab 1's conversation named paths that meant
+   *  nothing once the panel switched to tab 2 -- the very next letter typed there still opened one
+   *  of the old tab's paths, because the tab-switch reset cleared a long, explicit list of
+   *  per-conversation UI state and `pathPick` was not on it. Codex's saved probe reproduces this
+   *  exactly (`/scratch/v1-audit-probes/neovibe-p2/P2.audit.test.tsx`, "P2 cancels the path
+   *  picker on a tab switch"). */
+  it("switching tabs while gf's picker is open drops it: no open_path on the new tab (P2-A5)", () => {
+    const { container } = withPaths("compare a.rs and b.rs");
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "second conversation" }] }) });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "a" });
+    expect(posted.filter((m) => m.type === "open_path")).toEqual([]);
   });
 
   it("a click on an inline code path opens it", () => {
@@ -5380,6 +6028,89 @@ describe("v1 mode: entering bypass asks first", () => {
       fireEvent.keyDown(root, { key });
       expect(lastOfType("confirm_bypass")).toBeUndefined();
     } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** Whole-branch review (codex, 2026-09-28): a `y` with Ctrl/Alt/Meta held, or one an input method
+   *  is composing, is an editing keystroke, not D11's "y pressed on its own" -- the timing guard
+   *  alone let `Ctrl+y` (or the first letter of a pinyin syllable) enter bypass and approve the
+   *  waiting cards once the prompt had been up for the guard's duration. Each cancels, like any key
+   *  but a counted y. Shift is not in the list: `Y` is a counted answer (test b2).
+   *
+   *  Super/Hyper (v1 audit fixes, 2026-09-28): 325e007's own fix never checked
+   *  `getModifierState("Super"/"Hyper")` -- reconciling it with this branch's R2 ("refuse any Alt,
+   *  Meta or Super", `keymap.ts`'s `isPlainAnswerKey`) found that gap and this closes it. `jsdom`
+   *  honours `KeyboardEventInit`'s `modifierSuper` and `modifierHyper` as two independent booleans
+   *  (`EventModifierMixin-impl.js`'s `getModifierState` reads `this.modifier${keyArg}` for either),
+   *  so `Super+y` and `Hyper+y` below each isolate one without implying the other, the way a
+   *  physical keypress would report it (see keymap.ts's `KeyLike` doc comment on the honest caveat
+   *  about whether WebKitGTK ever surfaces either as a DOM modifier at all).
+   *
+   *  AltGraph (fix round 2, v1 audit review, "the AltGraph clause"): a level-3 shift some layouts
+   *  use to type an ordinary character -- neither 325e007 nor R2 named it, and `isPlainAnswerKey`
+   *  had no check for it until this round; `jsdom` honours `modifierAltGraph` the same way it
+   *  honours `modifierSuper`. */
+  it.each([
+    ["Ctrl+y", { key: "y", ctrlKey: true }],
+    ["Alt+y", { key: "y", altKey: true }],
+    ["Meta+y", { key: "y", metaKey: true }],
+    ["Super+y", { key: "y", modifierSuper: true }],
+    ["Hyper+y", { key: "y", modifierHyper: true }],
+    ["AltGraph+y", { key: "y", modifierAltGraph: true }],
+    ["Ctrl+Shift+Y", { key: "Y", ctrlKey: true, shiftKey: true }],
+    ["a y an input method is composing", { key: "y", isComposing: true }],
+    ["an input method's keyCode 229 y", { key: "y", keyCode: 229 }],
+  ] as const)("h3. %s after the guard cancels and posts nothing", (_name, init) => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, init);
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** Fix round 2 (v1 audit review, "the tests pin behaviour, not the use of the shared predicate"):
+   *  h3 above pins every modifier/composing case behaviourally, but a same-shaped hand-written copy
+   *  substituted for the `isPlainAnswerKey` call in the bypass-y handler would pass every one of
+   *  them too -- it only proves the RESULT, not that the two surfaces genuinely share one rule the
+   *  way the reconciliation commit (9b9c65a) claims. This spies on the real, exported
+   *  `keymap.ts#isPlainAnswerKey` (imported as a namespace, so the spy replaces the same binding
+   *  `App.tsx`'s own `import { isPlainAnswerKey }` resolves through -- confirmed in a throwaway
+   *  cross-module spike before writing this) and catches the one mutation at this call site h3
+   *  cannot: `App.tsx` reverting to a same-shaped hand-written modifier list (the spy sees zero
+   *  calls; confirmed by mutation -- every h3 row still passes, only this test turns red, exactly as
+   *  efacbb1's own commit message says). Hardcoding `plain = true` is a DIFFERENT mutation and not
+   *  that gap: confirmed by mutation, it fails every h3 row (all nine) as well as this one -- h3's
+   *  own behavioural assertions already catch it, so this test is merely redundant on that
+   *  particular case, not the reason it exists. It cannot reach `keymap.ts`'s OWN two internal call
+   *  sites (the `a`/`d` case, the `Shift+D` arm) -- those are intra-module references the bundler
+   *  compiles to a direct local call, not a property read through the spied namespace object,
+   *  confirmed the same way. `keymap.test.ts`'s own matrix test (v1 audit fixes, finding 1) is what
+   *  pins those two now, not behavioural tests alone -- though even that matrix cannot reach a bug
+   *  inside `isPlainAnswerKey` itself, since it derives its own expectation by calling the same
+   *  function under test; a direct `isPlainAnswerKey` unit test (and this file's own Hyper-alone h3
+   *  row) covers that instead. */
+  it("h3b. the bypass-y handler calls the real, exported isPlainAnswerKey, not a look-alike copy", () => {
+    const spy = vi.spyOn(keymapModule, "isPlainAnswerKey");
+    fakeClock();
+    try {
+      const { root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      spy.mockClear();
+      fireEvent.keyDown(root, { key: "y", ctrlKey: true });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+    } finally {
+      spy.mockRestore();
       vi.useRealTimers();
       vi.unstubAllGlobals();
     }

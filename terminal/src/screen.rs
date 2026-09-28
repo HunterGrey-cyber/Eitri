@@ -321,18 +321,28 @@ impl Screen {
     /// A grid below one cell is stored as one cell, the size `TIOCSWINSZ` gets too, so a
     /// `CSI 18 t` never answers `0x0`.
     ///
-    /// Takes no snapshot itself -- `Term::resize` is geometry, not a parser dispatch, so it cannot
-    /// be the transition [`Self::feed`] watches for, and `Self::render` already reprojects the
-    /// live `term` (new size included) the next time it is called with no update open. That covers
-    /// this even when an update IS open at resize time and goes on to publish nothing of its own
-    /// (an ESU/abort with no dispatch in between never latches `SyncBarrier`'s `dirty` flag): both
-    /// still clear `in_sync` unconditionally, so `open_update()` still reports `None` once it ends,
-    /// and the next `render()` picks up the resize regardless (re-review 2026-09-23, finding 2).
+    /// Takes no *frame* snapshot itself -- `Term::resize` is geometry, not a parser dispatch, so it
+    /// cannot be the transition [`Self::feed`] watches for, and `Self::render` already reprojects
+    /// the live `term` (new size included) the next time it is called with no update open. That
+    /// covers this even when an update IS open at resize time and goes on to publish nothing of its
+    /// own (an ESU/abort with no dispatch in between never latches `SyncBarrier`'s `dirty` flag):
+    /// both still clear `in_sync` unconditionally, so `open_update()` still reports `None` once it
+    /// ends, and the next `render()` picks up the resize regardless (re-review 2026-09-23, finding 2).
+    ///
+    /// **Does re-align the scrollback anchor (P4-A2, 2026-09-27 Codex audit).** A resize reflows
+    /// the grid -- how many logical lines/rows exist -- which can shift or evict what a pinned
+    /// [`ScrollView`] anchor points at, exactly the way output does; [`ScrollView::observe`]'s own
+    /// doc already asks for a call "once per feed -- output and resize both shift what history
+    /// retains." `Self::feed` called it; this did not, so a pinned anchor left stale by a resize
+    /// only [`RawViewport::resolve`](terminal_frame::viewport::RawViewport::resolve)d against the
+    /// *new* grid on the next `render()` -- silently returning whatever line the stale index now
+    /// landed on if it happened to still be in bounds, rather than reporting the anchor expired.
     pub fn resize(&mut self, size: PtySize) {
         let size = size.clamped();
         self.size = size;
         self.term.resize(grid_size(size));
         self.dirty = true;
+        self.scroll.observe(&self.term);
     }
 
     /// Something outside the byte stream changed what the frame shows (focus).

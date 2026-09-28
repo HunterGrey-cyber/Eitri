@@ -25,7 +25,7 @@ function key(k: string, options: { repeat?: boolean; onButton?: boolean } = {}) 
   const t = Date.now();
   guard.onKey(k, t);
   if (ANSWER_KEYS.has(k)) {
-    guard.defer(t, options.repeat ?? false, () => answers.push({ key: k, at: Date.now() }));
+    guard.defer(t, options.repeat ?? false, () => answers.push({ key: k, at: Date.now() }), "cancelled");
   } else if (k === "Enter" && options.onButton === true) {
     if (guard.mayAnswerNow("Enter", t, options.repeat ?? false)) answers.push({ key: k, at: t });
   }
@@ -102,7 +102,7 @@ describe("TypingGuard: typed prose never answers (spec §2.1)", () => {
   it("a then j at 200 ms: the j cancels the waiting a", () => {
     key("a");
     vi.advanceTimersByTime(200);
-    expect(guard.onKey("j", Date.now())).toBe(true);
+    expect(guard.onKey("j", Date.now())).toBe("cancelled");
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
   });
@@ -126,9 +126,9 @@ describe("TypingGuard: typed prose never answers (spec §2.1)", () => {
     const t = Date.now();
     guard.onKey("e", t);
     guard.onKey("a", t + 100);
-    expect(guard.defer(t + 100, false, () => answers.push({ key: "a", at: 0 }))).toBe(false);
+    expect(guard.defer(t + 100, false, () => answers.push({ key: "a", at: 0 }), "cancelled")).toBe(false);
     guard.onKey("a", t + 1000);
-    expect(guard.defer(t + 1000, false, () => answers.push({ key: "a", at: 0 }))).toBe(true);
+    expect(guard.defer(t + 1000, false, () => answers.push({ key: "a", at: 0 }), "cancelled")).toBe(true);
   });
 });
 
@@ -242,8 +242,20 @@ describe("TypingGuard: cancel", () => {
     expect(answers).toEqual([]);
   });
 
-  it("onKey says false when nothing was waiting", () => {
-    expect(guard.onKey("j", Date.now())).toBe(false);
+  it("onKey says null when nothing was waiting", () => {
+    expect(guard.onKey("j", Date.now())).toBeNull();
+  });
+
+  /** The whole-branch review: every deferred key shared one slot and the caller flashed the
+   *  `a`/`d` text for all of them. The flash that comes back is the cancelled wait's own. */
+  it("onKey hands back the flash the cancelled wait named, not another's", () => {
+    guard.onKey("f", 1000);
+    expect(guard.defer(1000, false, () => {}, "f starts HINT only on its own")).toBe(true);
+    expect(guard.onKey("i", 1080)).toBe("f starts HINT only on its own");
+    guard.onKey("L", 5000);
+    expect(guard.defer(5000, false, () => {}, "L (next tab) runs only on its own")).toBe(true);
+    expect(guard.onKey("o", 5080)).toBe("L (next tab) runs only on its own");
+    expect(guard.onKey("o", 5160)).toBeNull();
   });
 
   it("an injected clock is used instead of the global timers", () => {
@@ -260,7 +272,7 @@ describe("TypingGuard: cancel", () => {
     });
     let ran = 0;
     manual.onKey("a", 1000);
-    manual.defer(1000, false, () => ran++);
+    manual.defer(1000, false, () => ran++, "cancelled");
     expect(ran).toBe(0);
     scheduled[0]();
     expect(ran).toBe(1);

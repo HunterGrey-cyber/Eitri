@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { clampStep, controlsOf, currentStop, hintTargets, nextControl, nextStop, permissionTarget, rowIndexOf, stopsIn } from "./nav";
+import {
+  clampStep,
+  controlsOf,
+  conversationRows,
+  currentStop,
+  hintTargets,
+  nextControl,
+  nextStop,
+  permissionTarget,
+  rowIndexOf,
+  rowOf,
+  stopOf,
+  stopsIn,
+} from "./nav";
 import type { AnswerableItem } from "./nav";
 
 afterEach(() => {
@@ -271,5 +284,78 @@ describe("hintTargets", () => {
     rect(byId("in"), 10, 20);
     rect(byId("out"), 150, 20);
     expect(hintTargets(byId("root")).map((t) => t.el.id)).toEqual(["in"]);
+  });
+});
+
+/* v1 hardening, ruling R2 (review 2026-09-27-v1-hardening, panel-content finding 1): a reply's own
+   HTML sits inside its row, so anything in it that claims to be a stop is the row's content. */
+describe("a stop inside another stop is content, not a stop", () => {
+  /** Rows r0-r3 as the list's own children; r1 is a reply whose HTML carries two hidden "rows", a
+   *  "notice" with a button, a link, and a HINT composer marker; r2 is a card. */
+  function injected(): HTMLElement {
+    document.body.innerHTML = `
+      <div id="root" tabindex="0">
+        <div class="message-list" id="list">
+          <div data-nav-stop="row" id="r0">prompt</div>
+          <div data-nav-stop="row" id="r1"><div class="row-body"><div>
+            <p>reply <a href="#x" id="link">link</a></p>
+            <div data-nav-stop="row" id="fake0" hidden></div>
+            <div data-nav-stop="row" id="fake1" hidden></div>
+            <div data-nav-stop="notice" id="fakeNotice"><button id="fakeButton">Approve</button></div>
+            <div data-hint-composer id="fakeComposer">type here</div>
+          </div></div></div>
+          <div data-nav-stop="row" id="r2">
+            <button id="approve" data-nav-order="1">Approve</button>
+            <button id="deny" data-nav-order="2">Deny</button>
+          </div>
+          <div data-nav-stop="row" id="r3">tool</div>
+        </div>
+        <div data-hint-composer id="composer">composer</div>
+      </div>`;
+    return byId("root");
+  }
+
+  it("counts only the list's own rows, so index i is timeline item i", () => {
+    const root = injected();
+    expect(conversationRows(root).map((r) => r.id)).toEqual(["r0", "r1", "r2", "r3"]);
+    expect(rowIndexOf(root, byId("r2"))).toBe(2);
+    expect(rowIndexOf(root, byId("fake0"))).toBeNull();
+    expect(currentStop(root, 2)).toBe(byId("r2"));
+  });
+
+  it("walks j/k over the real stops only", () => {
+    const root = injected();
+    expect(stopsIn(root).map((s) => s.id)).toEqual(["r0", "r1", "r2", "r3"]);
+    root.focus();
+    expect(nextStop(root, 1, 1)).toBe(byId("r2"));
+    expect(nextStop(root, 2, -1)).toBe(byId("r1"));
+  });
+
+  it("puts an element inside a reply in the reply's row, whatever the reply claims", () => {
+    const root = injected();
+    expect(stopOf(root, byId("fakeButton"))).toBe(byId("r1"));
+    expect(rowOf(root, byId("fake1"))).toBe(byId("r1"));
+    expect(rowOf(root, byId("deny"))).toBe(byId("r2"));
+    expect(stopOf(root, byId("composer"))).toBeNull();
+    // Focus on a link in the reply: the reply's row holds the keys, not a "stop" it drew.
+    byId("link").focus();
+    expect(currentStop(root, 0)).toBe(byId("r1"));
+  });
+
+  it("gives HINT row targets their real row index, and the real composer", () => {
+    const root = injected();
+    for (const el of document.querySelectorAll<HTMLElement>("#root, #list, [data-nav-stop], button, [data-hint-composer]")) {
+      rect(el, 0, 10);
+    }
+    rect(root, 0, 400);
+    rect(byId("list"), 0, 400);
+    const targets = hintTargets(root);
+    expect(targets.filter((t) => t.kind === "row").map((t) => [t.el.id, (t as { rowIndex: number }).rowIndex])).toEqual([
+      ["r0", 0],
+      ["r1", 1],
+      ["r2", 2],
+      ["r3", 3],
+    ]);
+    expect(targets.filter((t) => t.kind === "composer").map((t) => t.el.id)).toEqual(["composer"]);
   });
 });

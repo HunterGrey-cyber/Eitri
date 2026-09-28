@@ -20,11 +20,29 @@
 //! the target once the grid has seen [`QUIET`] with no further change. A host appearing (first
 //! allocation, or shown again) gets its target at once. A move that keeps the size is not a
 //! resize and is never held. Nothing here -- no input, no field -- is a natural size.
+//!
+//! **A held size never reaches over a sibling (sw-layout-2, 2026-09-27 Codex sweep).** GTK
+//! hit-tests a widget by its own real allocation (`gtk_widget_do_pick`), never by
+//! `snapshot_children`'s paint clip, so a held size bigger than the target -- a host that was just
+//! unzoomed, settled at the whole window, is the clearest case -- used to reach past its target over
+//! the sibling that settled into the space and take a click that visibly lands on that sibling. On
+//! each axis where the held size is bigger than the target, the overflow is pointed past the edge of
+//! the grid the target touches, where there is no sibling: past the far edge when the target touches
+//! it (the target's own position, as before), else past the near edge (the held size ends where the
+//! target ends). The grid sets `overflow: hidden`, which makes GTK's pick return nothing for a point
+//! outside the grid, so an allocation reaching past the grid's edge can take no click from the top
+//! bar or anything else outside it. Only a host with a sibling on both sides of an axis is clamped to
+//! its target there, trading a WebView resize per pass for correctness.
+//!
+//! The first version of this fix clamped every held size to its target, which made every pass of
+//! every shrinking gesture a WebView resize -- 100 widths for a 100-pass sweep of the agent on the
+//! window's right, against one before, and P7/S3 measured over a full core for a WebView that follows
+//! every frame (whole-branch review).
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use neovibe_core::layout::{ModuleId, Rect};
+use neovibe_core::layout::{ModuleId, Rect, Size};
 
 /// P7's debounce: a web host gets its real size this long after the last change.
 pub(crate) const QUIET: Duration = Duration::from_millis(70);
@@ -54,15 +72,19 @@ pub(crate) struct WebThrottle {
 }
 
 impl WebThrottle {
-    /// What to allocate web host `id`, whose rectangle this pass is `target`. `was_on_screen`: it
-    /// was allocated in the previous pass too.
-    pub(crate) fn allocate(&mut self, id: &ModuleId, target: Rect, was_on_screen: bool) -> WebAllocation {
+    /// What to allocate web host `id`, whose rectangle this pass is `target` inside a grid of size
+    /// `bounds`. `was_on_screen`: it was allocated in the previous pass too.
+    pub(crate) fn allocate(&mut self, id: &ModuleId, target: Rect, was_on_screen: bool, bounds: Size) -> WebAllocation {
         match self.settled.get(id) {
-            Some(&(w, h)) if was_on_screen && (w, h) != (target.w, target.h) => WebAllocation {
-                rect: Rect { w, h, ..target },
-                held: true,
-                restart_quiet: self.held_for.insert(id.clone(), target) != Some(target),
-            },
+            Some(&(w, h)) if was_on_screen && (w, h) != (target.w, target.h) => {
+                let (x, w) = held_span(target.x, target.w, w, bounds.w);
+                let (y, h) = held_span(target.y, target.h, h, bounds.h);
+                WebAllocation {
+                    rect: Rect { x, y, w, h },
+                    held: true,
+                    restart_quiet: self.held_for.insert(id.clone(), target) != Some(target),
+                }
+            }
             _ => {
                 self.held_for.remove(id);
                 self.settled.insert(id.clone(), (target.w, target.h));
@@ -82,6 +104,23 @@ impl WebThrottle {
     }
 }
 
+/// One axis of a held allocation, as `(start, length)`: the target's span is `start..start + len`,
+/// the settled length `held`, the grid's length on this axis `bound`. See the module doc's
+/// sw-layout-2 paragraph: an overflow goes past a grid edge the target touches, never over a
+/// sibling.
+fn held_span(start: i32, len: i32, held: i32, bound: i32) -> (i32, i32) {
+    if held <= len || start + len >= bound {
+        // Nothing overflows, or it overflows past the grid's far edge: the target's own position.
+        (start, held)
+    } else if start <= 0 {
+        // Past the grid's near edge: the held length ends where the target ends.
+        (start + len - held, held)
+    } else {
+        // A sibling on both sides: never past the target.
+        (start, len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,12 +130,15 @@ mod tests {
         Rect { x, y: 0, w, h: 700 }
     }
 
+    /// The grid these tests' rectangles fill: `rect(803, 797)` ends at its right edge.
+    const WINDOW: Size = Size { w: 1600, h: 700 };
+
     #[test]
     fn the_first_allocation_and_a_reappearing_host_get_their_target_at_once() {
         let mut t = WebThrottle::default();
         let agent = ModuleId::agent();
         assert_eq!(
-            t.allocate(&agent, rect(803, 797), false),
+            t.allocate(&agent, rect(803, 797), false, WINDOW),
             WebAllocation {
                 rect: rect(803, 797),
                 held: false,
@@ -104,15 +146,15 @@ mod tests {
             }
         );
         // Hidden, then shown at another size: not a resize anyone watched, so no hold.
-        assert_eq!(t.allocate(&agent, rect(0, 1600), false).rect, rect(0, 1600));
+        assert_eq!(t.allocate(&agent, rect(0, 1600), false, WINDOW).rect, rect(0, 1600));
     }
 
     #[test]
     fn a_size_change_keeps_the_settled_size_at_the_new_position_until_quiet() {
         let mut t = WebThrottle::default();
         let agent = ModuleId::agent();
-        t.allocate(&agent, rect(803, 797), false);
-        let held = t.allocate(&agent, rect(700, 900), true);
+        t.allocate(&agent, rect(803, 797), false, WINDOW);
+        let held = t.allocate(&agent, rect(700, 900), true, WINDOW);
         assert_eq!(
             held,
             WebAllocation {
@@ -128,7 +170,7 @@ mod tests {
         );
         t.settle();
         assert_eq!(
-            t.allocate(&agent, rect(700, 900), true),
+            t.allocate(&agent, rect(700, 900), true, WINDOW),
             WebAllocation {
                 rect: rect(700, 900),
                 held: false,
@@ -141,8 +183,8 @@ mod tests {
     fn a_move_that_keeps_the_size_is_never_held() {
         let mut t = WebThrottle::default();
         let agent = ModuleId::agent();
-        t.allocate(&agent, rect(803, 797), false);
-        assert!(!t.allocate(&agent, rect(400, 797), true).held);
+        t.allocate(&agent, rect(803, 797), false, WINDOW);
+        assert!(!t.allocate(&agent, rect(400, 797), true, WINDOW).held);
     }
 
     /// The S3 regression, as a test of the rule rather than of GTK: after the host has once been
@@ -153,18 +195,18 @@ mod tests {
     fn the_throttle_never_follows_a_width_the_host_once_had() {
         let mut t = WebThrottle::default();
         let agent = ModuleId::agent();
-        t.allocate(&agent, rect(803, 797), false);
+        t.allocate(&agent, rect(803, 797), false, WINDOW);
         // The editor is hidden: the agent takes the whole width once things are quiet.
-        t.allocate(&agent, rect(0, 1600), true);
+        t.allocate(&agent, rect(0, 1600), true, WINDOW);
         t.settle();
-        assert_eq!(t.allocate(&agent, rect(0, 1600), true).rect.w, 1600);
+        assert_eq!(t.allocate(&agent, rect(0, 1600), true, WINDOW).rect.w, 1600);
         // The editor comes back.
-        t.allocate(&agent, rect(803, 797), true);
+        t.allocate(&agent, rect(803, 797), true, WINDOW);
         t.settle();
-        assert_eq!(t.allocate(&agent, rect(803, 797), true).rect.w, 797);
+        assert_eq!(t.allocate(&agent, rect(803, 797), true, WINDOW).rect.w, 797);
         // A sweep of 100 divider moves with no quiet in between.
         let widths: BTreeSet<i32> = (0..100)
-            .map(|i| t.allocate(&agent, rect(803 - i * 6, 797 + i * 6), true).rect.w)
+            .map(|i| t.allocate(&agent, rect(803 - i * 6, 797 + i * 6), true, WINDOW).rect.w)
             .collect();
         assert_eq!(widths, BTreeSet::from([797]));
     }
@@ -176,24 +218,24 @@ mod tests {
     fn only_a_new_target_restarts_the_quiet_period() {
         let mut t = WebThrottle::default();
         let agent = ModuleId::agent();
-        t.allocate(&agent, rect(803, 797), false);
+        t.allocate(&agent, rect(803, 797), false, WINDOW);
         assert!(
-            t.allocate(&agent, rect(700, 900), true).restart_quiet,
+            t.allocate(&agent, rect(700, 900), true, WINDOW).restart_quiet,
             "the drag's first step"
         );
-        let again = t.allocate(&agent, rect(700, 900), true);
+        let again = t.allocate(&agent, rect(700, 900), true, WINDOW);
         assert!(again.held, "still held");
         assert!(!again.restart_quiet, "the same target again is not a change");
         assert!(
-            t.allocate(&agent, rect(650, 950), true).restart_quiet,
+            t.allocate(&agent, rect(650, 950), true, WINDOW).restart_quiet,
             "the next step is"
         );
         // Back to the settled size: not held, and a later hold for a target seen before still counts.
-        assert!(!t.allocate(&agent, rect(803, 797), true).held);
-        assert!(t.allocate(&agent, rect(650, 950), true).restart_quiet);
+        assert!(!t.allocate(&agent, rect(803, 797), true, WINDOW).held);
+        assert!(t.allocate(&agent, rect(650, 950), true, WINDOW).restart_quiet);
         t.settle();
         assert!(
-            !t.allocate(&agent, rect(650, 950), true).restart_quiet,
+            !t.allocate(&agent, rect(650, 950), true, WINDOW).restart_quiet,
             "settled: not held at all"
         );
     }
@@ -202,9 +244,91 @@ mod tests {
     fn hosts_are_held_independently() {
         let mut t = WebThrottle::default();
         let (agent, notes) = (ModuleId::agent(), ModuleId::lua("notes"));
-        t.allocate(&agent, rect(0, 500), false);
-        t.allocate(&notes, rect(501, 500), false);
-        assert!(t.allocate(&agent, rect(0, 600), true).held);
-        assert!(!t.allocate(&notes, rect(601, 500), true).held, "notes only moved");
+        t.allocate(&agent, rect(0, 500), false, WINDOW);
+        t.allocate(&notes, rect(501, 500), false, WINDOW);
+        assert!(t.allocate(&agent, rect(0, 600), true, WINDOW).held);
+        assert!(
+            !t.allocate(&notes, rect(601, 500), true, WINDOW).held,
+            "notes only moved"
+        );
+    }
+    /// The whole-branch review's probe (sw-layout-2): the agent settled at 797 on the right of
+    /// `Row(editor | agent)` in a 1280-wide window, then a 100-pass divider sweep SHRINKING it. Its
+    /// held size overflows past the window's right edge, where there is no sibling to cover, so the
+    /// hold must stand for the whole sweep -- P7/S3's throttle. Clamping every held size to its
+    /// target made every pass of every shrink a WebView resize (100 widths, not 1).
+    #[test]
+    fn a_host_shrinking_toward_the_window_edge_is_still_held_at_one_size() {
+        let mut t = WebThrottle::default();
+        let agent = ModuleId::agent();
+        let window = Size { w: 1280, h: 700 };
+        t.allocate(&agent, rect(483, 797), false, window);
+        let passes: Vec<WebAllocation> = (1..=100)
+            .map(|i| t.allocate(&agent, rect(483 + i * 6, 797 - i * 6), true, window))
+            .collect();
+        let widths: BTreeSet<i32> = passes.iter().map(|a| a.rect.w).collect();
+        assert_eq!(widths, BTreeSet::from([797]));
+        for (i, a) in (1..=100).zip(&passes) {
+            assert_eq!(
+                a.rect.x,
+                483 + i * 6,
+                "at the target's own position; the overflow is off the window"
+            );
+        }
+    }
+
+    /// The same sweep with the agent on the LEFT of `Row(agent | editor)`: its far edge faces the
+    /// editor, so the held size ends where the target ends and overflows past the window's left
+    /// edge instead -- still one size for the whole sweep, and never a pixel over the editor. This
+    /// is sw-layout-2's own shape (a host shrinking with its sibling beyond its far edge).
+    #[test]
+    fn a_host_shrinking_away_from_the_window_edge_is_held_without_covering_its_sibling() {
+        let mut t = WebThrottle::default();
+        let agent = ModuleId::agent();
+        let window = Size { w: 1280, h: 700 };
+        t.allocate(&agent, rect(0, 797), false, window);
+        let mut widths = BTreeSet::new();
+        for i in 1..=100 {
+            let target = rect(0, 797 - i * 6);
+            let a = t.allocate(&agent, target, true, window);
+            assert!(a.held);
+            assert_eq!(
+                a.rect.x + a.rect.w,
+                target.x + target.w,
+                "pass {i}: ends where the target ends"
+            );
+            widths.insert(a.rect.w);
+        }
+        assert_eq!(widths, BTreeSet::from([797]));
+    }
+
+    /// A host with a sibling on both sides of the axis (a middle column) has nowhere to overflow:
+    /// it is clamped to its target there, never reaching either neighbour.
+    #[test]
+    fn a_host_between_two_siblings_is_clamped_to_its_target() {
+        let mut t = WebThrottle::default();
+        let panel = ModuleId::lua("notes");
+        let window = Size { w: 1280, h: 700 };
+        t.allocate(&panel, rect(400, 480), false, window);
+        let target = rect(420, 400);
+        let a = t.allocate(&panel, target, true, window);
+        assert!(a.held);
+        assert_eq!((a.rect.x, a.rect.w), (420, 400));
+        // And vertically: a shrink whose target touches neither the grid's top nor its bottom.
+        let tall = Rect {
+            x: 0,
+            y: 100,
+            w: 400,
+            h: 400,
+        };
+        t.allocate(&panel, tall, false, window);
+        let shorter = Rect {
+            x: 0,
+            y: 150,
+            w: 400,
+            h: 300,
+        };
+        let a = t.allocate(&panel, shorter, true, window);
+        assert_eq!((a.rect.y, a.rect.h), (150, 300));
     }
 }

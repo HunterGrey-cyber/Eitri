@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use webkit6::prelude::*;
-use webkit6::{UserContentManager, WebView};
+use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
 /// The embedded, single-file `agent-ui/web` production build -- `shell/build.rs` (Task 5)
 /// guarantees this file exists and is current by the time `shell` itself compiles.
@@ -509,6 +509,11 @@ struct AgentPanelState {
     /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
     /// can be refused.
     nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
+    /// R1-6: how many times this WebView's own web process has crashed recently, and whether
+    /// automatic recovery has given up on it -- see `AgentPanelHandle::on_web_process_terminated`.
+    /// Re-armed by a manual recovery, never by the automatic path itself --
+    /// `AgentPanelHandle::reload_document_by_hand`'s own doc says why.
+    crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
@@ -649,8 +654,65 @@ impl AgentPanelHandle {
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
         // The page that said `ready` is going; the tick holds its envelopes until the new one does.
         self.state.borrow_mut().document_ready = false;
+        // And so is the mode it reported: until the new page's `ready`, nothing is BROWSE or INPUT.
+        forget_the_pages_nav_mode(&self.state.borrow());
         let vars = self.state.borrow().theme.css_vars();
         self.webview.load_html(&themed_document(&vars), Some(PANEL_BASE_URI));
+    }
+
+    /// The user's OWN recovery action for a wedged or crashed panel -- `prefix r`
+    /// (`Action::PanelReload`) or the top-bar `\u{21bb}` button (`install_reload_action`) -- as
+    /// distinct from the AUTOMATIC reload `on_web_process_terminated` performs while still within
+    /// `crash_guard`'s own budget.
+    ///
+    /// Re-arms `crash_guard` (`WebViewCrashGuard::reset`) before doing exactly what
+    /// [`reload_document`](Self::reload_document) does. **Why a separate method rather than putting
+    /// the reset inside `reload_document` itself (fix round 1, v1 hardening review, the
+    /// guard-permanence finding on R1-6):** `on_web_process_terminated`'s own `Reload` branch calls
+    /// `reload_document` directly, on every crash still within budget -- if that shared path reset
+    /// the guard too, every automatic reload would erase its own crash history and `GiveUp` could
+    /// never be reached, defeating the loop guard entirely. Only a genuinely manual recovery may
+    /// re-arm it; the automatic path must keep counting toward the very loop it exists to detect.
+    pub(crate) fn reload_document_by_hand(&self) {
+        self.state.borrow_mut().crash_guard.reset();
+        self.reload_document();
+    }
+
+    /// `web-process-terminated` (R1-6, v1 hardening review): the panel's WebView process died --
+    /// a real WebKit crash, or the host genuinely out of memory. Until now nothing reconnected
+    /// this signal, so the chat stayed blank until the user found `\u{21bb}`/`prefix r` by hand.
+    /// Recovery is exactly [`reload_document`](Self::reload_document): the session lives in Rust,
+    /// so a fresh document rehydrates from its own `ready`/`hello` round trip with nothing lost.
+    ///
+    /// Guarded by `crash_guard` (`webview_crash_guard::WebViewCrashGuard`) so a page that cannot
+    /// even finish loading does not turn into a reload/crash loop; see that module's own doc for
+    /// why `TerminatedByApi` is skipped before the guard is ever asked (nothing on this WebView
+    /// calls `terminate_web_process()` today, but the check costs nothing and keeps this call site
+    /// consistent with the Lua-panel one, which does call it).
+    pub(crate) fn on_web_process_terminated(&self, reason: webkit6::WebProcessTerminationReason) {
+        if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
+            return;
+        }
+        // The page that reported BROWSE or INPUT is dead, and the give-up document never sends
+        // `ready`: left as it was, `main.rs` would keep claiming `Ctrl+j`/`Ctrl+k` for a page that
+        // cannot answer (the whole-branch review, R2-11's second half).
+        forget_the_pages_nav_mode(&self.state.borrow());
+        let response = self.state.borrow_mut().crash_guard.on_crash();
+        match response {
+            crate::webview_crash_guard::CrashResponse::Reload => {
+                eprintln!("[agent_panel] the WebView's web process terminated ({reason:?}); reloading it");
+                self.reload_document();
+            }
+            crate::webview_crash_guard::CrashResponse::GiveUp => {
+                eprintln!("[agent_panel] the WebView's web process kept terminating; giving up on automatic reload");
+                self.state.borrow_mut().document_ready = false;
+                let html = crate::webview_crash_guard::crash_message_html(
+                    "Reload it by hand with \u{21bb} in the top bar, or prefix r.",
+                );
+                self.webview.load_html(&html, Some(PANEL_BASE_URI));
+            }
+            crate::webview_crash_guard::CrashResponse::AlreadyGivenUp => {}
+        }
     }
 
     /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
@@ -1148,7 +1210,18 @@ pub(crate) fn build_agent_panel(
     scratch: Option<neovibe_core::scratch::ScratchDir>,
 ) -> (gtk4::Widget, AgentPanelHandle) {
     let content_manager = UserContentManager::new();
-    let webview = WebView::builder().user_content_manager(&content_manager).build();
+    // Finding 3 (panel-content review): a CSP floor the page cannot loosen, plus a network backstop
+    // behind it -- see `PANEL_CONTENT_SECURITY_POLICY` and `PANEL_NETWORK_PROXY_URI`'s doc comments.
+    let network_session = NetworkSession::new_ephemeral();
+    network_session.set_proxy_settings(
+        NetworkProxyMode::Custom,
+        Some(&NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI), &[])),
+    );
+    let webview = WebView::builder()
+        .user_content_manager(&content_manager)
+        .network_session(&network_session)
+        .default_content_security_policy(PANEL_CONTENT_SECURITY_POLICY)
+        .build();
     webview.set_hexpand(true);
     webview.set_vexpand(true);
 
@@ -1266,6 +1339,7 @@ pub(crate) fn build_agent_panel(
         tab_verb_hook: None,
         nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
+        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -1308,6 +1382,17 @@ pub(crate) fn build_agent_panel(
         state: state.clone(),
         webview: webview.clone(),
     };
+
+    // R1-6: recover this WebView's own crash automatically (guarded) instead of leaving the chat
+    // blank until the user finds `\u{21bb}`/`prefix r` by hand. See
+    // `AgentPanelHandle::on_web_process_terminated`'s own doc.
+    {
+        let handle = handle.clone();
+        webview.connect_web_process_terminated(move |_webview, reason| {
+            handle.on_web_process_terminated(reason);
+        });
+    }
+
     (webview.upcast(), handle)
 }
 
@@ -2154,6 +2239,15 @@ fn reset_nav_mode_for_ready(state: &AgentPanelState) {
     state.nav_mode.set(PanelKeys::Other);
 }
 
+/// The other half of the same rule: when the page that reported a mode goes -- its web process
+/// died (`on_web_process_terminated`, both the reload and the give-up path) or it is being
+/// replaced (`reload_document`) -- the mirror is `Other` until a new page says otherwise. The
+/// give-up document (`webview_crash_guard::crash_message_html`) never sends `ready`, so the reset
+/// on `ready` alone left `Ctrl+j` claimed for a page that could not take it.
+fn forget_the_pages_nav_mode(state: &AgentPanelState) {
+    state.nav_mode.set(PanelKeys::Other);
+}
+
 /// A window-level envelope for the tick: `Some` when the page can take it and it changed since the
 /// last one sent (phase 3 ruling 38). Recorded as sent only when it is returned.
 fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool) -> Option<String> {
@@ -2164,7 +2258,6 @@ fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool
     Some(now)
 }
 
-/// D7's `remember` (ruling 16): the rule Rust offered for `permission_id`, only with an allow.
 /// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
 struct PermissionAnswer {
     permission_id: String,
@@ -2208,7 +2301,18 @@ fn answer_permission_response(
 ) -> Result<Result<Vec<agent::AgentDomainEvent>, BackendError>, String> {
     let remembered = {
         let t = tabs.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
-        rule_to_remember(t, &answer.permission_id, answer.decision, answer.remember).map_err(str::to_string)?
+        // Panel-content review finding 4: read right before the save, so an id that is no longer
+        // pending -- or that this tab's user already answered, which the sidecar's projection still
+        // lists until its `PermissionResolved` arrives -- saves nothing (`Tab::card_is_waiting`).
+        let still_pending = t.card_is_waiting(&answer.permission_id);
+        rule_to_remember(
+            t,
+            &answer.permission_id,
+            answer.decision,
+            answer.remember,
+            still_pending,
+        )
+        .map_err(str::to_string)?
     };
     if let Some(rule) = remembered {
         let Some(dir) = rules_dir else {
@@ -2231,17 +2335,32 @@ fn answer_permission_response(
     Ok(tabs.answer_card(tab, &answer.permission_id, decision))
 }
 
+/// D7's `remember` (ruling 16): the rule Rust offered for `permission_id`, only with an allow, and
+/// only while that id is still a card waiting for the user (panel-content review finding 4).
+/// `still_pending` is the caller's own read (`Tab::card_is_waiting`), taken right before this runs
+/// -- passed in rather than read here so this stays testable without a live backend, the same
+/// reason `changed_envelope` takes `document_ready` as a parameter.
+///
+/// The offer itself is gone once the first answer to that id succeeds, whatever the decision, and
+/// never comes back (`TabSet::answer_card`, the tab's `user_answered`): on the sidecar path the
+/// projection still lists the id as pending until the provider's real `PermissionResolved`
+/// arrives, and `refresh_offers` recomputes offers from that projection whenever another id
+/// arrives, so a one-time removal alone was undone by the next pump (the whole-branch review).
 fn rule_to_remember(
     tab: &Tab,
     permission_id: &str,
     decision: neovibe_core::agent_bridge::DecisionChoice,
     remember: bool,
+    still_pending: bool,
 ) -> Result<Option<agent::PrefixRule>, &'static str> {
     if !remember {
         return Ok(None);
     }
     if decision != neovibe_core::agent_bridge::DecisionChoice::Allow {
         return Err("only an allow can be remembered");
+    }
+    if !still_pending {
+        return Err("this request was already answered");
     }
     tab.rule_offers
         .get(permission_id)
@@ -3285,13 +3404,25 @@ fn no_session_error() -> neovibe_core::agent_backend::BackendError {
 /// Inserted directly after the opening `<head>`, not before `</head>`: the single-file build
 /// inlines its script into `<head>`, and that script contains the literal `<head></head>`
 /// (DOMPurify), so the first `</head>` in the file is not the document's.
+///
+/// The CSP `<meta>` goes in first, ahead of even the theme `<style>` -- a `<meta
+/// http-equiv="Content-Security-Policy">` only governs what loads *after* it in the document, so it
+/// must be the very first thing `<head>` contains, before the single-file build's own inlined
+/// `<script>`/`<style>`. See `PANEL_CONTENT_SECURITY_POLICY`.
 fn themed_document(vars: &[(String, String)]) -> String {
     let declarations: String = vars.iter().map(|(name, value)| format!("{name}:{value};")).collect();
     let style = format!("<style id=\"nv-theme\">:root{{{declarations}}}</style>");
+    let csp_meta = format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{PANEL_CONTENT_SECURITY_POLICY}\">");
     match AGENT_UI_HTML.find("<head>") {
         Some(at) => {
             let insert = at + "<head>".len();
-            format!("{}{}{}", &AGENT_UI_HTML[..insert], style, &AGENT_UI_HTML[insert..])
+            format!(
+                "{}{}{}{}",
+                &AGENT_UI_HTML[..insert],
+                csp_meta,
+                style,
+                &AGENT_UI_HTML[insert..]
+            )
         }
         None => {
             eprintln!("[agent_panel] the panel document has no <head>; loading it without an inline theme");
@@ -3317,6 +3448,38 @@ fn paint_webview_background(webview: &WebView, tokens: &neovibe_core::theme::The
 /// 2026-09-25). `.invalid` never resolves (RFC 2606): nothing is ever fetched from it, and a
 /// relative link is still a `LinkClicked` that `connect_decide_policy` hands to the browser.
 const PANEL_BASE_URI: &str = "https://neovibe.invalid/";
+
+/// Ruling R1 (rendered model content is untrusted) plus finding 3 of
+/// `docs/superpowers/reviews/2026-09-27-v1-hardening/codex-sec-panel-content-verdicts.md`: a CSP
+/// floor the page cannot loosen, applied two ways -- as the `WebView`'s own
+/// `default-content-security-policy` (`build_agent_panel`) and as the first element of `<head>`
+/// (`themed_document`), so it is in force before the single-file build's own inlined `<script>`/
+/// `<style>` run. This is defense in depth behind Task 1's sanitizer, for whatever gets past it.
+///
+/// Checked what the panel legitimately loads before picking each directive: `agent-ui/web/src` has
+/// no `fetch`/`XMLHttpRequest`/`WebSocket`/`eval`/`new Function`, and `index.css` has no
+/// `@font-face`/`url(` -- every font is a locally-installed one named by `font-family`, resolved by
+/// WebKit's own font matching, never loaded as a resource. So `connect-src 'none'` and `media-src
+/// 'none'` cost the panel nothing today. `img-src data:`/`font-src data:` stay open only for a
+/// future inline `data:` use, never a remote load. `script-src`/`style-src 'unsafe-inline'` are what
+/// the single-file build's inlined `<script>`/`<style>` need (`vite-plugin-singlefile` leaves no
+/// hash or nonce to pin instead). `frame-src`/`object-src 'none'` and `form-action`/`base-uri 'none'`
+/// match `connect_decide_policy`'s existing navigation guard just above, which already refuses any
+/// `FormSubmitted`/`LinkClicked` navigation of this WebView itself.
+///
+/// `evaluate_javascript` from Rust (`evaluate_js_dispatch`) bypasses CSP by design -- it is this
+/// panel's own push channel, not page-originated content -- so the dispatch path this panel relies
+/// on is unaffected.
+const PANEL_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
+
+/// Finding 3's backstop, the same technique the (unbuilt) canvas design names for its own sandbox
+/// (`docs/superpowers/specs/2026-09-23-modules-and-canvas-design.md` §9.1): an ephemeral
+/// `NetworkSession` (per `WebKitWebsiteDataManager:is-ephemeral`, all data -- cookies, cache, storage
+/// -- is held in memory for the session's lifetime and never written to disk; it is non-persistent,
+/// not absent) whose proxy is the "discard" port on loopback, so any request that gets past the CSP
+/// above and Task 1's sanitizer dies at a closed port. **This is a backstop, not the boundary** --
+/// the CSP is.
+const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 
 fn evaluate_js_dispatch(webview: &WebView, json_payload: &str) {
     let script = format!(
@@ -3366,7 +3529,7 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
     // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
     // takes it by move.
     let handle = handle.clone();
-    action.connect_activate(move |_, _| handle.reload_document());
+    action.connect_activate(move |_, _| handle.reload_document_by_hand());
     app.add_action(&action);
 }
 
@@ -3692,6 +3855,7 @@ mod tests {
             tab_verb_hook: None,
             nav_mode: Cell::new(PanelKeys::Other),
             nav_fallthrough_hook: None,
+            crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
         }))
     }
 
@@ -3790,6 +3954,22 @@ mod tests {
                 PanelKeys::Other,
                 "stale {stale:?} must clear"
             );
+        }
+    }
+
+    /// The whole-branch review (R2-11, second half): a crashed or replaced page's BROWSE/INPUT is
+    /// forgotten at once, not at a `ready` the give-up document never sends. `on_web_process_terminated`
+    /// and `reload_document` need a real `WebView`, so this pins the call they both make.
+    #[test]
+    fn a_dead_pages_nav_mode_is_forgotten_before_any_ready() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        for stale in [PanelKeys::Input, PanelKeys::Browse] {
+            state.borrow().nav_mode.set(stale);
+            forget_the_pages_nav_mode(&state.borrow());
+            assert_eq!(state.borrow().nav_mode.get(), PanelKeys::Other, "stale {stale:?}");
         }
     }
 
@@ -4075,25 +4255,149 @@ mod tests {
             .insert("perm-1".into(), agent::PrefixRule::parse("Bash(git push *)").unwrap());
         let t = set.get(tab).unwrap();
         assert_eq!(
-            rule_to_remember(t, "perm-1", DecisionChoice::Allow, false),
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, false, true),
             Ok(None),
             "a plain allow"
         );
         assert_eq!(
-            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true)
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true, true)
                 .unwrap()
                 .unwrap()
                 .display(),
             "git push *"
         );
         assert!(
-            rule_to_remember(t, "perm-2", DecisionChoice::Allow, true).is_err(),
+            rule_to_remember(t, "perm-2", DecisionChoice::Allow, true, true).is_err(),
             "never offered"
         );
         assert!(
-            rule_to_remember(t, "perm-1", DecisionChoice::Deny, true).is_err(),
+            rule_to_remember(t, "perm-1", DecisionChoice::Deny, true, true).is_err(),
             "remember is an allow"
         );
+    }
+
+    /// Panel-content review finding 4: a request that is no longer pending -- because it was
+    /// already answered -- saves no rule, even though the offer Rust made for it may still be
+    /// sitting in `rule_offers` (the offer is only recomputed once per pump tick).
+    #[test]
+    fn a_no_longer_pending_request_saves_no_rule_even_if_still_offered() {
+        use neovibe_core::agent_bridge::DecisionChoice;
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        set.get_mut(tab)
+            .unwrap()
+            .rule_offers
+            .insert("perm-1".into(), agent::PrefixRule::parse("Bash(git push *)").unwrap());
+        let t = set.get(tab).unwrap();
+        assert!(
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true, false).is_err(),
+            "not pending any more, whatever the offer still says"
+        );
+    }
+
+    /// Panel-content review finding 4, the sidecar's own longer window, through the production route
+    /// (`answer_permission_response`, the whole `permission_response` arm): `respond_permission`'s
+    /// own resolution is not folded into the projection until the provider's real event arrives
+    /// (`AgentConversation::respond_permission`'s own doc), so a projection read alone cannot catch
+    /// a second response landing before that. The first successful answer, whatever its decision,
+    /// drops the offer and marks the card answered (`TabSet::answer_card`), and -- the whole-branch
+    /// review's finding -- the next pump, which recomputes offers because another id arrived, does
+    /// not bring it back.
+    #[test]
+    fn an_answered_cards_offer_never_comes_back_and_a_replayed_remember_saves_nothing() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-permission-remember-race");
+        let rules_dir = dir.join("rules");
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        let (provider, backend) = live_backend(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let pump_until = |set: &mut TabSet, what: &str, done: &dyn Fn(&TabSet) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !done(set) {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                set.pump(&dir, true);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let bash = |id: &str, command: &str| agent::AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+            provider_prompt: None,
+        };
+        let response = |id: &str, decision: &str, remember: bool| {
+            let message = parse_inbound_message(&format!(
+                r#"{{"type":"permission_response","request_id":"r","tab":{},"permission_id":"{id}","decision":"{decision}","remember":{remember}}}"#,
+                tab.0
+            ))
+            .unwrap();
+            PermissionAnswer::of(message).unwrap()
+        };
+        provider.queue(bash("perm-1", "git push origin main"));
+        pump_until(&mut set, "the offer", &|set| {
+            !set.get(tab).unwrap().rule_offers.is_empty()
+        });
+        assert_eq!(set.get(tab).unwrap().rule_offers["perm-1"].display(), "git push *");
+        assert!(set.get(tab).unwrap().card_is_waiting("perm-1"));
+
+        // The first response: a deny, never remembered, through the production route.
+        let outcome =
+            answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "deny", false));
+        assert!(matches!(outcome, Ok(Ok(_))));
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), false)]);
+        assert!(
+            !set.get(tab).unwrap().rule_offers.contains_key("perm-1"),
+            "the route itself drops the offer"
+        );
+
+        // A parallel call's card arrives before the provider's `PermissionResolved` for perm-1, so
+        // the pump recomputes the offers from a projection that still lists perm-1 as pending.
+        provider.queue(bash("perm-2", "git push origin other"));
+        pump_until(&mut set, "the second card's offer", &|set| {
+            set.get(tab).unwrap().rule_offers.contains_key("perm-2")
+        });
+        assert!(
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .pending_permissions
+                .contains_key("perm-1"),
+            "the premise: the sidecar has not folded perm-1's resolution yet"
+        );
+        let t = set.get(tab).unwrap();
+        assert!(
+            !t.rule_offers.contains_key("perm-1"),
+            "the recompute must not bring back an answered card's offer"
+        );
+        assert!(!t.card_is_waiting("perm-1"), "answered, whatever the projection says");
+        assert!(t.card_is_waiting("perm-2"));
+
+        // A replayed "Always allow" for perm-1 (a tab switch or a reload re-drew the card): refused,
+        // and no rule reaches the file.
+        let replay =
+            answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "allow", true));
+        assert_eq!(replay.map(|_| ()), Err("this request was already answered".to_string()));
+        assert_eq!(
+            neovibe_core::permission_store::load(&rules_dir, &dir),
+            neovibe_core::permission_store::LoadedRules::Missing,
+            "no rule was saved"
+        );
+        assert_eq!(provider.resolutions().len(), 1, "and nothing more reached the provider");
+        for mut tab in set.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
     }
 
     #[test]
@@ -4414,10 +4718,17 @@ mod tests {
     fn the_panel_document_carries_its_theme_before_its_script() {
         let tokens = neovibe_core::theme::ThemeTokens::fallback();
         let html = themed_document(&tokens.css_vars());
+        let csp_at = html
+            .find("<meta http-equiv=\"Content-Security-Policy\"")
+            .expect("the CSP meta is inserted");
         let style_at = html
             .find("<style id=\"nv-theme\">")
             .expect("the theme block is inserted");
         let script_at = html.find("<script").expect("the single-file build inlines its script");
+        assert!(
+            csp_at < style_at,
+            "the CSP must be in force before the theme style, or it would not cover it"
+        );
         assert!(
             style_at < script_at,
             "the theme must be parsed before the script that renders"
@@ -4425,7 +4736,125 @@ mod tests {
         assert_eq!(html.matches("<style id=\"nv-theme\">").count(), 1);
         assert!(html.contains(&format!("--nv-bg:{};", tokens.bg.hex())));
         let end = style_at + html[style_at..].find("</style>").unwrap() + "</style>".len();
-        assert_eq!(format!("{}{}", &html[..style_at], &html[end..]), AGENT_UI_HTML);
+        // The CSP meta and the theme style are inserted back to back at the same point `<head>`
+        // used to sit -- removing both must reconstruct the untouched embedded document.
+        assert_eq!(format!("{}{}", &html[..csp_at], &html[end..]), AGENT_UI_HTML);
+    }
+
+    /// Ruling R1 / finding 3 (see `PANEL_CONTENT_SECURITY_POLICY`'s own doc comment): the CSP meta
+    /// is the very first thing inside `<head>` -- nothing (not even the theme style) may load before
+    /// it, and its `content` must be exactly the policy this test pins so a future edit to one copy
+    /// cannot silently drift from the other (`build_agent_panel`'s builder-level CSP).
+    #[test]
+    fn the_panel_documents_csp_meta_is_first_in_head_and_matches_the_policy_constant() {
+        let tokens = neovibe_core::theme::ThemeTokens::fallback();
+        let html = themed_document(&tokens.css_vars());
+        let head_at = html.find("<head>").expect("the document has a <head>");
+        let after_head = head_at + "<head>".len();
+        assert!(
+            html[after_head..].starts_with("<meta http-equiv=\"Content-Security-Policy\""),
+            "the CSP meta must be the very first thing after <head>, before even the theme style"
+        );
+        let expected_meta =
+            format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{PANEL_CONTENT_SECURITY_POLICY}\">");
+        assert!(html.contains(&expected_meta), "{html}");
+        assert_eq!(html.matches("Content-Security-Policy").count(), 1);
+    }
+
+    /// Pins the policy string itself against silent drift, and each directive's presence against
+    /// the reasoning in `PANEL_CONTENT_SECURITY_POLICY`'s doc comment: `default-src 'none'` closes
+    /// everything not named, and nothing here reopens network access for the panel (`connect-src`,
+    /// `frame-src`, `object-src`, `media-src` all `'none'`; images/fonts limited to `data:`).
+    #[test]
+    fn the_panel_csp_closes_every_directive_it_does_not_explicitly_reopen() {
+        assert_eq!(
+            PANEL_CONTENT_SECURITY_POLICY,
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; \
+             font-src data:; media-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; \
+             form-action 'none'; base-uri 'none'"
+        );
+        assert!(PANEL_CONTENT_SECURITY_POLICY.starts_with("default-src 'none';"));
+        for directive in [
+            "connect-src 'none'",
+            "frame-src 'none'",
+            "object-src 'none'",
+            "media-src 'none'",
+        ] {
+            assert!(
+                PANEL_CONTENT_SECURITY_POLICY.contains(directive),
+                "{directive} missing from {PANEL_CONTENT_SECURITY_POLICY}"
+            );
+        }
+        // No directive allows an https:/http: remote load -- every source list is 'none', an inline
+        // keyword, or `data:`.
+        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains("https:"));
+        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains("http:"));
+        assert!(!PANEL_CONTENT_SECURITY_POLICY.contains('*'));
+    }
+
+    /// The `WebView` itself must be built with the same policy as a floor the page cannot loosen
+    /// (finding 3's "No CSP" half) -- source-scanned the same way
+    /// `the_panel_document_is_loaded_in_a_secure_context_that_never_resolves` pins `load_html`,
+    /// since constructing a real `WebView` needs a running WebKitGTK display this crate's tests do
+    /// not have.
+    #[test]
+    fn the_webview_builder_applies_the_content_security_policy() {
+        let source = include_str!("agent_panel.rs");
+        let builder_at = source
+            .find("WebView::builder()")
+            .expect("the panel's WebView is built through WebView::builder()");
+        let build_at = source[builder_at..]
+            .find(".build()")
+            .map(|i| builder_at + i)
+            .expect("the builder chain ends in .build()");
+        let chain = &source[builder_at..build_at];
+        assert!(
+            chain.contains(".default_content_security_policy(PANEL_CONTENT_SECURITY_POLICY)"),
+            "the WebView builder chain never applies the panel's CSP: {chain}"
+        );
+    }
+
+    /// Finding 3's backstop (`PANEL_NETWORK_PROXY_URI`'s own doc comment): the panel's `WebView` is
+    /// built with an ephemeral `NetworkSession` whose proxy is the closed loopback "discard" port, so
+    /// a request that gets past the CSP and the sanitizer still cannot leave. Source-scanned for the
+    /// same reason the CSP test above is.
+    #[test]
+    fn the_webview_builder_applies_the_network_proxy_backstop() {
+        assert_eq!(PANEL_NETWORK_PROXY_URI, "http://127.0.0.1:9");
+        let source = include_str!("agent_panel.rs");
+        // Scoped to `build_agent_panel`'s own body, ending at the WebView `.build()` call -- never
+        // the whole file. `source` (the whole file, via `include_str!`) includes this very test's own
+        // string literals, so searching all of `source` for e.g. "NetworkSession::new_ephemeral()"
+        // would always find a match in the assertion below regardless of what the production code
+        // does: a mutation that deleted the real call, or swapped in a persistent `NetworkSession`,
+        // would still leave this test green. `fn_at` keeps the needles below restricted to code that
+        // actually ran before the WebView was built.
+        let fn_at = source
+            .find("fn build_agent_panel(")
+            .expect("the panel is built by build_agent_panel");
+        let builder_at = source[fn_at..]
+            .find("WebView::builder()")
+            .map(|i| fn_at + i)
+            .expect("the panel's WebView is built through WebView::builder()");
+        let build_at = source[builder_at..]
+            .find(".build()")
+            .map(|i| builder_at + i)
+            .expect("the builder chain ends in .build()");
+        let scope = &source[fn_at..build_at];
+        let chain = &source[builder_at..build_at];
+        assert!(
+            chain.contains(".network_session(&network_session)"),
+            "the WebView builder chain never installs the ephemeral network session: {chain}"
+        );
+        assert!(
+            scope.contains("NetworkSession::new_ephemeral()"),
+            "the backstop session must be ephemeral: no cookies, cache or storage"
+        );
+        assert!(
+            scope.contains("NetworkProxyMode::Custom")
+                && scope.contains("NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI)"),
+            "the ephemeral session must be pointed at the unreachable proxy, not left on WebKit's default"
+        );
     }
 
     fn a_command() -> agent::handoff::ClaudeResumeCommand {

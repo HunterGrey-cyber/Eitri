@@ -1,0 +1,272 @@
+[
+  {
+    "label": "j",
+    "expected": {
+      "kind": "move",
+      "delta": 1
+    }
+  },
+  {
+    "label": "k",
+    "expected": {
+      "kind": "move",
+      "delta": -1
+    }
+  },
+  {
+    "label": "h",
+    "expected": {
+      "kind": "control",
+      "delta": -1
+    }
+  },
+  {
+    "label": "l",
+    "expected": {
+      "kind": "control",
+      "delta": 1
+    }
+  },
+  {
+    "label": "gg",
+    "expected": {
+      "kind": "jump",
+      "to": "first"
+    }
+  },
+  {
+    "label": "Shift+G",
+    "expected": {
+      "kind": "jump",
+      "to": "last"
+    }
+  },
+  {
+    "label": "gf",
+    "expected": {
+      "kind": "open-path"
+    }
+  },
+  {
+    "label": "1-9 (a digit)",
+    "expected": {
+      "kind": "count",
+      "digit": 3
+    }
+  },
+  {
+    "label": "[[",
+    "expected": {
+      "kind": "prompt-jump",
+      "delta": -1
+    }
+  },
+  {
+    "label": "]]",
+    "expected": {
+      "kind": "prompt-jump",
+      "delta": 1
+    }
+  },
+  {
+    "label": "Ctrl+d",
+    "expected": {
+      "kind": "half-page",
+      "delta": 1
+    }
+  },
+  {
+    "label": "Ctrl+u",
+    "expected": {
+      "kind": "half-page",
+      "delta": -1
+    }
+  },
+  {
+    "label": "Ctrl+c, idle",
+    "expected": null
+  },
+  {
+    "label": "Ctrl+c, a turn is running",
+    "expected": {
+      "kind": "interrupt"
+    }
+  },
+  {
+    "label": "a, a live session",
+    "expected": {
+      "kind": "answer",
+      "decision": "allow"
+    }
+  },
+  {
+    "label": "a, a session that ended",
+    "expected": null
+  },
+  {
+    "label": "d, a live session",
+    "expected": {
+      "kind": "answer",
+      "decision": "deny"
+    }
+  },
+  {
+    "label": "d, a session that ended",
+    "expected": null
+  },
+  {
+    "label": "Enter",
+    "expected": {
+      "kind": "toggle-expand"
+    }
+  },
+  {
+    "label": "y",
+    "expected": {
+      "kind": "copy"
+    }
+  },
+  {
+    "label": "Shift+Y",
+    "expected": {
+      "kind": "copy-output"
+    }
+  },
+  {
+    "label": "Shift+D, a live session",
+    "expected": {
+      "kind": "deny-reason"
+    }
+  },
+  {
+    "label": "Shift+D, a session that ended",
+    "expected": null
+  },
+  {
+    "label": "i, a live session",
+    "expected": {
+      "kind": "mode",
+      "to": "input",
+      "caret": "kept"
+    }
+  },
+  {
+    "label": "i, a session that ended",
+    "expected": null
+  },
+  {
+    "label": "o, a live session",
+    "expected": {
+      "kind": "mode",
+      "to": "input",
+      "caret": "kept"
+    }
+  },
+  {
+    "label": "o, a session that ended",
+    "expected": null
+  },
+  {
+    "label": "Shift+A, a live session",
+    "expected": {
+      "kind": "mode",
+      "to": "input",
+      "caret": "end"
+    }
+  },
+  {
+    "label": "Shift+A, a session that ended",
+    "expected": null
+  },
+  {
+    "label": "f",
+    "expected": {
+      "kind": "hint"
+    }
+  },
+  {
+    "label": "r, a live session",
+    "expected": null
+  },
+  {
+    "label": "r, a session that ended",
+    "expected": {
+      "kind": "restart"
+    }
+  },
+  {
+    "label": "/",
+    "expected": {
+      "kind": "search"
+    }
+  },
+  {
+    "label": "n",
+    "expected": {
+      "kind": "search-next",
+      "delta": 1
+    }
+  },
+  {
+    "label": "Shift+N",
+    "expected": {
+      "kind": "search-next",
+      "delta": -1
+    }
+  },
+  {
+    "label": "Ctrl+o, browse",
+    "expected": {
+      "kind": "detailed"
+    }
+  },
+  {
+    "label": "Ctrl+o, input",
+    "expected": {
+      "kind": "detailed"
+    }
+  },
+  {
+    "label": "zh",
+    "expected": {
+      "kind": "table-scroll",
+      "delta": -1
+    }
+  },
+  {
+    "label": "zl",
+    "expected": {
+      "kind": "table-scroll",
+      "delta": 1
+    }
+  },
+  {
+    "label": "Ctrl+g, browse",
+    "expected": {
+      "kind": "view-in-editor"
+    }
+  },
+  {
+    "label": "?",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "Escape, browse, idle",
+    "expected": null
+  },
+  {
+    "label": "Escape, browse, a turn is running",
+    "expected": {
+      "kind": "esc-blocked"
+    }
+  },
+  {
+    "label": "Escape, input",
+    "expected": {
+      "kind": "mode",
+      "to": "browse"
+    }
+  }
+]

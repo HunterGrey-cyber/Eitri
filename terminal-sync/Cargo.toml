@@ -15,6 +15,10 @@ description = "DECSET 2026 synchronized-output publication barrier for the verda
 # version out of Cargo.lock, so the generated code tracks the real resolved version.
 [dependencies]
 alacritty_terminal = "0.26.0"
+# Already in the graph (`terminal` depends on it for the same reason: measuring printed
+# characters the way `alacritty_terminal` does). `SyncSpy::input` uses it to cap a run of
+# zero-width combining marks per cell (sw-terminal-2).
+unicode-width = "0.2"
 
 [dev-dependencies]
 libc = "0.2"
