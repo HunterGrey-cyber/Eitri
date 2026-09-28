@@ -220,11 +220,25 @@ fn main() {
     main_loop.run();
     clock.disconnect(observer);
     unsafe { glib::gobject_ffi::g_signal_remove_emission_hook(signal, hook) };
+    let own_buffers = pane.draws_into_own_buffers();
+    let counts = pane.presentation_counts();
     let shutdown = pane.shutdown();
     let physical_width = pane.widget().width() * pane.widget().scale_factor();
     let physical_height = pane.widget().height() * pane.widget().scale_factor();
     window.close();
     println!("physical framebuffer: {physical_width}x{physical_height}");
+    println!(
+        "presentation: {}",
+        if own_buffers {
+            "own dmabuf buffers"
+        } else {
+            "GtkGLArea texture"
+        }
+    );
+    println!(
+        "presentation counts: own frames={} GtkGLArea frames={} own-buffer failures={}",
+        counts.own_frames, counts.fallback_frames, counts.failures
+    );
     println!("frame_pacing: config={} size={width}x{height} total_frames={} completed_phases={} timed_out={} shutdown={shutdown}",
         if user_config { "user" } else { "clean" }, probe.total_frames.get(), probe.completed_phases.get(), timed_out.get());
     for (name, samples) in ["hjkl / 35ms / 8s", "j scroll / 20ms / 8s"]

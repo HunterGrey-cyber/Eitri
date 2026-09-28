@@ -7,6 +7,15 @@
 //! pixels on a black background prove intermediate positions; the harness's cursor getter only
 //! reports the destination and would not prove animation. Readback is deliberately test-only.
 //!
+//! Which presentation path ran is printed, before and after the re-realize (`presentation:`), and
+//! so are the pane's counts over the whole run, from its first frame through the motion checks,
+//! the three resizes and the re-realize (`presentation counts:`, `NeovideEditorPane::presentation_counts`,
+//! never reset). `-- --ignored --expect-own-buffers` fails if a single one of those frames went
+//! through `GtkGLArea`'s texture or the own-buffer path failed even once -- a fallback that a later
+//! re-realize or size change recovered from included; `NEOVIBE_EDITOR_DMABUF=0 ... -- --ignored
+//! --expect-fallback` forces the fallback and fails if any frame was drawn into the own buffers, so
+//! both paths pass the same pixel checks.
+//!
 //! An independent nvim RPC confirms each input's destination BEFORE the GTK loop resumes. This
 //! makes the idle-gap regression deterministic instead of depending on whether nvim's redraw
 //! happens to arrive before or after an extra, still-unchanged frame. These synchronized cases
@@ -822,6 +831,14 @@ fn presentation_lifetime(
     capture.enabled.set(false);
 }
 
+fn presentation(pane: &NeovideEditorPane) -> &'static str {
+    if pane.draws_into_own_buffers() {
+        "own dmabuf buffers"
+    } else {
+        "GtkGLArea texture"
+    }
+}
+
 fn run(
     pane: &NeovideEditorPane,
     fixed: &gtk4::Fixed,
@@ -829,6 +846,7 @@ fn run(
     capture: &Rc<Capture>,
     counter: &RenderCounter,
     observer: &mut Option<PaintObserver>,
+    expect_own: Option<bool>,
 ) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while pane.cell_size().is_none() || !socket.exists() || capture.samples.borrow().iter().all(|s| s.center.is_none())
@@ -843,6 +861,7 @@ fn run(
     spin(Duration::from_millis(500));
     wait_cursor(socket, 10, 11);
     let mut failures = Vec::new();
+    println!("presentation: {}", presentation(pane));
     for (name, keys, target, delta) in [
         ("horizontal after idle", "l", (10, 12), (1, 0)),
         ("vertical after idle", "j", (11, 12), (0, 1)),
@@ -892,6 +911,29 @@ fn run(
     }
     println!("settled idle: renders={extra}");
     presentation_lifetime(pane, fixed, socket, capture, counter, observer);
+    println!("presentation after re-realize: {}", presentation(pane));
+    let counts = pane.presentation_counts();
+    println!(
+        "presentation counts: own frames={} GtkGLArea frames={} own-buffer failures={}",
+        counts.own_frames, counts.fallback_frames, counts.failures
+    );
+    match expect_own {
+        Some(true) if counts.fallback_frames > 0 || counts.failures > 0 || counts.own_frames == 0 => {
+            failures.push(format!(
+                "expected every frame in own dmabuf buffers: {} drawn there, {} through GtkGLArea's \
+                 texture, {} failure(s) of the own-buffer path",
+                counts.own_frames, counts.fallback_frames, counts.failures
+            ));
+        }
+        Some(false) if counts.own_frames > 0 || counts.fallback_frames == 0 => {
+            failures.push(format!(
+                "expected every frame through GtkGLArea's texture: {} drawn into own dmabuf buffers, {} \
+                 through GtkGLArea's",
+                counts.own_frames, counts.fallback_frames
+            ));
+        }
+        _ => {}
+    }
     failures
 }
 
@@ -899,6 +941,22 @@ fn main() {
     if !std::env::args().any(|arg| arg == "--ignored") {
         println!("cursor_animation: skipped (requires an isolated GUI sandbox; pass --ignored)");
         return;
+    }
+    let expect_own = match (
+        std::env::args().any(|arg| arg == "--expect-own-buffers"),
+        std::env::args().any(|arg| arg == "--expect-fallback"),
+    ) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+        (true, true) => panic!("--expect-own-buffers and --expect-fallback contradict each other"),
+    };
+    // As `shell`'s own `main` does: a pipe or socket on stdin whose writer stays open would reach the
+    // embedded nvim as a buffer and block it at startup (`neovide_editor::stdin`). A harness that
+    // launches this test with such a stdin (2026-09-28: an agent tool's socket) otherwise times out
+    // with "never showed a red cursor", on either presentation path.
+    if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+        println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
     }
     gtk4::init().expect("GTK initialization requires the isolated sandbox display");
     let scratch = PathBuf::from(format!("/tmp/neovibe-cursor-animation-{}", std::process::id()));
@@ -948,7 +1006,7 @@ fn main() {
     let mut observer = Some(PaintObserver::new(pane.widget(), &capture, &counter));
     // Assertions stay outside GLib callbacks, and teardown also runs for a failed assertion.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(&pane, &fixed, &socket, &capture, &counter, &mut observer)
+        run(&pane, &fixed, &socket, &capture, &counter, &mut observer, expect_own)
     }));
     drop(observer);
     let shutdown = pane.shutdown();
