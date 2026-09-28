@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 /** Freeze existing key meanings while allowing new bindings.
  *  `resolveKey` cases cover the fixed BROWSE/INPUT table and state-dependent actions.
  *  Events are hand-picked; only expected actions are snapshots, so help-text edits cannot
@@ -8,21 +9,20 @@
  *  for reserved-prefix sequences [b, ]b, gt and gT.
  *
  *  Regenerate only the resolve-key fixture here with
- *  `REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 npx vitest run src/keymap.v1Freeze.test.ts`.
+ *  `REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 npx vitest run -u src/keymap.v1Freeze.test.ts`.
+ *  The variable selects regeneration and -u allows the fixture to be written.
  *  The Rust test regenerates the panel fixture. Inspect changes by hand because snapshots
  *  cannot distinguish intended changes from regressions. */
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+// Read through Vite's `?raw` like the other tests here, not `node:fs`: the panel's `tsc -b` has no
+// Node types, and shell/build.rs runs that build.
+import resolveKeyFixtureText from "./fixtures/v1-frozen-resolve-key.json?raw";
+// Shared with core/tests/keymap_v1_freeze.rs -- one file, one freeze, for both languages.
+import panelFixtureText from "../../../docs/keymap/v1-frozen-panel-keys.json?raw";
 import { resolveKey } from "./keymap";
 import type { KeyLike, PanelAction, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 import { advanceSequence, startSequence } from "./leader";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const RESOLVE_KEY_FIXTURE_PATH = join(HERE, "fixtures", "v1-frozen-resolve-key.json");
-// Shared with core/tests/keymap_v1_freeze.rs -- one file, one freeze, for both languages.
-const PANEL_FIXTURE_PATH = join(HERE, "..", "..", "..", "docs", "keymap", "v1-frozen-panel-keys.json");
 
 const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> = {}): KeyLike => ({
   key: k,
@@ -89,22 +89,22 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   { label: "Escape, input", mode: "input", event: key("Escape"), ctx: { sessionEnded: false } },
 ];
 
-function readJson<T>(path: string): T {
-  return JSON.parse(readFileSync(path, "utf-8")) as T;
+function readJson<T>(text: string): T {
+  return JSON.parse(text) as T;
 }
 
-if (process.env.REGENERATE_V1_RESOLVE_KEY_FIXTURE) {
-  it("regenerates the resolveKey fixture (REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 only)", () => {
+if (import.meta.env.REGENERATE_V1_RESOLVE_KEY_FIXTURE) {
+  it("regenerates the resolveKey fixture (REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 only)", async () => {
     const snapshot = RESOLVE_KEY_CASES.map((c) => ({
       label: c.label,
       expected: resolveKey(c.mode, c.event, c.ctx),
     }));
-    writeFileSync(RESOLVE_KEY_FIXTURE_PATH, `${JSON.stringify(snapshot, null, 2)}\n`);
+    await expect(`${JSON.stringify(snapshot, null, 2)}\n`).toMatchFileSnapshot("./fixtures/v1-frozen-resolve-key.json");
     expect(snapshot.length).toBe(RESOLVE_KEY_CASES.length);
   });
 } else {
   describe("resolveKey keeps every pinned v1 key (F10)", () => {
-    const fixture = readJson<{ label: string; expected: PanelAction }[]>(RESOLVE_KEY_FIXTURE_PATH);
+    const fixture = readJson<{ label: string; expected: PanelAction }[]>(resolveKeyFixtureText);
     const byLabel = new Map(fixture.map((row) => [row.label, row.expected]));
 
     it("the fixture covers exactly today's candidate cases (no silent addition/removal)", () => {
@@ -124,7 +124,7 @@ if (process.env.REGENERATE_V1_RESOLVE_KEY_FIXTURE) {
 }
 
 describe("the panel/leader default table keeps every pinned v1 binding (F10)", () => {
-  const fixture = readJson<{ keys: string[]; action: string }[]>(PANEL_FIXTURE_PATH);
+  const fixture = readJson<{ keys: string[]; action: string }[]>(panelFixtureText);
 
   // A synthetic PanelTable built from the shared fixture: `desc`/`source` are irrelevant to what
   // `startSequence`/`advanceSequence`/`resolveKey`'s tableHit lookup do, so they are filled with
