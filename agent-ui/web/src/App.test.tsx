@@ -2080,6 +2080,34 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
+  /* The sandbox pass (2026-09-28, Task 1) found the case above passing in jsdom and failing on real
+     WebKitGTK 2.52.6, which never sets a modifier on `a` while Super is held: only Super's own
+     keydown (`key: "Super"`, `code: "OSLeft"`) and keyup arrive. This is that shape. */
+  it("a is not permission approval while Super is held, as WebKitGTK reports it (sandbox pass, 2026-09-28)", () => {
+    arrivedOnACard();
+    press("Super", { code: "OSLeft" });
+    press("a");
+    wait(1000);
+    expect(answered()).toEqual([]);
+    fireEvent.keyUp(document.activeElement ?? document.body, { key: "Super", code: "OSLeft" });
+    wait(300);
+    press("a");
+    wait(1000);
+    expect(answered()).toHaveLength(1);
+  });
+
+  /* Codex re-review (2026-09-28): `shell/src/panel_super.rs` drops `Super+x` before the page, so
+     after a waiting `a` the page sees only Super go down; that must cancel the answer. */
+  it("a, then Super within the guard window: nothing is answered (the shell withholds the chord)", () => {
+    arrivedOnACard();
+    press("a");
+    wait(100);
+    press("Super", { code: "OSLeft" });
+    wait(1000);
+    expect(answered()).toEqual([]);
+    fireEvent.keyUp(document.activeElement ?? document.body, { key: "Super", code: "OSLeft" });
+  });
+
   /* Fix round 2 (v1 audit review, "the AltGraph clause"): AltGr is a level-3 shift some layouts use
      to type an ordinary character, not one of the four modifiers R2 and fix round 1 named -- jsdom
      honours `KeyboardEventInit`'s `modifierAltGraph` the same way it honours `modifierSuper`. */
@@ -6111,6 +6139,29 @@ describe("v1 mode: entering bypass asks first", () => {
       expect(lastOfType("confirm_bypass")).toBeUndefined();
     } finally {
       spy.mockRestore();
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /* The sandbox pass (2026-09-28, the bypass follow-up): WebKitGTK names the Super key "Super",
+     which the prompt's old four-name modifier list did not know, so holding Super closed the prompt
+     by itself and the y after it copied a row instead. Super's own keydown is a modifier now, and a
+     y while it is held is refused like any other modified y. */
+  it("h4. Super's own keydown keeps the prompt, and a y while Super is held is refused with the flash", () => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "Super", code: "OSLeft" });
+      expect(container.querySelector(".band-prompt")).not.toBeNull();
+      fireEvent.keyDown(root, { key: "y", code: "KeyY" });
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+      expect(container.textContent).toContain("y must be pressed on its own");
+      fireEvent.keyUp(root, { key: "Super", code: "OSLeft" });
+    } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
     }

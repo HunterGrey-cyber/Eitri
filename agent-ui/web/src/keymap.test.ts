@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { noteKey } from "./heldSuper";
 import { BROWSE_KEYS, INPUT_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
@@ -121,6 +122,19 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("d", { superKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
     expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+  });
+
+  /* The sandbox pass (2026-09-28, Task 1): WebKitGTK 2.52.6 sets no modifier on `a` while Super is
+     held -- only Super's own keydown/keyup arrive, which `heldSuper.ts` tracks. */
+  it("refuses a/d while Super is held by its own keydown, with no modifier on the key itself", () => {
+    noteKey("keydown", { key: "Super", code: "OSLeft" });
+    try {
+      expect(resolveKey("browse", key("a"), ctx)).toBeNull();
+      expect(resolveKey("browse", key("d"), ctx)).toBeNull();
+    } finally {
+      noteKey("keyup", { key: "Super", code: "OSLeft" });
+    }
+    expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
   });
 
   it("offers restart only on a session that ended", () => {

@@ -107,6 +107,16 @@ describe("TypingGuard: typed prose never answers (spec §2.1)", () => {
     expect(answers).toEqual([]);
   });
 
+  /* Codex re-review (2026-09-28): the shell withholds a key pressed with Super or Hyper, so for
+     `a` then `Super+x` the page sees only Super's own keydown -- which must cancel as the x would. */
+  it("a then Super at 100 ms: Super's own keydown cancels the waiting a (the chord after it never arrives)", () => {
+    key("a");
+    vi.advanceTimersByTime(100);
+    expect(guard.onKey("Super", Date.now())).toBe("cancelled");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+  });
+
   it("a key 1 ms before the wait ends still cancels it", () => {
     key("a");
     vi.advanceTimersByTime(TYPING_GUARD_MS - 1);

@@ -19,6 +19,7 @@ mod module_grid;
 mod nvim_keys;
 mod pane_focus;
 mod pane_switch;
+mod panel_super;
 mod prefix;
 mod prefix_strip;
 mod supervisor_client;
@@ -1671,6 +1672,11 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
             None
         };
         install_module_nav(id.clone(), host, move_focus.clone(), intercept);
+        // No key with Super or Hyper held reaches the panel's page: WebKitGTK does not tell the
+        // page, so `a`/`d`/`D` and the bypass `y` could not refuse it there (`panel_super.rs`).
+        if id.kind() == ModuleKind::Agent {
+            panel_super::install(host);
+        }
     }
 
     // --- Ctrl+h/j/k/l in the terminal: neovibe's, always (owner, 2026-09-23: "neovibe的按键优先").

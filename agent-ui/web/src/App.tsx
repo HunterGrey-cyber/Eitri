@@ -12,6 +12,7 @@ import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "./typingGuard";
+import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
 import { buildDisplay, indexOfKey } from "./display";
@@ -604,6 +605,10 @@ export default function App() {
     flashSeq.current += 1;
     setFlash({ text, seq: flashSeq.current });
   }
+  // Whether Super is held, from its own keydown/keyup: WebKitGTK reports it on no other key's event,
+  // and `isPlainAnswerKey` reads this for `a`/`d`/`D` and the bypass `y` (heldSuper.ts). The first
+  // effect in this component, so its window-capture listener runs before HINT's, which stops keys.
+  useEffect(() => installHeldSuperTracking(document, window), []);
   // A newer flash replaces an older one (`showFlash` above); this only ever clears the flash that
   // is STILL the current one when its own two seconds are up, so an older flash's timer firing late
   // cannot erase a newer flash that has since taken its place.
@@ -1133,7 +1138,7 @@ export default function App() {
       // recently", and it must see a key whether or not this effect goes on to act on it itself.
       // `lastKeyAtRef` is set to the PRIOR value on purpose (see its own doc comment): this always
       // runs before the bubble-phase `answerConfirm` that would read it for THIS SAME keydown.
-      if (!["Shift", "Control", "Alt", "Meta"].includes(event.key)) {
+      if (!isModifierKey(event.key)) {
         lastKeyAtRef.current = currentKeyAtRef.current;
         currentKeyAtRef.current = performance.now();
       }
@@ -2655,7 +2660,9 @@ export default function App() {
       return false;
     }
     event.stopPropagation();
-    if (!["Shift", "Control", "Alt", "Meta"].includes(event.key)) {
+    // `isModifierKey`, not a four-name list: WebKitGTK names the Super key `"Super"`, not `"Meta"`, so
+    // holding it used to cancel the prompt by itself, silently (sandbox pass, 2026-09-28).
+    if (!isModifierKey(event.key)) {
       event.preventDefault();
       promptSwallowKeyRef.current = event.key;
       typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());

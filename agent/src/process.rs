@@ -161,8 +161,13 @@ pub enum PermissionMode {
 
 /// What a permission mode the CLI reports about itself means for a gated session (spec §2.3, D12).
 ///
-/// Neovibe asks for `default` on both backends, but a project's own `.claude/settings.json` can set
-/// `permissions.defaultMode`, and on the sidecar nothing outranks it. The fall-through that matters
+/// Neovibe asks for `default` on both backends. A project's own `.claude/settings.json` can set
+/// `permissions.defaultMode`, but an explicit `--permission-mode default` outranks it: measured on
+/// CLI 2.1.283 (2026-09-28), `acceptEdits` there reports `default` and a `Write` is denied, and
+/// `bypassPermissions` there is ignored even with no flag. Legacy passes the flag and the sidecar
+/// states `default` explicitly (Verdandi `c0b309e`), so this is a backstop for a CLI whose rule
+/// changes or a sidecar that stops stating the mode, not a path a project setting reaches today
+/// (dated record, 2026-09-28 (Super held; D12)). The fall-through that matters
 /// is a hook that gives no answer (the 600 s hook timeout, a relay failure that escapes
 /// `write_fail_closed_deny`): under `default` that is a denial (bar a project `permissions.allow`
 /// rule matching the call, which this tripwire does not see -- `spawn_hook_listener`'s doc), under a

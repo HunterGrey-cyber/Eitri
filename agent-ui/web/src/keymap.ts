@@ -1,3 +1,5 @@
+import { superHeld } from "./heldSuper";
+
 /** Which of the panel's three keyboard states has the keys.
  *
  * `hint` is declared here and rendered by the status line's mode block, and nothing reaches it yet:
@@ -146,7 +148,10 @@ export type PanelAction =
  *  WebKitGTK's own `WebEventFactory::modifiersForEvent` populates ANY DOM-visible modifier for a
  *  physical Super/Hyper press was not re-checked here (no GUI in this task's scope) -- if it does
  *  not, `getModifierState` is a no-op on that engine too and a real fix needs a shell-side key
- *  controller ahead of the WebView, outside `agent-ui/web`. Fix round 2 reads `getModifierState`
+ *  controller ahead of the WebView, outside `agent-ui/web`. **Answered (sandbox pass, 2026-09-28):
+ *  WebKitGTK 2.52.6 sets neither `metaKey` nor `getModifierState("Super")` while Super is held; its
+ *  own keydown/keyup do arrive, so `heldSuper.ts` tracks those and `hasSuperOrHyper` reads it too.**
+ *  Fix round 2 reads `getModifierState`
  *  once more, for `"AltGraph"` (`hasAltGraph`) -- the identical caveat applies to it: not re-checked
  *  against real WebKitGTK either. */
 export type KeyLike = {
@@ -164,7 +169,11 @@ export type KeyLike = {
  *  way this layer can (see `KeyLike`'s own doc comment on `getModifierState` for the honest caveat
  *  about whether WebKitGTK ever actually sets either). */
 function hasSuperOrHyper(event: KeyLike): boolean {
-  return event.getModifierState?.("Super") === true || event.getModifierState?.("Hyper") === true;
+  // WebKitGTK 2.52.6 reports neither on another key's event (sandbox pass, 2026-09-28), so the Super
+  // key's own keydown/keyup, tracked by `heldSuper.ts`, is what actually catches it there.
+  return (
+    superHeld() || event.getModifierState?.("Super") === true || event.getModifierState?.("Hyper") === true
+  );
 }
 
 /** Fix round 2 (v1 audit review, "the AltGraph clause"): whether AltGr is held, read the same way
