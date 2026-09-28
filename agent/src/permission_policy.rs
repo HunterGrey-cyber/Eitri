@@ -174,6 +174,14 @@ pub const REASON_GIT_SUBCOMMAND_NOT_READ_ONLY: &str = "this git subcommand is no
 pub const REPLACEABLE_BY_A_RULE: &[&str] = &[REASON_NOT_ON_READ_ONLY_LIST, REASON_GIT_SUBCOMMAND_NOT_READ_ONLY];
 /// The allow a rule produces, logged by `take_ui_delivery` like every other auto-answer.
 pub const REASON_ALLOWED_BY_A_PROJECT_RULE: &str = "a prefix rule the user approved for this project";
+/// A git global option before the subcommand (`-C`, `-c`, `--git-dir`, `--work-tree`,
+/// `--namespace`, ...). Excluded from [`REPLACEABLE_BY_A_RULE`]: relocating git can select a
+/// repository the policy did not check, so a saved `Bash(git -C *)` rule must not answer it.
+pub const REASON_GIT_GLOBAL_OPTION: &str =
+    "a git global option before the subcommand can point git at a repository this policy did not check";
+/// The work budget ran out (see [`MAX_WORK_PER_CLASSIFICATION`]). Running out always cards.
+pub const REASON_TOO_MUCH_WORK: &str =
+    "checking this call would need more of the disk read than this policy reads (too many files, links or includes)";
 
 /// Characters that stop command analysis and send the call to a permission card.
 ///
@@ -244,6 +252,9 @@ struct Surroundings<'a> {
     home: Option<&'a Path>,
     /// Any of [`GIT_LOCATION_VARIABLES`] is set.
     git_location_from_environment: bool,
+    /// The work this classification may do on the filesystem ([`MAX_WORK_PER_CLASSIFICATION`]
+    /// outside tests).
+    work_budget: usize,
 }
 
 /// The one entry point. `tool_name` and `input` are the `PermissionRequested` event's own fields,
@@ -257,6 +268,7 @@ pub fn classify_permission_request(tool_name: &str, input: &Value, project_root:
     let surroundings = Surroundings {
         home: home.as_deref(),
         git_location_from_environment: GIT_LOCATION_VARIABLES.iter().any(|v| std::env::var_os(v).is_some()),
+        work_budget: MAX_WORK_PER_CLASSIFICATION,
     };
     classify_in(tool_name, input, project_root, &surroundings)
 }
@@ -292,10 +304,29 @@ pub fn rule_that_allows(
         .then(|| rule.to_rule_string())
 }
 
-/// [`classify_permission_request`] with the home directory and the git environment passed in rather
-/// than read from the environment, so the "the root is not a boundary" branches are testable without
-/// mutating `HOME` or `GIT_DIR` for the whole test process.
+/// [`classify_permission_request`] with the home directory and git environment passed in, so
+/// boundary checks can be tested without changing `HOME` or `GIT_DIR` for the whole test
+/// process.
+///
+/// The whole classification shares one work budget. Exhausting it requires a card regardless of
+/// the result returned by the check that ran out.
 fn classify_in(tool_name: &str, input: &Value, project_root: &Path, surroundings: &Surroundings) -> Classification {
+    let (classification, ran_out) = with_work_budget(surroundings.work_budget, || {
+        classify_within_budget(tool_name, input, project_root, surroundings)
+    });
+    if ran_out {
+        ask(REASON_TOO_MUCH_WORK)
+    } else {
+        classification
+    }
+}
+
+fn classify_within_budget(
+    tool_name: &str,
+    input: &Value,
+    project_root: &Path,
+    surroundings: &Surroundings,
+) -> Classification {
     let home = surroundings.home;
     // Before anything else: a call whose input is not even an object is not a call this module can
     // read. Both backends deliver `input` as whatever JSON arrived, so this is reachable.
@@ -371,20 +402,13 @@ enum PathField {
     Optional,
 }
 
-/// `Read`/`Grep`/`Glob` are allowed only for a path that really resolves to somewhere inside the
-/// project root.
+/// `Read`/`Grep`/`Glob` are allowed only when the path resolves inside the project root. A
+/// malformed, empty, nonexistent or unresolvable path requires a card. A resolved path outside the
+/// root also requires a card.
 ///
-/// Every failure is a card, and the failures are not hypothetical:
-/// - the field is present but not a string, or is empty -- malformed;
-/// - the path does not exist, so `canonicalize` fails -- unresolvable;
-/// - the path exists but canonicalizes outside the root -- this is what catches both `..`
-///   traversal and a symlink pointing out of the tree, because `canonicalize` resolves both before
-///   the containment test rather than after;
-/// - the root itself will not canonicalize, or is `$HOME` or above it -- see [`boundary`], which
-///   the caller has already run; `root` here is its canonical result.
-///
-/// Resolving BEFORE comparing is the whole design. A textual check would be defeated by
-/// `src/../../etc/passwd` and by any symlink; `canonicalize` is a real syscall that follows both.
+/// The caller has already checked [`boundary`]; `root` is canonical and is neither `$HOME` nor
+/// an ancestor of it. Resolve before comparing so `..` and symlinks cannot bypass containment.
+/// [`resolve`] bounds the work because the project controls the links it follows.
 fn classify_path(input: &Value, field: &str, requirement: PathField, root: &Path) -> Classification {
     let raw = match input.get(field) {
         None | Some(Value::Null) => match requirement {
@@ -399,16 +423,12 @@ fn classify_path(input: &Value, field: &str, requirement: PathField, root: &Path
         return ask("this tool's path field is empty");
     }
 
-    let candidate: PathBuf = {
-        let p = Path::new(raw);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            root.join(p)
-        }
-    };
-    let Ok(resolved) = candidate.canonicalize() else {
-        return ask("the path could not be resolved on disk");
+    // Resolve within bounds because the project controls the link chain. Padded chains can make
+    // repeated `canonicalize` calls expensive.
+    let resolved = match resolve(root, Path::new(raw)) {
+        Resolution::At(resolved) => resolved,
+        Resolution::Missing => return ask("the path could not be resolved on disk"),
+        Resolution::Refused => return ask("the path's links could not be resolved within this policy's limits"),
     };
     if resolved.starts_with(root) {
         allow("the path resolves inside the project root")
@@ -481,7 +501,7 @@ fn classify_bash(input: &Value, root: &Path, surroundings: &Surroundings) -> Cla
         return ask("an argument glues a path to a short option, which this policy refuses to parse");
     }
     if !arguments_stay_inside(&arguments, root) {
-        return ask("an argument resolves outside the project root");
+        return ask("an argument resolves outside the project root, or not within this policy's limits");
     }
     if follows_links_while_walking(program, &arguments) {
         return ask("this command follows symbolic links while it walks the tree");
@@ -499,7 +519,11 @@ fn classify_bash(input: &Value, root: &Path, surroundings: &Surroundings) -> Cla
     // `diff DIR DIR` and `diff FILE DIR` open what the directory's entries name, following a link
     // out of the tree, and with no `-r` at all (measured 2026-09-28). A `--no-dereference` would not
     // follow, but proving an argument list safe is exactly the partial parse this module refuses.
-    if program == "diff" && arguments.iter().any(|a| root.join(a).is_dir()) {
+    if program == "diff"
+        && arguments
+            .iter()
+            .any(|a| resolve_existing(root, Path::new(a)).is_some_and(|resolved| resolved.is_dir()))
+    {
         return ask("diff of a directory opens what its entries link to, inside the project or not");
     }
 
@@ -528,7 +552,15 @@ fn classify_git(arguments: &[&str], root: &Path, surroundings: &Surroundings) ->
     {
         return ask("this git call carries an option that writes a file");
     }
-    match arguments.split_first() {
+    // Skip only exact `--no-pager` and `-P` options before locating the subcommand. They only
+    // disable the pager; abbreviated or combined forms are rejected by git. Leave every other
+    // global option in place so it requires a card, including options that relocate or
+    // reconfigure git.
+    let skipped = arguments
+        .iter()
+        .take_while(|a| matches!(**a, "--no-pager" | "-P"))
+        .count();
+    match arguments[skipped..].split_first() {
         Some((sub, rest)) if READ_ONLY_GIT_SUBCOMMANDS.contains(sub) => {
             if git_options_read_only_what_they_name(sub, rest) {
                 allow("a read-only git subcommand")
@@ -536,6 +568,10 @@ fn classify_git(arguments: &[&str], root: &Path, surroundings: &Surroundings) ->
                 ask(REASON_OPTION_NOT_KNOWN_TO_ONLY_READ)
             }
         }
+        // An option remaining after `--no-pager`/`-P` is global. Options such as `-C`,
+        // `--git-dir`, `--work-tree` and `--namespace` can select a repository the check above
+        // did not inspect. A saved prefix rule must not replace this reason.
+        Some((option, _)) if option.starts_with('-') => ask(REASON_GIT_GLOBAL_OPTION),
         _ => ask(REASON_GIT_SUBCOMMAND_NOT_READ_ONLY),
     }
 }
@@ -552,20 +588,24 @@ fn is_short_option_cluster(argument: &str) -> bool {
 /// Each suffix of a short-option cluster is checked because an option value may be attached, as
 /// in `grep -fescape`. The literal argument is checked too: after `--`, `-n` can name a file
 /// rather than an option. Checking only the suffix `n` would miss a symlink named `-n`.
+///
+/// Each distinct candidate is resolved once by [`resolve`], so repeated arguments cannot
+/// repeatedly traverse the same expensive link chain.
 fn arguments_stay_inside(arguments: &[&str], root: &Path) -> bool {
-    arguments.iter().all(|argument| {
-        let mut candidates: Vec<&str> = vec![argument];
+    let mut candidates: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for argument in arguments {
+        candidates.insert(argument);
         if is_short_option_cluster(argument) {
             candidates.extend((1..argument.len()).filter_map(|i| argument.get(i..)));
         }
-        candidates.into_iter().all(|candidate| {
-            let joined = root.join(candidate);
-            if joined.symlink_metadata().is_err() {
-                return true;
-            }
-            matches!(joined.canonicalize(), Ok(resolved) if resolved.starts_with(root))
+    }
+    candidates
+        .into_iter()
+        .all(|candidate| match resolve(root, Path::new(candidate)) {
+            Resolution::Missing => true,
+            Resolution::At(resolved) => resolved.starts_with(root),
+            Resolution::Refused => false,
         })
-    })
 }
 
 /// Whether `program`'s arguments ask it to follow symbolic links met while walking a tree.
@@ -1317,9 +1357,16 @@ const REASON_GIT_CONFIG_UNREADABLE: &str = "the repository's configuration could
 const REASON_GIT_HOOK: &str = "the repository holds a hook git may run under a read-only command";
 const REASON_GIT_HOOKSPATH: &str = "the repository's core.hooksPath points somewhere this policy cannot clear";
 const REASON_GIT_ALTERNATES: &str = "the repository reads objects from another repository (objects/info/alternates)";
-const REASON_GIT_DIR_ESCAPES: &str =
-    "the repository reads objects or refs from a path that leaves its own git directory";
+const REASON_GIT_DIR_ESCAPES: &str = "a symbolic link in the repository's git directory resolves outside both it and \
+     the project (or not at all), so git may read outside";
+const REASON_GIT_DIR_UNREADABLE: &str = "the repository's git directory could not be read in full";
+const REASON_GIT_DIR_TOO_BIG: &str = "the repository's git directory holds too many entries to check";
 const REASON_GIT_TOO_MUCH_TO_CHECK: &str = "the repository has too many submodule git directories to check";
+const REASON_GIT_DIR_TOO_MANY_LINKS: &str =
+    "the repository's git directory holds more symbolic links than this policy resolves";
+const REASON_GIT_DIR_NOT_THIS_PROJECTS: &str =
+    "the project's .git names a repository outside the project that does not \
+     name this project back as its linked worktree or submodule";
 
 /// Checks that the repository git discovers from `root` stays within that boundary
 /// and runs nothing of its own under a read. Discovery walks `.git` upward without
@@ -1356,9 +1403,94 @@ fn git_repository_stays_inside(root: &Path, surroundings: &Surroundings) -> Resu
             Ok(())
         };
     }
-    let git_dir = git_dir_named_by(&dot_git, root).ok_or(REASON_DOT_GIT_NOT_A_REPOSITORY)?;
+    let git_dir = git_dir_named_by(root).ok_or(REASON_DOT_GIT_NOT_A_REPOSITORY)?;
     let common = git_directory_git_accepts(&git_dir).ok_or(REASON_DOT_GIT_NOT_A_REPOSITORY)?;
+    repository_is_this_projects(&dot_git, &git_dir, &common, root)?;
     repository_runs_nothing_of_its_own(&git_dir, &common, root, surroundings.home)
+}
+
+/// Checks that the git directory and common directory belong to this project. A `.git` gitfile,
+/// symlink or `commondir` can select an unrelated repository and expose its committed files
+/// even if its config runs nothing.
+///
+/// Both directories may resolve inside the root. If either is outside, the root's `.git` must
+/// be a plain gitfile and the outside repository must contain a back-link to this root. A
+/// symlinked `.git` is refused.
+///
+/// For a linked worktree, the git directory is `<common>/worktrees/<name>` and its `gitdir`
+/// file must name this root's `.git`, absolutely or relative to that directory. For a
+/// submodule, the git directory is its own common directory under `<a git
+/// directory>/modules/<path>`, and its config's last `core.worktree` must resolve to this root.
+///
+/// Other outside layouts and failed reads require cards. This includes `--separate-git-dir`,
+/// manually moved worktrees awaiting `git worktree repair`, and submodules whose back-link
+/// exists only in `config.worktree` or an include. `git_dir` and `common` are canonical.
+fn repository_is_this_projects(dot_git: &Path, git_dir: &Path, common: &Path, root: &Path) -> Result<(), &'static str> {
+    if git_dir.starts_with(root) && common.starts_with(root) {
+        return Ok(());
+    }
+    // `root` is canonical, so a `.git` that is a regular file (not a symlink) is canonical too.
+    let is_a_gitfile = dot_git.symlink_metadata().is_ok_and(|meta| meta.file_type().is_file());
+    if is_a_gitfile
+        && (is_a_linked_worktree_of(git_dir, common, dot_git) || is_a_submodule_checked_out_at(git_dir, common, root))
+    {
+        Ok(())
+    } else {
+        Err(REASON_GIT_DIR_NOT_THIS_PROJECTS)
+    }
+}
+
+/// `git_dir` is `<common>/worktrees/<name>` and its `gitdir` back-link names `dot_git`. Both paths
+/// canonical.
+fn is_a_linked_worktree_of(git_dir: &Path, common: &Path, dot_git: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if git_dir.parent() != Some(common.join("worktrees").as_path()) {
+        return false;
+    }
+    let Ok(bytes) = read_small_file(&git_dir.join("gitdir")) else {
+        return false;
+    };
+    let named = trim_line_ends(&bytes);
+    if named.is_empty() {
+        return false;
+    }
+    resolve_existing(git_dir, Path::new(std::ffi::OsStr::from_bytes(named))).is_some_and(|named| named == dot_git)
+}
+
+/// `git_dir` is a submodule's own repository, under a `modules/` directory of a git directory, whose
+/// config's last `core.worktree` (no subsection) resolves to `root`. Git resolves a relative one by
+/// entering the git directory and then the value, so it is joined to the canonical git directory
+/// and canonicalized, as git's own `chdir`s would resolve it. Both paths canonical.
+fn is_a_submodule_checked_out_at(git_dir: &Path, common: &Path, root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if git_dir != common {
+        return false;
+    }
+    let under_a_superproject = git_dir.ancestors().skip(1).any(|dir| {
+        dir.file_name().is_some_and(|name| name == "modules")
+            && dir
+                .parent()
+                .is_some_and(|superproject| git_directory_git_accepts(superproject).is_some())
+    });
+    if !under_a_superproject {
+        return false;
+    }
+    let Some(variables) = read_small_file(&git_dir.join("config"))
+        .ok()
+        .and_then(|bytes| parse_git_config(&bytes))
+    else {
+        return false;
+    };
+    let Some(value) = variables
+        .iter()
+        .rev()
+        .find(|variable| variable.is_core_worktree() && !variable.has_subsection)
+        .and_then(|variable| variable.value.as_deref())
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    resolve_existing(git_dir, Path::new(std::ffi::OsStr::from_bytes(value))).is_some_and(|named| named == root)
 }
 
 /// A bare repository, or a directory inside one: git's `is_git_directory` asks for a `HEAD` and
@@ -1371,29 +1503,26 @@ fn looks_like_a_git_directory(dir: &Path) -> bool {
             .any(|name| dir.join(name).symlink_metadata().is_ok())
 }
 
-/// The git directory a `.git` names: itself when it is a directory, or the `gitdir: <path>` a
-/// gitfile holds (a linked worktree, a submodule), relative to the directory holding the `.git`.
-/// `None` for anything git would reject, which makes git die rather than read anything.
-fn git_dir_named_by(dot_git: &Path, root: &Path) -> Option<PathBuf> {
+/// Returns the canonical git directory named by `<root>/.git`: the directory itself or the path
+/// in a `gitdir: <path>` file, relative to the root. Both use [`resolve`] to bound link
+/// traversal before later lookups. Returns `None` for rejected forms or paths that cannot
+/// resolve within bounds.
+fn git_dir_named_by(root: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
+    let dot_git = resolve_existing(root, Path::new(".git"))?;
     let meta = dot_git.metadata().ok()?;
     if meta.is_dir() {
-        return Some(dot_git.to_path_buf());
+        return Some(dot_git);
     }
     if !meta.is_file() {
         return None;
     }
-    let bytes = read_small_file(dot_git).ok()?;
+    let bytes = read_small_file(&dot_git).ok()?;
     let named = trim_line_ends(bytes.strip_prefix(b"gitdir: ")?);
     if named.is_empty() {
         return None;
     }
-    let path = Path::new(std::ffi::OsStr::from_bytes(named));
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    })
+    resolve_existing(root, Path::new(std::ffi::OsStr::from_bytes(named)))
 }
 
 /// `git_dir`'s common directory, if git's `is_git_directory` would accept it -- and only then,
@@ -1425,12 +1554,7 @@ fn commondir_of(git_dir: &Path) -> Result<PathBuf, &'static str> {
             if named.is_empty() {
                 return Err(REASON_GIT_CONFIG_UNREADABLE);
             }
-            let path = Path::new(std::ffi::OsStr::from_bytes(named));
-            Ok(if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                git_dir.join(path)
-            })
+            resolve_existing(git_dir, Path::new(std::ffi::OsStr::from_bytes(named))).ok_or(REASON_GIT_CONFIG_UNREADABLE)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
         Err(_) => Err(REASON_GIT_CONFIG_UNREADABLE),
@@ -1480,14 +1604,22 @@ fn is_searchable_directory(path: &Path) -> bool {
 /// the thread that pumps permission requests.
 const MAX_GIT_FILE_BYTES: u64 = 1 << 20;
 
+/// Charges the work budget even for a missing file. Budget exhaustion returns an error other
+/// than `NotFound`, so callers cannot mistake it for absence.
 fn read_small_file(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
+    if !spend(WORK_PER_FILE) {
+        return Err(std::io::Error::other("out of work"));
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(MAX_GIT_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_GIT_FILE_BYTES {
         return Err(std::io::Error::other("larger than a git file this policy reads"));
+    }
+    if !spend(bytes.len() / 1024 * WORK_PER_KIB) {
+        return Err(std::io::Error::other("out of work"));
     }
     Ok(bytes)
 }
@@ -1498,6 +1630,184 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
         .rposition(|b| *b != b'\n' && *b != b'\r')
         .map_or(0, |i| i + 1);
     &bytes[..end]
+}
+
+// Classification runs on the GTK main loop, so unbounded path resolution can freeze the window.
+// The project controls paths and links in its tree and `.git`.
+//
+// [`resolve`] reads each link before following it and limits target length, components, `..`,
+// hops and steps. Each lookup uses an already resolved prefix, so the kernel does not follow
+// links on its behalf.
+//
+// Every lookup, directory entry and file read also spends from one classification budget.
+// Exhausting it requires a card regardless of which check ran out.
+
+/// The work one classification may do, in units of about one directory entry listed (~0.16 us on
+/// this host, release build). Calibrated 2026-09-28 so that a classification spending all of it
+/// takes about 40 ms in a release build; of the repositories measured, the
+/// largest repository spends about 4,000.
+const MAX_WORK_PER_CLASSIFICATION: usize = 200_000;
+/// One component looked up (`lstat`) or one link read (`readlink`) by [`resolve`].
+const WORK_PER_LOOKUP: usize = 16;
+/// One directory entry listed.
+const WORK_PER_ENTRY: usize = 1;
+/// One file opened and read by [`read_small_file`], plus this much per KiB read.
+const WORK_PER_FILE: usize = 20;
+const WORK_PER_KIB: usize = 48;
+
+thread_local! {
+    static WORK_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RAN_OUT_OF_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `check` with `budget` units of work, and says whether it ran out. Outside such a scope the
+/// budget is zero, so a check that is not run through here fails closed.
+fn with_work_budget<T>(budget: usize, check: impl FnOnce() -> T) -> (T, bool) {
+    let saved_left = WORK_LEFT.replace(budget);
+    let saved_ran_out = RAN_OUT_OF_WORK.replace(false);
+    let result = check();
+    let ran_out = RAN_OUT_OF_WORK.replace(saved_ran_out);
+    WORK_LEFT.set(saved_left);
+    (result, ran_out)
+}
+
+/// Takes `units` from the budget; `false`, for good, once it is spent.
+fn spend(units: usize) -> bool {
+    match WORK_LEFT.get().checked_sub(units) {
+        Some(left) if !RAN_OUT_OF_WORK.get() => {
+            WORK_LEFT.set(left);
+            true
+        }
+        _ => {
+            WORK_LEFT.set(0);
+            RAN_OUT_OF_WORK.set(true);
+            false
+        }
+    }
+}
+
+/// The most symbolic links a git directory may hold before it cards without any of them being
+/// followed. Six measured repositories hold none; a hook symlinked into the
+/// project is one per hook, and git knows 28 hook names.
+const MAX_GIT_DIRECTORY_SYMLINKS: usize = 64;
+/// Limits on ONE link's target, read with `readlink` before it is followed, on every hop. A hook
+/// symlinked into the project (`../../scripts/pre-commit`, or from a nested submodule's git
+/// directory seven `..` deep) sits far inside them; the review's padded hops (~4000 bytes, ~800
+/// `..`) do not. Components are counted as written, `.` included -- each costs a lookup.
+const MAX_LINK_TARGET_BYTES: usize = 1024;
+const MAX_LINK_TARGET_COMPONENTS: usize = 64;
+const MAX_LINK_TARGET_PARENTS: usize = 16;
+/// Links followed in one resolution. An ordinary path meets zero or one.
+const MAX_LINK_HOPS: usize = 8;
+/// Components looked up in one resolution, the path's own and every target's.
+const MAX_RESOLUTION_STEPS: usize = 256;
+/// The deepest resolved path a lookup is made under: each `lstat` walks its prefix again in the
+/// kernel, so this bounds what one lookup costs.
+const MAX_RESOLVED_DEPTH: usize = 128;
+
+/// What [`resolve`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    /// The path, canonical: every link followed, no `.` or `..` left.
+    At(PathBuf),
+    /// Nothing is there, as named: a component of the path itself does not exist (or is not a
+    /// directory). A dangling link AT the end of the path is not this, but [`Resolution::Refused`].
+    Missing,
+    /// It would not resolve within the limits above, a link's target would not read, the budget
+    /// ran out, or the path ends in a link that leads nowhere.
+    Refused,
+}
+
+/// Whether a link's target is small enough to follow. See [`MAX_LINK_TARGET_BYTES`].
+fn link_target_is_modest(target: &[u8]) -> bool {
+    let parts = target.split(|b| *b == b'/').filter(|part| !part.is_empty());
+    target.len() <= MAX_LINK_TARGET_BYTES
+        && parts.clone().count() <= MAX_LINK_TARGET_COMPONENTS
+        && parts.filter(|part| *part == b"..").count() <= MAX_LINK_TARGET_PARENTS
+}
+
+/// The components of a path as the kernel reads them, `.` dropped, in reverse (a stack), each
+/// marked with whether it is one of the path's own (`true`) or a link target's.
+fn components_to_resolve(path: &[u8], own: bool) -> Vec<(Vec<u8>, bool)> {
+    path.split(|b| *b == b'/')
+        .filter(|part| !part.is_empty() && *part != b".")
+        .rev()
+        .map(|part| (part.to_vec(), own))
+        .collect()
+}
+
+/// `path` resolved the way the kernel resolves it -- `realpath(3)`, physical `..`, every link
+/// followed -- from `base` when it is relative, but within the limits above and the work budget.
+///
+/// `base` must be canonical. Each component is looked up (`lstat`) under the prefix resolved so
+/// far, which is canonical, so the kernel never follows a link for this function; each link is read
+/// (`readlink`) and its target checked by [`link_target_is_modest`] before it is followed. What it
+/// answers matches the `lstat`-then-`canonicalize` it replaces: [`Resolution::Missing`] where the
+/// path as named does not exist (a component of it, or of a link met before its last component),
+/// [`Resolution::Refused`] where its last component is a link that leads nowhere.
+fn resolve(base: &Path, path: &Path) -> Resolution {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut resolved = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    };
+    let mut pending = components_to_resolve(path.as_os_str().as_bytes(), true);
+    let mut own_left = pending.len();
+    let (mut steps, mut hops, mut following_the_last) = (0, 0, false);
+    while let Some((part, own)) = pending.pop() {
+        steps += 1;
+        if steps > MAX_RESOLUTION_STEPS || !spend(WORK_PER_LOOKUP) {
+            return Resolution::Refused;
+        }
+        if own {
+            own_left -= 1;
+        }
+        if part == b".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(std::ffi::OsStr::from_bytes(&part));
+        if candidate.components().count() > MAX_RESOLVED_DEPTH {
+            return Resolution::Refused;
+        }
+        let meta = match candidate.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(_) if !following_the_last => return Resolution::Missing,
+            Err(_) => return Resolution::Refused,
+        };
+        if !meta.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        hops += 1;
+        if hops > MAX_LINK_HOPS || !spend(WORK_PER_LOOKUP) {
+            return Resolution::Refused;
+        }
+        if own && own_left == 0 {
+            following_the_last = true;
+        }
+        let Ok(target) = std::fs::read_link(&candidate) else {
+            return Resolution::Refused;
+        };
+        let target = target.into_os_string().into_vec();
+        if !link_target_is_modest(&target) {
+            return Resolution::Refused;
+        }
+        if target.first() == Some(&b'/') {
+            resolved = PathBuf::from("/");
+        }
+        pending.extend(components_to_resolve(&target, false));
+    }
+    Resolution::At(resolved)
+}
+
+/// [`resolve`] of a path that must exist: the canonical path, or `None`.
+fn resolve_existing(base: &Path, path: &Path) -> Option<PathBuf> {
+    match resolve(base, path) {
+        Resolution::At(resolved) => Some(resolved),
+        Resolution::Missing | Resolution::Refused => None,
+    }
 }
 
 /// A read-only git command can execute programs or read outside the project because
@@ -1511,7 +1821,8 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
 /// Submodule directories under `modules/` need the same checks; their `commondir` can
 /// also redirect common configuration. `objects/info/alternates` can expose foreign
 /// objects, and symlinked `objects`, `refs` or `packed-refs` can expose foreign data
-/// without an alternates file. [`git_directory_reads_stay_inside`] confines these reads.
+/// without an alternates file. Symlinked pack files and loose-object directories can
+/// also escape, so [`git_directory_reads_stay_inside`] confines every link in the tree.
 ///
 /// The model cannot write any of this without a card. What can is a directory or archive that
 /// arrives with its own `.git` (`git clone` carries none of it), and there the user's own
@@ -1523,6 +1834,13 @@ fn repository_runs_nothing_of_its_own(
     root: &Path,
     home: Option<&Path>,
 ) -> Result<(), &'static str> {
+    // First contain every link in the git directories using bounded resolution, so later reads
+    // cannot follow a link whose resolution cost has not been bounded.
+    let mut entries = MAX_GIT_DIRECTORY_ENTRIES;
+    git_directory_reads_stay_inside(common, root, &mut entries)?;
+    if !git_dir.starts_with(common) {
+        git_directory_reads_stay_inside(git_dir, root, &mut entries)?;
+    }
     // `common/config` is what git reads; `git_dir/config` and `config.worktree` are read whether or
     // not `extensions.worktreeConfig` asks for the latter -- a superset.
     let mut config_files = vec![common.join("config")];
@@ -1545,30 +1863,70 @@ fn repository_runs_nothing_of_its_own(
     if common.join("objects/info/alternates").symlink_metadata().is_ok() {
         return Err(REASON_GIT_ALTERNATES);
     }
-    git_directory_reads_stay_inside(common)?;
     hooks_run_nothing_under_a_read(&common.join("hooks"))?;
     let mut budget = MAX_SUBMODULE_GIT_DIRECTORIES;
-    submodule_git_directories_run_nothing(&common.join("modules"), root, home, &mut budget)
+    let mut scan = SubmoduleScan {
+        root,
+        home,
+        walked: common,
+        budget: &mut budget,
+        entries: &mut entries,
+    };
+    submodule_git_directories_run_nothing(&common.join("modules"), &mut scan)
 }
 
-/// Paths git reads under `objects`, `refs` and `packed-refs` must resolve inside the git
-/// directory; links out can expose another repository. `commondir`, `worktrees/*` and
-/// `modules/*` are checked separately because they can legitimately name other git directories.
-/// Any `objects/info/alternates` file or failure to canonicalize the git directory requires a
-/// card.
-const GIT_DIR_READS_THAT_MUST_STAY_INSIDE: &[&str] = &["objects", "refs", "packed-refs", "info", "logs"];
+/// How many entries of a repository's git directories are walked before the answer is a card. The
+/// six measured repositories held 420 to 1767 each, none of them a symbolic link; git's
+/// own `gc --auto` packs a repository once it passes 6700 loose objects.
+const MAX_GIT_DIRECTORY_ENTRIES: usize = 200_000;
 
-fn git_directory_reads_stay_inside(common: &Path) -> Result<(), &'static str> {
-    let Ok(canonical_common) = common.canonicalize() else {
-        return Err(REASON_GIT_DIR_ESCAPES);
-    };
-    for name in GIT_DIR_READS_THAT_MUST_STAY_INSIDE {
-        let entry = common.join(name);
-        if entry.symlink_metadata().is_err() {
-            continue;
+/// Every symlink in `dir` must resolve inside it or to a file inside the project. Project
+/// directories are refused because their entries were not walked. The walk follows no links;
+/// `dir` must already be canonical.
+///
+/// Checking only top-level entries misses nested links such as `objects/pack/pack-*.{idx,pack}`
+/// and `objects/<xx>`, which can expose another repository's objects. The same risk applies to
+/// `index`, `shallow`, loose refs and reflogs. Any `objects/info/alternates` file or unreadable
+/// directory requires a card.
+///
+/// Bound the work before following links: the walk stops at [`MAX_RESOLVED_DEPTH`], refuses
+/// more than [`MAX_GIT_DIRECTORY_SYMLINKS`] links, and resolves each accepted link with
+/// [`resolve`]. Padded link chains must not make this scan block the UI.
+fn git_directory_reads_stay_inside(dir: &Path, root: &Path, entries: &mut usize) -> Result<(), &'static str> {
+    let mut links = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        if next.components().count() > MAX_RESOLVED_DEPTH {
+            return Err(REASON_GIT_DIR_TOO_BIG);
         }
-        match entry.canonicalize() {
-            Ok(resolved) if resolved.starts_with(&canonical_common) => {}
+        if !spend(WORK_PER_LOOKUP) {
+            return Err(REASON_TOO_MUCH_WORK);
+        }
+        for entry in std::fs::read_dir(&next).map_err(|_| REASON_GIT_DIR_UNREADABLE)? {
+            let entry = entry.map_err(|_| REASON_GIT_DIR_UNREADABLE)?;
+            *entries = entries.checked_sub(1).ok_or(REASON_GIT_DIR_TOO_BIG)?;
+            if !spend(WORK_PER_ENTRY) {
+                return Err(REASON_TOO_MUCH_WORK);
+            }
+            let file_type = entry.file_type().map_err(|_| REASON_GIT_DIR_UNREADABLE)?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_symlink() {
+                if links.len() == MAX_GIT_DIRECTORY_SYMLINKS {
+                    return Err(REASON_GIT_DIR_TOO_MANY_LINKS);
+                }
+                links.push(entry.path());
+            }
+        }
+    }
+    for link in &links {
+        // The walk entered only real directories from a canonical start, so `parent` is canonical.
+        let (Some(parent), Some(name)) = (link.parent(), link.file_name()) else {
+            return Err(REASON_GIT_DIR_ESCAPES);
+        };
+        match resolve(parent, Path::new(name)) {
+            Resolution::At(resolved)
+                if resolved.starts_with(dir) || (resolved.starts_with(root) && !resolved.is_dir()) => {}
             _ => return Err(REASON_GIT_DIR_ESCAPES),
         }
     }
@@ -1619,7 +1977,14 @@ fn config_runs_nothing(path: &Path, scope: &ConfigScope, depth: usize) -> Result
                 .as_deref()
                 .and_then(|value| include_target(value, path, scope.home))
                 .ok_or(REASON_GIT_CONFIG_UNREADABLE)?;
-            config_runs_nothing(&target, scope, depth + 1)?;
+            // Resolve includes within bounds and skip missing ones as git does. Every include
+            // read spends from the work budget so branching include chains cannot cause
+            // unbounded reads.
+            match resolve(Path::new("/"), &target) {
+                Resolution::Missing => {}
+                Resolution::At(target) => config_runs_nothing(&target, scope, depth + 1)?,
+                Resolution::Refused => return Err(REASON_GIT_CONFIG_UNREADABLE),
+            }
             continue;
         }
         if variable.is_core_hookspath() {
@@ -1682,10 +2047,10 @@ fn hookspath_reads_only_known_hooks(value: Option<&[u8]>, scope: &ConfigScope) -
             scope.root.join(p)
         }
     };
-    let canonical = path.canonicalize().map_err(|_| REASON_GIT_HOOKSPATH)?;
+    let canonical = resolve_existing(Path::new("/"), &path).ok_or(REASON_GIT_HOOKSPATH)?;
     let inside = canonical.starts_with(scope.root)
-        || scope.git_dir.canonicalize().is_ok_and(|g| canonical.starts_with(g))
-        || scope.common.canonicalize().is_ok_and(|c| canonical.starts_with(c));
+        || canonical.starts_with(scope.git_dir)
+        || canonical.starts_with(scope.common);
     if !inside {
         return Err(REASON_GIT_HOOKSPATH);
     }
@@ -1702,14 +2067,8 @@ fn worktree_stays_inside(value: Option<&[u8]>, scope: &ConfigScope) -> Result<()
     if value.is_empty() {
         return Err(REASON_GIT_CONFIG_RUNS_A_PROGRAM);
     }
-    let p = Path::new(std::ffi::OsStr::from_bytes(value));
-    let path = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        scope.git_dir.join(p)
-    };
-    match path.canonicalize() {
-        Ok(resolved) if resolved.starts_with(scope.root) => Ok(()),
+    match resolve_existing(scope.git_dir, Path::new(std::ffi::OsStr::from_bytes(value))) {
+        Some(resolved) if resolved.starts_with(scope.root) => Ok(()),
         _ => Err(REASON_GIT_CONFIG_RUNS_A_PROGRAM),
     }
 }
@@ -1790,11 +2149,18 @@ fn hooks_run_nothing_under_a_read(hooks: &Path) -> Result<(), &'static str> {
     };
     for entry in entries {
         let entry = entry.map_err(|_| REASON_GIT_HOOK)?;
+        if !spend(WORK_PER_ENTRY) {
+            return Err(REASON_TOO_MUCH_WORK);
+        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             return Err(REASON_GIT_HOOK);
         };
-        if name.contains('.') || HOOKS_NO_READ_ONLY_SUBCOMMAND_RUNS.contains(&name) || entry.path().is_dir() {
+        // Inspect the entry's own type without following links, since project-controlled link
+        // chains can make listing expensive. Git never runs a directory. A directory symlink
+        // with a name outside the hook allowlist still requires a card.
+        let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if name.contains('.') || HOOKS_NO_READ_ONLY_SUBCOMMAND_RUNS.contains(&name) || is_dir {
             continue;
         }
         return Err(REASON_GIT_HOOK);
@@ -1805,17 +2171,31 @@ fn hooks_run_nothing_under_a_read(hooks: &Path) -> Result<(), &'static str> {
 /// How many directories under `modules/` are walked before the answer is a card.
 const MAX_SUBMODULE_GIT_DIRECTORIES: usize = 1024;
 
+/// What the walk of submodule git directories carries along: the project root, home, the top
+/// repository's common directory as [`git_directory_reads_stay_inside`] walked it (a submodule's
+/// own common directory under it has been walked already), and the two budgets.
+struct SubmoduleScan<'a> {
+    root: &'a Path,
+    home: Option<&'a Path>,
+    walked: &'a Path,
+    budget: &'a mut usize,
+    entries: &'a mut usize,
+}
+
 /// Checks every submodule git directory under `dir`, including names containing `/` and nested
 /// `modules/`, against the repository's config, hook and object-store rules. Resolve each
 /// `commondir` and check the common directory git actually reads: its `core.fsmonitor` can run
-/// under the superproject's `git status`. Unresolvable paths require cards. `root` bounds each
-/// submodule's `core.worktree`, which normally points back inside the superproject.
-fn submodule_git_directories_run_nothing(
-    dir: &Path,
-    root: &Path,
-    home: Option<&Path>,
-    budget: &mut usize,
-) -> Result<(), &'static str> {
+/// under the superproject's `git status`. Unresolvable paths require cards. `scan.root` bounds
+/// each submodule's `core.worktree`, which normally points back inside the superproject.
+fn submodule_git_directories_run_nothing(dir: &Path, scan: &mut SubmoduleScan) -> Result<(), &'static str> {
+    // `dir` resolved first: `<common>/modules` may itself be a link, and an entry's `..` must be
+    // taken physically, as git takes it.
+    let dir = match resolve(Path::new("/"), dir) {
+        Resolution::At(dir) => dir,
+        Resolution::Missing => return Ok(()),
+        Resolution::Refused => return Err(REASON_GIT_CONFIG_UNREADABLE),
+    };
+    let dir = dir.as_path();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e)
@@ -1829,22 +2209,37 @@ fn submodule_git_directories_run_nothing(
         Err(_) => return Err(REASON_GIT_CONFIG_UNREADABLE),
     };
     for entry in entries {
-        let path = entry.map_err(|_| REASON_GIT_CONFIG_UNREADABLE)?.path();
-        if !path.is_dir() {
-            continue;
+        let entry = entry.map_err(|_| REASON_GIT_CONFIG_UNREADABLE)?;
+        if !spend(WORK_PER_ENTRY) {
+            return Err(REASON_TOO_MUCH_WORK);
         }
-        *budget = budget.checked_sub(1).ok_or(REASON_GIT_TOO_MUCH_TO_CHECK)?;
+        // Follow links as git does, using bounded resolution. The containing directory's walk
+        // has already checked where they may lead. `dir` and every directory entered from it
+        // are canonical.
+        let path = match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => entry.path(),
+            Ok(file_type) if file_type.is_symlink() => match resolve_existing(dir, Path::new(&entry.file_name())) {
+                Some(resolved) if resolved.is_dir() => resolved,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        *scan.budget = scan.budget.checked_sub(1).ok_or(REASON_GIT_TOO_MUCH_TO_CHECK)?;
         let is_a_git_dir =
             path.join("HEAD").symlink_metadata().is_ok() || path.join("config").symlink_metadata().is_ok();
         if is_a_git_dir {
             // git reads a submodule's config and hooks from its COMMON directory, which its own
             // `commondir` may relocate. Resolve it and check there; an unresolvable one cards.
             let common = commondir_of(&path)?;
+            // Contained first, as for the top repository, when the walk above did not cover it.
+            if !common.starts_with(scan.walked) {
+                git_directory_reads_stay_inside(&common, scan.root, scan.entries)?;
+            }
             let scope = ConfigScope {
-                root,
+                root: scan.root,
                 git_dir: &path,
                 common: &common,
-                home,
+                home: scan.home,
                 is_top_level: false,
             };
             for file in ["config", "config.worktree"] {
@@ -1856,20 +2251,21 @@ fn submodule_git_directories_run_nothing(
             if common.join("objects/info/alternates").symlink_metadata().is_ok() {
                 return Err(REASON_GIT_ALTERNATES);
             }
-            git_directory_reads_stay_inside(&common)?;
             hooks_run_nothing_under_a_read(&common.join("hooks"))?;
-            submodule_git_directories_run_nothing(&common.join("modules"), root, home, budget)?;
+            submodule_git_directories_run_nothing(&common.join("modules"), scan)?;
         } else {
-            submodule_git_directories_run_nothing(&path, root, home, budget)?;
+            submodule_git_directories_run_nothing(&path, scan)?;
         }
     }
     Ok(())
 }
 
-/// One variable a git config file sets, named as git compares names: section and key lowercased.
-/// The subsection is not kept -- no rule here depends on it.
+/// A git config variable with section and key lowercased for comparison. Keep whether a
+/// subsection exists, but not its name: the submodule back-link must be plain `core.worktree`,
+/// which git does not read from `[core "x"]`.
 struct GitConfigVariable {
     section: String,
+    has_subsection: bool,
     key: String,
     /// `None` for a bare key, which git reads as boolean true.
     value: Option<Vec<u8>>,
@@ -1893,22 +2289,40 @@ impl GitConfigVariable {
     /// `extensions.objectformat`, `extensions.refstorage`, `extensions.worktreeconfig` and
     /// `extensions.preciousobjects` select repository formats without running programs.
     /// `extensions.partialclone` is excluded because it names a remote used for lazy fetch.
+    /// `pull.rebase`, `pull.ff`, `rerere.enabled`, `rerere.autoupdate`, branch descriptions
+    /// and rebase settings, and `submodule.<n>.branch` do not affect the permitted reads.
+    /// `submodule.<n>.update` is allowed only for `checkout`, `rebase`, `merge` or `none`;
+    /// `!command` and unknown strategies card. `extensions.relativeworktrees` describes
+    /// worktree link storage and runs nothing.
+    /// `filter.lfs.*` and partial-clone keys remain excluded.
     fn is_inert_for_reads(&self) -> bool {
-        matches!(
-            (self.section.as_str(), self.key.as_str()),
+        match (self.section.as_str(), self.key.as_str()) {
+            ("submodule", "update") => matches!(
+                self.value.as_deref(),
+                Some(b"checkout" | b"rebase" | b"merge" | b"none")
+            ),
             (
                 "core",
-                "repositoryformatversion" | "filemode" | "bare" | "logallrefupdates"
-            ) | ("core", "ignorecase" | "precomposeunicode" | "symlinks")
-                | ("remote", "fetch" | "glab-resolved")
-                | ("branch", "remote" | "merge" | "vscode-merge-base")
-                | ("submodule", "active")
-                | ("user", "name" | "email")
-                | (
-                    "extensions",
-                    "objectformat" | "refstorage" | "worktreeconfig" | "preciousobjects"
-                )
-        )
+                "repositoryformatversion"
+                | "filemode"
+                | "bare"
+                | "logallrefupdates"
+                | "ignorecase"
+                | "precomposeunicode"
+                | "symlinks",
+            )
+            | ("remote", "fetch" | "glab-resolved")
+            | ("branch", "remote" | "merge" | "vscode-merge-base" | "description" | "rebase")
+            | ("submodule", "active" | "branch")
+            | ("user", "name" | "email")
+            | ("pull", "rebase" | "ff")
+            | ("rerere", "enabled" | "autoupdate")
+            | (
+                "extensions",
+                "objectformat" | "refstorage" | "worktreeconfig" | "preciousobjects" | "relativeworktrees",
+            ) => true,
+            _ => false,
+        }
     }
 
     /// `remote.<n>.url` and `submodule.<n>.url`, whose value the caller checks for a program transport.
@@ -1947,7 +2361,7 @@ impl GitConfigVariable {
 fn parse_git_config(bytes: &[u8]) -> Option<Vec<GitConfigVariable>> {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let mut cursor = ConfigCursor { bytes, at: 0 };
-    let mut section: Option<String> = None;
+    let mut section: Option<(String, bool)> = None;
     let mut variables = Vec::new();
     let mut comment = false;
     loop {
@@ -1974,9 +2388,14 @@ fn parse_git_config(bytes: &[u8]) -> Option<Vec<GitConfigVariable>> {
             return None;
         }
         // A variable before any section header is not one git can name.
-        let section = section.clone()?;
+        let (section, has_subsection) = section.clone()?;
         let (key, value) = cursor.variable(c)?;
-        variables.push(GitConfigVariable { section, key, value });
+        variables.push(GitConfigVariable {
+            section,
+            has_subsection,
+            key,
+            value,
+        });
     }
 }
 
@@ -2008,9 +2427,10 @@ impl ConfigCursor<'_> {
     }
 
     /// `[section]`, `[section.subsection]` or `[section "subsection"]`, after its `[`; the section's
-    /// name, lowercased.
-    fn section_header(&mut self) -> Option<String> {
+    /// name, lowercased, and whether a subsection followed it.
+    fn section_header(&mut self) -> Option<(String, bool)> {
         let mut name = String::new();
+        let mut quoted = false;
         loop {
             let (c, end) = self.next();
             if end {
@@ -2021,6 +2441,7 @@ impl ConfigCursor<'_> {
             }
             if is_config_space(c) {
                 self.quoted_subsection(c)?;
+                quoted = true;
                 break;
             }
             if !(c.is_ascii_alphanumeric() || c == b'-' || c == b'.') {
@@ -2029,7 +2450,7 @@ impl ConfigCursor<'_> {
             name.push(c.to_ascii_lowercase() as char);
         }
         let section = name.split('.').next().unwrap_or_default();
-        (!section.is_empty()).then(|| section.to_string())
+        (!section.is_empty()).then(|| (section.to_string(), quoted || name.contains('.')))
     }
 
     /// The ` "subsection"]` of a header, from the blank that ended the section's name. Only its shape
@@ -2794,6 +3215,7 @@ mod tests {
             let surroundings = Surroundings {
                 home,
                 git_location_from_environment: false,
+                work_budget: MAX_WORK_PER_CLASSIFICATION,
             };
             classify_in(tool, input, root, &surroundings)
         };
@@ -3362,9 +3784,14 @@ mod tests {
         );
     }
 
-    /// A linked worktree (`.git` a file naming a git directory elsewhere, which names its common
+    /// A linked worktree (a `.git` file naming a git directory elsewhere, which names its common
     /// directory) is the project's own repository: its toplevel is the root. What its config says is
     /// read from the common directory, where git reads it.
+    ///
+    /// The git directory also holds the `gitdir` back-link naming this worktree's `.git`, as every
+    /// `git worktree add` writes it. Without one, a repository outside the root is not the
+    /// project's, and it cards (see
+    /// `a_dot_git_naming_a_repository_outside_the_root_cards_unless_that_repository_names_the_root`).
     #[test]
     fn a_linked_worktree_is_judged_by_its_common_directory() {
         let main = Workspace::new();
@@ -3374,6 +3801,11 @@ mod tests {
         std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
         let wt = Workspace::without_git();
         std::fs::write(wt.path().join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+        std::fs::write(
+            git_dir.join("gitdir"),
+            format!("{}\n", wt.path().join(".git").display()),
+        )
+        .unwrap();
         assert_eq!(
             bash("git log --oneline", wt.path()),
             PermissionVerdict::AllowWithoutAsking
@@ -3449,6 +3881,7 @@ mod tests {
         let with = |git_location_from_environment| Surroundings {
             home: None,
             git_location_from_environment,
+            work_budget: MAX_WORK_PER_CLASSIFICATION,
         };
         assert!(classify_in("Bash", &input, ws.path(), &with(true)).needs_a_human());
         assert!(!classify_in("Bash", &input, ws.path(), &with(false)).needs_a_human());
@@ -3467,6 +3900,7 @@ mod tests {
         let surroundings = Surroundings {
             home: Some(home.path()),
             git_location_from_environment: false,
+            work_budget: MAX_WORK_PER_CLASSIFICATION,
         };
         let status = json!({ "command": "git status" });
         ws.write(".git/config", "[include]\n\tpath = ~/hazard.inc\n");
@@ -3748,5 +4182,839 @@ mod tests {
         std::fs::create_dir_all(rel.path().join(".git/hooks")).unwrap();
         rel.write(".git/config", "[core]\n\thooksPath = .git/hooks\n");
         assert_eq!(bash("git status", rel.path()), PermissionVerdict::AllowWithoutAsking);
+    }
+
+
+    /// A linked worktree's git directory as `git worktree add` lays it out (git 2.55.0, measured):
+    /// `<common>/worktrees/<name>` holding `HEAD`, `commondir` = `../..` and, when given, the
+    /// `gitdir` back-link naming the worktree's own `.git` file.
+    fn fabricate_linked_worktree_git_dir(common: &Path, name: &str, back_link: Option<&str>) -> PathBuf {
+        let git_dir = common.join("worktrees").join(name);
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        if let Some(back_link) = back_link {
+            std::fs::write(git_dir.join("gitdir"), format!("{back_link}\n")).unwrap();
+        }
+        git_dir
+    }
+
+    /// A submodule's git directory as `git submodule add` lays it out (git 2.55.0, measured):
+    /// `<super git dir>/modules/<path>`, a repository of its own whose config sets `core.worktree`
+    /// back to the submodule's work tree -- here `worktree`, when given.
+    fn fabricate_submodule_git_dir(super_git_dir: &Path, path: &str, worktree: Option<&str>) -> PathBuf {
+        let git_dir = super_git_dir.join("modules").join(path);
+        fabricate_git_dir(&git_dir);
+        if let Some(worktree) = worktree {
+            std::fs::write(git_dir.join("config"), format!("[core]\n\tworktree = {worktree}\n")).unwrap();
+        }
+        git_dir
+    }
+
+    /// A `.git` gitfile or symlink can select any repository on disk and expose its committed
+    /// files. An outside repository belongs to this root only when it contains a back-link
+    /// naming the root: a linked worktree's `gitdir` file or a submodule's `core.worktree`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dot_git_naming_a_repository_outside_the_root_cards_unless_that_repository_names_the_root() {
+        let reads = ["git show HEAD:secret", "git log -p", "git status", "git diff"];
+        let expect_card = |label: &str, project: &Workspace| {
+            let leaks = mismatches(&reads, project.path(), PermissionVerdict::AskTheUser);
+            assert!(leaks.is_empty(), "{label}: allowed without a card: {leaks:#?}");
+        };
+        let victim = Workspace::new();
+        victim.write("secret", "private text\n");
+        let victim_git = victim.path().join(".git");
+        let gitfile = |dir: &Path| format!("gitdir: {}\n", dir.display());
+
+        // 1. A plain gitfile naming the other repository.
+        let project = Workspace::without_git();
+        project.write(".git", gitfile(&victim_git));
+        expect_card("a plain gitfile", &project);
+
+        // 2. `.git` a symlink to it.
+        let project = Workspace::without_git();
+        project.link(".git", &victim_git);
+        expect_card("a symlinked .git", &project);
+
+        // 3. A gitfile borrowing a real linked worktree of it, whose back-link names that worktree.
+        let real_wt = Workspace::without_git();
+        let real_wt_dot_git = real_wt.path().join(".git");
+        let borrowed =
+            fabricate_linked_worktree_git_dir(&victim_git, "real", Some(&real_wt_dot_git.display().to_string()));
+        real_wt.write(".git", gitfile(&borrowed));
+        let project = Workspace::without_git();
+        project.write(".git", gitfile(&borrowed));
+        expect_card("a borrowed worktree git directory", &project);
+
+        // 4. `.git` a symlink to that worktree's own gitfile: canonically it IS the file the back-link
+        //    names, so only refusing a symlinked `.git` cards it.
+        let project = Workspace::without_git();
+        project.link(".git", &real_wt_dot_git);
+        expect_card("a symlink to another worktree's gitfile", &project);
+
+        // 5. A worktree git directory with no back-link at all.
+        let unlinked = fabricate_linked_worktree_git_dir(&victim_git, "unlinked", None);
+        let project = Workspace::without_git();
+        project.write(".git", gitfile(&unlinked));
+        expect_card("no gitdir back-link", &project);
+
+        // 6. A back-link naming this root, in a directory that is not `<common>/worktrees/<name>`.
+        let project = Workspace::without_git();
+        let not_a_worktree = victim_git.join("elsewhere/wt");
+        std::fs::create_dir_all(&not_a_worktree).unwrap();
+        std::fs::write(not_a_worktree.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+        std::fs::write(not_a_worktree.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            not_a_worktree.join("gitdir"),
+            format!("{}\n", project.path().join(".git").display()),
+        )
+        .unwrap();
+        project.write(".git", gitfile(&not_a_worktree));
+        expect_card("a back-link outside worktrees/", &project);
+
+        // 7. A git directory inside the root whose `commondir` names the other repository.
+        let project = Workspace::new();
+        project.write(".git/commondir", format!("{}\n", victim_git.display()));
+        expect_card("a commondir outside the root", &project);
+
+        // 8. Another project's submodule: its `core.worktree` names that project's work tree.
+        std::fs::create_dir_all(victim.path().join("libs/sub")).unwrap();
+        let theirs = fabricate_submodule_git_dir(&victim_git, "libs/sub", Some("../../../../libs/sub"));
+        let project = Workspace::without_git();
+        project.write(".git", gitfile(&theirs));
+        expect_card("another project's submodule", &project);
+
+        // 9. A submodule git directory with no `core.worktree`.
+        let no_worktree = fabricate_submodule_git_dir(&victim_git, "no-worktree", None);
+        let project = Workspace::without_git();
+        project.write(".git", gitfile(&no_worktree));
+        expect_card("a submodule git directory with no core.worktree", &project);
+
+        // 10. `core.worktree` naming this root, in a directory that is not under a `modules/`.
+        let project = Workspace::without_git();
+        let loose = victim_git.join("loose/sub");
+        fabricate_git_dir(&loose);
+        std::fs::write(
+            loose.join("config"),
+            format!(
+                "[core]\n\tworktree = {}\n",
+                project.path().canonicalize().unwrap().display()
+            ),
+        )
+        .unwrap();
+        project.write(".git", gitfile(&loose));
+        expect_card("core.worktree outside modules/", &project);
+
+        // 11. `core.worktree` in a subsection is not `core.worktree` to git.
+        let project = Workspace::without_git();
+        let subsectioned = fabricate_submodule_git_dir(&victim_git, "subsectioned", None);
+        std::fs::write(
+            subsectioned.join("config"),
+            format!(
+                "[core \"x\"]\n\tworktree = {}\n",
+                project.path().canonicalize().unwrap().display()
+            ),
+        )
+        .unwrap();
+        project.write(".git", gitfile(&subsectioned));
+        expect_card("core.worktree in a subsection", &project);
+
+        // 12. A symlinked `.git` cards even where the back-link would hold: `.git` a link to a
+        //     gitfile elsewhere, naming a submodule git directory whose `core.worktree` IS this root.
+        //     (A worktree's back-link is compared with the literal `<root>/.git`, which a symlink
+        //     never canonicalizes to, so case 4 cards without this check; this one does not.)
+        let project = Workspace::without_git();
+        let root = project.path().canonicalize().unwrap().display().to_string();
+        let named_back = fabricate_submodule_git_dir(&victim_git, "named-back", Some(&root));
+        let elsewhere = Workspace::without_git();
+        elsewhere.write("gitfile", gitfile(&named_back));
+        project.link(".git", elsewhere.path().join("gitfile"));
+        expect_card("a symlinked .git whose target's back-link holds", &project);
+        // The positive control: the same repository through a plain gitfile.
+        let _ = std::fs::remove_file(project.path().join(".git"));
+        project.write(".git", gitfile(&named_back));
+        assert_eq!(
+            bash("git log -p", project.path()),
+            PermissionVerdict::AllowWithoutAsking,
+            "the same back-link through a plain gitfile"
+        );
+    }
+
+    /// A linked worktree reads without a card when its `gitdir` back-link names this root's
+    /// `.git`, absolutely or relative to its git directory. A submodule reads without a card
+    /// when its `core.worktree` resolves to this root.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_worktree_or_submodule_that_names_the_root_back_reads_without_a_card() {
+        let reads = ["git show HEAD:src/main.rs", "git log -p", "git status", "git diff"];
+        let expect_allowed = |label: &str, root: &Path| {
+            let cards = mismatches(&reads, root, PermissionVerdict::AllowWithoutAsking);
+            assert!(cards.is_empty(), "{label}: carded: {cards:#?}");
+        };
+        // A worktree at `<repo>/.worktrees/<lane>` uses the git directory
+        // `<repo>/.git/worktrees/<lane>`.
+        let repo = Workspace::new();
+        let lane = repo.path().join(".worktrees/lane");
+        std::fs::create_dir_all(lane.join("src")).unwrap();
+        std::fs::write(lane.join("src/main.rs"), "fn main() {}").unwrap();
+        let back_link = lane.join(".git").display().to_string();
+        let git_dir = fabricate_linked_worktree_git_dir(&repo.path().join(".git"), "lane", Some(&back_link));
+        std::fs::write(lane.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+        expect_allowed("a worktree inside its repository", &lane);
+
+        // A relative back-link, from the worktree's git directory (`<repo>/.git/worktrees/sibling`,
+        // four levels below the directory holding both workspaces) to its `.git`.
+        let sibling = Workspace::without_git();
+        let relative = format!(
+            "../../../../{}/.git",
+            sibling.path().file_name().unwrap().to_str().unwrap()
+        );
+        let git_dir = fabricate_linked_worktree_git_dir(&repo.path().join(".git"), "sibling", Some(&relative));
+        sibling.write(".git", format!("gitdir: {}\n", git_dir.display()));
+        assert_eq!(
+            git_dir.join(&relative).canonicalize().unwrap(),
+            sibling.path().join(".git").canonicalize().unwrap(),
+            "the premise: the relative back-link names the sibling's .git"
+        );
+        expect_allowed("a relative back-link", sibling.path());
+
+        // The project root as a submodule's work tree: `<super>/libs/sub`, the git directory at
+        // `<super>/.git/modules/libs/sub` with `core.worktree = ../../../../libs/sub`, and the
+        // relative gitfile git writes.
+        let superproject = Workspace::new();
+        let sub = superproject.path().join("libs/sub");
+        std::fs::create_dir_all(sub.join("src")).unwrap();
+        std::fs::write(sub.join("src/main.rs"), "fn main() {}").unwrap();
+        fabricate_submodule_git_dir(
+            &superproject.path().join(".git"),
+            "libs/sub",
+            Some("../../../../libs/sub"),
+        );
+        std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/libs/sub\n").unwrap();
+        expect_allowed("a submodule's work tree", &sub);
+    }
+
+    /// What git itself writes, run for real on this host's git: `git worktree add` (a
+    /// `.worktrees/<lane>` inside the repository, a sibling, and `--relative-paths`) and `git
+    /// submodule add` (the project root being the submodule's work tree, and a nested one) read
+    /// without a card. `git init --separate-git-dir` writes no back-link at all (measured: no
+    /// `core.worktree`, nothing naming the work tree), so it cards; a worktree moved by hand keeps a
+    /// stale back-link and cards until `git worktree repair`. Skipped where git is not installed.
+    #[test]
+    fn the_worktree_and_submodule_layouts_git_writes_are_judged_as_git_leaves_them() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git is not installed; skipped");
+            return;
+        }
+        let scratch = Workspace::without_git();
+        let top = scratch.path().canonicalize().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_TEMPLATE_DIR")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} in {}", dir.display());
+        };
+        let reads = ["git log --oneline", "git status --short", "git show HEAD"];
+        let judged = |root: &Path, expected: PermissionVerdict| mismatches(&reads, root, expected);
+
+        git(&top, &["init", "-q", "main"]);
+        let main = top.join("main");
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&main, &["worktree", "add", "-q", ".worktrees/lane", "-b", "lane"]);
+        git(&main, &["worktree", "add", "-q", "../sibling", "-b", "sibling"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--relative-paths",
+                "../relative",
+                "-b",
+                "relative",
+            ],
+        );
+        for root in [
+            main.join(".worktrees/lane"),
+            top.join("sibling"),
+            top.join("relative"),
+            main.clone(),
+        ] {
+            let cards = judged(&root, PermissionVerdict::AllowWithoutAsking);
+            assert!(cards.is_empty(), "{}: {cards:#?}", root.display());
+        }
+
+        // Moved by hand: the back-link still names the old place, so it cards -- until repaired.
+        std::fs::rename(top.join("sibling"), top.join("moved")).unwrap();
+        let leaks = judged(&top.join("moved"), PermissionVerdict::AskTheUser);
+        assert!(leaks.is_empty(), "a moved worktree: {leaks:#?}");
+        git(&top.join("moved"), &["worktree", "repair"]);
+        let cards = judged(&top.join("moved"), PermissionVerdict::AllowWithoutAsking);
+        assert!(cards.is_empty(), "a repaired worktree: {cards:#?}");
+
+        // Submodules: `libs/sub` of `super`, which itself holds `deep/nest`.
+        for name in ["subsrc", "nested", "super"] {
+            git(&top, &["init", "-q", name]);
+            git(&top.join(name), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        }
+        git(
+            &top.join("subsrc"),
+            &["submodule", "add", "-q", "../nested", "deep/nest"],
+        );
+        git(&top.join("subsrc"), &["commit", "-q", "-m", "nest"]);
+        let superproject = top.join("super");
+        git(&superproject, &["submodule", "add", "-q", "../subsrc", "libs/sub"]);
+        git(&superproject, &["submodule", "update", "-q", "--init", "--recursive"]);
+        for root in [
+            superproject.clone(),
+            superproject.join("libs/sub"),
+            superproject.join("libs/sub/deep/nest"),
+        ] {
+            let cards = judged(&root, PermissionVerdict::AllowWithoutAsking);
+            assert!(cards.is_empty(), "{}: {cards:#?}", root.display());
+        }
+
+        // `--separate-git-dir`: a gitfile naming a repository that names nothing back.
+        let separate = top.join("separate.git");
+        git(
+            &top,
+            &[
+                "init",
+                "-q",
+                &format!("--separate-git-dir={}", separate.display()),
+                "sepwt",
+            ],
+        );
+        let leaks = judged(&top.join("sepwt"), PermissionVerdict::AskTheUser);
+        assert!(leaks.is_empty(), "a separate git dir: {leaks:#?}");
+    }
+
+    /// Nested symlinks can expose another repository's objects even when top-level git entries
+    /// stay inside. Links at `.git/objects/pack/pack-*.{idx,pack}` or `.git/objects/<xx>` can
+    /// redirect `git show HEAD:<file>` to those objects. Every symlink in the git directory
+    /// must resolve inside it or inside the project.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_anywhere_in_the_git_directory_that_leaves_it_and_the_project_cards() {
+        for entry in [
+            "objects/pack/pack-1.pack",
+            "objects/ab",
+            "index",
+            "shallow",
+            "refs/heads/main",
+            "logs/HEAD",
+            "worktrees/wt/index",
+            "modules/sub/objects/pack/pack-1.pack",
+        ] {
+            let ws = Workspace::new();
+            let outside = Outside::new();
+            if entry.starts_with("modules/sub/") {
+                fabricate_git_dir(&ws.path().join(".git/modules/sub"));
+            }
+            ws.link(&format!(".git/{entry}"), outside.secret());
+            let leaks = mismatches(
+                &["git show HEAD:secret", "git status", "git log"],
+                ws.path(),
+                PermissionVerdict::AskTheUser,
+            );
+            assert!(leaks.is_empty(), "`.git/{entry}` linked out: {leaks:#?}");
+        }
+
+        // A link to a DIRECTORY inside the project is not enough: nobody walked what is in it, and
+        // here that holds a link out.
+        let ws = Workspace::new();
+        let outside = Outside::new();
+        ws.link("vendor/ab/cdef", outside.secret());
+        ws.link(".git/objects/ab", ws.path().join("vendor/ab"));
+        assert_eq!(
+            bash("git show HEAD", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "a link to a project directory"
+        );
+
+        // A link that stays inside the git directory, or to a file inside the project, reads as before.
+        let ws = Workspace::new();
+        ws.write(".git/refs/heads/main", "1111111111111111111111111111111111111111\n");
+        ws.link(".git/refs/heads/alias", ws.path().join(".git/refs/heads/main"));
+        ws.write("scripts/pre-commit", "#!/bin/sh\n");
+        ws.link(".git/hooks/pre-commit", ws.path().join("scripts/pre-commit"));
+        assert_eq!(bash("git status", ws.path()), PermissionVerdict::AllowWithoutAsking);
+    }
+
+    /// Ordinary pull, rerere, branch and submodule settings are inert for the permitted
+    /// read-only subcommands and should not require cards. Submodule update accepts only git's
+    /// four named strategies; `!command` and other values still require cards.
+    #[test]
+    fn benign_keys_pull_rerere_branch_and_submodule_use_leave_stay_card_free() {
+        let reads = ["git status", "git log", "git diff", "git show HEAD"];
+        for config in [
+            "[pull]\n\trebase = true\n",
+            "[pull]\n\tff = only\n",
+            "[rerere]\n\tenabled = true\n\tautoupdate = true\n",
+            "[branch \"main\"]\n\tdescription = what this branch is for\n\trebase = interactive\n",
+            "[submodule \"libs/sub\"]\n\tupdate = checkout\n\tbranch = main\n",
+            "[submodule \"libs/sub\"]\n\tupdate = rebase\n",
+            "[submodule \"libs/sub\"]\n\tupdate = merge\n",
+            "[submodule \"libs/sub\"]\n\tupdate = none\n\tbranch = .\n",
+            // `git worktree add --relative-paths` writes this (git 2.55.0, measured).
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trelativeWorktrees = true\n",
+        ] {
+            let ws = Workspace::new();
+            ws.write(".git/config", config);
+            let cards = mismatches(&reads, ws.path(), PermissionVerdict::AllowWithoutAsking);
+            assert!(cards.is_empty(), "config {config:?} carded: {cards:#?}");
+        }
+        for config in [
+            "[submodule \"libs/sub\"]\n\tupdate = !sh x\n",
+            "[submodule \"libs/sub\"]\n\tupdate = \"!sh x\"\n",
+            "[submodule \"libs/sub\"]\n\tupdate\n",
+            "[submodule \"libs/sub\"]\n\tupdate = Checkout\n",
+            // git-lfs is not installed on this host, so the values `git lfs install --local` writes
+            // could not be read off it: `filter.lfs.*` keeps carding, whatever its values.
+            "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\
+             \tprocess = git-lfs filter-process\n\trequired = true\n",
+            // Partial-clone config requires a card.
+            "[remote \"origin\"]\n\tpromisor = true\n\tpartialclonefilter = blob:none\n",
+            "[extensions]\n\tpartialClone = origin\n",
+        ] {
+            let ws = Workspace::new();
+            ws.write(".git/config", config);
+            let leaks = mismatches(&reads, ws.path(), PermissionVerdict::AskTheUser);
+            assert!(leaks.is_empty(), "config {config:?} allowed: {leaks:#?}");
+        }
+    }
+
+    /// Exact `--no-pager` and `-P` global options only disable the pager, so read-only
+    /// subcommands following them need no card. Abbreviations, combined forms and other global
+    /// options still require cards.
+    #[test]
+    fn git_no_pager_before_a_read_only_subcommand_needs_no_card_and_other_global_options_still_card() {
+        let ws = Workspace::new();
+        for command in [
+            "git --no-pager log --oneline",
+            "git --no-pager status --short",
+            "git -P diff",
+            "git -P --no-pager show HEAD:src/main.rs",
+        ] {
+            assert_eq!(
+                bash(command, ws.path()),
+                PermissionVerdict::AllowWithoutAsking,
+                "`{command}`"
+            );
+        }
+        for command in [
+            "git --no-pager",
+            "git --no-pager commit -m x",
+            "git -P push",
+            "git -p log",
+            "git --paginate log",
+            "git -C src log",
+            "git --no-pager -C src log",
+            "git -c color.ui log",
+            "git --git-dir .git log",
+            "git --work-tree src log",
+            "git --exec-path log",
+            "git --namespace x log",
+            "git --bare log",
+            "git --no-replace-objects log",
+            "git --literal-pathspecs log",
+            "git --no-pag log",
+            "git -Pp log",
+            "git -PC src log",
+        ] {
+            assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
+        }
+    }
+
+    /// Creates `n` symlinks named `<prefix><i>` in `dir`. Each target is padded with `d/../` up
+    /// to about `pad` bytes, and the last names `last`. The padding preserves the destination
+    /// while increasing resolution work.
+    #[cfg(unix)]
+    fn padded_chain(dir: &Path, prefix: &str, n: usize, pad: usize, last: &str) {
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        let padding = "d/../".repeat(pad / 5);
+        for i in 0..n {
+            let next = if i + 1 == n {
+                last.to_string()
+            } else {
+                format!("{prefix}{}", i + 1)
+            };
+            std::os::unix::fs::symlink(format!("{padding}{next}"), dir.join(format!("{prefix}{i}"))).unwrap();
+        }
+    }
+
+    /// Project-controlled paths and `.git` links must have bounded resolution costs because
+    /// classification runs on the GTK thread. Padded link chains can resolve inside the project
+    /// yet make repeated `canonicalize` calls block the UI.
+    ///
+    /// The resolver reads each link before following it and requires a card for excessive
+    /// target length, components, `..`, hops or steps. A git directory with more links than the
+    /// policy checks also requires a card.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_whose_links_would_take_long_to_resolve_cards_instead() {
+        // The review's shape, scaled down: links in `.git` whose every hop resolves inside it.
+        let ws = Workspace::new();
+        padded_chain(&ws.path().join(".git/links"), "h", 39, 4000, "../HEAD");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "padded links in .git"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // A short link in `.git` whose chain continues in the project, where the walk never goes.
+        let ws = Workspace::new();
+        padded_chain(&ws.path().join("chain"), "h", 39, 4000, "../src/main.rs");
+        ws.link(".git/hooks/pre-commit", "../../chain/h0");
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "a chain in the project"
+        );
+
+        // A config value through such a chain, many times over.
+        let ws = Workspace::new();
+        padded_chain(&ws.path().join("chain"), "w", 39, 4000, "..");
+        ws.write(".git/config", "[core]\n\tworktree = ../chain/w0\n".repeat(20));
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "core.worktree chains"
+        );
+
+        // An argument through one; repeating it costs nothing more.
+        let ws = Workspace::new();
+        padded_chain(&ws.path().join("chain"), "c", 39, 4000, "../src/main.rs");
+        let command = format!("cat {}", "chain/c0 ".repeat(500));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bash(&command, ws.path()),
+            PermissionVerdict::AskTheUser,
+            "argument chains"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // And a Read of one.
+        assert_eq!(
+            verdict("Read", json!({ "file_path": ws.path().join("chain/c0") }), ws.path()),
+            PermissionVerdict::AskTheUser,
+            "Read through a chain"
+        );
+    }
+
+    /// The bounds themselves, each at its limit and one past it. Ordinary layouts sit far inside
+    /// them: a hook symlinked into the project is one hop of a short target with two `..`.
+    #[cfg(unix)]
+    #[test]
+    fn each_bound_on_resolving_a_link_holds_at_its_limit_and_cards_past_it() {
+        let allowed = |ws: &Workspace, label: &str| {
+            assert_eq!(
+                bash("git status", ws.path()),
+                PermissionVerdict::AllowWithoutAsking,
+                "{label}"
+            );
+        };
+        let carded = |ws: &Workspace, label: &str| {
+            assert_eq!(bash("git status", ws.path()), PermissionVerdict::AskTheUser, "{label}");
+        };
+        // The number of links in a git directory.
+        for (n, ok) in [
+            (MAX_GIT_DIRECTORY_SYMLINKS, true),
+            (MAX_GIT_DIRECTORY_SYMLINKS + 1, false),
+        ] {
+            let ws = Workspace::new();
+            ws.write(".git/description", "x\n");
+            for i in 0..n {
+                ws.link(&format!(".git/l/{i}"), "../description");
+            }
+            if ok {
+                allowed(&ws, "links at the limit")
+            } else {
+                carded(&ws, "one link too many")
+            }
+        }
+        // A target's `..`: `d/../` repeated, each `..` a component too.
+        for (parents, ok) in [(MAX_LINK_TARGET_PARENTS, true), (MAX_LINK_TARGET_PARENTS + 1, false)] {
+            let ws = Workspace::new();
+            ws.write(".git/l/f", "x\n");
+            std::fs::create_dir_all(ws.path().join(".git/l/d")).unwrap();
+            ws.link(".git/l/x", format!("{}f", "d/../".repeat(parents)));
+            if ok {
+                allowed(&ws, "`..` at the limit")
+            } else {
+                carded(&ws, "one `..` too many")
+            }
+        }
+        // A target's components, as `./` (no `..` at all).
+        let limit = MAX_LINK_TARGET_COMPONENTS;
+        for (components, ok) in [(limit, true), (limit + 1, false)] {
+            let ws = Workspace::new();
+            ws.write(".git/l/f", "x\n");
+            ws.link(".git/l/x", format!("{}f", "./".repeat(components - 1)));
+            if ok {
+                allowed(&ws, "components at the limit")
+            } else {
+                carded(&ws, "one component too many")
+            }
+        }
+        // A target's bytes: one component, a long name.
+        for (bytes, ok) in [(MAX_LINK_TARGET_BYTES, true), (MAX_LINK_TARGET_BYTES + 1, false)] {
+            let ws = Workspace::new();
+            let name = "n".repeat(200);
+            let dirs = bytes / 201;
+            let rest = bytes - dirs * 201;
+            let mut target = format!("{name}/").repeat(dirs);
+            target.push_str(&"f".repeat(rest));
+            let file = ws.path().join(".git/l").join(&target);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x\n").unwrap();
+            assert_eq!(target.len(), bytes);
+            ws.link(".git/l/x", &target);
+            if ok {
+                allowed(&ws, "bytes at the limit")
+            } else {
+                carded(&ws, "one byte too many")
+            }
+        }
+        // Hops, one link naming the next.
+        for (hops, ok) in [(MAX_LINK_HOPS, true), (MAX_LINK_HOPS + 1, false)] {
+            let ws = Workspace::new();
+            ws.write(".git/l/f", "x\n");
+            for i in 0..hops {
+                let next = if i + 1 == hops {
+                    "f".to_string()
+                } else {
+                    format!("h{}", i + 1)
+                };
+                ws.link(&format!(".git/l/h{i}"), next);
+            }
+            // The walk starts every link of the chain; only `h0` is the one that takes every hop.
+            if ok {
+                allowed(&ws, "hops at the limit")
+            } else {
+                carded(&ws, "one hop too many")
+            }
+        }
+        // Steps: eight hops of `d/..` pairs, 1 + 8 x (2p + 1) lookups -- 249 with 15 pairs, 265
+        // with 16, every target inside its own limits.
+        for (pairs, ok) in [(15, true), (16, false)] {
+            let ws = Workspace::new();
+            ws.write(".git/l/f", "x\n");
+            std::fs::create_dir_all(ws.path().join(".git/l/d")).unwrap();
+            for i in 0..MAX_LINK_HOPS {
+                let next = if i + 1 == MAX_LINK_HOPS {
+                    "f".to_string()
+                } else {
+                    format!("h{}", i + 1)
+                };
+                ws.link(&format!(".git/l/h{i}"), format!("{}{next}", "d/../".repeat(pairs)));
+            }
+            if ok {
+                allowed(&ws, "steps under the limit")
+            } else {
+                carded(&ws, "steps past the limit")
+            }
+        }
+        // The depth a lookup is made at: a file whose path has MAX_RESOLVED_DEPTH components (the
+        // root directory counted), and one deeper.
+        for (extra, ok) in [(0, true), (1, false)] {
+            let ws = Workspace::new();
+            let root_depth = ws.path().canonicalize().unwrap().components().count();
+            let dirs = MAX_RESOLVED_DEPTH - root_depth - 1 + extra;
+            let relative = format!("{}f", "a/".repeat(dirs));
+            ws.write(&relative, "x\n");
+            let expected = if ok {
+                PermissionVerdict::AllowWithoutAsking
+            } else {
+                PermissionVerdict::AskTheUser
+            };
+            assert_eq!(
+                bash(&format!("cat {relative}"), ws.path()),
+                expected,
+                "depth, {extra} past the limit"
+            );
+        }
+    }
+
+    /// Two places a lexical reading of a path would differ from the kernel's. A gitfile may name
+    /// its git directory through a padded chain (resolved within bounds, so it cards rather than
+    /// costing seconds); and `<common>/modules` may itself be a link, so an entry in it naming
+    /// `../evil` means the directory beside the link's TARGET, as git takes it -- a scan resolving
+    /// that against `modules` would check a directory git never uses and miss the one it does.
+    #[cfg(unix)]
+    #[test]
+    fn git_paths_are_resolved_physically_and_within_bounds() {
+        let ws = Workspace::without_git();
+        fabricate_git_dir(&ws.path().join("real.git"));
+        padded_chain(&ws.path().join("chain"), "g", 39, 4000, "../real.git");
+        ws.write(".git", "gitdir: chain/g0\n");
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "a padded gitdir"
+        );
+        ws.write(".git", "gitdir: real.git\n");
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AllowWithoutAsking,
+            "the control"
+        );
+        // Judge the git directory by its resolved location. A gitfile naming an in-project link
+        // to an outside repository still needs the outside repository's back-link check.
+        let victim = Workspace::new();
+        victim.write("secret", "private text\n");
+        ws.link("x", victim.path().join(".git"));
+        ws.write(".git", "gitdir: x\n");
+        assert_eq!(
+            bash("git show HEAD:secret", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "gitdir: x -> outside"
+        );
+
+        let ws = Workspace::new();
+        fabricate_git_dir(&ws.path().join(".git/sub/evil"));
+        ws.write(".git/sub/evil/config", "[core]\n\tfsmonitor = ./fsm.sh\n");
+        std::fs::create_dir_all(ws.path().join(".git/sub/m")).unwrap();
+        ws.link(".git/modules", "sub/m");
+        ws.link(".git/sub/m/x", "../evil");
+        assert_eq!(
+            bash("git status", ws.path()),
+            PermissionVerdict::AskTheUser,
+            "modules/x -> ../evil through a linked modules/"
+        );
+    }
+
+    /// The work one classification may do is bounded, and running out always cards -- whatever
+    /// the check that ran out would have answered. The review's other bound (entries walked) did
+    /// not bound time; nor did a config's `include.path` fan-out, followed without limit: four
+    /// levels of 30 includes each cost 810,000 file reads, 1.27 s in a release build before it
+    /// ALLOWED (measured 2026-09-28), and git's depth limit of 10 lets it reach 30^10.
+    #[test]
+    fn running_out_of_work_cards_and_include_fan_out_runs_out() {
+        let ws = Workspace::new();
+        let input = json!({ "command": "git status" });
+        let with_budget = |work_budget| Surroundings {
+            home: None,
+            git_location_from_environment: false,
+            work_budget,
+        };
+        let starved = classify_in("Bash", &input, ws.path(), &with_budget(10));
+        assert_eq!(starved.verdict, PermissionVerdict::AskTheUser);
+        assert_eq!(starved.reason, REASON_TOO_MUCH_WORK);
+        let fed = classify_in("Bash", &input, ws.path(), &with_budget(MAX_WORK_PER_CLASSIFICATION));
+        assert_eq!(fed.verdict, PermissionVerdict::AllowWithoutAsking);
+        // A tool that touches no file needs no budget at all.
+        let todo = classify_in("TodoWrite", &json!({}), ws.path(), &with_budget(0));
+        assert_eq!(todo.verdict, PermissionVerdict::AllowWithoutAsking);
+
+        // include.path fan-out: 4 levels of 30 (810,000 reads) runs out and cards.
+        let ws = Workspace::new();
+        let fan = "\tpath = next.inc\n".repeat(30);
+        for level in (0..4).rev() {
+            let body = if level == 3 {
+                String::new()
+            } else {
+                format!("[include]\n{}", fan.replace("next", &format!("l{}", level + 1)))
+            };
+            ws.write(&format!(".git/l{level}.inc"), body);
+        }
+        ws.write(".git/config", format!("[include]\n{}", fan.replace("next", "l0")));
+        let started = std::time::Instant::now();
+        let fanned = classify_permission_request("Bash", &input, ws.path());
+        assert_eq!(fanned.verdict, PermissionVerdict::AskTheUser);
+        assert_eq!(fanned.reason, REASON_TOO_MUCH_WORK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Leading git global options such as `-C`, `--git-dir`, `--work-tree` and `--namespace`
+    /// can select a repository the root's repository check never inspected. Their
+    /// separate-argument forms carry no `=`. They require a card with a reason no saved rule
+    /// replaces, so `Bash(git -C *)` cannot authorize outside reads. A subcommand such as `git
+    /// push` keeps its replaceable reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_rule_never_answers_a_git_global_option() {
+        let ws = Workspace::new();
+        let outside = Workspace::new();
+        outside.write("secret", "private text\n");
+        ws.write(
+            "sub2/.git",
+            format!("gitdir: {}\n", outside.path().join(".git").display()),
+        );
+        for command in [
+            "git -C sub2 show HEAD:secret",
+            "git --no-pager -C sub2 log",
+            "git -P -C sub2 status",
+            "git --git-dir sub2/.git show HEAD:secret",
+            "git --work-tree sub2 status",
+            "git --namespace n log",
+            "git -c color.ui log",
+            "git --exec-path log",
+        ] {
+            let input = json!({ "command": command });
+            let plain = classify_permission_request("Bash", &input, ws.path());
+            assert_eq!(plain.reason, REASON_GIT_GLOBAL_OPTION, "`{command}`");
+            assert!(!REPLACEABLE_BY_A_RULE.contains(&plain.reason));
+            let words: Vec<&str> = command.split_whitespace().collect();
+            let rule =
+                crate::permission_rules::PrefixRule::parse(&format!("Bash({} {} *)", words[0], words[1])).unwrap();
+            let with_rule = classify_with_rules(
+                "Bash",
+                &input,
+                ws.path(),
+                &crate::permission_rules::PrefixRules::new(vec![rule]),
+            );
+            assert_eq!(
+                with_rule.verdict,
+                PermissionVerdict::AskTheUser,
+                "`{command}` with its rule saved"
+            );
+        }
+        // A genuine subcommand stays one a rule may answer, its repository checked at the root.
+        let input = json!({ "command": "git push origin main" });
+        assert_eq!(
+            classify_permission_request("Bash", &input, ws.path()).reason,
+            REASON_GIT_SUBCOMMAND_NOT_READ_ONLY
+        );
+        let rule = crate::permission_rules::PrefixRule::parse("Bash(git push *)").unwrap();
+        assert_eq!(
+            classify_with_rules(
+                "Bash",
+                &input,
+                ws.path(),
+                &crate::permission_rules::PrefixRules::new(vec![rule])
+            )
+            .verdict,
+            PermissionVerdict::AllowWithoutAsking
+        );
     }
 }

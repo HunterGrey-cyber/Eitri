@@ -223,15 +223,20 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let bash = |command: &str| offer("Bash", &json!({ "command": command }), &root).map(|r| r.display());
 
-        // The two shapes the review reproduced, each still a card the policy refused for a
+        // The shapes the review reproduced, each still a card the policy refused for a
         // replaceable reason -- so without this check they WOULD be offered.
-        for command in ["git -C sub log", "timeout 5 cargo test", "rm -rf sub"] {
+        for command in ["timeout 5 cargo test", "rm -rf sub"] {
             let c = classify_permission_request("Bash", &json!({ "command": command }), &root);
             assert!(
                 c.needs_a_human() && REPLACEABLE_BY_A_RULE.contains(&c.reason),
                 "{command}: {c:?}"
             );
         }
+        // `git -C sub log` has two independent guards: the global-option reason cannot be
+        // replaced by a saved rule, and no prefix rule is suggested. Check both.
+        let c = classify_permission_request("Bash", &json!({ "command": "git -C sub log" }), &root);
+        assert!(c.needs_a_human() && !REPLACEABLE_BY_A_RULE.contains(&c.reason), "{c:?}");
+        assert_eq!(suggest("git -C sub log"), None, "an option hides the subcommand");
         assert_eq!(bash("git -C sub log"), None, "an option hides the subcommand");
         assert_eq!(bash("timeout 5 cargo test"), None, "a wrapper runs whatever follows it");
         assert_eq!(bash("rm -rf sub"), None, "`rm *` is not what approving one rm meant");
