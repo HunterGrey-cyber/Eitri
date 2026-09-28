@@ -751,7 +751,7 @@ impl AgentBackend {
                 continue;
             };
             if tripped {
-                eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode (D12)");
+                eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode");
                 kept.push((revision, event));
                 continue;
             }
@@ -908,7 +908,7 @@ impl AgentBackend {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
         if self.projection().ungated_cli_mode.is_some() {
-            eprintln!("[permission] not answering {why}: the CLI reported an ungated mode (D12)");
+            eprintln!("[permission] not answering {why}: the CLI reported an ungated mode");
             return Approved::default();
         }
         let pending: std::collections::BTreeMap<String, String> = {

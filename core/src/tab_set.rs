@@ -364,7 +364,7 @@ pub struct Tripped {
 pub fn ungated_cli_mode_reason(reported: &str, detail: &str) -> String {
     format!(
         "the CLI reports permission mode '{reported}' ({detail}) — a project's permissions.defaultMode? \
-         neovibe runs only gated sessions (R07); the session was closed"
+         neovibe runs only sessions it gates itself; the session was closed"
     )
 }
 

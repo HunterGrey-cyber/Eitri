@@ -1,11 +1,11 @@
 //! Which local Claude account this process spends, as a configured value rather than an accident.
 //!
 //! **Why this exists, measured 2026-09-21.** A resumed session opened with an empty transcript.
-//! The record was real (`~/.local/state/neovibe/conversations/…/89e631b6-….json`, project
-//! `/home/user/rust/learning`, title "读handoff准备开始", `updated_at` > `created_at`), and so was
-//! the transcript -- but the two were in different accounts. The `shell` process had
-//! `CLAUDE_CONFIG_DIR=/home/user/.claude-personal` inherited from the terminal it was launched from,
-//! while the sidecar's `claude` had written the transcript into `/home/user/.claude-work`.
+//! The record was real (`~/.local/state/neovibe/conversations/<id>/<session>.json`, with a project,
+//! a title and `updated_at` > `created_at`), and so was the transcript -- but the two were in
+//! different accounts. The `shell` process had `CLAUDE_CONFIG_DIR=$HOME/.claude-a` inherited from
+//! the terminal it was launched from, while the sidecar's `claude` had written the transcript into
+//! `$HOME/.claude-b`.
 //! [`crate::transcript::claude_projects_dir`] read the host's own variable, so it looked in the
 //! wrong one of this machine's six config directories and found nothing. `external_writer.rs` had
 //! been reading a path that never existed for the same reason.

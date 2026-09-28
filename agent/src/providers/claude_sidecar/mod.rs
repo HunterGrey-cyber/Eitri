@@ -597,7 +597,7 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
         code: ProviderErrorCode::InvalidConfiguration,
         message: format!(
             "this provider does not offer a gated (interactive) mode, the only one neovibe runs a \
-             session in (R07); it advertises: {}",
+             session in; it advertises: {}",
             if info.advertised_permission_modes.is_empty() {
                 "none".to_string()
             } else {

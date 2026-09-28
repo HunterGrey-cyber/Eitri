@@ -372,8 +372,8 @@ fn spawn_hook_listener(
                 write_fail_closed_deny(
                     &stream,
                     &format!(
-                        "the CLI reports permission mode '{reported}' -- neovibe runs only gated sessions \
-                         (R07); this call is denied and the session is being closed"
+                        "the CLI reports permission mode '{reported}' -- neovibe runs only sessions \
+                         it gates itself; this call is denied and the session is being closed"
                     ),
                 );
                 if tx.send(AgentEvent::UngatedCliMode { reported }).is_err() {
