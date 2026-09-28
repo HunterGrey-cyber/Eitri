@@ -21,7 +21,7 @@
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
-    InterruptTurnRequest, PermissionMode, ProjectionStatus, SendTurnRequest, StreamingPreference, TurnOutcome,
+    InterruptTurnRequest, ProjectionStatus, SendTurnRequest, StreamingPreference, TurnOutcome,
 };
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,6 @@ fn open(provider: &ClaudeSidecarProvider) -> String {
     provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Bypass,
             streaming: StreamingPreference::Partial,
         })
         .expect("create_session should succeed")
@@ -82,9 +81,10 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::ResumeOutcome { .. } => "ResumeOutcome",
             AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
             AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
-            // No producer yet (this crate never issues SetPermissionMode this task): matched for
+            // Unsolicited since R07 (this crate never issues SetPermissionMode): matched for
             // exhaustiveness.
             AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
+            AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
         };
         *counts.entry(kind).or_default() += 1;
     }

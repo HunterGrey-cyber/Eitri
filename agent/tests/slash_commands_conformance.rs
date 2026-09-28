@@ -18,7 +18,8 @@
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
-    InterruptTurnRequest, PermissionMode, SendTurnRequest, StreamingPreference, UsageInfo,
+    InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, SendTurnRequest, StreamingPreference,
+    UsageInfo,
 };
 use std::time::{Duration, Instant};
 
@@ -120,6 +121,15 @@ fn run_probe_turn(provider: &ClaudeSidecarProvider, session_id: &str, text: &str
             {
                 result.assistant_text.push_str(text);
             }
+            // Gated since R07: answer what the pre-v1 BYPASS session ran unasked, so a command
+            // whose turn calls a tool is still measured rather than stalling on a card.
+            if let AgentDomainEvent::PermissionRequested { permission_id, .. } = &event {
+                let _ = provider.resolve_permission(ResolvePermissionRequest {
+                    session_id: session_id.to_string(),
+                    permission_id: permission_id.clone(),
+                    decision: PermissionDecision::Allow,
+                });
+            }
             if let AgentDomainEvent::TurnCompleted { usage, .. } = &event {
                 result.final_status = "completed";
                 result.usage = *usage;
@@ -161,7 +171,8 @@ fn probe_which_slash_commands_do_something_through_the_sidecar() {
     for command in COMMANDS {
         let session_id = match provider.create_session(CreateSessionRequest {
             cwd: cwd.clone(),
-            permission_mode: PermissionMode::Bypass,
+            // Every session is gated since v1 (R07): this probe used to ask for BYPASS so a
+            // command's tool calls ran unasked; now `run_probe_turn` answers each request `Allow`.
             streaming: StreamingPreference::Complete,
         }) {
             Ok(id) => id,

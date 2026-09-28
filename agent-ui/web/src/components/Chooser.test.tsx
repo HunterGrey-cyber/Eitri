@@ -46,7 +46,12 @@ function renderChooser(over: Record<string, unknown> = {}) {
     onCloseTab: vi.fn(),
     onRenameTab: vi.fn(),
     onCycleMode: vi.fn(),
+    onCycleTabMode: vi.fn(),
     onLeave: vi.fn(),
+    // v1 (spec §3.4): claims nothing by default, so every existing test below exercises the
+    // chooser's own keys exactly as before; the dedicated describe further down overrides this to
+    // prove the opposite -- a claiming `answerConfirm` swallows the chooser's keys whole.
+    answerConfirm: vi.fn(() => false),
     ...over,
   };
   const view = render(<Chooser {...props} />);
@@ -208,27 +213,56 @@ describe("Chooser", () => {
     expect(mark.textContent!.toLowerCase()).toBe("fix");
   });
 
-  it("the mode line reads Resume/Start on New session and a record, and a fixed pill on an open tab", () => {
+  /** v1 D6 made an open tab's mode switchable, so the line no longer says "fixed" (fix round 1): it
+   *  says what Shift+Tab does from here, and "toggle" rather than "cycle" (O2 a). */
+  it("the mode line reads Start/Resume on New session and a record, and what Shift+Tab does on an open tab", () => {
     const { root, container } = renderChooser({ defaultMode: "auto" });
+    const line = () => container.querySelector(".chooser-mode-line")!.textContent;
     // cursor starts on New session
-    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Start in ⏵⏵ auto mode on (shift+tab to cycle)");
-    fireEvent.keyDown(root, { key: "j" }); // tab 1, mode auto
-    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Tab 1 runs in ⏵⏵ auto mode on · fixed");
-    fireEvent.keyDown(root, { key: "j" }); // tab 2, mode bypass
-    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Tab 2 runs in ⏵⏵ bypass mode on · fixed");
+    expect(line()).toBe("Start in ⏵⏵ auto mode on (shift+tab to toggle)");
+    fireEvent.keyDown(root, { key: "j" }); // tab 1, auto, not the active tab (active: null)
+    expect(line()).toBe("Tab 1 runs in ⏵⏵ auto mode on · switch to it to change");
+    fireEvent.keyDown(root, { key: "j" }); // tab 2, bypass: leaving works from anywhere
+    expect(line()).toBe("Tab 2 runs in ⏵⏵ bypass mode on (shift+tab to toggle)");
     fireEvent.keyDown(root, { key: "j" });
     fireEvent.keyDown(root, { key: "j" }); // a record
-    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Resume in ⏵⏵ auto mode on (shift+tab to cycle)");
+    expect(line()).toBe("Resume in ⏵⏵ auto mode on (shift+tab to toggle)");
   });
 
-  it("Shift+Tab cycles the resume mode on New session and a record, and flashes fixed on an open tab", () => {
+  it("the active tab's own row offers the toggle", () => {
+    const { container } = renderChooser({ active: 1 }); // starts on the active tab's row
+    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("Tab 1 runs in ⏵⏵ auto mode on (shift+tab to toggle)");
+  });
+
+  it("an ended auto tab's row says it has ended, and Shift+Tab there flashes r rather than asking Rust", () => {
+    const ended: TabInfo = { ...TAB1, state: "ended" };
+    const { root, container, props } = renderChooser({ active: 1, tabs: [ended, TAB2] });
+    const line = () => container.querySelector(".chooser-mode-line")!.textContent;
+    expect(line()).toBe("Tab 1 runs in ⏵⏵ auto mode on · the session has ended");
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(props.onCycleTabMode).not.toHaveBeenCalled();
+    expect(line()).toBe("the session has ended — r to start again");
+  });
+
+  it("Shift+Tab: New session and a record cycle the resume mode; an open tab's row toggles that tab where Rust would", () => {
     const { root, container, props } = renderChooser();
     fireEvent.keyDown(root, { key: "Tab", shiftKey: true }); // on New session
     expect(props.onCycleMode).toHaveBeenCalledTimes(1);
-    fireEvent.keyDown(root, { key: "j" }); // tab 1
+    fireEvent.keyDown(root, { key: "j" }); // tab 1: auto, and not the one on screen
     fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
     expect(props.onCycleMode).toHaveBeenCalledTimes(1); // not called again
-    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("mode is fixed for this session");
+    expect(props.onCycleTabMode).not.toHaveBeenCalled();
+    expect(container.querySelector(".chooser-mode-line")!.textContent).toBe("switch to tab 1 to change its mode");
+    fireEvent.keyDown(root, { key: "j" }); // tab 2: bypass, which can always be left
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(props.onCycleTabMode).toHaveBeenCalledWith(2);
+  });
+
+  it("Shift+Tab on the active tab's own row toggles it (entering bypass: Rust asks, answered in here)", () => {
+    const { root, props } = renderChooser({ active: 1 });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(props.onCycleTabMode).toHaveBeenCalledWith(1);
+    expect(props.onCycleMode).not.toHaveBeenCalled();
   });
 
   it("Shift+Tab as WebKitGTK delivers it from a real keyboard (key Unidentified, code Tab) cycles too", () => {
@@ -337,5 +371,32 @@ describe("Chooser", () => {
     const signs = Array.from(root.querySelectorAll(".chooser-row .chooser-sign")).map((el) => el.textContent);
     expect(signs.filter((t) => t === "›").length).toBe(1);
     expect(root.querySelector(".chooser-row.current .chooser-sign")!.textContent).toBe("›");
+  });
+
+  /** v1 (spec §3.4): a bypass (or window-close) confirm owns every key ahead of everything else in
+   *  the panel, the chooser included -- `answerConfirm` is tried first in `onKeyDown`, and when it
+   *  claims the key nothing below (the row cursor, Enter's `choose`, `x`, `q`/`Esc`, this
+   *  component's own Shift+Tab) may also react to the same keydown. */
+  describe("a claiming answerConfirm owns the key first (v1, spec §3.4)", () => {
+    it.each(["j", "k", "Enter", "x", "q", "Escape"])("%s does nothing while it is claimed", (key) => {
+      const answerConfirm = vi.fn(() => true);
+      const { root, container, props } = renderChooser({ answerConfirm, active: 1 });
+      const before = container.querySelector(".chooser-row.current")!.textContent;
+      fireEvent.keyDown(root, { key });
+      expect(answerConfirm).toHaveBeenCalledTimes(1);
+      expect(container.querySelector(".chooser-row.current")!.textContent).toBe(before);
+      expect(props.onSwitch).not.toHaveBeenCalled();
+      expect(props.onResume).not.toHaveBeenCalled();
+      expect(props.onCloseTab).not.toHaveBeenCalled();
+      expect(props.onLeave).not.toHaveBeenCalled();
+    });
+
+    it("Shift+Tab does nothing while it is claimed either", () => {
+      const answerConfirm = vi.fn(() => true);
+      const { root, props } = renderChooser({ answerConfirm });
+      fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+      expect(answerConfirm).toHaveBeenCalledTimes(1);
+      expect(props.onCycleMode).not.toHaveBeenCalled();
+    });
   });
 });

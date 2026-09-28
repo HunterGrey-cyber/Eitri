@@ -41,6 +41,10 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // permission_mode_switchable added at 133dc03. `false` is what every session built
             // before this field existed sends -- this smoke test does not exercise switching.
             permission_mode_switchable: false,
+            // provider_permission_prompts added at b3aa188; stated `true` (what neovibe's own
+            // `build_create_request` sends when the handshake advertises it) so the assertion below
+            // proves the generated field carries a value, not merely that it compiles.
+            provider_permission_prompts: true,
         }),
         // model/effort/system_prompt/output_format added at 133dc03, each `optional`/absent =
         // the CLI's own default -- unexercised by this smoke test.
@@ -51,6 +55,7 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
     };
     assert_eq!(request.cwd, "/tmp/example");
     let policy = request.policy.unwrap();
+    assert!(policy.provider_permission_prompts);
     let tool_policy = policy.tool_policy.clone().expect("a stated tool policy must survive");
     assert_eq!(tool_policy.deny, vec!["Bash".to_string()]);
     assert!(

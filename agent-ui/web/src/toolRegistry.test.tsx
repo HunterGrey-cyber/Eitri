@@ -43,6 +43,18 @@ describe("renderToolCall", () => {
     expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
   });
 
+  /** O3 review item 7: a call whose CLI prompt neovibe answered without a card says so, muted, the
+   *  way a call a saved rule answered does; a call without one says nothing of the kind. */
+  it("says when the CLI's own prompt for a call was answered without a card", () => {
+    const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote: "Claude Code safety check — allowed in bypass" }))}</>);
+    const note = container.querySelector(".tool-prompt-note");
+    expect(note?.textContent).toBe("Claude Code safety check — allowed in bypass");
+    expect(note?.classList.contains("tool-rule-note")).toBe(true);
+    cleanup();
+    const plain = render(<>{renderToolCall(call({}))}</>);
+    expect(plain.container.querySelector(".tool-prompt-note")).toBeNull();
+  });
+
   /** v1 polish F21: a path under the project root is drawn relative, one outside it absolute; the
    *  click/`gf` target stays the path as sent. A folded result draws no line of its own. */
   it("draws project paths relative, keeps others absolute, and folds without a lone marker line", () => {

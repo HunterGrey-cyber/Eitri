@@ -384,6 +384,7 @@ mod tests {
                 tool_use_id: None,
                 tool_name: "Read".into(),
                 input: serde_json::json!({}),
+                provider_prompt: None,
             },
         );
         assert_eq!(derive_status(Some(&state)), AgentStatus::Blocked);

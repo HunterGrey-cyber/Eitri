@@ -88,6 +88,12 @@ pub enum AgentEvent {
         input: Value,
         source: PermissionSource,
     },
+    /// A `PreToolUse` hook call whose own payload reported a permission mode less restrictive than
+    /// `default` (`classify_cli_mode` said `Ungated`; spec §2.3, D12). The call itself was already
+    /// denied on its connection; this asks the host to close the conversation. Produced by
+    /// `process::spawn_hook_listener` INSTEAD of a `PermissionRequest`, so no card can be drawn for
+    /// a call the CLI would run if nobody answered it.
+    UngatedCliMode { reported: String },
     /// Any `control_response` line -- acknowledges `initialize`, `interrupt`, or a caller's own
     /// `can_use_tool` answer. `agent` does not correlate these internally; see `process.rs`.
     ControlResponse {

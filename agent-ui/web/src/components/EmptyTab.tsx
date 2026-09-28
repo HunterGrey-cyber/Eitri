@@ -146,7 +146,8 @@ export type EmptyTabProps = {
 };
 
 /** An empty session tab: Claude Code's fresh prompt (spec §3.6, F3). The composer is live in INPUT;
- *  the first send creates the session in Rust (ruling 4). `Shift+Tab` cycles the mode. Nothing here
+ *  the first send creates the session in Rust (ruling 4). `Shift+Tab` toggles the mode (O2 a; entering
+ *  bypass asks first). Nothing here
  *  spawns a process. */
 export function EmptyTab(props: EmptyTabProps) {
   const { hello, tab, handoff, failure } = props;
@@ -487,9 +488,10 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     if (hello === null) return;
     // The leader/which-key engine runs on a `starting` or `failed` tab too (whole-branch review):
-    // R4 names `<leader>` `mode.cycle` beside Shift+Tab as flashing `mode is fixed ...` on those
-    // tabs, and returning here first left it doing nothing at all there. Only the dashboard's own
-    // menu keys below stay a `not_started` tab's.
+    // R4 names `<leader>` `mode.cycle` beside Shift+Tab as routed through `modeKeyRoute` on those
+    // tabs (v1, D6: `starting` now always cycles, same as `live`; `failed` flashes `modeFixedMessage`
+    // unless it is already in bypass), and returning here first left it doing nothing at all there.
+    // Only the dashboard's own menu keys below stay a `not_started` tab's.
     // The leader/which-key engine (fix round 1, panel round 2 plan Task 12+13; spec §7, "Space
     // starts a leader sequence"): tried first, mirroring `App.tsx`'s own `onKeyDown` ordering, so a
     // table binding on any key not already claimed above (Space itself, or `H`/`L`/... once the

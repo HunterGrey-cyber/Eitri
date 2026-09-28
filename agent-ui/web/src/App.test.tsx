@@ -9,7 +9,7 @@ import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
 import { binding, TABLE } from "./testFixtures";
-import { MODE_STARTING_MESSAGE, modeFixedMessage } from "./modeKey";
+import { modeFixedMessage } from "./modeKey";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -554,7 +554,7 @@ describe("App handshake", () => {
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, mode: "bypass" }] });
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
-    expect(container.querySelector(".status-band .mode-pill")?.textContent).toBe("⏵⏵ bypass");
+    expect(container.querySelector(".status-band .mode-pill")?.textContent).toBe("⏵⏵ bypass permissions on");
   });
 
   it("shows why the tab failed to start, from the tabs envelope alone", () => {
@@ -1688,7 +1688,9 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
     }
   });
 
-  it("<leader>m flashes on a live session", () => {
+  /** v1 (D6): the wave-5 `SetPermissionMode` capability this used to gate on is gone -- a live
+   *  session now always cycles, so `<leader>m` posts rather than flashing. */
+  it("<leader>m cycles the mode on a live session", () => {
     const widen = stubBandWidth();
     const { container } = started();
     act(() => widen(container));
@@ -1696,12 +1698,8 @@ describe("the leader (panel round 2 plan, Task 8; spec 2026-09-26 §2)", () => {
     act(() => root(container).focus());
     press(" ");
     press("m");
-    // Wave 4 Task 1: the message now names how to get a different mode (`modeFixedMessage`);
-    // `sendTable()` dispatched `newTabChord: "Ctrl+b c"` above.
-    expect(container.querySelector(".band-message")!.textContent).toBe(
-      "mode is fixed for this session — Ctrl+b c for a new tab",
-    );
-    expect(posted.some((p) => p.type === "cycle_mode")).toBe(false);
+    expect(container.querySelector(".band-message")).toBeNull();
+    expect(posted.some((p) => p.type === "cycle_mode")).toBe(true);
     vi.unstubAllGlobals();
   });
 
@@ -3525,9 +3523,10 @@ describe("App: the ? keymap overlay (spec 2026-09-19-which-key-design.md §3)", 
     const keys = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Keys"))!;
     fireEvent.click(keys);
     expect(overlay(container)).not.toBeNull();
-    // `m` would cycle the mode on the dashboard; under the overlay it is swallowed.
-    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "m" });
-    expect(lastOfType("cycle_mode")).toBeUndefined();
+    // `w` would open the session chooser from the dashboard (v1: `m` no longer does anything at
+    // all, on the dashboard or off it); under the overlay it is swallowed.
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "w" });
+    expect(lastOfType("tab_verb")).toBeUndefined();
     fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "Escape" });
     expect(overlay(container)).toBeNull();
   });
@@ -3935,22 +3934,22 @@ describe("the session chooser", () => {
 });
 
 describe("phase 3 lines, and the band's message/prompt (panel round 2 plan, Task 10)", () => {
-  it("flashes that the mode is fixed on Shift+Tab after the start, and never offers a cycle (D6)", () => {
+  /** v1 (D6): a live tab always cycles now (see "Shift+Tab anywhere in the chat" below) -- the one
+   *  case that still flashes rather than posting is a tab that has already ENDED and is not already
+   *  in bypass, which can never be asked to ENTER bypass, only leave it. */
+  it("flashes that the mode is fixed once a session has ended, and never offers a cycle into bypass (D6)", () => {
     vi.useFakeTimers();
     const widen = stubBandWidth();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
-      dispatchLiveTab(snapshotState(), 1);
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "ended" }] });
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
       act(() => widen(container));
       expect(container.querySelector(".status-band .mode-pill")!.textContent).toBe("⏵⏵ auto");
-      enterInputMode(container);
-      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Tab", shiftKey: true });
-      // Wave 4 Task 1: the message now names how to get a different mode (`modeFixedMessage`); no
-      // `keymap` envelope was dispatched here, so `newTabChord` is still the pre-envelope default.
-      expect(container.querySelector(".band-message")!.textContent).toBe(
-        "mode is fixed for this session — open a new tab to choose",
-      );
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+      expect(container.querySelector(".band-message")!.textContent).toBe("the session has ended — r to start again");
       act(() => vi.advanceTimersByTime(2000));
       expect(container.querySelector(".band-message")).toBeNull();
       expect(lastOfType("cycle_mode")).toBeUndefined();
@@ -3974,7 +3973,7 @@ describe("phase 3 lines, and the band's message/prompt (panel round 2 plan, Task
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
     dispatch({ kind: "queue", tab: 1, items: [], error: null });
     dispatch({ kind: "draft", tab: 1, text: "" });
-    expect(container.querySelector(".status-band .mode-pill")!.textContent).toBe("⏵⏵ bypass");
+    expect(container.querySelector(".status-band .mode-pill")!.textContent).toBe("⏵⏵ bypass permissions on");
   });
 
   /** The INPUT hints (F4) are gone (ruling R4) -- nothing replaces `.footer-hint`; the queue and the
@@ -4902,7 +4901,10 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     return event;
   }
 
-  it("a. live tab, BROWSE, focus on the conversation root: no cycle_mode, the band names the way out", () => {
+  /** v1 (D6): the wave-5 `SetPermissionMode` capability this used to gate on is gone -- a `live`
+   *  tab always cycles now, on any backend (a move INTO bypass gets its own `confirm_bypass` y/n
+   *  from Rust instead, exercised in "v1 mode: entering bypass asks first" below). */
+  it("a. live tab, BROWSE, focus on the conversation root: cycle_mode posted, no flash, focus unchanged", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -4913,12 +4915,12 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     const event = shiftTab(root);
     expect(event.defaultPrevented).toBe(true);
     expect(document.activeElement).toBe(root);
-    expect(lastOfType("cycle_mode")).toBeUndefined();
-    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+    expect(container.querySelector(".band-message")).toBeNull();
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
 
-  it("b. live tab, INPUT, focus in the composer textarea: same flash, textarea keeps focus and its text", () => {
+  it("b. live tab, INPUT, focus in the composer textarea: posted, text and focus kept", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -4931,8 +4933,8 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     expect(event.defaultPrevented).toBe(true);
     expect(document.activeElement).toBe(textarea);
     expect(textarea.value).toBe("keep me");
-    expect(lastOfType("cycle_mode")).toBeUndefined();
-    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+    expect(container.querySelector(".band-message")).toBeNull();
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
 
@@ -5007,9 +5009,9 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     expect(lastOfType("cycle_default_mode")).toBeDefined();
   });
 
-  it("g. a starting tab: flash, no post", () => {
-    // Wave 5 (W5): a starting tab always says so -- the fixed-mode text would be false on a
-    // switch-capable sidecar, so `modeKeyRoute` never shows it here regardless of `canSwitch`.
+  /** v1 (D6): "a starting tab can switch" -- no separate "starting" flash any more, it simply
+   *  cycles like `not_started`/`live`. */
+  it("g. a starting tab: posts too, no flash", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -5018,8 +5020,8 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     const root = container.querySelector(".empty-tab")!;
     const event = shiftTab(root);
     expect(event.defaultPrevented).toBe(true);
-    expect(lastOfType("cycle_mode")).toBeUndefined();
-    expect(container.querySelector(".band-message")!.textContent).toBe(MODE_STARTING_MESSAGE);
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    expect(container.querySelector(".band-message")).toBeNull();
     vi.unstubAllGlobals();
   });
 
@@ -5040,7 +5042,9 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("i. <leader> mode.cycle on a live tab flashes the same modeFixedMessage text", () => {
+  /** v1 (D6): a live tab's `<leader>` `mode.cycle` always posts now too, the same as its Shift+Tab
+   *  (test a/b above) -- there is no capability left to grey the box entry out for. */
+  it("i. <leader> mode.cycle on a live tab posts, and the box does not grey it out", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -5049,17 +5053,29 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     const root = container.querySelector(".agent-ui-conversation")!;
     act(() => (root as HTMLElement).focus());
-    fireEvent.keyDown(root, { key: " " });
-    fireEvent.keyDown(root, { key: "m" });
-    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage("Ctrl+b c"));
-    expect(lastOfType("cycle_mode")).toBeUndefined();
+    vi.useFakeTimers();
+    try {
+      fireEvent.keyDown(root, { key: " " });
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      const box = container.querySelector(".which-key-box")!;
+      expect(box).not.toBeNull();
+      expect(box.textContent).toContain("mode");
+      expect(box.querySelector(".wk-disabled")).toBeNull();
+      fireEvent.keyDown(root, { key: "m" });
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(container.querySelector(".band-message")).toBeNull();
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
   /** Whole-branch review: R4 names Shift+Tab and `<leader>` `mode.cycle` as one rule, but on a
    *  `starting` or `failed` tab `EmptyTab` returned before its leader engine, so `<leader>m` did
    *  nothing at all; and `runPanelAction` gated on `live || ended`, so reaching it there would have
-   *  posted a `cycle_mode` Rust only refuses. Both now follow `modeKeyRoute`. */
-  it("j. <leader> mode.cycle on a failed tab flashes like Shift+Tab, no post", () => {
+   *  posted a `cycle_mode` Rust only refuses. Both now follow `modeKeyRoute`. v1 (D6): `failed` in
+   *  auto (not already bypass) is still the one state this flashes rather than posts -- and the text
+   *  now names `r` (the fixed reset key), not `newTabChord` (there is no rebindable "leave" chord). */
+  it("j. <leader> mode.cycle on a failed tab flashes 'the session has ended — r to start again', no post", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -5072,13 +5088,13 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     fireEvent.keyDown(target, { key: " " });
     fireEvent.keyDown(target, { key: "m" });
     expect(lastOfType("cycle_mode")).toBeUndefined();
-    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage("Ctrl+b c"));
+    expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage("r"));
     vi.unstubAllGlobals();
   });
 
-  // Wave 5 (W5): a starting tab flashes the "session is starting" text instead, both for Shift+Tab
-  // (test g) and here for `<leader> mode.cycle` -- `runPanelAction`'s own `modeKeyRoute` switch.
-  it("j2. <leader> mode.cycle on a starting tab flashes the starting text, no post", () => {
+  /** v1 (D6): "a starting tab can switch" -- `<leader>` `mode.cycle` posts on it too now, the same
+   *  as Shift+Tab (test g above), replacing wave 5's separate "session is starting" flash. */
+  it("j2. <leader> mode.cycle on a starting tab posts too, no flash", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -5090,107 +5106,649 @@ describe("Shift+Tab anywhere in the chat (wave 4, Task 1)", () => {
     expect(container.querySelector(".empty-tab")!.contains(target)).toBe(true);
     fireEvent.keyDown(target, { key: " " });
     fireEvent.keyDown(target, { key: "m" });
-    expect(lastOfType("cycle_mode")).toBeUndefined();
-    expect(container.querySelector(".band-message")!.textContent).toBe(MODE_STARTING_MESSAGE);
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    expect(container.querySelector(".band-message")).toBeNull();
     vi.unstubAllGlobals();
   });
 
-  describe("Shift+Tab switches a live tab (wave 5)", () => {
-    const switchCapable = { ...initialState().capabilities, modeSwitch: true };
+  /** v1 (D6): the one case that still refuses to enter bypass -- an already-ended tab that is not
+   *  already in bypass -- but that same tab, already in bypass, may still leave it. Both the plain
+   *  Shift+Tab route and the leader's `mode.cycle` share `modeKeyRoute`, so one check here stands in
+   *  for both call sites; the pure cases (every `tabState`/`tabMode` pair) are `modeKey.test.ts`'s. */
+  it("k. an ended tab already in bypass still cycles (to leave it) -- D6", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "ended", mode: "bypass" }] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")!;
+    const event = shiftTab(root);
+    expect(event.defaultPrevented).toBe(true);
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    expect(container.querySelector(".band-message")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+});
 
-    it("a. live tab, switch-capable sidecar, BROWSE: one cycle_mode, no flash, focus unchanged", () => {
-      const widen = stubBandWidth();
-      const { container } = render(<App />);
-      dispatch({ kind: "hello", ...HELLO });
-      dispatchLiveTab(snapshotState({ capabilities: switchCapable }), 1);
-      act(() => widen(container));
-      const root = container.querySelector(".agent-ui-conversation")!;
-      act(() => (root as HTMLElement).focus());
-      const event = shiftTab(root);
-      expect(event.defaultPrevented).toBe(true);
-      expect(document.activeElement).toBe(root);
-      expect(container.querySelector(".band-message")).toBeNull();
-      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
-      vi.unstubAllGlobals();
+/** v1 (spec `docs/superpowers/specs/2026-09-27-v1-mode-design.md`, D2/D6/D7/D11): entering bypass
+ *  asks a y/n first, and only a LONE `y`/`Y` -- not one that lands as part of typed text, or too
+ *  soon after the prompt appeared -- may answer it. `bypassYesCounts`'s own arithmetic (every
+ *  `now`/`openedAt`/`lastKeyAt` combination) is `modeKey.test.ts`'s; this file wires it through a
+ *  real `App` render, a real `confirm_bypass` envelope and real keydowns. */
+describe("v1 mode: entering bypass asks first", () => {
+  /** Fakes `performance.now()` alongside the timer functions -- plain `vi.useFakeTimers()` leaves
+   *  `performance.now()` real (confirmed empirically), and `App.tsx`'s guard reads the clock through
+   *  nothing else. */
+  function fakeClock() {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+  }
+  function dispatchBypassConfirm(
+    over: Partial<{ tab: number | null; scope: "tab" | "default"; nonce: number; lines: string[] }> = {},
+  ) {
+    dispatch({
+      kind: "confirm_bypass",
+      tab: over.tab === undefined ? 1 : over.tab,
+      scope: over.scope ?? "tab",
+      nonce: over.nonce ?? 7,
+      lines: over.lines ?? ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"],
     });
+  }
+  /** Mounts `App`, delivers `hello` and a live tab 1 (legacy backend, auto mode -- ordinary
+   *  defaults), and returns the conversation root every test answers keys on. */
+  function liveConversation() {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    return { container, root: container.querySelector(".agent-ui-conversation")! };
+  }
 
-    it("b. same in INPUT, text in the composer: posted, text and focus kept", () => {
-      const widen = stubBandWidth();
-      const { container } = render(<App />);
-      dispatch({ kind: "hello", ...HELLO });
-      dispatchLiveTab(snapshotState({ capabilities: switchCapable }), 1);
-      act(() => widen(container));
-      enterInputMode(container);
-      const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
-      fireEvent.change(textarea, { target: { value: "keep me" } });
-      const event = shiftTab(textarea);
-      expect(event.defaultPrevented).toBe(true);
-      expect(document.activeElement).toBe(textarea);
-      expect(textarea.value).toBe("keep me");
-      expect(container.querySelector(".band-message")).toBeNull();
-      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+  it("a. live tab Shift+Tab posts cycle_mode whatever capabilities says (legacy included)", () => {
+    const { root } = liveConversation();
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    vi.unstubAllGlobals();
+  });
+
+  it("b. draws lines[0] in the band; a lone y after the guard posts confirm_bypass with the envelope's own values and closes", () => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm({ tab: 1, scope: "tab", nonce: 7, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] });
+      expect(container.querySelector(".band-prompt")!.textContent).toBe("切到 bypass 并批准 2 张等待中的卡片？(y/n)");
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("confirm_bypass")).toMatchObject({ tab: 1, scope: "tab", nonce: 7 });
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
       vi.unstubAllGlobals();
-    });
+    }
+  });
 
-    it("c. without the capability: wave 4's fixed flash, nothing posted", () => {
-      const widen = stubBandWidth();
-      const { container } = render(<App />);
-      dispatch({ kind: "hello", ...HELLO });
-      dispatchLiveTab(snapshotState({ capabilities: { ...initialState().capabilities, modeSwitch: false } }), 1);
-      act(() => widen(container));
-      const root = container.querySelector(".agent-ui-conversation")!;
-      act(() => (root as HTMLElement).focus());
-      const event = shiftTab(root);
-      expect(event.defaultPrevented).toBe(true);
-      expect(lastOfType("cycle_mode")).toBeUndefined();
-      expect(container.querySelector(".band-message")!.textContent).toBe(modeFixedMessage(""));
+  it("b2. Y (capital) does the same as y (P7)", () => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm({ nonce: 9 });
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "Y" });
+      expect(lastOfType("confirm_bypass")).toMatchObject({ nonce: 9 });
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
       vi.unstubAllGlobals();
-    });
+    }
+  });
 
-    it("d. a starting tab: MODE_STARTING_MESSAGE, nothing posted -- never the fixed-mode text", () => {
-      // `modeKeyRoute`'s order puts `starting` ahead of `fixed` unconditionally (W5): a starting
-      // tab has no session yet, so `state.capabilities` (reset on every tab switch, along with the
-      // rest of the per-session projection) cannot yet say whether this one will switch -- but
-      // showing the fixed-mode text here would still be a lie on a switch-capable sidecar, so
-      // `modeKeyRoute` never shows it regardless.
-      const widen = stubBandWidth();
-      const { container } = render(<App />);
-      dispatch({ kind: "hello", ...HELLO });
-      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
-      act(() => widen(container));
-      const root = container.querySelector(".empty-tab")!;
-      const event = shiftTab(root);
-      expect(event.defaultPrevented).toBe(true);
-      expect(lastOfType("cycle_mode")).toBeUndefined();
-      expect(container.querySelector(".band-message")!.textContent).toBe(MODE_STARTING_MESSAGE);
+  it.each(["n", "Escape", "q"])("b3. %s closes and posts nothing", (key) => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key });
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
       vi.unstubAllGlobals();
-    });
+    }
+  });
 
-    it("e. <leader> mode.cycle on a live switch-capable tab: posted, box does not grey it out", () => {
-      const widen = stubBandWidth();
-      const { container } = render(<App />);
-      dispatch({ kind: "hello", ...HELLO });
-      dispatchLiveTab(snapshotState({ capabilities: switchCapable }), 1);
-      act(() => widen(container));
+  it("b4. a bare Shift does nothing -- the prompt stays open", () => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "Shift" });
+      expect(container.querySelector(".band-prompt")).not.toBeNull();
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('c. a scope:"default" envelope posts tab: null', () => {
+    fakeClock();
+    try {
+      const { root } = liveConversation();
+      dispatchBypassConfirm({ tab: null, scope: "default", nonce: 11, lines: ["新会话默认用 bypass？(y/n)"] });
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("confirm_bypass")).toMatchObject({ tab: null, scope: "default", nonce: 11 });
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("d. a second envelope while one is open replaces it (Reprompt): the newest nonce is what gets posted", () => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm({ nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+      dispatchBypassConfirm({ nonce: 2, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] });
+      expect(container.querySelector(".band-prompt")!.textContent).toBe("切到 bypass 并批准 2 张等待中的卡片？(y/n)");
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("confirm_bypass")).toMatchObject({ nonce: 2 });
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("d2. a Reprompt restarts the prompt's own 250ms on-screen wait, rather than inheriting the first envelope's elapsed time", () => {
+    fakeClock();
+    try {
+      const { root } = liveConversation();
+      dispatchBypassConfirm({ nonce: 1 });
+      act(() => vi.advanceTimersByTime(240));
+      dispatchBypassConfirm({ nonce: 2 }); // Reprompt: openedAt resets to now
+      // 240ms since the REPROMPT (480ms since the very first envelope, which would clear a
+      // guard measured from there) -- still under the guard measured from the reprompt itself.
+      act(() => vi.advanceTimersByTime(240));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("e. while the prompt is open, Shift+Tab does not post a second cycle_mode (modeKeyRoute -> overlay)", () => {
+    const { root } = liveConversation();
+    dispatchBypassConfirm();
+    posted.length = 0; // only what happens AFTER the prompt opens counts here
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(0);
+    vi.unstubAllGlobals();
+  });
+
+  it("f. <leader> mode.cycle on a live tab posts cycle_mode, and the which-key box does not grey it out", () => {
+    const { container, root } = liveConversation();
+    dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
+    act(() => (root as HTMLElement).focus());
+    vi.useFakeTimers();
+    try {
+      fireEvent.keyDown(root, { key: " " });
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      const box = container.querySelector(".which-key-box")!;
+      expect(box.querySelector(".wk-disabled")).toBeNull();
+      fireEvent.keyDown(root, { key: "m" });
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    vi.unstubAllGlobals();
+  });
+
+  /** D11: typed text can never answer the prompt, even when the very keys that triggered it (here,
+   *  the leader's own `Space m`) are what land right before the `y`. A live tab in BROWSE with a
+   *  card already waiting -- the realistic case R06's own wording describes. */
+  it("g. Space, m, y at 100ms with the envelope arriving between m and y: no confirm_bypass, no permission_response, the band names why", () => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
       dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
-      const root = container.querySelector(".agent-ui-conversation")!;
+      dispatch({
+        kind: "events",
+        tab: 1,
+        fromRevision: 0,
+        throughRevision: 2,
+        events: [
+          { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: {} },
+          { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: {} },
+        ],
+      });
       act(() => (root as HTMLElement).focus());
-      vi.useFakeTimers();
+      fireEvent.keyDown(root, { key: " " });
+      act(() => vi.advanceTimersByTime(100));
+      fireEvent.keyDown(root, { key: "m" });
+      dispatchBypassConfirm({ lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+      act(() => vi.advanceTimersByTime(100));
+      fireEvent.keyDown(root, { key: "y" });
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+      expect(lastOfType("permission_response")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+      expect(container.querySelector(".band-message")!.textContent).toBe(
+        "y must be pressed on its own to enter bypass — Shift+Tab to ask again",
+      );
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** D11's two named halves of `bypassYesCounts`, exercised end to end (every raw `now`/`openedAt`/
+   *  `lastKeyAt` combination, including the boundary, is `modeKey.test.ts`'s own `bypassYesCounts`
+   *  describe block -- these two just prove `App.tsx` actually wires the guard through). A key that
+   *  lands WHILE the prompt is already open cancels it outright via D1's own "any key but a counted
+   *  y/Y" rule (test b3) before the guard's stand-alone half would even matter -- and a key close
+   *  enough before the ANSWER to trip the stand-alone half is necessarily close enough to when the
+   *  prompt opened to also trip the on-screen half (the prompt cannot have been open for the guard's
+   *  own duration AND have a non-cancelling key land within the guard's duration of it, at once).
+   *  So test h2 below reproduces both halves failing together, the same shape as test g. */
+  it.each(["y", "Y"])("h. %s cancelled: too soon after the prompt opened, no other key at all (on-screen rule)", (key) => {
+    fakeClock();
+    try {
+      const { root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(100));
+      fireEvent.keyDown(root, { key });
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["y", "Y"])("h2. %s cancelled: another key landed shortly before it, before the prompt even opened", (key) => {
+    fakeClock();
+    try {
+      const { root } = liveConversation();
+      act(() => (root as HTMLElement).focus());
+      fireEvent.keyDown(root, { key: "x" });
+      act(() => vi.advanceTimersByTime(100));
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(100)); // 200ms since "x", 100ms since the prompt opened
+      fireEvent.keyDown(root, { key });
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  describe("i. every route away cancels the prompt (spec §3.4)", () => {
+    it.each([
+      ["pane_focus losing focus", () => dispatch({ kind: "pane_focus", focused: false })],
+      ["a tabs envelope naming a DIFFERENT active tab", () => dispatch({ kind: "tabs", active: 2, tabs: [{ ...LIVE_TAB, id: 2 }] })],
+      ["arrive", () => dispatch({ kind: "arrive" })],
+      ["focus_permission", () => dispatch({ kind: "focus_permission", tab: 1 })],
+      ["enter_input", () => dispatch({ kind: "enter_input" })],
+      ["chooser", () => dispatch({ kind: "chooser", open: [], records: [] })],
+      // Fix round 1 (whole-branch review, blocking): GTK claims these keys before the WebView sees
+      // a keydown, so none of them passes through `answerConfirm` -- and "HINT then y" (copy a code
+      // block) or a rename starting with y answered the prompt.
+      ["hint_collect (prefix f)", () => dispatch({ kind: "hint_collect", sessionId: 1 })],
+      ["begin_rename (prefix ,)", () => dispatch({ kind: "begin_rename", tab: 1, current: null })],
+      ["tab_detail (prefix i), whose own y copies a row", () => dispatch({ kind: "tab_detail", tab: 1, rows: [{ label: "cwd", value: "/p" }] })],
+      ["open_keymap (prefix ?)", () => dispatch({ kind: "open_keymap" })],
+      ["nav_key (Ctrl+j)", () => dispatch({ kind: "nav_key", direction: "down" })],
+      ["literal_key (prefix C-b)", () => dispatch({ kind: "literal_key", key: "C-a" })],
+    ] as const)("%s cancels it, and a y 300ms later posts nothing", (_name, cancel) => {
+      fakeClock();
       try {
-        fireEvent.keyDown(root, { key: " " });
-        act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
-        const box = container.querySelector(".which-key-box")!;
-        expect(box).not.toBeNull();
-        expect(box.textContent).toContain("mode");
-        expect(box.querySelector(".wk-disabled")).toBeNull();
-        fireEvent.keyDown(root, { key: "m" });
+        const { container } = liveConversation();
+        dispatchBypassConfirm();
+        expect(container.querySelector(".band-prompt")).not.toBeNull();
+        cancel();
+        expect(container.querySelector(".band-prompt")).toBeNull();
+        act(() => vi.advanceTimersByTime(300));
+        const root = container.querySelector(".agent-ui-conversation") ?? container.querySelector(".empty-tab")!;
+        fireEvent.keyDown(root, { key: "y" });
+        expect(lastOfType("confirm_bypass")).toBeUndefined();
       } finally {
         vi.useRealTimers();
+        vi.unstubAllGlobals();
       }
-      expect(container.querySelector(".band-message")).toBeNull();
-      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
-      vi.unstubAllGlobals();
     });
+
+    it("a tabs envelope naming the SAME active tab does not cancel it", () => {
+      fakeClock();
+      try {
+        const { container } = liveConversation();
+        dispatchBypassConfirm();
+        dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+        expect(container.querySelector(".band-prompt")).not.toBeNull();
+        act(() => vi.advanceTimersByTime(300));
+        fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "y" });
+        expect(lastOfType("confirm_bypass")).toBeDefined();
+      } finally {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    });
+  });
+
+  describe("j. the chooser (spec §3.4)", () => {
+    it("over an empty tab: Shift+Tab posts cycle_mode; the envelope shows over the chooser without closing it; y after the guard posts", () => {
+      fakeClock();
+      try {
+        const widen = stubBandWidth();
+        const { container } = render(<App />);
+        dispatch({ kind: "hello", ...HELLO });
+        dispatchEmptyTab();
+        act(() => widen(container));
+        dispatch({ kind: "chooser", open: [], records: [] });
+        const chooser = container.querySelector(".chooser")!;
+        fireEvent.keyDown(chooser, { key: "Tab", shiftKey: true }); // cursor starts on "New session"
+        expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+        dispatchBypassConfirm({ nonce: 4 });
+        expect(container.querySelector(".chooser")).not.toBeNull();
+        expect(container.querySelector(".band-prompt")).not.toBeNull();
+        act(() => vi.advanceTimersByTime(300));
+        fireEvent.keyDown(chooser, { key: "y" });
+        expect(lastOfType("confirm_bypass")).toMatchObject({ nonce: 4 });
+      } finally {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("over a live tab: Shift+Tab posts cycle_default_mode instead", () => {
+      fakeClock();
+      try {
+        const { container } = liveConversation();
+        dispatch({
+          kind: "chooser",
+          open: [],
+          records: [{ providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
+        });
+        const chooser = container.querySelector(".chooser")!;
+        fireEvent.keyDown(chooser, { key: "Tab", shiftKey: true }); // cursor on "New session" (no "open" row for tab 1)
+        expect(lastOfType("cycle_mode")).toBeUndefined();
+        expect(lastOfType("cycle_default_mode")).toBeDefined();
+        dispatchBypassConfirm({ tab: null, scope: "default", nonce: 5 });
+        act(() => vi.advanceTimersByTime(300));
+        fireEvent.keyDown(chooser, { key: "y" });
+        expect(lastOfType("confirm_bypass")).toMatchObject({ tab: null, scope: "default", nonce: 5 });
+      } finally {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("with the prompt open, Enter cancels it and picks no row; j/k do not move the chooser's selection", () => {
+      fakeClock();
+      try {
+        const widen = stubBandWidth();
+        const { container } = render(<App />);
+        dispatch({ kind: "hello", ...HELLO });
+        dispatchEmptyTab();
+        act(() => widen(container));
+        // Two records, so from the first record both `j` and `k` WOULD move the cursor if they reached
+        // the chooser -- a row where one of them is a no-op anyway proves nothing about that key.
+        dispatch({
+          kind: "chooser",
+          open: [],
+          records: [
+            { providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false },
+            { providerSessionId: "free-1111", name: null, title: "free two", createdAt: "1", updatedAt: "2", heldElsewhere: false },
+          ],
+        });
+        const chooser = container.querySelector(".chooser")!;
+        const current = () => container.querySelector(".chooser-row.current")!.textContent;
+        fireEvent.keyDown(chooser, { key: "j" }); // no prompt yet: onto "free one", the middle row
+        const before = current();
+        expect(before).toContain("free one");
+        dispatchBypassConfirm();
+        expect(container.querySelector(".band-prompt")).not.toBeNull();
+        fireEvent.keyDown(chooser, { key: "j" });
+        expect(container.querySelector(".band-prompt")).toBeNull(); // j answered the prompt (cancel)...
+        expect(current()).toBe(before); // ...and did nothing else
+        // `k` needs a prompt of its own: the `j` above already closed the first one, so a `k` sent now
+        // would reach the chooser with no prompt open and prove nothing (fix round 1, item B).
+        dispatchBypassConfirm({ nonce: 8 });
+        act(() => vi.advanceTimersByTime(300));
+        expect(container.querySelector(".band-prompt")).not.toBeNull();
+        fireEvent.keyDown(chooser, { key: "k" });
+        expect(container.querySelector(".band-prompt")).toBeNull();
+        expect(current()).toBe(before);
+        // A fresh prompt, then Enter: cancels, picks nothing, closes -- "nothing but the cancel happens".
+        dispatchBypassConfirm({ nonce: 20 });
+        fireEvent.keyDown(chooser, { key: "Enter" });
+        expect(container.querySelector(".band-prompt")).toBeNull();
+        expect(current()).toBe(before);
+        expect(lastOfType("resume")).toBeUndefined();
+        expect(lastOfType("confirm_bypass")).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    });
+  });
+});
+
+/** v1-mode fix round 1: Codex finding 5 (the chooser let a key it does not handle reach the card
+ *  under it) and the whole-branch review's panel findings -- the typing guard never saw the key that
+ *  answered a prompt, a held `y` counted, the chooser's `y` was handled twice, and the chooser's own
+ *  inputs kept Enter/Escape from the prompt. */
+describe("v1 mode fix round 1: the prompt and the chooser take the keys whole", () => {
+  function fakeClock() {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+  }
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+  const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  const answered = () => posted.filter((m) => m.type === "permission_response");
+  const confirms = () => posted.filter((m) => m.type === "confirm_bypass");
+
+  /** One Write card on a live tab, the keys arrived on it (`arrive` lands on the oldest card). */
+  function arrivedOnACard() {
+    const widen = stubBandWidth();
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Write", input: { file_path: "a.txt", content: "x" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Write", input: { file_path: "a.txt", content: "x" } },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    expect(rendered.container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    return rendered;
+  }
+
+  it.each(["a", "d"])("Codex 5: the chooser open over a card -- a lone %s answers nothing and the chooser stays", (key) => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "chooser", open: [], records: [] });
+    const chooser = container.querySelector(".chooser")!;
+    expect(document.activeElement).toBe(chooser);
+    wait(300);
+    press(key);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(container.querySelector(".chooser")).not.toBeNull();
+  });
+
+  it("the key that cancels the prompt still counts for the typing guard: x then a 100 ms later answers nothing", () => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 3, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    wait(1000);
+    press("x");
+    expect(container.querySelector(".band-prompt")).toBeNull();
+    wait(100);
+    press("a");
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(confirms()).toEqual([]);
+  });
+
+  it("a held y's autorepeat never answers the reprompt that followed its first press", () => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    wait(300);
+    press("y");
+    expect(confirms().map((m) => m.nonce)).toEqual([1]);
+    wait(20);
+    // D7: a card arrived while the prompt was up, so Rust answers with a fresh prompt.
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] });
+    wait(280);
+    press("y", { repeat: true });
+    expect(confirms().map((m) => m.nonce)).toEqual([1]);
+    expect(container.querySelector(".band-prompt")).toBeNull();
+  });
+
+  /** Defect 2 (2026-09-27 sandbox GUI pass): distinct from the test just above, which holds `y`
+   *  across a D7 REPROMPT. Here nothing reprompts -- the FIRST `y` (too soon after the prompt
+   *  opened, so it fails the guard's on-screen half) just cancels, leaving `confirm` null, and the
+   *  physical key is still held. Before the fix, each auto-repeat after that fell through to
+   *  BROWSE's own `y` (copy the row under the cursor), which calls `copied()` and overwrites the
+   *  D11 flash with "copied N chars" within about one repeat interval. */
+  it("defect 2: after a held y cancels the prompt, its autorepeats do not fall through as BROWSE's copy", () => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    // Too soon after the prompt opened (needs >= 250ms): this first, non-repeat "y" cancels rather
+    // than answers -- the physical first keydown of a held press is never itself a repeat.
+    wait(100);
+    press("y");
+    expect(confirms()).toEqual([]);
+    expect(container.querySelector(".band-message")!.textContent).toBe(
+      "y must be pressed on its own to enter bypass — Shift+Tab to ask again",
+    );
+    // The OS keeps sending the held key's auto-repeat. None of these may answer (kept, per the test
+    // above) NOR fall through as an ordinary BROWSE key that stomps the explanation just shown.
+    press("y", { repeat: true });
+    press("y", { repeat: true });
+    expect(confirms()).toEqual([]);
+    expect(container.querySelector(".band-message")!.textContent).toBe(
+      "y must be pressed on its own to enter bypass — Shift+Tab to ask again",
+    );
+  });
+
+  it("defect 2: once the held key is released, a fresh y answers the next prompt normally", () => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    wait(100);
+    press("y"); // cancels
+    press("y", { repeat: true }); // swallowed
+    fireEvent.keyUp(document.activeElement ?? document.body, { key: "y" });
+    wait(500);
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["切到 bypass 并批准 1 张等待中的卡片？(y/n)"] });
+    wait(300);
+    press("y"); // a genuinely fresh, non-repeat press
+    expect(confirms().map((m) => m.nonce)).toEqual([2]);
+    expect(container.querySelector(".band-prompt")).toBeNull();
+  });
+
+  it("the chooser's y over a live tab posts confirm_bypass exactly once", () => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({ kind: "chooser", open: [], records: [] });
+    dispatch({ kind: "confirm_bypass", tab: null, scope: "default", nonce: 5, lines: ["新会话默认用 bypass？(y/n)"] });
+    wait(300);
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "y" });
+    expect(confirms()).toEqual([expect.objectContaining({ scope: "default", nonce: 5 })]);
+  });
+
+  it("Enter in the chooser's filter with the prompt open only cancels the prompt: the filter stays and nothing is chosen", () => {
+    fakeClock();
+    const { container } = arrivedOnACard();
+    dispatch({
+      kind: "chooser",
+      open: [],
+      records: [{ providerSessionId: "free-0000", name: null, title: "free one", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
+    });
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    expect(document.activeElement).toBe(filter);
+    dispatch({ kind: "confirm_bypass", tab: null, scope: "default", nonce: 6, lines: ["新会话默认用 bypass？(y/n)"] });
+    wait(300);
+    fireEvent.keyDown(filter, { key: "Enter" });
+    expect(container.querySelector(".band-prompt")).toBeNull();
+    expect(container.querySelector(".chooser-filter")).not.toBeNull();
+    expect(lastOfType("resume")).toBeUndefined();
+    expect(lastOfType("tab_verb")).toBeUndefined();
+    expect(confirms()).toEqual([]);
+  });
+
+  it("Escape in the chooser's rename field with the prompt open only cancels the prompt: the rename stays open", () => {
+    fakeClock();
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    dispatch({ kind: "chooser", open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: false }], records: [] });
+    // The cursor starts on the active tab's row; Ctrl+r opens its rename.
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "r", ctrlKey: true });
+    const rename = container.querySelector<HTMLInputElement>(".chooser-rename")!;
+    expect(document.activeElement).toBe(rename);
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 7, lines: ["切到 bypass？(y/n)"] });
+    wait(300);
+    fireEvent.keyDown(rename, { key: "Escape" });
+    expect(container.querySelector(".band-prompt")).toBeNull();
+    expect(container.querySelector(".chooser-rename")).not.toBeNull();
+    expect(confirms()).toEqual([]);
+  });
+
+  /** Shift+Tab inside the tab bar's rename field is still the mode key (the document-capture router
+   *  has no rename overlay to defer to), so a bypass prompt can open over it. */
+  it("a bypass prompt open over the tab bar's rename takes its Enter: the prompt cancels, the rename is not committed", () => {
+    fakeClock();
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    dispatch({ kind: "begin_rename", tab: 1, current: null });
+    const rename = container.querySelector<HTMLInputElement>(".tab-rename")!;
+    expect(document.activeElement).toBe(rename);
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 9, lines: ["切到 bypass？(y/n)"] });
+    wait(300);
+    fireEvent.keyDown(rename, { key: "Enter" });
+    expect(container.querySelector(".band-prompt")).toBeNull();
+    expect(container.querySelector(".tab-rename")).not.toBeNull();
+    expect(lastOfType("rename_tab")).toBeUndefined();
+    expect(confirms()).toEqual([]);
+  });
+
+  it("Enter in the composer with the prompt open only cancels the prompt: nothing is sent", () => {
+    fakeClock();
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 1);
+    act(() => widen(container));
+    enterInputMode(container);
+    const box = container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    fireEvent.change(box, { target: { value: "hello" } });
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 10, lines: ["切到 bypass？(y/n)"] });
+    wait(300);
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(container.querySelector(".band-prompt")).toBeNull();
+    expect(lastOfType("send_message")).toBeUndefined();
+    expect(lastOfType("queue_message")).toBeUndefined();
+    expect(confirms()).toEqual([]);
   });
 });
 

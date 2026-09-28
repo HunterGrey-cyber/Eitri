@@ -4,8 +4,7 @@
 //! file's own polling style (`pump()` inside a deadline loop) deliberately, not a different idiom.
 
 use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionDecision, PermissionMode,
-    PermissionOutcome,
+    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionDecision, PermissionOutcome,
 };
 
 fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(
@@ -33,7 +32,6 @@ fn real_pretooluse_permission_allow_end_to_end() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd,
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();
@@ -132,7 +130,6 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd,
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();
@@ -202,7 +199,6 @@ fn real_close_session_fail_closes_a_pending_permission() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd,
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();
@@ -250,8 +246,9 @@ fn real_close_session_fail_closes_a_pending_permission() {
 /// The legacy twin is `backend_conformance.rs::real_edit_under_the_auto_gate_…`. This one matters
 /// separately because the two backends express the same policy through different mechanisms: legacy
 /// passes `--disallowedTools` on the command line, the sidecar sends `ClaudeHostPolicy.tool_policy`
-/// over gRPC, and since 2026-09-18 both are built from `disallowed_tools_for(mode)`. A change that
-/// kept one working and broke the other would be invisible in the other file.
+/// over gRPC, and since 2026-09-18 both are built from `disallowed_tools_for(mode)` -- one
+/// `disallowed_tools()` since R07 (2026-09-27). A change that kept one working and broke the other
+/// would be invisible in the other file.
 #[test]
 #[ignore]
 fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
@@ -264,7 +261,6 @@ fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd: dir.to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();
@@ -319,7 +315,7 @@ fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
 
     let input = edit_input.expect(
         "the model never reached for `Edit` on the sidecar path -- check that tool_policy.deny is \
-         built from disallowed_tools_for(mode) and not from the conservative list in every mode",
+         built from disallowed_tools() and not from the conservative list",
     );
     for field in ["file_path", "old_string", "new_string"] {
         assert!(

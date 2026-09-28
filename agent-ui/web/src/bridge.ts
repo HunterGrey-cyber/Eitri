@@ -68,6 +68,12 @@ export type OutboundMessage =
    *  was shown with, so this carries no tab list of its own. `InboundMessage::CloseOthers`,
    *  `core/src/agent_bridge.rs`. */
   | { type: "close_others"; request_id: string }
+  /** `y`/`Y` to a `confirm_bypass` prompt (v1 spec `2026-09-27-v1-mode-design.md`, D11), guarded by
+   *  `modeKey.ts#bypassYesCounts` before this is ever sent. `tab`/`scope`/`nonce` echo the envelope's
+   *  own values verbatim -- this side never counts cards or decides which ones a `y` approves; Rust
+   *  keeps that list and answers only the delivered cards still pending, still on `tab`, at `nonce`
+   *  (D7). `InboundMessage::ConfirmBypass`, `core/src/agent_bridge.rs`. */
+  | { type: "confirm_bypass"; request_id: string; tab: TabId | null; scope: "tab" | "default"; nonce: number }
   /** V1 §3.5's composer mirror: the effective mode this window is in, whenever it changes (and once
    *  after `ready`). Window-level, like `TabVerb` -- Rust keeps one value per window, not per tab,
    *  because the capture controller (`install_module_nav`) that reads it back is itself installed
@@ -139,6 +145,8 @@ type InboundHandler = (
         ruleNotes?: { toolUseId: string; rule: string }[];
         /** v1 polish F22: `Write` cards in this batch raised over no file; absent when none were. */
         createsFile?: { permissionId: string; toolUseId: string | null }[];
+        /** O3 review item 7: calls in this batch whose CLI prompt was answered without a card. */
+        promptNotes?: { toolUseId: string; note: string }[];
       }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
@@ -195,6 +203,15 @@ type InboundHandler = (
      *  trusted from here. `serialize_confirm_close_others_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "confirm_close_others"; tabs: TabId[]; lines: string[] }
     | { kind: "begin_rename"; tab: TabId; current: string | null }
+    /** A move into bypass needs a y/n first (v1 spec `2026-09-27-v1-mode-design.md`, D2/D11):
+     *  `scope: "tab"` names the tab switching (`tab` is that id); `scope: "default"` is the window's
+     *  own default (`cycle_default_mode` from the chooser or an empty tab), and carries `tab: null`
+     *  -- there is no single tab to name. `lines[0]` is R06's own wording, already carrying the
+     *  waiting-card count; this side never counts them itself. `nonce` is echoed back verbatim on
+     *  `y`/`Y` so Rust can tell a stale answer from the current prompt (D7). A second envelope while
+     *  one is already open REPLACES it (Reprompt) -- this is not additive.
+     *  `serialize_confirm_bypass_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "confirm_bypass"; tab: TabId | null; scope: "tab" | "default"; nonce: number; lines: string[] }
     /** This tab's queue, and its current refusal reason if the last flush was refused (phase 3
      *  ruling 3). */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
@@ -237,6 +254,14 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
+      // D11/D7: a `confirm_bypass` with no numeric `nonce` can never be answered correctly (there
+      // would be nothing real to echo back on `y`), so it is rejected the same way an unrecognized
+      // envelope is -- warned about and dropped -- rather than reaching `App.tsx` as a confirm this
+      // side would have to guess a nonce for.
+      if (obj.kind === "confirm_bypass" && typeof (obj as { nonce?: unknown }).nonce !== "number") {
+        console.warn("agent-ui: __neovibeDispatch received a malformed confirm_bypass envelope (no nonce)", parsed);
+        return;
+      }
       if (
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
@@ -262,6 +287,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "chooser" ||
         obj.kind === "confirm_close" ||
         obj.kind === "confirm_close_others" ||
+        obj.kind === "confirm_bypass" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||
         obj.kind === "draft" ||

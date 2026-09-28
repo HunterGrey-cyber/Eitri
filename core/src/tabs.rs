@@ -189,6 +189,41 @@ pub fn close_steps(facts: &CloseFacts) -> Vec<CloseStep> {
     steps
 }
 
+/// Which prompt `TabSet::cycle_mode`/`cycle_default_mode` builds for a move into bypass (R06/S2,
+/// D2): the text depends on whether the tab already has a session, or whether this is the window
+/// default rather than any one tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptScope {
+    /// A tab with a live or starting session: this entry only ever applies to that one tab.
+    LiveTab,
+    /// A `NotStarted` tab: entering bypass here also moves the window default (D13), so the text
+    /// says so.
+    EmptyTab,
+    /// The chooser's own default, not any open tab.
+    Default,
+}
+
+/// R06's exact texts (owner's Chinese, `？` full-width U+FF1F, `(y/n)` ASCII). `waiting` -- the
+/// number of delivered cards a `LiveTab` entry would approve -- is read only for `LiveTab`; the
+/// other two scopes never have cards to approve (a `NotStarted` tab has no session and the window
+/// default is not a tab at all).
+pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
+    match scope {
+        PromptScope::LiveTab if waiting == 0 => "切到 bypass？(y/n)".to_string(),
+        PromptScope::LiveTab => format!("切到 bypass 并批准 {waiting} 张等待中的卡片？(y/n)"),
+        PromptScope::EmptyTab => "切到 bypass？本窗口之后的新会话也用 bypass (y/n)".to_string(),
+        PromptScope::Default => "新会话默认用 bypass？(y/n)".to_string(),
+    }
+}
+
+/// The consequence line under a bypass prompt when cards stay waiting after `y` (O3 review #6): a
+/// CLI prompt the user's own ask rule forced, or one of a kind this build does not know, is a card
+/// in bypass too, and `y` does not approve it -- so the prompt says so rather than leaving it to be
+/// found afterwards.
+pub fn bypass_staying_line(staying: usize) -> String {
+    format!("{staying} 张须你亲自回答的卡片（ask 规则）不在其中，切换后仍保留")
+}
+
 /// tmux's `confirm-before`, plus a line for each consequence that applies (spec §3.5).
 pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
     let mut lines = vec![format!("close {} \"{}\"? (y/n)", facts.number, facts.label_name)];
@@ -441,6 +476,22 @@ mod tests {
             close_prompt(&facts(false, 1, false))[1],
             "1 queued message goes to history"
         );
+    }
+
+    /// R06/S2: the owner's exact Chinese texts, byte for byte -- the full-width `？` and the ASCII
+    /// `(y/n)`.
+    #[test]
+    fn the_four_bypass_prompts_are_the_owners_text() {
+        assert_eq!(bypass_prompt(PromptScope::LiveTab, 0), "切到 bypass？(y/n)");
+        assert_eq!(
+            bypass_prompt(PromptScope::LiveTab, 2),
+            "切到 bypass 并批准 2 张等待中的卡片？(y/n)"
+        );
+        assert_eq!(
+            bypass_prompt(PromptScope::EmptyTab, 0),
+            "切到 bypass？本窗口之后的新会话也用 bypass (y/n)"
+        );
+        assert_eq!(bypass_prompt(PromptScope::Default, 0), "新会话默认用 bypass？(y/n)");
     }
 
     #[test]

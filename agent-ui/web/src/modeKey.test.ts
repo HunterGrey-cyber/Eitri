@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isModeCycleKey, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { bypassYesCounts, isModeCycleKey, modeFixedMessage, modeKeyRoute } from "./modeKey";
 
 const key = (over: Partial<Parameters<typeof isModeCycleKey>[0]> = {}) => ({
   key: "Tab", shiftKey: true, ctrlKey: false, altKey: false, metaKey: false, isComposing: false, ...over,
@@ -25,42 +25,56 @@ describe("isModeCycleKey", () => {
   });
 });
 
-describe("modeKeyRoute", () => {
-  const base = { confirmOpen: false, chooserOpen: false, tabState: "not_started" as const, canSwitch: false };
-  it("cycles an empty tab", () => expect(modeKeyRoute(base)).toBe("cycle"));
-  it("says the mode is fixed once a session exists, without the switch capability", () => {
-    for (const tabState of ["live", "ended", "failed"] as const) {
+describe("modeKeyRoute (v1: no canSwitch, D6's ended/failed-in-bypass exception)", () => {
+  const base = { confirmOpen: false, chooserOpen: false, tabState: "not_started" as const, tabMode: "auto" as const };
+
+  it("always cycles a not_started, starting or live tab", () => {
+    for (const tabState of ["not_started", "starting", "live"] as const) {
+      expect(modeKeyRoute({ ...base, tabState })).toBe("cycle");
+    }
+  });
+
+  it("fixes an ended or failed tab in auto (entering bypass there is refused)", () => {
+    for (const tabState of ["ended", "failed"] as const) {
       expect(modeKeyRoute({ ...base, tabState })).toBe("fixed");
     }
   });
-  // Wave 5: a starting tab always says so (W5) -- the fixed-mode text would be wrong on a
-  // switch-capable sidecar, so it is never shown here regardless of `canSwitch`.
-  it("says a starting session is starting, even without the switch capability", () =>
-    expect(modeKeyRoute({ ...base, tabState: "starting" })).toBe("starting"));
+
+  it("still cycles an ended or failed tab that is already in bypass -- leaving it always works (D6)", () => {
+    for (const tabState of ["ended", "failed"] as const) {
+      expect(modeKeyRoute({ ...base, tabState, tabMode: "bypass" })).toBe("cycle");
+    }
+  });
+
   it("leaves an open prompt or chooser its own key", () => {
     expect(modeKeyRoute({ ...base, confirmOpen: true })).toBe("overlay");
     expect(modeKeyRoute({ ...base, chooserOpen: true, tabState: "live" })).toBe("overlay");
   });
+
   it("does nothing before the first tabs envelope", () => {
-    expect(modeKeyRoute({ ...base, tabState: null })).toBe("none");
+    expect(modeKeyRoute({ ...base, tabState: null, tabMode: null })).toBe("none");
   });
 });
 
-describe("modeKeyRoute with a switch-capable session (wave 5)", () => {
-  const base = { confirmOpen: false, chooserOpen: false, tabState: "live" as const, canSwitch: true };
-  it("cycles a live tab whose sidecar can switch", () => expect(modeKeyRoute(base)).toBe("cycle"));
-  it("keeps the fixed flash without the capability", () =>
-    expect(modeKeyRoute({ ...base, canSwitch: false })).toBe("fixed"));
-  it("cannot switch an ended or failed session", () => {
-    for (const tabState of ["ended", "failed"] as const) expect(modeKeyRoute({ ...base, tabState })).toBe("fixed");
-  });
-  it("says a starting session is starting", () =>
-    expect(modeKeyRoute({ ...base, tabState: "starting" })).toBe("starting"));
-  it("still leaves an overlay its own key", () =>
-    expect(modeKeyRoute({ ...base, chooserOpen: true })).toBe("overlay"));
+it("names the way back once a session has ended", () => {
+  expect(modeFixedMessage("r")).toBe("the session has ended — r to start again");
+  expect(modeFixedMessage("")).toBe("the session has ended — start a new one to change the mode");
 });
 
-it("names the way to a different mode", () => {
-  expect(modeFixedMessage("C-b c")).toBe("mode is fixed for this session — C-b c for a new tab");
-  expect(modeFixedMessage("")).toBe("mode is fixed for this session — open a new tab to choose");
+describe("bypassYesCounts (D11)", () => {
+  it("counts once the prompt has been on screen the guard, with no key at all since it opened", () => {
+    expect(bypassYesCounts({ now: 1300, openedAt: 1000, lastKeyAt: -Infinity })).toBe(true);
+  });
+  it("cancels when the prompt has not been on screen the guard yet, even with no other key", () => {
+    // 100ms after the envelope, no key before it: the on-screen rule alone fails.
+    expect(bypassYesCounts({ now: 1100, openedAt: 1000, lastKeyAt: -Infinity })).toBe(false);
+  });
+  it("cancels when a key landed less than the guard before this one, even once on-screen long enough", () => {
+    // 300ms after the envelope (on-screen rule OK), but another key 100ms before this one.
+    expect(bypassYesCounts({ now: 1300, openedAt: 1000, lastKeyAt: 1200 })).toBe(false);
+  });
+  it("counts only once BOTH rules clear, at exactly the guard", () => {
+    expect(bypassYesCounts({ now: 1250, openedAt: 1000, lastKeyAt: 1000 })).toBe(true);
+    expect(bypassYesCounts({ now: 1249, openedAt: 1000, lastKeyAt: 1000 })).toBe(false);
+  });
 });

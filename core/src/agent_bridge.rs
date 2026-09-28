@@ -12,6 +12,7 @@ use agent::AgentSessionProjection;
 use agent::{AgentDomainEvent, PermissionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,8 +46,13 @@ impl SessionModeChoice {
         }
     }
 
-    /// `Shift+Tab` on an empty tab: the next of `offered` (in order), wrapping; a mode not in
-    /// `offered` goes to the first one it can parse.
+    /// The next of `offered` (in order), wrapping; a mode not in `offered` goes to the first one it
+    /// can parse. **Not what `Shift+Tab` does since v1 (O2 a):** that key is now a fixed
+    /// auto/bypass TOGGLE, frozen as such, and goes through `TabSet::cycle_mode`/
+    /// `cycle_default_mode`, which switch on the mode explicitly rather than calling this.
+    /// `agent_prefs::startup_mode`'s own "the first offered mode" default reads
+    /// `CLIENT_IMPLEMENTED_PERMISSION_MODES.first()` directly and does not call this either -- this
+    /// function has no production caller left; it is kept for its own tests, below.
     pub fn cycled(self, offered: &[&str]) -> Self {
         let modes: Vec<Self> = offered.iter().filter_map(|m| Self::parse(m)).collect();
         match modes.iter().position(|m| *m == self) {
@@ -171,7 +177,10 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
-    /// `Shift+Tab` on an empty tab: cycles its remembered permission mode.
+    /// `Shift+Tab`/`<leader>m` on any tab (R07/S2, O2 a): TOGGLES it between `auto` and `bypass`,
+    /// frozen as a two-state toggle rather than Claude Code's own multi-mode cycling order. Entering
+    /// bypass always asks first (`ModeCycle::Confirm`, answered by `confirm_bypass`); leaving it is
+    /// immediate.
     CycleMode {
         request_id: String,
         #[serde(default)]
@@ -253,9 +262,10 @@ pub enum InboundMessage {
         request_id: String,
         verb: TabVerbWire,
     },
-    /// `Shift+Tab` on the chooser's `New session` row or a record (spec §6.3): cycles
-    /// `TabSet::default_mode` rather than any one tab's `mode` (which `cycle_mode{tab}` already
-    /// does for a `NotStarted` active tab). Window-level for the same reason `TabVerb` is.
+    /// `Shift+Tab` on the chooser's `New session` row or a record (spec §6.3): the same auto/bypass
+    /// TOGGLE as `CycleMode`, applied to `TabSet::default_mode` (the window's remembered default for
+    /// new tabs) rather than any one tab's own `mode` -- `cycle_mode{tab}` toggles any tab's mode,
+    /// live or empty, not only a `NotStarted` one. Window-level for the same reason `TabVerb` is.
     CycleDefaultMode {
         request_id: String,
     },
@@ -280,6 +290,48 @@ pub enum InboundMessage {
         request_id: String,
         direction: NavKeyDirection,
     },
+    /// `y`/`Y` to a `confirm_bypass` prompt (R06/S2, D1/D11): the panel's own answer, guarded by its
+    /// typed-input rules (Task 4), naming the tab (or `null` for the window default) and the nonce
+    /// it was shown so a stale prompt can never answer a newer one (D7). Window-level for routing
+    /// (`tab_ref` -> `WindowLevel`): it names its own tab in `tab`/`scope`, the same shape `TabVerb`
+    /// already uses, rather than being addressed to "the active tab".
+    ConfirmBypass {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        scope: BypassScopeWire,
+        // No `#[serde(default)]`: a `confirm_bypass` with no nonce is a protocol error (a client
+        // that does not know which prompt it is answering), never "the current one" -- D7's whole
+        // point is that only the exact prompt shown may be answered.
+        nonce: u64,
+    },
+}
+
+/// The wire spelling of `crate::tab_set::BypassScope`. Kept separate from that type (rather than
+/// deriving `Deserialize` on it directly) because the wire is JS's vocabulary and the core type is
+/// Rust's; see `scope` for the one place they meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BypassScopeWire {
+    Tab,
+    Default,
+}
+
+impl BypassScopeWire {
+    /// Pairs the wire scope with the `tab` field `ConfirmBypass` carries into a real
+    /// `tab_set::BypassScope`. `(Tab, Some)` and `(Default, None)` are the only combinations a
+    /// well-formed client sends; the other two are a protocol error, not a guess at which one was
+    /// meant.
+    pub fn scope(self, tab: Option<u64>) -> Result<crate::tab_set::BypassScope, String> {
+        match (self, tab) {
+            (BypassScopeWire::Tab, Some(id)) => Ok(crate::tab_set::BypassScope::Tab(crate::tabs::TabId(id))),
+            (BypassScopeWire::Default, None) => Ok(crate::tab_set::BypassScope::Default),
+            (BypassScopeWire::Tab, None) => Err("protocol: confirm_bypass scope \"tab\" with no tab".to_string()),
+            (BypassScopeWire::Default, Some(_)) => {
+                Err("protocol: confirm_bypass scope \"default\" names a tab".to_string())
+            }
+        }
+    }
 }
 
 /// A `tab_verb` message's payload (spec §10.2): the same actions the prefix's own `Action::Tab` arm
@@ -322,6 +374,9 @@ impl InboundMessage {
             | InboundMessage::TabVerb { .. }
             | InboundMessage::CycleDefaultMode { .. }
             | InboundMessage::CloseOthers { .. }
+            // `ConfirmBypass` names its own tab in `scope`/`tab` (`BypassScopeWire::scope`), the
+            // same reason `TabVerb` is window-level rather than routed by this generic mechanism.
+            | InboundMessage::ConfirmBypass { .. }
             | InboundMessage::PanelKeys { .. }
             | InboundMessage::NavFallthrough { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
@@ -404,6 +459,7 @@ impl InboundMessage {
             | InboundMessage::TabVerb { request_id, .. }
             | InboundMessage::CycleDefaultMode { request_id }
             | InboundMessage::CloseOthers { request_id }
+            | InboundMessage::ConfirmBypass { request_id, .. }
             | InboundMessage::PanelKeys { request_id, .. }
             | InboundMessage::NavFallthrough { request_id, .. } => request_id,
         }
@@ -698,11 +754,14 @@ pub struct CallNotes {
     /// was raised (v1 polish F22): the card says it creates a file rather than warning about
     /// overwriting one it cannot see.
     pub creates_file: BTreeMap<String, Option<String>>,
+    /// Tool-use id -> the note for a call whose CLI prompt neovibe answered without a card (O3 review
+    /// item 7): "Claude Code safety check — allowed in bypass" / "— allowed with your approval".
+    pub prompt_notes: BTreeMap<String, String>,
 }
 
 impl CallNotes {
     pub fn is_empty(&self) -> bool {
-        self.allowed_by_rule.is_empty() && self.creates_file.is_empty()
+        self.allowed_by_rule.is_empty() && self.creates_file.is_empty() && self.prompt_notes.is_empty()
     }
 
     /// Whether this tool-use id's `Write` created its file (see `creates_file`).
@@ -735,6 +794,13 @@ pub fn serialize_events_with_notes_for_js(
             .map(|(tool_use_id, rule)| json!({ "toolUseId": tool_use_id, "rule": rule }))
             .collect();
     }
+    if !notes.prompt_notes.is_empty() {
+        payload["promptNotes"] = notes
+            .prompt_notes
+            .iter()
+            .map(|(tool_use_id, note)| json!({ "toolUseId": tool_use_id, "note": note }))
+            .collect();
+    }
     if !notes.creates_file.is_empty() {
         payload["createsFile"] = notes
             .creates_file
@@ -765,10 +831,18 @@ pub struct SnapshotView<'a> {
     /// thread's lock, so a snapshot is serialized directly out of canonical state rather than from a
     /// copy of a whole conversation.
     pub projection: crate::agent_backend::ProjectionRef<'a>,
+    /// Permission ids `serialize_snapshot_for_js` must omit from `pendingPermissions` (D9, R07/S2):
+    /// requests neovibe itself already answered (`Tab::host_answered`) and is waiting on the
+    /// provider's resolution for. `None` only in tests that build a bare `SnapshotView` literal
+    /// directly and have no such set to hide.
+    pub hidden_pending: Option<&'a BTreeSet<String>>,
 }
 
 impl<'a> SnapshotView<'a> {
-    pub fn of(backend: &'a crate::agent_backend::AgentBackend) -> Self {
+    /// `hidden` is `Tab::host_answered`: every id in it is dropped from `pendingPermissions` (never
+    /// from tool calls or the transcript) so a request neovibe answered on the user's behalf never
+    /// draws a card, and the tray never counts it either (D9).
+    pub fn of(backend: &'a crate::agent_backend::AgentBackend, hidden: &'a BTreeSet<String>) -> Self {
         Self {
             backend: backend.kind().as_str(),
             conversation_id: backend.conversation_id(),
@@ -777,6 +851,7 @@ impl<'a> SnapshotView<'a> {
             capabilities: backend.capabilities(),
             provider: backend.provider_info(),
             projection: backend.projection(),
+            hidden_pending: Some(hidden),
         }
     }
 }
@@ -852,6 +927,9 @@ pub fn serialize_snapshot_with_notes_for_js(
             if notes.creates_file_call(&call.tool_use_id) {
                 entry["createsFile"] = json!(true);
             }
+            if let Some(note) = notes.prompt_notes.get(&call.tool_use_id) {
+                entry["promptNote"] = json!(note);
+            }
             entry
         })
         .collect();
@@ -867,7 +945,15 @@ pub fn serialize_snapshot_with_notes_for_js(
     // Sorted by `seq`, which is also the order they were requested in. `pending_permissions` is a
     // `HashMap` and `values()` order is unspecified, so without this two snapshots of one state
     // could emit two different card orders.
-    let mut pending: Vec<&agent::PermissionRequestRecord> = projection.pending_permissions.values().collect();
+    let mut pending: Vec<&agent::PermissionRequestRecord> = projection
+        .pending_permissions
+        .values()
+        .filter(|p| {
+            !view
+                .hidden_pending
+                .is_some_and(|hidden| hidden.contains(&p.permission_id))
+        })
+        .collect();
     pending.sort_by_key(|p| p.seq);
     let pending_permissions: Vec<Value> = pending
         .into_iter()
@@ -883,6 +969,22 @@ pub fn serialize_snapshot_with_notes_for_js(
             });
             if notes.creates_file.contains_key(&p.permission_id) {
                 entry["createsFile"] = json!(true);
+            }
+            // O3: the CLI's own prompt, with its words, so a reload or a tab switch keeps the
+            // reason its card was drawn for. Absent on the gate's own request, as on the events path
+            // (where the event itself carries `provider_prompt` in snake_case).
+            if let Some(prompt) = &p.provider_prompt {
+                entry["providerPrompt"] = json!({
+                    "reason": prompt.reason,
+                    "description": prompt.description,
+                    "blockedPath": prompt.blocked_path,
+                    "unrecognizedOrigin": prompt.unrecognized_origin,
+                    "matchedAskRule": prompt.matched_ask_rule.as_ref().map(|rule| json!({
+                        "source": rule.source,
+                        "toolName": rule.tool_name,
+                        "ruleContent": rule.rule_content,
+                    })),
+                });
             }
             entry
         })
@@ -951,7 +1053,8 @@ pub fn serialize_snapshot_with_notes_for_js(
             "fork": capabilities.fork,
             "interrupt": capabilities.interrupt,
             "bypassPermissionMode": capabilities.bypass_permission_mode,
-            "modeSwitch": capabilities.set_permission_mode,
+            // No `modeSwitch` since R07 (spec §6): nothing switches a live session's CLI mode any
+            // more; the tab's own mode is local to the host.
         },
         "provider": provider,
     });
@@ -1246,6 +1349,25 @@ pub fn serialize_scratch_for_js(tab: crate::tabs::TabId, editing: bool) -> Strin
 /// A one-line message for the footer's transient slot (ruling 29).
 pub fn serialize_notice_for_js(text: &str) -> String {
     json!({ "kind": "notice", "text": text }).to_string()
+}
+
+/// `{"kind":"confirm_bypass","tab":...,"scope":...,"nonce":...,"lines":[...]}` -- the wire contract
+/// fixed at the top of the v1-mode plan. **Never emits `plan.approve`**: Rust keeps that list (D7's
+/// re-check re-reads it on `confirm_bypass`, spec §3.3), so the panel counts nothing and echoes no
+/// id back -- it only shows `lines` and answers with the tab/scope/nonce it was given.
+pub fn serialize_confirm_bypass_for_js(plan: &crate::tab_set::BypassPlan) -> String {
+    let (tab, scope) = match plan.scope {
+        crate::tab_set::BypassScope::Tab(id) => (Value::from(id.0), "tab"),
+        crate::tab_set::BypassScope::Default => (Value::Null, "default"),
+    };
+    json!({
+        "kind": "confirm_bypass",
+        "tab": tab,
+        "scope": scope,
+        "nonce": plan.nonce,
+        "lines": plan.lines,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -1722,10 +1844,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
 
         let json_str = serialize_snapshot_for_js(TabId(1), &view, None);
@@ -1782,6 +1904,7 @@ mod tests {
             tool_use_id: Some("toolu_01ABC".into()),
             tool_name: "Bash".into(),
             input: json!({"command": "rm -rf /"}),
+            provider_prompt: None,
         });
         let view = SnapshotView {
             backend: "sidecar",
@@ -1794,16 +1917,74 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
         assert_eq!(pending["permissionId"], "perm-1");
         assert_eq!(pending["toolUseId"], "toolu_01ABC");
         assert_eq!(pending["toolName"], "Bash");
+    }
+
+    /// O3: a reload or a tab switch rebuilds the panel from this snapshot, so the CLI's own prompt
+    /// must arrive here with its words (`providerPrompt`, camelCase like the rest of the snapshot)
+    /// or its card would lose the reason it was drawn for. A gate request carries no such key.
+    #[test]
+    fn a_snapshot_carries_the_clis_own_prompt_and_its_words() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("toolu_1".into()),
+            tool_name: "Write".into(),
+            input: json!({}),
+            provider_prompt: None,
+        });
+        projection.apply(&AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-cli".into(),
+            tool_use_id: Some("toolu_1".into()),
+            tool_name: "Write".into(),
+            input: json!({}),
+            provider_prompt: Some(agent::ProviderPrompt {
+                reason: Some("Claude requested permissions to edit /p/.git/probe which is a sensitive file.".into()),
+                description: Some(".git/probe".into()),
+                blocked_path: Some("/p/.git/probe".into()),
+                matched_ask_rule: Some(agent::MatchedAskRule {
+                    source: "projectSettings".into(),
+                    tool_name: "Write".into(),
+                    rule_content: None,
+                }),
+                unrecognized_origin: None,
+            }),
+        });
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities::default(),
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
+        assert_eq!(cards.len(), 2, "both requests for the one call are cards of their own");
+        assert_eq!(cards[0]["permissionId"], "perm-gate");
+        assert!(!cards[0].as_object().unwrap().contains_key("providerPrompt"));
+        assert_eq!(cards[1]["permissionId"], "perm-cli");
+        let prompt = &cards[1]["providerPrompt"];
+        assert_eq!(
+            prompt["reason"],
+            "Claude requested permissions to edit /p/.git/probe which is a sensitive file."
+        );
+        assert_eq!(prompt["description"], ".git/probe");
+        assert_eq!(prompt["blockedPath"], "/p/.git/probe");
+        assert_eq!(prompt["matchedAskRule"]["source"], "projectSettings");
+        assert_eq!(prompt["matchedAskRule"]["toolName"], "Write");
+        assert!(prompt["matchedAskRule"]["ruleContent"].is_null());
     }
 
     /// `null`, not an omitted key. The TS side declares the field as `string | null`, and an absent
@@ -1819,6 +2000,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Bash".into(),
             input: json!({}),
+            provider_prompt: None,
         });
         let view = SnapshotView {
             backend: "legacy",
@@ -1831,10 +2013,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
@@ -1875,10 +2057,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let history = &parsed["state"]["history"];
@@ -1912,10 +2094,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let state = parsed["state"].as_object().unwrap();
@@ -1941,6 +2123,7 @@ mod tests {
             tool_use_id: Some("toolu_01CtdezhmhUCrBaswxW5HYmC".into()),
             tool_name: "Bash".into(),
             input: json!({"command": "echo hello"}),
+            provider_prompt: None,
         });
         let view = SnapshotView {
             backend: "legacy",
@@ -1953,10 +2136,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let pending = &parsed["state"]["pendingPermissions"][0];
@@ -2002,6 +2185,7 @@ mod tests {
             tool_use_id: Some("toolu_2".into()),
             tool_name: "Read".into(),
             input: json!({}),
+            provider_prompt: None,
         });
 
         let view = SnapshotView {
@@ -2015,10 +2199,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let state = &parsed["state"];
@@ -2093,6 +2277,7 @@ mod tests {
                     tool_use_id: None,
                     tool_name: "Bash".into(),
                     input: json!({}),
+                    provider_prompt: None,
                 });
             }
             let view = SnapshotView {
@@ -2106,10 +2291,10 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
-                    set_permission_mode: false,
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
             };
             let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
             let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
@@ -2128,6 +2313,130 @@ mod tests {
                 "projection {attempt} emitted seqs {seqs:?}"
             );
         }
+    }
+
+    /// D9/R07/S2: `hidden_pending` (`Tab::host_answered`) drops exactly the ids it names from
+    /// `pendingPermissions` -- never from tool calls or the transcript, which this test does not
+    /// build any of, so their absence is not itself the assertion.
+    #[test]
+    fn a_snapshot_hides_the_ids_it_is_given() {
+        let mut projection = AgentSessionProjection::default();
+        for id in ["shown", "hidden"] {
+            projection.apply(&AgentDomainEvent::PermissionRequested {
+                permission_id: id.into(),
+                tool_use_id: None,
+                tool_name: "Bash".into(),
+                input: json!({}),
+                provider_prompt: None,
+            });
+        }
+        let hidden: std::collections::BTreeSet<String> = ["hidden".to_string()].into_iter().collect();
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities {
+                resume: false,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: Some(&hidden),
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        let cards = parsed["state"]["pendingPermissions"].as_array().unwrap();
+        let ids: Vec<&str> = cards.iter().map(|p| p["permissionId"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["shown"], "{ids:?}");
+    }
+
+    /// The wire contract at the top of the v1-mode plan, both directions.
+    #[test]
+    fn the_confirm_bypass_envelope_matches_the_wire_contract() {
+        let tab_plan = crate::tab_set::BypassPlan {
+            scope: crate::tab_set::BypassScope::Tab(TabId(3)),
+            nonce: 17,
+            approve: vec!["p1".to_string(), "p2".to_string()],
+            lines: vec!["切到 bypass 并批准 2 张等待中的卡片？(y/n)".to_string()],
+            prompt: crate::tabs::PromptScope::LiveTab,
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&serialize_confirm_bypass_for_js(&tab_plan)).unwrap(),
+            json!({
+                "kind": "confirm_bypass",
+                "tab": 3,
+                "scope": "tab",
+                "nonce": 17,
+                "lines": ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"],
+            }),
+            "approve must never reach the wire"
+        );
+
+        let default_plan = crate::tab_set::BypassPlan {
+            scope: crate::tab_set::BypassScope::Default,
+            nonce: 18,
+            approve: Vec::new(),
+            lines: vec!["新会话默认用 bypass？(y/n)".to_string()],
+            prompt: crate::tabs::PromptScope::Default,
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&serialize_confirm_bypass_for_js(&default_plan)).unwrap(),
+            json!({
+                "kind": "confirm_bypass",
+                "tab": null,
+                "scope": "default",
+                "nonce": 18,
+                "lines": ["新会话默认用 bypass？(y/n)"],
+            })
+        );
+
+        // Inbound: the exact contract line -- both fields, and the mapping to a real `BypassScope`.
+        let msg =
+            parse_inbound_message(r#"{"type":"confirm_bypass","request_id":"r7","tab":3,"scope":"tab","nonce":17}"#)
+                .unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "r7");
+        match msg {
+            InboundMessage::ConfirmBypass { tab, scope, nonce, .. } => {
+                assert_eq!(scope.scope(tab), Ok(crate::tab_set::BypassScope::Tab(TabId(3))));
+                assert_eq!(nonce, 17);
+            }
+            other => panic!("expected ConfirmBypass, got {other:?}"),
+        }
+
+        // A missing nonce fails to parse -- D7's whole point is that only the EXACT prompt shown may
+        // answer, never "whatever is current".
+        assert!(
+            parse_inbound_message(r#"{"type":"confirm_bypass","request_id":"r7","tab":3,"scope":"tab"}"#).is_none()
+        );
+        // A malformed nonce, and an unrecognized scope, are each their own parse failure.
+        assert!(parse_inbound_message(
+            r#"{"type":"confirm_bypass","request_id":"r7","tab":3,"scope":"tab","nonce":"17"}"#
+        )
+        .is_none());
+        assert!(parse_inbound_message(
+            r#"{"type":"confirm_bypass","request_id":"r7","tab":3,"scope":"window","nonce":17}"#
+        )
+        .is_none());
+    }
+
+    /// `BypassScopeWire::scope` refuses a mismatched pair rather than guessing which the client
+    /// meant -- a well-formed client only ever sends `(Tab, Some)` or `(Default, None)`.
+    #[test]
+    fn bypass_scope_wire_refuses_a_mismatched_tab_default_pairing() {
+        assert_eq!(
+            BypassScopeWire::Tab.scope(Some(3)),
+            Ok(crate::tab_set::BypassScope::Tab(TabId(3)))
+        );
+        assert_eq!(
+            BypassScopeWire::Default.scope(None),
+            Ok(crate::tab_set::BypassScope::Default)
+        );
+        assert!(BypassScopeWire::Tab.scope(None).is_err());
+        assert!(BypassScopeWire::Default.scope(Some(3)).is_err());
     }
 
     /// The panel's half of what the user asked (Task 2 of the panel-as-document plan): a snapshot
@@ -2150,10 +2459,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let json: serde_json::Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         assert_eq!(json["state"]["userPrompts"][0]["text"], "hello");
@@ -2170,6 +2479,7 @@ mod tests {
             tool_use_id: Some("toolu_01ABC".into()),
             tool_name: "Bash".into(),
             input: json!({}),
+            provider_prompt: None,
         }];
         let parsed: Value = serde_json::from_str(&serialize_events_for_js(TabId(1), 0, 1, &events)).unwrap();
         assert_eq!(parsed["events"][0]["tool_use_id"], "toolu_01ABC");
@@ -2217,10 +2527,10 @@ mod tests {
                 interrupt: true,
                 bypass_permission_mode: true,
                 interactive_permission_mode: true,
-                set_permission_mode: false,
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
         };
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         assert_eq!(parsed["state"]["backend"], "legacy");
@@ -2727,31 +3037,28 @@ mod tests {
         assert_eq!(context_summary(None, root), None);
     }
 
-    /// D6 (wave 5): the capability the panel gates a live tab's Shift+Tab on is this session's own
-    /// `set_permission_mode` -- per snapshot, so per tab's backend, never a window-wide constant.
+    /// R07 (spec §6): the snapshot no longer carries `modeSwitch` -- no session's CLI mode is ever
+    /// switched, so there is no capability for the panel to gate on. Absent, not `false`: a panel
+    /// still reading it must see nothing, never a "no" it could mistake for a live answer.
     #[test]
-    fn a_snapshot_says_whether_this_session_can_switch() {
+    fn a_snapshot_carries_no_mode_switch_capability() {
         let projection = AgentSessionProjection::default();
-        let mode_switch = |capabilities: agent::ProviderCapabilities| {
-            let view = SnapshotView {
-                backend: "sidecar",
-                conversation_id: None,
-                session_id: None,
-                provider_session_id: None,
-                capabilities,
-                provider: None,
-                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
-            };
-            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
-            parsed["state"]["capabilities"]["modeSwitch"].clone()
-        };
-        assert_eq!(
-            mode_switch(agent::ProviderCapabilities {
-                set_permission_mode: true,
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities {
+                interactive_permission_mode: true,
+                bypass_permission_mode: true,
                 ..Default::default()
-            }),
-            true
-        );
-        assert_eq!(mode_switch(agent::ProviderCapabilities::default()), false);
+            },
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        let capabilities = parsed["state"]["capabilities"].as_object().unwrap();
+        assert!(!capabilities.contains_key("modeSwitch"), "{capabilities:?}");
     }
 }

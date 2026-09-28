@@ -24,8 +24,7 @@
 //! See `agent/BACKEND_BASELINE.md` (added in this plan's Task 3) for the full baseline record.
 
 use agent::{
-    AgentDomainEvent, AgentSession, PermissionDecision, PermissionMode, ProjectionStatus, TurnOutcome,
-    CONSERVATIVE_DISALLOWED_TOOLS,
+    AgentDomainEvent, AgentSession, PermissionDecision, ProjectionStatus, TurnOutcome, CONSERVATIVE_DISALLOWED_TOOLS,
 };
 
 #[test]
@@ -33,7 +32,7 @@ use agent::{
 fn real_multi_turn_conversation_in_one_process() {
     let dir = std::env::temp_dir().join(format!("agent-session-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+    let mut session = AgentSession::start(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
 
     session.send_turn("reply with exactly the word: pong").unwrap();
     let result1 = drain_until_finished(&mut session);
@@ -67,7 +66,7 @@ fn real_multi_turn_conversation_in_one_process() {
 fn real_pretooluse_hook_allow_end_to_end() {
     let dir = std::env::temp_dir().join(format!("agent-session-hook-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
     let mut gated_tool_use_id: Option<Option<String>> = None;
@@ -140,7 +139,7 @@ fn real_pretooluse_hook_deny_end_to_end() {
 
     let dir = std::env::temp_dir().join(format!("agent-session-deny-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
 
@@ -224,8 +223,8 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
     let dir = std::env::temp_dir().join(format!("agent-collision-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut session_a = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
-    let mut session_b = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session_a = AgentSession::start(&dir, &[]).unwrap();
+    let mut session_b = AgentSession::start(&dir, &[]).unwrap();
 
     // The mechanism, asserted before the behavior: starting two sessions must not have written
     // anything into the project. Under the old code this directory already held one
@@ -313,7 +312,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
 fn real_interrupt_mid_permission_denies_pending_requests_without_ending_the_session() {
     let dir = std::env::temp_dir().join(format!("agent-interrupt-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
 
@@ -403,6 +402,8 @@ fn drain_until_finished(session: &mut agent::AgentSession) -> String {
 /// list would prove the CLI can edit, which was never in doubt, and not that the product's own
 /// policy permits it. (Since 2026-09-25 that list IS empty -- Auto offers `Bash` too, the owner's
 /// ruling -- and the call still goes through the function so a future list reaches this test.)
+/// (Since R07, 2026-09-27, the function is `disallowed_tools()`, one list for every session, and
+/// the CLI runs `--permission-mode default` rather than `auto` under the same gate.)
 #[test]
 #[ignore]
 fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_the_file() {
@@ -411,12 +412,7 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     let target = dir.join("greeting.txt");
     std::fs::write(&target, "hello world\n").unwrap();
 
-    let mut session = AgentSession::start(
-        &dir,
-        PermissionMode::Auto,
-        agent::disallowed_tools_for(PermissionMode::Auto),
-    )
-    .unwrap();
+    let mut session = AgentSession::start(&dir, agent::disallowed_tools()).unwrap();
     session
         .send_turn(&format!(
             "Use the Edit tool to change the word 'world' to 'neovibe' in {}. Do not use a shell.",

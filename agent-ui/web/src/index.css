@@ -373,6 +373,36 @@ body,
 .band-seg {
   white-space: nowrap;
 }
+/* Defect 1 (2026-09-27, v1 sandbox GUI pass): the owner's own WebKit zoom 1.5 measured a 47-column
+   band, where the R06 bypass prompt (`切到 bypass 并批准 1 张等待中的卡片？(y/n)`), the empty-tab
+   bypass prompt and the D11 flash (`y must be pressed on its own to enter bypass ...`) all lost
+   their own trailing `(y/n)`/explanation to the fixed-height, `overflow: hidden` row below. Neither
+   is truncated by `band.ts` any more (`Seg.wraps`); `StatusBand` adds this class only on a render
+   that actually needs it (a segment `bandLayout` marked `wraps`), so a short prompt/flash still
+   renders on the one fixed row exactly as before, and the moment `wraps` stops being set (the
+   prompt/flash itself ending, or the band widening enough to fit it), the class -- and this height
+   -- disappear with it, restoring the `--nv-editor-row` height ruling R5 (wave 4) asked for.
+   `align-items: flex-start` keeps the mode block pinned to the first line while the wrapped text
+   grows the row underneath it -- overridable by the owner, cited here rather than reinvented quietly
+   if a later pass wants the mode block centred against the wrapped block instead. */
+.status-band--wrap {
+  height: auto;
+  min-height: var(--nv-editor-row, 24px);
+  overflow: visible;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.status-band--wrap .band-open {
+  overflow: visible;
+  white-space: normal;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.status-band--wrap .band-prompt,
+.status-band--wrap .band-message {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 /* The mode section (spec §5.2's first row): bold, its own fill, dim while the pane lacks the keys
    (`data-focused`, `paneFocused`'s own claim) -- moved unchanged from the old `Footer`'s mode
    block, itself explained by the big comment above this rule. */
@@ -1030,6 +1060,22 @@ body,
 }
 .permission-card-description {
   color: var(--nv-muted);
+}
+/* O3: the CLI's own prompt -- a small label naming whose question it is, then the CLI's sentence. */
+.permission-card-provider {
+  margin: 4px 0 6px;
+  font-size: var(--fs-sm);
+  color: var(--nv-fg);
+  overflow-wrap: anywhere;
+}
+.permission-card-provider-label {
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+  border: 1px solid var(--nv-border);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-right: 6px;
+  white-space: nowrap;
 }
 .permission-card-buttons button {
   margin-right: 8px;

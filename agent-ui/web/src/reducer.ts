@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ToolCallRecord } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ProviderPrompt, ToolCallRecord, WireProviderPrompt } from "./types";
 
 /** The state before any snapshot arrives. `backend` defaults to "legacy" only because something
  * must be written here -- the real value always arrives with `hello` (before any session can exist)
@@ -175,6 +175,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
             toolUseId: event.tool_use_id,
             toolName: event.tool_name,
             input: event.input,
+            // O3: the CLI's own prompt, reshaped to the snapshot's camelCase so a card built from
+            // events and one rebuilt from a snapshot read the same. Absent on the gate's request.
+            ...(event.provider_prompt ? { providerPrompt: providerPromptFromWire(event.provider_prompt) } : {}),
           },
         ],
       };
@@ -243,6 +246,8 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
 export type CallNotes = {
   ruleNotes?: readonly { toolUseId: string; rule: string }[];
   createsFile?: readonly { permissionId: string; toolUseId: string | null }[];
+  /** O3 review item 7: calls whose CLI prompt was answered without a card, with their row's note. */
+  promptNotes?: readonly { toolUseId: string; note: string }[];
 };
 
 /** Folds an events envelope's `CallNotes` into the state, after that envelope's events, so a call
@@ -252,16 +257,35 @@ export function applyCallNotes(state: AgentUiState, notes: CallNotes): AgentUiSt
   const rules = new Map((notes.ruleNotes ?? []).map((n) => [n.toolUseId, n.rule]));
   const newFileCards = new Set((notes.createsFile ?? []).map((n) => n.permissionId));
   const newFileCalls = new Set((notes.createsFile ?? []).flatMap((n) => (n.toolUseId === null ? [] : [n.toolUseId])));
-  if (rules.size === 0 && newFileCards.size === 0) return state;
+  const promptNotes = new Map((notes.promptNotes ?? []).map((n) => [n.toolUseId, n.note]));
+  if (rules.size === 0 && newFileCards.size === 0 && promptNotes.size === 0) return state;
   return {
     ...state,
     toolCalls: state.toolCalls.map((call) => {
       const rule = rules.get(call.toolUseId);
       const creates = newFileCalls.has(call.toolUseId);
-      if (rule === undefined && !creates) return call;
-      return { ...call, ...(rule === undefined ? {} : { allowedByRule: rule }), ...(creates ? { createsFile: true } : {}) };
+      const promptNote = promptNotes.get(call.toolUseId);
+      if (rule === undefined && !creates && promptNote === undefined) return call;
+      return {
+        ...call,
+        ...(rule === undefined ? {} : { allowedByRule: rule }),
+        ...(creates ? { createsFile: true } : {}),
+        ...(promptNote === undefined ? {} : { promptNote }),
+      };
     }),
     pendingPermissions: state.pendingPermissions.map((p) => (newFileCards.has(p.permissionId) ? { ...p, createsFile: true } : p)),
+  };
+}
+
+/** The event's snake_case `provider_prompt` as the snapshot spells it (`agent_bridge.rs`). */
+function providerPromptFromWire(wire: WireProviderPrompt): ProviderPrompt {
+  const rule = wire.matched_ask_rule;
+  return {
+    reason: wire.reason ?? null,
+    description: wire.description ?? null,
+    blockedPath: wire.blocked_path ?? null,
+    matchedAskRule: rule ? { source: rule.source, toolName: rule.tool_name, ruleContent: rule.rule_content ?? null } : null,
+    unrecognizedOrigin: wire.unrecognized_origin ?? null,
   };
 }
 

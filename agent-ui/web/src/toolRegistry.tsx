@@ -392,11 +392,17 @@ export function renderToolCall(
         allowed by rule <code>{call.allowedByRule}</code>
       </div>
     );
+  // O3 review item 7 (the spike's row note): the CLI's own prompt for this call was answered without
+  // a card -- in bypass, or on the user's earlier approval of the same call. Rust writes the words;
+  // muted like the rule note, which it sits beside.
+  const promptNote =
+    call.promptNote === undefined ? null : <div className="tool-rule-note tool-prompt-note">{call.promptNote}</div>;
   const shown = call.result === null || showResult || opts.detailed === true;
   return (
     <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
       {invocation}
       {ruleNote}
+      {promptNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} />}
     </div>
   );

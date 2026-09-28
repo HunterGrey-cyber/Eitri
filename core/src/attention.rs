@@ -11,12 +11,12 @@
 //! -- and drops each one the projection no longer holds, which is how an answer given from the panel
 //! (`respond_permission`, on legacy never a delivered event) stops counting.
 //!
-//! **One gap is inherited, not fixed here:** [`AttentionTracker::resync`] takes the projection's
-//! pending set, because a resync rebuilds the panel's cards from that same snapshot -- so a `Read`
-//! the policy answered, still pending there, is counted until the next pump's `retain_pending`
-//! drops it, and can raise a toast. It is the gap `AgentBackend::answer_what_needs_no_human`'s doc
-//! records for the panel (a resync needs 256 queued events, never observed). The count matching
-//! the cards drawn is the point; fix it there, in the snapshot, never by counting less here.
+//! **That gap is closed as of R07/S2 (2026-09-27, Task 2), not by counting less here.**
+//! [`AttentionTracker::resync`] still takes whatever set the caller hands it, but `TabSet::pump`
+//! now passes the projection's pending ids MINUS `Tab::host_answered` (D9) -- the ids neovibe
+//! itself already answered, in bypass or under the classifier -- so a request nobody needs to see
+//! a card for is never counted here either. The fix stays in the caller, not in `resync` itself:
+//! this tracker still counts exactly the set it is handed.
 //!
 //! **A session that ends owes nothing** ([`AttentionTracker::session_ended`]): its cards can no
 //! longer be answered, so they stop counting even though the panel still draws them -- the count is
@@ -128,6 +128,16 @@ impl AttentionTracker {
         self.cards.retain(|id, _| still_pending(id));
     }
 
+    /// The ids this tracker still holds a card for, oldest arrival first (R06/S2, Task 2's
+    /// `TabSet::waiting_cards`: a bypass entry approves exactly these). `cards` is keyed by id, not
+    /// by arrival order, so this sorts by the stamp `observe`/`resync` assigned rather than walking
+    /// the map's own (alphabetical) key order.
+    pub fn card_ids(&self) -> Vec<String> {
+        let mut ids: Vec<(&String, &u64)> = self.cards.iter().collect();
+        ids.sort_by_key(|(_, stamp)| **stamp);
+        ids.into_iter().map(|(id, _)| id.clone()).collect()
+    }
+
     /// The chat is on screen: what finished while it was away has been seen.
     pub fn seen(&mut self) {
         self.unread = false;
@@ -228,6 +238,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Write".into(),
             input: serde_json::json!({}),
+            provider_prompt: None,
         }
     }
     fn resolved(id: &str) -> AgentDomainEvent {
@@ -431,6 +442,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// R06/S2: a bypass entry approves the delivered cards in arrival order, not alphabetical order
+    /// -- a plain `BTreeMap::keys()` would put `"a"` before `"b"` however they arrived.
+    #[test]
+    fn card_ids_are_oldest_first_not_alphabetical() {
+        let mut t = AttentionTracker::default();
+        t.observe(&[requested("b")], false);
+        t.observe(&[requested("a")], false);
+        assert_eq!(t.card_ids(), vec!["b".to_string(), "a".to_string()]);
     }
 
     /// Ruling 20: one clock across every tab's tracker, so "the oldest card" means the same thing

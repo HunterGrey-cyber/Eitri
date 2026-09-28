@@ -11,14 +11,19 @@
 //! evidence -- this project has repeatedly shipped defects that only running could find. These
 //! tests are the evidence.
 //!
-//! Every test uses `PermissionMode::Bypass`, which is deliberate and not laziness: BYPASS is the
-//! only permission policy this milestone actually ships, so the lifecycle must be proven on the
-//! path that will really run. (The Auto/`interactive` permission path has its own coverage in
+//! Every test used `PermissionMode::Bypass`, which was deliberate and not laziness: BYPASS was the
+//! only permission policy that milestone shipped, so the lifecycle had to be proven on the path
+//! that would really run. (The Auto/`interactive` permission path has its own coverage in
 //! `claude_sidecar_conformance.rs`.)
+//!
+//! **Since R07 (2026-09-27) every session here is gated** -- `INTERACTIVE`, the CLI in `default`,
+//! which is again the path that really runs: the client can no longer ask for anything else, and
+//! the product's bypass is neovibe answering `allow`. So a turn that uses a tool raises a
+//! `PermissionRequested`, and `run_turn` answers each one `Allow`, standing in for that answer.
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, CreateSessionRequest,
-    InterruptTurnRequest, PermissionMode, SendTurnRequest, TurnOutcome,
+    InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, SendTurnRequest, TurnOutcome,
 };
 use std::time::{Duration, Instant};
 
@@ -114,17 +119,16 @@ fn connect() -> ClaudeSidecarProvider {
         .expect("connecting to a real sidecar should succeed")
 }
 
-fn create_bypass_session(provider: &ClaudeSidecarProvider) -> String {
-    create_bypass_session_with(provider, agent::StreamingPreference::Partial)
+fn create_gated_session(provider: &ClaudeSidecarProvider) -> String {
+    create_gated_session_with(provider, agent::StreamingPreference::Partial)
 }
 
 /// The streaming preference is a parameter so the same helper can drive both sides of a real
 /// before/after measurement rather than two divergent copies of the setup.
-fn create_bypass_session_with(provider: &ClaudeSidecarProvider, streaming: agent::StreamingPreference) -> String {
+fn create_gated_session_with(provider: &ClaudeSidecarProvider, streaming: agent::StreamingPreference) -> String {
     provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Bypass,
             streaming,
         })
         .expect("create_session should succeed")
@@ -143,11 +147,20 @@ fn run_turn(
             text: text.to_string(),
         })
         .expect("send_turn should be accepted");
-    let events = drain_until(provider, deadline_secs, |events| {
-        events
+    let deadline = Instant::now() + Duration::from_secs(deadline_secs);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        let batch = provider.pump();
+        allow_every_request(provider, session_id, &batch);
+        events.extend(batch);
+        if events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
-    });
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         events
             .iter()
@@ -155,6 +168,22 @@ fn run_turn(
         "turn {text:?} did not complete within {deadline_secs}s; got: {events:?}"
     );
     events
+}
+
+/// Answers every `PermissionRequested` in `events` with `Allow` -- what neovibe's bypass does since
+/// R07, done here at the provider level because these tests drive the provider directly.
+fn allow_every_request(provider: &ClaudeSidecarProvider, session_id: &str, events: &[AgentDomainEvent]) {
+    for event in events {
+        if let AgentDomainEvent::PermissionRequested { permission_id, .. } = event {
+            provider
+                .resolve_permission(ResolvePermissionRequest {
+                    session_id: session_id.to_string(),
+                    permission_id: permission_id.clone(),
+                    decision: PermissionDecision::Allow,
+                })
+                .expect("answering a pending request should succeed");
+        }
+    }
 }
 
 /// T2.1 -- the sidecar analog of the legacy backend's own multi-turn conformance test.
@@ -167,7 +196,7 @@ fn run_turn(
 #[ignore]
 fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
     let provider = connect();
-    let session_id = create_bypass_session(&provider);
+    let session_id = create_gated_session(&provider);
 
     let first = run_turn(
         &provider,
@@ -296,7 +325,7 @@ fn real_second_turn_on_the_same_session_recalls_the_first_turns_content() {
 #[ignore]
 fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
     let provider = connect();
-    let session_id = create_bypass_session(&provider);
+    let session_id = create_gated_session(&provider);
 
     provider
         .send_turn(SendTurnRequest {
@@ -360,22 +389,20 @@ fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
 
 /// T2.3 -- BYPASS must genuinely bypass, and must be honest about it.
 ///
-/// BYPASS is this milestone's only shipped permission policy, and until now every real sidecar test
-/// used `PermissionMode::Auto`. Two things have to be true at once, and a test asserting only one
-/// of them proves nothing useful:
-///   1. NO permission request is raised (otherwise the UI, which has no permission surface in this
-///      milestone, would deadlock on a request nobody can answer);
-///   2. the tool actually RAN (otherwise "no permission request" would be trivially satisfied by a
-///      policy that silently refuses every tool).
+/// That was: no permission request raised, AND the tool actually ran. **Since R07 (2026-09-27)
+/// the first half is inverted by design**: the session is gated, so the request IS raised, and the
+/// bypass is the host's `Allow` (`run_turn` answers it). What stays is the half that gave the old
+/// test its meaning -- the tool really ran and its real output reached the model -- plus the new
+/// fact that makes it safe: the call went through the gate first.
 #[test]
 #[ignore]
-fn real_bypass_runs_a_tool_with_no_permission_request() {
+fn real_gated_session_runs_a_tool_once_the_host_allows_it() {
     let provider = connect();
     assert!(
-        provider.capabilities().bypass_permission_mode,
-        "the sidecar must advertise the bypass permission mode before this milestone relies on it"
+        provider.capabilities().interactive_permission_mode,
+        "the sidecar must advertise the interactive (gated) policy, the only one sessions are created under"
     );
-    let session_id = create_bypass_session(&provider);
+    let session_id = create_gated_session(&provider);
 
     let events = run_turn(
         &provider,
@@ -385,10 +412,10 @@ fn real_bypass_runs_a_tool_with_no_permission_request() {
     );
 
     assert!(
-        !events
+        events
             .iter()
             .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
-        "BYPASS raised a permission request, which nothing in this milestone can answer; got: {events:?}"
+        "a gated session must raise a permission request for the Bash call; got: {events:?}"
     );
 
     let tool_calls: Vec<&AgentDomainEvent> = events
@@ -397,7 +424,7 @@ fn real_bypass_runs_a_tool_with_no_permission_request() {
         .collect();
     assert!(
         !tool_calls.is_empty(),
-        "no tool ran at all -- 'no permission request' is meaningless without this. got: {events:?}"
+        "no tool ran at all -- the Allow answered nothing. got: {events:?}"
     );
 
     let completed_without_error = events
@@ -432,7 +459,7 @@ fn dropping_the_provider_leaves_no_orphaned_sidecar() {
             agent::process_probe::pid_is_alive(pid),
             "the sidecar pid {pid} should exist while the provider is alive"
         );
-        let session_id = create_bypass_session(&provider);
+        let session_id = create_gated_session(&provider);
         provider.close_session(CloseSessionRequest { session_id }).unwrap();
         pid
     }; // provider dropped here: stdin closes, the sidecar sees EOF and exits
@@ -521,7 +548,7 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
             provider.capabilities().resume,
             "the sidecar must advertise resume before this can pass"
         );
-        let session_id = create_bypass_session(&provider);
+        let session_id = create_gated_session(&provider);
 
         let events = run_turn(
             &provider,
@@ -557,7 +584,6 @@ fn real_resume_continues_the_same_provider_session_with_its_history() {
         .resume_session(agent::ResumeSessionRequest {
             provider_session_id: provider_session_id.clone(),
             cwd,
-            permission_mode: PermissionMode::Bypass,
             streaming: agent::StreamingPreference::Partial,
         })
         .expect("resume_session should succeed against a real, closed session");

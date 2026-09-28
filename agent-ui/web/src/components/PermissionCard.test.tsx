@@ -201,3 +201,76 @@ describe("PermissionCard for a Write", () => {
     expect(container.textContent).not.toContain("Creates a new file.");
   });
 });
+
+/** O3 ruling 6: the CLI's own prompt (it asked after the gate had answered) is drawn in the same
+ *  card, showing the CLI's own sentence and a small label saying whose question it is -- Claude
+ *  Code's safety check, or the user's own ask rule when one forced it -- and it answers through the
+ *  same buttons, keys and permission id as any card. */
+describe("PermissionCard for the CLI's own prompt", () => {
+  const REASON = "Claude requested permissions to edit /p/.git/probe which is a sensitive file.";
+  const prompt: PermissionRequestRecord = {
+    ...REQUEST,
+    permissionId: "perm-cli",
+    toolName: "Write",
+    input: { file_path: "/p/.git/probe", content: "o3\n" },
+    providerPrompt: { reason: REASON, description: ".git/probe", blockedPath: null, matchedAskRule: null, unrecognizedOrigin: null },
+  };
+
+  it("shows the CLI's own sentence under a Claude Code safety check label", () => {
+    const { container } = render(<PermissionCard request={prompt} sessionEnded={false} onAnswer={vi.fn()} />);
+    const line = container.querySelector(".permission-card-provider")!;
+    expect(line).not.toBeNull();
+    expect(line.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code safety check");
+    expect(line.querySelector(".permission-card-provider-reason")!.textContent).toBe(REASON);
+  });
+
+  it("names the user's own ask rule instead when one forced the prompt", () => {
+    const forced: PermissionRequestRecord = {
+      ...prompt,
+      toolName: "Bash",
+      input: { command: "cat notes.txt" },
+      providerPrompt: {
+        reason: null,
+        description: null,
+        blockedPath: null,
+        matchedAskRule: { source: "projectSettings", toolName: "Bash", ruleContent: "cat:*" },
+        unrecognizedOrigin: null,
+      },
+    };
+    const { container } = render(<PermissionCard request={forced} sessionEnded={false} onAnswer={vi.fn()} />);
+    const label = container.querySelector(".permission-card-provider-label")!;
+    expect(label.textContent).toBe("your ask rule: Bash(cat:*)");
+    expect(label.getAttribute("title")).toContain("projectSettings");
+    expect(container.textContent).not.toContain("Claude Code safety check");
+    expect(container.querySelector(".permission-card-provider-reason")).toBeNull();
+  });
+
+  /* O3 review #5: only a prompt that says why is called a safety check. One with no reason, and one
+     of a kind this build does not know, are "Claude Code asked" -- nothing is claimed for them. */
+  it("calls a prompt with no reason, or of an unknown kind, neutrally", () => {
+    const silent: PermissionRequestRecord = { ...prompt, providerPrompt: { ...prompt.providerPrompt!, reason: null } };
+    const first = render(<PermissionCard request={silent} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(first.container.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code asked");
+    expect(first.container.querySelector(".permission-card-provider-reason")).toBeNull();
+    first.unmount();
+    const unknown: PermissionRequestRecord = { ...prompt, providerPrompt: { ...prompt.providerPrompt!, unrecognizedOrigin: 7 } };
+    const { container } = render(<PermissionCard request={unknown} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(container.querySelector(".permission-card-provider-label")!.textContent).toBe("Claude Code asked");
+    expect(container.querySelector(".permission-card-provider-reason")!.textContent).toBe(REASON);
+  });
+
+  it("answers through the same buttons and permission id as any card", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(<PermissionCard request={prompt} sessionEnded={false} onAnswer={onAnswer} />);
+    const approve = container.querySelector('button[data-nav-action="allow"]') as HTMLButtonElement;
+    expect(approve.textContent).toBe("Approve");
+    expect(container.querySelector('button[data-nav-action="deny"]')).not.toBeNull();
+    fireEvent.click(approve);
+    expect(onAnswer).toHaveBeenCalledWith("perm-cli", "allow", undefined);
+  });
+
+  it("draws nothing extra on the gate's own card", () => {
+    const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(container.querySelector(".permission-card-provider")).toBeNull();
+  });
+});

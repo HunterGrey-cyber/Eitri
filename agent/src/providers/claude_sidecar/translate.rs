@@ -4,20 +4,30 @@
 //! no sidecar process involved, matching this crate's own established preference for testing a
 //! pure reducer/translator in isolation before any real-process integration test exercises it.
 
+use crate::process::{classify_cli_mode, CliModeReport};
 use crate::{AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TurnOutcome};
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
-    PermissionMode as ProtoPermissionMode, PermissionOutcome as ProtoPermissionOutcome,
-    ResumeStatus as ProtoResumeStatus, SessionCloseReason, SessionEvent as ProtoSessionEvent,
-    TurnOutcome as ProtoTurnOutcome,
+    PermissionMode as ProtoPermissionMode, PermissionOrigin as ProtoPermissionOrigin,
+    PermissionOutcome as ProtoPermissionOutcome, ResumeStatus as ProtoResumeStatus, SessionCloseReason,
+    SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome,
 };
 
-/// Translates one proto `SessionEvent`'s wire fields into this crate's own domain event. Returns
-/// `None` for a genuinely malformed message (unset `oneof`, or unparseable `input_json`/
+/// Translates one proto `SessionEvent`'s wire fields into this crate's own domain events. Returns
+/// nothing for a genuinely malformed message (unset `oneof`, or unparseable `input_json`/
 /// `content_json`) -- logged via `eprintln!`, never panics (Global Constraints), and the caller
 /// (Task 8's watch-loop) simply skips that one occurrence rather than tearing down the whole
 /// stream over one bad event.
-pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
+///
+/// Usually one event. Two only when a `SessionReady` reports a CLI permission mode less restrictive
+/// than `default` (spec §2.3, D12): the session did open, AND it must be closed -- so both are said,
+/// in that order, rather than one hiding the other.
+pub(crate) fn translate(event: ProtoSessionEvent) -> Vec<AgentDomainEvent> {
+    translate_one(event).into_iter().flatten().collect()
+}
+
+/// `translate`'s body: `None` is nothing, and `Some` is one or two events.
+fn translate_one(event: ProtoSessionEvent) -> Option<Vec<AgentDomainEvent>> {
     // The ENVELOPE's session_id, captured before the oneof is destructured. This is the sidecar's
     // own session id -- the value `CreateSession` returned and the one every subsequent RPC must be
     // addressed with.
@@ -34,29 +44,44 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
     // client does not depend on it being fixed.
     let envelope_session_id = event.session_id;
     let envelope_turn_id = event.turn_id;
+    let one = |event: AgentDomainEvent| Some(vec![event]);
     match event.event? {
-        ProtoEvent::SessionReady(ready) => Some(AgentDomainEvent::SessionOpened {
-            session_id: envelope_session_id,
-            provider_session_id: ready.provider_session_id,
-            model: ready.model,
-            cwd: ready.cwd,
-        }),
-        ProtoEvent::TurnStarted(started) => Some(AgentDomainEvent::TurnStarted {
+        // `permission_mode` is the CLI's own `system/init` report, re-sent every turn (read by
+        // nothing before R07). A project's `permissions.defaultMode` can set it, because the
+        // sidecar sends no mode for INTERACTIVE; anything less restrictive than `default` must
+        // close the session (D12). Stricter and unreported values are noted by `CliModeNote`.
+        ProtoEvent::SessionReady(ready) => {
+            let reported = ready.permission_mode;
+            let mut out = vec![AgentDomainEvent::SessionOpened {
+                session_id: envelope_session_id,
+                provider_session_id: ready.provider_session_id,
+                model: ready.model,
+                cwd: ready.cwd,
+            }];
+            if classify_cli_mode(&reported) == CliModeReport::Ungated {
+                out.push(AgentDomainEvent::UngatedCliMode {
+                    reported,
+                    detail: "SessionReady".to_string(),
+                });
+            }
+            Some(out)
+        }
+        ProtoEvent::TurnStarted(started) => one(AgentDomainEvent::TurnStarted {
             turn_id: started.turn_id,
         }),
-        ProtoEvent::TextDelta(delta) => Some(AgentDomainEvent::ContentDelta {
+        ProtoEvent::TextDelta(delta) => one(AgentDomainEvent::ContentDelta {
             turn_id: delta.turn_id,
             kind: ContentKind::Text,
             text: delta.text,
         }),
-        ProtoEvent::ThinkingDelta(delta) => Some(AgentDomainEvent::ContentDelta {
+        ProtoEvent::ThinkingDelta(delta) => one(AgentDomainEvent::ContentDelta {
             turn_id: delta.turn_id,
             kind: ContentKind::Thinking,
             text: delta.text,
         }),
         ProtoEvent::ToolCallStarted(started) => {
             match serde_json::from_str(&started.input_json) {
-                Ok(input) => Some(AgentDomainEvent::ToolCallStarted {
+                Ok(input) => one(AgentDomainEvent::ToolCallStarted {
                     turn_id: started.turn_id,
                     tool_use_id: started.tool_use_id,
                     name: started.name,
@@ -69,7 +94,7 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             }
         }
         ProtoEvent::ToolCallCompleted(completed) => match serde_json::from_str(&completed.content_json) {
-            Ok(content) => Some(AgentDomainEvent::ToolCallCompleted {
+            Ok(content) => one(AgentDomainEvent::ToolCallCompleted {
                 turn_id: completed.turn_id,
                 tool_use_id: completed.tool_use_id,
                 content,
@@ -81,7 +106,9 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             }
         },
         ProtoEvent::PermissionRequested(requested) => match serde_json::from_str(&requested.input_json) {
-            Ok(input) => Some(AgentDomainEvent::PermissionRequested {
+            Ok(input) => one(AgentDomainEvent::PermissionRequested {
+                // Read before the fields below are moved out of `requested`.
+                provider_prompt: provider_prompt_of(&requested),
                 permission_id: requested.permission_id,
                 // Through the shared rule rather than straight into `Some`: proto3 has no absent
                 // string, so an id the provider never set arrives here as `""`, and `Some("")`
@@ -105,14 +132,14 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
         },
         ProtoEvent::PermissionResolved(resolved) => {
             let outcome = translate_permission_outcome(resolved.outcome());
-            Some(AgentDomainEvent::PermissionResolved {
+            one(AgentDomainEvent::PermissionResolved {
                 permission_id: resolved.permission_id,
                 outcome,
             })
         }
         ProtoEvent::TurnCompleted(completed) => {
             let outcome = translate_turn_outcome(completed.outcome());
-            Some(AgentDomainEvent::TurnCompleted {
+            one(AgentDomainEvent::TurnCompleted {
                 turn_id: completed.turn_id,
                 outcome,
                 result_text: completed.result_text,
@@ -129,12 +156,12 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 usage: None,
             })
         }
-        ProtoEvent::SessionClosed(closed) => Some(AgentDomainEvent::SessionClosed {
+        ProtoEvent::SessionClosed(closed) => one(AgentDomainEvent::SessionClosed {
             reason: translate_close_reason(closed.reason()),
         }),
         ProtoEvent::ResumeOutcome(outcome) => {
             let status = translate_resume_status(outcome.status());
-            Some(AgentDomainEvent::ResumeOutcome {
+            one(AgentDomainEvent::ResumeOutcome {
                 requested_provider_session_id: outcome.requested_provider_session_id,
                 status,
                 // The wire uses an empty string for "not set" on a plain string field. An empty id
@@ -155,17 +182,40 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
             );
             None
         }
-        // Capability 'set_permission_mode' (Verdandi 133dc03). Emitted once per accepted switch, to every
-        // watcher. INTERACTIVE and VERDANDI_RULES are both neovibe's `Auto` (`capabilities_from_handshake`'s
-        // note on verdandi_rules); UNSPECIFIED is not a mode anybody chose, so it is dropped, loudly.
+        // Capability 'set_permission_mode' (Verdandi 133dc03). Emitted once per accepted switch, to
+        // every watcher. **Since R07 this client never asks for a switch** (spec §6, D5), so any
+        // report is unsolicited: one naming `default` is folded as a no-op, and one naming anything
+        // less restrictive -- or the BYPASS enum at all -- closes the session (D12). The
+        // `Bypass =>` pattern below is the wire guard's one allowlisted entry: it decodes a report
+        // the sidecar sends; it never constructs a request.
+        //
+        // INTERACTIVE and VERDANDI_RULES are both neovibe's `Auto` (`capabilities_from_handshake`'s
+        // note on verdandi_rules); UNSPECIFIED is not a mode anybody chose, so it is dropped, loudly
+        // -- after the provider-mode check, which never depends on it.
         ProtoEvent::PermissionModeChanged(changed) => {
             let mode = match changed.mode() {
-                ProtoPermissionMode::Bypass => crate::PermissionMode::Bypass,
-                ProtoPermissionMode::Interactive | ProtoPermissionMode::VerdandiRules => crate::PermissionMode::Auto,
-                ProtoPermissionMode::Unspecified => {
-                    eprintln!("agent: ClaudeSidecarProvider: PermissionModeChanged with no mode, dropping it");
-                    return None;
+                ProtoPermissionMode::Bypass => Some(crate::PermissionMode::Bypass),
+                ProtoPermissionMode::Interactive | ProtoPermissionMode::VerdandiRules => {
+                    Some(crate::PermissionMode::Auto)
                 }
+                ProtoPermissionMode::Unspecified => None,
+            };
+            let ungated_by_name = classify_cli_mode(&changed.permission_mode) == CliModeReport::Ungated;
+            if ungated_by_name || mode == Some(crate::PermissionMode::Bypass) {
+                return one(AgentDomainEvent::UngatedCliMode {
+                    // The CLI's own word when it gave one that trips; `BYPASS` when only the enum
+                    // did (a contradictory report still fails closed).
+                    reported: if ungated_by_name {
+                        changed.permission_mode
+                    } else {
+                        "BYPASS".to_string()
+                    },
+                    detail: "PermissionModeChanged".to_string(),
+                });
+            }
+            let Some(mode) = mode else {
+                eprintln!("agent: ClaudeSidecarProvider: PermissionModeChanged with no mode, dropping it");
+                return None;
             };
             if changed.bypass_default_deny_applied {
                 // Neovibe states `unrestricted` on every session (owner, 2026-09-20: bypass denies
@@ -173,13 +223,50 @@ pub(crate) fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
                 // Bash/Write/Edit/NotebookEdit.
                 eprintln!("agent: ClaudeSidecarProvider: entering bypass applied Verdandi's conservative floor");
             }
-            Some(AgentDomainEvent::PermissionModeChanged {
+            one(AgentDomainEvent::PermissionModeChanged {
                 mode,
                 provider_mode: changed.permission_mode,
                 floor_applied: changed.bypass_default_deny_applied,
             })
         }
     }
+}
+
+/// Which kind of request this is (O3; Verdandi b3aa188): `None` for the gate's own, `Some` with the
+/// CLI's own words for a prompt the CLI raised itself after the gate answered.
+///
+/// UNSPECIFIED is what a sidecar older than the field sends, and the proto says to read it as HOOK;
+/// provider fields on a HOOK request (which the proto says never happens) are not believed. A value
+/// this client does not know fails toward a provider prompt the permission policy never judges (O3
+/// ruling 3) AND that nothing automatic answers (`unrecognized_origin`, `needs_a_human`; review #3):
+/// an unknown kind of ask is a card in every mode, bypass included.
+fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequested) -> Option<crate::ProviderPrompt> {
+    let unrecognized_origin = match ProtoPermissionOrigin::try_from(requested.origin) {
+        Ok(ProtoPermissionOrigin::Unspecified) | Ok(ProtoPermissionOrigin::Hook) => return None,
+        Ok(ProtoPermissionOrigin::ProviderPrompt) => None,
+        Err(_) => {
+            eprintln!(
+                "agent: ClaudeSidecarProvider: PermissionRequested with unrecognized origin {}, treated as \
+                 a CLI prompt only a human answers (a card in every mode)",
+                requested.origin
+            );
+            Some(requested.origin)
+        }
+    };
+    Some(crate::ProviderPrompt {
+        unrecognized_origin,
+        reason: requested.provider_reason.clone(),
+        description: requested.provider_description.clone(),
+        blocked_path: requested.provider_blocked_path.clone(),
+        matched_ask_rule: requested
+            .provider_matched_ask_rule
+            .as_ref()
+            .map(|rule| crate::MatchedAskRule {
+                source: rule.source.clone(),
+                tool_name: rule.tool_name.clone(),
+                rule_content: rule.rule_content.clone(),
+            }),
+    })
 }
 
 /// An unrecognized or unset status becomes `InitializationFailed`, never `Attached`.
@@ -291,14 +378,60 @@ impl MessageSplit {
     }
 }
 
+/// Notes, once per session, a CLI permission mode that is stricter than `default` or not reported
+/// at all (spec §2.3). Neither closes the session -- a stricter mode still denies on a non-answer,
+/// and an empty field is a sidecar older than it, neither a downgrade nor an all-clear -- but both
+/// are worth one line, and `SessionReady` arrives every turn, so the line would otherwise repeat.
+///
+/// Per session, alongside `MessageSplit`, in the watch loop; `translate` itself stays pure.
+#[derive(Default)]
+pub(crate) struct CliModeNote {
+    noted: bool,
+}
+
+impl CliModeNote {
+    /// The line to print for this event, the first time one is due.
+    pub(crate) fn observe(&mut self, event: &ProtoSessionEvent) -> Option<String> {
+        let (reported, source) = match event.event.as_ref()? {
+            ProtoEvent::SessionReady(ready) => (ready.permission_mode.as_str(), "SessionReady"),
+            ProtoEvent::PermissionModeChanged(changed) => (changed.permission_mode.as_str(), "PermissionModeChanged"),
+            _ => return None,
+        };
+        let line = match classify_cli_mode(reported) {
+            CliModeReport::Stricter => {
+                format!("[permission] the CLI reports permission mode '{reported}' in {source}, not 'default'")
+            }
+            CliModeReport::Unreported => format!(
+                "[permission] {source} reports no CLI permission mode (a sidecar older than the field): \
+                 neither a downgrade nor an all-clear"
+            ),
+            CliModeReport::Default | CliModeReport::Ungated => return None,
+        };
+        if std::mem::replace(&mut self.noted, true) {
+            return None;
+        }
+        Some(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use claude_runtime_protocol::v1::{
-        PermissionModeChanged, PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved,
-        ProviderNotice, SessionCloseReason, SessionClosed, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted,
-        ToolCallStarted, TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
+        MatchedAskRule, PermissionModeChanged, PermissionOrigin as ProtoPermissionOrigin,
+        PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved, ProviderNotice,
+        SessionCloseReason, SessionClosed, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted, ToolCallStarted,
+        TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
     };
+
+    /// The single event the old `Option`-returning `translate` gave, for the tests written against
+    /// it. Every event but a tripping `SessionReady` still translates to at most one; that one is
+    /// tested through `super::translate` itself.
+    fn translate(event: ProtoSessionEvent) -> Option<AgentDomainEvent> {
+        let mut out = super::translate(event);
+        assert!(out.len() <= 1, "expected at most one event, got {out:?}");
+        out.pop()
+    }
 
     fn wrap(event: ProtoEvent) -> ProtoSessionEvent {
         ProtoSessionEvent {
@@ -323,8 +456,8 @@ mod tests {
             cwd: "/tmp".into(),
             // New in the protocol bump of 2026-09-20: the sidecar now reports the permission mode
             // actually in force, rather than leaving the caller to assume the one it asked for.
-            // Nothing on this side reads it yet, so the fixture carries the empty string rather
-            // than a value a reader could mistake for an assertion.
+            // Read since R07 by the D12 tripwire (the tests below); empty here, which is
+            // "unreported" -- noted, never a trip, so this test still sees exactly one event.
             permission_mode: String::new(),
             // account_identity, init_fingerprint: added at 133dc03, read by nothing in this test.
             ..Default::default()
@@ -457,6 +590,8 @@ mod tests {
             tool_use_id: "tu-1".into(),
             tool_name: "Write".into(),
             input_json: "{}".into(),
+            // `origin` UNSPECIFIED and no provider fields: what a sidecar older than b3aa188 sends.
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -465,6 +600,7 @@ mod tests {
                 tool_use_id: Some("tu-1".into()),
                 tool_name: "Write".into(),
                 input: serde_json::json!({}),
+                provider_prompt: None,
             })
         );
     }
@@ -482,6 +618,7 @@ mod tests {
             tool_use_id: String::new(),
             tool_name: "Write".into(),
             input_json: "{}".into(),
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -490,8 +627,141 @@ mod tests {
                 tool_use_id: None,
                 tool_name: "Write".into(),
                 input: serde_json::json!({}),
+                provider_prompt: None,
             })
         );
+    }
+
+    /// A `PermissionRequested` the CLI itself raised (O3; Verdandi b3aa188): origin PROVIDER_PROMPT,
+    /// with the CLI's own words carried verbatim into `provider_prompt` -- the reason sentence the
+    /// card shows, the subject, the blocked path, and the user's ask rule when one forced it.
+    fn provider_prompt_wire(origin: i32) -> PermissionRequested {
+        PermissionRequested {
+            permission_id: "perm-2".into(),
+            tool_use_id: "toolu_01NqRA82mkgduq2VkbswcvQQ".into(),
+            tool_name: "Write".into(),
+            input_json: r#"{"file_path":"/p/.git/probe","content":"o3 2"}"#.into(),
+            origin,
+            provider_reason: Some(
+                "Claude requested permissions to edit /p/.git/probe which is a sensitive file.".into(),
+            ),
+            provider_description: Some(".git/probe".into()),
+            provider_blocked_path: Some("/p/.git/probe".into()),
+            provider_matched_ask_rule: Some(MatchedAskRule {
+                source: "projectSettings".into(),
+                tool_name: "Write".into(),
+                rule_content: Some(".git/**".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_provider_prompt_carries_the_clis_own_words_verbatim() {
+        let event = wrap(ProtoEvent::PermissionRequested(provider_prompt_wire(
+            ProtoPermissionOrigin::ProviderPrompt as i32,
+        )));
+        assert_eq!(
+            translate(event),
+            Some(AgentDomainEvent::PermissionRequested {
+                permission_id: "perm-2".into(),
+                tool_use_id: Some("toolu_01NqRA82mkgduq2VkbswcvQQ".into()),
+                tool_name: "Write".into(),
+                input: serde_json::json!({ "file_path": "/p/.git/probe", "content": "o3 2" }),
+                provider_prompt: Some(crate::ProviderPrompt {
+                    reason: Some(
+                        "Claude requested permissions to edit /p/.git/probe which is a sensitive file.".into()
+                    ),
+                    description: Some(".git/probe".into()),
+                    blocked_path: Some("/p/.git/probe".into()),
+                    matched_ask_rule: Some(crate::MatchedAskRule {
+                        source: "projectSettings".into(),
+                        tool_name: "Write".into(),
+                        rule_content: Some(".git/**".into()),
+                    }),
+                    unrecognized_origin: None,
+                }),
+            })
+        );
+    }
+
+    /// Every provider field is optional on the wire; a provider prompt that carries none of them is
+    /// still the CLI's own prompt, never the gate's -- origin alone decides.
+    #[test]
+    fn a_provider_prompt_without_any_provider_field_is_still_one() {
+        let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
+            permission_id: "perm-3".into(),
+            tool_use_id: "tu-3".into(),
+            tool_name: "Write".into(),
+            input_json: "{}".into(),
+            origin: ProtoPermissionOrigin::ProviderPrompt as i32,
+            ..Default::default()
+        }));
+        match translate(event) {
+            Some(AgentDomainEvent::PermissionRequested { provider_prompt, .. }) => {
+                assert_eq!(provider_prompt, Some(crate::ProviderPrompt::default()));
+            }
+            other => panic!("expected a PermissionRequested, got {other:?}"),
+        }
+    }
+
+    /// The gate's own request, from a sidecar with the capability (HOOK) or from one older than the
+    /// field (UNSPECIFIED, which the proto says to read as HOOK), is never a provider prompt -- and
+    /// provider fields a HOOK request should not carry are not believed if it does.
+    #[test]
+    fn a_hook_request_and_an_older_sidecars_unspecified_origin_are_the_gates_own() {
+        for origin in [ProtoPermissionOrigin::Hook, ProtoPermissionOrigin::Unspecified] {
+            let event = wrap(ProtoEvent::PermissionRequested(provider_prompt_wire(origin as i32)));
+            match translate(event) {
+                Some(AgentDomainEvent::PermissionRequested { provider_prompt, .. }) => {
+                    assert_eq!(provider_prompt, None, "{origin:?}");
+                }
+                other => panic!("{origin:?}: expected a PermissionRequested, got {other:?}"),
+            }
+        }
+    }
+
+    /// A value this client does not know (a newer sidecar's) fails toward the CLI's own prompt: that
+    /// kind is never judged by the permission policy, and in Auto it is a card, so an unknown origin
+    /// can never be auto-allowed by the classifier as though the gate had asked.
+    #[test]
+    fn an_unrecognized_origin_is_treated_as_the_clis_own_prompt() {
+        let event = wrap(ProtoEvent::PermissionRequested(PermissionRequested {
+            permission_id: "perm-4".into(),
+            tool_use_id: "tu-4".into(),
+            tool_name: "Read".into(),
+            input_json: r#"{"file_path":"main.rs"}"#.into(),
+            origin: 7,
+            ..Default::default()
+        }));
+        match translate(event) {
+            Some(AgentDomainEvent::PermissionRequested { provider_prompt, .. }) => {
+                let prompt = provider_prompt.expect("an unknown origin is never the gate's own request");
+                assert_eq!(prompt.unrecognized_origin, Some(7));
+                // O3 review #3: it is a card in every mode, bypass included -- the same standing
+                // as the user's own ask rule, not the plain CLI prompt bypass allows.
+                assert!(prompt.needs_a_human());
+            }
+            other => panic!("expected a PermissionRequested, got {other:?}"),
+        }
+    }
+
+    /// The shared link rule applies to a provider prompt too: an empty proto3 id is no link, so a
+    /// prompt with one can never be matched against another request's empty id (O3 ruling 5).
+    #[test]
+    fn a_provider_prompt_with_an_empty_tool_use_id_carries_no_link() {
+        let mut wire = provider_prompt_wire(ProtoPermissionOrigin::ProviderPrompt as i32);
+        wire.tool_use_id = String::new();
+        match translate(wrap(ProtoEvent::PermissionRequested(wire))) {
+            Some(AgentDomainEvent::PermissionRequested {
+                tool_use_id,
+                provider_prompt,
+                ..
+            }) => {
+                assert_eq!(tool_use_id, None);
+                assert!(provider_prompt.is_some());
+            }
+            other => panic!("expected a PermissionRequested, got {other:?}"),
+        }
     }
 
     #[test]
@@ -590,35 +860,130 @@ mod tests {
         assert_eq!(translate(event), None);
     }
 
+    fn ready(permission_mode: &str) -> ProtoSessionEvent {
+        wrap(ProtoEvent::SessionReady(SessionReady {
+            session_id: "claude-1".into(),
+            provider_session_id: "claude-1".into(),
+            model: "m".into(),
+            cwd: "/tmp".into(),
+            permission_mode: permission_mode.into(),
+            ..Default::default()
+        }))
+    }
+
+    fn opened() -> AgentDomainEvent {
+        AgentDomainEvent::SessionOpened {
+            session_id: "sess-1".into(),
+            provider_session_id: "claude-1".into(),
+            model: "m".into(),
+            cwd: "/tmp".into(),
+        }
+    }
+
+    fn mode_changed(mode: ProtoPermissionMode, provider_mode: &str) -> ProtoSessionEvent {
+        wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged {
+            mode: mode as i32,
+            permission_mode: provider_mode.into(),
+            bypass_default_deny_applied: false,
+        }))
+    }
+
+    /// D12: a `SessionReady` whose CLI reports a mode less restrictive than `default` -- a project's
+    /// own `permissions.defaultMode`, most likely -- opened a session that must be closed. Both are
+    /// said, the opening first. An unknown value resolves toward stopping.
     #[test]
-    fn a_permission_mode_change_is_translated_and_an_unspecified_one_is_dropped() {
-        let event = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged {
-            mode: ProtoPermissionMode::Bypass as i32,
-            permission_mode: "bypassPermissions".into(),
-            bypass_default_deny_applied: false,
-        }));
+    fn a_session_ready_reporting_a_less_restrictive_mode_opens_and_trips() {
+        for reported in ["bypassPermissions", "acceptEdits", "auto", "weird"] {
+            assert_eq!(
+                super::translate(ready(reported)),
+                vec![
+                    opened(),
+                    AgentDomainEvent::UngatedCliMode {
+                        reported: reported.into(),
+                        detail: "SessionReady".into(),
+                    },
+                ],
+                "{reported}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_ready_in_default_a_stricter_mode_or_none_only_opens() {
+        for reported in ["default", "plan", "dontAsk", ""] {
+            assert_eq!(super::translate(ready(reported)), vec![opened()], "{reported:?}");
+        }
+    }
+
+    /// Nothing asks for a switch since R07, so a `PermissionModeChanged` is unsolicited: `default` is
+    /// the no-op it always folded to, and anything less restrictive -- by name, or the BYPASS enum
+    /// alone -- closes the session (D12).
+    #[test]
+    fn a_permission_mode_change_trips_unless_it_reports_default() {
         assert_eq!(
-            translate(event),
-            Some(AgentDomainEvent::PermissionModeChanged {
-                mode: crate::PermissionMode::Bypass,
-                provider_mode: "bypassPermissions".into(),
-                floor_applied: false,
-            })
+            super::translate(mode_changed(ProtoPermissionMode::Bypass, "bypassPermissions")),
+            vec![AgentDomainEvent::UngatedCliMode {
+                reported: "bypassPermissions".into(),
+                detail: "PermissionModeChanged".into(),
+            }]
         );
-        let interactive = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged {
-            mode: ProtoPermissionMode::Interactive as i32,
-            permission_mode: "default".into(),
-            bypass_default_deny_applied: false,
-        }));
-        assert!(matches!(
-            translate(interactive),
-            Some(AgentDomainEvent::PermissionModeChanged {
+        assert_eq!(
+            super::translate(mode_changed(ProtoPermissionMode::Interactive, "acceptEdits")),
+            vec![AgentDomainEvent::UngatedCliMode {
+                reported: "acceptEdits".into(),
+                detail: "PermissionModeChanged".into(),
+            }]
+        );
+        // A contradictory report fails closed on the enum.
+        assert_eq!(
+            super::translate(mode_changed(ProtoPermissionMode::Bypass, "default")),
+            vec![AgentDomainEvent::UngatedCliMode {
+                reported: "BYPASS".into(),
+                detail: "PermissionModeChanged".into(),
+            }]
+        );
+        assert_eq!(
+            super::translate(mode_changed(ProtoPermissionMode::Interactive, "default")),
+            vec![AgentDomainEvent::PermissionModeChanged {
                 mode: crate::PermissionMode::Auto,
-                ..
-            })
-        ));
+                provider_mode: "default".into(),
+                floor_applied: false,
+            }]
+        );
+        // UNSPECIFIED with nothing ungated about it is still dropped, loudly.
         let none = wrap(ProtoEvent::PermissionModeChanged(PermissionModeChanged::default()));
-        assert_eq!(translate(none), None);
+        assert_eq!(super::translate(none), vec![]);
+        // And UNSPECIFIED never hides an ungated name.
+        assert_eq!(
+            super::translate(mode_changed(ProtoPermissionMode::Unspecified, "bypassPermissions")),
+            vec![AgentDomainEvent::UngatedCliMode {
+                reported: "bypassPermissions".into(),
+                detail: "PermissionModeChanged".into(),
+            }]
+        );
+    }
+
+    /// Stricter and unreported modes are one line per session, not one per turn's `SessionReady`;
+    /// `default` and the tripping ones earn none here (the trip is `translate`'s).
+    #[test]
+    fn a_stricter_or_unreported_mode_is_noted_once_per_session() {
+        let mut note = CliModeNote::default();
+        assert_eq!(note.observe(&ready("default")), None);
+        assert_eq!(note.observe(&ready("bypassPermissions")), None);
+        let line = note
+            .observe(&ready("plan"))
+            .expect("the first stricter report is noted");
+        assert!(line.contains("'plan'") && line.contains("SessionReady"), "{line}");
+        assert_eq!(note.observe(&ready("plan")), None, "once per session");
+        assert_eq!(note.observe(&ready("")), None, "once per session, whatever the reason");
+
+        let mut fresh = CliModeNote::default();
+        let line = fresh.observe(&ready("")).expect("an unreported mode is noted too");
+        assert!(line.contains("no CLI permission mode"), "{line}");
+        let mut other = CliModeNote::default();
+        assert!(other
+            .observe(&mode_changed(ProtoPermissionMode::Interactive, "dontAsk"))
+            .is_some_and(|l| l.contains("PermissionModeChanged")));
     }
 
     #[test]

@@ -8,9 +8,9 @@
 //! `neovibe_core::tab_set::TabSet`; this module spawns the workers that set only holds receivers
 //! for, drains every tab on one 33 ms tick, and routes each inbound command to the tab it names --
 //! never to "the active one" (spec §3.8 point 2). Backend construction is lazy per tab: an empty
-//! tab starts its backend on its first `send_message` (or a `resume`), with that tab's own mode --
-//! `PermissionMode` is a construction-time-only choice on the real `agent` API (no live mode-switch
-//! exists). Which backend gets built is `neovibe_core::agent_backend`'s decision.
+//! tab starts its backend on its first `send_message` (or a `resume`). No mode goes into it (R07,
+//! 2026-09-27): every session is gated, and the tab's own mode is read where requests are answered,
+//! never sent to the CLI. Which backend gets built is `neovibe_core::agent_backend`'s decision.
 //!
 //! **State is server-originated.** For the sidecar backend this module folds nothing of its own:
 //! `active_turn_id`, tool calls and permissions all arrive as real events through `pump()`. A
@@ -28,7 +28,7 @@ use neovibe_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, B
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
     serialize_hello_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage,
-    NavKeyDirection, PanelKeys, SessionModeChoice, TabVerbWire,
+    NavKeyDirection, PanelKeys, TabVerbWire,
 };
 use neovibe_core::keymap::TabAction;
 use neovibe_core::layout::Direction;
@@ -745,6 +745,13 @@ impl AgentPanelHandle {
     /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
     pub(crate) fn set_pane_focused(&self, focused: bool) {
         self.state.borrow_mut().pane_focused = focused;
+        if !focused {
+            // Spec §3.3/§3.4: a pending bypass prompt is about the tab the user was just looking
+            // at. Losing the keys entirely (focus moved to another module, e.g. the editor or the
+            // terminal) must drop it, the same way switching tabs already does (`TabSet::select`),
+            // so a `y` that slips through afterwards lands on nothing.
+            self.state.borrow_mut().tabs.drop_bypass_prompt();
+        }
         self.dispatch(
             neovibe_core::agent_bridge::serialize_pane_focus_for_js(focused),
             "pane focus",
@@ -756,6 +763,7 @@ impl AgentPanelHandle {
     /// the page loads (the dispatch is guarded), in which case there is no composer yet and nothing
     /// happens.
     pub(crate) fn enter_input(&self) {
+        self.drop_bypass_prompt();
         self.dispatch(
             neovibe_core::agent_bridge::serialize_enter_input_for_js(),
             "enter-input",
@@ -768,7 +776,20 @@ impl AgentPanelHandle {
     /// decision 4: reverses 2026-09-19's "control l直接闪cursor"). Mirrors `enter_input` exactly
     /// except for the envelope it dispatches; safe before the page loads for the same reason.
     pub(crate) fn arrive(&self) {
+        self.drop_bypass_prompt();
         self.dispatch(neovibe_core::agent_bridge::serialize_arrive_for_js(), "arrive");
+    }
+
+    /// Spec §3.3/§3.4: every keyboard route GTK claims before the WebView sees a key is a route away
+    /// from a bypass prompt. The panel cancels its own copy on the matching envelope; this drops
+    /// Rust's, so a `y` that slipped through is refused by the nonce. v1-mode fix round 1 (the
+    /// whole-branch review, blocking): HINT (`prefix f`) and `prefix ,` left the prompt open, and the
+    /// next ordinary key -- the `y` that copies a code block HINT landed on, a name starting with
+    /// `y` -- entered bypass and approved the waiting cards. The same now holds for `arrive`,
+    /// `enter_input`, `nav_key`, `literal_key`, `prefix ?`, `prefix i`, `prefix &`, `<leader>bo` and
+    /// a card landing, besides `pane_focus false` and the tab switches that already dropped it.
+    fn drop_bypass_prompt(&self) {
+        self.state.borrow_mut().tabs.drop_bypass_prompt();
     }
 
     /// C1's mirror (spec §3.5): the page's last-reported effective mode, for `main.rs`'s
@@ -782,6 +803,7 @@ impl AgentPanelHandle {
     /// `Ctrl+k` claimed in INPUT. Safe before the page loads for the same reason `arrive` is --
     /// there is no live mirror yet, so `main.rs`'s intercept never calls this before one exists.
     pub(crate) fn nav_key(&self, direction: NavKeyDirection) {
+        self.drop_bypass_prompt();
         self.dispatch(serialize_nav_key_for_js(direction), "nav-key");
     }
 
@@ -794,6 +816,7 @@ impl AgentPanelHandle {
 
     /// `send-prefix`/`send-keys` with the panel holding the keys (keymap spec §2.6).
     pub(crate) fn literal_key(&self, key: &neovibe_core::keymap::KeySpec) {
+        self.drop_bypass_prompt();
         self.dispatch(
             neovibe_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()),
             "literal-key",
@@ -802,6 +825,7 @@ impl AgentPanelHandle {
 
     /// `prefix ?`: open the `?` overlay.
     pub(crate) fn open_keymap(&self) {
+        self.drop_bypass_prompt();
         self.dispatch(
             neovibe_core::agent_bridge::serialize_open_keymap_for_js(),
             "open-keymap",
@@ -812,6 +836,7 @@ impl AgentPanelHandle {
     /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
     /// drives the session, this handle only relays it to the WebView.
     pub(crate) fn hint_collect(&self, session_id: u64) {
+        self.drop_bypass_prompt();
         self.dispatch(
             neovibe_core::agent_bridge::serialize_hint_collect_for_js(session_id),
             "hint collect",
@@ -937,6 +962,7 @@ impl AgentPanelHandle {
         if self.closing() {
             return;
         }
+        self.drop_bypass_prompt();
         let payload = {
             let state = self.state.borrow();
             let tab = state.tabs.active_tab();
@@ -950,6 +976,8 @@ impl AgentPanelHandle {
         if self.closing() {
             return;
         }
+        // The panel's close prompt replaces a bypass prompt on screen; Rust's copy goes with it.
+        self.drop_bypass_prompt();
         let payload = {
             let state = self.state.borrow();
             let active = state.tabs.active();
@@ -970,6 +998,7 @@ impl AgentPanelHandle {
         if self.closing() {
             return;
         }
+        self.drop_bypass_prompt();
         let Some((tabs, prompt)) = self.state.borrow().tabs.close_others_plan() else {
             return;
         };
@@ -982,6 +1011,10 @@ impl AgentPanelHandle {
         if self.closing() {
             return;
         }
+        // Spec §3.4: opening the chooser is one of the routes that cancels an outstanding bypass
+        // prompt -- it was about the tab the user is leaving to see this list. A fresh one raised
+        // from inside the chooser (its own Shift+Tab) makes its own plan afterwards, unaffected.
+        self.state.borrow_mut().tabs.drop_bypass_prompt();
         let payload = chooser_payload(&self.state.borrow());
         self.dispatch(payload, "chooser");
     }
@@ -991,6 +1024,7 @@ impl AgentPanelHandle {
         if self.closing() {
             return;
         }
+        self.drop_bypass_prompt();
         let payload = {
             let state = self.state.borrow();
             detail_payload(&state, state.tabs.active())
@@ -1010,6 +1044,9 @@ impl AgentPanelHandle {
                 return false;
             };
             state.tabs.select(target);
+            // A landing on a card is a route away (spec §3.4) even when it names the tab already on
+            // screen, which `select` alone does not treat as a move.
+            state.tabs.drop_bypass_prompt();
             target
         };
         send_switch(&self.state, &self.webview);
@@ -1306,7 +1343,7 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully.
-        let (payload, first_text, turn_ended, offers_changed) = {
+        let (payload, first_text, turn_ended, offers_changed, tripped) = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -1345,8 +1382,24 @@ fn start_pump_timer(state: Rc<RefCell<AgentPanelState>>, webview: WebView) {
             if let Some(supervisor) = state_ref.supervisor.as_mut() {
                 supervisor.send_status(status);
             }
-            (out.active_payload, out.first_text, out.turn_ended, out.offers_changed)
+            (
+                out.active_payload,
+                out.first_text,
+                out.turn_ended,
+                out.offers_changed,
+                out.tripped,
+            )
         };
+        // The CLI-mode tripwire failed these tabs (spec §2.3, D12): each session is shut down off
+        // this thread, as a closed tab's is, and the shutdown denies what is still pending in it.
+        // The active one also says why, as a session that never opened does.
+        for tripped in tripped {
+            let active = state.borrow().tabs.active() == tripped.tab;
+            state.borrow_mut().retiring.backend(tripped.backend);
+            if active {
+                evaluate_js_dispatch(&webview, &serialize_error_for_js(tripped.tab, &tripped.reason));
+            }
+        }
         if let Some(payload) = payload {
             evaluate_js_dispatch(&webview, &payload);
             // Stamped after the dispatch call, which is where the WebView's own clock starts.
@@ -1726,7 +1779,7 @@ fn detail_rows(
         ("name", known(tab.name.clone())),
         ("title", known(tab.title.clone())),
         ("state", tab.wire_state().as_str().to_string()),
-        ("mode", tab.mode.as_str().to_string()),
+        ("mode", tab.mode().as_str().to_string()),
         ("model", known(model)),
         ("backend", kind.as_str().to_string()),
         ("account", known(account.map(str::to_string))),
@@ -1759,12 +1812,11 @@ fn detail_rows(
 fn spawn_connect(
     kind: BackendKind,
     project_dir: PathBuf,
-    mode: SessionModeChoice,
     resume: Option<String>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = AgentBackend::start(kind, &project_dir, mode.into(), resume.as_deref());
+        let result = AgentBackend::start(kind, &project_dir, resume.as_deref());
         // The receiver is gone only if the tab or the panel was torn down mid-connect; dropping
         // the backend here is then the cleanup (`Retiring` normally holds the receiver instead).
         let _ = result_tx.send(result);
@@ -2113,6 +2165,72 @@ fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool
 }
 
 /// D7's `remember` (ruling 16): the rule Rust offered for `permission_id`, only with an allow.
+/// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
+struct PermissionAnswer {
+    permission_id: String,
+    decision: neovibe_core::agent_bridge::DecisionChoice,
+    reason: Option<String>,
+    remember: bool,
+}
+
+impl PermissionAnswer {
+    fn of(message: InboundMessage) -> Option<Self> {
+        match message {
+            InboundMessage::PermissionResponse {
+                permission_id,
+                decision,
+                reason,
+                remember,
+                ..
+            } => Some(PermissionAnswer {
+                permission_id,
+                decision,
+                reason,
+                remember,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Everything a `permission_response` does, with no WebView, so its route is tested whole (O3 review
+/// #4): the rule the card offered is saved first when the user chose "Always allow" (never taken
+/// from the panel, ruling 16), then the answer goes through `TabSet::answer_card` -- the one route
+/// that records a human approval, which is what lets the CLI's own prompt for the same call through
+/// without a second card (O3 ruling 5). `Err` is a refusal the panel shows (the card stays and `a`
+/// still works); `Ok` is the answer's own outcome.
+fn answer_permission_response(
+    tabs: &mut neovibe_core::tab_set::TabSet,
+    rules_dir: Option<&Path>,
+    project_dir: &Path,
+    tab: TabId,
+    answer: PermissionAnswer,
+) -> Result<Result<Vec<agent::AgentDomainEvent>, BackendError>, String> {
+    let remembered = {
+        let t = tabs.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
+        rule_to_remember(t, &answer.permission_id, answer.decision, answer.remember).map_err(str::to_string)?
+    };
+    if let Some(rule) = remembered {
+        let Some(dir) = rules_dir else {
+            return Err("no state directory: the rule cannot be saved".to_string());
+        };
+        match neovibe_core::permission_store::add(dir, project_dir, &rule) {
+            Ok(rules) => {
+                eprintln!(
+                    "[permission] rule saved: {} ({})",
+                    rule.to_rule_string(),
+                    neovibe_core::permission_store::path(dir, project_dir).display()
+                );
+                tabs.set_rules(rules);
+            }
+            // Not answered: the card stays and `a` still works (ruling 16).
+            Err(e) => return Err(format!("could not save the rule: {e}")),
+        }
+    }
+    let decision = answer.decision.into_decision(answer.reason);
+    Ok(tabs.answer_card(tab, &answer.permission_id, decision))
+}
+
 fn rule_to_remember(
     tab: &Tab,
     permission_id: &str,
@@ -2161,6 +2279,27 @@ fn events_owed(
     }
 }
 
+/// The `events` envelope for a batch a backend RETURNED (folded into its own projection already)
+/// rather than delivered through the pump: legacy's synthesized events, a refused send's folded
+/// prompt, and -- since v1-mode fix round 1 -- the `PermissionResolved`s entering bypass produced on
+/// legacy (`ConfirmOutcome::Entered::resolved`), which no pump ever carries. `None` for an empty
+/// batch, or for a tab that is not the active one: the WebView draws only that tab, and a background
+/// tab catches up with a snapshot when it is switched to. The revisions are the projection's, as the
+/// events were folded into it one each, just now, on this thread.
+fn returned_events_payload(state: &AgentPanelState, tab: TabId, events: &[agent::AgentDomainEvent]) -> Option<String> {
+    if events.is_empty() || state.tabs.active() != tab {
+        return None;
+    }
+    let through_revision = state
+        .tabs
+        .get(tab)
+        .and_then(|t| t.live())
+        .map(|b| b.projection().last_revision)
+        .unwrap_or(0);
+    let from_revision = through_revision.saturating_sub(events.len() as u64);
+    Some(serialize_events_for_js(tab, from_revision, through_revision, events))
+}
+
 /// Applies one command's outcome to its tab and the frontend, uniformly.
 ///
 /// The benign/fatal split is the whole point: a benign failure (a turn sent while one was running,
@@ -2190,25 +2329,12 @@ fn apply_outcome(
 ) {
     let events = events_owed(&outcome);
     let active = state.borrow().tabs.active() == tab;
-    if !events.is_empty() && active {
-        // Only the legacy backend ever gets here with a non-empty batch: it synthesizes events its
-        // own wire protocol cannot provide. The sidecar backend returns an empty vec and its state
-        // arrives through the pump, from the server.
-        let through_revision = {
-            let state_ref = state.borrow();
-            let revision = state_ref
-                .tabs
-                .get(tab)
-                .and_then(|t| t.live())
-                .map(|b| b.projection().last_revision)
-                .unwrap_or(0);
-            revision
-        };
-        let from_revision = through_revision.saturating_sub(events.len() as u64);
-        evaluate_js_dispatch(
-            webview,
-            &serialize_events_for_js(tab, from_revision, through_revision, events),
-        );
+    // Only the legacy backend ever gets here with a non-empty batch: it synthesizes events its own
+    // wire protocol cannot provide. The sidecar backend returns an empty vec and its state arrives
+    // through the pump, from the server.
+    let payload = returned_events_payload(&state.borrow(), tab, events);
+    if let Some(payload) = payload {
+        evaluate_js_dispatch(webview, &payload);
     }
     match outcome {
         Ok(_) => {
@@ -2382,7 +2508,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                             Plan::Sent(outcome)
                         }
                         TabBackend::NotStarted => {
-                            let result_rx = spawn_connect(kind, project_dir, t.mode, None);
+                            let result_rx = spawn_connect(kind, project_dir, None);
                             t.backend = TabBackend::Starting(PendingStart {
                                 request_id: request_id.clone(),
                                 result_rx,
@@ -2456,7 +2582,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                             .tabs
                             .get_mut(target_tab)
                             .expect("route_resume names a tab it has");
-                        let result_rx = spawn_connect(kind, project_dir, t.mode, Some(provider_session_id.clone()));
+                        let result_rx = spawn_connect(kind, project_dir, Some(provider_session_id.clone()));
                         t.backend = TabBackend::Starting(PendingStart {
                             request_id: request_id.clone(),
                             result_rx,
@@ -2478,48 +2604,24 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             let outcome = backend_for(&mut state.borrow_mut().tabs, tab).and_then(|backend| backend.interrupt());
             apply_command_outcome(state, webview, tab, &request_id, outcome);
         }
-        InboundMessage::PermissionResponse {
-            permission_id,
-            decision,
-            reason,
-            remember,
-            ..
-        } => {
+        message @ InboundMessage::PermissionResponse { .. } => {
             let tab = tab_of(target);
-            let remembered = {
-                let state_ref = state.borrow();
-                let t = state_ref.tabs.get(tab).expect("resolved above");
-                rule_to_remember(t, &permission_id, decision, remember)
+            let answer = PermissionAnswer::of(message).expect("matched as a permission_response above");
+            let (rules_dir, project_dir) = {
+                let s = state.borrow();
+                (s.rules_dir.clone(), s.project_dir.clone())
             };
-            match remembered {
-                Err(why) => return refuse(webview, why),
-                Ok(Some(rule)) => {
-                    let (dir, root) = {
-                        let s = state.borrow();
-                        (s.rules_dir.clone(), s.project_dir.clone())
-                    };
-                    let Some(dir) = dir else {
-                        return refuse(webview, "no state directory: the rule cannot be saved");
-                    };
-                    match neovibe_core::permission_store::add(&dir, &root, &rule) {
-                        Ok(rules) => {
-                            eprintln!(
-                                "[permission] rule saved: {} ({})",
-                                rule.to_rule_string(),
-                                neovibe_core::permission_store::path(&dir, &root).display()
-                            );
-                            state.borrow_mut().tabs.set_rules(rules);
-                        }
-                        // Not answered: the card stays and `a` still works (ruling 16).
-                        Err(e) => return refuse(webview, &format!("could not save the rule: {e}")),
-                    }
-                }
-                Ok(None) => {}
+            let answered = answer_permission_response(
+                &mut state.borrow_mut().tabs,
+                rules_dir.as_deref(),
+                &project_dir,
+                tab,
+                answer,
+            );
+            match answered {
+                Err(why) => refuse(webview, &why),
+                Ok(outcome) => apply_command_outcome(state, webview, tab, &request_id, outcome),
             }
-            let decision = decision.into_decision(reason);
-            let outcome = backend_for(&mut state.borrow_mut().tabs, tab)
-                .and_then(|backend| backend.respond_permission(&permission_id, decision));
-            apply_command_outcome(state, webview, tab, &request_id, outcome);
         }
         InboundMessage::HintRequest { .. } => {
             // Cloned out of the borrow before calling: the hook calls back into this handle,
@@ -2613,6 +2715,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             // provider's session.
             let taken = {
                 let mut state_ref = state.borrow_mut();
+                // The whole-branch review (gate): the tab becomes `NotStarted` under whatever bypass
+                // prompt was open for it -- a live tab's `切到 bypass？` whose `y` would then also
+                // have moved the window default (spec §7.2). Reached by clicks that never pass
+                // through the panel's y/n, so it is dropped here; `confirm_bypass`'s own re-check of
+                // which question was asked is the other half.
+                state_ref.tabs.drop_bypass_prompt();
                 let t = state_ref.tabs.get_mut(tab).expect("resolved above");
                 match std::mem::replace(&mut t.backend, TabBackend::NotStarted) {
                     TabBackend::Live(backend) => Some(backend),
@@ -2700,41 +2808,56 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
                 Err(why) => refuse(webview, &why),
             }
         }
+        // R07/S2, Task 2: `TabSet::cycle_mode` now returns a `Result<ModeCycle, String>` -- a live,
+        // active tab can toggle too (D6), not only an empty one, so `Ok(Changed(_))` here no longer
+        // means "was empty". `was_empty` is read BEFORE the call so the persisted "next launch"
+        // default (ruling 5) is written only for the tab whose move that preference is actually
+        // about. Task 3, D2: `Confirm(plan)` dispatches the real y/n prompt rather than refusing --
+        // `apply_confirm_bypass`, below, is what a later `confirm_bypass` message answers it with.
         InboundMessage::CycleMode { .. } => {
             let tab = tab_of(target);
-            let cycled = state.borrow_mut().tabs.cycle_mode(tab);
-            match cycled {
-                Some(mode) => {
-                    let (prefs_dir, project_dir) = {
-                        let state_ref = state.borrow();
-                        (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
-                    };
-                    // Remembered for the next empty tab and the next launch (ruling 5). A failure
-                    // to write is logged, not refused: the mode itself did change.
-                    if let Some(dir) = prefs_dir {
-                        if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
-                            eprintln!("[agent_panel] could not remember the permission mode: {e}");
+            let was_empty = matches!(
+                state.borrow().tabs.get(tab).map(|t| &t.backend),
+                Some(TabBackend::NotStarted)
+            );
+            // Bound as its own statement, not the match scrutinee: edition 2021 keeps a match
+            // scrutinee's temporaries alive for the whole match, so `state.borrow_mut()` here would
+            // otherwise still hold the `RefCell`'s mutable borrow while the `Changed` arm below calls
+            // `send_tabs`, which itself needs `state.borrow_mut()` -- a reproducible panic ("already
+            // borrowed") once a tab could actually reach `Changed` by leaving bypass.
+            let outcome = state.borrow_mut().tabs.cycle_mode(tab);
+            match outcome {
+                Ok(neovibe_core::tab_set::ModeCycle::Changed(mode)) => {
+                    if was_empty {
+                        let (prefs_dir, project_dir) = {
+                            let state_ref = state.borrow();
+                            (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
+                        };
+                        // Remembered for the next empty tab and the next launch (ruling 5). A
+                        // failure to write is logged, not refused: the mode itself did change.
+                        if let Some(dir) = prefs_dir {
+                            if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
+                                eprintln!("[agent_panel] could not remember the permission mode: {e}");
+                            }
                         }
                     }
                     send_tabs(state, webview);
                     ok(webview);
                 }
-                None => {
-                    // A started tab: switch it when its sidecar can (wave 5), else the old refusal. The
-                    // borrow ends before `send_tabs`, which borrows again. Nothing is remembered (W2).
-                    let switched = state.borrow_mut().tabs.switch_mode(tab);
-                    match switched {
-                        Ok(_) => {
-                            send_tabs(state, webview);
-                            ok(webview);
-                        }
-                        Err(why) => refuse(webview, &why),
-                    }
+                Ok(neovibe_core::tab_set::ModeCycle::Confirm(plan)) => {
+                    evaluate_js_dispatch(
+                        webview,
+                        &neovibe_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
+                    );
+                    ok(webview);
                 }
+                Err(why) => refuse(webview, &why),
             }
         }
         InboundMessage::OpenDetail { .. } => {
             let tab = tab_of(target);
+            // A route away from a bypass prompt (spec §3.4; the panel cancels its own on `tab_detail`).
+            state.borrow_mut().tabs.drop_bypass_prompt();
             let payload = detail_payload(&state.borrow(), tab);
             evaluate_js_dispatch(webview, &payload);
             ok(webview);
@@ -2891,10 +3014,21 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
         },
         InboundMessage::CycleDefaultMode { .. } => {
             // `Shift+Tab` on the chooser's `New session` row or a record (spec §6.3): the window's
-            // remembered default, exactly as `CycleMode` remembers a tab's own mode above.
-            cycle_default_mode(state);
-            send_tabs(state, webview);
-            ok(webview);
+            // remembered default, exactly as `CycleMode` remembers a tab's own mode above. `Confirm`
+            // dispatches the same y/n prompt (D2), answered by a later `confirm_bypass` message.
+            match cycle_default_mode(state) {
+                neovibe_core::tab_set::ModeCycle::Changed(_) => {
+                    send_tabs(state, webview);
+                    ok(webview);
+                }
+                neovibe_core::tab_set::ModeCycle::Confirm(plan) => {
+                    evaluate_js_dispatch(
+                        webview,
+                        &neovibe_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
+                    );
+                    ok(webview);
+                }
+            }
         }
         InboundMessage::CloseOthers { .. } => {
             // `y` to `confirm_close_others` (Owner answers Q2): recomputed fresh rather than
@@ -2927,25 +3061,89 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             Ok(()) => ok(webview),
             Err(why) => refuse(webview, why),
         },
+        // R07/S2, Task 3: `y`/`Y` to the band's bypass prompt. D11's typed-input guard (the 250ms
+        // `TYPING_GUARD_MS` rule, cancelling on every route away) is enforced client-side (spec
+        // §3.4) -- this only re-validates the facts §3.3 names (the nonce, the active tab, exactly
+        // the delivered cards still pending) via `apply_confirm_bypass`/`TabSet::confirm_bypass`,
+        // which is where all of that is actually checked.
+        InboundMessage::ConfirmBypass { tab, scope, nonce, .. } => match scope.scope(tab) {
+            Err(why) => refuse(webview, &why),
+            Ok(scope) => {
+                let before = state.borrow().tabs.attention();
+                match apply_confirm_bypass(state, scope, nonce) {
+                    Ok(neovibe_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
+                        // Codex v1-mode finding 1: on legacy the approved cards' resolutions exist
+                        // only here (its CLI reports nothing for a hook reply), so without this the
+                        // cards stayed drawn and counted as waiting until the next snapshot. A tab
+                        // scope is always the active tab (`confirm_bypass` refuses any other); the
+                        // window-default scope approves nothing, so `resolved` is empty there.
+                        let payload = {
+                            let state_ref = state.borrow();
+                            let active = state_ref.tabs.active();
+                            returned_events_payload(&state_ref, active, &resolved)
+                        };
+                        if let Some(payload) = payload {
+                            evaluate_js_dispatch(webview, &payload);
+                        }
+                        send_tabs(state, webview);
+                        // The cards `confirm_bypass` just approved leave the tray at once, rather
+                        // than waiting for a later poll to notice `attention()` dropped.
+                        report_attention(state, before);
+                        ok(webview);
+                    }
+                    Ok(neovibe_core::tab_set::ConfirmOutcome::AlreadyBypass) => {
+                        send_tabs(state, webview);
+                        ok(webview);
+                    }
+                    Ok(neovibe_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
+                        // D7: a card arrived while the prompt was up -- nothing changed, and the
+                        // panel is shown the fresh count under a fresh nonce instead.
+                        evaluate_js_dispatch(
+                            webview,
+                            &neovibe_core::agent_bridge::serialize_confirm_bypass_for_js(&plan),
+                        );
+                        ok(webview);
+                    }
+                    Err(why) => refuse(webview, &why),
+                }
+            }
+        },
     }
 }
 
-/// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default, exactly as
-/// `CycleMode`'s arm above does for a tab's own mode -- a failure to write is logged, not refused,
-/// since the mode itself did change. Never touches the WebView, so it is tested directly; the arm
-/// above owns `send_tabs`.
-fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> SessionModeChoice {
-    let mode = state.borrow_mut().tabs.cycle_default_mode();
-    let (prefs_dir, project_dir) = {
-        let state_ref = state.borrow();
-        (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
-    };
-    if let Some(dir) = prefs_dir {
-        if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
-            eprintln!("[agent_panel] could not remember the permission mode: {e}");
+/// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default on
+/// `Changed(Auto)` only -- D3: bypass is never written, and a `Confirm` is not persisted here
+/// either (only actually entering bypass, via `apply_confirm_bypass` below, ever could -- and D3
+/// forbids that too). A failure to write is logged, not refused, since the mode itself did change.
+/// Never touches the WebView, so it is tested directly; the arm above owns `send_tabs` and
+/// dispatching the prompt.
+fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> neovibe_core::tab_set::ModeCycle {
+    let outcome = state.borrow_mut().tabs.cycle_default_mode();
+    if let neovibe_core::tab_set::ModeCycle::Changed(mode) = outcome {
+        let (prefs_dir, project_dir) = {
+            let state_ref = state.borrow();
+            (state_ref.prefs_dir.clone(), state_ref.project_dir.clone())
+        };
+        if let Some(dir) = prefs_dir {
+            if let Err(e) = neovibe_core::agent_prefs::save_mode(&dir, &project_dir, mode) {
+                eprintln!("[agent_panel] could not remember the permission mode: {e}");
+            }
         }
     }
-    mode
+    outcome
+}
+
+/// `confirm_bypass`: the `ConfirmBypass` arm's WebView-free body, the same split `cycle_default_mode`
+/// gets above. `TabSet::confirm_bypass` does all of the checking (D7's re-check against exactly the
+/// delivered cards, the nonce, the active tab, ended/failed) and D3 forbids ever writing bypass to
+/// disk, so there is nothing else for this wrapper to do -- it exists so a test can drive the exact
+/// call the arm makes without a WebView, the same way `cycle_default_mode` can.
+fn apply_confirm_bypass(
+    state: &Rc<RefCell<AgentPanelState>>,
+    scope: neovibe_core::tab_set::BypassScope,
+    nonce: u64,
+) -> Result<neovibe_core::tab_set::ConfirmOutcome, String> {
+    state.borrow_mut().tabs.confirm_bypass(scope, nonce)
 }
 
 /// `tab_verb`: the hook `main.rs` installs via `on_tab_verb` (`run_tab_action`, panel round 2 plan
@@ -3176,6 +3374,7 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 mod tests {
     use super::*;
 
+    use neovibe_core::agent_bridge::SessionModeChoice;
     use neovibe_core::tab_set::{TabBackend, TabSet};
     use neovibe_core::tabs::TabId;
     use neovibe_core::test_providers::RecordingProvider;
@@ -3268,8 +3467,7 @@ mod tests {
 
     fn live_backend(dir: &std::path::Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation =
-            agent::AgentConversation::create(provider.clone(), dir, agent::PermissionMode::Auto).unwrap();
+        let conversation = agent::AgentConversation::create(provider.clone(), dir).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -3297,6 +3495,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while set.get(asking).unwrap().attention.attention().pending != 1 {
@@ -3311,11 +3510,87 @@ mod tests {
         ))
         .unwrap();
         let tab = set.resolve(message.tab_ref()).unwrap().unwrap();
-        let outcome = backend_for(&mut set, tab)
-            .and_then(|backend| backend.respond_permission("perm-1", agent::PermissionDecision::Allow));
-        assert!(outcome.is_ok());
+        // The production route itself (`InboundMessage::PermissionResponse`'s whole body).
+        let outcome = answer_permission_response(&mut set, None, &dir, tab, PermissionAnswer::of(message).unwrap());
+        assert!(
+            matches!(outcome, Ok(Ok(_))),
+            "{:?}",
+            outcome.map(|r| r.map_err(|e| e.message))
+        );
         assert_eq!(asking_provider.resolutions(), vec![("perm-1".to_string(), true)]);
         assert!(other_provider.resolutions().is_empty(), "never the active tab");
+        for mut tab in set.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// O3 review #4: the panel's own `permission_response` route records the human's approval, so the
+    /// CLI's own prompt for the same call that follows it is answered without a second card (ruling
+    /// 5). Were the route to answer the backend directly, this would be a second card.
+    #[test]
+    fn the_panels_approve_route_lets_the_clis_own_prompt_for_that_call_through() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-o3-approve-route");
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        let (provider, backend) = live_backend(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input = serde_json::json!({ "file_path": ".git/probe2", "content": "o3" });
+        provider.queue(agent::AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-hook".into(),
+            tool_use_id: Some("toolu_route".into()),
+            tool_name: "Write".into(),
+            input: input.clone(),
+            provider_prompt: None,
+        });
+        let pump_until = |set: &mut TabSet, what: &str, done: &dyn Fn(&TabSet) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !done(set) {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                set.pump(&dir, true);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        pump_until(&mut set, "the gate's card", &|set| {
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+
+        let message = parse_inbound_message(&format!(
+            r#"{{"type":"permission_response","request_id":"r","tab":{},"permission_id":"perm-hook","decision":"allow"}}"#,
+            tab.0
+        ))
+        .unwrap();
+        let tab = set.resolve(message.tab_ref()).unwrap().unwrap();
+        let outcome = answer_permission_response(&mut set, None, &dir, tab, PermissionAnswer::of(message).unwrap());
+        assert!(matches!(outcome, Ok(Ok(_))));
+
+        provider.queue(agent::AgentDomainEvent::PermissionResolved {
+            permission_id: "perm-hook".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
+        provider.queue(agent::AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-cli".into(),
+            tool_use_id: Some("toolu_route".into()),
+            tool_name: "Write".into(),
+            input,
+            provider_prompt: Some(agent::ProviderPrompt {
+                reason: Some("Claude requested permissions to edit .git/probe2 which is a sensitive file.".into()),
+                ..Default::default()
+            }),
+        });
+        let answered = |_: &TabSet| provider.resolutions().len() == 2;
+        pump_until(&mut set, "the CLI's own prompt answered", &answered);
+        assert_eq!(provider.resolutions()[1], ("perm-cli".to_string(), true));
+        assert_eq!(
+            set.get(tab).unwrap().attention.attention().arrived,
+            1,
+            "one card for the call"
+        );
         for mut tab in set.take_all() {
             if let TabBackend::Live(backend) = &mut tab.backend {
                 backend.shutdown();
@@ -3546,11 +3821,12 @@ mod tests {
         }
     }
 
-    /// Panel round 2 plan Task 6, spec §6.3: `CycleDefaultMode` moves the window's remembered
-    /// default (not any open tab's own mode -- `tab_set`'s own test already pins that half) and
-    /// remembers it on disk exactly as `CycleMode`'s arm does, readable back by `load_mode`.
+    /// **Correction (R07/S2, D3):** the old version of this test asserted bypass remembered on
+    /// disk, which D3 forbids and which `save_mode` now refuses outright. Auto -> bypass
+    /// always asks first (D2) and writes nothing either way; only leaving bypass (always to Auto,
+    /// which D3 allows) is ever remembered.
     #[test]
-    fn cycle_default_mode_moves_the_default_and_remembers_it_on_disk() {
+    fn cycle_default_mode_moves_the_default_and_remembers_auto_only_on_disk() {
         let dir = agent::state_dirs::test_workspace_dir("panel-cycle-default-mode");
         let prefs_dir = dir.join("prefs");
         let project_dir = dir.join("project");
@@ -3561,19 +3837,49 @@ mod tests {
         state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
         state.borrow_mut().project_dir = project_dir.clone();
 
-        let mode = cycle_default_mode(&state);
+        let plan = match cycle_default_mode(&state) {
+            neovibe_core::tab_set::ModeCycle::Confirm(plan) => plan,
+            other => panic!("auto -> bypass must ask first: {other:?}"),
+        };
         assert_eq!(
-            mode,
-            SessionModeChoice::Bypass,
-            "Auto -> Bypass is the only other implemented mode"
+            state.borrow().tabs.default_mode(),
+            SessionModeChoice::Auto,
+            "nothing moved yet"
         );
-        assert_eq!(state.borrow().tabs.default_mode(), mode);
+        assert_eq!(
+            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            neovibe_core::agent_prefs::LoadedMode::Missing,
+            "nothing on disk yet"
+        );
+
+        // Confirming is `apply_confirm_bypass`'s job (Task 3), which is `TabSet::confirm_bypass`
+        // and nothing else -- it moves the in-memory default and still writes nothing (D3).
+        assert_eq!(
+            apply_confirm_bypass(&state, plan.scope, plan.nonce),
+            Ok(neovibe_core::tab_set::ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+        assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Bypass);
         // Never the open tab's own mode (still `NotStarted`, so `cycle_mode` alone would move it;
-        // `cycle_default_mode` must not).
+        // `confirm_bypass(Default, ..)` must not).
         assert_eq!(set_mode(&state, open_tab), SessionModeChoice::Auto);
         assert_eq!(
             neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
-            neovibe_core::agent_prefs::LoadedMode::Remembered(mode)
+            neovibe_core::agent_prefs::LoadedMode::Missing,
+            "still nothing on disk while bypass"
+        );
+
+        // Leaving bypass moves at once and IS remembered -- it is Auto, which D3 allows.
+        assert_eq!(
+            cycle_default_mode(&state),
+            neovibe_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
+        );
+        assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Auto);
+        assert_eq!(
+            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            neovibe_core::agent_prefs::LoadedMode::Remembered(SessionModeChoice::Auto)
         );
     }
 
@@ -3581,7 +3887,101 @@ mod tests {
     /// `TabSet::cycle_mode` (which would change it): a thin accessor so the test above can assert
     /// on the untouched tab without reaching into a private field from two call sites.
     fn set_mode(state: &Rc<RefCell<AgentPanelState>>, tab: TabId) -> SessionModeChoice {
-        state.borrow().tabs.get(tab).unwrap().mode
+        state.borrow().tabs.get(tab).unwrap().mode()
+    }
+
+    /// D2/D3: `apply_confirm_bypass` -- the `ConfirmBypass` arm's WebView-free body -- moves a
+    /// TAB's own mode (not only the window default the test above covers) and, like every path into
+    /// bypass, never writes it to the prefs dir either way.
+    #[test]
+    fn apply_confirm_bypass_moves_a_live_tabs_mode_and_never_touches_prefs() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-apply-confirm-bypass-tab");
+        let prefs_dir = dir.join("prefs");
+        let project_dir = dir.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        let state = state_for_hooks(set);
+        state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
+        state.borrow_mut().project_dir = project_dir.clone();
+
+        let plan = match state.borrow_mut().tabs.cycle_mode(tab) {
+            Ok(neovibe_core::tab_set::ModeCycle::Confirm(plan)) => plan,
+            other => panic!("an empty auto tab must ask first: {other:?}"),
+        };
+        assert_eq!(
+            apply_confirm_bypass(&state, plan.scope, plan.nonce),
+            Ok(neovibe_core::tab_set::ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+        assert_eq!(set_mode(&state, tab), SessionModeChoice::Bypass);
+        assert_eq!(
+            neovibe_core::agent_prefs::load_mode(&prefs_dir, &project_dir),
+            neovibe_core::agent_prefs::LoadedMode::Missing,
+            "D3: bypass is never written, even the one apply_confirm_bypass itself enters"
+        );
+    }
+
+    /// Codex v1-mode finding 1: entering bypass on a legacy tab approves its waiting cards through
+    /// `respond_permission`, whose `PermissionResolved` exists nowhere but in what it returns (the CLI
+    /// reports nothing for a hook reply). `ConfirmOutcome::Entered::resolved` now carries it, and the
+    /// `ConfirmBypass` arm hands it to the panel through this function -- the only event that takes a
+    /// card off the panel's screen (`reducer.ts`'s `permission_resolved`). A real
+    /// `AgentBackend::Legacy` needs a real `claude` process, so the half that FILLS `resolved` is
+    /// `neovibe-core`'s `approve_pending_keeps_the_resolutions_a_legacy_answer_returns`.
+    #[test]
+    fn a_resolution_entering_bypass_returned_reaches_the_panel_payload() {
+        let mut set = TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto);
+        let active = set.active();
+        let background = set.open();
+        set.select(active);
+        let state = state_for_hooks(set);
+        let resolved = vec![agent::AgentDomainEvent::PermissionResolved {
+            permission_id: "perm-1".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        }];
+
+        let payload = returned_events_payload(&state.borrow(), active, &resolved)
+            .expect("the tab on screen is owed the resolution");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["kind"], "events");
+        assert_eq!(value["tab"], active.0);
+        assert_eq!(value["events"][0]["type"], "permission_resolved");
+        assert_eq!(value["events"][0]["permission_id"], "perm-1");
+        assert_eq!(value["events"][0]["outcome"], "allowed");
+
+        assert!(
+            returned_events_payload(&state.borrow(), background, &resolved).is_none(),
+            "a background tab catches up with a snapshot on its switch, never a stray batch"
+        );
+        assert!(returned_events_payload(&state.borrow(), active, &[]).is_none());
+    }
+
+    /// Spec §3.3/§3.4: the pane losing the keys entirely -- the WebView-free half of
+    /// `set_pane_focused(false)`, `TabSet::drop_bypass_prompt` -- drops an outstanding bypass
+    /// prompt the same way switching tabs already does, so a `y` that slips through afterwards is
+    /// refused by the nonce rather than landing on a tab no longer on screen.
+    #[test]
+    fn a_bypass_prompt_dropped_by_a_focus_loss_refuses_a_later_confirm() {
+        let set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        let state = state_for_hooks(set);
+
+        let plan = match state.borrow_mut().tabs.cycle_mode(tab) {
+            Ok(neovibe_core::tab_set::ModeCycle::Confirm(plan)) => plan,
+            other => panic!("an empty auto tab must ask first: {other:?}"),
+        };
+
+        // `AgentPanelHandle::set_pane_focused(false)` calls exactly this on the state it holds.
+        state.borrow_mut().tabs.drop_bypass_prompt();
+
+        assert_eq!(
+            apply_confirm_bypass(&state, plan.scope, plan.nonce),
+            Err("that prompt is no longer current".to_string())
+        );
+        assert_eq!(set_mode(&state, tab), SessionModeChoice::Auto, "nothing changed");
     }
 
     /// Review focus 3 (spec §3.5): every worker is counted, and a worker that died (dropped its

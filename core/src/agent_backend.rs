@@ -22,6 +22,7 @@ use agent::{
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
     ResumableSession, UiDelivery,
 };
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The legacy backend's capabilities, stated once so a test can assert on the value
@@ -29,17 +30,18 @@ use std::path::{Path, PathBuf};
 ///
 /// It advertises nothing over a wire, so these are read off what its code demonstrably does: it
 /// interrupts (`AgentSession::interrupt` sends a real control_request), it has no resume and no
-/// fork, and `PermissionMode::Bypass` is a real construction-time choice.
+/// fork, and it runs every session gated.
 const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     resume: false,
     fork: false,
     interrupt: true,
-    bypass_permission_mode: true,
+    // False since R07 (2026-09-27): this backend never starts the CLI in `bypassPermissions` any
+    // more -- it always passes `--permission-mode default` and the hook. Neovibe's bypass is its own
+    // `allow` under that gate, which needs only the capability below.
+    bypass_permission_mode: false,
     // Its interactive gate is the `PreToolUse` hook relay, which is this backend's primary,
     // end-to-end-verified permission mechanism -- not the leaky `can_use_tool` it also listens to.
     interactive_permission_mode: true,
-    // The CLI's stream-json has no mid-session switch neovibe drives.
-    set_permission_mode: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -55,6 +57,16 @@ const _: () = {
     assert!(
         !LEGACY_CAPABILITIES.fork,
         "fork must not be advertised before it works end to end"
+    );
+    // R07: every offered mode is honoured through the interactive gate (bypass is neovibe answering
+    // `allow` under it), and this backend never starts the CLI ungated.
+    assert!(
+        LEGACY_CAPABILITIES.interactive_permission_mode,
+        "every offered permission mode needs the interactive gate"
+    );
+    assert!(
+        !LEGACY_CAPABILITIES.bypass_permission_mode,
+        "R07: the legacy backend never starts the CLI ungated"
     );
 };
 
@@ -205,15 +217,6 @@ impl BackendError {
         }
     }
 
-    /// A refusal of THIS command by this side, with the session untouched.
-    fn benign(message: &str) -> Self {
-        Self {
-            message: message.to_string(),
-            benign: true,
-            folded_events: Vec::new(),
-        }
-    }
-
     /// Attaches events the projection has already taken, so the caller can deliver them even though
     /// the command failed. See `folded_events`.
     fn with_folded_events(mut self, events: Vec<AgentDomainEvent>) -> Self {
@@ -277,12 +280,11 @@ impl AgentBackend {
     /// session anywhere on this path -- the whole Phase 4 validation exists to catch exactly that
     /// silent substitution, and doing it in the host would reintroduce one layer above where the
     /// protocol was fixed.
-    pub fn start(
-        kind: BackendKind,
-        project_dir: &Path,
-        mode: PermissionMode,
-        resume: Option<&str>,
-    ) -> Result<Self, BackendError> {
+    ///
+    /// No permission mode (R07): every session on both backends is gated, and the tab's mode is
+    /// read at the one point that answers requests (`take_ui_delivery_with_rules`), never sent to
+    /// the CLI.
+    pub fn start(kind: BackendKind, project_dir: &Path, resume: Option<&str>) -> Result<Self, BackendError> {
         match kind {
             BackendKind::Legacy => {
                 if resume.is_some() {
@@ -292,7 +294,7 @@ impl AgentBackend {
                             .to_string(),
                     ));
                 }
-                AgentSession::start(project_dir, mode, agent::disallowed_tools_for(mode))
+                AgentSession::start(project_dir, agent::disallowed_tools())
                     .map(AgentBackend::Legacy)
                     .map_err(|e| BackendError::fatal(format!("failed to start the legacy Claude backend: {e}")))
             }
@@ -306,11 +308,11 @@ impl AgentBackend {
                 })?;
                 match resume {
                     Some(provider_session_id) => {
-                        AgentConversation::resume(std::sync::Arc::new(provider), project_dir, provider_session_id, mode)
+                        AgentConversation::resume(std::sync::Arc::new(provider), project_dir, provider_session_id)
                             .map(|c| AgentBackend::Sidecar(Box::new(c)))
                             .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}")))
                     }
-                    None => AgentConversation::create(std::sync::Arc::new(provider), project_dir, mode)
+                    None => AgentConversation::create(std::sync::Arc::new(provider), project_dir)
                         .map(|c| AgentBackend::Sidecar(Box::new(c)))
                         .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
                 }
@@ -403,8 +405,8 @@ impl AgentBackend {
     /// intersection; this just reports it).
     ///
     /// The legacy backend advertises nothing over a wire, so its capabilities are stated from what
-    /// its code demonstrably does: it interrupts, it has no resume and no fork, and it supports a
-    /// real bypass mode.
+    /// its code demonstrably does: it interrupts, it has no resume and no fork, and it runs every
+    /// session gated (R07).
     pub fn capabilities(&self) -> ProviderCapabilities {
         match self {
             AgentBackend::Legacy(_) => LEGACY_CAPABILITIES,
@@ -516,86 +518,6 @@ impl AgentBackend {
         }
     }
 
-    /// Whether this session's permission mode can change mid-conversation (D6, wave 5): the sidecar
-    /// advertised `set_permission_mode` and this client implements it. Legacy never can -- the CLI's
-    /// stream-json has no switch neovibe drives (`LEGACY_CAPABILITIES`).
-    pub fn can_switch_mode(&self) -> bool {
-        match self {
-            AgentBackend::Legacy(_) => false,
-            AgentBackend::Sidecar(conversation) => conversation.can_switch_mode(),
-        }
-    }
-
-    /// The mode the provider last ACKNOWLEDGED for this session -- `None` on legacy, which has no
-    /// acknowledged mode to report. This, never the tab's `mode` (which a `PermissionModeChanged`
-    /// report also moves), is what decides whether a card is answered in bypass (W4).
-    pub fn permission_mode(&self) -> Option<PermissionMode> {
-        match self {
-            AgentBackend::Legacy(_) => None,
-            AgentBackend::Sidecar(conversation) => Some(conversation.permission_mode()),
-        }
-    }
-
-    /// Switches this live session between auto and bypass (Verdandi `SetPermissionMode`). One unary
-    /// RPC on the caller's thread, as `interrupt` is (W1).
-    ///
-    /// Without the capability the refusal is BENIGN and said here, before the conversation is asked:
-    /// the conversation's own `UnsupportedCapability` is classified fatal, which would contradict
-    /// "the session is fine, its mode is just fixed". A provider's own refusal is classified as
-    /// `interrupt`'s errors are.
-    pub fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), BackendError> {
-        const FIXED: &str = "the mode is fixed for this session";
-        match self {
-            AgentBackend::Legacy(_) => Err(BackendError::benign(FIXED)),
-            AgentBackend::Sidecar(conversation) if !conversation.can_switch_mode() => Err(BackendError::benign(FIXED)),
-            AgentBackend::Sidecar(conversation) => {
-                conversation.set_permission_mode(mode)?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Answers Allow to every card pending on THIS session, returning how many were allowed (W4:
-    /// entering bypass answers the cards already waiting; Verdandi leaves them pending). Each is one
-    /// `[permission] allowed on entering bypass: <tool>` line on stderr, naming the tool only and
-    /// never its input (the policy's own rule, `answer_what_needs_no_human`).
-    ///
-    /// Accepted, not deduplicated: a request the classifier already allowed whose resolution has not
-    /// come back yet, or one folded but not yet delivered (which the bypass branch of
-    /// `answer_what_needs_no_human` answers again on the next pump), gets a second Allow. The
-    /// sidecar refuses that one (`PermissionNotFound`/`AlreadyResolved`) and the card, if drawn,
-    /// clears when the `PermissionResolved` arrives. `AgentBackend` is an enum with nowhere to keep
-    /// dedupe state, and the flash is harmless and self-clearing.
-    pub fn allow_all_pending(&mut self) -> usize {
-        // Collected in its own statement, guard dropped, before any answer: on the sidecar
-        // `projection()` holds the ingestion mutex and `respond_permission` locks it again (the
-        // 2026-09-15 GTK freeze). Sorted by `seq` so the log reads in the order the cards arrived;
-        // the map is a `HashMap`.
-        let mut pending: Vec<(u64, String, String)> = self
-            .projection()
-            .pending_permissions
-            .values()
-            .map(|record| (record.seq, record.permission_id.clone(), record.tool_name.clone()))
-            .collect();
-        pending.sort();
-        let mut allowed = 0;
-        for (_seq, permission_id, tool_name) in pending {
-            match self.respond_permission(&permission_id, PermissionDecision::Allow) {
-                Ok(_resolution) => {
-                    eprintln!("[permission] allowed on entering bypass: {tool_name}");
-                    allowed += 1;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[permission] could not allow {tool_name} on entering bypass: {}",
-                        error.message
-                    );
-                }
-            }
-        }
-        allowed
-    }
-
     /// What the UI should apply next.
     ///
     /// The two backends reach this differently and the difference is the point of the sidecar
@@ -608,15 +530,55 @@ impl AgentBackend {
     /// -- see `answer_what_needs_no_human`. `project_root` is the session's canonical project
     /// directory, which is the boundary `Read`/`Grep`/`Glob` are judged against; it is a parameter
     /// rather than state on this enum because `AgentBackend` is an enum its own tests construct
-    /// variant-by-variant, and a caller that forgets it does not compile.
-    pub fn take_ui_delivery(&mut self, project_root: &Path) -> UiDelivery {
-        self.take_ui_delivery_with_rules(project_root, &agent::PrefixRules::default())
+    /// variant-by-variant, and a caller that forgets it does not compile. `mode` is the tab's own
+    /// `Tab::mode` (R07/S2, spec §2.2): in `Bypass` every request is answered here, never only what
+    /// the classifier would allow in `Auto`. Builds a throwaway `host_answered` set -- a caller that
+    /// wants the ids kept (every real caller does) uses `take_ui_delivery_with_rules` directly.
+    pub fn take_ui_delivery(&mut self, project_root: &Path, mode: PermissionMode) -> UiDelivery {
+        let mut discarded = BTreeSet::new();
+        self.take_ui_delivery_with_rules(project_root, &agent::PrefixRules::default(), mode, &mut discarded)
     }
 
     /// `take_ui_delivery`, with the project's D7 prefix rules (`agent::permission_rules`) applied by
-    /// the classifier. A rule can only replace the two "not on the read-only list" verdicts, never a
-    /// fail-closed one; see `agent::classify_with_rules`.
-    pub fn take_ui_delivery_with_rules(&mut self, project_root: &Path, rules: &agent::PrefixRules) -> UiDelivery {
+    /// the classifier in `Auto`. A rule can only replace the two "not on the read-only list"
+    /// verdicts, never a fail-closed one; see `agent::classify_with_rules`. `host_answered` collects
+    /// every id this call answers on the caller's behalf (bypass or the classifier), so the caller
+    /// (`TabSet::pump`) can hide them from the tray and from a later snapshot (D9).
+    ///
+    /// Knows no human approvals, so in `Auto` the CLI's own prompt (O3) is always a card here; the
+    /// tab set, which does know them, calls `take_ui_delivery_with_approvals`.
+    pub fn take_ui_delivery_with_rules(
+        &mut self,
+        project_root: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+    ) -> UiDelivery {
+        self.take_ui_delivery_with_approvals(
+            project_root,
+            rules,
+            mode,
+            host_answered,
+            &mut HumanApprovals::default(),
+            &mut Vec::new(),
+        )
+    }
+
+    /// `take_ui_delivery_with_rules`, plus the tab's `approvals`: the calls the user approved on a
+    /// card (`TabSet::answer_card`), each with the tool and exact input the card showed. In `Auto` the
+    /// CLI's own prompt for exactly such a call -- same non-empty tool-use id, same tool, same input --
+    /// is answered `allow` here, once, and the approval is used up (O3 ruling 5, tightened by the
+    /// review): the user approved that call, and the real CLI asks once. `answered_for_you` receives
+    /// every CLI prompt answered without a card, for the muted note on its call's row.
+    pub fn take_ui_delivery_with_approvals(
+        &mut self,
+        project_root: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+        approvals: &mut HumanApprovals,
+        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+    ) -> UiDelivery {
         let delivery = match self {
             AgentBackend::Legacy(session) => {
                 let events = session.pump();
@@ -630,7 +592,17 @@ impl AgentBackend {
         };
         match delivery {
             UiDelivery::Events(events) => {
-                let kept = self.answer_what_needs_no_human(events, project_root, rules);
+                let kept = self.answer_what_needs_no_human(
+                    events,
+                    project_root,
+                    AnswerContext {
+                        rules,
+                        mode,
+                        host_answered,
+                        approvals,
+                        answered_for_you,
+                    },
+                );
                 if kept.is_empty() {
                     UiDelivery::Nothing
                 } else {
@@ -639,7 +611,7 @@ impl AgentBackend {
             }
             // A `Resync` carries no events to filter: the UI is about to rebuild from the
             // projection instead. See `answer_what_needs_no_human`'s own note on the window that
-            // leaves open.
+            // leaves open, and `TabSet::pump`'s own Resync arm for how bypass sweeps it (D9).
             other => other,
         }
     }
@@ -664,49 +636,146 @@ impl AgentBackend {
     /// the projection with no card on screen is a session the user cannot unstick, which is a worse
     /// failure than an extra click.
     ///
-    /// **In bypass (wave 5, W4) every request is answered Allow before the classifier is asked** --
-    /// the user switched this session to bypass, and a request still arriving was raised before the
-    /// switch took effect. Keyed on the provider-acknowledged mode (`permission_mode`) only; legacy
-    /// has none, and in bypass installs no gate, so it raises no cards to answer.
+    /// **In `Bypass` (R07/S2, 2026-09-27), every `PermissionRequested` is answered `Allow` here,
+    /// unconditionally, before the classifier ever runs.** This is neovibe's own definition of
+    /// bypass since R07: the CLI itself is never told to skip permissions (it always runs gated,
+    /// `--permission-mode default` plus the hook, or the sidecar's INTERACTIVE mode); "bypass" means
+    /// neovibe answers every request `allow` under that gate instead of showing a card. `mode` comes
+    /// from the caller's `Tab::mode` on every pump -- this function holds no mode of its own, so
+    /// nothing here can drift from what the tab set thinks the tab is in. An id already in
+    /// `host_answered` (a duplicate delivery of a request already allowed, e.g. after a resync) is
+    /// dropped without answering it a second time.
     ///
-    /// Two honest gaps, neither of which any test here covers:
+    /// **Nothing is answered once the CLI has reported an ungated mode** (spec §2.3, D12) -- neither
+    /// in this batch after the `UngatedCliMode`, nor in any batch after the projection recorded one,
+    /// and this holds in both modes. Such a session is about to be closed (`TabSet::pump`), and a
+    /// request left unanswered is denied by that close; an automatic `allow` here -- in bypass or
+    /// under the classifier -- would be a grant made to a session nobody should be granting anything.
     ///
-    /// - The resolution is dropped too, but only the legacy backend's, which is returned
-    ///   synchronously. The sidecar's `PermissionResolved` arrives on a later pump and IS delivered,
-    ///   for a `permission_id` the frontend never saw; its reducer filters `pendingPermissions` by
-    ///   id, so that is a no-op there rather than an error.
-    /// - On the sidecar path the projection keeps the request pending until that resolution
-    ///   arrives. A `UiDelivery::Resync` landing inside that window would rebuild the frontend from
-    ///   a snapshot that still holds the card, which would then vanish on the next pump. A resync
-    ///   needs 256 queued events to happen at all, so this has never been observed; it is written
-    ///   down because it is reachable, not because it was seen.
+    /// One honest gap remains, uncovered by any test here: the resolution is dropped too, but only
+    /// the legacy backend's, which is returned synchronously. The sidecar's `PermissionResolved`
+    /// arrives on a later pump and IS delivered, for a `permission_id` the frontend never saw; its
+    /// reducer filters `pendingPermissions` by id, so that is a no-op there rather than an error.
+    ///
+    /// **The second gap this doc used to record is closed, not merely documented, by
+    /// `host_answered` and D9:** an id this function inserts into `host_answered` is hidden from a
+    /// `Resync`'s snapshot and from the attention tray by `TabSet::pump` (`SnapshotView::of`,
+    /// `AttentionTracker::resync`), so a request answered here can no longer resurrect a card the
+    /// user was never meant to see, in bypass or under the classifier alike.
+    ///
+    /// **The CLI's own prompts (O3, Verdandi b3aa188) have their own rules, checked before either
+    /// path above** (`provider_prompt: Some`): the CLI raised one after the gate had already
+    /// answered, for a check of its own that no hook `allow` or session rule silences (its
+    /// sensitive-file check is the measured one). So the classifier and the saved prefix rules never
+    /// see it (ruling 3); bypass allows it, because a real `bypassPermissions` session runs the call
+    /// (ruling 4); in `Auto` it is allowed only when `approvals` holds the same call -- id, tool and
+    /// input the user approved on a card -- and that approval is then used up; otherwise it is a card
+    /// (ruling 5). One that `needs_a_human` -- the user's own `permissions.ask` rule forced it, or its
+    /// kind is unknown to this build -- is a card in every mode: the SDK's guidance is that a host
+    /// auto-approving must not approve a rule-forced ask (ruling 4; review #3 for the unknown kind).
+    /// Each answered without a card goes into `answered_for_you` with its row's note.
     fn answer_what_needs_no_human(
         &mut self,
         events: Vec<AgentDomainEvent>,
         project_root: &Path,
-        rules: &agent::PrefixRules,
+        cx: AnswerContext<'_>,
     ) -> Vec<AgentDomainEvent> {
-        // Read once, and from the conversation's ACKNOWLEDGED mode, never the tab's (W4, Review
-        // Focus 2): a reported `PermissionModeChanged` moves the band but never grants this.
-        let bypass = self.permission_mode() == Some(PermissionMode::Bypass);
+        let AnswerContext {
+            rules,
+            mode,
+            host_answered,
+            approvals,
+            answered_for_you,
+        } = cx;
+        // Its own statement, guard dropped before any answer: on the sidecar `projection()` holds
+        // the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK freeze).
+        let mut tripped = self.projection().ungated_cli_mode.is_some();
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
+            tripped |= matches!(event, AgentDomainEvent::UngatedCliMode { .. });
             let AgentDomainEvent::PermissionRequested {
                 permission_id,
+                tool_use_id,
                 tool_name,
                 input,
-                ..
+                provider_prompt,
             } = &event
             else {
                 kept.push(event);
                 continue;
             };
-            if bypass {
-                // Raised before the switch, delivered after it: the user chose bypass, so it is
-                // answered as `allow_all_pending` answered the cards already drawn (W4).
+            if tripped {
+                eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode (D12)");
+                kept.push(event);
+                continue;
+            }
+            if let Some(prompt) = provider_prompt {
+                // O3: never the classifier's or a rule's (ruling 3). The CLI's sentence embeds the
+                // model's own path and a rule can come from a file in the repository, so both are
+                // printed escaped (`{:?}`, review #2): they cannot forge or garble a log line.
+                if prompt.needs_a_human() {
+                    eprintln!(
+                        "[permission] asking the user: {tool_name} (the CLI's own prompt, only you answer it: {:?})",
+                        prompt.label()
+                    );
+                    kept.push(event);
+                    continue;
+                }
+                if host_answered.contains(permission_id) {
+                    continue;
+                }
+                let allow_because = match mode {
+                    PermissionMode::Bypass => Some("in bypass"),
+                    PermissionMode::Auto => approvals
+                        .matches(tool_use_id.as_deref(), tool_name, input)
+                        .then_some("with your approval"),
+                };
+                let Some(because) = allow_because else {
+                    eprintln!(
+                        "[permission] asking the user: {tool_name} (the CLI's own prompt: {:?})",
+                        prompt.reason.as_deref().unwrap_or("no reason given")
+                    );
+                    kept.push(event);
+                    continue;
+                };
+                let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+                let (tool_use_id, label) = (tool_use_id.clone(), prompt.label());
+                match self.respond_permission(&permission_id, PermissionDecision::Allow) {
+                    Ok(_resolution) => {
+                        host_answered.insert(permission_id);
+                        if let Some(id) = tool_use_id {
+                            // Used up (ruling 5, once per call): a later prompt under this id is a
+                            // card. In bypass this is a no-op -- nothing was consulted.
+                            approvals.consume(&id);
+                            answered_for_you.push(PromptAnsweredForYou {
+                                tool_use_id: id,
+                                note: format!("{label} — allowed {because}"),
+                            });
+                        }
+                        eprintln!("[permission] allowed the CLI's own prompt {because}: {tool_name}");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[permission] could not allow the CLI's own prompt for {tool_name}, showing a card instead: {}",
+                            error.message
+                        );
+                        kept.push(event);
+                    }
+                }
+                continue;
+            }
+            if mode == PermissionMode::Bypass {
+                if host_answered.contains(permission_id) {
+                    // Already allowed once (the duplicate-delivery case D9 exists for): drop it
+                    // silently rather than answering an id twice.
+                    continue;
+                }
                 let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
                 match self.respond_permission(&permission_id, PermissionDecision::Allow) {
-                    Ok(_resolution) => eprintln!("[permission] allowed on entering bypass: {tool_name}"),
+                    Ok(_resolution) => {
+                        host_answered.insert(permission_id);
+                        eprintln!("[permission] allowed in bypass: {tool_name}");
+                    }
                     Err(error) => {
                         eprintln!(
                             "[permission] could not allow {tool_name} in bypass, showing a card instead: {}",
@@ -742,6 +811,7 @@ impl AgentBackend {
                         "[permission] allowed without asking: {tool_name} ({})",
                         classification.reason
                     );
+                    host_answered.insert(permission_id);
                 }
                 Err(error) => {
                     eprintln!(
@@ -755,12 +825,182 @@ impl AgentBackend {
         kept
     }
 
+    /// Answers `allow` to each id in `ids` that is still pending on THIS session, in the order
+    /// given (the caller sorts by `seq`); an id that is not pending is skipped silently -- resolved
+    /// already, or never real. Returns the ids it actually answered, so the caller can extend
+    /// `host_answered` with exactly those and no others, and the events those answers produced here
+    /// (`Approved`). `why` is the log label ("on entering bypass" / "in bypass after a resync").
+    ///
+    /// **The events are the legacy backend's `PermissionResolved`s, and the panel is owed them**
+    /// (Codex v1-mode finding 1). Legacy's CLI emits nothing for a hook reply, so
+    /// `AgentSession::respond_permission` folds the resolution itself and returns it -- no pump ever
+    /// carries it. Dropping it here left the approved card drawn and counted as waiting until the next
+    /// snapshot. The sidecar returns none: its resolution arrives through the pump like any other.
+    ///
+    /// Collects the pending set in one statement, guard dropped before any answer -- the same
+    /// lock-order rule `answer_what_needs_no_human` follows (the 2026-09-15 GTK freeze:
+    /// `projection()` holds the sidecar's ingestion mutex and `respond_permission` locks it again).
+    ///
+    /// **Fails toward a card, never toward a silent grant.** If `respond_permission` errors, the id
+    /// is not added to the returned list -- the caller does not hide it, so it stays drawn as a card
+    /// and the user can still answer it themselves. A double answer (the user pressed `y` on a card
+    /// the same tick this entered bypass) is accepted: the second `respond_permission` is refused by
+    /// the provider, logged, and otherwise harmless.
+    ///
+    /// **Nothing is answered once the CLI has reported an ungated mode** (spec §2.3, D12) -- the same
+    /// rule `answer_what_needs_no_human` holds. `TabSet::pump`'s own tripwire check already keeps this
+    /// from being reached on the Resync path (D9), but `TabSet::confirm_bypass` calls this directly,
+    /// off the 33ms pump, so a report the background ingestion has already folded into the projection
+    /// but that pump has not yet turned into a `Failed` tab could otherwise still be approved here.
+    ///
+    /// **A CLI prompt only a human answers is never answered here** -- one the user's own
+    /// `permissions.ask` rule forced (O3 ruling 4), or one of a kind this build does not know (review
+    /// #3): it is a card in bypass too, answered only on the card itself. `TabSet::waiting_cards`
+    /// leaves it out of what a bypass entry counts and lists, so the prompt's N matches what `y`
+    /// approves; this skip is the backstop for any other caller.
+    pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
+        // Its own statement, guard dropped before any answer -- the same lock-order rule the
+        // collection below follows.
+        if self.projection().ungated_cli_mode.is_some() {
+            eprintln!("[permission] not answering {why}: the CLI reported an ungated mode (D12)");
+            return Approved::default();
+        }
+        let pending: std::collections::BTreeMap<String, String> = {
+            let projection = self.projection();
+            ids.iter()
+                .filter_map(|id| {
+                    let p = projection.pending_permissions.get(id)?;
+                    if let Some(prompt) = p.provider_prompt.as_ref().filter(|pp| pp.needs_a_human()) {
+                        eprintln!(
+                            "[permission] not allowing {} {why}: only you answer this prompt ({:?})",
+                            p.tool_name,
+                            prompt.label()
+                        );
+                        return None;
+                    }
+                    Some((id.clone(), p.tool_name.clone()))
+                })
+                .collect()
+        };
+        approve_each(ids, &pending, why, |id| {
+            self.respond_permission(id, PermissionDecision::Allow)
+        })
+    }
+
     pub fn shutdown(&mut self) {
         match self {
             AgentBackend::Legacy(session) => session.shutdown(),
             AgentBackend::Sidecar(conversation) => conversation.shutdown(),
         }
     }
+}
+
+/// What [`AgentBackend::approve_pending`] answered: the ids, and the events answering them produced
+/// on this side (legacy's locally folded `PermissionResolved`s; none on the sidecar). A caller that
+/// shows the panel a tab must hand it `events`, or the approved cards stay drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Approved {
+    pub ids: Vec<String>,
+    pub events: Vec<AgentDomainEvent>,
+}
+
+/// `approve_pending`'s loop, with the answer itself injected: the legacy arm of `respond_permission`
+/// needs a real `claude` process to exist at all (see `user_prompt_event_records_what_was_typed_not_
+/// what_went_on_the_wire`'s doc), so this is the part a test can drive with a legacy-shaped answer.
+/// `pending` maps each still-pending id to its tool name (for the log only).
+fn approve_each(
+    ids: &[String],
+    pending: &std::collections::BTreeMap<String, String>,
+    why: &str,
+    mut respond: impl FnMut(&str) -> Result<Vec<AgentDomainEvent>, BackendError>,
+) -> Approved {
+    let mut approved = Approved::default();
+    for id in ids {
+        let Some(tool_name) = pending.get(id) else {
+            continue;
+        };
+        match respond(id) {
+            Ok(events) => {
+                eprintln!("[permission] allowed {why}: {tool_name}");
+                approved.ids.push(id.clone());
+                approved.events.extend(events);
+            }
+            Err(error) => {
+                eprintln!("[permission] could not allow {tool_name} {why}: {}", error.message);
+            }
+        }
+    }
+    approved
+}
+
+/// What one `answer_what_needs_no_human` call reads and writes besides the batch: bundled so the
+/// signature stays readable. See `take_ui_delivery_with_approvals` for each field.
+struct AnswerContext<'a> {
+    rules: &'a agent::PrefixRules,
+    mode: PermissionMode,
+    host_answered: &'a mut BTreeSet<String>,
+    approvals: &'a mut HumanApprovals,
+    answered_for_you: &'a mut Vec<PromptAnsweredForYou>,
+}
+
+/// The calls the user approved on a card in one tab, each kept with the tool and the exact input the
+/// card showed (O3 ruling 5, tightened by the Codex and Opus reviews). `TabSet::answer_card` records
+/// one on an Approve that reached the provider; `matches` is the only test the Auto rule applies to
+/// the CLI's own prompt, and `consume` uses an approval up once it answered one.
+///
+/// The input is kept whole rather than as a digest: the comparison is then exact (`Value` equality,
+/// which ignores object key order) with no canonical form to get wrong and no collision to argue
+/// about. The set is small and short-lived -- emptied at every turn end, every `Resync`, `r` and with
+/// the backend (`TabSet`).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HumanApprovals {
+    calls: std::collections::BTreeMap<String, (String, serde_json::Value)>,
+}
+
+impl HumanApprovals {
+    /// The user approved `tool_name` with `input` for the call `tool_use_id`. An empty id is no link
+    /// to anything and is never recorded.
+    pub fn record(&mut self, tool_use_id: &str, tool_name: &str, input: &serde_json::Value) {
+        if !tool_use_id.is_empty() {
+            self.calls
+                .insert(tool_use_id.to_string(), (tool_name.to_string(), input.clone()));
+        }
+    }
+
+    /// Whether the user approved exactly this call: the same non-empty tool-use id, the same tool and
+    /// the same input. A prompt with no id matches nothing.
+    pub fn matches(&self, tool_use_id: Option<&str>, tool_name: &str, input: &serde_json::Value) -> bool {
+        tool_use_id
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.calls.get(id))
+            .is_some_and(|(tool, approved)| tool == tool_name && approved == input)
+    }
+
+    /// The approval for `tool_use_id` answered a prompt: it answers no other.
+    pub fn consume(&mut self, tool_use_id: &str) {
+        self.calls.remove(tool_use_id);
+    }
+
+    pub fn contains(&self, tool_use_id: &str) -> bool {
+        self.calls.contains_key(tool_use_id)
+    }
+
+    pub fn clear(&mut self) {
+        self.calls.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+/// A CLI prompt answered without a card, and the note its call's row shows (review item 7, the
+/// spike's row note): "Claude Code safety check — allowed in bypass" / "— allowed with your
+/// approval" (`ProviderPrompt::label` names whose question it was).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptAnsweredForYou {
+    pub tool_use_id: String,
+    pub note: String,
 }
 
 /// Every permission policy this CLIENT can drive end to end, in the order a start screen should
@@ -1015,18 +1255,20 @@ mod tests {
 
     /// Ties the offered list to the capability struct it claims to describe, so adding a mode to one
     /// without the other fails here rather than producing a button whose mode is never honored.
+    ///
+    /// Since R07 every offered mode needs the same thing from a backend: its interactive gate. Both
+    /// modes run the CLI gated; bypass is neovibe answering `allow`, not a CLI posture, so the
+    /// backend's own `bypass_permission_mode` is no longer what honours it. That half is a constant
+    /// and is asserted at compile time beside `LEGACY_CAPABILITIES`; what is left here is that
+    /// every offered string is a mode at all.
     #[test]
     fn every_offered_mode_is_one_the_legacy_capabilities_actually_claim() {
         for mode in CLIENT_IMPLEMENTED_PERMISSION_MODES {
-            let parsed = match *mode {
+            let _: PermissionMode = match *mode {
                 "auto" => PermissionMode::Auto,
                 "bypass" => PermissionMode::Bypass,
                 other => panic!("offered permission mode {other:?} has no PermissionMode to map to"),
             };
-            assert!(
-                LEGACY_CAPABILITIES.supports_permission_mode(parsed),
-                "{mode} is offered but LEGACY_CAPABILITIES does not claim it"
-            );
         }
     }
 
@@ -1055,10 +1297,10 @@ mod tests {
         // resume/fork being false is enforced at compile time beside the constant; asserting it
         // again here would be a constant assertion, which is what the previous version of this
         // test was.
-        // Cross-checked against the greeting rather than asserted directly: the greeting offers
-        // "bypass" as a real choice, and a backend that advertises the mode must support it.
+        // The greeting offers "bypass" as a real choice, and since R07 what honours it is the
+        // interactive gate (neovibe answers `allow` under it), not a CLI bypass mode the legacy
+        // backend no longer has -- both halves asserted at compile time beside the constant.
         let modes: Vec<&str> = greeting.permission_modes.to_vec();
-        assert_eq!(modes.contains(&"bypass"), LEGACY_CAPABILITIES.bypass_permission_mode);
         assert_eq!(modes, vec!["auto", "bypass"]);
     }
 
@@ -1340,14 +1582,9 @@ mod tests {
     /// would hand the user a conversation with none of the history they picked it for.
     #[test]
     fn the_legacy_backend_refuses_a_resume_rather_than_starting_a_fresh_session() {
-        let error = AgentBackend::start(
-            BackendKind::Legacy,
-            Path::new("/tmp"),
-            PermissionMode::Bypass,
-            Some("claude-abc"),
-        )
-        .err()
-        .expect("the legacy backend must refuse a resume");
+        let error = AgentBackend::start(BackendKind::Legacy, Path::new("/tmp"), Some("claude-abc"))
+            .err()
+            .expect("the legacy backend must refuse a resume");
         assert!(
             !error.benign,
             "a refused resume ends the attempt; it is not an ordering complaint"
@@ -1476,9 +1713,8 @@ mod tests {
     fn a_rejected_sidecar_turn_still_leaves_the_prompt_recorded() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("rejected-turn-keeps-prompt");
-        let conversation =
-            AgentConversation::create(std::sync::Arc::new(RejectingProvider), &dir, PermissionMode::Bypass)
-                .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
+        let conversation = AgentConversation::create(std::sync::Arc::new(RejectingProvider), &dir)
+            .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         let result = backend.send_turn("wire text with context composed in", "what does this do?");
@@ -1512,7 +1748,7 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("title-as-typed");
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Bypass).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let conversation_id = backend
             .conversation_id()
@@ -1549,7 +1785,7 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("name-before-adoption");
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Bypass).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let conversation_id = backend.conversation_id().unwrap().to_string();
 
@@ -1594,10 +1830,14 @@ mod tests {
 
     /// Drives the pump until it yields something or the deadline passes. The sidecar's events cross
     /// the ingestion thread, so the first call after a queue is normally empty.
-    fn pump_until_delivery(backend: &mut AgentBackend, project_root: &Path) -> Vec<AgentDomainEvent> {
+    fn pump_until_delivery(
+        backend: &mut AgentBackend,
+        project_root: &Path,
+        mode: PermissionMode,
+    ) -> Vec<AgentDomainEvent> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match backend.take_ui_delivery(project_root) {
+            match backend.take_ui_delivery(project_root, mode) {
                 UiDelivery::Events(events) => return events,
                 _ if std::time::Instant::now() > deadline => return Vec::new(),
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -1612,7 +1852,7 @@ mod tests {
     fn a_read_inside_the_project_is_answered_here_and_never_becomes_a_card() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -1620,6 +1860,7 @@ mod tests {
             tool_use_id: Some("tool-1".into()),
             tool_name: "Read".into(),
             input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
         });
         // One `ToolCallStarted` alongside it, so this also pins that the FILTER is selective: the
         // record of what ran must still reach the transcript.
@@ -1630,7 +1871,7 @@ mod tests {
             input: serde_json::json!({ "file_path": "main.rs" }),
         });
 
-        let delivered = pump_until_delivery(&mut backend, &dir);
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
         assert!(
             !delivered
                 .iter()
@@ -1657,7 +1898,7 @@ mod tests {
     fn a_write_still_reaches_the_user_and_is_answered_by_nobody_else() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -1665,9 +1906,10 @@ mod tests {
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
         });
 
-        let delivered = pump_until_delivery(&mut backend, &dir);
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
         assert!(
             delivered.iter().any(|e| matches!(
                 e,
@@ -1691,7 +1933,7 @@ mod tests {
     fn a_read_outside_the_project_still_reaches_the_user() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
 
         provider.queue(AgentDomainEvent::PermissionRequested {
@@ -1699,9 +1941,10 @@ mod tests {
             tool_use_id: Some("tool-3".into()),
             tool_name: "Read".into(),
             input: serde_json::json!({ "file_path": "/etc/hostname" }),
+            provider_prompt: None,
         });
 
-        let delivered = pump_until_delivery(&mut backend, &dir);
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
         assert!(
             delivered
                 .iter()
@@ -1718,7 +1961,7 @@ mod tests {
     fn a_project_rule_answers_a_bash_call_and_never_a_compound_one() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
         for (id, command) in [("perm-rule", "npm ci"), ("perm-compound", "npm ci && rm -rf .")] {
@@ -1727,11 +1970,13 @@ mod tests {
                 tool_use_id: None,
                 tool_name: "Bash".into(),
                 input: serde_json::json!({ "command": command }),
+                provider_prompt: None,
             });
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut host_answered = BTreeSet::new();
         let delivered = loop {
-            match backend.take_ui_delivery_with_rules(&dir, &rules) {
+            match backend.take_ui_delivery_with_rules(&dir, &rules, PermissionMode::Auto, &mut host_answered) {
                 UiDelivery::Events(events) => break events,
                 _ => {
                     assert!(std::time::Instant::now() < deadline, "nothing was delivered");
@@ -1756,7 +2001,7 @@ mod tests {
     fn a_hidden_chat_counts_the_card_it_holds_and_still_answers_what_needs_no_human() {
         let dir = a_workspace_holding_one_file();
         let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
         let mut backend = AgentBackend::Sidecar(Box::new(conversation));
         let mut tracker = crate::attention::AttentionTracker::default();
 
@@ -1765,14 +2010,16 @@ mod tests {
             tool_use_id: Some("tool-1".into()),
             tool_name: "Read".into(),
             input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
         });
         provider.queue(AgentDomainEvent::PermissionRequested {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir);
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
         tracker.observe(&delivered, false);
         tracker.retain_pending(|id| backend.projection().pending_permissions.contains_key(id));
 
@@ -1793,7 +2040,7 @@ mod tests {
             permission_id: "perm-write".into(),
             outcome: agent::PermissionOutcome::Allowed,
         });
-        let delivered = pump_until_delivery(&mut backend, &dir);
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
         tracker.observe(&delivered, false);
         tracker.retain_pending(|id| backend.projection().pending_permissions.contains_key(id));
         assert_eq!(tracker.attention().pending, 0);
@@ -1830,74 +2077,745 @@ mod tests {
         assert_eq!(fatal.folded_events.len(), 1);
     }
 
-    // ---- wave 5, Task 4: a live mode switch and what entering bypass answers ----
+    // ---- R07, D12: nothing is answered for a CLI that reported an ungated mode ----
 
-    fn a_write_request(id: &str) -> AgentDomainEvent {
-        AgentDomainEvent::PermissionRequested {
+    /// A `Read` inside the project is what the classifier answers `allow` on its own (the test above).
+    /// Once the CLI has reported an ungated mode, not even that: the session is about to be closed,
+    /// and every request is left for the close to deny -- the one queued behind the report in the
+    /// same batch, and one arriving in a later batch (which only the projection's record can catch,
+    /// the event having gone by).
+    #[test]
+    fn after_an_ungated_report_nothing_is_answered_automatically() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let read = |id: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
+        };
+
+        provider.queue(AgentDomainEvent::UngatedCliMode {
+            reported: "acceptEdits".into(),
+            detail: "SessionReady".into(),
+        });
+        provider.queue(read("behind-it"));
+        let mut delivered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !delivered
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
+            if let UiDelivery::Events(events) = backend.take_ui_delivery(&dir, PermissionMode::Auto) {
+                delivered.extend(events);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            provider.resolutions().is_empty(),
+            "a request behind the trip is left for the close to deny: {:?}",
+            provider.resolutions()
+        );
+
+        provider.queue(read("later"));
+        let later = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert!(
+            later.iter().any(
+                |e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "later")
+            ),
+            "{later:?}"
+        );
+        assert!(provider.resolutions().is_empty(), "nor one in a later batch");
+        backend.shutdown();
+    }
+
+    /// A tripwire riding in the SAME batch as a `Bypass` mode must not be approved either -- D12
+    /// outranks R07's bypass rule, not the other way round.
+    #[test]
+    fn a_tripwire_in_bypass_answers_nothing_either() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let read = |id: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
+        };
+
+        provider.queue(AgentDomainEvent::UngatedCliMode {
+            reported: "acceptEdits".into(),
+            detail: "SessionReady".into(),
+        });
+        provider.queue(read("behind-it"));
+        let mut delivered = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !delivered
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out: {delivered:?}");
+            if let UiDelivery::Events(events) = backend.take_ui_delivery(&dir, PermissionMode::Bypass) {
+                delivered.extend(events);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            provider.resolutions().is_empty(),
+            "bypass must not allow a request behind the tripwire either: {:?}",
+            provider.resolutions()
+        );
+        backend.shutdown();
+    }
+
+    // ---- R07/S2: bypass is neovibe answering every request itself, and `approve_pending` -------
+
+    /// The owner's whole definition of bypass in one assertion: nothing reaches the panel as a
+    /// card, and both requests really were answered -- the in-root write and the out-of-root read
+    /// alike, since bypass never consults the classifier's path boundary at all. The tool call
+    /// itself is still owed to the transcript.
+    #[test]
+    fn in_bypass_every_request_is_answered_and_never_delivered() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let rules = agent::PrefixRules::default();
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-write".into(),
+            tool_use_id: Some("tool-1".into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-outside".into(),
+            tool_use_id: Some("tool-2".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "/etc/hostname" }),
+            provider_prompt: None,
+        });
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "turn-1".into(),
+            tool_use_id: "tool-1".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+        });
+
+        let mut host_answered = BTreeSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let delivered = loop {
+            match backend.take_ui_delivery_with_rules(&dir, &rules, PermissionMode::Bypass, &mut host_answered) {
+                UiDelivery::Events(events) => break events,
+                _ => {
+                    assert!(std::time::Instant::now() < deadline, "nothing was delivered");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        };
+
+        assert!(
+            !delivered
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })),
+            "bypass must show no card at all: {delivered:?}"
+        );
+        assert!(
+            delivered
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::ToolCallStarted { .. })),
+            "the tool call itself is still owed to the transcript: {delivered:?}"
+        );
+        let mut resolutions = provider.resolutions();
+        resolutions.sort();
+        assert_eq!(
+            resolutions,
+            vec![("perm-outside".to_string(), true), ("perm-write".to_string(), true)]
+        );
+        assert_eq!(
+            host_answered,
+            BTreeSet::from(["perm-outside".to_string(), "perm-write".to_string()])
+        );
+        backend.shutdown();
+    }
+
+    /// The other half of `host_answered`, in `Auto`: only the id the classifier itself allowed goes
+    /// into the set, never one that was delivered as a card.
+    #[test]
+    fn the_classifier_records_what_it_answers() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let rules = agent::PrefixRules::default();
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-read".into(),
+            tool_use_id: Some("tool-1".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-write".into(),
+            tool_use_id: Some("tool-2".into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
+        });
+
+        let mut host_answered = BTreeSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match backend.take_ui_delivery_with_rules(&dir, &rules, PermissionMode::Auto, &mut host_answered) {
+                UiDelivery::Events(_) => break,
+                _ => {
+                    assert!(std::time::Instant::now() < deadline, "nothing was delivered");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        assert_eq!(host_answered, BTreeSet::from(["perm-read".to_string()]));
+        backend.shutdown();
+    }
+
+    /// `approve_pending` walks its ids in the order given, skips one no longer pending (already
+    /// resolved, or never real) silently, and returns exactly what it answered.
+    #[test]
+    fn approve_pending_skips_ids_no_longer_pending_and_returns_what_it_answered() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let write = |id: &str| AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
-        }
-    }
+            provider_prompt: None,
+        };
 
-    /// Without the capability a switch is refused BENIGNLY -- the session is fine, the mode is just
-    /// fixed -- and nothing reaches the provider. `UnsupportedCapability` alone would be fatal.
-    #[test]
-    fn a_sidecar_without_the_capability_refuses_a_switch_benignly() {
-        let dir = a_workspace_holding_one_file();
-        let provider = std::sync::Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
-        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        provider.queue(write("a"));
+        provider.queue(write("b"));
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert_eq!(delivered.len(), 2, "both must card in Auto: {delivered:?}");
 
-        assert!(!backend.can_switch_mode());
-        let refused = backend.set_permission_mode(PermissionMode::Bypass).unwrap_err();
-        assert!(refused.benign, "{refused:?}");
-        assert!(refused.message.contains("fixed"), "{}", refused.message);
-        assert!(provider.modes().is_empty());
-        assert_eq!(backend.permission_mode(), Some(PermissionMode::Auto));
-        backend.shutdown();
-    }
-
-    #[test]
-    fn a_switchable_sidecar_reports_the_acknowledged_mode() {
-        let dir = a_workspace_holding_one_file();
-        let provider = std::sync::Arc::new(RecordingProvider::switchable());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
-        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
-
-        assert!(backend.can_switch_mode());
-        backend.set_permission_mode(PermissionMode::Bypass).unwrap();
-        assert_eq!(backend.permission_mode(), Some(PermissionMode::Bypass));
-        provider.refuse_switches(true);
-        // Classified as `interrupt`'s errors are (`From<ConversationError>`); `TabSet::switch_mode`
-        // only shows the message, so a refusal never tears the tab down either way.
-        assert!(backend.set_permission_mode(PermissionMode::Auto).is_err());
-        assert_eq!(backend.permission_mode(), Some(PermissionMode::Bypass), "unchanged");
-        backend.shutdown();
-    }
-
-    #[test]
-    fn allow_all_pending_answers_each_pending_request_once_and_counts_them() {
-        let dir = a_workspace_holding_one_file();
-        let provider = std::sync::Arc::new(RecordingProvider::switchable());
-        let conversation = AgentConversation::create(provider.clone(), &dir, PermissionMode::Auto).unwrap();
-        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
-
-        provider.queue(a_write_request("a"));
-        provider.queue(a_write_request("b"));
+        provider.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: "b".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while backend.projection().pending_permissions.len() < 2 {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for two cards");
-            let _ = backend.take_ui_delivery(&dir);
+        while backend.projection().pending_permissions.contains_key("b") {
+            assert!(std::time::Instant::now() < deadline, "b never resolved");
+            backend.take_ui_delivery(&dir, PermissionMode::Auto);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(provider.resolutions().is_empty());
+        assert!(
+            backend.projection().pending_permissions.contains_key("a"),
+            "the premise: a is still pending, b is not"
+        );
 
-        assert_eq!(backend.allow_all_pending(), 2);
-        let mut resolved = provider.resolutions();
-        resolved.sort();
-        assert_eq!(resolved, vec![("a".to_string(), true), ("b".to_string(), true)]);
+        let ids = vec!["a".to_string(), "b".to_string(), "zzz".to_string()];
+        let answered = backend.approve_pending(&ids, "test");
+        assert_eq!(answered.ids, vec!["a".to_string()]);
+        assert!(
+            answered.events.is_empty(),
+            "the sidecar's resolution comes through the pump, never from here: {:?}",
+            answered.events
+        );
+        assert_eq!(provider.resolutions(), vec![("a".to_string(), true)]);
+        backend.shutdown();
+    }
+
+    /// Codex v1-mode finding 1: legacy's `respond_permission` is the only place its
+    /// `PermissionResolved` exists (the CLI emits nothing for a hook reply, and `pump()` yields only
+    /// wire events), and `approve_pending` used to drop it -- so a card approved by entering bypass
+    /// stayed drawn and counted as waiting. Driven through `approve_each` with a legacy-shaped answer,
+    /// since a real `AgentBackend::Legacy` needs a real `claude` process (the asymmetry
+    /// `user_prompt_event_records_what_was_typed_not_what_went_on_the_wire` records).
+    #[test]
+    fn approve_pending_keeps_the_resolutions_a_legacy_answer_returns() {
+        let pending: std::collections::BTreeMap<String, String> = [("p1", "Write"), ("p2", "Bash"), ("p3", "Edit")]
+            .into_iter()
+            .map(|(id, tool)| (id.to_string(), tool.to_string()))
+            .collect();
+        let ids: Vec<String> = ["p1", "gone", "p2", "p3"].iter().map(|s| s.to_string()).collect();
+        let mut asked = Vec::new();
+        let approved = approve_each(&ids, &pending, "test", |id| {
+            asked.push(id.to_string());
+            if id == "p2" {
+                // Fails toward a card: not answered, not hidden, no event.
+                return Err(BackendError {
+                    message: "the provider refused the answer".into(),
+                    benign: true,
+                    folded_events: Vec::new(),
+                });
+            }
+            Ok(vec![AgentDomainEvent::PermissionResolved {
+                permission_id: id.to_string(),
+                outcome: agent::PermissionOutcome::Allowed,
+            }])
+        });
+        assert_eq!(
+            asked,
+            vec!["p1", "p2", "p3"],
+            "an id that is no longer pending is never answered"
+        );
+        assert_eq!(approved.ids, vec!["p1".to_string(), "p3".to_string()]);
+        assert_eq!(
+            approved.events,
+            vec![
+                AgentDomainEvent::PermissionResolved {
+                    permission_id: "p1".into(),
+                    outcome: agent::PermissionOutcome::Allowed,
+                },
+                AgentDomainEvent::PermissionResolved {
+                    permission_id: "p3".into(),
+                    outcome: agent::PermissionOutcome::Allowed,
+                },
+            ],
+            "every resolution the answers returned, in order, for the caller to hand the panel"
+        );
+    }
+
+    /// D12: `TabSet::confirm_bypass` calls `approve_pending` directly, off the 33ms pump that would
+    /// otherwise catch an `UngatedCliMode` report and fail the tab first -- so this function must hold
+    /// the same rule on its own once the background ingestion has folded the report into the
+    /// projection, even before any pump has turned it into a `Failed` tab.
+    #[test]
+    fn approve_pending_answers_nothing_once_the_cli_reported_an_ungated_mode() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+        let write = |id: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
+        };
+
+        provider.queue(write("still-pending"));
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert_eq!(delivered.len(), 1, "the premise: it really is a delivered card");
+
+        provider.queue(AgentDomainEvent::UngatedCliMode {
+            reported: "bypassPermissions".into(),
+            detail: "PermissionModeChanged".into(),
+        });
+        // Folded by the background ingestion thread; no pump call here, deliberately -- this is the
+        // window between the report landing in the projection and the next `TabSet::pump` tick.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.projection().ungated_cli_mode.is_none() {
+            assert!(std::time::Instant::now() < deadline, "the report was never folded");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let answered = backend.approve_pending(&["still-pending".to_string()], "on entering bypass");
+        assert_eq!(answered, Approved::default());
+        assert!(
+            provider.resolutions().is_empty(),
+            "nothing was answered on the host's side: {:?}",
+            provider.resolutions()
+        );
+        backend.shutdown();
+    }
+
+    /// Fail toward a card: a bypass allow the provider refuses is not silently lost -- the event
+    /// stays in the delivery.
+    #[test]
+    fn a_failed_allow_in_bypass_draws_the_card() {
+        let dir = a_workspace_holding_one_file();
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        provider.refuse_resolutions(true);
+        let conversation = AgentConversation::create(provider.clone(), &dir).unwrap();
+        let mut backend = AgentBackend::Sidecar(Box::new(conversation));
+
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-write".into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
+        });
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Bypass);
+        assert!(
+            delivered.iter().any(
+                |e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == "perm-write")
+            ),
+            "a failed allow in bypass must fall back to a card: {delivered:?}"
+        );
+        assert!(provider.resolutions().is_empty());
+        backend.shutdown();
+    }
+
+    // ---- O3: the CLI's own permission prompts (Verdandi b3aa188) ----------------------------------
+
+    /// The CLI's own prompt for `tool_use_id`, as the sidecar translation produces it.
+    fn provider_prompt(
+        permission_id: &str,
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input: serde_json::Value,
+        ask_rule: Option<&str>,
+    ) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: tool_use_id.map(str::to_string),
+            tool_name: tool_name.into(),
+            input,
+            provider_prompt: Some(agent::ProviderPrompt {
+                reason: Some("Claude requested permissions to edit /p/.git/probe which is a sensitive file.".into()),
+                description: Some(".git/probe".into()),
+                blocked_path: None,
+                matched_ask_rule: ask_rule.map(|content| agent::MatchedAskRule {
+                    source: "projectSettings".into(),
+                    tool_name: tool_name.into(),
+                    rule_content: Some(content.into()),
+                }),
+                unrecognized_origin: None,
+            }),
+        }
+    }
+
+    fn probe_write() -> serde_json::Value {
+        serde_json::json!({ "file_path": ".git/probe", "content": "o3" })
+    }
+
+    /// One delivery through the O3 entry point, with the tab's human approvals; returns what was
+    /// delivered and the CLI prompts answered without a card (for the row notes).
+    fn deliver(
+        backend: &mut AgentBackend,
+        dir: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+        approvals: &mut HumanApprovals,
+    ) -> (Vec<AgentDomainEvent>, Vec<PromptAnsweredForYou>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut answered = Vec::new();
+        loop {
+            match backend.take_ui_delivery_with_approvals(dir, rules, mode, host_answered, approvals, &mut answered) {
+                UiDelivery::Events(events) => return (events, answered),
+                _ if std::time::Instant::now() > deadline => return (Vec::new(), answered),
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+
+    fn sidecar_backend(dir: &Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
+        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+    }
+
+    fn carded(delivered: &[AgentDomainEvent], id: &str) -> bool {
+        delivered
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == id))
+    }
+
+    /// O3 ruling 3: a `Read` inside the project is what the classifier allows unasked -- as the
+    /// gate's request. The CLI's own prompt for the very same call never goes through the classifier:
+    /// in Auto, with no human approval of that call, it is a card.
+    #[test]
+    fn the_classifier_never_answers_the_clis_own_prompt() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        provider.queue(provider_prompt(
+            "perm-prov",
+            Some("tu-1"),
+            "Read",
+            serde_json::json!({ "file_path": "main.rs" }),
+            None,
+        ));
+        let mut host_answered = BTreeSet::new();
+        let (delivered, _) = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut HumanApprovals::default(),
+        );
+        assert!(carded(&delivered, "perm-prov"), "{delivered:?}");
+        assert!(provider.resolutions().is_empty(), "{:?}", provider.resolutions());
+        assert!(host_answered.is_empty());
+        backend.shutdown();
+    }
+
+    /// O3 ruling 3, the saved-rule half: a prefix rule that answers `npm ci` for the gate does not
+    /// answer the CLI's own prompt about the same command.
+    #[test]
+    fn a_saved_rule_never_answers_the_clis_own_prompt() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
+        provider.queue(provider_prompt(
+            "perm-prov",
+            Some("tu-1"),
+            "Bash",
+            serde_json::json!({ "command": "npm ci" }),
+            None,
+        ));
+        let (delivered, _) = deliver(
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(carded(&delivered, "perm-prov"), "{delivered:?}");
+        assert!(provider.resolutions().is_empty());
+        backend.shutdown();
+    }
+
+    /// O3 ruling 4: bypass allows the CLI's own prompt with no card, as a real bypassPermissions
+    /// session runs the call -- says so in `host_answered`, like every answer bypass makes, and hands
+    /// back the note its row shows (review item 7).
+    #[test]
+    fn bypass_allows_the_clis_own_prompt_without_a_card() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        provider.queue(provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "turn-1".into(),
+            tool_use_id: "tu-1".into(),
+            name: "Write".into(),
+            input: probe_write(),
+        });
+        let mut host_answered = BTreeSet::new();
+        let (delivered, answered) = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Bypass,
+            &mut host_answered,
+            &mut HumanApprovals::default(),
+        );
+        assert!(!carded(&delivered, "perm-prov"), "{delivered:?}");
+        assert_eq!(provider.resolutions(), vec![("perm-prov".to_string(), true)]);
+        assert_eq!(host_answered, BTreeSet::from(["perm-prov".to_string()]));
+        assert_eq!(
+            answered,
+            vec![PromptAnsweredForYou {
+                tool_use_id: "tu-1".into(),
+                note: "Claude Code safety check — allowed in bypass".into(),
+            }]
+        );
+        backend.shutdown();
+    }
+
+    /// O3 ruling 4's exception, and review #3: the user's own `permissions.ask` rule forced this
+    /// prompt, or its kind is unknown to this build -- a card in bypass too, and in Auto even after
+    /// the human approved the gate's card for exactly this call.
+    #[test]
+    fn a_prompt_only_a_human_answers_is_a_card_in_every_mode() {
+        let dir = a_workspace_holding_one_file();
+        let cat = serde_json::json!({ "command": "cat notes.txt" });
+        let mut unknown = provider_prompt("perm-unknown", Some("tu-1"), "Bash", cat.clone(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut unknown {
+            provider_prompt.as_mut().unwrap().unrecognized_origin = Some(7);
+        }
+        let ruled = provider_prompt("perm-ask", Some("tu-1"), "Bash", cat.clone(), Some("cat:*"));
+        for (event, id) in [(ruled, "perm-ask"), (unknown, "perm-unknown")] {
+            for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+                let (provider, mut backend) = sidecar_backend(&dir);
+                provider.queue(event.clone());
+                let mut approvals = HumanApprovals::default();
+                approvals.record("tu-1", "Bash", &cat);
+                let mut host_answered = BTreeSet::new();
+                let (delivered, answered) = deliver(
+                    &mut backend,
+                    &dir,
+                    &agent::PrefixRules::default(),
+                    mode,
+                    &mut host_answered,
+                    &mut approvals,
+                );
+                assert!(carded(&delivered, id), "{id} {mode:?}: {delivered:?}");
+                assert!(provider.resolutions().is_empty(), "{id} {mode:?}");
+                assert!(host_answered.is_empty() && answered.is_empty(), "{id} {mode:?}");
+                assert!(
+                    approvals.contains("tu-1"),
+                    "{id} {mode:?}: an approval a card kept is not used up"
+                );
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// O3 ruling 5, as the review tightened it: in Auto the human's approval answers the CLI's own
+    /// prompt only for the SAME call -- same non-empty tool-use id, same tool, same input the card
+    /// showed -- and only once. Another call's approval, another tool or input under the approved id,
+    /// no id at all, and a second prompt after the approval was used are all cards.
+    #[test]
+    fn in_auto_an_approval_answers_one_prompt_for_exactly_the_call_it_approved() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        let other_input = serde_json::json!({ "file_path": ".git/hooks/pre-commit", "content": "evil" });
+        provider.queue(provider_prompt(
+            "perm-input",
+            Some("tu-approved"),
+            "Write",
+            other_input,
+            None,
+        ));
+        provider.queue(provider_prompt(
+            "perm-tool",
+            Some("tu-approved"),
+            "Bash",
+            serde_json::json!({ "command": "cp evil .git/hooks/pre-commit" }),
+            None,
+        ));
+        // The matching prompt comes AFTER the mismatches, so an id-only comparison would have let
+        // one of them take the approval first.
+        provider.queue(provider_prompt(
+            "perm-same",
+            Some("tu-approved"),
+            "Write",
+            probe_write(),
+            None,
+        ));
+        provider.queue(provider_prompt(
+            "perm-again",
+            Some("tu-approved"),
+            "Write",
+            probe_write(),
+            None,
+        ));
+        provider.queue(provider_prompt(
+            "perm-other",
+            Some("tu-other"),
+            "Write",
+            probe_write(),
+            None,
+        ));
+        provider.queue(provider_prompt("perm-noid", None, "Write", probe_write(), None));
+        let mut approvals = HumanApprovals::default();
+        approvals.record("tu-approved", "Write", &probe_write());
+        let mut host_answered = BTreeSet::new();
+        let (delivered, answered) = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut approvals,
+        );
+        assert!(!carded(&delivered, "perm-same"), "{delivered:?}");
+        for id in ["perm-again", "perm-input", "perm-tool", "perm-other", "perm-noid"] {
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert_eq!(provider.resolutions(), vec![("perm-same".to_string(), true)]);
+        assert_eq!(host_answered, BTreeSet::from(["perm-same".to_string()]));
+        assert!(approvals.is_empty(), "used up by the one prompt it answered");
+        assert_eq!(
+            answered,
+            vec![PromptAnsweredForYou {
+                tool_use_id: "tu-approved".into(),
+                note: "Claude Code safety check — allowed with your approval".into(),
+            }]
+        );
+        backend.shutdown();
+    }
+
+    /// A prompt that gave no reason is not called a safety check on its row either (review #5).
+    #[test]
+    fn a_prompt_with_no_reason_is_noted_neutrally() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        let mut event = provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut event {
+            provider_prompt.as_mut().unwrap().reason = None;
+        }
+        provider.queue(event);
+        let (_, answered) = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Bypass,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert_eq!(answered[0].note, "Claude Code asked — allowed in bypass");
+        backend.shutdown();
+    }
+
+    /// Fail toward a card, as every automatic answer here does: an allow of the CLI's own prompt that
+    /// the provider refuses stays in the delivery -- and an approval it would have used is kept.
+    #[test]
+    fn a_failed_allow_of_the_clis_own_prompt_draws_the_card() {
+        let dir = a_workspace_holding_one_file();
+        for mode in [PermissionMode::Bypass, PermissionMode::Auto] {
+            let (provider, mut backend) = sidecar_backend(&dir);
+            provider.refuse_resolutions(true);
+            provider.queue(provider_prompt("perm-prov", Some("tu-1"), "Write", probe_write(), None));
+            let mut approvals = HumanApprovals::default();
+            approvals.record("tu-1", "Write", &probe_write());
+            let mut host_answered = BTreeSet::new();
+            let (delivered, answered) = deliver(
+                &mut backend,
+                &dir,
+                &agent::PrefixRules::default(),
+                mode,
+                &mut host_answered,
+                &mut approvals,
+            );
+            assert!(carded(&delivered, "perm-prov"), "{mode:?}: {delivered:?}");
+            assert!(host_answered.is_empty() && answered.is_empty(), "{mode:?}");
+            assert!(approvals.contains("tu-1"), "{mode:?}");
+            backend.shutdown();
+        }
+    }
+
+    /// `approve_pending` (entering bypass with cards waiting, and the bypass resync sweep) answers a
+    /// list in one go; a prompt only a human answers -- an ask rule's, or one of unknown kind -- is
+    /// never in what it answers.
+    #[test]
+    fn approve_pending_never_answers_a_prompt_only_a_human_answers() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        provider.queue(provider_prompt(
+            "perm-ask",
+            Some("tu-1"),
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
+        let mut unknown = provider_prompt("perm-unknown", Some("tu-3"), "Write", probe_write(), None);
+        if let AgentDomainEvent::PermissionRequested { provider_prompt, .. } = &mut unknown {
+            provider_prompt.as_mut().unwrap().unrecognized_origin = Some(7);
+        }
+        provider.queue(unknown);
+        provider.queue(provider_prompt(
+            "perm-plain",
+            Some("tu-2"),
+            "Write",
+            probe_write(),
+            None,
+        ));
+        let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
+        assert_eq!(delivered.len(), 3, "all card in Auto with no approval: {delivered:?}");
+        let answered = backend.approve_pending(
+            &[
+                "perm-ask".to_string(),
+                "perm-unknown".to_string(),
+                "perm-plain".to_string(),
+            ],
+            "test",
+        );
+        assert_eq!(answered.ids, vec!["perm-plain".to_string()]);
+        assert_eq!(provider.resolutions(), vec![("perm-plain".to_string(), true)]);
         backend.shutdown();
     }
 }

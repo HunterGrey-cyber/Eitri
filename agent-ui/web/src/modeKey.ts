@@ -1,5 +1,6 @@
 import { isImeKey } from "./composerKeys";
-import type { TabInfo } from "./types";
+import { TYPING_GUARD_MS } from "./typingGuard";
+import type { PermissionModeChoice, TabInfo } from "./types";
 
 /** Claude Code's mode key (Shift+Tab cycles the permission mode), claimed everywhere in the chat so it never
  *  becomes WebKit's backward focus navigation or GTK's `move-focus` (owner, 2026-09-26: "在agent pane都要可以直接切换"). */
@@ -33,28 +34,49 @@ export type ModeKeyState = {
   confirmOpen: boolean;
   chooserOpen: boolean;
   tabState: TabInfo["state"] | null;
-  /** Verdandi `SetPermissionMode` (D6) is live for this tab's sidecar (`capabilities.modeSwitch`), so a live
-   *  session can switch mid-session rather than being fixed after the first message. Wave 5. */
-  canSwitch: boolean;
+  /** The tab's own mode (`TabInfo.mode`), read only to settle the `ended`/`failed` case (v1 spec
+   *  D6): entering bypass there is refused, but a tab that is ALREADY in bypass can still leave it
+   *  in every state, so `ended`/`failed` is not simply "fixed" any more. `null` before any tab
+   *  exists yet, the same as `tabState`. */
+  tabMode: PermissionModeChoice | null;
 };
 
-/** See the table in the wave-4 plan, Task 1, extended by wave 5 (ruling W5). A mode is chosen before a session's
- *  first message (ruling 5) unless the sidecar can switch, in which case a live tab keeps cycling; a starting
- *  tab says so rather than flashing the (false, on a switch-capable sidecar) fixed-mode text; ended/failed
- *  sessions are always fixed. */
-export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "starting" | "none" {
+/** v1 (spec `docs/superpowers/specs/2026-09-27-v1-mode-design.md`, D6, replacing wave 5's
+ *  `canSwitch`/`SetPermissionMode` gate, which Task 1 removes entirely): `not_started`, `starting`
+ *  and `live` all always cycle now -- there is no provider capability left to gate on, since every
+ *  session is gated and Rust is the one authority for whether a cycle actually lands in bypass (it
+ *  may reprompt with `confirm_bypass` instead of just applying it). `ended`/`failed` can only LEAVE
+ *  bypass, never enter it. */
+export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "none" {
   if (s.confirmOpen || s.chooserOpen) return "overlay";
   if (s.tabState === null) return "none";
-  if (s.tabState === "not_started") return "cycle";
-  if (s.tabState === "live" && s.canSwitch) return "cycle";
-  if (s.tabState === "starting") return "starting";
-  return "fixed";
+  if (s.tabState === "not_started" || s.tabState === "starting" || s.tabState === "live") return "cycle";
+  return s.tabMode === "bypass" ? "cycle" : "fixed";
 }
 
-export const MODE_STARTING_MESSAGE = "session is starting — try again once it is up";
+/** The key that restarts an ended or failed session in place (`EmptyTab`'s own `r` while failed;
+ *  the live conversation's `restart` case while ended) -- fixed, not a rebindable `panelTable`
+ *  action, so there is nothing on the wire to read it from; unlike `newTabChord` (which this
+ *  parameter replaces at both call sites) it is never actually empty in practice, but the same
+ *  optional shape is kept so a caller with none at all still gets a sensible message. */
+export function modeFixedMessage(resetKey: string): string {
+  return resetKey === ""
+    ? "the session has ended — start a new one to change the mode"
+    : `the session has ended — ${resetKey} to start again`;
+}
 
-export function modeFixedMessage(newTabChord: string): string {
-  return newTabChord === ""
-    ? "mode is fixed for this session — open a new tab to choose"
-    : `mode is fixed for this session — ${newTabChord} for a new tab`;
+/** D11: how long a `confirm_bypass` prompt must have been on screen, and how long since the last
+ *  non-modifier keydown ANYWHERE in the panel, before a `y`/`Y` counts as answering it -- typed text
+ *  (even the very keys that triggered the prompt, like `<leader>m`) must never fall through into
+ *  bypass. It IS `typingGuard.ts#TYPING_GUARD_MS` (v1 S1): one number for "typed text is still
+ *  arriving", unified when v1-mode merged onto v1-ui. */
+export const BYPASS_YES_GUARD_MS = TYPING_GUARD_MS;
+
+/** Both halves of D11's guard, pure and clock-injected (`performance.now()` at the call site, never
+ *  `event.timeStamp`, so tests can control it). `lastKeyAt` is the last non-modifier keydown
+ *  strictly BEFORE this one -- see `App.tsx`'s document-capture listener, which records it for every
+ *  keydown in the panel before any routing, so a key typed into any handler (the composer, a card's
+ *  reason box, the leader engine) counts, not just ones this module itself sees. */
+export function bypassYesCounts({ now, openedAt, lastKeyAt }: { now: number; openedAt: number; lastKeyAt: number }): boolean {
+  return now - openedAt >= BYPASS_YES_GUARD_MS && now - lastKeyAt >= BYPASS_YES_GUARD_MS;
 }

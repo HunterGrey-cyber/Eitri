@@ -35,7 +35,7 @@ fn project() -> std::path::PathBuf {
 }
 
 fn start(dir: &std::path::Path) -> AgentBackend {
-    AgentBackend::start(BackendKind::Sidecar, dir, agent::PermissionMode::Auto, None)
+    AgentBackend::start(BackendKind::Sidecar, dir, None)
         .map_err(|e| e.message)
         .expect("a sidecar session starts; is this running under a test-account wrapper?")
 }

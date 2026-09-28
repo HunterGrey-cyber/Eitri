@@ -16,12 +16,12 @@ pub struct RecordingProvider {
     turns: std::sync::Mutex<Vec<String>>,
     interrupts: AtomicUsize,
     refusing: AtomicBool,
+    /// While on, every `resolve_permission` is refused as a provider error. R07/S2, Task 2: covers
+    /// `AgentBackend::approve_pending`'s failed-allow path ("fail toward a card").
+    refusing_resolutions: AtomicBool,
     interrupt_capable: bool,
-    /// Advertises `set_permission_mode` (wave 5, Task 4).
-    switch_capable: bool,
-    refusing_switches: AtomicBool,
-    /// Every `set_permission_mode` call's mode, accepted or refused.
-    modes: std::sync::Mutex<Vec<agent::PermissionMode>>,
+    /// Every `close_session` that reached the provider: what a backend's shutdown does.
+    closes: AtomicUsize,
 }
 
 impl RecordingProvider {
@@ -39,21 +39,9 @@ impl RecordingProvider {
             ..Default::default()
         }
     }
-    /// A provider that advertises `set_permission_mode` (read by `AgentConversation::create`, so
-    /// choose it before creating the conversation), as `interruptible` does for `interrupt`.
-    pub fn switchable() -> Self {
-        RecordingProvider {
-            switch_capable: true,
-            ..Default::default()
-        }
-    }
-    /// Every mode a `set_permission_mode` reached the provider with, refused ones included.
-    pub fn modes(&self) -> Vec<agent::PermissionMode> {
-        self.modes.lock().unwrap().clone()
-    }
-    /// While on, every mode switch is refused as a provider error.
-    pub fn refuse_switches(&self, on: bool) {
-        self.refusing_switches.store(on, Ordering::SeqCst);
+    /// How many times the session was closed -- non-zero once its backend was shut down.
+    pub fn closes(&self) -> usize {
+        self.closes.load(Ordering::SeqCst)
     }
     pub fn turns(&self) -> Vec<String> {
         self.turns.lock().unwrap().clone()
@@ -65,13 +53,16 @@ impl RecordingProvider {
     pub fn refuse_sends(&self, on: bool) {
         self.refusing.store(on, Ordering::SeqCst);
     }
+    /// While on, every `resolve_permission` (an allow or a deny) is refused as a provider error.
+    pub fn refuse_resolutions(&self, on: bool) {
+        self.refusing_resolutions.store(on, Ordering::SeqCst);
+    }
 }
 
 impl agent::AgentProvider for RecordingProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             interrupt: self.interrupt_capable,
-            set_permission_mode: self.switch_capable,
             ..ProviderCapabilities::default()
         }
     }
@@ -99,28 +90,20 @@ impl agent::AgentProvider for RecordingProvider {
         Ok(())
     }
     fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+        if self.refusing_resolutions.load(Ordering::SeqCst) {
+            return Err(agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::PermissionAlreadyResolved,
+                message: "resolutions refused by the test".into(),
+            });
+        }
         self.resolved
             .lock()
             .unwrap()
             .push((request.permission_id, request.decision.allows()));
         Ok(())
     }
-    fn set_permission_mode(&self, request: agent::SetPermissionModeRequest) -> Result<String, agent::ProviderError> {
-        self.modes.lock().unwrap().push(request.mode);
-        if self.refusing_switches.load(Ordering::SeqCst) {
-            return Err(agent::ProviderError::Provider {
-                code: agent::ProviderErrorCode::InvalidConfiguration,
-                message: "refused by the test".into(),
-            });
-        }
-        // The provider's own vocabulary, as `SetPermissionModeResponse.permission_mode` carries it.
-        Ok(match request.mode {
-            agent::PermissionMode::Auto => "default",
-            agent::PermissionMode::Bypass => "bypassPermissions",
-        }
-        .into())
-    }
     fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn pump(&self) -> Vec<AgentDomainEvent> {

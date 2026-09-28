@@ -115,6 +115,7 @@ fn permission_requested_populates_pending_permissions_map() {
         tool_use_id: Some("tu-1".into()),
         tool_name: "Bash".into(),
         input: json!({}),
+        provider_prompt: None,
     });
     assert!(projection.pending_permissions.contains_key("perm-1"));
     assert_eq!(projection.pending_permissions["perm-1"].tool_name, "Bash");
@@ -149,6 +150,7 @@ fn a_pending_permission_names_one_specific_tool_call_among_several_of_the_same_t
         tool_use_id: Some("toolu_second".into()),
         tool_name: "Bash".into(),
         input: json!({"command": "rm -rf /"}),
+        provider_prompt: None,
     });
 
     let request = &projection.pending_permissions["toolu_second"];
@@ -177,10 +179,141 @@ fn the_legacy_hook_relay_shape_where_both_ids_are_one_string_is_stored_intact() 
         tool_use_id: Some("toolu_01CtdezhmhUCrBaswxW5HYmC".into()),
         tool_name: "Bash".into(),
         input: json!({"command": "echo hello"}),
+        provider_prompt: None,
     });
     let record = &projection.pending_permissions["toolu_01CtdezhmhUCrBaswxW5HYmC"];
     assert_eq!(record.permission_id, "toolu_01CtdezhmhUCrBaswxW5HYmC");
     assert_eq!(record.tool_use_id.as_deref(), Some("toolu_01CtdezhmhUCrBaswxW5HYmC"));
+}
+
+/// O3 ruling 7: the CLI's own prompt for a call is a SECOND request for a `tool_use_id` whose gate
+/// request was already answered and resolved (measured: same id, new permission id, 15-140 ms after
+/// the gate's allow). It must land as a pending request of its own, carrying the CLI's words, and
+/// resolve independently -- never be taken for a duplicate of the first.
+#[test]
+fn a_second_request_for_a_call_already_answered_is_a_new_pending_request() {
+    let mut projection = AgentSessionProjection::default();
+    let gate = AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-hook".into(),
+        tool_use_id: Some("toolu_01NqRA82mkgduq2VkbswcvQQ".into()),
+        tool_name: "Write".into(),
+        input: json!({"file_path": "/p/.git/probe", "content": "o3"}),
+        provider_prompt: None,
+    };
+    projection.apply(&gate);
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-hook".into(),
+        outcome: PermissionOutcome::Allowed,
+    });
+    assert!(projection.pending_permissions.is_empty());
+
+    let prompt = agent::ProviderPrompt {
+        reason: Some("Claude requested permissions to edit /p/.git/probe which is a sensitive file.".into()),
+        description: Some(".git/probe".into()),
+        ..Default::default()
+    };
+    projection.apply(&AgentDomainEvent::PermissionRequested {
+        permission_id: "perm-provider".into(),
+        tool_use_id: Some("toolu_01NqRA82mkgduq2VkbswcvQQ".into()),
+        tool_name: "Write".into(),
+        input: json!({"file_path": "/p/.git/probe", "content": "o3"}),
+        provider_prompt: Some(prompt.clone()),
+    });
+    let record = &projection.pending_permissions["perm-provider"];
+    assert_eq!(record.tool_use_id.as_deref(), Some("toolu_01NqRA82mkgduq2VkbswcvQQ"));
+    assert_eq!(record.provider_prompt.as_ref(), Some(&prompt));
+
+    projection.apply(&AgentDomainEvent::PermissionResolved {
+        permission_id: "perm-provider".into(),
+        outcome: PermissionOutcome::Allowed,
+    });
+    assert!(projection.pending_permissions.is_empty());
+}
+
+/// The event's JSON (what the panel's `events` payload carries): a gate request serializes exactly
+/// as it did before the field existed, and a provider prompt carries the CLI's words under
+/// `provider_prompt`, in the event's own snake_case.
+#[test]
+fn a_gate_request_serializes_unchanged_and_a_provider_prompt_carries_its_words() {
+    let gate = AgentDomainEvent::PermissionRequested {
+        permission_id: "p1".into(),
+        tool_use_id: Some("tu".into()),
+        tool_name: "Write".into(),
+        input: json!({}),
+        provider_prompt: None,
+    };
+    let json = serde_json::to_value(&gate).unwrap();
+    assert!(json.get("provider_prompt").is_none(), "{json}");
+
+    let asked = AgentDomainEvent::PermissionRequested {
+        permission_id: "p2".into(),
+        tool_use_id: Some("tu".into()),
+        tool_name: "Write".into(),
+        input: json!({}),
+        provider_prompt: Some(agent::ProviderPrompt {
+            reason: Some("why".into()),
+            description: None,
+            blocked_path: None,
+            matched_ask_rule: Some(agent::MatchedAskRule {
+                source: "projectSettings".into(),
+                tool_name: "Bash".into(),
+                rule_content: Some("cat:*".into()),
+            }),
+            unrecognized_origin: None,
+        }),
+    };
+    let json = serde_json::to_value(&asked).unwrap();
+    assert!(json["provider_prompt"].get("unrecognized_origin").is_none(), "{json}");
+    assert_eq!(json["provider_prompt"]["reason"], "why");
+    assert_eq!(json["provider_prompt"]["matched_ask_rule"]["tool_name"], "Bash");
+    assert_eq!(json["provider_prompt"]["matched_ask_rule"]["rule_content"], "cat:*");
+}
+
+/// Which CLI prompts no automatic path may answer (O3 ruling 4 and review #3): one the user's own ask
+/// rule forced, and one whose origin this build does not know. A plain one (the sensitive-file check)
+/// is not among them. And the label a card and a row note use: the CLI's own check when it gave a
+/// reason, a neutral "Claude Code asked" when it gave none or its kind is unknown (review #5).
+#[test]
+fn which_cli_prompts_need_a_human_and_what_they_are_called() {
+    let plain = agent::ProviderPrompt {
+        reason: Some("... which is a sensitive file.".into()),
+        ..Default::default()
+    };
+    assert!(!plain.needs_a_human());
+    assert_eq!(plain.label(), "Claude Code safety check");
+
+    let silent = agent::ProviderPrompt::default();
+    assert!(!silent.needs_a_human());
+    assert_eq!(silent.label(), "Claude Code asked");
+
+    let ruled = agent::ProviderPrompt {
+        matched_ask_rule: Some(agent::MatchedAskRule {
+            source: "projectSettings".into(),
+            tool_name: "Bash".into(),
+            rule_content: Some("cat:*".into()),
+        }),
+        ..plain.clone()
+    };
+    assert!(ruled.needs_a_human());
+    assert_eq!(ruled.label(), "your ask rule: Bash(cat:*)");
+
+    let unknown = agent::ProviderPrompt {
+        unrecognized_origin: Some(7),
+        ..plain
+    };
+    assert!(unknown.needs_a_human());
+    assert_eq!(unknown.label(), "Claude Code asked");
+}
+
+#[test]
+fn a_matched_ask_rule_reads_as_claude_codes_own_rule_syntax() {
+    let rule = |content: Option<&str>| agent::MatchedAskRule {
+        source: "projectSettings".into(),
+        tool_name: "Bash".into(),
+        rule_content: content.map(str::to_string),
+    };
+    assert_eq!(rule(Some("cat:*")).display(), "Bash(cat:*)");
+    assert_eq!(rule(None).display(), "Bash");
 }
 
 /// The scenario `agent/BACKEND_BASELINE.md` cites by name as pinning concurrent-permission
@@ -194,12 +327,14 @@ fn two_concurrent_permission_requests_are_both_retained_and_independently_resolv
         tool_use_id: None,
         tool_name: "Bash".into(),
         input: json!({}),
+        provider_prompt: None,
     });
     projection.apply(&AgentDomainEvent::PermissionRequested {
         permission_id: "perm-2".into(),
         tool_use_id: None,
         tool_name: "Write".into(),
         input: json!({}),
+        provider_prompt: None,
     });
     assert_eq!(projection.pending_permissions.len(), 2);
 
@@ -372,6 +507,7 @@ fn permission_resolved_accepts_provider_failed_and_expired_outcomes() {
         tool_use_id: None,
         tool_name: "Bash".into(),
         input: json!({}),
+        provider_prompt: None,
     });
     projection.apply(&AgentDomainEvent::PermissionResolved {
         permission_id: "perm-1".into(),
@@ -384,6 +520,7 @@ fn permission_resolved_accepts_provider_failed_and_expired_outcomes() {
         tool_use_id: None,
         tool_name: "Write".into(),
         input: json!({}),
+        provider_prompt: None,
     });
     projection.apply(&AgentDomainEvent::PermissionResolved {
         permission_id: "perm-2".into(),
@@ -575,6 +712,7 @@ fn every_item_carries_a_sequence_number_ordering_it_against_the_other_two_collec
         tool_use_id: Some("toolu_2".into()),
         tool_name: "Read".into(),
         input: json!({}),
+        provider_prompt: None,
     });
     projection.apply(&AgentDomainEvent::ContentDelta {
         turn_id: "t1".into(),
@@ -663,6 +801,7 @@ fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
         tool_use_id: None,
         tool_name: "Bash".into(),
         input: json!({}),
+        provider_prompt: None,
     });
 
     let highest = projection
@@ -803,6 +942,7 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             tool_use_id: Some("toolu_1".into()),
             tool_name: "Bash".into(),
             input: json!({}),
+            provider_prompt: None,
         },
         AgentDomainEvent::ContentDelta {
             turn_id: "t1".into(),
@@ -841,6 +981,10 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             provider_mode: "bypassPermissions".into(),
             floor_applied: false,
         },
+        AgentDomainEvent::UngatedCliMode {
+            reported: "acceptEdits".into(),
+            detail: "SessionReady".into(),
+        },
     ]
 }
 
@@ -871,5 +1015,6 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
         AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
         AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
+        AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
     }
 }

@@ -142,7 +142,14 @@ impl SpawnedSidecar {
 /// `.claude/settings.json` widening it). `git diff 133dc03 c0b309e -- proto crates` is
 /// **empty** — this bump changes no generated type and no capability; it exists only to
 /// track the sidecar artifact this client spawns.
-pub const EXPECTED_VERDANDI_REVISION: &str = "b0f043f";
+///
+/// Bumped 2026-09-27 (later) from c0b309e to b3aa188, the merge of Verdandi
+/// `feat/provider-permission-prompts` (its head 2d79351; `git diff 2d79351 b3aa188` is empty).
+/// Proto diff +90/−0, additive only: `ClaudeHostPolicy.provider_permission_prompts` (tag 9),
+/// `PermissionRequested.origin` and the four `provider_*` fields (tags 5-9), `PermissionOrigin`,
+/// `MatchedAskRule`, and capability `provider_permission_prompts` (the handshake list grows by one,
+/// ahead of `executable_host_cli`). `ResolvePermissionRequest` is unchanged.
+pub const EXPECTED_VERDANDI_REVISION: &str = "22400e8";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.

@@ -369,7 +369,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
-  { keys: "Shift+Tab", what: "Cycle the mode (a live session switches where the sidecar can)" },
+  { keys: "Shift+Tab", what: "Toggle auto ⇄ bypass (entering bypass asks first)" },
   { keys: "Esc", what: "Stop typing (back to browsing)" },
   { keys: "?", what: "This list, from an empty box" },
 ];

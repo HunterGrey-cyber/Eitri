@@ -12,7 +12,7 @@
 //! the provider only reports its session id at the start of a TURN, and `resume()` sends none. The
 //! provider now states a typed verdict instead, and these drive it.
 
-use agent::{AgentConversation, ClaudeSidecarProvider, ConversationError, PermissionMode};
+use agent::{AgentConversation, ClaudeSidecarProvider, ConversationError};
 
 fn provider() -> std::sync::Arc<ClaudeSidecarProvider> {
     std::sync::Arc::new(
@@ -43,7 +43,7 @@ fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
     let missing = "00000000-dead-beef-0000-000000000000";
 
     let started = std::time::Instant::now();
-    let result = AgentConversation::resume(provider(), &cwd, missing, PermissionMode::Bypass);
+    let result = AgentConversation::resume(provider(), &cwd, missing);
     let elapsed = started.elapsed();
 
     let error = match result {
@@ -95,12 +95,7 @@ fn resuming_a_session_that_does_not_exist_fails_as_a_resume() {
 fn the_refusal_carries_the_providers_own_account_rather_than_an_inference() {
     let cwd = workspace();
     let started = std::time::Instant::now();
-    let result = AgentConversation::resume(
-        provider(),
-        &cwd,
-        "11111111-2222-3333-4444-555555555555",
-        PermissionMode::Bypass,
-    );
+    let result = AgentConversation::resume(provider(), &cwd, "11111111-2222-3333-4444-555555555555");
     eprintln!("verdict in {}ms", started.elapsed().as_millis());
 
     let error = result.err().expect("a nonexistent session must not resume");

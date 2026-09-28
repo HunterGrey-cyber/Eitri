@@ -24,6 +24,10 @@ mod provider;
 mod runtime_thread;
 mod session;
 mod wire;
+/// A source scan keeping every route back to an ungated `claude` out of this crate (R07). Test-only,
+/// and declared so on purpose: its own pattern literals are then test code, which it does not scan.
+#[cfg(test)]
+mod wire_guard;
 
 pub mod account;
 pub mod external_writer;
@@ -53,19 +57,21 @@ pub use permission_policy::{
 };
 pub use permission_rules::{PrefixRule, PrefixRules};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
-pub use process::{disallowed_tools_for, AgentProcess, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
+pub use process::{
+    classify_cli_mode, disallowed_tools, AgentProcess, CliModeReport, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS,
+};
 pub use session::AgentSession;
 pub use wire::translate_line;
 
 pub use projection::{
     describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource,
-    PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ResumeStatus, ToolCallRecord, ToolCallResult,
-    TranscriptMessage, TurnOutcome, UsageInfo, UserPromptRecord,
+    MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt, ResumeStatus,
+    ToolCallRecord, ToolCallResult, TranscriptMessage, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
 };
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
-    ResumeSessionRequest, SendTurnRequest, SetPermissionModeRequest, StreamingPreference,
+    ResumeSessionRequest, SendTurnRequest, StreamingPreference,
 };
 pub use providers::claude_sidecar::{
     packaged_sidecar_available, sidecar_missing_message, BackpressureStats, ClaudeSidecarProvider,

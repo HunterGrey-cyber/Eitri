@@ -20,19 +20,18 @@ pub use spawn::{packaged_sidecar_available, sidecar_missing_message, EXPECTED_VE
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
-    SetPermissionModeRequest, StreamingPreference,
+    StreamingPreference,
 };
 use crate::runtime_thread::RuntimeThread;
-use crate::{AgentDomainEvent, PermissionMode};
+use crate::AgentDomainEvent;
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
     ClaudeHostPolicy, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
     CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ErrorDetail, ExecutableSource,
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode, ReplayStart,
-    ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest,
-    SetPermissionModeRequest as ProtoSetPermissionModeRequest, SettingSource, SettingSourceSelection, StreamingMode,
-    ToolPolicy, WatchSessionEventsRequest,
+    ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest, SettingSource,
+    SettingSourceSelection, StreamingMode, ToolPolicy, WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
@@ -56,13 +55,15 @@ pub const CLIENT_PROTOCOL_MAJOR: u32 = 3;
 const CAP_INTERRUPT_TURN: &str = "interrupt_turn";
 const CAP_RESUME_SESSION: &str = "resume_session";
 const CAP_FORK_SESSION: &str = "fork_session";
-/// Verdandi 133dc03. `capabilities_from_handshake` intersects this with
-/// `CLIENT_IMPLEMENTS_SET_PERMISSION_MODE` below.
-const CAP_SET_PERMISSION_MODE: &str = "set_permission_mode";
 /// Verdandi 133dc03. Read by `connect()` to decide `splits_messages`, which `start_watching` then
 /// uses to split two sidecar assistant messages at a `TextDelta.message_id` change -- see
 /// `translate::MessageSplit`.
 const CAP_TEXT_DELTA_MESSAGE_ID: &str = "text_delta_message_id";
+/// Verdandi b3aa188: `ClaudeHostPolicy.provider_permission_prompts` -- the CLI's OWN permission
+/// prompts (its sensitive-file safety check on `.git/`/`.claude/` is the measured one) routed to this
+/// host as `PermissionRequested` with origin PROVIDER_PROMPT. Read by `connect()` into
+/// `provider_prompts`, which `build_create_request` sends.
+const CAP_PROVIDER_PERMISSION_PROMPTS: &str = "provider_permission_prompts";
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -81,12 +82,28 @@ pub const CLIENT_IMPLEMENTS_RESUME: bool = true;
 /// client asks for a fork and nothing has verified one end to end. Flip it in the change that does
 /// both, not before.
 const CLIENT_IMPLEMENTS_FORK: bool = false;
-/// True since wave-5 Task 2, the change that makes the call real: `set_permission_mode` issues
-/// Verdandi's `SetPermissionMode`, and every session created against a sidecar advertising it is
-/// created `permission_mode_switchable` (and gated -- see `initial_policy`), which is what lets that
-/// call be accepted at all. Task 1 added the wire types with this `false`, so the capability was
-/// intersected away until both halves existed.
-pub(crate) const CLIENT_IMPLEMENTS_SET_PERMISSION_MODE: bool = true;
+/// True since O3 (2026-09-27): a provider prompt is translated with its origin
+/// (`translate::provider_prompt_of`), answered by `neovibe_core::agent_backend` on the rules O3 set
+/// (bypass allows it unless the user's own ask rule forced it; Auto allows it only after the human
+/// approved the same call), and drawn as a card with the CLI's own reason otherwise. Before that a
+/// session that asked for these would have had its prompts judged as if the gate had asked.
+const CLIENT_IMPLEMENTS_PROVIDER_PROMPTS: bool = true;
+
+/// Whether sessions on this sidecar ask for the CLI's own prompts (O3 ruling 2): the intersection of
+/// what the handshake advertised and what this client implements, like every capability here. A
+/// sidecar without it is sent nothing new and behaves exactly as before b3aa188 -- the CLI's own
+/// asks are refused headlessly, with nobody told.
+///
+/// Not a `ProviderCapabilities` field, for the reason `splits_messages` is not: no caller outside
+/// this provider branches on it. Every session this client creates is gated (R07), so it is asked
+/// for on every one of them.
+fn provider_prompts_from_handshake(response: &HandshakeResponse) -> bool {
+    CLIENT_IMPLEMENTS_PROVIDER_PROMPTS
+        && response
+            .capabilities
+            .iter()
+            .any(|c| c == CAP_PROVIDER_PERMISSION_PROMPTS)
+}
 
 /// Derives what the provider can actually do from what it actually said. Pure, so it is unit-tested
 /// against real handshake shapes without a sidecar process.
@@ -105,7 +122,6 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
             .permission_modes
             .iter()
             .any(|m| m == PERMISSION_MODE_INTERACTIVE),
-        set_permission_mode: CLIENT_IMPLEMENTS_SET_PERMISSION_MODE && has(CAP_SET_PERMISSION_MODE),
     }
 }
 
@@ -183,6 +199,9 @@ pub struct ClaudeSidecarProvider {
     /// `ProviderCapabilities` field: no caller outside this provider branches on it, it only feeds
     /// `start_watching`'s own `MessageSplit`.
     splits_messages: bool,
+    /// `provider_prompts_from_handshake`, captured at `connect()`: whether `create_session` and
+    /// `resume_session` ask this sidecar for the CLI's own permission prompts (O3 ruling 2).
+    provider_prompts: bool,
 }
 
 impl ClaudeSidecarProvider {
@@ -255,6 +274,16 @@ impl ClaudeSidecarProvider {
 
         let capabilities = capabilities_from_handshake(&handshake);
         let splits_messages = handshake.capabilities.iter().any(|c| c == CAP_TEXT_DELTA_MESSAGE_ID);
+        let provider_prompts = provider_prompts_from_handshake(&handshake);
+        if !provider_prompts {
+            // Said once, on stderr only: an older sidecar is not a fault, but a bypass on it is
+            // narrower than the CLI's own bypassPermissions (O3), and this is the line that says why.
+            eprintln!(
+                "agent: ClaudeSidecarProvider: this sidecar does not offer {CAP_PROVIDER_PERMISSION_PROMPTS}; \
+                 a call the CLI itself asks about after the gate allowed it (a write under .git/ or \
+                 .claude/) is refused with nobody asked"
+            );
+        }
         // Warnings only. The checkout DESCRIPTION is always present and travels separately as
         // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
         // a permanent warning indicator in the UI for every healthy session.
@@ -274,6 +303,7 @@ impl ClaudeSidecarProvider {
             capabilities,
             info,
             splits_messages,
+            provider_prompts,
         })
     }
 
@@ -334,51 +364,8 @@ impl ClaudeSidecarProvider {
         Ok(response.session_id)
     }
 
-    /// `finish_start` against this sidecar: the switch to bypass and the close are the real RPCs.
-    fn complete_start(&self, session_id: String, switch_after: bool) -> Result<String, ProviderError> {
-        finish_start(
-            session_id,
-            switch_after,
-            |id| {
-                self.set_permission_mode(SetPermissionModeRequest {
-                    session_id: id.to_string(),
-                    mode: PermissionMode::Bypass,
-                })
-            },
-            |id| {
-                self.close_session(CloseSessionRequest {
-                    session_id: id.to_string(),
-                })
-            },
-        )
-    }
-
-    /// Refuses a permission policy the live handshake does not advertise.
-    ///
-    /// The mode reaches here from a choice made on the start screen, before any provider existed --
-    /// so the offer there is what this CLIENT implements, and this is the server half of the same
-    /// two-term check `resume` already uses. Failing loudly is the whole point: the alternative,
-    /// mapping an unsupported mode onto whatever the provider does support, would start an agent
-    /// under a permission policy the user did not pick and would not be told about.
-    fn require_permission_mode(&self, mode: PermissionMode) -> Result<(), ProviderError> {
-        if self.capabilities.supports_permission_mode(mode) {
-            return Ok(());
-        }
-        Err(ProviderError::Provider {
-            code: ProviderErrorCode::InvalidConfiguration,
-            message: format!(
-                "this provider does not offer the {} permission policy (it advertises: {})",
-                match mode {
-                    PermissionMode::Auto => PERMISSION_MODE_INTERACTIVE,
-                    PermissionMode::Bypass => PERMISSION_MODE_BYPASS,
-                },
-                if self.info.advertised_permission_modes.is_empty() {
-                    "none".to_string()
-                } else {
-                    self.info.advertised_permission_modes.join(", ")
-                }
-            ),
-        })
+    fn require_interactive(&self) -> Result<(), ProviderError> {
+        require_interactive(&self.capabilities, &self.info)
     }
 
     /// Watches one session's event stream for as long as the session lives, reconnecting across
@@ -400,6 +387,9 @@ impl ClaudeSidecarProvider {
             // message id it last saw, and `tracker` (just above) already drops `Duplicate` events
             // before they reach here, so a replay after a reconnect cannot split a message twice.
             let mut split = translate::MessageSplit::new(splits_messages);
+            // Per session, like `split`: a stricter or unreported CLI permission mode is noted once,
+            // not on every turn's `SessionReady` (spec §2.3).
+            let mut cli_mode_note = translate::CliModeNote::default();
             // Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new
             // event resets it, so the budget bounds "getting nowhere", not "reconnecting at all".
             let mut consecutive_failures = 0usize;
@@ -466,7 +456,10 @@ impl ClaudeSidecarProvider {
                                     if let Some(boundary) = split.before(&event) {
                                         events.lock().unwrap().push(boundary);
                                     }
-                                    if let Some(domain_event) = translate::translate(event) {
+                                    if let Some(line) = cli_mode_note.observe(&event) {
+                                        eprintln!("{line}");
+                                    }
+                                    for domain_event in translate::translate(event) {
                                         // A session that closes on its own terms is the one ending
                                         // that is not a loss -- recorded from the provider's own
                                         // terminal event, never inferred from the stream stopping.
@@ -589,76 +582,57 @@ fn map_status(status: tonic::Status) -> ProviderError {
     ProviderError::Transport(status.message().to_string())
 }
 
-/// What a session is CREATED in, and whether it must then be switched (Verdandi 133dc03,
-/// `runtime.proto` `SetPermissionModeRequest`): a session created under BYPASS has no PreToolUse
-/// gate and can never return to INTERACTIVE, so a session that may switch is created gated and, when
-/// the user chose bypass, switched right after `CreateSession` -- the order that contract
-/// prescribes. `switchable` sets `--allow-dangerously-skip-permissions` on the CLI, which the CLI
-/// refuses as root without IS_SANDBOX=1 (same comment; the session would die at startup); neovibe
-/// does not run as root.
-fn initial_policy(requested: PermissionMode, switchable: bool) -> (PermissionMode, bool) {
-    match (requested, switchable) {
-        (PermissionMode::Bypass, true) => (PermissionMode::Auto, true),
-        (mode, _) => (mode, false),
+/// Refuses to start a session on a sidecar that does not advertise the gated (`interactive`)
+/// policy -- since R07 the only one any session is created under, whatever the tab's mode.
+///
+/// Failing loudly is the whole point: the alternative, starting the session under whatever the
+/// provider does offer, would run an agent under a permission policy nobody chose and nobody was
+/// told about. There is no fallback to BYPASS, ever. A free function so it is tested without a
+/// sidecar.
+fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo) -> Result<(), ProviderError> {
+    if capabilities.interactive_permission_mode {
+        return Ok(());
     }
-}
-
-/// The tail of a start (W3 of the wave-5 plan): a start the user chose as bypass is not handed back
-/// until the switch was acknowledged. A refused switch closes the gated session it would otherwise
-/// leave running -- never a gated session the user did not choose -- and the start fails with the
-/// SWITCH's error; a failing close is logged, not returned, because it is not what went wrong.
-/// Separate from the provider so this ordering is unit-tested without a sidecar.
-fn finish_start(
-    session_id: String,
-    switch_after: bool,
-    switch: impl FnOnce(&str) -> Result<String, ProviderError>,
-    close: impl FnOnce(&str) -> Result<(), ProviderError>,
-) -> Result<String, ProviderError> {
-    if !switch_after {
-        return Ok(session_id);
-    }
-    match switch(&session_id) {
-        Ok(ack) => {
-            eprintln!("[permission] started in bypass (provider: {ack})");
-            Ok(session_id)
-        }
-        Err(e) => {
-            if let Err(c) = close(&session_id) {
-                eprintln!(
-                    "agent: ClaudeSidecarProvider: closing the gated session after a refused bypass switch failed: {c}"
-                );
+    Err(ProviderError::Provider {
+        code: ProviderErrorCode::InvalidConfiguration,
+        message: format!(
+            "this provider does not offer a gated (interactive) mode, the only one neovibe runs a \
+             session in (R07); it advertises: {}",
+            if info.advertised_permission_modes.is_empty() {
+                "none".to_string()
+            } else {
+                info.advertised_permission_modes.join(", ")
             }
-            Err(e)
-        }
-    }
+        ),
+    })
 }
 
 /// Builds the one `CreateSessionRequest` both a fresh session and a resume go through.
 ///
-/// The policy is fixed rather than parameterised on purpose, with one capability-driven input:
-/// `switchable` (the sidecar advertises `set_permission_mode`), which creates the session gated and
-/// states `permission_mode_switchable` -- see `initial_policy`. Otherwise this client only ever sends values
-/// whose runtime behavior has been confirmed distinct. `verdandi_rules` is identical to
-/// `interactive` in the current sidecar, `external_store` is identical to `ephemeral`, and
+/// The policy is fixed rather than parameterised on purpose, and since R07 that includes the
+/// permission policy: every session is `INTERACTIVE` and never switchable, whatever the tab's
+/// mode. This client only ever sends values whose runtime behavior has been confirmed distinct.
+/// `verdandi_rules` is identical to `interactive` in the current sidecar, `external_store` is
+/// identical to `ephemeral`, and
 /// `executable` is not read at all -- sending any of them would be choosing a value that means
 /// nothing. `streaming` is the exception that proves the rule: PARTIAL has a measured, distinct
-/// effect, so it is sent.
+/// effect, so it is sent. `provider_prompts` is the other: `provider_prompts_from_handshake`, the one
+/// policy field that depends on the peer (O3 ruling 2).
 fn build_create_request(
     cwd: String,
-    permission_mode: PermissionMode,
     streaming: StreamingPreference,
     resume_provider_session_id: Option<String>,
     fork: bool,
-    switchable: bool,
+    provider_prompts: bool,
 ) -> ProtoCreateSessionRequest {
-    // From the REQUESTED mode, not the one sent: the tool list is a statement about what the user
-    // chose, and a switchable bypass session is still a bypass session once switched.
-    let denied = crate::process::disallowed_tools_for(permission_mode);
+    let denied = crate::process::disallowed_tools();
     ProtoCreateSessionRequest {
         cwd,
         policy: Some(ClaudeHostPolicy {
             configuration: ConfigurationProfile::Native as i32,
-            permissions: to_proto_permission_mode(initial_policy(permission_mode, switchable).0),
+            // Always gated (R07): the CLI runs `default` under Verdandi's `PreToolUse` broker, and
+            // bypass is neovibe answering `allow`, never a policy sent here.
+            permissions: ProtoPermissionMode::Interactive as i32,
             persistence: PersistenceMode::HostCli as i32,
             executable: ExecutableSource::HostCli as i32,
             // Without PARTIAL a long reply is a blank panel for ten-plus seconds and then a wall of
@@ -713,17 +687,17 @@ fn build_create_request(
                 // `unrestricted` alongside any stated restriction (`runtimeServiceImpl.ts`) rather
                 // than guessing which of the two the caller meant. The two can therefore never
                 // disagree here.
-                //
-                // A switchable session states `unrestricted` too, so entering bypass by a switch
-                // applies no floor (`usesDefaultBypassDeny`, Verdandi `session.ts`; the proto's
-                // `SetPermissionModeRequest` comment).
                 unrestricted: denied.is_empty(),
                 allow: None,
             }),
-            // Opt-in to a later mid-session switch to bypass (capability 'set_permission_mode',
-            // Verdandi 133dc03): true exactly when the sidecar advertises the call, so a sidecar
-            // without it is sent nothing new.
-            permission_mode_switchable: switchable,
+            // Never switchable (R07): `true` sets --allow-dangerously-skip-permissions on the CLI.
+            permission_mode_switchable: false,
+            // O3: the CLI's own permission prompts (its sensitive-file check, which neither the
+            // gate's `allow` nor a rule silences) come to this host instead of being refused with
+            // nobody asked. Meaningful because the session is INTERACTIVE; an older sidecar is never
+            // sent it (`provider_prompts_from_handshake`). Adds no tool: the sidecar disallows the
+            // three the SDK's prompt channel brings with it, and `allow` above is absent.
+            provider_permission_prompts: provider_prompts,
         }),
         resume_provider_session_id,
         fork,
@@ -737,13 +711,6 @@ fn build_create_request(
     }
 }
 
-fn to_proto_permission_mode(mode: PermissionMode) -> i32 {
-    match mode {
-        PermissionMode::Auto => ProtoPermissionMode::Interactive as i32,
-        PermissionMode::Bypass => ProtoPermissionMode::Bypass as i32,
-    }
-}
-
 impl AgentProvider for ClaudeSidecarProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities
@@ -753,26 +720,17 @@ impl AgentProvider for ClaudeSidecarProvider {
         self.info.clone()
     }
 
-    /// On a sidecar that can switch, a bypass start is created gated and switched right after
-    /// `CreateSession` (`initial_policy`, W3); a refused switch closes it and fails the start.
+    /// Always gated (R07): refused on a sidecar without the interactive policy, never started under
+    /// another one.
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
-        self.require_permission_mode(request.permission_mode)?;
-        let switchable = self.capabilities.set_permission_mode;
-        let (sent, switch_after) = initial_policy(request.permission_mode, switchable);
-        if sent != request.permission_mode {
-            // A bypass start is CREATED interactive, so that mode must be offered too -- never a
-            // sidecar error for a mode nobody asked for by name.
-            self.require_permission_mode(sent)?;
-        }
-        let session_id = self.open_session(build_create_request(
+        self.require_interactive()?;
+        self.open_session(build_create_request(
             request.cwd,
-            request.permission_mode,
             request.streaming,
             None,
             false,
-            switchable,
-        ))?;
-        self.complete_start(session_id, switch_after)
+            self.provider_prompts,
+        ))
     }
 
     /// Continues an existing Claude session. Goes through the same `CreateSession` RPC as a fresh
@@ -783,11 +741,6 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// Returns the sidecar's session id for the resumed session, which is NOT the provider session
     /// id that was passed in: the former is Verdandi's, minted fresh per `CreateSession`; the latter
     /// is Claude's, and is what continues.
-    ///
-    /// A bypass resume on a sidecar that can switch is switched here, before
-    /// `AgentConversation::resume` waits for its attach verdict -- so a bogus resume id may fail as
-    /// a refused switch (the session already closing) rather than as `ResumeRejected`. The start
-    /// fails and nothing is left running either way.
     fn resume_session(&self, request: ResumeSessionRequest) -> Result<String, ProviderError> {
         if !self.capabilities.resume {
             // The provider does not advertise it, so this client must not send it -- design doc
@@ -801,23 +754,15 @@ impl AgentProvider for ClaudeSidecarProvider {
             });
         }
         // Checked on this path too, not only on create: resuming does not inherit the policy the
-        // original session ran under, so a resume into an unsupported mode would be a conversation
-        // coming back with a permission posture nobody chose.
-        self.require_permission_mode(request.permission_mode)?;
-        let switchable = self.capabilities.set_permission_mode;
-        let (sent, switch_after) = initial_policy(request.permission_mode, switchable);
-        if sent != request.permission_mode {
-            self.require_permission_mode(sent)?;
-        }
-        let session_id = self.open_session(build_create_request(
+        // original session ran under, and the resumed session is created gated like any other.
+        self.require_interactive()?;
+        self.open_session(build_create_request(
             request.cwd,
-            request.permission_mode,
             request.streaming,
             Some(request.provider_session_id),
             false,
-            switchable,
-        ))?;
-        self.complete_start(session_id, switch_after)
+            self.provider_prompts,
+        ))
     }
 
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError> {
@@ -867,27 +812,6 @@ impl AgentProvider for ClaudeSidecarProvider {
         Ok(())
     }
 
-    /// Verdandi `SetPermissionMode` (133dc03). Refused here, without a call, when the intersection
-    /// says the sidecar cannot do it -- a sidecar without the RPC would answer UNIMPLEMENTED, a
-    /// transport error that says less. Returns the CLI's acknowledged mode (`bypassPermissions` /
-    /// `default`); a CLI refusal fails the RPC and leaves the session's mode as it was.
-    fn set_permission_mode(&self, request: SetPermissionModeRequest) -> Result<String, ProviderError> {
-        if !self.capabilities.set_permission_mode {
-            return Err(ProviderError::UnsupportedCapability("set_permission_mode"));
-        }
-        self.require_permission_mode(request.mode)?;
-        let mut client = self.client.clone();
-        let proto_request = ProtoSetPermissionModeRequest {
-            session_id: request.session_id,
-            // Idempotent per command_id on the sidecar (`runtimeServiceImpl.ts` setPermissionMode).
-            command_id: uuid::Uuid::new_v4().to_string(),
-            mode: to_proto_permission_mode(request.mode),
-        };
-        Ok(self
-            .run_unary(async move { client.set_permission_mode(proto_request).await })?
-            .permission_mode)
-    }
-
     fn pump(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
     }
@@ -920,39 +844,96 @@ fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64)
 mod tests {
     use super::*;
 
-    /// The sidecar half of the owner's 2026-09-25 ruling ("auto模式给claude，和claude本身的做法一致"):
-    /// an `Auto` session is `INTERACTIVE` with an empty deny list stated as `unrestricted`, so
-    /// `Bash` is offered. Checked against Verdandi's source (read-only, 2026-09-25): the
-    /// `CONSERVATIVE_BYPASS_DENY` floor is injected only when `permissions === 'bypass'`
-    /// (`usesDefaultBypassDeny`, `packages/claude-runtime/src/session.ts`), and the `PreToolUse`
-    /// hook (matcher `*`) is installed whenever `permissions !== 'bypass'` -- neither reads
-    /// `unrestricted`, so the gate stays and no floor comes back.
+    /// R07 on the sidecar wire: every request -- fresh, resume and fork alike -- is `INTERACTIVE`,
+    /// never switchable, and states an empty deny list as `unrestricted`, whatever mode the tab is
+    /// in (the request has no mode to carry any more). `INTERACTIVE` is what Verdandi installs its
+    /// `PreToolUse` broker for (`permissions !== 'bypass'`, `packages/claude-runtime/src/session.ts`),
+    /// and `unrestricted` is what keeps its `CONSERVATIVE_BYPASS_DENY` floor off (checked in
+    /// Verdandi's source, read-only, 2026-09-25) -- so the gate is there and no tool is denied.
     #[test]
-    fn an_auto_request_is_interactive_and_restricts_no_tool() {
-        let request = build_create_request(
-            "/tmp/p".into(),
-            PermissionMode::Auto,
-            StreamingPreference::Partial,
-            None,
-            false,
-            false,
-        );
-        let policy = request.policy.expect("a policy is always sent");
-        assert_eq!(
-            policy.permissions,
-            ProtoPermissionMode::Interactive as i32,
-            "Auto is the mode Verdandi installs the PreToolUse gate for"
-        );
-        let tools = policy.tool_policy.expect("a tool policy is always stated");
-        assert!(tools.deny.is_empty(), "Auto offers Bash: {:?}", tools.deny);
+    fn every_request_is_gated_never_switchable_and_restricts_no_tool() {
+        let shapes = [
+            (
+                "fresh",
+                build_create_request("/tmp/p".into(), StreamingPreference::Partial, None, false, true),
+            ),
+            (
+                "resume",
+                build_create_request(
+                    "/tmp/p".into(),
+                    StreamingPreference::Partial,
+                    Some("claude-id".into()),
+                    false,
+                    true,
+                ),
+            ),
+            (
+                "fork",
+                build_create_request(
+                    "/tmp/p".into(),
+                    StreamingPreference::Complete,
+                    Some("claude-id".into()),
+                    true,
+                    true,
+                ),
+            ),
+        ];
+        for (shape, request) in shapes {
+            let policy = request.policy.expect("a policy is always sent");
+            assert_eq!(
+                policy.permissions,
+                ProtoPermissionMode::Interactive as i32,
+                "{shape}: every session is gated (R07)"
+            );
+            assert!(
+                !policy.permission_mode_switchable,
+                "{shape}: never switchable -- `true` sets --allow-dangerously-skip-permissions"
+            );
+            let tools = policy.tool_policy.expect("a tool policy is always stated");
+            assert!(
+                tools.unrestricted && tools.deny.is_empty(),
+                "{shape}: no tool is denied, and an empty list is stated rather than left as silence: {tools:?}"
+            );
+            assert!(
+                tools.allow.is_none(),
+                "{shape}: absent, not empty: the base tool set is untouched"
+            );
+        }
+    }
+
+    /// O3 ruling 2: the CLI's own permission prompts are asked for on every session this client
+    /// creates -- all of them gated -- exactly when the handshake advertised the capability, and the
+    /// flag is the ONLY thing that moves: the policy is otherwise the one `every_request_is_gated_...`
+    /// pins, `allow` still absent (Verdandi refuses an allow list naming the three prompt tools the
+    /// flag would add, and neovibe has none).
+    #[test]
+    fn the_clis_own_prompts_are_asked_for_exactly_when_the_sidecar_offers_them() {
+        assert!(provider_prompts_from_handshake(&real_handshake_today()));
+        let mut older = real_handshake_today();
+        older.capabilities.retain(|c| c != CAP_PROVIDER_PERMISSION_PROMPTS);
         assert!(
-            tools.allow.is_none(),
-            "absent, not empty: the base tool set is untouched"
+            !provider_prompts_from_handshake(&older),
+            "an older sidecar is never asked"
         );
-        assert!(
-            tools.unrestricted,
-            "an empty list is stated, never left as silence the sidecar could read as a floor request"
-        );
+
+        for offered in [true, false] {
+            for (shape, resume, fork) in [
+                ("fresh", None, false),
+                ("resume", Some("claude-id".to_string()), false),
+                ("fork", Some("claude-id".to_string()), true),
+            ] {
+                let policy = build_create_request("/tmp/p".into(), StreamingPreference::Partial, resume, fork, offered)
+                    .policy
+                    .expect("a policy is always sent");
+                assert_eq!(policy.provider_permission_prompts, offered, "{shape}");
+                assert_eq!(policy.permissions, ProtoPermissionMode::Interactive as i32, "{shape}");
+                assert!(!policy.permission_mode_switchable, "{shape}");
+                assert!(
+                    policy.tool_policy.expect("stated").allow.is_none(),
+                    "{shape}: no allow list, so none of the three prompt tools can be named in one"
+                );
+            }
+        }
     }
 
     /// The shape the real sidecar returns at the revision this crate pins
@@ -1016,10 +997,16 @@ mod tests {
                 "account_identity",
                 "init_fingerprint",
                 "tool_allow_list",
-                // Capability 'set_permission_mode' -- see CAP_SET_PERMISSION_MODE.
+                // Still advertised by the pinned sidecar; since R07 this client never calls it (spec
+                // §6: removed, not disabled), so no capability is derived from it.
                 "set_permission_mode",
                 // Capability 'text_delta_message_id' -- see CAP_TEXT_DELTA_MESSAGE_ID.
                 "text_delta_message_id",
+                // Added at b3aa188 (2026-09-27): `ClaudeHostPolicy.provider_permission_prompts`,
+                // the CLI's own permission prompts routed to the host as `PermissionRequested`
+                // with origin PROVIDER_PROMPT. Transcribed from Verdandi's handshake literal
+                // (`runtimeServiceImpl.ts`), which puts it last before the executable entries.
+                "provider_permission_prompts",
                 // Which executable sources this build can actually serve, advertised as capability
                 // strings rather than a new wire field. `executable_host_cli` is always present;
                 // a checkout build adds one more, `executable_sdk_bundled`, which a PACKAGED build
@@ -1063,7 +1050,11 @@ mod tests {
         );
         assert!(
             capabilities.bypass_permission_mode,
-            "bypass is advertised, and is this milestone's only permission policy"
+            "bypass is advertised -- a reported fact only, never requested since R07"
+        );
+        assert!(
+            capabilities.interactive_permission_mode,
+            "interactive is advertised, and is the only policy any session is created under (R07)"
         );
         assert!(
             capabilities.resume,
@@ -1073,154 +1064,29 @@ mod tests {
             !capabilities.fork,
             "fork_session IS advertised on the wire -- this reports false because CLIENT_IMPLEMENTS_FORK is still false"
         );
-        assert!(
-            capabilities.set_permission_mode,
-            "set_permission_mode is advertised AND CLIENT_IMPLEMENTS_SET_PERMISSION_MODE is true (wave-5 Task 2)"
-        );
-        // The provider half of the intersection: a sidecar that never offered the call reads as
-        // unable to switch, however much this client implements it.
-        let mut older = real_handshake_today();
-        older.capabilities.retain(|c| c != CAP_SET_PERMISSION_MODE);
-        assert!(!capabilities_from_handshake(&older).set_permission_mode);
     }
 
-    /// (a) A switchable session is created gated, states it may switch, and restricts no tool -- so
-    /// entering bypass later applies no Verdandi floor (`usesDefaultBypassDeny` needs
-    /// `unrestricted !== true`; `runtime.proto`'s `SetPermissionModeRequest` comment).
+    /// A sidecar without the gated policy is refused at session creation, naming what is missing
+    /// and what it does offer -- never started under BYPASS instead (R07).
     #[test]
-    fn a_switchable_bypass_request_is_created_gated_and_unrestricted() {
-        assert_eq!(
-            initial_policy(PermissionMode::Bypass, true),
-            (PermissionMode::Auto, true)
-        );
-        assert_eq!(
-            initial_policy(PermissionMode::Auto, true),
-            (PermissionMode::Auto, false)
-        );
-        assert_eq!(
-            initial_policy(PermissionMode::Bypass, false),
-            (PermissionMode::Bypass, false)
-        );
-        assert_eq!(
-            initial_policy(PermissionMode::Auto, false),
-            (PermissionMode::Auto, false)
-        );
-        for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
-            let request = build_create_request("/p".into(), mode, StreamingPreference::Partial, None, false, true);
-            let policy = request.policy.unwrap();
-            assert_eq!(policy.permissions, ProtoPermissionMode::Interactive as i32, "{mode:?}");
-            assert!(policy.permission_mode_switchable, "{mode:?}");
-            let tools = policy.tool_policy.unwrap();
-            assert!(
-                tools.unrestricted && tools.deny.is_empty(),
-                "{mode:?}: bypass denies nothing (2026-09-20)"
-            );
+    fn a_sidecar_without_the_gated_policy_is_refused_loudly() {
+        let today = real_handshake_today();
+        let info = info_from_handshake(&today, None, Vec::new());
+        assert!(require_interactive(&capabilities_from_handshake(&today), &info).is_ok());
+
+        let mut bypass_only = real_handshake_today();
+        bypass_only.permission_modes.retain(|m| m == "bypass");
+        let info = info_from_handshake(&bypass_only, None, Vec::new());
+        match require_interactive(&capabilities_from_handshake(&bypass_only), &info) {
+            Err(ProviderError::Provider {
+                code: ProviderErrorCode::InvalidConfiguration,
+                message,
+            }) => {
+                assert!(message.contains("a gated (interactive) mode"), "{message}");
+                assert!(message.contains("advertises: bypass"), "{message}");
+            }
+            other => panic!("expected a loud refusal, got {other:?}"),
         }
-        let old = build_create_request(
-            "/p".into(),
-            PermissionMode::Bypass,
-            StreamingPreference::Partial,
-            None,
-            false,
-            false,
-        );
-        assert_eq!(
-            old.policy.as_ref().unwrap().permissions,
-            ProtoPermissionMode::Bypass as i32
-        );
-        assert!(
-            !old.policy.unwrap().permission_mode_switchable,
-            "a sidecar without the capability is sent nothing new"
-        );
-    }
-
-    /// W3: a start the user chose as bypass is handed back only once the switch was acknowledged;
-    /// a refused switch closes the gated session and the start fails with the SWITCH's error.
-    #[test]
-    fn finish_start_closes_the_gated_session_when_the_bypass_switch_is_refused() {
-        use std::cell::RefCell;
-        let refused = || ProviderError::Provider {
-            code: ProviderErrorCode::InvalidConfiguration,
-            message: "refused".into(),
-        };
-
-        // Nothing to switch: neither closure runs.
-        let log = RefCell::new(Vec::<String>::new());
-        let result = finish_start(
-            "s1".into(),
-            false,
-            |id| {
-                log.borrow_mut().push(format!("switch({id})"));
-                Ok("bypassPermissions".into())
-            },
-            |id| {
-                log.borrow_mut().push(format!("close({id})"));
-                Ok(())
-            },
-        );
-        assert_eq!(result.unwrap(), "s1");
-        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
-
-        // Switch acknowledged: the session is handed back, nothing closed.
-        let log = RefCell::new(Vec::<String>::new());
-        let result = finish_start(
-            "s2".into(),
-            true,
-            |id| {
-                log.borrow_mut().push(format!("switch({id})"));
-                Ok("bypassPermissions".into())
-            },
-            |id| {
-                log.borrow_mut().push(format!("close({id})"));
-                Ok(())
-            },
-        );
-        assert_eq!(result.unwrap(), "s2");
-        assert_eq!(*log.borrow(), vec!["switch(s2)".to_string()]);
-
-        // Switch refused: the gated session is closed, the switch's error returned.
-        let log = RefCell::new(Vec::<String>::new());
-        let result = finish_start(
-            "s3".into(),
-            true,
-            |id| {
-                log.borrow_mut().push(format!("switch({id})"));
-                Err(refused())
-            },
-            |id| {
-                log.borrow_mut().push(format!("close({id})"));
-                Ok(())
-            },
-        );
-        assert!(
-            matches!(
-                result,
-                Err(ProviderError::Provider {
-                    code: ProviderErrorCode::InvalidConfiguration,
-                    ..
-                })
-            ),
-            "{result:?}"
-        );
-        assert_eq!(*log.borrow(), vec!["switch(s3)".to_string(), "close(s3)".to_string()]);
-
-        // The close failing too still returns the switch's error, never the close's.
-        let result = finish_start(
-            "s4".into(),
-            true,
-            |_| Err(refused()),
-            |_| Err(ProviderError::Transport("close failed".into())),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(ProviderError::Provider {
-                    code: ProviderErrorCode::InvalidConfiguration,
-                    ..
-                })
-            ),
-            "{result:?}"
-        );
     }
 
     #[test]
@@ -1272,10 +1138,11 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Twenty-three: the PACKAGED shape at 133dc03, which is what a shipped install meets. A
-        // checkout build advertises one more, executable_sdk_bundled, and a sidecar with egress
-        // restrictions enabled advertises egress_restricted besides. See real_handshake_today().
-        assert_eq!(info.advertised_capabilities.len(), 23);
+        // Twenty-four: the PACKAGED shape at b3aa188 (133dc03's twenty-three plus
+        // provider_permission_prompts), which is what a shipped install meets. A checkout build
+        // advertises one more, executable_sdk_bundled, and a sidecar with egress restrictions
+        // enabled advertises egress_restricted besides. See real_handshake_today().
+        assert_eq!(info.advertised_capabilities.len(), 24);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
@@ -1305,7 +1172,7 @@ mod tests {
     #[test]
     fn permission_mode_changed_serializes_with_the_wire_shape_the_panel_snapshot_needs() {
         let event = AgentDomainEvent::PermissionModeChanged {
-            mode: PermissionMode::Bypass,
+            mode: crate::PermissionMode::Bypass,
             provider_mode: "bypassPermissions".into(),
             floor_applied: false,
         };

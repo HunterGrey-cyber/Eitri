@@ -778,6 +778,7 @@ pub(crate) mod tests {
             tool_use_id: Some("tool-1".into()),
             tool_name: "Bash".into(),
             input: serde_json::json!({}),
+            provider_prompt: None,
         });
         state.fold(AgentDomainEvent::SessionUnavailable {
             reason: "the stream died".into(),

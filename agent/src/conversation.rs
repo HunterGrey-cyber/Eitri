@@ -52,7 +52,6 @@ use crate::projection::{AgentDomainEvent, PermissionOutcome};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
     ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
-    SetPermissionModeRequest,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -337,11 +336,6 @@ pub struct AgentConversation {
     /// Whether `note_title` has already taken this conversation's title, so later turns touch
     /// neither the lock nor the disk.
     title_noted: bool,
-    /// The mode this session is in as the provider last ACKNOWLEDGED it: the `create`/`resume`
-    /// argument, then each successful `set_permission_mode`. Never set optimistically (W1 of the
-    /// wave-5 plan): "a requested permission mode must never silently become a different one"
-    /// (`provider.rs`).
-    permission_mode: crate::PermissionMode,
 }
 
 impl AgentConversation {
@@ -351,28 +345,19 @@ impl AgentConversation {
     /// and the provider all see -- otherwise `/home/x/proj` and `/home/x/../x/proj` would be two
     /// conversations for one directory, would take two different locks, and would later map to two
     /// different persisted records.
-    pub fn create(
-        provider: Arc<dyn AgentProvider + Send + Sync>,
-        cwd: &Path,
-        permission_mode: crate::PermissionMode,
-    ) -> Result<Self, ConversationError> {
+    ///
+    /// No permission mode (R07): the session is gated whatever the tab's mode, and the host decides
+    /// above this API whether to answer its requests `allow` itself.
+    pub fn create(provider: Arc<dyn AgentProvider + Send + Sync>, cwd: &Path) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
         let info = provider.info();
         let session_id = provider.create_session(CreateSessionRequest {
             cwd: canonical_cwd.to_string_lossy().to_string(),
-            permission_mode,
             // A UI client always wants incremental presentation.
             streaming: crate::provider::StreamingPreference::Partial,
         })?;
-        Ok(Self::assembled(
-            provider,
-            canonical_cwd,
-            capabilities,
-            info,
-            session_id,
-            permission_mode,
-        ))
+        Ok(Self::assembled(provider, canonical_cwd, capabilities, info, session_id))
     }
 
     /// Wires a freshly-created conversation to its ingestion thread.
@@ -386,7 +371,6 @@ impl AgentConversation {
         capabilities: ProviderCapabilities,
         info: ProviderInfo,
         session_id: String,
-        permission_mode: crate::PermissionMode,
     ) -> Self {
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
         let ingest = ConversationIngest::start(
@@ -409,7 +393,6 @@ impl AgentConversation {
             session_id: Some(session_id),
             ingest,
             title_noted: false,
-            permission_mode,
         }
     }
 
@@ -434,7 +417,6 @@ impl AgentConversation {
         provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
         provider_session_id: &str,
-        permission_mode: crate::PermissionMode,
     ) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
@@ -488,7 +470,6 @@ impl AgentConversation {
         let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
             provider_session_id: provider_session_id.to_string(),
             cwd: cwd_string.clone(),
-            permission_mode,
             streaming: crate::provider::StreamingPreference::Partial,
         })?;
 
@@ -512,7 +493,6 @@ impl AgentConversation {
             session_id: Some(session_id),
             ingest,
             title_noted: false,
-            permission_mode,
         };
 
         // A resume the provider ACCEPTS can still fail moments later. The sidecar's CreateSession
@@ -766,49 +746,6 @@ impl AgentConversation {
         Ok(())
     }
 
-    /// The permission mode the provider last acknowledged for this session.
-    pub fn permission_mode(&self) -> crate::PermissionMode {
-        self.permission_mode
-    }
-
-    /// Whether this session's mode can change mid-conversation: the provider advertises
-    /// `set_permission_mode` AND this client implements it (the intersection in `capabilities`).
-    pub fn can_switch_mode(&self) -> bool {
-        self.capabilities.set_permission_mode
-    }
-
-    /// Switches this live session between auto and bypass (Verdandi `SetPermissionMode`).
-    ///
-    /// Synchronous, one unary RPC on the caller's thread -- the GTK thread in the product, the same
-    /// as `interrupt` and `respond_permission`, bounded by the provider's unary timeout (W1). The
-    /// mode is stored only once the provider acknowledged it; a refusal returns its error and
-    /// leaves `permission_mode()` as it was, because "a requested permission mode must never
-    /// silently become a different one" (`provider.rs`). A same-mode request is sent anyway: the
-    /// sidecar accepts it, and the provider rather than a cached copy is the authority.
-    ///
-    /// The projection is not touched: `PermissionModeChanged` arrives as a provider event, and the
-    /// tab owns what the band shows.
-    pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) -> Result<(), ConversationError> {
-        if !self.capabilities.set_permission_mode {
-            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
-                "set_permission_mode",
-            )));
-        }
-        let session_id = self.require_session()?;
-        let ack = self
-            .provider
-            .set_permission_mode(SetPermissionModeRequest { session_id, mode })?;
-        self.permission_mode = mode;
-        eprintln!(
-            "[permission] mode is now {} (provider: {ack})",
-            match mode {
-                crate::PermissionMode::Auto => "auto",
-                crate::PermissionMode::Bypass => "bypass",
-            }
-        );
-        Ok(())
-    }
-
     /// Answers one pending permission request. Rejects an id the projection does not currently list
     /// as pending, so an already-answered card cannot produce a second decision.
     ///
@@ -908,8 +845,8 @@ impl AgentConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ResumeSessionRequest, SetPermissionModeRequest};
-    use crate::{ContentKind, PermissionMode, ProviderErrorCode, TurnOutcome};
+    use crate::provider::ResumeSessionRequest;
+    use crate::{ContentKind, ProviderErrorCode, TurnOutcome};
     use std::sync::{Arc, Mutex};
 
     /// A provider that records what it was asked to do and replays scripted events. No process, no
@@ -923,8 +860,6 @@ mod tests {
         calls: Mutex<Vec<String>>,
         queued_events: Mutex<Vec<AgentDomainEvent>>,
         send_turn_error: Mutex<Option<ProviderError>>,
-        /// Taken once by the next `set_permission_mode`, which then fails with it.
-        set_permission_mode_error: Mutex<Option<ProviderError>>,
         /// Every event ever queued. A test waits for ingestion to reach exactly this, which is a
         /// real condition rather than a sleep long enough to probably be fine.
         queued_total: std::sync::atomic::AtomicU64,
@@ -939,7 +874,6 @@ mod tests {
                     fork: false,
                     interrupt: true,
                     bypass_permission_mode: true,
-                    set_permission_mode: false,
                 },
                 ..Default::default()
             }
@@ -1000,20 +934,6 @@ mod tests {
             self.calls.lock().unwrap().push("close_session".into());
             Ok(())
         }
-        fn set_permission_mode(&self, request: SetPermissionModeRequest) -> Result<String, ProviderError> {
-            self.calls.lock().unwrap().push(format!(
-                "set_permission_mode({}, {:?})",
-                request.session_id, request.mode
-            ));
-            if let Some(e) = self.set_permission_mode_error.lock().unwrap().take() {
-                return Err(e);
-            }
-            // The vocabulary Verdandi's `SetPermissionModeResponse.permission_mode` answers in.
-            Ok(match request.mode {
-                PermissionMode::Bypass => "bypassPermissions".into(),
-                PermissionMode::Auto => "default".into(),
-            })
-        }
         fn pump(&self) -> Vec<AgentDomainEvent> {
             std::mem::take(&mut *self.queued_events.lock().unwrap())
         }
@@ -1041,14 +961,6 @@ mod tests {
     }
 
     fn conversation_in(fake: Arc<FakeProvider>, dir: &Path) -> Result<AgentConversation, ConversationError> {
-        conversation_in_mode(fake, dir, PermissionMode::Bypass)
-    }
-
-    fn conversation_in_mode(
-        fake: Arc<FakeProvider>,
-        dir: &Path,
-        mode: PermissionMode,
-    ) -> Result<AgentConversation, ConversationError> {
         struct Shared(Arc<FakeProvider>);
         impl AgentProvider for Shared {
             fn capabilities(&self) -> ProviderCapabilities {
@@ -1075,111 +987,11 @@ mod tests {
             fn close_session(&self, r: CloseSessionRequest) -> Result<(), ProviderError> {
                 self.0.close_session(r)
             }
-            // Forwarded explicitly: the trait's default would answer `UnsupportedCapability`
-            // without ever reaching the fake, and a test checking only `is_err` would pass on it.
-            fn set_permission_mode(&self, r: SetPermissionModeRequest) -> Result<String, ProviderError> {
-                self.0.set_permission_mode(r)
-            }
             fn pump(&self) -> Vec<AgentDomainEvent> {
                 self.0.pump()
             }
         }
-        AgentConversation::create(Arc::new(Shared(fake)), dir, mode)
-    }
-
-    fn switch_calls(fake: &FakeProvider) -> Vec<String> {
-        fake.calls()
-            .into_iter()
-            .filter(|c| c.starts_with("set_permission_mode("))
-            .collect()
-    }
-
-    /// (b) No capability, no call: the mode stays what it was and the provider is never asked.
-    #[test]
-    fn set_permission_mode_is_refused_without_the_capability() {
-        let fake = Arc::new(FakeProvider::new());
-        let mut conversation = conversation_with(Arc::clone(&fake));
-        assert!(!conversation.can_switch_mode());
-        let result = conversation.set_permission_mode(PermissionMode::Auto);
-        assert!(
-            matches!(
-                result,
-                Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
-                    "set_permission_mode"
-                )))
-            ),
-            "{result:?}"
-        );
-        assert!(switch_calls(&fake).is_empty(), "{:?}", fake.calls());
-        assert_eq!(conversation.permission_mode(), PermissionMode::Bypass);
-    }
-
-    /// (c) With the capability, both directions reach the provider with this session's id, and the
-    /// mode follows only the acknowledgement.
-    #[test]
-    fn set_permission_mode_switches_both_ways_once_acknowledged() {
-        let mut fake = FakeProvider::new();
-        fake.capabilities.set_permission_mode = true;
-        let fake = Arc::new(fake);
-        let mut conversation = conversation_in_mode(Arc::clone(&fake), &unique_dir(), PermissionMode::Auto).unwrap();
-        assert!(conversation.can_switch_mode());
-        assert_eq!(conversation.permission_mode(), PermissionMode::Auto);
-
-        conversation.set_permission_mode(PermissionMode::Bypass).unwrap();
-        assert_eq!(conversation.permission_mode(), PermissionMode::Bypass);
-        conversation.set_permission_mode(PermissionMode::Auto).unwrap();
-        assert_eq!(conversation.permission_mode(), PermissionMode::Auto);
-        assert_eq!(
-            switch_calls(&fake),
-            vec![
-                "set_permission_mode(verdandi-session-1, Bypass)".to_string(),
-                "set_permission_mode(verdandi-session-1, Auto)".to_string(),
-            ]
-        );
-    }
-
-    /// (d) A refusal is the provider's to make and leaves the mode where it was (Review Focus 1).
-    #[test]
-    fn set_permission_mode_leaves_the_mode_when_the_provider_refuses() {
-        let mut fake = FakeProvider::new();
-        fake.capabilities.set_permission_mode = true;
-        *fake.set_permission_mode_error.lock().unwrap() = Some(ProviderError::Provider {
-            code: ProviderErrorCode::InvalidConfiguration,
-            message: "refused".into(),
-        });
-        let fake = Arc::new(fake);
-        let mut conversation = conversation_in_mode(Arc::clone(&fake), &unique_dir(), PermissionMode::Auto).unwrap();
-        let result = conversation.set_permission_mode(PermissionMode::Bypass);
-        assert!(
-            matches!(
-                result,
-                Err(ConversationError::Provider(ProviderError::Provider {
-                    code: ProviderErrorCode::InvalidConfiguration,
-                    ..
-                }))
-            ),
-            "{result:?}"
-        );
-        assert_eq!(conversation.permission_mode(), PermissionMode::Auto);
-        assert_eq!(
-            switch_calls(&fake),
-            vec!["set_permission_mode(verdandi-session-1, Bypass)".to_string()],
-            "the refusal came from the provider, not from a check on this side"
-        );
-    }
-
-    /// (e) After shutdown there is no session to switch, and the provider is not asked.
-    #[test]
-    fn set_permission_mode_after_shutdown_is_no_session() {
-        let mut fake = FakeProvider::new();
-        fake.capabilities.set_permission_mode = true;
-        let fake = Arc::new(fake);
-        let mut conversation = conversation_in_mode(Arc::clone(&fake), &unique_dir(), PermissionMode::Auto).unwrap();
-        conversation.shutdown();
-        let result = conversation.set_permission_mode(PermissionMode::Bypass);
-        assert!(matches!(result, Err(ConversationError::NoSession)), "{result:?}");
-        assert!(switch_calls(&fake).is_empty(), "{:?}", fake.calls());
-        assert_eq!(conversation.permission_mode(), PermissionMode::Auto);
+        AgentConversation::create(Arc::new(Shared(fake)), dir)
     }
 
     /// Waits for the ingestion thread to reach a state, or fails.
@@ -1363,7 +1175,6 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     interactive_permission_mode: true,
-                    set_permission_mode: false,
                 }
             }
             fn info(&self) -> ProviderInfo {
@@ -1413,7 +1224,7 @@ mod tests {
             ]),
         });
 
-        let conversation = AgentConversation::resume(provider, &dir, &session, PermissionMode::Bypass)
+        let conversation = AgentConversation::resume(provider, &dir, &session)
             .expect("the fake provider attaches to the session it was asked for");
         wait_for_ingest(&conversation, 2);
 
@@ -1801,11 +1612,7 @@ mod tests {
                 vec![]
             }
         }
-        let result = AgentConversation::create(
-            Arc::new(Never),
-            Path::new("/definitely/does/not/exist/neovibe-test"),
-            PermissionMode::Bypass,
-        );
+        let result = AgentConversation::create(Arc::new(Never), Path::new("/definitely/does/not/exist/neovibe-test"));
         // `AgentConversation` is deliberately not Debug (it owns a Box<dyn AgentProvider>), so
         // match the error out rather than formatting the whole Result.
         match result {
@@ -2053,6 +1860,7 @@ mod tests {
             tool_use_id: Some("tu1".into()),
             tool_name: "Bash".into(),
             input: serde_json::json!({}),
+            provider_prompt: None,
         });
         settle(&fake, &conversation);
 
@@ -2076,6 +1884,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Write".into(),
             input: serde_json::json!({}),
+            provider_prompt: None,
         });
         settle(&fake, &conversation);
         assert_eq!(conversation.projection().pending_permissions.len(), 1);

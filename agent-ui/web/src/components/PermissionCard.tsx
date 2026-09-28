@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { PermissionRequestRecord } from "../types";
+import type { MatchedAskRule, PermissionRequestRecord, ProviderPrompt } from "../types";
 import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
 import { isUsableLink } from "../timeline";
@@ -53,6 +53,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: P
       >
         Permission requested: {request.toolName}
       </div>
+      {request.providerPrompt && <ProviderPromptLine prompt={request.providerPrompt} />}
       <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />
       <input
         type="text"
@@ -88,6 +89,36 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: P
       )}
     </div>
   );
+}
+
+/** O3 ruling 6: whose question this card is when the CLI itself asked (after the gate had already
+ *  answered the call): a small label -- Claude Code's own safety check, or the user's own ask rule
+ *  when one forced the prompt -- and the CLI's own sentence, verbatim (it is prose, never parsed;
+ *  its path is the CLI's, absolute). Answered like any card: same buttons, keys and permission id. */
+function ProviderPromptLine({ prompt }: { prompt: ProviderPrompt }) {
+  const rule = prompt.matchedAskRule;
+  return (
+    <div className="permission-card-provider">
+      <span className="permission-card-provider-label" title={rule ? `from ${rule.source}` : undefined}>
+        {providerPromptLabel(prompt)}
+      </span>
+      {prompt.reason && <span className="permission-card-provider-reason">{prompt.reason}</span>}
+    </div>
+  );
+}
+
+/** Whose question it is (Rust's `ProviderPrompt::label`, which names the row notes too): the user's
+ *  own ask rule; "Claude Code safety check" only when the CLI said why; otherwise -- no reason, or a
+ *  kind of prompt this build does not know -- the neutral "Claude Code asked" (O3 review #5, #3). */
+function providerPromptLabel(prompt: ProviderPrompt): string {
+  if (prompt.matchedAskRule) return `your ask rule: ${askRuleText(prompt.matchedAskRule)}`;
+  if (prompt.unrecognizedOrigin == null && prompt.reason) return "Claude Code safety check";
+  return "Claude Code asked";
+}
+
+/** The rule as Claude Code's own settings spell it (Rust's `MatchedAskRule::display`). */
+function askRuleText(rule: MatchedAskRule): string {
+  return rule.ruleContent === null ? rule.toolName : `${rule.toolName}(${rule.ruleContent})`;
 }
 
 /** What the call would do, for a person deciding whether to allow it.

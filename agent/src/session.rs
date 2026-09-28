@@ -14,7 +14,7 @@
 //! `pending_permission_sources`, a private map never exposed through `AgentSessionProjection`.
 
 use crate::event::{AgentEvent, PermissionSource};
-use crate::process::{AgentProcess, PermissionMode};
+use crate::process::AgentProcess;
 use crate::projection::{AgentDomainEvent, AgentSessionProjection, ContentKind, PermissionOutcome, TurnOutcome};
 use crate::provider::PermissionDecision;
 use std::collections::HashMap;
@@ -49,7 +49,8 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Spawns the underlying `AgentProcess` for a whole conversation. See
-    /// `AgentProcess::spawn`'s own doc for what `project_dir`/`mode`/`disallowed_tools` mean.
+    /// `AgentProcess::spawn`'s own doc for what `project_dir`/`disallowed_tools` mean. There is no
+    /// permission mode to pass (R07): the CLI always runs gated, in `default`.
     ///
     /// **Nothing here claims the directory.** Two `AgentSession`s in one project directory is a
     /// supported shape, not a hazard to be locked out: each one's `PreToolUse` hook config travels
@@ -57,8 +58,8 @@ impl AgentSession {
     /// overwrite or delete the other's. `backend_conformance`'s
     /// `real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_hooks`
     /// asserts exactly that against the real CLI.
-    pub fn start(project_dir: &Path, mode: PermissionMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
-        let process = AgentProcess::spawn(project_dir, mode, disallowed_tools)?;
+    pub fn start(project_dir: &Path, disallowed_tools: &[&str]) -> std::io::Result<Self> {
+        let process = AgentProcess::spawn(project_dir, disallowed_tools)?;
         Ok(Self {
             process,
             projection: AgentSessionProjection::default(),
@@ -415,6 +416,12 @@ pub(crate) fn translate_wire_event(
             };
             vec![AgentDomainEvent::SessionUnavailable { reason }]
         }
+        // The hook call itself was already denied on its connection (`process::spawn_hook_listener`);
+        // what is left is the close, which is the host's (spec §2.3, D12).
+        AgentEvent::UngatedCliMode { reported } => vec![AgentDomainEvent::UngatedCliMode {
+            reported,
+            detail: "a PreToolUse hook call".to_string(),
+        }],
         AgentEvent::ProcessStderr { line } => {
             eprintln!("[agent] claude stderr: {line}");
             vec![]
@@ -469,6 +476,11 @@ fn permission_requested_event(
         tool_use_id: tool_use_id.and_then(crate::projection::tool_use_link),
         tool_name,
         input,
+        // Always the gate's own request on legacy (O3 ruling 8): this backend never passes
+        // `--permission-prompt-tool`, so the CLI's own prompts never reach it and are refused
+        // headlessly, as before. The `CanUseTool` source here is that channel's never-observed
+        // secondary signal, kept as it was.
+        provider_prompt: None,
     }
 }
 

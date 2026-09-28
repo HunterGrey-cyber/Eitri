@@ -36,12 +36,14 @@ describe("acceptsEnvelope", () => {
 
 describe("tab helpers", () => {
   it("names the mode the way the pill reads, with the cycle hint only when it is offered", () => {
-    expect(modePill("auto", true)).toBe("⏵⏵ auto on (shift+tab to cycle)");
+    expect(modePill("auto", true)).toBe("⏵⏵ auto on (shift+tab to toggle)");
     expect(modePill("bypass", false)).toBe("⏵⏵ bypass on");
   });
   it("drops the hint and the word 'on' in short form, for the band (panel round 2 plan, Task 10)", () => {
     expect(modePill("auto", true, true)).toBe("⏵⏵ auto");
-    expect(modePill("bypass", false, true)).toBe("⏵⏵ bypass");
+  });
+  it("spells out what bypass means in short form too (v1, D8)", () => {
+    expect(modePill("bypass", false, true)).toBe("⏵⏵ bypass permissions on");
   });
   it("draws one glyph per marker", () => {
     expect(markerGlyph("needs_input", 1)).toBe("⚑");

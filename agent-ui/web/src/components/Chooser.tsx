@@ -4,7 +4,7 @@ import type { BackendKind, ChooserEnvelope, PermissionModeChoice, TabId, TabInfo
 import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
-import { isShiftTab } from "../modeKey";
+import { isShiftTab, modeFixedMessage, modeKeyRoute } from "../modeKey";
 
 type Props = {
   envelope: ChooserEnvelope;
@@ -26,7 +26,18 @@ type Props = {
   onCloseTab: (tab: TabId) => void;
   onRenameTab: (tab: TabId, name: string) => void;
   onCycleMode: () => void;
+  /** `Shift+Tab` on an open tab's own row (v1-mode fix round 1): toggles THAT tab's mode -- D6 made
+   *  an open tab's mode switchable, so the old "fixed for this session" flash was false. Only offered
+   *  where Rust would act on it: leaving bypass (any tab, any state), or entering it on the active
+   *  tab (Rust asks first; the prompt is answered here, in the chooser). */
+  onCycleTabMode: (tab: TabId) => void;
   onLeave: () => void;
+  /** The window-close prompt AND (v1, spec §3.4) an open bypass confirm both own every key ahead of
+   *  everything else here too -- lifted out of `App.tsx` for the same reason `EmptyTab` takes it.
+   *  Tried first in `onKeyDown`, ahead of even this component's own Shift+Tab (`cycleMode`): a
+   *  `y`/`Y`/anything-else answering the prompt must never also move the chooser's cursor or choose
+   *  a row. */
+  answerConfirm: (event: KeyboardEvent<HTMLDivElement>) => boolean;
 };
 
 /** An IME's own Enter/Esc: `isComposing`, or the legacy 229 some WebKit builds still report. */
@@ -85,19 +96,26 @@ function tabNumber(tab: { tab: TabId; label: string }, info: TabInfo | null): nu
 }
 
 /** The mode line, above the keys (spec §6.1, decision 3/6): what a resume of the row under the
- *  cursor will run in, and where. An open tab's own mode is fixed for its session.
+ *  cursor will run in, and where. An open tab's own mode is no longer "fixed" (v1 D6, fix round 1):
+ *  the line says what `Shift+Tab` does to it from here -- see `tabModeRoute`.
+ *
+ *  O2 (a): the mode key TOGGLES auto and bypass, so the hint says "toggle" (it said "cycle", after
+ *  Claude Code's own N-mode footer).
  *
  *  Deliberately NOT `modePill` (`tabs.ts`) -- that helper's own established wording is `⏵⏵ auto on
- *  (shift+tab to cycle)` (`tabs.test.ts`), one word short of what spec §6.1 quotes verbatim twice
- *  (`Resume in ⏵⏵ auto mode on (shift+tab to cycle)`, `Tab 3 runs in ⏵⏵ auto mode on · fixed`): the
+ *  (shift+tab to toggle)` (`tabs.test.ts`), one word short of what the round-2 spec §6.1 quoted
+ *  (`Resume in ⏵⏵ auto mode on (shift+tab to cycle)`, before O2 froze the key as a toggle): the
  *  chooser's own phrasing names the mode as a noun ("auto mode") before saying it is on, which
  *  reads better in a full sentence than the footer pill's terser form does. */
 function modeLine(row: ChooserRow, active: TabInfo | null, defaultMode: PermissionModeChoice): ReactNode {
   if (row.kind === "tab") {
     const mode = row.info?.mode ?? "auto";
+    const route = tabModeRoute(row, active);
+    const tail =
+      route === "toggle" ? "(shift+tab to toggle)" : route === "ended" ? "· the session has ended" : "· switch to it to change";
     return (
       <>
-        Tab {tabNumber(row.tab, row.info)} runs in <ModeGlyph mode={mode} /> {mode} mode on · fixed
+        Tab {tabNumber(row.tab, row.info)} runs in <ModeGlyph mode={mode} /> {mode} mode on {tail}
       </>
     );
   }
@@ -105,9 +123,22 @@ function modeLine(row: ChooserRow, active: TabInfo | null, defaultMode: Permissi
   const verb = row.kind === "new" ? "Start" : "Resume";
   return (
     <>
-      {verb} in <ModeGlyph mode={mode} /> {mode} mode on (shift+tab to cycle)
+      {verb} in <ModeGlyph mode={mode} /> {mode} mode on (shift+tab to toggle)
     </>
   );
+}
+
+/** What `Shift+Tab` on an open tab's row does (v1 D6, fix round 1), matching what Rust's
+ *  `TabSet::cycle_mode` would do with it: leaving bypass works on any tab in any state; entering it
+ *  is refused on an ended/failed tab (`modeKeyRoute`'s "fixed") and on a tab that is not the one on
+ *  screen (spec §3.3, "tab N is not the one on screen") -- both said here instead of sending a
+ *  command Rust would only refuse into a banner hidden under this overlay. */
+function tabModeRoute(row: Extract<ChooserRow, { kind: "tab" }>, active: TabInfo | null): "toggle" | "ended" | "elsewhere" {
+  const info = row.info;
+  const route = modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: info?.state ?? null, tabMode: info?.mode ?? null });
+  if (route === "fixed") return "ended";
+  if (info?.mode === "bypass") return "toggle";
+  return active !== null && row.tab.tab === active.id ? "toggle" : "elsewhere";
 }
 
 /** The `⏵⏵` glyph, split into its own span (spec §9) so the font stack and colour rules stay
@@ -148,14 +179,16 @@ export function Chooser({
   onCloseTab,
   onRenameTab,
   onCycleMode,
+  onCycleTabMode,
   onLeave,
+  answerConfirm,
 }: Props) {
   const [filter, setFilter] = useState("");
   const [filtering, setFiltering] = useState(false);
   const [renaming, setRenaming] = useState<{ tab: TabId; value: string } | null>(null);
-  // A local flash (D6, unchanged): `Shift+Tab` on an open tab's mode is fixed for its session. Not
-  // the window's own `showFlash`/footer -- the chooser is a full overlay drawn over it (`.chooser`
-  // is `position: absolute; inset: 0`), so that flash would be invisible while this is open.
+  // A local flash: why `Shift+Tab` on an open tab's row did nothing (`tabModeRoute`). Not the
+  // window's own `showFlash`/footer -- the chooser is a full overlay drawn over it (`.chooser` is
+  // `position: absolute; inset: 0`), so that flash would be invisible while this is open.
   const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
   const flashSeq = useRef(0);
   useEffect(() => {
@@ -216,8 +249,14 @@ export function Chooser({
 
   function cycleMode(row: ChooserRow | undefined) {
     if (row === undefined) return;
-    if (row.kind === "tab") showFlash("mode is fixed for this session");
-    else onCycleMode();
+    if (row.kind !== "tab") {
+      onCycleMode();
+      return;
+    }
+    const route = tabModeRoute(row, activeInfo);
+    if (route === "toggle") onCycleTabMode(row.tab.tab);
+    else if (route === "ended") showFlash(modeFixedMessage("r"));
+    else showFlash(`switch to tab ${tabNumber(row.tab, row.info)} to change its mode`);
   }
 
   // Spec §6.2's `gg` (r2-gui GUI pass, 2026-09-26): a lone `g` waits for the second; any other key
@@ -225,6 +264,10 @@ export function Chooser({
   const pendingG = useRef(false);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (composing(event)) return;
+    // v1, spec §3.4: a bypass (or window-close) confirm owns every key ahead of everything else in
+    // here too, even the filter/rename inputs and this component's own Shift+Tab below -- `j`/`k`/
+    // `Enter` must never move the cursor or choose a row while it is answering a y/n instead.
+    if (answerConfirm(event)) return;
     // Wave 4 Task 1: Shift+Tab is claimed here even while the filter or rename input is focused --
     // App.tsx's document-capture router (`modeKey.ts`) already routed here (`route === "overlay"`)
     // because the chooser is open, and this component's own row-dependent choice (`cycleMode`) still

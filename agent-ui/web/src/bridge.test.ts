@@ -183,6 +183,34 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith({ kind: "hint_end", sessionId: 7 });
   });
 
+  it("demuxes a confirm_bypass envelope", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const envelope = { kind: "confirm_bypass", tab: 3, scope: "tab", nonce: 17, lines: ["切到 bypass 并批准 2 张等待中的卡片？(y/n)"] };
+    window.__neovibeDispatch!(JSON.stringify(envelope));
+    expect(handler).toHaveBeenCalledWith(envelope);
+  });
+
+  it("demuxes a confirm_bypass envelope with a null tab (window default scope)", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const envelope = { kind: "confirm_bypass", tab: null, scope: "default", nonce: 18, lines: ["新会话默认用 bypass？(y/n)"] };
+    window.__neovibeDispatch!(JSON.stringify(envelope));
+    expect(handler).toHaveBeenCalledWith(envelope);
+  });
+
+  /* D7/D11: a `y` can only ever echo a real nonce back -- one this side never made up itself -- so
+     an envelope with none is rejected up front, the same as invalid JSON or an unrecognized kind. */
+  it("rejects a confirm_bypass envelope with no nonce, like other malformed envelopes", () => {
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    installDispatch(handler);
+    window.__neovibeDispatch!(JSON.stringify({ kind: "confirm_bypass", tab: 3, scope: "tab", lines: ["?"] }));
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("passes every phase 3 envelope through the whitelist", () => {
     const handler = vi.fn();
     installDispatch(handler);

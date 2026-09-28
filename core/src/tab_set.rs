@@ -8,6 +8,7 @@
 //! `provider_session_id()` takes it again. Never call the second while holding the first's guard
 //! (the 2026-09-15 GTK freeze). Every method below reads them in separate statements.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -116,7 +117,11 @@ pub struct Tab {
     /// The first prompt's title, or the resumed record's display title.
     pub title: Option<String>,
     /// Was React's `startedPermissionMode`; now survives a panel reload (spec §3.8 point 3).
-    pub mode: SessionModeChoice,
+    /// Private outside this module for the same reason `host_answered` is (R06/S2): S2's rule that
+    /// entering bypass always asks first only holds if nothing but `cycle_mode`/`confirm_bypass` can
+    /// ever move it there. `mode()` below is the read-only way out; this module's own tests still
+    /// write the field directly.
+    mode: SessionModeChoice,
     pub backend: TabBackend,
     pub attention: AttentionTracker,
     /// The WebView's copy is behind: this tab took events while it was not active (ruling 18).
@@ -162,6 +167,25 @@ pub struct Tab {
     /// `TurnStarted` event, because a legacy `TurnStarted` is returned by `send_turn` and never
     /// pumped -- so it is at most one 33 ms tick late, on both backends.
     turn_clock: Option<(String, u64)>,
+    /// Permission ids this tab answered `allow` on the user's behalf -- in bypass
+    /// (`approve_pending`), or under the classifier (`answer_what_needs_no_human`) -- and is still
+    /// waiting on the provider's `PermissionResolved` for (R07/S2, D9). Hidden from the snapshot
+    /// (`SnapshotView::of`) and from the tray (`pump`'s `resync`/attention feed), so a request
+    /// nobody needs to see never draws a card and never counts. Private: only `tab_set` may insert,
+    /// so the hiding rule cannot be bypassed from outside this module. Read directly by this
+    /// module's own tests.
+    host_answered: BTreeSet<String>,
+    /// The calls the user approved on a card in this tab, this turn, each with the tool and input the
+    /// card showed (O3 ruling 5): the CLI's own prompt for exactly such a call, which follows the
+    /// gate's request for it, is answered `allow` without a second card, once -- as the real CLI asks
+    /// once. Written only by `TabSet::answer_card` on an Approve that reached the provider; emptied
+    /// when the turn ends (the CLI asks within the turn that made the call), on EVERY `Resync` (one
+    /// can swallow a turn boundary -- Codex's finding), on `r` and with the backend. Private for the
+    /// reason `host_answered` is.
+    human_allowed: crate::agent_backend::HumanApprovals,
+    /// Tool-use id -> the note for a call whose CLI prompt was answered without a card (review item
+    /// 7), until the call completes; it then becomes `notes.prompt_notes`, as a rule candidate does.
+    prompt_note_candidates: std::collections::BTreeMap<String, String>,
 }
 
 impl Tab {
@@ -189,12 +213,20 @@ impl Tab {
             notes: CallNotes::default(),
             rule_candidates: std::collections::BTreeMap::new(),
             turn_clock: None,
+            host_answered: BTreeSet::new(),
+            human_allowed: crate::agent_backend::HumanApprovals::default(),
+            prompt_note_candidates: std::collections::BTreeMap::new(),
         }
     }
 
     /// When this tab's running turn started, if one is running (see `turn_clock`).
     pub fn turn_started_at_ms(&self) -> Option<u64> {
         self.turn_clock.as_ref().map(|(_, at)| *at)
+    }
+
+    /// The tab's own permission mode. Read-only outside this module -- see the field's own doc.
+    pub fn mode(&self) -> SessionModeChoice {
+        self.mode
     }
 
     pub fn live(&self) -> Option<&AgentBackend> {
@@ -291,6 +323,29 @@ pub struct PumpOutput {
     pub turn_ended: Vec<TabId>,
     /// Tabs whose `rule_offers` changed in this tick: the caller sends them to the panel.
     pub offers_changed: Vec<TabId>,
+    /// Tabs this tick failed because their CLI reported an ungated permission mode (spec §2.3,
+    /// D12), each with the backend taken out of it. The caller shuts each one down off the GTK
+    /// thread exactly as it does a closed tab's (`shell::agent_panel`'s `Retiring::backend`).
+    pub tripped: Vec<Tripped>,
+}
+
+/// One tab the CLI-mode tripwire failed (spec §2.3, D12). See `PumpOutput::tripped`.
+pub struct Tripped {
+    pub tab: TabId,
+    /// The same text the tab's `Failed` reason carries.
+    pub reason: String,
+    /// The session, still running until the caller shuts it down: its shutdown is what denies the
+    /// requests left pending in it.
+    pub backend: AgentBackend,
+}
+
+/// Why a tab whose CLI reported `reported` was closed (spec §2.3's text). Names the setting most
+/// likely responsible, because that is the one thing the user can go and change.
+pub fn ungated_cli_mode_reason(reported: &str, detail: &str) -> String {
+    format!(
+        "the CLI reports permission mode '{reported}' ({detail}) — a project's permissions.defaultMode? \
+         neovibe runs only gated sessions (R07); the session was closed"
+    )
 }
 
 pub enum StartCollected {
@@ -316,6 +371,62 @@ pub enum ResumeRoute {
     StartIn(TabId),
 }
 
+/// Which mode a bypass entry moves: one tab's own mode, or the window's remembered `default_mode`
+/// for tabs not yet started (R06/S2, D2/D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassScope {
+    Tab(TabId),
+    Default,
+}
+
+/// A pending "enter bypass" prompt, stored on `TabSet::pending_bypass` until `y`/`n` answers it (D1,
+/// D2, D11). `approve` never reaches the panel (`serialize_confirm_bypass_for_js` sends only
+/// `lines`) -- Rust keeps the list so the panel never counts cards or echoes an id back (spec §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BypassPlan {
+    pub scope: BypassScope,
+    /// Answers a stale confirm (D7): only the exact prompt shown, by this nonce, may be accepted.
+    pub nonce: u64,
+    /// The delivered cards this entry would approve if confirmed now, `seq`-ordered -- the same set
+    /// `confirm_bypass` re-derives fresh (`waiting_cards`) and compares against before acting.
+    pub approve: Vec<String>,
+    /// What the panel shows (`tabs::bypass_prompt`), one or more lines (D11's y/n plus any warning).
+    pub lines: Vec<String>,
+    /// Which of `tabs::bypass_prompt`'s texts `lines` is -- what the user is agreeing to. A live
+    /// tab's prompt says nothing about new sessions; an empty tab's says they will use bypass too.
+    /// `confirm_bypass` re-derives it and reprompts when it no longer matches (the whole-branch
+    /// review: a live tab handed off to a terminal became `NotStarted` under an open live-tab prompt,
+    /// and its `y` then moved the window default into bypass, spec §7.2).
+    pub prompt: tabs::PromptScope,
+}
+
+/// What `cycle_mode`/`cycle_default_mode` return: bypass -> auto moves at once (D6); auto -> bypass
+/// always needs a confirm first (D2), never applied here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeCycle {
+    Changed(SessionModeChoice),
+    Confirm(BypassPlan),
+}
+
+/// What `confirm_bypass` did with a stored `BypassPlan`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmOutcome {
+    /// Entered bypass, having approved `approved` of the cards the plan listed. `resolved` is what
+    /// answering them produced on this side (`AgentBackend::approve_pending`'s `Approved::events`:
+    /// legacy's `PermissionResolved`s, which no pump will ever carry) -- the caller owes the panel
+    /// these, or the approved cards stay drawn (Codex v1-mode finding 1). Empty on the sidecar.
+    Entered {
+        approved: usize,
+        resolved: Vec<AgentDomainEvent>,
+    },
+    /// The tab was already in bypass by the time this confirm arrived (a race, not an error):
+    /// nothing to do.
+    AlreadyBypass,
+    /// A delivered card arrived after the plan was built and is not in `approve` (D7): nothing
+    /// changed; the caller should show the fresh plan's prompt instead.
+    Reprompt(BypassPlan),
+}
+
 pub struct TabSet {
     tabs: Vec<Tab>,
     active: TabId,
@@ -323,6 +434,11 @@ pub struct TabSet {
     next_id: u64,
     kind: BackendKind,
     default_mode: SessionModeChoice,
+    /// An "enter bypass" prompt on screen, if any (D2): at most one at a time, a fresh press on the
+    /// mode key (or any tab-switching call) superseding or dropping whatever was open.
+    pending_bypass: Option<BypassPlan>,
+    /// The next `BypassPlan::nonce`, starting at 1 so `0` is never a valid nonce to compare against.
+    next_nonce: u64,
     /// Every card the tabs removed from this set had been handed, so the window's `arrived`
     /// (`attention`) never goes down when a tab closes: [`crate::attention::react`] reads only its
     /// growth.
@@ -333,7 +449,20 @@ pub struct TabSet {
 
 impl TabSet {
     /// One empty tab 1 (D10: open tabs are not restored across launches).
+    ///
+    /// **Never in bypass** (D3, R07/S2; the whole-branch review): a `Bypass` here is taken as `Auto`,
+    /// with a log line, so "a launch never starts in bypass" holds by construction rather than
+    /// because the one caller (`agent_panel`, passing `agent_prefs::startup_mode`) happens never to
+    /// pass it. Without this, every tab of the window -- tab 1 and every later `open()` -- would sit
+    /// in bypass with no `y` ever pressed, the one thing `Tab::mode` being private exists to stop.
     pub fn new(kind: BackendKind, default_mode: SessionModeChoice) -> Self {
+        let default_mode = match default_mode {
+            SessionModeChoice::Bypass => {
+                eprintln!("[permission] a window never starts in bypass (D3): new tabs start in auto");
+                SessionModeChoice::Auto
+            }
+            mode => mode,
+        };
         let mut set = TabSet {
             tabs: Vec::new(),
             active: TabId(0),
@@ -341,6 +470,8 @@ impl TabSet {
             next_id: 1,
             kind,
             default_mode,
+            pending_bypass: None,
+            next_nonce: 1,
             removed_arrived: 0,
             rules: agent::PrefixRules::default(),
         };
@@ -404,6 +535,10 @@ impl TabSet {
         if id != self.active {
             self.last_active = Some(self.active);
             self.active = id;
+            // Spec §3.3: every method that MOVES the active tab drops a pending bypass prompt --
+            // it was about the tab the user is leaving, and a `y` typed after switching away must
+            // never land on it.
+            self.drop_bypass_prompt();
         }
         true
     }
@@ -431,6 +566,7 @@ impl TabSet {
     /// shut down or watch. The last tab's removal opens a fresh tab 1 (spec §3.5).
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let at = self.tabs.iter().position(|t| t.id == id)?;
+        let before = self.active;
         let tab = self.tabs.remove(at);
         self.removed_arrived += tab.attention.attention().arrived;
         if self.last_active == Some(id) {
@@ -442,6 +578,11 @@ impl TabSet {
         } else if self.active == id {
             let fallback = self.tabs[at.min(self.tabs.len() - 1)].id;
             self.active = self.last_active.take().unwrap_or(fallback);
+        }
+        // `open()` above already dropped it through `select`; this covers the fallback path, which
+        // assigns `self.active` directly (spec §3.3).
+        if self.active != before {
+            self.drop_bypass_prompt();
         }
         Some(tab)
     }
@@ -458,63 +599,232 @@ impl TabSet {
         true
     }
 
-    /// `Shift+Tab` on an empty tab (ruling 5). `None` once the session exists.
-    pub fn cycle_mode(&mut self, id: TabId) -> Option<SessionModeChoice> {
-        let tab = self.get_mut(id)?;
-        if !matches!(tab.backend, TabBackend::NotStarted) {
-            return None;
+    /// `Shift+Tab` / `<leader>m`: the auto/bypass TOGGLE, frozen as such (O2 a) -- an explicit
+    /// `match` on the mode, never `SessionModeChoice::cycled` (that helper is Claude Code's N-way
+    /// cycle order and is not what this key does any more). Leaving bypass moves at once, in every
+    /// tab state including `ended`/`failed` (D6). Entering it never applies here: it always needs a
+    /// `confirm_bypass` first (D2), so this returns a plan to show rather than a changed mode.
+    pub fn cycle_mode(&mut self, id: TabId) -> Result<ModeCycle, String> {
+        // A fresh press supersedes whatever prompt was already open (D2); `Confirm` below stores a
+        // new one if it builds one.
+        self.pending_bypass = None;
+        let at = self
+            .tabs
+            .iter()
+            .position(|t| t.id == id)
+            .ok_or_else(|| format!("no tab {}", id.0))?;
+        match self.tabs[at].mode {
+            SessionModeChoice::Bypass => {
+                let tab = &mut self.tabs[at];
+                tab.mode = SessionModeChoice::Auto;
+                let number = tab.number;
+                let not_started = matches!(tab.backend, TabBackend::NotStarted);
+                // Ruling 5 / D13: an empty tab's own move also carries the window default with it
+                // (there is no session yet for the mode to be "just this tab's own"), and leaving
+                // bypass on ANY tab returns an in-window default to auto, wherever that default came
+                // from -- a live tab someone confirmed into bypass while the default was also
+                // bypass must not leave the default stranded there once it itself leaves.
+                let default_moved = not_started || self.default_mode == SessionModeChoice::Bypass;
+                if default_moved {
+                    self.default_mode = SessionModeChoice::Auto;
+                }
+                eprintln!(
+                    "[permission] mode is now auto (tab {number}{})",
+                    if default_moved { "; new sessions too" } else { "" }
+                );
+                Ok(ModeCycle::Changed(SessionModeChoice::Auto))
+            }
+            SessionModeChoice::Auto => {
+                let tab = &self.tabs[at];
+                match tab.wire_state() {
+                    TabStateWire::Ended | TabStateWire::Failed => Err("the session has ended".to_string()),
+                    _ if id != self.active => Err(format!("tab {} is not the one on screen", tab.number)),
+                    _ => {
+                        let scope_kind = if matches!(tab.backend, TabBackend::NotStarted) {
+                            tabs::PromptScope::EmptyTab
+                        } else {
+                            tabs::PromptScope::LiveTab
+                        };
+                        let approve = waiting_cards(tab);
+                        let nonce = self.next_nonce;
+                        self.next_nonce += 1;
+                        let plan = BypassPlan {
+                            scope: BypassScope::Tab(id),
+                            nonce,
+                            lines: bypass_lines(scope_kind, tab, approve.len()),
+                            approve,
+                            prompt: scope_kind,
+                        };
+                        self.pending_bypass = Some(plan.clone());
+                        Ok(ModeCycle::Confirm(plan))
+                    }
+                }
+            }
         }
-        tab.mode = tab
-            .mode
-            .cycled(crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES);
-        let mode = tab.mode;
-        self.default_mode = mode;
-        Some(mode)
-    }
-
-    /// Shift+Tab on a started tab (D6, wave 5): the session switches between auto and bypass when its
-    /// sidecar can (`set_permission_mode`), once the sidecar acknowledged -- never optimistically
-    /// (W1: "a requested permission mode must never silently become a different one", `provider.rs`).
-    /// Entering bypass answers the cards already waiting on THIS tab (owner, 2026-09-26: "能不能做自动
-    /// 放行"; W4); Verdandi leaves them pending. Does not touch `default_mode` (W2): that is chosen on
-    /// an empty tab or the chooser, and Claude Code's own Shift+Tab does not persist either. There is
-    /// deliberately no reconnect or resume-in-another-mode fallback for a session that cannot switch.
-    pub fn switch_mode(&mut self, id: TabId) -> Result<SessionModeChoice, String> {
-        let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
-        let target = tab
-            .mode
-            .cycled(crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES);
-        let ended = matches!(tab.wire_state(), TabStateWire::Ended | TabStateWire::Failed);
-        let backend = match &mut tab.backend {
-            TabBackend::Live(backend) => backend,
-            // W5's text, which the panel flashes itself; said here too for a panel that posts anyway.
-            TabBackend::Starting(_) => return Err("session is starting — try again once it is up".into()),
-            TabBackend::NotStarted | TabBackend::Failed { .. } => return Err("the session has not started yet".into()),
-        };
-        if !backend.can_switch_mode() {
-            return Err("the mode is fixed for this session".into());
-        }
-        if ended {
-            return Err("the session has ended".into());
-        }
-        backend.set_permission_mode(target.into()).map_err(|e| e.message)?;
-        tab.mode = target;
-        if target == SessionModeChoice::Bypass {
-            backend.allow_all_pending();
-        }
-        Ok(target)
     }
 
     /// `Shift+Tab` on the chooser's `New session` row or a record, once the active tab is not itself
-    /// `NotStarted` (spec §6.3, panel round 2 plan Task 5): cycles the window's remembered
-    /// `default_mode` -- the mode a fresh tab, or a resume that opens a new tab, takes. Every open
-    /// tab keeps whatever mode it already has; ruling 5 ("fixed once the session exists") is about a
-    /// *tab's own* mode, and does not apply here since this never touches one.
-    pub fn cycle_default_mode(&mut self) -> SessionModeChoice {
-        self.default_mode = self
-            .default_mode
-            .cycled(crate::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES);
-        self.default_mode
+    /// `NotStarted` (spec §6.3, panel round 2 plan Task 5): the same auto/bypass toggle as
+    /// `cycle_mode`, applied to the window's remembered `default_mode` rather than any one tab's own
+    /// mode. Every open tab keeps whatever mode it already has.
+    pub fn cycle_default_mode(&mut self) -> ModeCycle {
+        self.pending_bypass = None;
+        match self.default_mode {
+            SessionModeChoice::Bypass => {
+                self.default_mode = SessionModeChoice::Auto;
+                eprintln!("[permission] mode is now auto (new sessions)");
+                ModeCycle::Changed(SessionModeChoice::Auto)
+            }
+            SessionModeChoice::Auto => {
+                let nonce = self.next_nonce;
+                self.next_nonce += 1;
+                let plan = BypassPlan {
+                    scope: BypassScope::Default,
+                    nonce,
+                    approve: Vec::new(),
+                    lines: vec![tabs::bypass_prompt(tabs::PromptScope::Default, 0)],
+                    prompt: tabs::PromptScope::Default,
+                };
+                self.pending_bypass = Some(plan.clone());
+                ModeCycle::Confirm(plan)
+            }
+        }
+    }
+
+    /// `y`/`Y` to a `confirm_bypass` prompt (D1, D2, D7, D11). Compares against the STORED plan
+    /// before taking it: a mismatched scope or a stale nonce leaves the CURRENT prompt exactly as it
+    /// was, so an answer to an old prompt can never cancel a newer, still-open one.
+    pub fn confirm_bypass(&mut self, scope: BypassScope, nonce: u64) -> Result<ConfirmOutcome, String> {
+        match &self.pending_bypass {
+            Some(plan) if plan.scope == scope && plan.nonce == nonce => {}
+            _ => return Err("that prompt is no longer current".to_string()),
+        }
+        let plan = self.pending_bypass.take().expect("checked above");
+        match scope {
+            BypassScope::Tab(id) => {
+                let at = match self.tabs.iter().position(|t| t.id == id) {
+                    Some(at) => at,
+                    None => return Err(format!("no tab {}", id.0)),
+                };
+                if id != self.active {
+                    return Err(format!("tab {} is not the one on screen", self.tabs[at].number));
+                }
+                if matches!(self.tabs[at].wire_state(), TabStateWire::Ended | TabStateWire::Failed) {
+                    return Err("the session has ended".to_string());
+                }
+                if self.tabs[at].mode == SessionModeChoice::Bypass {
+                    return Ok(ConfirmOutcome::AlreadyBypass);
+                }
+                // D7: re-derive what `y` would approve NOW, not what the plan said when it was
+                // built -- a card delivered while the prompt was up must never be silently approved.
+                let now = waiting_cards(&self.tabs[at]);
+                // And re-derive WHICH question it is: the tab can change kind under an open prompt
+                // (a terminal handoff turns a live tab into `NotStarted`), and an empty tab's `y`
+                // also moves the window default -- which a live tab's prompt never said (spec §7.2:
+                // the only way into bypass is a confirmed prompt or a confirmed window default).
+                let scope_kind = if matches!(self.tabs[at].backend, TabBackend::NotStarted) {
+                    tabs::PromptScope::EmptyTab
+                } else {
+                    tabs::PromptScope::LiveTab
+                };
+                if now.iter().any(|id| !plan.approve.contains(id)) || scope_kind != plan.prompt {
+                    let fresh_nonce = self.next_nonce;
+                    self.next_nonce += 1;
+                    let fresh = BypassPlan {
+                        scope,
+                        nonce: fresh_nonce,
+                        lines: bypass_lines(scope_kind, &self.tabs[at], now.len()),
+                        approve: now,
+                        prompt: scope_kind,
+                    };
+                    self.pending_bypass = Some(fresh.clone());
+                    return Ok(ConfirmOutcome::Reprompt(fresh));
+                }
+                // `now` is already a subset of `plan.approve` (checked above), so it IS the
+                // intersection D7 asks for -- nothing besides a still-pending, still-delivered card
+                // is ever approved.
+                let tab = &mut self.tabs[at];
+                tab.mode = SessionModeChoice::Bypass;
+                if matches!(tab.backend, TabBackend::NotStarted) {
+                    // Disjoint fields of `self` (`tabs` vs `default_mode`): `tab` stays borrowed.
+                    self.default_mode = SessionModeChoice::Bypass;
+                }
+                let answered = match tab.live_mut() {
+                    Some(backend) => backend.approve_pending(&now, "on entering bypass"),
+                    None => crate::agent_backend::Approved::default(),
+                };
+                tab.host_answered.extend(answered.ids.iter().cloned());
+                let answered_set: BTreeSet<String> = answered.ids.iter().cloned().collect();
+                tab.attention.retain_pending(|id| !answered_set.contains(id));
+                let approved = answered.ids.len();
+                let number = tab.number;
+                eprintln!("[permission] mode is now bypass (tab {number}, approved {approved} waiting)");
+                Ok(ConfirmOutcome::Entered {
+                    approved,
+                    resolved: answered.events,
+                })
+            }
+            BypassScope::Default => {
+                self.default_mode = SessionModeChoice::Bypass;
+                eprintln!("[permission] mode is now bypass (new sessions)");
+                Ok(ConfirmOutcome::Entered {
+                    approved: 0,
+                    resolved: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// The user's own answer to one card (`permission_response` from the panel): the one route a
+    /// human decision takes, so the tab can remember which calls the user approved (O3 ruling 5).
+    ///
+    /// An Approve that reached the provider records the call -- tool-use id, tool and input, as the
+    /// card showed them -- in `human_allowed`, and the CLI's own prompt for exactly that call (it
+    /// follows the gate's request, with a new permission id) is then answered by the pump without a
+    /// second card, once. A Deny, an answer the provider refused, and a card with no tool-use id
+    /// record nothing. The id is read before answering, in
+    /// its own statement (the lock-order rule this module inherits).
+    ///
+    /// Errors as the panel's own path always did: `no active session` (benign) when the tab is
+    /// gone or holds no live backend.
+    pub fn answer_card(
+        &mut self,
+        id: TabId,
+        permission_id: &str,
+        decision: agent::PermissionDecision,
+    ) -> Result<Vec<AgentDomainEvent>, BackendError> {
+        let no_session = || BackendError {
+            message: "no active session".to_string(),
+            benign: true,
+            folded_events: Vec::new(),
+        };
+        let tab = self.get_mut(id).ok_or_else(no_session)?;
+        let backend = tab.live_mut().ok_or_else(no_session)?;
+        // The call exactly as the card showed it: id, tool and input (the review's tightening).
+        let call: Option<(String, String, serde_json::Value)> = backend
+            .projection()
+            .pending_permissions
+            .get(permission_id)
+            .and_then(|p| {
+                let id = p.tool_use_id.clone().filter(|id| !id.is_empty())?;
+                Some((id, p.tool_name.clone(), p.input.clone()))
+            });
+        let approves = decision.allows();
+        let events = backend.respond_permission(permission_id, decision)?;
+        if approves {
+            if let Some((tool_use_id, tool_name, input)) = call {
+                tab.human_allowed.record(&tool_use_id, &tool_name, &input);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Clears whatever "enter bypass" prompt is on screen (D2, spec §3.3). Every method that moves
+    /// the active tab calls this once the active id has actually changed, so a stale `y` typed after
+    /// switching tabs, opening a new one, or removing one can never land on a prompt about a tab the
+    /// user is no longer looking at. Task 3 additionally calls it when the panel loses focus.
+    pub fn drop_bypass_prompt(&mut self) {
+        self.pending_bypass = None;
     }
 
     /// `r` (ruling 12): an ended or failed tab back to empty, keeping its number, name and mode.
@@ -540,6 +850,17 @@ impl TabSet {
         tab.stale = false;
         tab.turn_trace = None;
         tab.reported_start_failure = false;
+        // The backend that answered these is gone with `old`; nothing left for the set to hide.
+        // `tab.mode` itself is untouched -- a bypass tab resets back to an empty bypass tab (spec
+        // §3.1's `r` row, D6).
+        tab.host_answered.clear();
+        // The tab changes kind (ended/failed -> `NotStarted`) under whatever prompt was open; drop it
+        // rather than let a `y` answer a question about the tab as it was (the whole-branch review,
+        // symmetric with the terminal handoff's own drop in `agent_panel`). `confirm_bypass`'s kind
+        // re-check would reprompt anyway; this is the belt to that brace.
+        tab.human_allowed.clear();
+        tab.prompt_note_candidates.clear();
+        self.pending_bypass = None;
         Ok(match old {
             TabBackend::Live(backend) => Some(backend),
             _ => None,
@@ -599,6 +920,7 @@ impl TabSet {
             first_text: false,
             turn_ended: Vec::new(),
             offers_changed: Vec::new(),
+            tripped: Vec::new(),
         };
         let rules = &self.rules;
         for tab in &mut self.tabs {
@@ -609,11 +931,66 @@ impl TabSet {
                 tab.attention.retain_pending(|_| false);
                 tab.was_running = false;
                 tab.turn_clock = None;
+                // The backend that answered these on the user's behalf is gone; nothing left to hide.
+                tab.host_answered.clear();
+                tab.human_allowed.clear();
+                tab.prompt_note_candidates.clear();
                 continue;
             };
             let from_revision = backend.projection().last_revision;
             let mut turn_ended = false;
-            let delivery = backend.take_ui_delivery_with_rules(project_root, rules);
+            // `tab.mode` (R07/S2, spec §2.2, D9): the classifier's `Auto` path, or bypass answering
+            // everything, and `tab.host_answered` collects every id either path answers so the
+            // Resync arm and `active_state_payloads` can hide them.
+            // `tab.human_allowed` (O3 ruling 5): in `Auto`, the CLI's own prompt for exactly a call
+            // the user approved on a card here is answered without a second card, once. What was
+            // answered without a card becomes a note on its call's row when the call completes.
+            let mut answered_for_you = Vec::new();
+            let delivery = backend.take_ui_delivery_with_approvals(
+                project_root,
+                rules,
+                tab.mode.into(),
+                &mut tab.host_answered,
+                &mut tab.human_allowed,
+                &mut answered_for_you,
+            );
+            tab.prompt_note_candidates.extend(
+                answered_for_you
+                    .into_iter()
+                    .map(|answered| (answered.tool_use_id, answered.note)),
+            );
+            // The CLI-mode tripwire (spec §2.3, D12), before anything of this delivery reaches the
+            // panel or the attention count: from the batch itself, or -- for a report a `Resync`
+            // dropped, or one folded ahead of its delivery -- from the projection's record. The
+            // whole batch is withheld, so no card in it is ever drawn to be approved; the session
+            // is handed out to be shut down, which denies what is still pending in it.
+            let reported = match &delivery {
+                UiDelivery::Events(events) => events.iter().find_map(|event| match event {
+                    AgentDomainEvent::UngatedCliMode { reported, detail } => Some((reported.clone(), detail.clone())),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            let reported = reported.or_else(|| {
+                let record = backend.projection().ungated_cli_mode.clone();
+                record.map(|r| (r.reported, r.detail))
+            });
+            if let Some((reported, detail)) = reported {
+                let reason = ungated_cli_mode_reason(&reported, &detail);
+                eprintln!("[permission] tab {}: {reason}", tab.id.0);
+                tab.attention.session_ended(on_screen);
+                tab.was_running = false;
+                tab.turn_clock = None;
+                let dead = std::mem::replace(&mut tab.backend, TabBackend::Failed { reason: reason.clone() });
+                if let TabBackend::Live(backend) = dead {
+                    out.tripped.push(Tripped {
+                        tab: tab.id,
+                        reason,
+                        backend,
+                    });
+                }
+                continue;
+            }
             observe_turn_clock(
                 &mut tab.turn_clock,
                 backend.projection().active_turn_id.as_deref(),
@@ -632,21 +1009,31 @@ impl TabSet {
                             AgentDomainEvent::TurnCompleted { .. } => {
                                 tab.was_running = false;
                                 turn_ended = true;
+                                // The CLI asks within the turn that made the call (O3).
+                                tab.human_allowed.clear();
                             }
                             // The session ended: its queue waits for `r` (ruling 9), not a flush.
                             AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
                                 tab.was_running = false
                             }
-                            // The sidecar's own report wins over a stale tab (wave 5). It moves the
-                            // band only: auto-approval reads the acknowledged mode, never `tab.mode`.
-                            AgentDomainEvent::PermissionModeChanged { mode, .. } => tab.mode = choice_of(*mode),
+                            // `Tab::mode` is the only authority (spec §2.2): nothing a provider
+                            // reports moves it. A `PermissionModeChanged` that got this far named
+                            // `default` (anything else became `UngatedCliMode`, handled above), so
+                            // there is nothing to do with it.
+                            //
+                            // A resolution for an id this pump (or an earlier one) already answered
+                            // on the user's behalf: forgotten now, since there is nothing left to
+                            // hide it from (D9).
+                            AgentDomainEvent::PermissionResolved { permission_id, .. } => {
+                                tab.host_answered.remove(permission_id);
+                            }
                             _ => {}
                         }
                     }
                     // Read, never written (the mode code is not this function's): a bypass session
-                    // answers without the classifier, so no rule answered anything there.
-                    let bypass = tab.mode == SessionModeChoice::Bypass
-                        || backend.permission_mode() == Some(agent::PermissionMode::Bypass);
+                    // answers without the classifier, so no rule answered anything there. `Tab::mode`
+                    // is the only authority (v1-mode, R07/S2): the CLI itself never runs ungated.
+                    let bypass = tab.mode == SessionModeChoice::Bypass;
                     let fresh_notes = CallNotes {
                         allowed_by_rule: note_rule_answers(
                             &mut tab.rule_candidates,
@@ -657,6 +1044,11 @@ impl TabSet {
                             bypass,
                         ),
                         creates_file: note_new_files(&mut tab.notes.creates_file, &events, project_root),
+                        prompt_notes: note_prompt_answers(
+                            &mut tab.prompt_note_candidates,
+                            &mut tab.notes.prompt_notes,
+                            &events,
+                        ),
                     };
                     tab.attention.observe(&events, on_screen);
                     if let Some(trace) = tab.turn_trace.as_mut() {
@@ -685,12 +1077,54 @@ impl TabSet {
                     let running = backend.projection().active_turn_id.is_some();
                     turn_ended = tab.was_running && !running;
                     tab.was_running = running;
+                    // Unconditionally (Codex's finding): the dropped events may have held a turn's
+                    // end and the next one's start, which `was_running` cannot see, and an approval
+                    // must never outlive its turn. Costs at most a card.
+                    tab.human_allowed.clear();
+                    // A candidate whose call finished inside the dropped events becomes its note now,
+                    // so the snapshot below already carries it.
+                    {
+                        let projection = backend.projection();
+                        let finished: Vec<String> = tab
+                            .prompt_note_candidates
+                            .keys()
+                            .filter(|id| {
+                                projection
+                                    .tool_calls
+                                    .iter()
+                                    .any(|call| &call.tool_use_id == *id && call.result.is_some())
+                            })
+                            .cloned()
+                            .collect();
+                        for id in finished {
+                            if let Some(note) = tab.prompt_note_candidates.remove(&id) {
+                                tab.notes.prompt_notes.insert(id, note);
+                            }
+                        }
+                    }
                     let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
-                    tab.attention.resync(pending);
+                    // D9: a resync in bypass sweeps whatever the overflow dropped through the same
+                    // `approve_pending` a confirm uses, so a request never drawn as a card is never
+                    // rebuilt as one by the very mechanism meant to rebuild the panel honestly. This
+                    // also hides what the classifier already answered in `Auto`, closing the gap
+                    // `attention`'s module doc used to record for `resync` itself.
+                    if tab.mode == SessionModeChoice::Bypass {
+                        let sweep: Vec<String> = pending
+                            .iter()
+                            .filter(|id| !tab.host_answered.contains(*id))
+                            .cloned()
+                            .collect();
+                        // The events (legacy's own resolutions) are not needed here: the snapshot below
+                        // is read after they were folded, so it already shows those cards answered.
+                        let answered = backend.approve_pending(&sweep, "in bypass after a resync");
+                        tab.host_answered.extend(answered.ids);
+                    }
+                    tab.attention
+                        .resync(pending.iter().filter(|id| !tab.host_answered.contains(*id)).cloned());
                     if is_active {
                         out.active_payload = Some(serialize_snapshot_with_notes_for_js(
                             tab.id,
-                            &SnapshotView::of(backend),
+                            &SnapshotView::of(backend, &tab.host_answered),
                             turn_started_at_ms,
                             &tab.notes,
                         ));
@@ -710,6 +1144,7 @@ impl TabSet {
             let still: std::collections::HashSet<String> =
                 backend.projection().pending_permissions.keys().cloned().collect();
             tab.attention.retain_pending(|id| still.contains(id));
+            tab.host_answered.retain(|id| still.contains(id));
             if refresh_offers(tab, project_root) {
                 out.offers_changed.push(tab.id);
             }
@@ -757,9 +1192,12 @@ impl TabSet {
                     tab.attention.restart();
                     tab.notes = CallNotes::default();
                     tab.rule_candidates.clear();
+                    tab.prompt_note_candidates.clear();
                     tab.last_handoff = None;
                     tab.reported_start_failure = false;
                     tab.title = pending.resumed_title;
+                    // A freshly installed backend has answered nothing yet on this tab's behalf.
+                    tab.host_answered.clear();
                     collected.push(StartCollected::Installed {
                         tab: tab.id,
                         request_id: pending.request_id,
@@ -790,7 +1228,7 @@ impl TabSet {
         match &tab.backend {
             TabBackend::Live(backend) => payloads.push(serialize_snapshot_with_notes_for_js(
                 tab.id,
-                &SnapshotView::of(backend),
+                &SnapshotView::of(backend, &tab.host_answered),
                 tab.turn_clock.as_ref().map(|(_, at)| *at),
                 &tab.notes,
             )),
@@ -1056,15 +1494,6 @@ impl TabSet {
     }
 }
 
-/// The tab's choice for a mode a provider reported. Only the reverse `From` exists
-/// (`agent_bridge`), and this one is needed only by the pump.
-fn choice_of(mode: agent::PermissionMode) -> SessionModeChoice {
-    match mode {
-        agent::PermissionMode::Auto => SessionModeChoice::Auto,
-        agent::PermissionMode::Bypass => SessionModeChoice::Bypass,
-    }
-}
-
 /// v1 polish F18: which tool calls in this batch a saved prefix rule answered, as (tool-use id,
 /// `Bash(git log *)`), recorded in the tab's `notes` for later snapshots too.
 ///
@@ -1136,6 +1565,7 @@ fn note_new_files(
             tool_use_id,
             tool_name,
             input,
+            ..
         } = event
         else {
             continue;
@@ -1164,6 +1594,87 @@ fn note_new_files(
 
 /// Recomputes `rule_offers` when the set of pending permission ids changed; `true` if the offers did.
 /// Only `projection()` is read, once, and released before anything else is touched.
+/// The delivered cards this tab could approve right now (R06/S2, spec §3.3): its own attention
+/// tray, intersected with the projection's still-pending ids and with anything it has not already
+/// host-answered, less any CLI prompt the user's own ask rule forced (O3), `seq`-ordered (the order
+/// the panel shows them in). Empty unless the tab is
+/// `Live` -- a `NotStarted`/`Starting`/`Failed` tab has no session to hold a pending request at all.
+///
+/// This one function builds every `BypassPlan::approve` and every D7 re-check `confirm_bypass`
+/// makes against a stored plan: both need exactly the same answer to "what would `y` approve right
+/// now", so there is one place that answer comes from.
+fn waiting_cards(tab: &Tab) -> Vec<String> {
+    let Some(backend) = tab.live() else {
+        return Vec::new();
+    };
+    let cards: BTreeSet<String> = tab.attention.card_ids().into_iter().collect();
+    // Its own statement, guard dropped at the end of the block: the lock-order rule this whole
+    // module inherits (`projection()` before any `respond_permission`-adjacent call).
+    let mut ordered: Vec<(u64, String)> = {
+        let projection = backend.projection();
+        projection
+            .pending_permissions
+            .values()
+            .filter(|p| cards.contains(&p.permission_id) && !tab.host_answered.contains(&p.permission_id))
+            // O3 ruling 4 / review #3: a CLI prompt only a human answers (an ask rule's, or one of
+            // unknown kind) is a card in bypass too, so entering bypass neither counts nor approves
+            // it (`approve_pending` would skip it); `staying_cards` counts it for the prompt instead.
+            .filter(|p| !p.provider_prompt.as_ref().is_some_and(|prompt| prompt.needs_a_human()))
+            .map(|p| (p.seq, p.permission_id.clone()))
+            .collect()
+    };
+    ordered.sort_by_key(|(seq, _)| *seq);
+    ordered.into_iter().map(|(_, id)| id).collect()
+}
+
+/// The delivered cards a bypass entry leaves waiting (review #6): still pending, not host-answered,
+/// and only a human answers them (`ProviderPrompt::needs_a_human`). `waiting_cards`' complement among
+/// the tab's cards, counted so the prompt can say they stay.
+fn staying_cards(tab: &Tab) -> usize {
+    let Some(backend) = tab.live() else {
+        return 0;
+    };
+    let cards: BTreeSet<String> = tab.attention.card_ids().into_iter().collect();
+    let projection = backend.projection();
+    projection
+        .pending_permissions
+        .values()
+        .filter(|p| cards.contains(&p.permission_id) && !tab.host_answered.contains(&p.permission_id))
+        .filter(|p| p.provider_prompt.as_ref().is_some_and(|prompt| prompt.needs_a_human()))
+        .count()
+}
+
+/// A bypass entry's prompt lines for a tab: R06's own line, then one saying which cards stay, when
+/// any do (review #6; tmux `confirm-before` plus a consequence line, as `close_prompt` does).
+fn bypass_lines(scope: tabs::PromptScope, tab: &Tab, approving: usize) -> Vec<String> {
+    let mut lines = vec![tabs::bypass_prompt(scope, approving)];
+    let staying = staying_cards(tab);
+    if staying > 0 {
+        lines.push(tabs::bypass_staying_line(staying));
+    }
+    lines
+}
+
+/// v1 polish F18's twin for the CLI's own prompts (review item 7): a candidate whose call completes
+/// in this batch becomes its row's note, kept in `notes` for later snapshots and returned as this
+/// batch's own.
+fn note_prompt_answers(
+    candidates: &mut std::collections::BTreeMap<String, String>,
+    notes: &mut std::collections::BTreeMap<String, String>,
+    events: &[AgentDomainEvent],
+) -> std::collections::BTreeMap<String, String> {
+    let mut fresh = std::collections::BTreeMap::new();
+    for event in events {
+        if let AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } = event {
+            if let Some(note) = candidates.remove(tool_use_id) {
+                notes.insert(tool_use_id.clone(), note.clone());
+                fresh.insert(tool_use_id.clone(), note);
+            }
+        }
+    }
+    fresh
+}
+
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
     let Some(backend) = tab.live() else {
         let had = !tab.rule_offers.is_empty();
@@ -1173,9 +1684,12 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
     };
     let pending: Vec<(String, String, serde_json::Value)> = {
         let projection = backend.projection();
+        // The CLI's own prompts are never offered a rule (O3 ruling 3): no saved rule answers one,
+        // and the CLI itself does not let a rule silence its check.
         let mut ids: Vec<_> = projection
             .pending_permissions
             .values()
+            .filter(|p| p.provider_prompt.is_none())
             .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
             .collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1218,7 +1732,7 @@ fn wall_clock_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::test_providers::RecordingProvider;
-    use agent::{AgentConversation, AgentDomainEvent, PermissionMode};
+    use agent::{AgentConversation, AgentDomainEvent};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1232,7 +1746,7 @@ mod tests {
 
     fn live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
         let provider = Arc::new(RecordingProvider::default());
-        let conversation = AgentConversation::create(provider.clone(), dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -1250,6 +1764,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Read".into(),
             input: serde_json::json!({ "file_path": "main.rs" }),
+            provider_prompt: None,
         }
     }
 
@@ -1259,11 +1774,34 @@ mod tests {
             tool_use_id: None,
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            provider_prompt: None,
+        }
+    }
+
+    /// A `Read` OUTSIDE the project root: still cards under the classifier, and bypass still
+    /// answers it (bypass never consults the path boundary at all).
+    fn outside(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "/etc/hostname" }),
+            provider_prompt: None,
         }
     }
 
     fn set() -> TabSet {
         TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto)
+    }
+
+    /// Unwraps a `Confirm` plan out of `cycle_mode`/`cycle_default_mode`'s `Result<ModeCycle, _>`,
+    /// panicking with the actual value on anything else -- every bypass-entry test wants the plan,
+    /// never `Changed` or an `Err`.
+    fn plan(result: Result<ModeCycle, String>) -> BypassPlan {
+        match result {
+            Ok(ModeCycle::Confirm(plan)) => plan,
+            other => panic!("expected Ok(ModeCycle::Confirm(_)), got {other:?}"),
+        }
     }
 
     fn shut_down_all(set: &mut TabSet) {
@@ -1373,11 +1911,16 @@ mod tests {
         let snapshot: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert_eq!(snapshot["kind"], "snapshot");
         assert_eq!(snapshot["tab"], background.0);
+        // The projection still holds both until the Read's resolution returns (`answer_what_needs_no_human`'s
+        // remaining honest gap), but D9/`host_answered` closes the OTHER half that used to be
+        // documented here: the Read neovibe already answered is now hidden from the snapshot too,
+        // not only from the tray -- only the Write, still genuinely waiting, is shown.
         assert_eq!(
             snapshot["state"]["pendingPermissions"].as_array().unwrap().len(),
-            2,
-            "the projection holds both until the Read's resolution returns"
+            1,
+            "the auto-answered Read is hidden (D9); only the Write is a real card"
         );
+        assert_eq!(snapshot["state"]["pendingPermissions"][0]["permissionId"], "perm-write");
         assert!(!set.get(background).unwrap().stale);
         shut_down_all(&mut set);
     }
@@ -1592,8 +2135,12 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// **Correction (R07/S2, D6/§2.1):** this test's old name and its "ruling 5: fixed once the
+    /// session exists" assertion are both superseded -- a live, active auto tab now gets `Confirm`
+    /// too, never a flat refusal. What "before and after the start" now means is that BOTH still ask
+    /// before entering bypass; only leaving it is immediate, in either state (D6).
     #[test]
-    fn a_rename_is_normalized_and_the_mode_cycles_only_before_the_start() {
+    fn a_rename_is_normalized_and_the_mode_can_still_be_switched_after_the_session_starts() {
         let dir = workspace("tabs-rename-mode");
         let mut set = set();
         let tab = set.active();
@@ -1603,7 +2150,18 @@ mod tests {
         assert_eq!(set.get(tab).unwrap().name, None);
         assert!(!set.rename(TabId(99), "x"));
 
-        assert_eq!(set.cycle_mode(tab), Some(SessionModeChoice::Bypass));
+        // Before the session starts (NotStarted, auto): entering bypass still asks (D2), and
+        // confirming also moves the window default (ruling 5, D13), so a fresh tab inherits it
+        // unasked.
+        let first_plan = plan(set.cycle_mode(tab));
+        assert_eq!(first_plan.scope, BypassScope::Tab(tab));
+        assert_eq!(
+            set.confirm_bypass(first_plan.scope, first_plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
         assert_eq!(
             set.default_mode(),
             SessionModeChoice::Bypass,
@@ -1611,9 +2169,21 @@ mod tests {
         );
         let next = set.open();
         assert_eq!(set.get(next).unwrap().mode, SessionModeChoice::Bypass);
+
         let (_provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        assert_eq!(set.cycle_mode(tab), None, "ruling 5: fixed once the session exists");
+        // D6: leaving bypass works even though `next`, not `tab`, is on screen -- unlike entering
+        // it, leaving never needs the tab to be active.
+        assert_eq!(
+            set.cycle_mode(tab),
+            Ok(ModeCycle::Changed(SessionModeChoice::Auto)),
+            "leaving bypass on a live tab moves at once"
+        );
+        // Entering it again still asks, exactly as it did before the session existed -- once `tab`
+        // is the one on screen again (D2's active-tab check, unaffected by this correction).
+        set.select(tab);
+        let second_plan = plan(set.cycle_mode(tab));
+        assert_eq!(second_plan.scope, BypassScope::Tab(tab));
         shut_down_all(&mut set);
     }
 
@@ -1623,7 +2193,25 @@ mod tests {
         let tab = set.active();
         assert_eq!(set.default_mode(), SessionModeChoice::Auto);
         assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
-        assert_eq!(set.cycle_default_mode(), SessionModeChoice::Bypass);
+
+        let plan = match set.cycle_default_mode() {
+            ModeCycle::Confirm(plan) => plan,
+            other => panic!("auto -> bypass always asks first (D2): {other:?}"),
+        };
+        assert_eq!(plan.scope, BypassScope::Default);
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "nothing moves until confirmed"
+        );
+
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
         assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
         assert_eq!(
             set.get(tab).unwrap().mode,
@@ -1632,10 +2220,926 @@ mod tests {
         );
         assert_eq!(
             set.cycle_default_mode(),
-            SessionModeChoice::Auto,
-            "wraps like cycle_mode does"
+            ModeCycle::Changed(SessionModeChoice::Auto),
+            "leaving bypass moves at once"
         );
         shut_down_all(&mut set);
+    }
+
+    // ---- R07/S2: entering bypass asks first, and neovibe answers everything once in it --------
+
+    #[test]
+    fn entering_bypass_on_a_live_tab_asks_and_changes_nothing_until_confirmed() {
+        let dir = workspace("bypass-ask-first");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        let _plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.get(tab).unwrap().mode,
+            SessionModeChoice::Auto,
+            "nothing changes until confirmed"
+        );
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "the window default is untouched too"
+        );
+
+        provider.queue(write("p1"));
+        until("the card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert!(
+            provider.resolutions().is_empty(),
+            "a queued write still cards in auto: {:?}",
+            provider.resolutions()
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn confirming_approves_exactly_the_listed_cards_on_that_tab() {
+        let dir = workspace("bypass-approves-exactly-listed");
+        let mut set = set();
+        let first = set.active();
+        let (first_provider, backend) = live(&dir);
+        set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
+        let second = set.open();
+        let (second_provider, backend) = live(&dir);
+        set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
+
+        first_provider.queue(write("p1"));
+        second_provider.queue(write("p2"));
+        until("both cards", || {
+            set.pump(&dir, true);
+            set.get(first).unwrap().attention.attention().pending == 1
+                && set.get(second).unwrap().attention.attention().pending == 1
+        });
+
+        // The brief's own bug: `open()` above left `second` active, and entering bypass on a tab
+        // that is not on screen is refused -- select back to `first` first.
+        set.select(first);
+        let plan = plan(set.cycle_mode(first));
+        assert_eq!(plan.approve, vec!["p1".to_string()]);
+        assert!(plan.lines[0].contains("1 张"), "{:?}", plan.lines);
+
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 1,
+                resolved: vec![]
+            })
+        );
+        assert_eq!(first_provider.resolutions(), vec![("p1".to_string(), true)]);
+        assert!(second_provider.resolutions().is_empty());
+        assert_eq!(
+            set.get(first).unwrap().attention.attention().pending,
+            0,
+            "cleared at once, no extra pump needed"
+        );
+        assert_eq!(set.attention().pending, 1, "only the second tab's own card remains");
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_card_arriving_while_the_prompt_is_up_reprompts() {
+        let dir = workspace("bypass-reprompt-on-new-card");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(write("p1"));
+        until("p1's card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        let old_plan = plan(set.cycle_mode(tab));
+        assert_eq!(old_plan.approve, vec!["p1".to_string()]);
+
+        provider.queue(write("p2"));
+        until("p2's card too", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+
+        let reprompted = match set.confirm_bypass(old_plan.scope, old_plan.nonce) {
+            Ok(ConfirmOutcome::Reprompt(plan)) => plan,
+            other => panic!("a card arrived while the prompt was up: {other:?}"),
+        };
+        assert_eq!(reprompted.approve, vec!["p1".to_string(), "p2".to_string()]);
+        assert_ne!(reprompted.nonce, old_plan.nonce);
+        assert!(reprompted.lines[0].contains("2 张"), "{:?}", reprompted.lines);
+        assert_eq!(
+            set.get(tab).unwrap().mode,
+            SessionModeChoice::Auto,
+            "nothing changed yet"
+        );
+        assert!(provider.resolutions().is_empty(), "no resolution sent by a reprompt");
+
+        assert_eq!(
+            set.confirm_bypass(old_plan.scope, old_plan.nonce),
+            Err("that prompt is no longer current".to_string()),
+            "the OLD nonce is dead now"
+        );
+        assert_eq!(
+            set.confirm_bypass(reprompted.scope, reprompted.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 2,
+                resolved: vec![]
+            })
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn in_bypass_every_request_is_answered_and_never_delivered() {
+        let dir = workspace("bypass-answers-everything");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+
+        provider.queue(write("p3"));
+        provider.queue(outside("p4"));
+        until("both resolved", || {
+            let out = set.pump(&dir, true);
+            if let Some(payload) = &out.active_payload {
+                assert!(!payload.contains("\"p3\"") && !payload.contains("\"p4\""), "{payload}");
+            }
+            let mut resolved: Vec<String> = provider.resolutions().into_iter().map(|(id, _)| id).collect();
+            resolved.sort();
+            resolved == vec!["p3".to_string(), "p4".to_string()]
+        });
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+        assert_eq!(
+            set.get(tab).unwrap().host_answered,
+            BTreeSet::from(["p3".to_string(), "p4".to_string()])
+        );
+
+        provider.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: "p3".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
+        provider.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: "p4".into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        });
+        until("host_answered empties", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.is_empty()
+        });
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn leaving_bypass_is_immediate_and_the_classifier_decides_again() {
+        let dir = workspace("bypass-leave-immediate");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+
+        provider.queue(write("p5"));
+        provider.queue(read("p6"));
+        until("p5 cards and p6 is answered", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert_eq!(provider.resolutions(), vec![("p6".to_string(), true)]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn an_empty_tab_confirm_moves_the_window_default_and_new_tabs_inherit_it_unasked() {
+        let mut set = set();
+        let tab = set.active();
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(plan.scope, BypassScope::Tab(tab));
+        assert!(
+            plan.lines[0].contains("本窗口之后的新会话也用 bypass"),
+            "{:?}",
+            plan.lines
+        );
+
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+        assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
+
+        let next = set.open();
+        assert_eq!(
+            set.get(next).unwrap().mode,
+            SessionModeChoice::Bypass,
+            "inherited unasked"
+        );
+        assert_eq!(
+            set.confirm_bypass(BypassScope::Tab(next), 0),
+            Err("that prompt is no longer current".to_string()),
+            "open() left no stray prompt behind"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_chooser_default_asks_before_bypass_and_not_before_auto() {
+        let mut set = set();
+        let tab = set.active();
+        match set.cycle_default_mode() {
+            ModeCycle::Confirm(plan) => {
+                assert_eq!(plan.scope, BypassScope::Default);
+                assert_eq!(
+                    set.confirm_bypass(plan.scope, plan.nonce),
+                    Ok(ConfirmOutcome::Entered {
+                        approved: 0,
+                        resolved: vec![]
+                    })
+                );
+            }
+            other => panic!("auto -> bypass must ask first: {other:?}"),
+        }
+        assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
+        assert_eq!(
+            set.get(tab).unwrap().mode,
+            SessionModeChoice::Auto,
+            "an open tab never changes"
+        );
+
+        assert_eq!(
+            set.cycle_default_mode(),
+            ModeCycle::Changed(SessionModeChoice::Auto),
+            "bypass -> auto never asks"
+        );
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto, "still untouched");
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn entering_bypass_on_ended_and_failed_tabs_refuses_and_leaving_it_works() {
+        let dir = workspace("bypass-ended-failed");
+
+        // An ENDED AUTO tab refuses to enter bypass.
+        {
+            let mut set = set();
+            let ended_auto = set.active();
+            let (provider, backend) = live(&dir);
+            set.get_mut(ended_auto).unwrap().backend = TabBackend::Live(backend);
+            set.get_mut(ended_auto).unwrap().live_mut().unwrap().shutdown();
+            provider.queue(AgentDomainEvent::SessionClosed {
+                reason: "closed".into(),
+            });
+            until("ended", || {
+                set.pump(&dir, true);
+                set.get(ended_auto).unwrap().wire_state() == TabStateWire::Ended
+            });
+            assert_eq!(set.cycle_mode(ended_auto), Err("the session has ended".to_string()));
+            shut_down_all(&mut set);
+        }
+
+        // A STARTING tab asks like a live one (D6): `Confirm`, LiveTab text, 0 cards. It then fails
+        // to start, and the FAILED bypass tab still leaves at once.
+        {
+            let mut set = set();
+            let starting_tab = set.active();
+            let tx = starting(&mut set, starting_tab, None, None);
+            let plan = plan(set.cycle_mode(starting_tab));
+            assert_eq!(plan.approve, Vec::<String>::new());
+            assert_eq!(
+                plan.lines,
+                vec!["切到 bypass？(y/n)".to_string()],
+                "a starting tab asks like a live one"
+            );
+            assert_eq!(
+                set.confirm_bypass(plan.scope, plan.nonce),
+                Ok(ConfirmOutcome::Entered {
+                    approved: 0,
+                    resolved: vec![]
+                })
+            );
+            tx.send(Err(BackendError {
+                message: "boom".into(),
+                benign: false,
+                folded_events: Vec::new(),
+            }))
+            .unwrap();
+            set.collect_starts();
+            assert_eq!(set.get(starting_tab).unwrap().wire_state(), TabStateWire::Failed);
+            assert_eq!(
+                set.get(starting_tab).unwrap().mode,
+                SessionModeChoice::Bypass,
+                "the mode survived the failed start"
+            );
+            assert_eq!(
+                set.cycle_mode(starting_tab),
+                Ok(ModeCycle::Changed(SessionModeChoice::Auto)),
+                "a failed bypass tab still leaves at once"
+            );
+            shut_down_all(&mut set);
+        }
+
+        // An ENDED bypass tab also leaves at once...
+        {
+            let mut set = set();
+            let ended_bypass = set.active();
+            let (provider, backend) = live(&dir);
+            set.get_mut(ended_bypass).unwrap().backend = TabBackend::Live(backend);
+            let plan = plan(set.cycle_mode(ended_bypass));
+            set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+            set.get_mut(ended_bypass).unwrap().live_mut().unwrap().shutdown();
+            provider.queue(AgentDomainEvent::SessionClosed {
+                reason: "closed".into(),
+            });
+            until("ended", || {
+                set.pump(&dir, true);
+                set.get(ended_bypass).unwrap().wire_state() == TabStateWire::Ended
+            });
+            assert_eq!(
+                set.cycle_mode(ended_bypass),
+                Ok(ModeCycle::Changed(SessionModeChoice::Auto)),
+                "an ended bypass tab still leaves at once"
+            );
+            shut_down_all(&mut set);
+        }
+
+        // ...and `reset` on a still-bypass ended tab keeps bypass and leaves the default untouched
+        // (spec §3.1's `r` row).
+        {
+            let mut set = set();
+            let ended_bypass = set.active();
+            let (provider, backend) = live(&dir);
+            set.get_mut(ended_bypass).unwrap().backend = TabBackend::Live(backend);
+            let plan = plan(set.cycle_mode(ended_bypass));
+            set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+            let default_after_confirm = set.default_mode();
+            set.get_mut(ended_bypass).unwrap().live_mut().unwrap().shutdown();
+            provider.queue(AgentDomainEvent::SessionClosed {
+                reason: "closed".into(),
+            });
+            until("ended", || {
+                set.pump(&dir, true);
+                set.get(ended_bypass).unwrap().wire_state() == TabStateWire::Ended
+            });
+            set.reset(ended_bypass).unwrap();
+            assert_eq!(
+                set.get(ended_bypass).unwrap().mode,
+                SessionModeChoice::Bypass,
+                "reset keeps bypass (spec §3.1 r row, D6)"
+            );
+            assert_eq!(
+                set.default_mode(),
+                default_after_confirm,
+                "reset does not touch the window default"
+            );
+            shut_down_all(&mut set);
+        }
+    }
+
+    #[test]
+    fn a_resync_in_bypass_sweeps_the_pending_cards_and_draws_none() {
+        let dir = workspace("bypass-resync-sweep");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+
+        provider.queue(write("pre"));
+        until(
+            "pre answered, still pending (the double no test provides its own resolution)",
+            || {
+                set.pump(&dir, true);
+                set.get(tab).unwrap().host_answered.contains("pre")
+                    && set
+                        .get(tab)
+                        .unwrap()
+                        .live()
+                        .unwrap()
+                        .projection()
+                        .pending_permissions
+                        .contains_key("pre")
+            },
+        );
+
+        // Without pumping in between: enough to overflow the sidecar's own UI queue.
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        for i in 0..300 {
+            provider.queue(AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Text,
+                text: format!("chunk {i}"),
+            });
+        }
+        provider.queue(write("lost1"));
+        provider.queue(write("lost2"));
+
+        until("all three pending in the projection", || {
+            let Some(backend) = set.get(tab).unwrap().live() else {
+                return false;
+            };
+            backend.projection().pending_permissions.len() == 3
+        });
+
+        let out = set.pump(&dir, true);
+        let payload = out.active_payload.expect("the active tab's own resync payload");
+        let snapshot: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+
+        let mut resolved: Vec<String> = provider.resolutions().into_iter().map(|(id, _)| id).collect();
+        resolved.sort();
+        assert_eq!(
+            resolved,
+            vec!["lost1".to_string(), "lost2".to_string(), "pre".to_string()]
+        );
+        assert_eq!(
+            provider.resolutions().iter().filter(|(id, _)| id == "pre").count(),
+            1,
+            "pre was already host-answered before the resync -- never answered twice"
+        );
+
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+        let pending = snapshot["state"]["pendingPermissions"].as_array().unwrap();
+        assert!(pending.is_empty(), "no swept id is drawn: {pending:?}");
+        shut_down_all(&mut set);
+    }
+
+    /// The gap `attention`'s module doc used to record for `resync` is closed in `Auto` too: an id
+    /// the classifier already answered is swept from the snapshot and the tray exactly as bypass's
+    /// own sweep is, even though nothing here re-answers it (it was never in `Bypass`).
+    #[test]
+    fn a_resync_in_auto_hides_what_the_classifier_answered() {
+        let dir = workspace("auto-resync-hides-classifier-answer");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(read("seen"));
+        until("the classifier answered it", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("seen")
+        });
+
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        for i in 0..300 {
+            provider.queue(AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Text,
+                text: format!("chunk {i}"),
+            });
+        }
+        provider.queue(write("lost"));
+
+        until("both pending in the projection", || {
+            let Some(backend) = set.get(tab).unwrap().live() else {
+                return false;
+            };
+            backend.projection().pending_permissions.len() == 2
+        });
+
+        let out = set.pump(&dir, true);
+        let payload = out.active_payload.expect("the active tab's own resync payload");
+        let snapshot: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+        let pending = snapshot["state"]["pendingPermissions"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0]["permissionId"], "lost");
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 1);
+        shut_down_all(&mut set);
+    }
+
+    /// The brief's own version of this test cannot fail (a raw `PermissionModeChanged` event, which
+    /// a real provider never emits with an unrestricted mode -- that becomes `UngatedCliMode`
+    /// instead): what it actually pins is that `Tab::mode` is the only authority, whatever a
+    /// provider reports (spec §2.2).
+    #[test]
+    fn a_provider_mode_report_moves_nothing() {
+        let dir = workspace("mode-report-is-inert");
+        let mut set = set();
+        let auto_tab = set.active();
+        let (auto_provider, backend) = live(&dir);
+        set.get_mut(auto_tab).unwrap().backend = TabBackend::Live(backend);
+        auto_provider.queue(AgentDomainEvent::PermissionModeChanged {
+            mode: agent::PermissionMode::Bypass,
+            provider_mode: "default".into(),
+            floor_applied: false,
+        });
+        auto_provider.queue(write("still-a-card"));
+        until("the write still cards", || {
+            set.pump(&dir, true);
+            set.get(auto_tab).unwrap().attention.attention().pending == 1
+        });
+        assert_eq!(
+            set.get(auto_tab).unwrap().mode,
+            SessionModeChoice::Auto,
+            "a provider report never moves Tab::mode"
+        );
+
+        let bypass_tab = set.open();
+        let (bypass_provider, backend) = live(&dir);
+        set.get_mut(bypass_tab).unwrap().backend = TabBackend::Live(backend);
+        let plan = plan(set.cycle_mode(bypass_tab));
+        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        bypass_provider.queue(AgentDomainEvent::PermissionModeChanged {
+            mode: agent::PermissionMode::Auto,
+            provider_mode: "default".into(),
+            floor_applied: false,
+        });
+        bypass_provider.queue(write("answered-anyway"));
+        until("it is answered anyway", || {
+            set.pump(&dir, true);
+            bypass_provider
+                .resolutions()
+                .iter()
+                .any(|(id, _)| id == "answered-anyway")
+        });
+        assert_eq!(
+            set.get(bypass_tab).unwrap().mode,
+            SessionModeChoice::Bypass,
+            "still bypass"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_prompt_dies_with_a_tab_switch() {
+        let dir = workspace("bypass-prompt-dies-on-switch");
+
+        fn two_tabs(dir: &Path) -> (TabSet, TabId, TabId) {
+            let mut set = set();
+            let first = set.active();
+            let (_p, backend) = live(dir);
+            set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
+            let second = set.open();
+            let (_p, backend) = live(dir);
+            set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
+            set.select(first);
+            (set, first, second)
+        }
+
+        for mutate in [
+            "select_second",
+            "open",
+            "step",
+            "select_number",
+            "select_last",
+            "remove_first",
+        ] {
+            let (mut set, first, second) = two_tabs(&dir);
+            let plan = plan(set.cycle_mode(first));
+            match mutate {
+                "select_second" => {
+                    set.select(second);
+                }
+                "open" => {
+                    set.open();
+                }
+                "step" => {
+                    set.step(1);
+                }
+                "select_number" => {
+                    set.select_number(set.get(second).unwrap().number);
+                }
+                "select_last" => {
+                    set.select(second);
+                    set.select(first);
+                    set.select_last();
+                }
+                "remove_first" => {
+                    set.remove(first);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                set.confirm_bypass(plan.scope, plan.nonce),
+                Err("that prompt is no longer current".to_string()),
+                "{mutate}"
+            );
+            if mutate != "remove_first" {
+                assert_eq!(set.get(first).unwrap().mode, SessionModeChoice::Auto, "{mutate}");
+            }
+            shut_down_all(&mut set);
+        }
+
+        // The strongest case: select(second) then back to select(first) -- the SAME tab ends up
+        // active again -- still drops the prompt, since the active id genuinely changed in between.
+        let (mut set, first, second) = two_tabs(&dir);
+        let first_plan = plan(set.cycle_mode(first));
+        set.select(second);
+        set.select(first);
+        assert_eq!(
+            set.confirm_bypass(first_plan.scope, first_plan.nonce),
+            Err("that prompt is no longer current".to_string())
+        );
+
+        let second_plan = plan(set.cycle_mode(first));
+        set.drop_bypass_prompt();
+        assert_eq!(
+            set.confirm_bypass(second_plan.scope, second_plan.nonce),
+            Err("that prompt is no longer current".to_string())
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn entering_bypass_on_a_tab_that_is_not_active_is_refused() {
+        let dir = workspace("bypass-not-active-refused");
+        let mut set = set();
+        let first = set.active();
+        let (_p, backend) = live(&dir);
+        set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
+        let second = set.open();
+        let (_p, backend) = live(&dir);
+        set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
+        set.select(first);
+        assert_eq!(
+            set.cycle_mode(second),
+            Err(format!(
+                "tab {} is not the one on screen",
+                set.get(second).unwrap().number
+            ))
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_count_is_the_delivered_cards_not_the_projection() {
+        let dir = workspace("bypass-count-is-delivered-cards");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        // Stays pending in the projection until its resolution is queued (`RecordingProvider` never
+        // emits one on its own) -- this holds the classifier's own answer back exactly the way the
+        // brief's decision 10 describes.
+        provider.queue(read("classifier-answered"));
+        provider.queue(write("real-card"));
+        until("only the real card is a card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert!(
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .pending_permissions
+                .contains_key("classifier-answered"),
+            "the premise: it has not resolved yet"
+        );
+
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(plan.approve, vec!["real-card".to_string()]);
+        assert!(plan.lines[0].contains("1 张"), "{:?}", plan.lines);
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 1,
+                resolved: vec![]
+            }),
+            "must not Reprompt for the classifier-answered id"
+        );
+        let mut resolutions = provider.resolutions();
+        resolutions.sort();
+        assert_eq!(
+            resolutions,
+            vec![
+                ("classifier-answered".to_string(), true),
+                ("real-card".to_string(), true)
+            ],
+            "each answered exactly once"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// The attention half of `waiting_cards`' filter, isolated from the `host_answered` half: a
+    /// request the background ingestion has already folded into the projection, but that no pump has
+    /// yet delivered as a card (`tab.attention.card_ids()`), must not be offered for bypass approval
+    /// either. Without this test, removing `cards.contains(&p.permission_id)` from `waiting_cards` and
+    /// keeping only the `host_answered` filter left the whole suite passing, because
+    /// `the_count_is_the_delivered_cards_not_the_projection`'s held-back id is also `host_answered`
+    /// (the classifier already allowed it), which masks the attention half entirely.
+    #[test]
+    fn waiting_cards_excludes_a_request_not_yet_delivered_as_a_card() {
+        let dir = workspace("bypass-waiting-cards-excludes-undelivered");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(write("real-card"));
+        until(
+            "the projection holds it, before any pump has delivered it as a card",
+            || {
+                set.get(tab)
+                    .unwrap()
+                    .live()
+                    .unwrap()
+                    .projection()
+                    .pending_permissions
+                    .contains_key("real-card")
+            },
+        );
+        assert_eq!(
+            set.get(tab).unwrap().attention.attention().pending,
+            0,
+            "the premise: nothing has been pumped, so nothing is a delivered card yet"
+        );
+
+        let plan = plan(set.cycle_mode(tab));
+        assert!(
+            plan.approve.is_empty(),
+            "a request only in the projection, never delivered as a card, must not be offered for \
+             bypass approval: {:?}",
+            plan.approve
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn leaving_bypass_on_a_live_tab_drops_the_window_bypass_default() {
+        let dir = workspace("bypass-leaving-live-drops-default");
+        let mut set = set();
+        let tab = set.active();
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+        assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
+
+        let (_p, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(
+            set.get(tab).unwrap().mode,
+            SessionModeChoice::Bypass,
+            "starting the session kept the mode"
+        );
+
+        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "D13: leaving bypass on ANY tab drops an in-window default too"
+        );
+
+        let next = set.open();
+        assert_eq!(set.get(next).unwrap().mode, SessionModeChoice::Auto);
+        shut_down_all(&mut set);
+    }
+
+    /// The whole-branch review (gate, important): a live tab's prompt (`切到 bypass？(y/n)`, which
+    /// says nothing about new sessions) answered after a terminal handoff turned the tab into
+    /// `NotStarted` used to move the WINDOW default into bypass too -- every later `prefix c` then
+    /// opened in bypass with no `y` for it (spec §7.2). The plan now records which question it asked,
+    /// and a `y` to a question that no longer describes the tab is a reprompt, never an entry.
+    #[test]
+    fn a_live_tab_prompt_answered_after_the_tab_became_empty_reprompts_and_moves_nothing() {
+        let dir = workspace("bypass-prompt-kind-changed");
+        let mut set = set();
+        let tab = set.active();
+        let (_provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        let live_plan = plan(set.cycle_mode(tab));
+        assert_eq!(live_plan.prompt, tabs::PromptScope::LiveTab);
+        assert_eq!(
+            live_plan.lines,
+            vec![tabs::bypass_prompt(tabs::PromptScope::LiveTab, 0)]
+        );
+
+        // What `agent_panel`'s `HandoffToTerminal` arm does to the tab (its own drop of the prompt
+        // is the other half of this fix; this is the half that holds even without it).
+        if let TabBackend::Live(mut backend) =
+            std::mem::replace(&mut set.get_mut(tab).unwrap().backend, TabBackend::NotStarted)
+        {
+            backend.shutdown();
+        }
+
+        let fresh = match set.confirm_bypass(live_plan.scope, live_plan.nonce) {
+            Ok(ConfirmOutcome::Reprompt(fresh)) => fresh,
+            other => panic!("the question changed, so the answer must be asked again: {other:?}"),
+        };
+        assert_eq!(fresh.prompt, tabs::PromptScope::EmptyTab);
+        assert_eq!(fresh.lines, vec![tabs::bypass_prompt(tabs::PromptScope::EmptyTab, 0)]);
+        assert_ne!(fresh.nonce, live_plan.nonce);
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto, "nothing entered");
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "and the window default never moved"
+        );
+        assert_eq!(
+            set.confirm_bypass(live_plan.scope, live_plan.nonce),
+            Err("that prompt is no longer current".to_string())
+        );
+        let next = set.open();
+        assert_eq!(
+            set.get(next).unwrap().mode,
+            SessionModeChoice::Auto,
+            "a new tab is still auto"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// The same re-check the other way: an empty tab's prompt (which DOES say new sessions follow)
+    /// answered once the tab has started is asked again as a live tab's, which moves only the tab.
+    #[test]
+    fn an_empty_tab_prompt_answered_after_the_tab_started_reprompts_as_a_live_tab() {
+        let dir = workspace("bypass-prompt-kind-changed-2");
+        let mut set = set();
+        let tab = set.active();
+        let empty_plan = plan(set.cycle_mode(tab));
+        assert_eq!(empty_plan.prompt, tabs::PromptScope::EmptyTab);
+        let (_provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        let fresh = match set.confirm_bypass(empty_plan.scope, empty_plan.nonce) {
+            Ok(ConfirmOutcome::Reprompt(fresh)) => fresh,
+            other => panic!("expected a reprompt: {other:?}"),
+        };
+        assert_eq!(fresh.prompt, tabs::PromptScope::LiveTab);
+        assert_eq!(
+            set.confirm_bypass(fresh.scope, fresh.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: vec![]
+            })
+        );
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Bypass);
+        assert_eq!(
+            set.default_mode(),
+            SessionModeChoice::Auto,
+            "a live tab's entry moves only that tab"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn reset_drops_an_open_bypass_prompt() {
+        let mut set = set();
+        let tab = set.active();
+        set.get_mut(tab).unwrap().backend = TabBackend::Failed { reason: "test".into() };
+        let default_plan = match set.cycle_default_mode() {
+            ModeCycle::Confirm(plan) => plan,
+            other => panic!("auto -> bypass asks: {other:?}"),
+        };
+        set.reset(tab).unwrap();
+        assert_eq!(
+            set.confirm_bypass(default_plan.scope, default_plan.nonce),
+            Err("that prompt is no longer current".to_string())
+        );
+        assert_eq!(set.default_mode(), SessionModeChoice::Auto);
+    }
+
+    /// The whole-branch review (gate, minor): D3's "a launch never starts in bypass" held only because
+    /// the one caller passes `agent_prefs::startup_mode`, which never returns it. Now it holds here.
+    #[test]
+    fn a_window_never_starts_in_bypass_whatever_it_is_handed() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Bypass);
+        assert_eq!(set.default_mode(), SessionModeChoice::Auto);
+        assert_eq!(set.active_tab().mode(), SessionModeChoice::Auto);
+        let next = set.open();
+        assert_eq!(set.get(next).unwrap().mode(), SessionModeChoice::Auto);
     }
 
     #[test]
@@ -1712,7 +3216,7 @@ mod tests {
 
     fn interruptible_live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
         let provider = Arc::new(RecordingProvider::interruptible());
-        let conversation = AgentConversation::create(provider.clone(), dir, PermissionMode::Auto).unwrap();
+        let conversation = AgentConversation::create(provider.clone(), dir).unwrap();
         (provider, AgentBackend::Sidecar(Box::new(conversation)))
     }
 
@@ -2062,6 +3566,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Bash".into(),
             input: serde_json::json!({ "command": command }),
+            provider_prompt: None,
         };
         provider.queue(bash("perm-npm", "npm ci"));
         provider.queue(bash("perm-cargo", "cargo test --lib"));
@@ -2099,6 +3604,7 @@ mod tests {
             tool_use_id: Some(id.into()),
             tool_name: "Bash".into(),
             input: serde_json::json!({ "command": command }),
+            provider_prompt: None,
         };
         let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
             turn_id: "t1".into(),
@@ -2163,6 +3669,7 @@ mod tests {
             tool_use_id: Some(id.into()),
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": path, "content": "x" }),
+            provider_prompt: None,
         };
         provider.queue(AgentDomainEvent::ToolCallStarted {
             turn_id: "t1".into(),
@@ -2224,6 +3731,7 @@ mod tests {
             tool_use_id: Some(format!("toolu_{perm}")),
             tool_name: "Write".into(),
             input: serde_json::json!({ "file_path": path, "content": "x" }),
+            provider_prompt: None,
         };
         let events = vec![
             card("absent", "absent.txt"),
@@ -2259,6 +3767,7 @@ mod tests {
             tool_use_id: Some(id.into()),
             tool_name: "Bash".into(),
             input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
         };
         let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
             turn_id: "t1".into(),
@@ -2428,216 +3937,607 @@ mod tests {
         assert_eq!(set.get(second).unwrap().draft, "second's own");
     }
 
-    // ---- wave 5, Task 4: Shift+Tab switches a live tab; entering bypass answers its cards ----
+    // ---- R07, D12: a CLI reporting an ungated mode closes the session ----
 
-    fn live_switchable(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
-        let provider = Arc::new(RecordingProvider::switchable());
-        let conversation = AgentConversation::create(provider.clone(), dir, PermissionMode::Auto).unwrap();
-        (provider, AgentBackend::Sidecar(Box::new(conversation)))
-    }
-
-    /// Pumps until `tab` holds `pending` cards the pump delivered.
-    fn pump_until_pending(set: &mut TabSet, dir: &Path, tab: TabId, pending: usize) {
-        until("the pending cards", || {
-            set.pump(dir, true);
-            set.get(tab).unwrap().attention.attention().pending == pending
-        });
-    }
-
+    /// D12 at the one place that closes a session: an `UngatedCliMode` fails the tab with a reason
+    /// naming the setting and the mode, hands the backend out for the shutdown path a closed tab
+    /// uses, and delivers nothing of the batch it came in -- so the `Write` queued behind it is
+    /// never a card anyone could approve, and the shutdown is what denies it.
     #[test]
-    fn a_started_tab_switches_both_ways_when_the_sidecar_can() {
-        let dir = workspace("tabs-switch-both-ways");
+    fn a_cli_reporting_an_ungated_mode_closes_the_session() {
+        let dir = workspace("tabs-ungated-cli-mode");
         let mut set = set();
         let tab = set.active();
-        let (provider, backend) = live_switchable(&dir);
+        let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let default_before = set.default_mode();
 
-        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Bypass));
-        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Bypass);
-        assert_eq!(provider.modes(), vec![PermissionMode::Bypass]);
+        provider.queue(AgentDomainEvent::UngatedCliMode {
+            reported: "acceptEdits".into(),
+            detail: "SessionReady".into(),
+        });
+        provider.queue(write("behind-the-trip"));
+
+        let mut tripped = Vec::new();
+        let mut payloads = Vec::new();
+        until("the trip", || {
+            let out = set.pump(&dir, true);
+            payloads.extend(out.active_payload);
+            tripped.extend(out.tripped);
+            !tripped.is_empty()
+        });
+        let state = set.get(tab).unwrap();
+        let TabBackend::Failed { reason } = &state.backend else {
+            panic!("the tab must be failed");
+        };
+        assert!(reason.contains("permissions.defaultMode"), "{reason}");
+        assert!(reason.contains("'acceptEdits'"), "{reason}");
+        assert_eq!(state.wire_state(), TabStateWire::Failed);
+        assert_eq!(state.attention.attention().pending, 0, "no card is counted as waiting");
+
+        // Handed out, and exactly once, for the caller to shut down -- which closes the session.
+        assert_eq!(tripped.len(), 1);
+        assert_eq!(tripped[0].tab, tab);
+        assert_eq!(&tripped[0].reason, reason);
+        assert_eq!(
+            provider.closes(),
+            0,
+            "the pump shuts nothing down on the GTK thread itself"
+        );
+        for mut t in tripped {
+            t.backend.shutdown();
+        }
+        assert_eq!(provider.closes(), 1);
+
+        // Nothing more arrives for it, and nothing that did named the Write.
+        for _ in 0..5 {
+            let out = set.pump(&dir, true);
+            assert!(out.tripped.is_empty());
+            payloads.extend(out.active_payload);
+        }
+        for payload in &payloads {
+            assert!(
+                !payload.contains("behind-the-trip"),
+                "a card could have been drawn: {payload}"
+            );
+        }
         assert!(
             provider.resolutions().is_empty(),
-            "nothing was pending, so nothing is answered"
+            "nothing was answered on the host's side"
         );
-        assert_eq!(
-            set.default_mode(),
-            default_before,
-            "W2: a live switch is that session's only"
-        );
-
-        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Auto));
-        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
-        assert_eq!(provider.modes(), vec![PermissionMode::Bypass, PermissionMode::Auto]);
-        assert_eq!(set.default_mode(), default_before);
         shut_down_all(&mut set);
     }
 
+    /// The report survives a `Resync`: a UI queue that overflowed drops its events, the tripwire
+    /// among them, and the projection's record is what still closes the session.
     #[test]
-    fn a_started_tab_without_the_capability_stays_fixed() {
-        let dir = workspace("tabs-switch-fixed");
+    fn a_trip_lost_to_a_resync_still_closes_the_session() {
+        let dir = workspace("tabs-ungated-cli-mode-resync");
         let mut set = set();
-
-        // An empty tab is `cycle_mode`'s, not this.
-        let empty = set.active();
-        assert!(set.switch_mode(empty).is_err());
-        assert_eq!(set.get(empty).unwrap().mode, SessionModeChoice::Auto);
-
-        // W5: a starting tab says so, not "fixed" (false on a switch-capable sidecar).
-        let connecting = set.open();
-        let _tx = starting(&mut set, connecting, None, None);
-        let refused = set.switch_mode(connecting).unwrap_err();
-        assert_eq!(refused, "session is starting — try again once it is up");
-
-        let fixed = set.open();
+        let tab = set.active();
         let (provider, backend) = live(&dir);
-        set.get_mut(fixed).unwrap().backend = TabBackend::Live(backend);
-        let refused = set.switch_mode(fixed).unwrap_err();
-        assert!(refused.contains("fixed"), "{refused}");
-        assert!(provider.modes().is_empty(), "no call without the capability");
-        assert_eq!(set.get(fixed).unwrap().mode, SessionModeChoice::Auto);
+        provider.queue(AgentDomainEvent::UngatedCliMode {
+            reported: "bypassPermissions".into(),
+            detail: "PermissionModeChanged".into(),
+        });
+        // More than the UI queue holds, so the first delivery is a `Resync`.
+        for _ in 0..(agent::UI_EVENT_QUEUE_CAPACITY + 20) {
+            provider.open_session("claude-1", &dir);
+        }
+        until("an overflowed UI queue", || {
+            let AgentBackend::Sidecar(conversation) = &backend else {
+                unreachable!("`live` builds a sidecar")
+            };
+            let stats = conversation.ingest_stats();
+            stats.resyncs >= 1 && stats.events_ingested as usize > agent::UI_EVENT_QUEUE_CAPACITY + 20
+        });
+        assert!(
+            backend.projection().ungated_cli_mode.is_some(),
+            "the report was folded, and only the projection still has it"
+        );
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        // Ended, on a switchable tab: the capability check comes first.
-        let ended = set.open();
-        let (provider, backend) = live_switchable(&dir);
-        set.get_mut(ended).unwrap().backend = TabBackend::Live(backend);
+        let out = set.pump(&dir, true);
+        assert_eq!(out.tripped.len(), 1, "the first pump already closes it");
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::Failed { .. }));
+        for mut t in out.tripped {
+            t.backend.shutdown();
+        }
+        shut_down_all(&mut set);
+    }
+
+    /// `Tab::mode` is the only authority (spec §2.2): a `PermissionModeChanged` that reached the
+    /// pump -- which only one naming `default` can -- moves nothing.
+    #[test]
+    fn a_reported_mode_change_moves_nothing() {
+        let dir = workspace("tabs-mode-report-moves-nothing");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Bypass;
+
+        provider.queue(AgentDomainEvent::PermissionModeChanged {
+            mode: agent::PermissionMode::Auto,
+            provider_mode: "default".into(),
+            floor_applied: false,
+        });
         provider.queue(AgentDomainEvent::SessionClosed { reason: "x".into() });
         until("the session's end", || {
             set.pump(&dir, true);
-            set.get(ended).unwrap().wire_state() == TabStateWire::Ended
+            set.get(tab).unwrap().wire_state() == TabStateWire::Ended
         });
-        let refused = set.switch_mode(ended).unwrap_err();
-        assert!(refused.contains("ended"), "{refused}");
-        assert!(provider.modes().is_empty());
+        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Bypass);
         shut_down_all(&mut set);
     }
 
-    /// Review Focus 1: never a mode nobody chose.
+    // ---- O3: the CLI's own permission prompts through the tab set ---------------------------------
+
+    fn gate_write(permission_id: &str, tool_use_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: Some(tool_use_id.into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": ".git/probe2", "content": "o3" }),
+            provider_prompt: None,
+        }
+    }
+
+    /// The CLI's own prompt for a call, as the sidecar translation produces it.
+    fn cli_prompt(
+        permission_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+        ask_rule: Option<&str>,
+    ) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: Some(tool_use_id.into()),
+            tool_name: tool_name.into(),
+            input,
+            provider_prompt: Some(agent::ProviderPrompt {
+                reason: Some("Claude requested permissions to edit .git/probe2 which is a sensitive file.".into()),
+                description: Some(".git/probe2".into()),
+                blocked_path: None,
+                matched_ask_rule: ask_rule.map(|content| agent::MatchedAskRule {
+                    source: "projectSettings".into(),
+                    tool_name: tool_name.into(),
+                    rule_content: Some(content.into()),
+                }),
+                unrecognized_origin: None,
+            }),
+        }
+    }
+
+    fn resolved(permission_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionResolved {
+            permission_id: permission_id.into(),
+            outcome: agent::PermissionOutcome::Allowed,
+        }
+    }
+
+    /// O3 rulings 5 and 7, the whole sequence the real CLI produces in Auto: the gate's card, the
+    /// human's Approve on it (`answer_card`), the gate's resolution, then the CLI's own prompt for the
+    /// SAME call under a new permission id. That second request is accepted (ruling 7) and answered
+    /// `allow` without a second card (ruling 5): exactly one card for the call.
     #[test]
-    fn a_refused_switch_changes_nothing() {
-        let dir = workspace("tabs-switch-refused");
+    fn approving_the_card_for_a_call_answers_the_clis_own_prompt_that_follows() {
+        let dir = workspace("o3-auto-one-card");
         let mut set = set();
         let tab = set.active();
-        let (provider, backend) = live_switchable(&dir);
+        let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        provider.refuse_switches(true);
 
-        assert!(set.switch_mode(tab).is_err());
-        assert_eq!(provider.modes(), vec![PermissionMode::Bypass], "the call was made");
-        assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
-        assert_eq!(
-            set.get(tab).unwrap().live().unwrap().permission_mode(),
-            Some(PermissionMode::Auto)
-        );
+        provider.queue(gate_write("perm-hook", "toolu_probe2"));
+        until("the gate's card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        set.answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        assert_eq!(provider.resolutions(), vec![("perm-hook".to_string(), true)]);
+
+        provider.queue(resolved("perm-hook"));
+        provider.queue(cli_prompt(
+            "perm-cli",
+            "toolu_probe2",
+            "Write",
+            serde_json::json!({ "file_path": ".git/probe2", "content": "o3" }),
+            None,
+        ));
+        until("the CLI's own prompt answered", || {
+            if let Some(payload) = set.pump(&dir, true).active_payload {
+                assert!(!payload.contains("perm-cli"), "never drawn: {payload}");
+            }
+            provider.resolutions().len() == 2
+        });
+        assert_eq!(provider.resolutions()[1], ("perm-cli".to_string(), true));
+        let attention = set.get(tab).unwrap().attention.attention();
+        assert_eq!(attention.pending, 0);
+        assert_eq!(attention.arrived, 1, "exactly one card for the call");
         shut_down_all(&mut set);
     }
 
-    /// W4: entering bypass answers the cards waiting on THAT tab, and no other's.
+    /// Only an Approve counts: a denied card, and a card answered behind the tab set's back (not
+    /// through `answer_card`), leave the CLI's own prompt for that call a card.
     #[test]
-    fn entering_bypass_answers_this_tabs_waiting_cards_only() {
-        let dir = workspace("tabs-switch-answers-own-cards");
+    fn only_an_approve_through_the_tab_set_answers_the_clis_own_prompt() {
+        let dir = workspace("o3-auto-deny");
         let mut set = set();
-        let first = set.active();
-        let (first_provider, backend) = live_switchable(&dir);
-        set.get_mut(first).unwrap().backend = TabBackend::Live(backend);
-        let second = set.open();
-        let (second_provider, backend) = live_switchable(&dir);
-        set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        first_provider.queue(write("p1"));
-        second_provider.queue(write("p2"));
+        provider.queue(gate_write("perm-denied", "toolu_a"));
+        provider.queue(gate_write("perm-direct", "toolu_b"));
+        until("both gate cards", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        set.answer_card(
+            tab,
+            "perm-denied",
+            agent::PermissionDecision::Deny {
+                reason: Some("no".into()),
+            },
+        )
+        .map_err(|e| e.message)
+        .unwrap();
+        set.get_mut(tab)
+            .unwrap()
+            .live_mut()
+            .unwrap()
+            .respond_permission("perm-direct", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+
+        provider.queue(resolved("perm-denied"));
+        provider.queue(resolved("perm-direct"));
+        let input = serde_json::json!({ "file_path": ".git/probe2", "content": "o3" });
+        provider.queue(cli_prompt("perm-cli-a", "toolu_a", "Write", input.clone(), None));
+        provider.queue(cli_prompt("perm-cli-b", "toolu_b", "Write", input, None));
+        until("both CLI prompts card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        assert_eq!(provider.resolutions().len(), 2, "{:?}", provider.resolutions());
+        shut_down_all(&mut set);
+    }
+
+    /// The set of approved calls lives for the turn: the CLI asks within the turn that made the call,
+    /// so it is emptied when the turn ends rather than growing for the life of the tab.
+    #[test]
+    fn approved_calls_are_forgotten_when_the_turn_ends() {
+        let dir = workspace("o3-auto-turn-end");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        provider.queue(gate_write("perm-hook", "toolu_c"));
+        until("the gate's card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        set.answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        assert!(set.get(tab).unwrap().human_allowed.contains("toolu_c"));
+        provider.queue(resolved("perm-hook"));
+        provider.queue(AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        });
+        until("the turn ends", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().human_allowed.is_empty()
+        });
+        shut_down_all(&mut set);
+    }
+
+    /// O3 ruling 4 through the tab set: in bypass the CLI's own prompt is answered and never drawn.
+    #[test]
+    fn in_bypass_the_clis_own_prompt_is_answered_and_never_delivered() {
+        let dir = workspace("o3-bypass");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: Vec::new()
+            })
+        );
+        provider.queue(cli_prompt(
+            "perm-cli",
+            "toolu_d",
+            "Write",
+            serde_json::json!({ "file_path": ".claude/probe.json", "content": "{}" }),
+            None,
+        ));
+        until("answered", || {
+            if let Some(payload) = set.pump(&dir, true).active_payload {
+                assert!(!payload.contains("perm-cli"), "{payload}");
+            }
+            !provider.resolutions().is_empty()
+        });
+        assert_eq!(provider.resolutions(), vec![("perm-cli".to_string(), true)]);
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
+        shut_down_all(&mut set);
+    }
+
+    /// O3 ruling 3, the card half: a saved rule can never silence the CLI's own prompt, so its card
+    /// never offers "Always allow" -- while the gate's card for the same command still does.
+    #[test]
+    fn the_clis_own_prompt_is_never_offered_a_rule() {
+        let dir = workspace("o3-no-offer");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let npm = serde_json::json!({ "command": "npm ci" });
+        provider.queue(cli_prompt("perm-cli", "toolu_e", "Bash", npm.clone(), None));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("toolu_f".into()),
+            tool_name: "Bash".into(),
+            input: npm,
+            provider_prompt: None,
+        });
         until("both cards", || {
             set.pump(&dir, true);
-            set.get(first).unwrap().attention.attention().pending == 1
-                && set.get(second).unwrap().attention.attention().pending == 1
+            set.get(tab).unwrap().attention.attention().pending == 2
         });
-        assert!(first_provider.resolutions().is_empty(), "a Write is a card in auto");
-
-        assert_eq!(set.switch_mode(first), Ok(SessionModeChoice::Bypass));
-        assert_eq!(first_provider.resolutions(), vec![("p1".to_string(), true)]);
-        assert!(
-            second_provider.resolutions().is_empty(),
-            "another tab's card is untouched"
-        );
+        let offers = &set.get(tab).unwrap().rule_offers;
+        assert!(offers.contains_key("perm-gate"), "{offers:?}");
+        assert!(!offers.contains_key("perm-cli"), "{offers:?}");
         shut_down_all(&mut set);
     }
 
-    /// W4: raised before the switch, delivered after -- allowed, and no card is drawn.
+    /// O3 ruling 4's exception at a bypass entry: a card the user's own ask rule forced is not among
+    /// the cards `y` approves -- it is not counted, not listed, and still waiting afterwards.
     #[test]
-    fn a_card_delivered_after_the_switch_is_allowed() {
-        let dir = workspace("tabs-switch-card-after");
+    fn entering_bypass_leaves_a_card_the_users_ask_rule_forced() {
+        let dir = workspace("o3-bypass-entry-ask");
         let mut set = set();
         let tab = set.active();
-        let (provider, backend) = live_switchable(&dir);
+        let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Bypass));
+        provider.queue(cli_prompt(
+            "perm-ask",
+            "toolu_g",
+            "Bash",
+            serde_json::json!({ "command": "cat notes.txt" }),
+            Some("cat:*"),
+        ));
+        provider.queue(write("perm-write"));
+        until("both cards", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 2
+        });
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(plan.approve, vec!["perm-write".to_string()]);
+        // Review #6: the prompt says the card that will stay, on a line of its own after R06's.
+        assert_eq!(plan.lines.len(), 2, "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("批准 1 张"), "{:?}", plan.lines);
+        assert!(
+            plan.lines[1].contains("1 张") && plan.lines[1].contains("保留"),
+            "{:?}",
+            plan.lines
+        );
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 1,
+                resolved: Vec::new()
+            })
+        );
+        assert_eq!(provider.resolutions(), vec![("perm-write".to_string(), true)]);
+        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 1);
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .contains_key("perm-ask"));
+        shut_down_all(&mut set);
+    }
 
-        provider.queue(write("p3-after"));
-        until("the late card's answer", || {
+    /// `answer_card` names what it could not answer the way the panel's own path always did.
+    #[test]
+    fn answering_a_card_on_a_tab_with_no_session_is_refused() {
+        let mut set = set();
+        let tab = set.active();
+        let error = set
+            .answer_card(tab, "perm-x", agent::PermissionDecision::Allow)
+            .expect_err("no session");
+        assert_eq!(error.message, "no active session");
+        assert!(error.benign);
+        assert!(set
+            .answer_card(TabId(999), "perm-x", agent::PermissionDecision::Allow)
+            .is_err());
+    }
+
+    /// Codex's finding: a `Resync` can swallow a turn boundary (T1's `TurnCompleted` and T2's
+    /// `TurnStarted` both dropped with the overflow), so the turn-end clear never runs. Every Resync
+    /// forgets the tab's approvals, so a T2 prompt reusing T1's id -- same tool, same input -- is a
+    /// card, not answered on T1's approval.
+    #[test]
+    fn a_resync_forgets_every_approval_even_across_a_turn_it_swallowed() {
+        let dir = workspace("o3-resync-forgets");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        provider.queue(gate_write("perm-hook", "toolu_reused"));
+        until("the gate's card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        set.answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        assert!(set.get(tab).unwrap().human_allowed.contains("toolu_reused"));
+
+        provider.queue(resolved("perm-hook"));
+        provider.queue(AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+        });
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        for i in 0..300 {
+            provider.queue(AgentDomainEvent::ContentDelta {
+                turn_id: "t2".into(),
+                kind: agent::ContentKind::Text,
+                text: format!("chunk {i}"),
+            });
+        }
+        until("t2 folded", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            let projection = backend.projection();
+            projection.active_turn_id.as_deref() == Some("t2")
+                && projection
+                    .transcript
+                    .last()
+                    .is_some_and(|m| m.text.ends_with("chunk 299"))
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+
+        provider.queue(cli_prompt(
+            "perm-cli-t2",
+            "toolu_reused",
+            "Write",
+            serde_json::json!({ "file_path": ".git/probe2", "content": "o3" }),
+            None,
+        ));
+        until("the T2 prompt cards", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert_eq!(provider.resolutions(), vec![("perm-hook".to_string(), true)]);
+        shut_down_all(&mut set);
+    }
+
+    /// `r` forgets the approvals at once, before any pump (review #4, C2).
+    #[test]
+    fn reset_forgets_the_approvals() {
+        let mut set = set();
+        let tab = set.active();
+        let t = set.get_mut(tab).unwrap();
+        t.backend = TabBackend::Failed { reason: "gone".into() };
+        t.human_allowed.record("toolu_x", "Write", &serde_json::json!({}));
+        set.reset(tab).unwrap();
+        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+    }
+
+    /// A tab with no backend holds no approvals: the pump's non-live arm forgets them (review #4, C3).
+    #[test]
+    fn a_tab_without_a_backend_holds_no_approvals() {
+        let dir = workspace("o3-no-backend");
+        let mut set = set();
+        let tab = set.active();
+        set.get_mut(tab)
+            .unwrap()
+            .human_allowed
+            .record("toolu_x", "Write", &serde_json::json!({}));
+        set.pump(&dir, true);
+        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+    }
+
+    /// An Approve the provider refused approved nothing, so nothing is recorded (review #4, C4).
+    #[test]
+    fn a_refused_approve_records_no_approval() {
+        let dir = workspace("o3-refused-approve");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(gate_write("perm-hook", "toolu_r"));
+        until("the gate's card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        provider.refuse_resolutions(true);
+        assert!(set
+            .answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+            .is_err());
+        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// Review item 7 (the spike's row note): a call whose CLI prompt was answered without a card says
+    /// so, muted, on its row -- in the events payload when the call completes, and in every later
+    /// snapshot -- as a call a saved rule answered does.
+    #[test]
+    fn a_call_answered_without_a_card_says_so_on_its_row() {
+        let dir = workspace("o3-row-note");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.confirm_bypass(plan.scope, plan.nonce),
+            Ok(ConfirmOutcome::Entered {
+                approved: 0,
+                resolved: Vec::new()
+            })
+        );
+        let input = serde_json::json!({ "file_path": ".git/probe2", "content": "o3" });
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_n".into(),
+            name: "Write".into(),
+            input: input.clone(),
+        });
+        provider.queue(cli_prompt("perm-cli", "toolu_n", "Write", input, None));
+        until("answered", || {
+            set.pump(&dir, true);
+            !provider.resolutions().is_empty()
+        });
+        provider.queue(resolved("perm-cli"));
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_n".into(),
+            content: serde_json::json!("File created successfully"),
+            is_error: false,
+        });
+        let mut notes = serde_json::Value::Null;
+        until("the note", || {
             if let Some(payload) = set.pump(&dir, true).active_payload {
-                let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
-                for event in parsed["events"].as_array().unwrap() {
-                    assert!(
-                        !event.to_string().contains("p3-after"),
-                        "no card is delivered in bypass: {event}"
-                    );
+                let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                if value.get("promptNotes").is_some() {
+                    notes = value["promptNotes"].clone();
                 }
             }
-            provider.resolutions().contains(&("p3-after".to_string(), true))
+            !notes.is_null()
         });
-        assert_eq!(provider.resolutions(), vec![("p3-after".to_string(), true)]);
-        shut_down_all(&mut set);
-    }
-
-    /// W4: no card is answered on a switch back to auto; the classifier decides again.
-    #[test]
-    fn back_in_auto_the_classifier_decides_again() {
-        let dir = workspace("tabs-switch-back-to-auto");
-        let mut set = set();
-        let tab = set.active();
-        let (provider, backend) = live_switchable(&dir);
-        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Bypass));
-        assert_eq!(set.switch_mode(tab), Ok(SessionModeChoice::Auto));
-
-        provider.queue(write("p4"));
-        pump_until_pending(&mut set, &dir, tab, 1);
-        assert!(provider.resolutions().is_empty(), "a Write is a card again");
-
-        provider.queue(read("p5"));
-        until("the Read's answer", || {
-            set.pump(&dir, true);
-            provider.resolutions().contains(&("p5".to_string(), true))
-        });
-        assert_eq!(provider.resolutions(), vec![("p5".to_string(), true)]);
-        assert_eq!(set.get(tab).unwrap().attention.attention().pending, 1, "p4 still waits");
-        shut_down_all(&mut set);
-    }
-
-    /// The sidecar's own report moves the band, but never grants auto-approval: only an
-    /// acknowledged switch does (Review Focus 2).
-    #[test]
-    fn a_reported_mode_change_moves_the_tab() {
-        let dir = workspace("tabs-switch-reported");
-        let mut set = set();
-        let tab = set.active();
-        let (provider, backend) = live_switchable(&dir);
-        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let default_before = set.default_mode();
-
-        provider.queue(AgentDomainEvent::PermissionModeChanged {
-            mode: PermissionMode::Bypass,
-            provider_mode: "bypassPermissions".into(),
-            floor_applied: false,
-        });
-        until("the reported mode", || {
-            set.pump(&dir, true);
-            set.get(tab).unwrap().mode == SessionModeChoice::Bypass
-        });
-        assert_eq!(set.default_mode(), default_before);
         assert_eq!(
-            set.get(tab).unwrap().live().unwrap().permission_mode(),
-            Some(PermissionMode::Auto)
+            notes,
+            serde_json::json!([{ "toolUseId": "toolu_n", "note": "Claude Code safety check — allowed in bypass" }])
+        );
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        assert_eq!(
+            snapshot["state"]["toolCalls"][0]["promptNote"],
+            "Claude Code safety check — allowed in bypass"
         );
         shut_down_all(&mut set);
     }

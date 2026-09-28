@@ -140,6 +140,55 @@ describe("applyEvent", () => {
     expect(state.pendingPermissions[0].toolUseId).toBe("toolu_01ABC");
   });
 
+  /* O3: the CLI's own prompt for a call arrives as a SECOND request carrying the same tool_use_id
+     as the gate's (already answered) one, under a new permission id, with the CLI's own words in
+     `provider_prompt` (Rust's snake_case event). The reducer keeps it as a card of its own and
+     carries the words in the snapshot's camelCase shape, so an events-built card and a
+     snapshot-built one read the same. A gate request carries no `providerPrompt` at all. */
+  it("keeps the CLI's own prompt for an answered call as its own card, with its words", () => {
+    let state = applyEvent(initialState(), {
+      type: "permission_requested",
+      permission_id: "perm-gate",
+      tool_use_id: "toolu_probe",
+      tool_name: "Write",
+      input: {},
+    });
+    expect(state.pendingPermissions[0]).not.toHaveProperty("providerPrompt");
+    state = applyEvent(state, { type: "permission_resolved", permission_id: "perm-gate", outcome: "allowed" });
+    state = applyEvent(state, {
+      type: "permission_requested",
+      permission_id: "perm-cli",
+      tool_use_id: "toolu_probe",
+      tool_name: "Write",
+      input: {},
+      provider_prompt: {
+        reason: "Claude requested permissions to edit /p/.git/probe which is a sensitive file.",
+        description: ".git/probe",
+        blocked_path: null,
+        matched_ask_rule: { source: "projectSettings", tool_name: "Write", rule_content: null },
+      },
+    });
+    expect(state.pendingPermissions).toHaveLength(1);
+    expect(state.pendingPermissions[0].permissionId).toBe("perm-cli");
+    expect(state.pendingPermissions[0].providerPrompt).toEqual({
+      reason: "Claude requested permissions to edit /p/.git/probe which is a sensitive file.",
+      description: ".git/probe",
+      blockedPath: null,
+      matchedAskRule: { source: "projectSettings", toolName: "Write", ruleContent: null },
+      unrecognizedOrigin: null,
+    });
+    // O3 review #3: an origin this build does not know is carried, so the card calls it neutrally.
+    state = applyEvent(state, {
+      type: "permission_requested",
+      permission_id: "perm-new",
+      tool_use_id: "toolu_new",
+      tool_name: "Write",
+      input: {},
+      provider_prompt: { reason: null, description: null, blocked_path: null, matched_ask_rule: null, unrecognized_origin: 7 },
+    });
+    expect(state.pendingPermissions[1].providerPrompt?.unrecognizedOrigin).toBe(7);
+  });
+
   /* The legacy backend's own shape, new on 2026-09-15: its `PreToolUse` hook payload's
      `tool_use_id` is BOTH the identity of the gated call and the id the request is answered by, so
      the two arrive as one string. Nothing in the reducer may assume they differ -- the card is
@@ -644,6 +693,22 @@ describe("applyCallNotes (v1 polish F18, F22)", () => {
     expect(next.toolCalls[1]).toBe(other);
     expect(applyCallNotes(state, {})).toBe(state);
     expect(applyCallNotes(state, { ruleNotes: [], createsFile: [] })).toBe(state);
+  });
+
+  it("puts the note for a call answered without a card on that call (O3 review item 7)", () => {
+    let state = initialState();
+    for (const id of ["toolu_1", "toolu_2"]) {
+      state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: id, name: "Write", input: {} });
+    }
+    const next = applyCallNotes(state, {
+      promptNotes: [
+        { toolUseId: "toolu_2", note: "Claude Code safety check — allowed with your approval" },
+        { toolUseId: "toolu_gone", note: "x" },
+      ],
+    });
+    expect(next.toolCalls.map((c) => c.promptNote)).toEqual([undefined, "Claude Code safety check — allowed with your approval"]);
+    expect(next.toolCalls[0]).toBe(state.toolCalls[0]);
+    expect(applyCallNotes(state, { promptNotes: [] })).toBe(state);
   });
 
   it("marks a Write card raised over no file, and its call", () => {

@@ -500,6 +500,66 @@ describe("EmptyTab (F3)", () => {
     });
   });
 
+  /** v1 (spec `2026-09-27-v1-mode-design.md`, S2): the dashboard used to cycle the mode straight off
+   *  a bare `m`, with none of the D11 typed-text guard the rest of the panel now has around a move
+   *  into bypass. `App.tsx`'s document-capture Shift+Tab router is the only way in now; this screen
+   *  never dispatches on the letter at all any more, at any timing. */
+  describe("v1 mode: S2 via the prompt", () => {
+    it("m in the menu posts nothing", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "m" });
+      expect(props.onCycleMode).not.toHaveBeenCalled();
+    });
+
+    it("m then y posts nothing (an envelope arriving between them changes nothing here)", () => {
+      const rendered = renderEmpty();
+      const { props } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "m" });
+      // Stands in for an envelope landing between the two keys: this screen reads no envelope
+      // directly (that is `App.tsx`'s job), so a re-render with the same props is the whole effect
+      // one could have here, and it changes nothing about what the next key does.
+      rendered.rerender(<EmptyTab {...props} arriveRequest={1} />);
+      fireEvent.keyDown(root, { key: "y" });
+      expect(props.onCycleMode).not.toHaveBeenCalled();
+    });
+
+    it("Space, m, y at 100ms with the envelope between m and y: still nothing", () => {
+      vi.useFakeTimers();
+      try {
+        const rendered = renderEmpty();
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: " " });
+        act(() => vi.advanceTimersByTime(100));
+        fireEvent.keyDown(root, { key: "m" });
+        rendered.rerender(<EmptyTab {...props} arriveRequest={1} />);
+        act(() => vi.advanceTimersByTime(100));
+        fireEvent.keyDown(root, { key: "y" });
+        expect(props.onCycleMode).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the Mode item still runs on Enter, and its label is the real way in (⇧Tab)", () => {
+      const rendered = renderEmpty();
+      const { props, container } = rendered;
+      const root = toBrowse(rendered, props);
+      // dashItems' own order with a resumable session present: new, resume, sessions, mode, keys.
+      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "Enter" });
+      expect(props.onCycleMode).toHaveBeenCalledTimes(1);
+      const keys = Array.from(container.querySelectorAll(".dash-key")).map((el) => el.textContent);
+      expect(keys).toContain("⇧Tab");
+      expect(keys).not.toContain("m");
+    });
+  });
+
   it("in INPUT the dashboard's letters type into the composer instead of running an item", () => {
     const { container, props } = renderEmpty(); // starts in INPUT (mode defaults to "input")
     const box = container.querySelector("textarea")!;

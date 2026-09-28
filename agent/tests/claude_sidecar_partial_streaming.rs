@@ -14,10 +14,16 @@
 //! loses it. `final text == accumulated stream` is the assertion that catches both directions, and
 //! it is checked against the turn's own authoritative `result_text`, not against a second copy of
 //! the same accumulation.
+//!
+//! **Since R07 (2026-09-27) every session here is gated** (`INTERACTIVE`, the CLI in `default`);
+//! they used BYPASS so a tool call ran unasked. A turn that uses a tool now raises a
+//! `PermissionRequested`, which `run_timed_turn` answers `Allow` -- neovibe's own bypass answer,
+//! given at the provider level because these tests drive the provider directly.
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
-    InterruptTurnRequest, PermissionMode, SendTurnRequest, StreamingPreference, TurnOutcome,
+    InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, SendTurnRequest, StreamingPreference,
+    TurnOutcome,
 };
 use std::time::{Duration, Instant};
 
@@ -69,7 +75,6 @@ fn open(provider: &ClaudeSidecarProvider, streaming: StreamingPreference) -> Str
     provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Bypass,
             streaming,
         })
         .expect("create_session should succeed")
@@ -112,6 +117,13 @@ fn run_timed_turn(provider: &ClaudeSidecarProvider, session_id: &str, prompt: &s
                     timeline.chunks.push(text.clone());
                 }
                 AgentDomainEvent::TurnCompleted { .. } => timeline.completed = Some(now),
+                AgentDomainEvent::PermissionRequested { permission_id, .. } => provider
+                    .resolve_permission(ResolvePermissionRequest {
+                        session_id: session_id.to_string(),
+                        permission_id: permission_id.clone(),
+                        decision: PermissionDecision::Allow,
+                    })
+                    .expect("answering a pending request should succeed"),
                 _ => {}
             }
             timeline.events.push(event);

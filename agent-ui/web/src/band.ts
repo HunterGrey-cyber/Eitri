@@ -8,7 +8,19 @@ export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" 
  *  left of the gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
  *  model, position, `↓N`). `StatusBand` groups by `side` when it renders; `bandLayout` itself never
  *  reorders by side, only by priority. */
-export type Seg = { id: SegId; text: string; side: "left" | "right" };
+export type Seg = {
+  id: SegId;
+  text: string;
+  side: "left" | "right";
+  /** Set only on `"prompt"`/`"message"`, and only when the FULL text (never truncated any more,
+   *  defect 1 of the 2026-09-27 sandbox GUI pass) does not fit the band's one row at the measured
+   *  width. `StatusBand` reads this to switch the band from its fixed one-editor-row height to a
+   *  wrapping, auto-height one for as long as this text is shown -- a y/n prompt's own trailing
+   *  `(y/n)`, or the D11 flash explaining what `y` does, used to be exactly the part `bandLayout`'s
+   *  old `cut()` truncated away. Absent (not merely `false`) on every other segment, which keeps
+   *  the existing drop-by-priority degrade instead. */
+  wraps?: boolean;
+};
 
 /** What the band has to say this render, gathered by `App.tsx` from state that already exists
  *  elsewhere (this crate's own state, the tab's mode, the reducer's projection) -- `bandLayout` is
@@ -44,31 +56,16 @@ export function textWidth(text: string): number {
   return n;
 }
 
-/** Keeps whole characters up to width `n - 1` and appends `…` -- the one truncation rule this
- *  module uses, for a message/prompt that does not fit (spec §5.3.3). `n <= 1` leaves no room even
- *  for the ellipsis, so the result is empty.
- *
- *  Deviation from the task brief's own worked description, recorded per its own instruction to fix
- *  a disagreement minimally: text that already fits within `n` is returned unchanged, with no
- *  ellipsis appended. The brief's prose called for always appending one, but its own prompt case
- *  (below) calls this unconditionally, even when the y/n prompt already fits the band whole -- a
- *  fitting `close 1 "new"? (y/n)` read as `close 1 "new"? (y/n)…` would be a truncation mark on
- *  text that was never cut, which is not what an ellipsis means anywhere else in this file (the
- *  `message` segment's own use of `cut`, three lines down, only ever runs when `over > 0` -- i.e.
- *  only when truncation is real). */
-function cut(text: string, n: number): string {
-  if (n <= 1) return "";
-  if (textWidth(text) <= n) return text;
-  let out = "";
-  let width = 0;
-  for (const ch of text) {
-    const w = WIDE.test(ch) ? 2 : 1;
-    if (width + w > n - 1) break;
-    out += ch;
-    width += w;
-  }
-  return out + "…";
-}
+/** This module used to have a `cut(text, n)` truncator here, appending `…` to a message/prompt
+ *  that did not fit (spec §5.3.3). **Removed 2026-09-27 (v1 sandbox GUI pass, defect 1):** at the
+ *  owner's own WebKit zoom 1.5 (a 47-column band), it truncated the R06 bypass prompt to
+ *  `切到 bypass 并批准 1 张等待中的卡…`, losing its own `(y/n)`, and did the same to the D11
+ *  flash explaining what `y` does -- exactly the two things a y/n prompt/flash must stay legible
+ *  for. Neither a prompt nor a message is ever cut any more; a segment that would have been reads
+ *  `wraps: true` instead (below), and `StatusBand`/`index.css`'s `.status-band--wrap` let the band
+ *  grow upward and wrap it onto more rows for as long as it is shown, returning to the fixed
+ *  one-editor-row height the moment the prompt/flash ends. Ordinary segments (mode, pill, cards,
+ *  queue, context, model, position, unread) are untouched: they still degrade by priority, below. */
 
 const PAD = 2; // one character of padding each side (8px at --fs-sm)
 const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT" };
@@ -84,7 +81,8 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   if (widthPx <= 0 || charPx <= 0) return [mode, pill];
   const budget = Math.floor(widthPx / charPx);
   if (f.prompt !== null) {
-    return [mode, { id: "prompt", text: cut(f.prompt, budget - textWidth(mode.text) - 2 * PAD), side: "left" }];
+    const roomForPrompt = budget - textWidth(mode.text) - 2 * PAD;
+    return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }];
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
   let segs: Seg[] = [
@@ -114,8 +112,12 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     if (width(segs) <= budget) break;
     segs = apply(segs);
   }
+  // Defect 1: `message` is never cut either (`over > 0` here means every droppable segment is
+  // already gone and the message's own full text is still wider than the row) -- it is marked
+  // `wraps` instead of being shortened, so `StatusBand` grows the band rather than hiding the end
+  // of a flash like the D11 explanation.
   const over = width(segs) - budget;
-  if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, text: cut(x.text, textWidth(x.text) - over) } : x));
+  if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, wraps: true } : x));
   return segs;
 }
 

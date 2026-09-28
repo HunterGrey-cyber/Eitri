@@ -20,20 +20,25 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
 }
 
 /** Claude Code's mode pill (docs, permission-modes.md), with neovibe's own word for the mode
- *  (`hello.permissionModes`): neovibe's `auto` is not the CLI's. `cycleOffered` names D6's own
- *  capability gate (`state.capabilities.modeSwitch`) before a start it is always offered
- *  (phase 2's own behaviour); once a session is live it is offered only when Verdandi can actually
- *  change a live session's mode (D6/wave 5's `set_permission_mode`).
+ *  (`hello.permissionModes`): neovibe's `auto` is not the CLI's. `cycleOffered` used to name wave
+ *  5's own `SetPermissionMode` capability gate; v1 (spec `2026-09-27-v1-mode-design.md`) removes
+ *  that capability entirely -- every tab can always attempt to cycle now (`modeKey.ts`'s
+ *  `modeKeyRoute`) -- but the parameter stays for the long form's own shape, below.
  *
  *  `short` (panel round 2 plan, Task 10; spec §5.2): the bottom band has no room for "on" or the
  *  cycle hint, so it always reads `short = true` and gets the bare `⏵⏵ <mode>` -- `cycleOffered` is
  *  ignored entirely in that case, since there is nowhere left to draw the hint anyway. Backend and
  *  model, and the full pill with its hint, moved to `prefix i` (decision 6); nothing left calls this
  *  with `short` omitted, but the parameter defaults to `false` rather than being required, so a
- *  future caller that wants the long form back does not have to relearn what it looked like. */
+ *  future caller that wants the long form back does not have to relearn what it looked like.
+ *
+ *  D8: bypass's short pill spells out what it means (`⏵⏵ bypass permissions on`) rather than the
+ *  bare mode word every other mode gets -- neovibe's own answer, spent on every waiting card, is not
+ *  something a glance at "bypass" alone says. */
 export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
-  if (short) return `⏵⏵ ${mode}`;
-  return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to cycle)` : `⏵⏵ ${mode} on`;
+  if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;
+  // O2 (a): the key toggles auto and bypass, frozen as such -- "toggle", not Claude Code's "cycle".
+  return cycleOffered ? `⏵⏵ ${mode} on (shift+tab to toggle)` : `⏵⏵ ${mode} on`;
 }
 
 /** One glyph per marker (spec §3.2). `working` has none: `TurnActivity`'s motion draws it. */

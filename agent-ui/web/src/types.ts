@@ -31,6 +31,9 @@ export type ToolCallRecord = {
   allowedByRule?: string;
   /** v1 polish F22: this `Write`'s card was raised over no file (see `PermissionRequestRecord`). */
   createsFile?: boolean;
+  /** O3 review item 7: the CLI's own prompt for this call was answered without a card -- "Claude Code
+   *  safety check — allowed in bypass" / "— allowed with your approval". Absent on every other call. */
+  promptNote?: string;
 };
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.
@@ -53,6 +56,32 @@ export type PermissionRequestRecord = {
   /** v1 polish F22: a `Write` whose file did not exist when the card was raised (Rust looked).
    *  Absent when it did, and for every other tool. */
   createsFile?: boolean;
+  /** O3: present when the CLI itself asked about this call, after the gate had already answered it
+   *  (Verdandi's PERMISSION_ORIGIN_PROVIDER_PROMPT; Rust's `ProviderPrompt`). Absent on the gate's
+   *  own request. Answered like any card, with the same permission id. */
+  providerPrompt?: ProviderPrompt;
+};
+/** The CLI's own words about why it asked, verbatim; any of them may be `null`. `reason` is English
+ *  prose from the CLI ("... which is a sensitive file.") -- shown, never parsed. */
+export type ProviderPrompt = {
+  reason: string | null;
+  description: string | null;
+  blockedPath: string | null;
+  /** The user's own `permissions.ask` rule that forced this prompt, when one did. */
+  matchedAskRule: MatchedAskRule | null;
+  /** The raw `origin` a sidecar newer than this build sent (O3 review #3); `null` for a known one.
+   *  Such a prompt is a card in every mode and is called neutrally. */
+  unrecognizedOrigin: number | null;
+};
+export type MatchedAskRule = { source: string; toolName: string; ruleContent: string | null };
+/** `ProviderPrompt` as the `permission_requested` EVENT carries it: Rust's own snake_case. */
+export type WireProviderPrompt = {
+  reason: string | null;
+  description: string | null;
+  blocked_path: string | null;
+  matched_ask_rule: { source: string; tool_name: string; rule_content: string | null } | null;
+  /** Omitted by Rust for every origin this build knows. */
+  unrecognized_origin?: number;
 };
 export type SessionStatus =
   | { kind: "starting" }
@@ -125,13 +154,6 @@ export type Capabilities = {
   fork: boolean;
   interrupt: boolean;
   bypassPermissionMode: boolean;
-  /** Whether the sidecar can switch THIS live session's permission mode
-   *  (`agent/src/providers/claude_sidecar/mod.rs`'s `set_permission_mode`); `false`/absent on legacy
-   *  and on an older sidecar that never advertised `SetPermissionMode`. Wave 5 flips
-   *  `CLIENT_IMPLEMENTS_SET_PERMISSION_MODE` to `true` once the switch RPC is real, at which point a
-   *  live tab's Shift+Tab (`modeKey.ts`'s `modeKeyRoute`) cycles instead of flashing the fixed-mode
-   *  text -- see the wave-5 correction to the "D6" row this doc comment used to describe alone. */
-  modeSwitch?: boolean;
 };
 
 /** Descriptive only -- for display and diagnostics, never for deciding whether a control is
@@ -327,7 +349,15 @@ export type AgentDomainEvent =
   | { type: "assistant_message_boundary"; turn_id: string }
   | { type: "tool_call_started"; turn_id: string; tool_use_id: string; name: string; input: unknown }
   | { type: "tool_call_completed"; turn_id: string; tool_use_id: string; content: unknown; is_error: boolean }
-  | { type: "permission_requested"; permission_id: string; tool_use_id: string | null; tool_name: string; input: unknown }
+  | {
+      type: "permission_requested";
+      permission_id: string;
+      tool_use_id: string | null;
+      tool_name: string;
+      input: unknown;
+      /** O3: the CLI's own prompt; omitted by Rust on the gate's own request. */
+      provider_prompt?: WireProviderPrompt;
+    }
   | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" }
   | { type: "turn_completed"; turn_id: string; outcome: TurnOutcome; result_text: string; stop_reason: string | null; usage: UsageInfo | null }
   /** The provider's verdict on a resume, stated once for a session that asked for one. Mirrors the

@@ -28,7 +28,7 @@ fn live_set(dir: &std::path::Path) -> (TabSet, neovibe_core::tabs::TabId) {
 fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, neovibe_core::tabs::TabId) {
     let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
-    let backend = AgentBackend::start(kind, dir, agent::PermissionMode::Auto, None)
+    let backend = AgentBackend::start(kind, dir, None)
         .map_err(|e| e.message)
         .expect("a sidecar session starts; is this running under a test-account wrapper?");
     set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -182,7 +182,7 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
     assert!(
         ran_bash,
         "no Bash call reached the gate, so a D7 rule was not shown answering anything \
-         (check agent::disallowed_tools_for(Auto) still offers Bash)"
+         (check agent::disallowed_tools() still offers Bash)"
     );
 
     deny_the_next_card(

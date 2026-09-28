@@ -9,7 +9,7 @@
 //! therefore be installed for these to pass -- the cost claim is about billing, not about
 //! dependencies.
 
-use agent::{AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode};
+use agent::{AgentProvider, ClaudeSidecarProvider, CreateSessionRequest};
 
 #[test]
 #[ignore]
@@ -18,7 +18,6 @@ fn create_session_returns_a_real_session_id() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();
@@ -48,7 +47,6 @@ fn resume_is_now_advertised_and_an_empty_id_is_rejected_before_the_wire() {
     let result = provider.resume_session(agent::ResumeSessionRequest {
         provider_session_id: "   ".into(),
         cwd: "/tmp".into(),
-        permission_mode: PermissionMode::Bypass,
         streaming: agent::StreamingPreference::Partial,
     });
     match result {
@@ -137,12 +135,13 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "tool_allow_list",
         "set_permission_mode",
         "text_delta_message_id",
+        "provider_permission_prompts",
         "executable_host_cli",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
-    // Order and length included for the 133dc03 list, not just set membership: the fixture is
+    // Order and length included for the b3aa188 list, not just set membership: the fixture is
     // transcribed from the sidecar's own literal, and this is what keeps the transcription honest.
     //
     // Two permitted differences, each transcribed from Verdandi's own handshake handler at its one

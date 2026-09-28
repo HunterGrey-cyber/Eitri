@@ -4,9 +4,7 @@
 //! permission/interrupt/close-fail-close scenarios; this file is scoped to the plain-text happy
 //! path only.
 
-use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode, TurnOutcome,
-};
+use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, TurnOutcome};
 
 #[test]
 #[ignore]
@@ -15,7 +13,6 @@ fn a_real_turn_s_reply_arrives_via_pump() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();
