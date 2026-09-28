@@ -2272,29 +2272,23 @@ struct GitConfigVariable {
 }
 
 impl GitConfigVariable {
-    /// Allows only configuration keys known to be inert for the permitted read-only commands.
-    /// A denylist can miss file-reading keys such as `blame.ignoreRevsFile` or promisor
-    /// remotes using `ext::`, and new git versions can add more. Unknown keys card through
-    /// [`config_runs_nothing`]. The caller handles `include`, both `*.url` keys,
-    /// `core.hooksPath` and `core.worktree` separately.
-    /// Section and key are lowercased; the subsection does not affect this check.
-    /// `core.repositoryformatversion`, `core.filemode`, `core.bare` and `core.logallrefupdates`
-    /// are format or boolean values, not paths or programs. `core.ignorecase`,
-    /// `core.precomposeunicode` and `core.symlinks` are filesystem-behaviour booleans.
-    /// `remote.<n>.fetch` is a refspec. `remote.<n>.glab-resolved` and
-    /// `branch.<n>.vscode-merge-base` are metadata git does not read.
-    /// `branch.<n>.remote` and `branch.<n>.merge` name a remote and ref.
-    /// `submodule.<n>.active` is a boolean or pathspec. `user.name` and `user.email` are
-    /// identity strings, not paths or programs used by read-only commands.
-    /// `extensions.objectformat`, `extensions.refstorage`, `extensions.worktreeconfig` and
-    /// `extensions.preciousobjects` select repository formats without running programs.
-    /// `extensions.partialclone` is excluded because it names a remote used for lazy fetch.
-    /// `pull.rebase`, `pull.ff`, `rerere.enabled`, `rerere.autoupdate`, branch descriptions
-    /// and rebase settings, and `submodule.<n>.branch` do not affect the permitted reads.
-    /// `submodule.<n>.update` is allowed only for `checkout`, `rebase`, `merge` or `none`;
-    /// `!command` and unknown strategies card. `extensions.relativeworktrees` describes
-    /// worktree link storage and runs nothing.
-    /// `filter.lfs.*` and partial-clone keys remain excluded.
+    /// Allows only config keys known to be inert for the permitted read-only subcommands.
+    /// Unknown keys require cards because a denylist can miss program execution through
+    /// lazy-fetch transports or file reads through keys such as `blame.ignoreRevsFile`. The
+    /// caller separately handles includes, URL keys, `core.hooksPath` and `core.worktree`.
+    ///
+    /// Section and key are compared lowercased. Format flags and filesystem booleans are inert,
+    /// as are remote fetch refspecs, branch remote names and merge refs, submodule active
+    /// settings and commit identity strings. Git does not read the `glab-resolved` or
+    /// `vscode-merge-base` metadata keys.
+    ///
+    /// Pull, rerere, branch description/rebase and submodule branch settings are unused by the
+    /// permitted reads. Submodule update allows only `checkout`, `rebase`, `merge` and `none`;
+    /// `!command` and unknown values require cards. `extensions.relativeworktrees` only
+    /// describes how worktree links are stored.
+    ///
+    /// `filter.lfs.*` and partial-clone keys remain outside the allowlist.
+    /// `extensions.partialclone` names a promisor remote that lazy fetch can reach.
     fn is_inert_for_reads(&self) -> bool {
         match (self.section.as_str(), self.key.as_str()) {
             ("submodule", "update") => matches!(
@@ -4129,13 +4123,13 @@ mod tests {
     /// `git config --local --list --name-only` on this host, 2026-09-28.
     #[test]
     fn ordinary_repository_configs_stay_card_free() {
-        // Configuration keys left by `git init` and a normal clone.
+        // A plain repository: what git init + a normal clone leave.
         let plain = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
                      \tlogallrefupdates = true\n\tignorecase = true\n\tprecomposeunicode = true\n\
                      [remote \"origin\"]\n\turl = git@git.example.org:owner/x.git\n\
                      \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
                      [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n";
-        // The glab CLI writes `remote.<n>.glab-resolved`, which git never reads.
+        // A repository the glab CLI has touched: it writes remote.<n>.glab-resolved, which git never reads.
         let glab = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
                         \tlogallrefupdates = true\n\
                         [remote \"origin\"]\n\turl = https://git.example.org/owner/tool.git\n\
@@ -4152,7 +4146,7 @@ mod tests {
             assert!(leaks.is_empty(), "config {config:?} carded: {leaks:#?}");
         }
 
-        // self-host: core.hooksPath at its own (absolute) .git/hooks, and VS Code's
+        // core.hooksPath at the repository's own (absolute) .git/hooks, and VS Code's
         // branch.<n>.vscode-merge-base, which git never reads.
         let ws = Workspace::new();
         std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
@@ -4175,7 +4169,7 @@ mod tests {
             ws.path(),
             PermissionVerdict::AllowWithoutAsking,
         );
-        assert!(leaks.is_empty(), "self-host style carded: {leaks:#?}");
+        assert!(leaks.is_empty(), "hooksPath-at-its-own-hooks style carded: {leaks:#?}");
 
         // A relative core.hooksPath at the default hooks directory reads without a card too.
         let rel = Workspace::new();
