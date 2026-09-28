@@ -16,6 +16,8 @@
 //! `connect_close_request` handler (which calls `LiveHarness::shutdown()` and logs the result)
 //! becomes the public `shutdown()` method, for the host's own close-request handler to call.
 
+mod dmabuf_target;
+mod editor_area;
 mod frame_clock;
 mod gl_interop;
 mod keyboard;
@@ -24,6 +26,7 @@ mod nvim_child;
 mod nvim_rpc;
 mod stdin;
 
+pub use editor_area::PresentationCounts;
 pub use nvim_rpc::{CallWatch, NvimMode};
 pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
@@ -910,14 +913,17 @@ impl NeovideEditorPane {
             cwd,
             extra_nvim_args,
         } = options;
-        let gl_area = GLArea::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .has_stencil_buffer(true)
-            .auto_render(true)
-            .focusable(true)
-            .can_focus(true)
-            .build();
+        // A `GtkGLArea` whose snapshot presents through the pane's own tiled buffers
+        // (`editor_area`); every handler below is connected to it as a plain `GLArea`.
+        let gl_area: GLArea = glib::Object::builder::<editor_area::EditorGlArea>()
+            .property("hexpand", true)
+            .property("vexpand", true)
+            .property("has-stencil-buffer", true)
+            .property("auto-render", true)
+            .property("focusable", true)
+            .property("can-focus", true)
+            .build()
+            .upcast();
 
         let skia_state: Rc<RefCell<Option<SkiaState>>> = Rc::new(RefCell::new(None));
         let live_state: Rc<RefCell<LiveState>> = Rc::new(RefCell::new(LiveState::NotStarted));
@@ -1184,8 +1190,13 @@ impl NeovideEditorPane {
                 // record and the measurements behind doing this every frame rather than only on
                 // resize frames.
                 state.invalidate_cached_gl_state();
-                state.ensure_gtk_surface();
-                state.ensure_render_surface();
+                // `EditorGlArea`'s own tiled buffer is bound (`editor_area`): Skia draws straight
+                // into it, with no intermediate and no copy. Otherwise `GtkGLArea`'s.
+                let own_buffer = widget
+                    .downcast_ref::<editor_area::EditorGlArea>()
+                    .is_some_and(|area| area.draws_into_own_buffer());
+                state.ensure_gtk_surface(own_buffer);
+                state.ensure_render_surface(own_buffer);
 
                 let Some(gtk_surface) = state.gtk_surface.as_mut() else {
                     return glib::Propagation::Stop;
@@ -1771,6 +1782,25 @@ impl NeovideEditorPane {
     /// an `ApplicationWindow`'s child) -- this pane never does so itself.
     pub fn widget(&self) -> &gtk4::GLArea {
         &self.widget
+    }
+
+    /// Whether the last frame was drawn into the pane's own tiled dmabuf buffers and handed to GTK
+    /// as a texture (`editor_area`), rather than into `GtkGLArea`'s texture through a Skia
+    /// intermediate. Diagnostic: the real-framebuffer regression prints which path it ran on.
+    pub fn draws_into_own_buffers(&self) -> bool {
+        self.widget
+            .downcast_ref::<editor_area::EditorGlArea>()
+            .is_some_and(|area| area.draws_into_own_buffer())
+    }
+
+    /// How many frames went through each presentation path, and how often the own-buffer path
+    /// failed, since this pane was built -- across every realize, never reset. Diagnostic: the
+    /// real-framebuffer regression fails a run that expects the own buffers on any fallback.
+    pub fn presentation_counts(&self) -> PresentationCounts {
+        self.widget
+            .downcast_ref::<editor_area::EditorGlArea>()
+            .map(|area| area.presentation_counts())
+            .unwrap_or_default()
     }
 
     /// Grabs keyboard focus for this pane's `GLArea` and tells the IME it's now the focused

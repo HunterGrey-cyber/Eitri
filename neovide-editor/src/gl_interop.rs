@@ -23,12 +23,18 @@ use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
 /// geometry tests name, and the frozen `poc/` crates (ADR §6) still carry their own copies.
 pub(crate) const CONTENT_MARGIN: f32 = 0.0;
 
-/// GL-context-bound Skia state. Complex drawing uses a Skia-owned GPU target, then one Src copy
-/// presents it through GTK's framebuffer. GTK's exported buffer can have a linear layout that is
-/// expensive for the glyph workload; keeping the render target separate lets Skia choose its own.
+/// GL-context-bound Skia state. Normally Skia draws straight into the pane's own tiled dmabuf
+/// buffer (`editor_area`, `dmabuf_target`). On the fallback into `GtkGLArea`'s texture, it draws
+/// into a Skia-owned GPU target and one Src copy presents that through GTK's framebuffer: GTK's
+/// exported buffer can have a linear layout that is expensive for the glyph workload, and keeping
+/// the render target separate lets Skia choose its own.
 pub(crate) struct SkiaState {
     pub(crate) gr_context: DirectContext,
     pub(crate) gtk_surface: Option<Surface>,
+    /// The framebuffer `gtk_surface` wraps, and whether it is `EditorGlArea`'s own (see
+    /// `editor_area`) rather than `GtkGLArea`'s. The two alternate when the pane's own buffers
+    /// fail and it falls back, and GL may give `GtkGLArea`'s new framebuffer the name ours had.
+    gtk_framebuffer: (i32, bool),
     pub(crate) render_surface: Option<Surface>,
     render_surface_failed_size: Option<(i32, i32)>,
     pub(crate) fb_width: i32,
@@ -40,6 +46,7 @@ impl SkiaState {
         Self {
             gr_context,
             gtk_surface: None,
+            gtk_framebuffer: (0, false),
             render_surface: None,
             render_surface_failed_size: None,
             fb_width,
@@ -82,15 +89,18 @@ impl SkiaState {
         self.gr_context.reset(None);
     }
 
-    pub(crate) fn ensure_gtk_surface(&mut self) {
-        if self.gtk_surface.is_some() {
+    /// `target_is_own_buffer`: as for [`SkiaState::ensure_render_surface`].
+    pub(crate) fn ensure_gtk_surface(&mut self, target_is_own_buffer: bool) {
+        let fboid = current_bound_framebuffer();
+        if self.gtk_surface.is_some() && self.gtk_framebuffer == (fboid, target_is_own_buffer) {
             return;
         }
+        self.gtk_surface = None;
         if self.fb_width <= 0 || self.fb_height <= 0 {
             return;
         }
+        self.gtk_framebuffer = (fboid, target_is_own_buffer);
 
-        let fboid = current_bound_framebuffer();
         let fb_info = FramebufferInfo {
             fboid: fboid as u32,
             format: GlFormat::RGBA8.into(),
@@ -121,7 +131,15 @@ impl SkiaState {
     /// draw into GTK directly; retry only at a different size or with a new GL context.
     /// Skia can defer GPU allocation until submission: a later device/OOM failure is not
     /// reported by this constructor and is not covered by this fallback.
-    pub(crate) fn ensure_render_surface(&mut self) {
+    ///
+    /// `target_is_own_buffer`: the frame is drawn into `EditorGlArea`'s own tiled buffer
+    /// (`editor_area`), where Skia draws as fast as into its own target, so there is no
+    /// intermediate and no copy; this releases one left from a fallback frame.
+    pub(crate) fn ensure_render_surface(&mut self, target_is_own_buffer: bool) {
+        if target_is_own_buffer {
+            self.render_surface = None;
+            return;
+        }
         if self.fb_width <= 0 || self.fb_height <= 0 {
             self.render_surface = None;
             return;
@@ -204,7 +222,7 @@ pub(crate) fn make_gl_interface() -> GlInterface {
 }
 
 /// Carried over verbatim from `neovide_embed::resolve_gl_proc`.
-unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
+pub(crate) unsafe fn resolve_gl_proc(lib: &libloading::os::unix::Library, name: &str) -> *const std::ffi::c_void {
     unsafe {
         if let Ok(epoxy_name) = std::ffi::CString::new(format!("epoxy_{name}")) {
             if let Ok(sym) = lib.get::<*const std::ffi::c_void>(epoxy_name.as_bytes_with_nul()) {
