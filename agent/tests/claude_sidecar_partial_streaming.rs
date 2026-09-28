@@ -1,23 +1,24 @@
-//! Partial assistant streaming, measured and pinned against a real sidecar and a real Claude CLI.
+//! Checks partial assistant streaming against a real sidecar and a real Claude CLI.
 //!
-//! `#[ignore]`d and billed. Run with
+//! Tests are ignored by default and billed. Run with
 //! `cargo test -p agent --test claude_sidecar_partial_streaming -- --ignored --test-threads=1 --nocapture`.
 //!
-//! **Terminology.** The SDK's `includePartialMessages` emits `stream_event` messages carrying
-//! Anthropic Messages API streaming events. Those are PRESENTATION deltas -- nothing in the SDK
-//! contract guarantees a token boundary -- so nothing here calls them tokens. "Partial assistant
-//! update" and "streaming content" are the accurate terms.
+//! The SDK's `includePartialMessages` emits `stream_event` messages carrying Messages API
+//! streaming events. These are presentation deltas with no guaranteed token boundaries.
 //!
-//! The correctness risk this file exists for is not "does text appear sooner". It is that with
-//! partials on, the provider sends the incremental deltas AND, at the end, the completed assistant
-//! message carrying the same characters. Translating both doubles every reply; translating neither
-//! loses it. `final text == accumulated stream` is the assertion that catches both directions, and
-//! it is checked against the turn's own authoritative `result_text`, not against a second copy of
-//! the same accumulation.
+//! With partials enabled, the provider sends incremental deltas followed by a completed
+//! assistant message containing the same text. Translating both duplicates the reply;
+//! translating neither loses it. The accumulated stream must equal the turn's authoritative
+//! `result_text`, so the check can detect both duplication and loss.
+//!
+//! Every session is gated with INTERACTIVE and the CLI in `default`. Tool calls raise
+//! `PermissionRequested`, which `run_timed_turn` answers with `Allow` at the provider level
+//! because these tests drive the provider directly.
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
-    InterruptTurnRequest, PermissionMode, SendTurnRequest, StreamingPreference, TurnOutcome,
+    InterruptTurnRequest, PermissionDecision, ResolvePermissionRequest, SendTurnRequest, StreamingPreference,
+    TurnOutcome,
 };
 use std::time::{Duration, Instant};
 
@@ -69,7 +70,6 @@ fn open(provider: &ClaudeSidecarProvider, streaming: StreamingPreference) -> Str
     provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Bypass,
             streaming,
         })
         .expect("create_session should succeed")
@@ -112,6 +112,13 @@ fn run_timed_turn(provider: &ClaudeSidecarProvider, session_id: &str, prompt: &s
                     timeline.chunks.push(text.clone());
                 }
                 AgentDomainEvent::TurnCompleted { .. } => timeline.completed = Some(now),
+                AgentDomainEvent::PermissionRequested { permission_id, .. } => provider
+                    .resolve_permission(ResolvePermissionRequest {
+                        session_id: session_id.to_string(),
+                        permission_id: permission_id.clone(),
+                        decision: PermissionDecision::Allow,
+                    })
+                    .expect("answering a pending request should succeed"),
                 _ => {}
             }
             timeline.events.push(event);

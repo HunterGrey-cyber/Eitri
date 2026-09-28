@@ -19,7 +19,7 @@
 
 use agent::{
     AgentConversation, AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,
-    InterruptTurnRequest, PermissionMode, ProjectionStatus, ProviderCapabilities, ProviderError, ProviderInfo,
+    InterruptTurnRequest, ProjectionStatus, ProviderCapabilities, ProviderError, ProviderInfo,
     ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, TurnOutcome, UiDelivery, UI_EVENT_QUEUE_CAPACITY,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +70,6 @@ impl AgentProvider for ScriptedProvider {
             interrupt: true,
             bypass_permission_mode: true,
             interactive_permission_mode: true,
-            set_permission_mode: false,
         }
     }
     fn info(&self) -> ProviderInfo {
@@ -110,8 +109,7 @@ impl AgentProvider for ScriptedProvider {
 /// distinct cwd per conversation keeps these tests from sharing a lease key with each other.
 fn conversation(provider: Arc<ScriptedProvider>) -> AgentConversation {
     let dir = agent::state_dirs::test_workspace_dir("slow-ui");
-    AgentConversation::create(provider, &dir, PermissionMode::Bypass)
-        .expect("create should succeed against the scripted provider")
+    AgentConversation::create(provider, &dir).expect("create should succeed against the scripted provider")
 }
 
 fn text(text: &str) -> AgentDomainEvent {
@@ -333,6 +331,7 @@ fn a_permission_requested_during_a_stall_is_still_pending_when_the_ui_returns() 
         tool_use_id: Some("tool-1".into()),
         tool_name: "Bash".into(),
         input: serde_json::json!({ "command": "echo hi" }),
+        provider_prompt: None,
     });
     for i in 0..1_000 {
         provider.emit(text(&format!("after-{i} ")));

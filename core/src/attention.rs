@@ -1,29 +1,21 @@
-//! What a chat that is not on screen owes the user: how
-//! many permission cards it is holding, and whether a turn finished while nobody was looking. The
-//! top bar's tray reads it as `agent ⚑N` (`layout::tray::chip_label`); a card arriving while the chat
-//! is away also raises a toast, or with `modules.chat.on_permission = reveal` shows the chat again.
+//! Tracks answerable permission cards and unseen turn completion for chats off screen. The
+//! tray displays `agent ⚑N` through `layout::tray::chip_label`. A new card raises a toast or
+//! shows the chat when `modules.chat.on_permission = reveal`.
 //!
-//! **Counted from what the panel was handed, never from the projection alone.** On the sidecar
-//! path a request the permission policy answered itself stays in `pending_permissions` until the
-//! provider's `PermissionResolved` arrives on a later pump (`AgentBackend::answer_what_needs_no_human`'s
-//! own doc). Counting the projection would light `⚑1` for a moment on every `Read`. So the tracker
-//! counts the `PermissionRequested` events that reached the UI -- exactly the cards the panel draws
-//! -- and drops each one the projection no longer holds, which is how an answer given from the panel
-//! (`respond_permission`, on legacy never a delivered event) stops counting.
+//! Counts `PermissionRequested` events delivered to the UI, then removes ids no longer
+//! pending in the projection. Automatically answered sidecar requests can stay pending until
+//! `PermissionResolved` arrives on a later pump. Counting the projection alone would briefly
+//! show a badge for each such request. Legacy panel answers are detected through the
+//! projection even without a delivered resolution event.
 //!
-//! **One gap is inherited, not fixed here:** [`AttentionTracker::resync`] takes the projection's
-//! pending set, because a resync rebuilds the panel's cards from that same snapshot -- so a `Read`
-//! the policy answered, still pending there, is counted until the next pump's `retain_pending`
-//! drops it, and can raise a toast. It is the gap `AgentBackend::answer_what_needs_no_human`'s doc
-//! records for the panel (a resync needs 256 queued events, never observed). The count matching
-//! the cards drawn is the point; fix it there, in the snapshot, never by counting less here.
+//! For resync, `TabSet::pump` supplies pending ids minus `Tab::host_answered`, excluding
+//! requests already answered locally in bypass or by the classifier.
+//! [`AttentionTracker::resync`] counts exactly the set it receives.
 //!
-//! **A session that ends owes nothing** ([`AttentionTracker::session_ended`]): its cards can no
-//! longer be answered, so they stop counting even though the panel still draws them -- the count is
-//! of cards still answerable. Ended off screen, it also sets `unread`: without that, a hidden chat
-//! whose session died with a card waiting would go from `agent ⚑1` back to a bare `agent`, its only
-//! sign gone. `shell` calls it at every place it takes a session away,
-//! not only on the event that says so: a fatal command, or a session that never opened.
+//! [`AttentionTracker::session_ended`] clears the count because ended cards can no longer be
+//! answered, even if still drawn. Ending off screen also sets `unread`, so losing the last
+//! waiting card does not remove every sign of the ended session. `shell` calls it whenever a
+//! session is removed, including fatal commands and sessions that never opened.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,6 +120,15 @@ impl AttentionTracker {
         self.cards.retain(|id, _| still_pending(id));
     }
 
+    /// Ids of cards still held by this tracker, oldest arrival first.
+    /// A bypass entry approves these cards through `TabSet::waiting_cards`. Since `cards` is keyed
+    /// by id, sort by the stamp assigned by `observe` or `resync` rather than by map key.
+    pub fn card_ids(&self) -> Vec<String> {
+        let mut ids: Vec<(&String, &u64)> = self.cards.iter().collect();
+        ids.sort_by_key(|(_, stamp)| **stamp);
+        ids.into_iter().map(|(id, _)| id.clone()).collect()
+    }
+
     /// The chat is on screen: what finished while it was away has been seen.
     pub fn seen(&mut self) {
         self.unread = false;
@@ -226,6 +227,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Write".into(),
             input: serde_json::json!({}),
+            provider_prompt: None,
         }
     }
     fn resolved(id: &str) -> AgentDomainEvent {
@@ -429,6 +431,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Entering bypass approves delivered cards in arrival order. `BTreeMap::keys()` would
+    /// sort ids alphabetically instead, regardless of arrival order.
+    #[test]
+    fn card_ids_are_oldest_first_not_alphabetical() {
+        let mut t = AttentionTracker::default();
+        t.observe(&[requested("b")], false);
+        t.observe(&[requested("a")], false);
+        assert_eq!(t.card_ids(), vec!["b".to_string(), "a".to_string()]);
     }
 
     /// Every tab's tracker shares one clock so card arrival order can be compared across tabs.

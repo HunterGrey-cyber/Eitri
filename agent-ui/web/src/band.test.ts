@@ -34,3 +34,53 @@ describe("the band degrades by priority", () => {
     expect(ids(360, { ...idle, context: { file: "说明文档非常长的文件名称.md", lines: null } })).toEqual(["mode", "pill", "context"]);
   });
 });
+
+/** At WebKit zoom 1.5, a 520-logical-pixel panel has about 346 CSS pixels, giving a 47-column
+ *  budget at 7.2 pixels per character. At this width, truncation could hide a prompt's `(y/n)` or a
+ *  flash's explanation of how to answer. */
+describe("defect 1: a y/n prompt or a flash is never truncated", () => {
+  const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
+  const R06_PROMPT = "切到 bypass 并批准 1 张等待中的卡片？(y/n)";
+  const EMPTY_TAB_PROMPT = "切到 bypass？本窗口之后的新会话也用 bypass (y/n)";
+  const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
+
+  it("keeps the R06 bypass prompt whole, (y/n) included, at a 47-column budget", () => {
+    const segs = bandLayout({ ...idle, prompt: R06_PROMPT }, NARROW_BUDGET_WIDTH, 7.2);
+    const prompt = segs.find((s) => s.id === "prompt")!;
+    expect(prompt.text).toBe(R06_PROMPT);
+    expect(prompt.text).not.toContain("…");
+    expect(prompt.text).toContain("(y/n)");
+    expect(prompt.wraps).toBe(true); // it did not fit whole -- StatusBand must wrap it
+  });
+
+  it("keeps the empty-tab bypass prompt whole at the same budget", () => {
+    const segs = bandLayout({ ...idle, prompt: EMPTY_TAB_PROMPT }, NARROW_BUDGET_WIDTH, 7.2);
+    const prompt = segs.find((s) => s.id === "prompt")!;
+    expect(prompt.text).toBe(EMPTY_TAB_PROMPT);
+    expect(prompt.text).not.toContain("…");
+    expect(prompt.text).toContain("(y/n)");
+  });
+
+  it("keeps the flash whole -- it explains what y does, not just a status word", () => {
+    const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.text).toBe(D11_FLASH);
+    expect(message.text).not.toContain("…");
+    expect(message.wraps).toBe(true);
+  });
+
+  it("a short prompt still fits the row whole -- no wraps flag, same as before this fix", () => {
+    const shortPrompt = 'close 1 "docs"? (y/n)';
+    const segs = bandLayout({ ...idle, prompt: shortPrompt }, NARROW_BUDGET_WIDTH, 7.2);
+    const prompt = segs.find((s) => s.id === "prompt")!;
+    expect(prompt.text).toBe(shortPrompt);
+    expect(prompt.wraps).toBeFalsy();
+  });
+
+  it("a short flash still fits the row whole -- no wraps flag", () => {
+    const segs = bandLayout({ ...idle, message: "copied 12 chars" }, NARROW_BUDGET_WIDTH, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.text).toBe("copied 12 chars");
+    expect(message.wraps).toBeFalsy();
+  });
+});

@@ -38,6 +38,10 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // `false` preserves the value sent by clients that predate `permission_mode_switchable`.
             // This smoke test does not exercise permission-mode switching.
             permission_mode_switchable: false,
+            // Set `provider_permission_prompts` to `true`, as `build_create_request` does when
+            // the handshake advertises it. The assertion checks that the generated field carries
+            // the value, beyond merely compiling.
+            provider_permission_prompts: true,
         }),
         // Absent `model`, `effort`, `system_prompt` and `output_format` use the CLI defaults.
         // This smoke test does not exercise these options.
@@ -48,6 +52,7 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
     };
     assert_eq!(request.cwd, "/tmp/example");
     let policy = request.policy.unwrap();
+    assert!(policy.provider_permission_prompts);
     let tool_policy = policy.tool_policy.clone().expect("a stated tool policy must survive");
     assert_eq!(tool_policy.deny, vec!["Bash".to_string()]);
     assert!(

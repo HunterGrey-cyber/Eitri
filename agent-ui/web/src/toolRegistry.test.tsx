@@ -43,6 +43,18 @@ describe("renderToolCall", () => {
     expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
   });
 
+  /** A call whose CLI prompt was answered without a card shows a muted note, like a call answered
+   *  by a saved rule. Calls without that note show no such text. */
+  it("says when the CLI's own prompt for a call was answered without a card", () => {
+    const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote: "Claude Code safety check — allowed in bypass" }))}</>);
+    const note = container.querySelector(".tool-prompt-note");
+    expect(note?.textContent).toBe("Claude Code safety check — allowed in bypass");
+    expect(note?.classList.contains("tool-rule-note")).toBe(true);
+    cleanup();
+    const plain = render(<>{renderToolCall(call({}))}</>);
+    expect(plain.container.querySelector(".tool-prompt-note")).toBeNull();
+  });
+
   /** A path under the project root is drawn relative, one outside it absolute; the
    *  click/`gf` target stays the path as sent. A folded result draws no line of its own. */
   it("draws project paths relative, keeps others absolute, and folds without a lone marker line", () => {

@@ -7,7 +7,15 @@ export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" 
 /** One band segment's text and side of the gap. The left holds mode, pill, `⚑N`, `⧗N`, and
  *  message; the right holds showcmd, `⚠`, context, model, position, and `↓N`.
  *  `StatusBand` groups by `side` when rendering; `bandLayout` reorders only by priority. */
-export type Seg = { id: SegId; text: string; side: "left" | "right" };
+export type Seg = {
+  id: SegId;
+  text: string;
+  side: "left" | "right";
+  /** Set only on a prompt or message whose full text exceeds the band's measured row width.
+   *  `StatusBand` wraps it at auto height so the trailing `(y/n)` or flash explanation stays
+   *  visible. Absent on other segments, which still drop by priority. */
+  wraps?: boolean;
+};
 
 /** What the band has to say this render, gathered by `App.tsx` from state that already exists
  *  elsewhere (this crate's own state, the tab's mode, the reducer's projection) -- `bandLayout` is
@@ -41,22 +49,10 @@ export function textWidth(text: string): number {
   return n;
 }
 
-/** Return an empty string for `n <= 1`. Otherwise return text that fits within width `n`
- *  unchanged, or keep whole characters up to width `n - 1` and append an ellipsis. Fitting prompts pass
- *  through this function too, so adding an ellipsis to them would falsely indicate truncation. */
-function cut(text: string, n: number): string {
-  if (n <= 1) return "";
-  if (textWidth(text) <= n) return text;
-  let out = "";
-  let width = 0;
-  for (const ch of text) {
-    const w = WIDE.test(ch) ? 2 : 1;
-    if (width + w > n - 1) break;
-    out += ch;
-    width += w;
-  }
-  return out + "…";
-}
+/** Prompts and messages keep their full text so narrow bands cannot hide a trailing `(y/n)` or the
+ *  explanation of how to answer. Oversized segments use `wraps: true`; `StatusBand` and
+ *  `.status-band--wrap` let the band grow upward until the prompt or flash ends. Other segments
+ *  still degrade by priority. */
 
 const PAD = 2; // one character of padding each side (8px at --fs-sm)
 const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT" };
@@ -71,7 +67,8 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   if (widthPx <= 0 || charPx <= 0) return [mode, pill];
   const budget = Math.floor(widthPx / charPx);
   if (f.prompt !== null) {
-    return [mode, { id: "prompt", text: cut(f.prompt, budget - textWidth(mode.text) - 2 * PAD), side: "left" }];
+    const roomForPrompt = budget - textWidth(mode.text) - 2 * PAD;
+    return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }];
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
   let segs: Seg[] = [
@@ -101,8 +98,10 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     if (width(segs) <= budget) break;
     segs = apply(segs);
   }
+  // If the full message still exceeds the row after every droppable segment is gone, mark it
+  // `wraps`. `StatusBand` grows to keep the flash's explanation visible.
   const over = width(segs) - budget;
-  if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, text: cut(x.text, textWidth(x.text) - over) } : x));
+  if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, wraps: true } : x));
   return segs;
 }
 

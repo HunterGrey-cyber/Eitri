@@ -150,6 +150,13 @@ pub enum AgentDomainEvent {
         tool_use_id: Option<String>,
         tool_name: String,
         input: serde_json::Value,
+        /// `Some` when the CLI itself asked after the `PreToolUse` gate had already answered:
+        /// `PERMISSION_ORIGIN_PROVIDER_PROMPT`, with capability `provider_permission_prompts`.
+        /// `None` for the gate's request: every legacy request and sidecar origins HOOK or UNSPECIFIED.
+        /// See [`ProviderPrompt`]. Omitted from the serialized event when `None` so gate requests
+        /// keep their existing serialized shape.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_prompt: Option<ProviderPrompt>,
     },
     PermissionResolved {
         permission_id: String,
@@ -195,9 +202,10 @@ pub enum AgentDomainEvent {
     SessionClosed {
         reason: String,
     },
-    /// A sidecar acknowledgment of `SetPermissionMode` through `PermissionModeChanged`,
-    /// with capability `set_permission_mode`. Produced by `providers/claude_sidecar/translate.rs`
-    /// when the sidecar acknowledges the RPC this client issues.
+    /// Represents a sidecar `PermissionModeChanged` acknowledgment of `SetPermissionMode`
+    /// with capability `set_permission_mode`. This client issues no such RPC, but still decodes
+    /// the event because the pinned protocol can emit it. A `default` report is folded as a
+    /// no-op; a less restrictive report becomes `UngatedCliMode` instead.
     PermissionModeChanged {
         mode: crate::PermissionMode,
         /// `SetPermissionModeResponse.permission_mode` verbatim -- `default` / `bypassPermissions`,
@@ -209,6 +217,28 @@ pub enum AgentDomainEvent {
         /// translate-side match arm for what a `true` here means.
         floor_applied: bool,
     },
+    /// The CLI reported a mode that `crate::classify_cli_mode` classifies as `Ungated` rather than
+    /// at least as restrictive as the requested `default`. An unanswered hook in that mode can let
+    /// the tool run, so the session must close.
+    ///
+    /// The sidecar emits this for `SessionReady.permission_mode` or `PermissionModeChanged`.
+    /// Legacy emits it for a `PreToolUse` payload after denying the call. The host's
+    /// `tab_set::TabSet::pump` closes the session and fails the tab.
+    UngatedCliMode {
+        /// The mode as the CLI named it, verbatim (`bypassPermissions`, `acceptEdits`, ...).
+        reported: String,
+        /// Which report it came from: `SessionReady`, `PermissionModeChanged`, or `a PreToolUse hook
+        /// call`.
+        detail: String,
+    },
+}
+
+/// The first `UngatedCliMode` a session reported, as the projection keeps it. See
+/// `AgentSessionProjection::ungated_cli_mode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UngatedCliModeRecord {
+    pub reported: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -304,6 +334,84 @@ pub struct PermissionRequestRecord {
     pub tool_use_id: Option<String>,
     pub tool_name: String,
     pub input: serde_json::Value,
+    /// The event's own `provider_prompt`: `Some` when this is the CLI's own prompt rather than the
+    /// gate's request. `default` so a record stored before the field existed still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_prompt: Option<ProviderPrompt>,
+}
+
+/// The CLI's own permission prompt, relayed with capability `provider_permission_prompts`.
+/// The CLI runs in `default`, and a `PreToolUse` hook asks the host about every call.
+/// The CLI can still ask after the hook allows a call, such as for a `Write` under `.git/`
+/// or `.claude/`. Neither a hook `allow` nor a session rule silences that sensitive-file check.
+/// Without a way to answer, a headless CLI can refuse the write. The prompt arrives as a
+/// second `PermissionRequested` for the same call with a new `permission_id`, answered through
+/// `ResolvePermission`. It can share the first request's `tool_use_id`, but this is not guaranteed.
+/// `classify_permission_request` and saved prefix rules judge only the gate's request.
+/// The host's agent backend handles this additional prompt using bypass or the human's
+/// earlier approval of the same call; the permission classifier does not answer it.
+/// Every field is copied verbatim from the CLI and may be absent.
+/// `reason` is English prose for display and must never be parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPrompt {
+    /// The SDK's `decisionReason`: why the CLI asked, in its own words.
+    pub reason: Option<String>,
+    /// The SDK's `description`: the CLI's short subject, e.g. `.git/probe`.
+    pub description: Option<String>,
+    /// The SDK's `blockedPath`: the path that triggered the prompt.
+    pub blocked_path: Option<String>,
+    /// Present when one of the user's own `permissions.ask` rules forced this prompt. Such a prompt
+    /// is meant for a human, and the SDK's guidance is that a host auto-approving must not approve
+    /// it: neovibe draws it as a card in every mode, bypass included.
+    pub matched_ask_rule: Option<MatchedAskRule>,
+    /// Set, to the raw wire value, when the sidecar named an `origin` this build does not know (a
+    /// sidecar newer than this client). Such a prompt is a card in every mode, like one an ask rule
+    /// forced (O3 review #3): what a future kind of ask means cannot be judged here, so nothing
+    /// automatic answers it. `None` for every origin this build knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecognized_origin: Option<i32>,
+}
+
+impl ProviderPrompt {
+    /// Whether only a human may answer this prompt, in every mode: the user's own ask rule forced it
+    ///, or its kind is unknown to this build (review #3). Bypass, the Auto approval
+    /// rule, a bypass entry's `y` and the bypass resync sweep all leave such a prompt a card.
+    pub fn needs_a_human(&self) -> bool {
+        self.matched_ask_rule.is_some() || self.unrecognized_origin.is_some()
+    }
+
+    /// Whose question this is, in the words a card and a row note use: the user's own ask rule when
+    /// one forced it; "Claude Code safety check" when the CLI gave its reason (every measured prompt
+    /// did: the sensitive-file check); otherwise the neutral "Claude Code asked" (review #5), which is
+    /// also what an unknown kind of prompt is called.
+    pub fn label(&self) -> String {
+        match (&self.matched_ask_rule, self.unrecognized_origin, &self.reason) {
+            (Some(rule), _, _) => format!("your ask rule: {}", rule.display()),
+            (None, None, Some(_)) => "Claude Code safety check".to_string(),
+            _ => "Claude Code asked".to_string(),
+        }
+    }
+}
+
+/// The `permissions.ask` rule behind a provider prompt, verbatim from the SDK's `matchedAskRule`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchedAskRule {
+    /// Which settings tier it came from, e.g. `projectSettings` -- which for a project/local session
+    /// can be a file in the repository being worked on.
+    pub source: String,
+    pub tool_name: String,
+    /// E.g. `cat:*` for `Bash(cat:*)`; absent for a bare tool-name rule.
+    pub rule_content: Option<String>,
+}
+
+impl MatchedAskRule {
+    /// The rule as Claude Code's own settings spell it: `Bash(cat:*)`, or `Write` for a bare rule.
+    pub fn display(&self) -> String {
+        match &self.rule_content {
+            Some(content) => format!("{}({content})", self.tool_name),
+            None => self.tool_name.clone(),
+        }
+    }
 }
 
 /// The one definition of "this provider-supplied id is a real link to a tool call", shared by
@@ -407,6 +515,16 @@ pub struct AgentSessionProjection {
     /// exactly as it found it, which is what makes "the history notice describes the seed" true for
     /// the whole life of the projection rather than only at the moment of loading.
     pub history: Option<HistoryNotice>,
+    /// The first `UngatedCliMode` this session reported, or `None`.
+    ///
+    /// Kept rather than folded away because the event alone does not survive a
+    /// `UiDelivery::Resync`: an overflowing UI queue drops its events and the host rebuilds from
+    /// this projection, and a tripwire that vanished there would leave an ungated session running
+    /// until its next report. `neovibe_core`'s pump reads this after every delivery. It changes
+    /// nothing a view draws -- the status is untouched and it is not serialized; closing the session
+    /// is the host's to do.
+    #[serde(skip)]
+    pub ungated_cli_mode: Option<UngatedCliModeRecord>,
 }
 
 /// Which source supplied the restored history.
@@ -572,8 +690,12 @@ impl AgentSessionProjection {
                 tool_use_id,
                 tool_name,
                 input,
+                provider_prompt,
             } => {
                 self.assistant_message_open = false;
+                // Keyed by `permission_id`, never by `tool_use_id`: a provider prompt is a SECOND
+                // request for a call whose gate request was already answered, and it must land as a
+                // card of its own rather than be taken for a duplicate.
                 self.pending_permissions.insert(
                     permission_id.clone(),
                     PermissionRequestRecord {
@@ -582,6 +704,7 @@ impl AgentSessionProjection {
                         tool_use_id: tool_use_id.clone(),
                         tool_name: tool_name.clone(),
                         input: input.clone(),
+                        provider_prompt: provider_prompt.clone(),
                     },
                 );
             }
@@ -645,8 +768,19 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
                 self.status = ProjectionStatus::Closed { reason: reason.clone() };
             }
-            // Permission mode is carried by the tab (`Tab::mode`), so the projection ignores this change.
+            // The host's answer mode is the tab's (`Tab::mode`), and nothing a provider reports moves
+            // it; a report of `default` is therefore nothing to fold.
             AgentDomainEvent::PermissionModeChanged { .. } => {}
+            // Recorded, first report wins, and nothing else changes: the host closes the session
+            // (`TabSet::pump`), and until it has, the projection says what it was told.
+            AgentDomainEvent::UngatedCliMode { reported, detail } => {
+                if self.ungated_cli_mode.is_none() {
+                    self.ungated_cli_mode = Some(UngatedCliModeRecord {
+                        reported: reported.clone(),
+                        detail: detail.clone(),
+                    });
+                }
+            }
         }
         self.last_revision += 1;
     }

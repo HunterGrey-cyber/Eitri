@@ -62,7 +62,16 @@ pub fn load_mode(dir: &Path, project_root: &Path) -> LoadedMode {
     LoadedMode::Remembered(file.permission_mode)
 }
 
+/// Refuses bypass with `InvalidInput` in every build, before writing anything. A
+/// `debug_assert!` would disappear in release builds. Both callers log save failures and
+/// continue.
 pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> std::io::Result<PathBuf> {
+    if mode == SessionModeChoice::Bypass {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bypass is never written to disk",
+        ));
+    }
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(project_root));
     let tmp = temporary(&path);
@@ -101,6 +110,16 @@ pub fn startup_mode(dir: Option<&Path>, project_root: &Path) -> (SessionModeChoi
         );
     };
     match load_mode(dir, project_root) {
+        // A remembered bypass starts in auto. Leave the saved file untouched and return a
+        // note explaining the mode change.
+        LoadedMode::Remembered(SessionModeChoice::Bypass) => (
+            SessionModeChoice::Auto,
+            vec![
+                "[agent] this project remembered bypass; every launch starts in auto since v1 \
+                 (R07/S2) -- Shift+Tab switches, and asks first"
+                    .to_string(),
+            ],
+        ),
         LoadedMode::Remembered(mode) => (mode, Vec::new()),
         LoadedMode::Missing => (default, Vec::new()),
         LoadedMode::Unusable(why) => {
@@ -145,24 +164,82 @@ mod tests {
         assert_eq!(state_dir(Some(OsStr::new("relative")), None), None);
     }
 
+    /// Saves and reloads `Auto`, the only mode `save_mode` writes. Bypass refusal is checked by
+    /// `bypass_is_never_written_in_any_build`.
     #[test]
     fn a_saved_mode_is_read_back_and_nothing_else_is_written() {
         let dir = scratch("roundtrip");
         assert_eq!(load_mode(&dir, &root()), LoadedMode::Missing);
-        let path = save_mode(&dir, &root(), SessionModeChoice::Bypass).unwrap();
+        let path = save_mode(&dir, &root(), SessionModeChoice::Auto).unwrap();
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             crate::layout::persist::file_name(&root())
         );
         assert_eq!(
             load_mode(&dir, &root()),
-            LoadedMode::Remembered(SessionModeChoice::Bypass)
+            LoadedMode::Remembered(SessionModeChoice::Auto)
         );
         let names: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 1, "no .tmp left behind: {names:?}");
+    }
+
+    /// Refusing bypass writes nothing in every build and leaves any saved `auto` value
+    /// untouched.
+    #[test]
+    fn bypass_is_never_written_in_any_build() {
+        let dir = scratch("never-bypass");
+        let error = save_mode(&dir, &root(), SessionModeChoice::Bypass).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(load_mode(&dir, &root()), LoadedMode::Missing, "nothing written");
+        save_mode(&dir, &root(), SessionModeChoice::Auto).unwrap();
+        assert!(save_mode(&dir, &root(), SessionModeChoice::Bypass).is_err());
+        assert_eq!(
+            load_mode(&dir, &root()),
+            LoadedMode::Remembered(SessionModeChoice::Auto),
+            "the auto on disk is untouched"
+        );
+    }
+
+    /// A file remembering bypass starts in auto with an explanatory note. The file is neither
+    /// rewritten nor renamed to `.unusable`.
+    #[test]
+    fn a_remembered_bypass_starts_in_auto_with_a_note_and_the_file_is_untouched() {
+        let dir = scratch("remembered-bypass");
+        // Written directly, the way `another_projects_file_or_a_broken_one_is_unusable...` writes a
+        // "foreign" file: `save_mode` itself refuses to write `Bypass`.
+        let path = dir.join(crate::layout::persist::file_name(&root()));
+        let raw = format!(
+            "{{\"version\":1,\"project_root\":{:?},\"permission_mode\":\"bypass\"}}",
+            root().to_string_lossy()
+        );
+        std::fs::write(&path, &raw).unwrap();
+        assert_eq!(
+            load_mode(&dir, &root()),
+            LoadedMode::Remembered(SessionModeChoice::Bypass),
+            "the premise: the file really does say bypass"
+        );
+
+        let before = std::fs::read(&path).unwrap();
+        let (mode, notes) = startup_mode(Some(&dir), &root());
+        assert_eq!(mode, SessionModeChoice::Auto);
+        assert_eq!(
+            notes,
+            vec![
+                "[agent] this project remembered bypass; every launch starts in auto since v1 \
+                 (R07/S2) -- Shift+Tab switches, and asks first"
+                    .to_string()
+            ]
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "the file is left exactly as it was");
+        assert!(
+            !dir.join(format!("{}.unusable", crate::layout::persist::file_name(&root())))
+                .exists(),
+            "a remembered bypass is not unusable -- nothing is set aside"
+        );
     }
 
     #[test]

@@ -8,8 +8,7 @@
 //! `snapshot` restore prior state. Literal `WebView::reload()` leaves this content blank.
 
 use agent::{
-    AgentDomainEvent, AgentSession, PermissionDecision, PermissionMode, ProjectionStatus, TurnOutcome,
-    CONSERVATIVE_DISALLOWED_TOOLS,
+    AgentDomainEvent, AgentSession, PermissionDecision, ProjectionStatus, TurnOutcome, CONSERVATIVE_DISALLOWED_TOOLS,
 };
 
 #[test]
@@ -17,7 +16,7 @@ use agent::{
 fn real_multi_turn_conversation_in_one_process() {
     let dir = std::env::temp_dir().join(format!("agent-session-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+    let mut session = AgentSession::start(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
 
     session.send_turn("reply with exactly the word: pong").unwrap();
     let result1 = drain_until_finished(&mut session);
@@ -43,7 +42,7 @@ fn real_multi_turn_conversation_in_one_process() {
 fn real_pretooluse_hook_allow_end_to_end() {
     let dir = std::env::temp_dir().join(format!("agent-session-hook-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
     let mut gated_tool_use_id: Option<Option<String>> = None;
@@ -110,7 +109,7 @@ fn real_pretooluse_hook_deny_end_to_end() {
 
     let dir = std::env::temp_dir().join(format!("agent-session-deny-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
 
@@ -194,8 +193,8 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
     let dir = std::env::temp_dir().join(format!("agent-collision-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut session_a = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
-    let mut session_b = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session_a = AgentSession::start(&dir, &[]).unwrap();
+    let mut session_b = AgentSession::start(&dir, &[]).unwrap();
 
     // The mechanism, asserted before the behavior: starting two sessions must not have written
     // anything into the project. Under the old code this directory already held one
@@ -283,7 +282,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
 fn real_interrupt_mid_permission_denies_pending_requests_without_ending_the_session() {
     let dir = std::env::temp_dir().join(format!("agent-interrupt-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut session = AgentSession::start(&dir, PermissionMode::Auto, &[]).unwrap();
+    let mut session = AgentSession::start(&dir, &[]).unwrap();
 
     session.send_turn("run: echo hello, and tell me the output").unwrap();
 
@@ -356,23 +355,13 @@ fn drain_until_finished(session: &mut agent::AgentSession) -> String {
     panic!("no TurnCompleted within 60s");
 }
 
-/// **The product's own MVP sentence, as far as this crate can carry it**: "I tell it to change the
-/// file I am looking at, I see a diff, I approve, the change lands."
+/// Checks that a real CLI can request an edit, stop at the permission gate, and write the
+/// file after approval. The request must carry the fields needed to render a diff.
+/// Diff rendering is covered by `agent-ui/web`; buffer reloading has separate coverage.
 ///
-/// This covers the first, third and fourth clauses. The diff is rendered by `agent-ui/web`, whose
-/// own tests cover it, and the buffer reload is `neovibe-core::buffer_reload`'s. What is asserted
-/// here is the part only a real CLI can settle: that with the product's own Auto-mode deny list the
-/// model may reach for `Edit` at all, that the gate stops it, that the request carries the fields a
-/// diff is drawn from, and that approving it really writes the file.
-///
-/// Before 2026-09-18 this test could not have been written. `Edit` was on the deny list in every
-/// mode, so the model never reached for it and no permission card for an edit could exist -- the
-/// MVP sentence failed at its first clause for a reason nothing in the UI explained.
-///
-/// Deliberately runs with the REAL `disallowed_tools_for(Auto)` rather than an empty list: an empty
-/// list would prove the CLI can edit, which was never in doubt, and not that the product's own
-/// policy permits it. (That list is empty -- Auto offers `Bash` too, a policy
-/// setting -- and the call still goes through the function so a future list reaches this test.)
+/// Uses the real `disallowed_tools()` policy so changes to the product's deny list reach
+/// this test, even while that list is empty. Every session uses that list and runs the CLI
+/// with `--permission-mode default` under the gate.
 #[test]
 #[ignore]
 fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_the_file() {
@@ -381,12 +370,7 @@ fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_th
     let target = dir.join("greeting.txt");
     std::fs::write(&target, "hello world\n").unwrap();
 
-    let mut session = AgentSession::start(
-        &dir,
-        PermissionMode::Auto,
-        agent::disallowed_tools_for(PermissionMode::Auto),
-    )
-    .unwrap();
+    let mut session = AgentSession::start(&dir, agent::disallowed_tools()).unwrap();
     session
         .send_turn(&format!(
             "Use the Edit tool to change the word 'world' to 'neovibe' in {}. Do not use a shell.",

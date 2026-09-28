@@ -60,54 +60,39 @@ const STDERR_TAIL_CAPACITY: usize = 20;
 /// instead; this is a suggested default, not hardcoded into `spawn`.
 pub const CONSERVATIVE_DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 
-/// The deny list for a session in `mode`: empty in both modes, so what separates them is only the
-/// gate. `Auto` installs the `PreToolUse` hook; `Bypass` installs none (`spawn_with_binary` passes
-/// no `--settings` in that mode).
+/// The deny list every session gets, on both backends: empty. There is one CLI permission mode,
+/// `default` under the `PreToolUse` gate, and the host's auto/bypass choice (`PermissionMode`) never
+/// reaches the CLI: bypass is the host answering every request `allow`, and the CLI never runs in
+/// `bypassPermissions`.
 ///
-/// `Bypass` denies nothing, because a mode labelled "bypass all permissions" that is the only mode
-/// unable to edit a file has a false label. The risk is real and unchanged: with no hook installed,
-/// an `Edit` rewrites a file under a live buffer with no diff, no decision, and nothing in the
-/// transcript that had to be read. A better answer than any deny list is to stop using
-/// `bypassPermissions` at all, run `Auto` with the host auto-answering every request, and keep the
-/// tool calls and their diffs in the transcript; ACP's `PermissionOptionKind` makes "stop asking
-/// me" an answer (`AllowAlways`), never a capability the agent loses.
+/// `Bash` is not denied, as Claude Code's own `default` mode does not deny it. Its risk is answered
+/// by the gate rather than by the list: every `Bash` call reaches the `PreToolUse` hook (matcher
+/// `*`, both backends), `crate::permission_policy` auto-answers only a read-only command inside the
+/// project, and everything else (a write, a redirect, compound syntax, an option naming a path
+/// outside the tree) is a card a human answers. Denying `Bash` would also leave the prefix rules
+/// (`crate::permission_rules`) and the card's "always allow" nothing to answer. On the sidecar an
+/// empty list is sent as `unrestricted`.
 ///
-/// `Auto` denies nothing either: it gets `Bash`, as Claude Code's own `default` mode does. `Bash`'s
-/// risk is answered by the gate rather than by the list: every `Bash` call reaches the `PreToolUse`
-/// hook (matcher `*`, both backends), `crate::permission_policy` auto-answers only a read-only
-/// command inside the project, and everything else (a write, a redirect, compound syntax, an
-/// option naming a path outside the tree) is a card a human answers. Denying `Bash` would also
-/// leave the prefix rules (`crate::permission_rules`) and the card's "always allow" nothing to
-/// answer. On the sidecar an empty list is sent as `unrestricted`; the sidecar's conservative
-/// bypass deny floor applies only under `bypass`, and its hook is installed for every other mode,
-/// so `Auto` keeps its gate.
-///
-/// This is best-effort in both modes: no single permission flag reliably blocks all tool use. It
-/// is the second line; the hook is the first.
-pub fn disallowed_tools_for(mode: PermissionMode) -> &'static [&'static str] {
-    match mode {
-        // The hook gates every tool with matcher `*`, so edits and shell commands reach the
-        // policy and require a user card when needed.
-        PermissionMode::Auto => &[],
-        // Empty, not `CONSERVATIVE_DISALLOWED_TOOLS`. On the sidecar path this ALONE would have
-        // changed nothing -- an empty list under `bypass` reads to Verdandi as silence and earns its
-        // own identical floor -- so the request also states `unrestricted` (see
-        // `providers::claude_sidecar::build_create_request`). The constant itself is untouched: it
-        // is still the floor Verdandi injects for a caller that says nothing, and it is still
-        // hand-copied there as `CONSERVATIVE_BYPASS_DENY`.
-        PermissionMode::Bypass => &[],
-    }
+/// This is best-effort and was documented as such from the start: no single permission flag
+/// reliably blocks all tool use. It is the second line; the hook is the first.
+pub fn disallowed_tools() -> &'static [&'static str] {
+    // Return an empty list so edits and shell commands reach the policy through the `*` hook.
+    // Requests needing approval produce cards; bypass answers them `allow` in the application.
+    // The sidecar request marks the empty list as `unrestricted` in
+    // `providers::claude_sidecar::build_create_request`, avoiding its default
+    // `CONSERVATIVE_BYPASS_DENY` floor.
+    &[]
 }
 
-/// Which permission gate the CLI itself enforces for the whole conversation. `Auto` is the normal
-/// mode: the real, reliable `PreToolUse` hook (relayed by `agent-hook` over the per-conversation
-/// Unix socket) is the primary gate; `CanUseTool` control_requests are a secondary, unreliable
-/// signal (see `PermissionSource`). `Bypass` skips permission gating entirely (no hook settings
-/// are even generated) -- intended only for trusted, non-interactive callers.
+/// Controls whether the application answers every permission request `allow`. This mode is
+/// never sent to the CLI. Both backends keep their permission gates: legacy uses
+/// `--permission-mode default` with the `PreToolUse` hook, and the sidecar uses `INTERACTIVE`.
 ///
-/// `Serialize`: carried on `AgentDomainEvent::PermissionModeChanged`,
-/// which the panel's snapshot serializes as JSON. `rename_all = "snake_case"` matches this crate's
-/// existing convention for wire-facing enums (see `AgentDomainEvent`'s own `#[serde(...)]`).
+/// Keeping this mode out of session requests prevents it from being silently ignored or
+/// enabling CLI `bypassPermissions` instead of application-level answers.
+///
+/// Serialized on `AgentDomainEvent::PermissionModeChanged` for the panel's JSON snapshot.
+/// `rename_all = "snake_case"` matches the event enums' wire convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -115,13 +100,48 @@ pub enum PermissionMode {
     Bypass,
 }
 
-impl PermissionMode {
-    fn as_cli_flag(&self) -> &'static str {
-        match self {
-            PermissionMode::Auto => "auto",
-            PermissionMode::Bypass => "bypassPermissions",
-        }
+/// What a permission mode the CLI reports about itself means for a gated session.
+///
+/// Neovibe asks for `default` on both backends, but a project's own `.claude/settings.json` can set
+/// `permissions.defaultMode`, and on the sidecar nothing outranks it. The fall-through that matters
+/// is a hook that gives no answer (the 600 s hook timeout, a relay failure that escapes
+/// `write_fail_closed_deny`): under `default` that is a denial (bar a project `permissions.allow`
+/// rule matching the call, which this tripwire does not see -- `spawn_hook_listener`'s doc), under a
+/// less restrictive mode the tool runs. So the report is checked wherever the CLI makes one, and
+/// anything not known to be at least as strict as `default` stops the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliModeReport {
+    /// `default`: what neovibe asked for.
+    Default,
+    /// `plan` or `dontAsk`: stricter than `default` -- a non-answer still denies. Noted once, the
+    /// session continues.
+    Stricter,
+    /// Empty: a producer older than the field. Neither a downgrade nor an all-clear; noted once.
+    Unreported,
+    /// Anything else, including `bypassPermissions`, `acceptEdits`, `auto`, or an unknown value.
+    /// The session is closed because the reported mode is not known to preserve the gate.
+    Ungated,
+}
+
+/// Classifies one CLI-reported permission mode. See [`CliModeReport`].
+pub fn classify_cli_mode(reported: &str) -> CliModeReport {
+    match reported {
+        "default" => CliModeReport::Default,
+        "plan" | "dontAsk" => CliModeReport::Stricter,
+        "" => CliModeReport::Unreported,
+        _ => CliModeReport::Ungated,
     }
+}
+
+/// The one `[permission]` line a stricter or unreported hook-call mode earns per conversation, or
+/// `None` once `noted` says it was already printed.
+fn note_hook_cli_mode(noted: &AtomicBool, reported: &str) -> Option<String> {
+    if noted.swap(true, Ordering::Relaxed) {
+        return None;
+    }
+    Some(format!(
+        "[permission] the CLI reports permission mode '{reported}' in a hook call, not 'default'"
+    ))
 }
 
 /// Tracks one pending `HookRelay` permission request so `respond_permission` knows which live
@@ -160,6 +180,10 @@ pub struct AgentProcess {
     /// Live `agent-hook` socket connections awaiting a decision, keyed by `tool_use_id` --
     /// written to by the hook-listener thread, read/removed by `respond_permission`.
     pending_hook_connections: Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
+    /// Whether a hook call's stricter or unreported `permission_mode` has already been noted on
+    /// stderr: once per conversation, not once per tool call. Shared with the listener.
+    #[allow(dead_code)] // held so the listener's flag lives exactly as long as this conversation
+    cli_mode_noted: Arc<AtomicBool>,
     socket_path: std::path::PathBuf,
     /// The child's own last few stderr lines, verbatim, newest last -- shared with the stderr
     /// thread so `poll_events` can stamp them onto `AgentEvent::ProcessExited` when the child dies.
@@ -178,45 +202,36 @@ pub struct AgentProcess {
     shut_down: bool,
 }
 
-/// Spawns the hook-relay listener thread: accepts one connection per `PreToolUse` firing, reads
-/// the real stdin JSON `agent-hook` forwarded, parses it, stashes the live connection in
-/// `pending` so `respond_permission` can write the answer back later, and emits a
-/// `PermissionRequest` event over `tx`. Runs a non-blocking `accept()` poll loop with a stop flag
-/// (rather than a blocking `for incoming in listener.incoming()` loop) so the returned stop flag
-/// can make this thread return in bounded time even when nothing ever connects -- a blocking loop
-/// here is a real, confirmed deadlock hazard, not a hypothetical one: removing a Unix socket's
-/// filesystem path does NOT unblock a thread already parked inside `accept()` on Linux (the
-/// listening fd stays valid and blocked regardless of whether its path still exists on disk), so
-/// a real run of the earlier blocking-loop version hung for hours in `shutdown()`'s `join()` the
-/// first time a real test exercised a turn that never triggered a tool call (the common case).
+/// Spawns the hook-relay listener thread. Each `PreToolUse` connection carries stdin JSON from
+/// `agent-hook`. The parsed request is emitted over `tx`, and the connection is stored in `pending`
+/// so `respond_permission` can answer it later.
 ///
-/// Also bounds the per-connection read via `HOOK_CONNECTION_READ_TIMEOUT`: on Linux a non-blocking
-/// listener's accepted streams do NOT themselves come back non-blocking, and on macOS they do, so
-/// each one is set blocking explicitly right after `accept()` (confirmed real on both, same
-/// class of deadlock as the accept()-side one above, just triggered by "a connection starts but
-/// never completes its line" instead of "nothing ever connects") -- without this, a real
-/// `agent-hook` process killed/orphaned mid-write would park this thread in `read_line` forever.
+/// A non-blocking `accept()` loop polls a stop flag so shutdown completes even if no client connects.
+/// Removing a Unix socket path does not unblock an existing `accept()` on Linux. Accepted streams
+/// are explicitly set blocking because macOS inherits the listener's non-blocking mode while Linux
+/// does not. `HOOK_CONNECTION_READ_TIMEOUT` bounds reads from clients that never finish their line.
 ///
-/// **Fail-closed security posture (non-negotiable):** every way this loop can fail to relay a
-/// request -- a read error or read timeout, an empty/EOF line, or a payload that doesn't parse --
-/// writes an explicit `deny` decision back on that connection before dropping it. Silently
-/// dropping the connection instead (what this loop originally did) is a real, confirmed *allow*:
-/// `agent-hook` then exits 0 with empty stdout, its documented "no data" behavior, which the CLI
-/// treats as "the hook expressed no `permissionDecision`" -- under `--permission-mode auto` the
-/// tool call then proceeds on the CLI's own judgment, i.e. exactly the leak this whole hook
-/// mechanism exists to close. A parent crash, a malformed payload, and a transient socket hiccup
-/// must never be indistinguishable from a human's real approval. The deny write is best-effort
-/// (errors ignored): in the "peer already gone" case there is nothing to tell, and attempting it
-/// is harmless.
+/// Read errors, timeouts, empty input and parse errors receive an explicit `deny` before disconnect.
+/// The write is best-effort because the peer may already be gone. Dropping a connection silently
+/// makes `agent-hook` exit successfully with no decision, which under `--permission-mode auto`
+/// lets the CLI decide whether to run the tool. Transport failures must not act as approval.
+/// In `default`, an unanswered hook enters the CLI's permission flow. Headless calls are denied
+/// unless project or local `permissions.allow` rules match. These settings load through
+/// `--setting-sources project,local`. This behavior has not been probed on a real CLI.
+/// Error paths still send an explicit denial because project settings can override the CLI flag.
 ///
-/// Split out from `spawn` as its own function (rather than inlined there) specifically so this
-/// exact logic -- the fast-stop guarantee, the stalled-connection guarantee, the fail-closed deny
-/// on every error branch, and the real PreToolUse-parsing happy path -- can be unit-tested
-/// directly against a plain `UnixListener`, without spawning a real `claude` child process at all.
+/// Kept separate from `spawn` so stopping, stalled reads, error denials and successful parsing can
+/// be tested with a plain `UnixListener` without launching a CLI process.
+///
+/// Each payload's `permission_mode` is classified before its connection is stored. A mode less
+/// restrictive than `default` is denied and emits `AgentEvent::UngatedCliMode` to close the session
+/// instead of showing a card. Stricter or unreported modes are noted once per conversation through
+/// `cli_mode_noted`, then filed normally.
 fn spawn_hook_listener(
     listener: UnixListener,
     tx: std::sync::mpsc::Sender<AgentEvent>,
     pending: Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
+    cli_mode_noted: Arc<AtomicBool>,
 ) -> std::io::Result<(JoinHandle<()>, Arc<AtomicBool>)> {
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -261,6 +276,30 @@ fn spawn_hook_listener(
             write_fail_closed_deny(&stream, "relayed request could not be parsed as PreToolUse JSON");
             continue;
         };
+        // Reject calls the CLI could run without an answer before storing them as pending requests.
+        // An absent mode is unreported, never assumed to be `default`.
+        let reported = parsed.permission_mode.clone().unwrap_or_default();
+        match classify_cli_mode(&reported) {
+            CliModeReport::Default => {}
+            CliModeReport::Stricter | CliModeReport::Unreported => {
+                if let Some(line) = note_hook_cli_mode(&cli_mode_noted, &reported) {
+                    eprintln!("{line}");
+                }
+            }
+            CliModeReport::Ungated => {
+                write_fail_closed_deny(
+                    &stream,
+                    &format!(
+                        "the CLI reports permission mode '{reported}' -- neovibe runs only gated sessions \
+                         (R07); this call is denied and the session is being closed"
+                    ),
+                );
+                if tx.send(AgentEvent::UngatedCliMode { reported }).is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let request_id = parsed.tool_use_id.clone();
         pending
             .lock()
@@ -471,12 +510,13 @@ fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Op
 }
 
 impl AgentProcess {
-    /// Spawns exactly one long-lived process for the whole conversation. `project_dir` is both
-    /// the CLI's cwd (so `--setting-sources project,local` resolves the project's own real
-    /// settings there) and the root this conversation operates on. This crate writes nothing into
-    /// it: the hook configuration goes in argv and the per-conversation socket in the temp dir.
-    pub fn spawn(project_dir: &Path, mode: PermissionMode, disallowed_tools: &[&str]) -> std::io::Result<Self> {
-        Self::spawn_with_binary(project_dir, mode, disallowed_tools, "claude")
+    /// Spawns one long-lived process for the whole conversation. `project_dir` is the CLI's cwd,
+    /// where `--setting-sources project,local` finds project settings, and the root the conversation
+    /// operates on. This crate writes nothing there: hook settings go in argv and the socket goes in
+    /// the temp directory. Every session uses `default` with the `PreToolUse` gate. The host decides
+    /// whether to answer `allow` above this session API, so there is no mode parameter here.
+    pub fn spawn(project_dir: &Path, disallowed_tools: &[&str]) -> std::io::Result<Self> {
+        Self::spawn_with_binary(project_dir, disallowed_tools, "claude")
     }
 
     /// The real body of [`spawn`](Self::spawn), parameterized only by which binary to exec.
@@ -496,12 +536,7 @@ impl AgentProcess {
     /// The hook configuration itself is an argv value (`--settings`), not a file, so there is no
     /// longer anything on disk to generate first or to restore afterwards -- see
     /// `crate::settings` for the real-CLI spike that forced that change.
-    fn spawn_with_binary(
-        project_dir: &Path,
-        mode: PermissionMode,
-        disallowed_tools: &[&str],
-        binary: &str,
-    ) -> std::io::Result<Self> {
+    fn spawn_with_binary(project_dir: &Path, disallowed_tools: &[&str], binary: &str) -> std::io::Result<Self> {
         let conversation_id = Uuid::new_v4();
         // A configured account (`init.lua`'s `agent.account`) governs the SIDECAR child and where
         // this crate reads transcripts -- not this spawn. The `claude` on `PATH` here is, on the
@@ -521,15 +556,11 @@ impl AgentProcess {
         let socket_path = crate::socket_path::hook_socket(&std::env::temp_dir(), conversation_id)?;
         let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
-        // Bypass mode asks for no gate at all, so no hook is installed. In every other mode the
-        // gate travels in this one process's argv, where no other conversation can reach it.
-        let hook_settings_arg = if mode == PermissionMode::Bypass {
-            None
-        } else {
-            Some(crate::settings::hook_settings_arg(&socket_path)?)
-        };
+        // Every process installs the gate through its own argv, isolated from other conversations.
+        // No mode skips hook installation.
+        let hook_settings = crate::settings::hook_settings_arg(&socket_path)?;
 
-        // Preflight: in every mode that installs a gate, confirm the resolved binary actually
+        // Preflight: every spawn installs a gate, so confirm the resolved binary actually
         // accepts `--settings` before doing anything else -- binding the socket, spawning the
         // real long-lived process, any of it. This is the fix for a real, reproduced failure
         // (2026-09-18, work, production binary): a multi-account launcher on this host's
@@ -544,9 +575,7 @@ impl AgentProcess {
         // because it is the cheapest terminating flag known to open no session and spend no
         // tokens: the CLI prints its version and exits before doing anything else, so this is
         // safe to run unconditionally rather than only when something looks wrong.
-        if let Some(settings) = &hook_settings_arg {
-            preflight_gate_flag_is_accepted(binary, settings, project_dir)?;
-        }
+        preflight_gate_flag_is_accepted(binary, &hook_settings, project_dir)?;
 
         // Undoes everything `spawn` has created so far, for use on the error path of every
         // fallible step below -- no thread has been started at any point where this is called, so
@@ -576,8 +605,13 @@ impl AgentProcess {
             .arg("--verbose")
             .arg("--setting-sources")
             .arg("project,local")
+            // Use `default` so an unanswered hook enters the CLI's permission flow rather than its
+            // classifier. Headless calls are denied unless a project/local `permissions.allow` rule matches;
+            // that exception has not been probed on a real CLI. Under `auto`, the classifier was observed
+            // allowing `rm -rf` outside the project tree. The sidecar uses the same underlying mode.
+            // Bypass is the host answering `allow` through the gate.
             .arg("--permission-mode")
-            .arg(mode.as_cli_flag())
+            .arg("default")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -586,9 +620,7 @@ impl AgentProcess {
             cmd.arg("--disallowedTools").arg(disallowed_tools.join(","));
         }
 
-        if let Some(settings) = &hook_settings_arg {
-            cmd.arg("--settings").arg(settings);
-        }
+        cmd.arg("--settings").arg(&hook_settings);
 
         // Logged once per spawn attempt, unconditionally -- see `resolve_binary_absolute_path`'s
         // doc for why nothing recorded this before 2026-09-18. Deliberately placed after every
@@ -618,18 +650,23 @@ impl AgentProcess {
         // Only now that a real child exists is the hook-listener thread started: from here on
         // there is genuinely something that can stop it again (`shutdown()`, via the stop flag on
         // the returned `Self`).
-        let (hook_listener_handle, hook_listener_stop) =
-            match spawn_hook_listener(listener, tx.clone(), pending_hook_connections.clone()) {
-                Ok(started) => started,
-                Err(e) => {
-                    // The child is already running and nothing owns it yet -- kill and reap it
-                    // here rather than returning an Err that orphans it.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    cleanup_partial_spawn();
-                    return Err(e);
-                }
-            };
+        let cli_mode_noted = Arc::new(AtomicBool::new(false));
+        let (hook_listener_handle, hook_listener_stop) = match spawn_hook_listener(
+            listener,
+            tx.clone(),
+            pending_hook_connections.clone(),
+            cli_mode_noted.clone(),
+        ) {
+            Ok(started) => started,
+            Err(e) => {
+                // The child is already running and nothing owns it yet -- kill and reap it
+                // here rather than returning an Err that orphans it.
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup_partial_spawn();
+                return Err(e);
+            }
+        };
 
         let stdin = child.stdin.take().expect("piped stdin must be present");
         let stdout = child.stdout.take().expect("piped stdout must be present");
@@ -682,6 +719,7 @@ impl AgentProcess {
             hook_listener_handle: Some(hook_listener_handle),
             hook_listener_stop,
             pending_hook_connections,
+            cli_mode_noted,
             socket_path,
             stderr_tail,
             exit_reported: false,
@@ -920,42 +958,54 @@ impl Drop for AgentProcess {
 #[cfg(test)]
 mod tests {
 
-    /// Pins both lists: `Auto` and `Bypass` each offer every tool, including `Bash`.
-    ///
-    /// `Bypass` installs no `PreToolUse` gate at all, so an `Edit` there is a file rewritten under a
-    /// live buffer with no card and no decision. That risk is real, but a mode labelled "bypass all
-    /// permissions" that could not edit a file would be strictly less capable than the mode with a
-    /// gate; the safer shape is to auto-answer under a gate, as ACP does.
-    ///
-    /// `Auto` offers `Bash` because the gate answers for it: every `Bash` call reaches the
-    /// `PreToolUse` hook (matcher `*`), `permission_policy` answers only the read-only ones inside the
-    /// project, and the rest are cards, as in Claude Code's own `default` mode. With `Bash` denied,
-    /// the prefix rules and the card's "always allow" would have nothing on the real CLI to answer.
+    /// Checks that the shared deny list is empty so every session offers every tool.
+    /// Both modes run the CLI in `default` under the `PreToolUse` gate. `Auto` routes calls
+    /// through the permission policy; bypass answers `allow` through that same gate.
+    /// The empty list omits `--disallowedTools` on legacy and uses `unrestricted` on the sidecar.
     #[test]
-    fn auto_offers_every_tool_because_the_gate_covers_them_and_bypass_denies_nothing() {
-        let auto = disallowed_tools_for(PermissionMode::Auto);
-        let bypass = disallowed_tools_for(PermissionMode::Bypass);
+    fn every_session_offers_every_tool_because_the_gate_covers_them_and_bypass_denies_nothing() {
+        let list = disallowed_tools();
         for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
             assert!(
-                !auto.contains(&tool),
-                "Auto must offer {tool}: the PreToolUse hook gates every call"
-            );
-            assert!(
-                !bypass.contains(&tool),
-                "Bypass must permit {tool}: a mode named after having every permission cannot be \
-                 the one mode that may not edit"
+                !list.contains(&tool),
+                "{tool} must be offered: the PreToolUse hook gates every call, \
+                 and bypass, neovibe's own allow, denies nothing (2026-09-20, R07)"
             );
         }
-        // Both empty, and that is the whole of both lists: an empty list is what makes the legacy
-        // spawn omit `--disallowedTools` and the sidecar request state `unrestricted`.
-        assert!(auto.is_empty(), "Auto denies nothing; the gate is the boundary");
+        // Empty, and that is the whole list: an empty list is what makes the legacy spawn omit
+        // `--disallowedTools` and the sidecar request state `unrestricted`, without which Verdandi
+        // re-applies its own identical floor.
         assert!(
-            bypass.is_empty(),
-            "Bypass denies nothing; an empty list is also what makes the sidecar request state \
-             `unrestricted`, without which Verdandi re-applies its own identical floor"
+            list.is_empty(),
+            "every session denies nothing; the gate is the boundary"
         );
-        // What still separates the two modes is the gate, not the list: Auto installs the hook and
-        // Bypass installs none (`spawn_with_binary`). The list no longer carries that difference.
+    }
+
+    /// Checks CLI mode classification: `default` is requested, `plan` and `dontAsk` still deny
+    /// without an answer, and empty means unreported. Every other value, including unknown values,
+    /// stops the session.
+    #[test]
+    fn a_reported_cli_mode_is_classified_toward_stopping() {
+        assert_eq!(classify_cli_mode("default"), CliModeReport::Default);
+        assert_eq!(classify_cli_mode("plan"), CliModeReport::Stricter);
+        assert_eq!(classify_cli_mode("dontAsk"), CliModeReport::Stricter);
+        assert_eq!(classify_cli_mode(""), CliModeReport::Unreported);
+        for ungated in ["bypassPermissions", "acceptEdits", "auto", "Default", "weird"] {
+            assert_eq!(classify_cli_mode(ungated), CliModeReport::Ungated, "{ungated:?}");
+        }
+    }
+
+    /// Once per conversation: the flag is what `AgentProcess` shares with its listener.
+    #[test]
+    fn a_stricter_hook_mode_is_noted_once() {
+        let noted = AtomicBool::new(false);
+        let line = note_hook_cli_mode(&noted, "plan").expect("the first report is noted");
+        assert_eq!(
+            line,
+            "[permission] the CLI reports permission mode 'plan' in a hook call, not 'default'"
+        );
+        assert_eq!(note_hook_cli_mode(&noted, "plan"), None);
+        assert_eq!(note_hook_cli_mode(&noted, ""), None);
     }
 
     /// Pins the exact contents of `CONSERVATIVE_DISALLOWED_TOOLS`, because a typo in it is silent
@@ -1002,7 +1052,7 @@ mod tests {
     fn real_two_turns_in_one_process_no_resume() {
         let dir = std::env::temp_dir().join(format!("agent-process-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut process = AgentProcess::spawn(&dir, PermissionMode::Auto, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+        let mut process = AgentProcess::spawn(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
 
         process.send_turn("reply with exactly the word: pong").unwrap();
         let result1 = drain_until_turn_finished(&mut process);
@@ -1040,7 +1090,7 @@ mod tests {
     fn shutdown_after_interrupt_leaves_no_orphan() {
         let dir = std::env::temp_dir().join(format!("agent-process-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut process = AgentProcess::spawn(&dir, PermissionMode::Auto, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
+        let mut process = AgentProcess::spawn(&dir, CONSERVATIVE_DISALLOWED_TOOLS).unwrap();
         let pid = process.pid();
 
         process
@@ -1077,6 +1127,30 @@ mod tests {
         panic!("no TurnFinished within 60s");
     }
 
+    /// A fresh once-per-conversation flag, as `AgentProcess` gives its listener.
+    fn not_noted() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// The captured fixture's own payload with its `permission_mode` replaced (`None` removes the
+    /// field) and a `tool_use_id` of the test's choosing.
+    fn hook_payload_in(mode: Option<&str>, tool_use_id: &str) -> String {
+        let fixture = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/v2_hook_pretooluse_stdin.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(fixture.trim()).unwrap();
+        match mode {
+            Some(mode) => payload["permission_mode"] = serde_json::Value::String(mode.to_string()),
+            None => {
+                payload.as_object_mut().unwrap().remove("permission_mode");
+            }
+        }
+        payload["tool_use_id"] = serde_json::Value::String(tool_use_id.to_string());
+        serde_json::to_string(&payload).unwrap()
+    }
+
     fn temp_socket_path() -> std::path::PathBuf {
         crate::socket_path::in_dir(
             &std::env::temp_dir(),
@@ -1098,7 +1172,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending, not_noted()).unwrap();
 
         // Give the thread a moment to actually enter its poll loop before asking it to stop.
         std::thread::sleep(Duration::from_millis(50));
@@ -1139,7 +1213,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending, not_noted()).unwrap();
 
         // Connect, write a partial line (no trailing newline) and never send more -- the
         // connection is kept alive (not dropped) for the rest of the test so the listener thread
@@ -1193,7 +1267,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone()).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), not_noted()).unwrap();
 
         let client = UnixStream::connect(&socket_path).unwrap();
         std::thread::sleep(HOOK_LISTENER_POLL_INTERVAL * 5);
@@ -1260,7 +1334,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone()).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), not_noted()).unwrap();
 
         let mut client = UnixStream::connect(&socket_path).unwrap();
         writeln!(client, "{}", fixture.trim()).unwrap();
@@ -1405,7 +1479,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone()).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), not_noted()).unwrap();
 
         // A real client playing `agent-hook`: relay the request, then block waiting for a decision.
         let mut client = UnixStream::connect(&socket_path).unwrap();
@@ -1470,7 +1544,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone()).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), not_noted()).unwrap();
 
         let mut client = UnixStream::connect(&socket_path).unwrap();
         writeln!(client, "{{\"this\": \"is not a PreToolUse payload\"}}").unwrap();
@@ -1506,7 +1580,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (handle, stop) = spawn_hook_listener(listener, tx, pending).unwrap();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending, not_noted()).unwrap();
 
         let client = UnixStream::connect(&socket_path).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
@@ -1520,6 +1594,130 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A legacy hook payload reporting a mode less restrictive than `default` is denied on its
+    /// connection and emits `UngatedCliMode` so the host closes the session. It is never stored as a
+    /// pending request or shown as a card because an unanswered hook in that mode could run the tool.
+    #[test]
+    fn a_hook_call_reporting_an_ungated_mode_is_denied_and_asks_for_the_session_to_close() {
+        for mode in ["bypassPermissions", "acceptEdits"] {
+            let socket_path = temp_socket_path();
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), not_noted()).unwrap();
+
+            let mut client = UnixStream::connect(&socket_path).unwrap();
+            writeln!(client, "{}", hook_payload_in(Some(mode), "toolu_ungated")).unwrap();
+            let mut reader = BufReader::new(client);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let decision: serde_json::Value = serde_json::from_str(line.trim()).expect("a decision comes back");
+            assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny", "{mode}");
+            let reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap();
+            assert!(
+                reason.contains(&format!("'{mode}'")),
+                "the deny names the mode: {reason}"
+            );
+
+            let event = rx.recv_timeout(Duration::from_secs(2)).expect("an event within 2s");
+            assert_eq!(event, AgentEvent::UngatedCliMode { reported: mode.into() });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "{mode}: no PermissionRequest follows the trip"
+            );
+            assert!(
+                pending.lock().unwrap().is_empty(),
+                "{mode}: nothing is filed to approve"
+            );
+
+            // One layer on, with the event the socket produced: what the host is handed.
+            let domain = crate::session::translate_wire_event(
+                event,
+                None,
+                &mut false,
+                &mut std::collections::HashMap::new(),
+                &mut None,
+            );
+            assert_eq!(
+                domain,
+                vec![crate::projection::AgentDomainEvent::UngatedCliMode {
+                    reported: mode.into(),
+                    detail: "a PreToolUse hook call".into(),
+                }]
+            );
+
+            stop.store(true, Ordering::Relaxed);
+            handle.join().unwrap();
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// `default` is what neovibe asked for: an ordinary request, filed, and nothing noted.
+    #[test]
+    fn a_hook_call_in_default_is_an_ordinary_request() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let noted = not_noted();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), noted.clone()).unwrap();
+
+        let mut client = UnixStream::connect(&socket_path).unwrap();
+        writeln!(client, "{}", hook_payload_in(Some("default"), "toolu_default")).unwrap();
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(AgentEvent::PermissionRequest { request_id, .. }) => assert_eq!(request_id, "toolu_default"),
+            other => panic!("expected a PermissionRequest, got {other:?}"),
+        }
+        assert!(pending.lock().unwrap().contains_key("toolu_default"));
+        assert!(!noted.load(Ordering::Relaxed), "nothing to note about `default`");
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A stricter mode (`plan`) still denies on a non-answer, so its calls are filed as usual -- and
+    /// the line saying so is printed once per conversation, not once per call. An absent field is
+    /// unreported: filed as usual too, never read as `default`.
+    #[test]
+    fn a_stricter_or_unreported_hook_mode_is_filed_as_usual_and_noted_once() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let noted = not_noted();
+        let (handle, stop) = spawn_hook_listener(listener, tx, pending.clone(), noted.clone()).unwrap();
+
+        let mut clients = Vec::new();
+        for (mode, id) in [
+            (Some("plan"), "toolu_plan_1"),
+            (Some("plan"), "toolu_plan_2"),
+            (None, "toolu_none"),
+        ] {
+            let mut client = UnixStream::connect(&socket_path).unwrap();
+            writeln!(client, "{}", hook_payload_in(mode, id)).unwrap();
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(AgentEvent::PermissionRequest { request_id, .. }) => assert_eq!(request_id, id),
+                other => panic!("{mode:?}: expected a PermissionRequest, got {other:?}"),
+            }
+            clients.push(client);
+        }
+        assert_eq!(pending.lock().unwrap().len(), 3, "all three are filed");
+        assert!(noted.load(Ordering::Relaxed), "the first `plan` was noted");
+        assert_eq!(
+            note_hook_cli_mode(&noted, "plan"),
+            None,
+            "and the flag the listener shares says no further line is due"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        drop(clients);
         let _ = std::fs::remove_file(&socket_path);
     }
 
@@ -1546,12 +1744,8 @@ mod tests {
         let sockets_before = temp_hook_socket_names();
         let threads_before = live_thread_count();
         for _ in 0..5 {
-            let outcome = AgentProcess::spawn_with_binary(
-                &dir,
-                PermissionMode::Auto,
-                &[],
-                "/nonexistent/definitely-not-a-real-claude-binary",
-            );
+            let outcome =
+                AgentProcess::spawn_with_binary(&dir, &[], "/nonexistent/definitely-not-a-real-claude-binary");
             match outcome {
                 Ok(_) => panic!("spawning a nonexistent binary must fail"),
                 Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
@@ -1765,10 +1959,9 @@ exit 0"#,
         );
     }
 
-    /// The same fake launcher, but exercised through the real `spawn_with_binary` in `Auto` mode
-    /// (which is exactly when a gate is installed) rather than calling the preflight function in
-    /// isolation -- proving the preflight is actually wired into the real spawn path and runs
-    /// BEFORE the socket is ever bound, so a doomed spawn leaves nothing behind to clean up.
+    /// Exercises the fake launcher through `spawn_with_binary`, which installs a gate on every
+    /// spawn. Checks that the real spawn path runs the preflight before binding the socket, so a
+    /// launcher that rejects the hook settings leaves nothing to clean up.
     #[test]
     fn spawn_with_binary_fails_fast_via_preflight_and_binds_no_socket_when_the_resolved_binary_refuses_settings() {
         let _socket_guard = hook_socket_guard();
@@ -1788,7 +1981,7 @@ exit 0"#,
         );
 
         let sockets_before = temp_hook_socket_names();
-        let outcome = AgentProcess::spawn_with_binary(&dir, PermissionMode::Auto, &[], script.to_str().unwrap());
+        let outcome = AgentProcess::spawn_with_binary(&dir, &[], script.to_str().unwrap());
         let err = outcome
             .err()
             .expect("spawn must fail when the resolved binary refuses the gate flag");
@@ -1810,12 +2003,14 @@ exit 0"#,
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Checks the arguments passed by the real legacy spawn path in `Auto`.
+    /// Checks the arguments passed by the real legacy spawn path.
     /// The child gets the `PreToolUse` gate through `--settings` and no `--disallowedTools`,
     /// so `Bash` is offered and every call reaches the hook. Passing `--disallowedTools Bash`
     /// could escape the deny-list test above but fails this spawn check.
+    /// The CLI runs in `default`, and no flags select `auto` or an ungated mode.
+    /// In CLI `auto`, an unanswered hook request falls through to a model classifier.
     #[test]
-    fn an_auto_spawn_offers_bash_under_the_gate_and_passes_no_deny_list() {
+    fn every_spawn_runs_default_under_the_gate_and_passes_no_deny_list() {
         let _socket_guard = hook_socket_guard();
         let dir = std::env::temp_dir().join(format!("agent-process-auto-argv-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1829,13 +2024,8 @@ exit 0"#,
             record.display()
         ));
 
-        let mut process = AgentProcess::spawn_with_binary(
-            &dir,
-            PermissionMode::Auto,
-            disallowed_tools_for(PermissionMode::Auto),
-            script.to_str().unwrap(),
-        )
-        .expect("the fake binary accepts --settings, so the Auto spawn succeeds");
+        let mut process = AgentProcess::spawn_with_binary(&dir, disallowed_tools(), script.to_str().unwrap())
+            .expect("the fake binary accepts --settings, so the spawn succeeds");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let session_argv = loop {
             let text = std::fs::read_to_string(&record).unwrap_or_default();
@@ -1851,44 +2041,25 @@ exit 0"#,
         process.shutdown();
 
         assert!(
-            session_argv.contains("--permission-mode auto"),
-            "Auto spawns the CLI in auto: {session_argv}"
+            session_argv.contains("--permission-mode default"),
+            "the CLI runs in `default`: {session_argv}"
         );
+        for ungated in [
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+        ] {
+            assert!(!session_argv.contains(ungated), "R07: {ungated} in {session_argv}");
+        }
         assert!(
             session_argv.contains("--settings"),
-            "Auto installs the PreToolUse gate, which is what makes offering Bash safe: {session_argv}"
+            "every spawn installs the PreToolUse gate, which is what makes offering Bash safe: {session_argv}"
         );
         assert!(
             !session_argv.contains("--disallowedTools"),
-            "Auto must offer Bash (and every other tool) under the gate, so no deny list is passed: {session_argv}"
+            "every spawn must offer Bash (and every other tool) under the gate, so no deny list is \
+             passed: {session_argv}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `Bypass` mode installs no gate and therefore builds no `--settings` value, so the
-    /// preflight must never run at all -- a binary that would refuse `--settings` is irrelevant
-    /// to a mode that never passes it, and this is also the mode this project explicitly calls
-    /// out as the current workaround for today's launcher (see `PermissionMode`'s own doc), so a
-    /// regression that started preflighting Bypass too would break the one mode that currently
-    /// works on this host.
-    #[test]
-    fn spawn_with_binary_never_preflights_in_bypass_mode() {
-        let _socket_guard = hook_socket_guard();
-        let dir = std::env::temp_dir().join(format!("agent-process-bypass-preflight-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // This script would refuse ANY invocation -- if Bypass mode ever preflighted it, this
-        // test would see this script's own refusal message in the error instead of a real
-        // process actually spawning (Bypass installs no --settings, so nothing here should ever
-        // read this script's stderr as a preflight failure).
-        let script = fake_binary_script("echo \"should never be invoked for a preflight check\" >&2\nexit 1");
-
-        let outcome = AgentProcess::spawn_with_binary(&dir, PermissionMode::Bypass, &[], script.to_str().unwrap());
-        match outcome {
-            Ok(mut process) => process.shutdown(),
-            Err(e) => panic!("Bypass mode must not preflight the resolved binary at all, got: {e}"),
-        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

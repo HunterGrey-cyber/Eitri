@@ -6,14 +6,20 @@ use serde::Deserialize;
 use serde_json::json;
 
 /// Only the fields this crate actually needs from the hook's real stdin payload -- the real
-/// shape also carries `transcript_path`, `cwd`, `prompt_id`, `permission_mode`, `effort`, and
-/// `hook_event_name`, which are ignored here (serde ignores unknown fields by default).
+/// shape also carries `transcript_path`, `cwd`, `prompt_id`, `effort`, and `hook_event_name`,
+/// which are ignored here (serde ignores unknown fields by default).
 #[derive(Debug, Deserialize)]
 pub struct PreToolUseHookInput {
     pub session_id: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub tool_use_id: String,
+    /// The CLI's permission mode at the time of this call, `"default"` in the fixture.
+    /// Enforcement uses `process::classify_cli_mode` to deny the call and close the session if this
+    /// mode is less restrictive than the requested `default`. Optional because some CLI builds may omit it;
+    /// an absent value is classified as unreported, never as `default`.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 pub fn parse_pretooluse_input(json_str: &str) -> Result<PreToolUseHookInput, serde_json::Error> {

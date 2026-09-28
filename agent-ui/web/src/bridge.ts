@@ -67,6 +67,11 @@ export type OutboundMessage =
    *  Rust recomputes every tab except the active one when answering, so this carries no tab list.
    *  Maps to `InboundMessage::CloseOthers` in `core/src/agent_bridge.rs`. */
   | { type: "close_others"; request_id: string }
+  /** Answer a `confirm_bypass` prompt with `y`/`Y` after `bypassYesCounts` accepts the key. Echo
+   *  `tab`, `scope`, and `nonce` verbatim. Rust retains the delivered card list and answers only
+   *  cards still pending on that tab at that nonce; this side never chooses the cards. Maps to
+   *  `InboundMessage::ConfirmBypass` in `core/src/agent_bridge.rs`. */
+  | { type: "confirm_bypass"; request_id: string; tab: TabId | null; scope: "tab" | "default"; nonce: number }
   /** Mirror the window's effective mode whenever it changes and once after `ready`. Rust keeps one
    *  value per window because `install_module_nav`, which reads it, is installed once per window.
    *  The empty tab's menu and composer also count as browse and input. Use other for states that
@@ -135,6 +140,8 @@ type InboundHandler = (
         ruleNotes?: { toolUseId: string; rule: string }[];
         /** `Write` cards in this batch raised over no file; absent when none were. */
         createsFile?: { permissionId: string; toolUseId: string | null }[];
+        /** Calls in this batch whose CLI prompt was answered without a card. */
+        promptNotes?: { toolUseId: string; note: string }[];
       }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`
@@ -190,6 +197,12 @@ type InboundHandler = (
      *  See `serialize_confirm_close_others_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "confirm_close_others"; tabs: TabId[]; lines: string[] }
     | { kind: "begin_rename"; tab: TabId; current: string | null }
+    /** A move into bypass asks for y/n first. With tab scope, `tab` identifies the switching tab;
+     *  default scope changes the window default and carries `tab: null`. `lines[0]` already
+     *  includes the waiting-card count, which this side never computes. Echo `nonce` on `y`/`Y` so
+     *  Rust can reject stale answers. A second envelope replaces an open prompt. Serialized by
+     *  `serialize_confirm_bypass_for_js` in `core/src/agent_bridge.rs`. */
+    | { kind: "confirm_bypass"; tab: TabId | null; scope: "tab" | "default"; nonce: number; lines: string[] }
     /** This tab's queue and the refusal reason if its last flush was refused. */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null }
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
@@ -230,6 +243,13 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
+      // Reject a `confirm_bypass` without a numeric `nonce`, warning and dropping it like an
+      // unrecognized envelope. A `y` answer must echo a received nonce; `App.tsx` must never invent
+      // one.
+      if (obj.kind === "confirm_bypass" && typeof (obj as { nonce?: unknown }).nonce !== "number") {
+        console.warn("agent-ui: __neovibeDispatch received a malformed confirm_bypass envelope (no nonce)", parsed);
+        return;
+      }
       if (
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
@@ -255,6 +275,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "chooser" ||
         obj.kind === "confirm_close" ||
         obj.kind === "confirm_close_others" ||
+        obj.kind === "confirm_bypass" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||
         obj.kind === "draft" ||

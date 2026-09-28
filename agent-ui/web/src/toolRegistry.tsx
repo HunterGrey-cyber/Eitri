@@ -372,11 +372,16 @@ export function renderToolCall(
         allowed by rule <code>{call.allowedByRule}</code>
       </div>
     );
+  // The CLI prompt was answered without a card, either in bypass or through earlier user approval
+  // of the same call. Rust supplies the text, shown muted beside the saved-rule note.
+  const promptNote =
+    call.promptNote === undefined ? null : <div className="tool-rule-note tool-prompt-note">{call.promptNote}</div>;
   const shown = call.result === null || showResult || opts.detailed === true;
   return (
     <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
       {invocation}
       {ruleNote}
+      {promptNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} />}
     </div>
   );

@@ -2,9 +2,7 @@
 //! `claude` CLI. It incurs API usage and checks create_session -> start_watching -> send_turn
 //! through TextDelta and TurnCompleted events arriving via pump().
 
-use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, PermissionMode, TurnOutcome,
-};
+use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, TurnOutcome};
 
 #[test]
 #[ignore]
@@ -13,7 +11,6 @@ fn a_real_turn_s_reply_arrives_via_pump() {
     let session_id = provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Auto,
             streaming: agent::StreamingPreference::Partial,
         })
         .unwrap();

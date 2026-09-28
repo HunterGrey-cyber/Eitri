@@ -10,7 +10,7 @@
 //!. Streaming output (assistant text, tool calls, permission requests, ...) is never
 //! returned directly from these methods; it arrives via `pump()`, mirroring `AgentSession::pump()`.
 
-use crate::{AgentDomainEvent, PermissionMode};
+use crate::AgentDomainEvent;
 
 /// How much of an assistant reply the caller wants while it is still being produced.
 ///
@@ -27,25 +27,26 @@ pub enum StreamingPreference {
     Partial,
 }
 
+/// A fresh session. There is no permission mode on it: every session a provider
+/// creates is gated -- the sidecar's `INTERACTIVE` policy, the CLI in `default` -- and whether the
+/// host answers `allow` on its own is decided above this API. The field was removed rather than
+/// ignored: "a requested permission mode must never silently become a different one" would be
+/// broken by a `Bypass` the wire then disregarded, and a field the wire honoured would be a way back
+/// to `bypassPermissions`.
 #[derive(Debug, Clone)]
 pub struct CreateSessionRequest {
     pub cwd: String,
-    pub permission_mode: PermissionMode,
     pub streaming: StreamingPreference,
 }
 
-/// Continue an existing provider (Claude) session rather than starting a fresh one.
-///
-/// Carries a `permission_mode` because the host policy applies to the resumed session exactly as it
-/// does to a new one -- resuming does not inherit the policy the original session ran under, and
-/// silently defaulting it would mean a conversation could come back with a different permission
-/// posture than the caller asked for.
+/// Continues an existing provider session. Resumed sessions do not inherit their earlier
+/// permission policy, so they are created gated just like fresh sessions through
+/// `CreateSessionRequest`. No permission mode parameter is needed here.
 #[derive(Debug, Clone)]
 pub struct ResumeSessionRequest {
     /// Claude's own session UUID -- the one `SessionOpened.provider_session_id` reported.
     pub provider_session_id: String,
     pub cwd: String,
-    pub permission_mode: PermissionMode,
     pub streaming: StreamingPreference,
 }
 
@@ -58,15 +59,6 @@ pub struct SendTurnRequest {
 #[derive(Debug, Clone)]
 pub struct InterruptTurnRequest {
     pub session_id: String,
-}
-
-/// Changes a live session's permission mode through `SetPermissionMode`, using the
-/// `set_permission_mode` capability. Limited to the two modes this client requests,
-/// rather than all three modes in the wire enum.
-#[derive(Debug, Clone)]
-pub struct SetPermissionModeRequest {
-    pub session_id: String,
-    pub mode: PermissionMode,
 }
 
 /// What a human decided about one pending permission request.
@@ -130,36 +122,18 @@ pub struct ProviderCapabilities {
     pub fork: bool,
     /// The provider can cancel an in-flight turn.
     pub interrupt: bool,
-    /// The provider advertises a BYPASS permission mode: tools run without asking.
+    /// The provider advertises BYPASS mode, where tools run without asking.
+    /// This is a handshake fact only. The host implements bypass by answering `allow` through the
+    /// gate, which requires `interactive_permission_mode` rather than provider BYPASS mode.
     pub bypass_permission_mode: bool,
-    /// The provider advertises an INTERACTIVE permission mode: tool use raises a real
-    /// `PermissionRequested` that a human answers.
+    /// The provider advertises INTERACTIVE mode, where tool use raises `PermissionRequested`.
     ///
-    /// A separate capability from `bypass_permission_mode` because the two are separately
-    /// advertised and separately absent, and because choosing between them is a decision about what
-    /// the agent is allowed to do unsupervised. `verdandi_rules` is deliberately NOT modeled: it is
-    /// confirmed to behave identically to `interactive` in the current sidecar, so offering it as a
-    /// third choice would be a distinction without a difference.
+    /// Tracked separately from `bypass_permission_mode` because providers advertise them independently.
+    /// `verdandi_rules` is not modeled: it behaves identically to INTERACTIVE in the current sidecar,
+    /// so a third choice would add no distinction. Every session uses INTERACTIVE;
+    /// `ClaudeSidecarProvider::require_interactive` refuses providers without it at session creation
+    /// rather than silently choosing another permission policy.
     pub interactive_permission_mode: bool,
-    /// The provider can switch a live session's permission mode through `SetPermissionMode`.
-    /// Requires both the advertised `set_permission_mode` capability and
-    /// `CLIENT_IMPLEMENTS_SET_PERMISSION_MODE`, just like the resume and fork checks.
-    pub set_permission_mode: bool,
-}
-
-impl ProviderCapabilities {
-    /// Whether this provider can actually honor a given permission policy.
-    ///
-    /// The hard rule this exists to enforce: **a requested permission mode must never silently
-    /// become a different one.** A provider that cannot do what was asked must fail loudly, exactly
-    /// as a resume that cannot continue a session must never quietly start a fresh one -- the cost
-    /// of getting it wrong is the same in kind, an agent running under a policy nobody chose.
-    pub fn supports_permission_mode(&self, mode: PermissionMode) -> bool {
-        match mode {
-            PermissionMode::Auto => self.interactive_permission_mode,
-            PermissionMode::Bypass => self.bypass_permission_mode,
-        }
-    }
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the
@@ -304,11 +278,4 @@ pub trait AgentProvider {
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --
     /// mirrors `AgentSession::pump()`'s existing contract exactly.
     fn pump(&self) -> Vec<AgentDomainEvent>;
-    /// Changes a live session's permission mode (Verdandi `SetPermissionMode`, capability
-    /// `set_permission_mode`). Returns the provider-level mode the CLI acknowledged (`default` /
-    /// `bypassPermissions`). Default: unsupported, so a provider that cannot do it says so rather
-    /// than pretending (every fake keeps compiling unchanged).
-    fn set_permission_mode(&self, _request: SetPermissionModeRequest) -> Result<String, ProviderError> {
-        Err(ProviderError::UnsupportedCapability("set_permission_mode"))
-    }
 }

@@ -663,7 +663,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "claude-runtime-protocol"
 version = "0.1.0"
-source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=b0f043f31a453cc667e981d5f9e327b6219e442c#b0f043f31a453cc667e981d5f9e327b6219e442c"
+source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=22400e87bf6452ad0da9b9232dcb612607ef18c9#22400e87bf6452ad0da9b9232dcb612607ef18c9"
 dependencies = [
  "prost",
  "tonic",

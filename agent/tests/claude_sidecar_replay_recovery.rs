@@ -19,8 +19,8 @@
 //! never evicts, and never gapping looks exactly like correct behaviour.
 
 use agent::{
-    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, ContentKind, CreateSessionRequest, PermissionMode,
-    ProjectionStatus, SendTurnRequest, StreamingPreference,
+    AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, ContentKind, CreateSessionRequest, ProjectionStatus,
+    SendTurnRequest, StreamingPreference,
 };
 use std::time::{Duration, Instant};
 
@@ -50,7 +50,6 @@ fn open(provider: &ClaudeSidecarProvider) -> String {
     provider
         .create_session(CreateSessionRequest {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
-            permission_mode: PermissionMode::Bypass,
             streaming: StreamingPreference::Partial,
         })
         .expect("create_session should succeed")
@@ -283,8 +282,8 @@ fn a_conversation_keeps_ingesting_while_its_ui_is_stalled() {
     // conversation record and takes a real session lease, and `test_workspace_dir` keeps both out
     // of the developer's own XDG directories (see `agent::state_dirs`).
     let cwd = agent::state_dirs::test_workspace_dir("replay-recovery");
-    let mut conversation = agent::AgentConversation::create(provider.clone(), &cwd, PermissionMode::Bypass)
-        .expect("creating a conversation should succeed");
+    let mut conversation =
+        agent::AgentConversation::create(provider.clone(), &cwd).expect("creating a conversation should succeed");
 
     conversation
         .send_turn(STREAMING_PROMPT)

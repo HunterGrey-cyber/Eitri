@@ -10,7 +10,7 @@ import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
-import { isModeCycleKey, isShiftTab, MODE_STARTING_MESSAGE, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { isModifierKey, leaderTypingFlash, TypingGuard } from "./typingGuard";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
@@ -304,16 +304,16 @@ export default function App() {
    *  its first render's value forever. Assigned during render, so it is current by the time any
    *  later envelope arrives. */
   const sessionStartedRef = useRef(false);
-  /** Whether this session's sidecar can switch its live permission mode.
-   *  `Capabilities.modeSwitch` must be exactly `true`: the optional field is absent on older
-   *  sidecars, which cannot switch. */
-  const modeSwitch = state.capabilities.modeSwitch === true;
-  /** Whether `<leader>` `mode.cycle` (and, by the same rule, Shift+Tab) would flash rather than post
-   *  -- `modeKeyRoute`'s own routing, so a `starting`/`failed`/`ended` tab still greys the box entry,
-   *  but a `live` tab whose sidecar can switch (`modeSwitch`) does not. */
+  /** Whether `<leader>` `mode.cycle` and Shift+Tab flash rather than post, using
+   *  `modeKeyRoute`. An ended or failed tab can still cycle out of bypass, but cannot cycle
+   *  into it. */
   const modeFixed =
-    modeKeyRoute({ confirmOpen: false, chooserOpen: false, tabState: activeTab?.state ?? null, canSwitch: modeSwitch }) !==
-    "cycle";
+    modeKeyRoute({
+      confirmOpen: false,
+      chooserOpen: false,
+      tabState: activeTab?.state ?? null,
+      tabMode: activeTab?.mode ?? null,
+    }) === "fixed";
   sessionStartedRef.current = sessionStarted;
   /** A fatal, session-ending failure, shown in the panel. Replaces window.alert, which cannot be
    * copied, cannot show the sidecar's own multi-line startup diagnostics, and blocks the WebView. */
@@ -723,25 +723,24 @@ export default function App() {
         break;
       case "mode.cycle":
         // Mode cycling is disabled for fixed tabs and flashes instead of posting. `modeKeyRoute`
-        // also routes Shift+Tab: starting and failed tabs flash instead of sending a request Rust
-        // would refuse. A live tab with `modeSwitch` posts the request, matching its enabled entry
-        // in the which-key box.
+        // also routes Shift+Tab. All routes except an ended or failed tab that is not already in
+        // bypass post the request. Rust asks for confirmation before entering bypass.
         switch (
           modeKeyRoute({
             confirmOpen: false,
             chooserOpen: false,
             tabState: activeTab?.state ?? null,
-            canSwitch: modeSwitch,
+            tabMode: activeTab?.mode ?? null,
           })
         ) {
           case "cycle":
             post({ type: "cycle_mode" });
             break;
-          case "starting":
-            showFlash(MODE_STARTING_MESSAGE);
-            break;
           case "fixed":
-            showFlash(modeFixedMessage(keymapHelp.newTabChord));
+            // "r" (not `keymapHelp.newTabChord`): reaching "fixed" means the tab has already ended
+            // or failed, and `r` -- not a rebindable panel-table action -- is what restarts it in
+            // place on both layouts (`EmptyTab`'s own `r`, BROWSE's `restart` case).
+            showFlash(modeFixedMessage("r"));
             break;
         }
         break;
@@ -785,11 +784,17 @@ export default function App() {
    *  While open, the tab bar stays visible even with one tab. `begin_rename` opens it;
    *  commit or cancel clears it. */
   const [renaming, setRenaming] = useState<{ tab: TabId; initial: string } | null>(null);
-  /** The close confirmation prompt, or `null` when closed. It replaces the footer's which-key strip
-   *  and takes every key. `confirm_close` names one tab; `confirm_close_others` has no tab of its own.
-   *  `onKeyDown` calls `answerConfirm`: `y` closes, and any other key cancels. */
+  /** The close or bypass confirmation prompt, or `null` when closed. It replaces the footer's
+   *  which-key strip and takes every key. `confirm_close` names one tab;
+   *  `confirm_close_others` has no tab of its own. `answerConfirm` handles close or cancel.
+   *  `confirm_bypass` supplies `scope`, `tab`, `nonce` and `lines`; echo them unchanged on `y`/`Y`.
+   *  Stamp `openedAt` with `performance.now()` so it shares the guard's clock.
+   *  Replacing the object for a new envelope restarts the 250ms wait, even if a prompt is already open. */
   const [confirm, setConfirm] = useState<
-    { kind: "close"; tab: TabId; lines: string[] } | { kind: "close_others"; lines: string[] } | null
+    | { kind: "close"; tab: TabId; lines: string[] }
+    | { kind: "close_others"; lines: string[] }
+    | { kind: "bypass"; tab: TabId | null; scope: "tab" | "default"; nonce: number; lines: string[]; openedAt: number }
+    | null
   >(null);
   /** The `prefix w` overlay lists open tabs followed by saved sessions, or is `null` when
    *  closed. A `chooser` envelope sets it. It is window-wide rather than tab-scoped (`tabs.ts`
@@ -847,12 +852,33 @@ export default function App() {
   chooserOpenRef.current = chooser !== null;
   const tabsRef = useRef<TabsEnvelope | null>(null);
   tabsRef.current = tabs;
-  const newTabChordRef = useRef("");
-  newTabChordRef.current = keymapHelp.newTabChord;
-  /** Mirrors `modeSwitch` for the document-capture `onModeKey` effect, which is installed once
-   *  and needs a ref to read the current render's value. */
-  const canSwitchRef = useRef(false);
-  canSwitchRef.current = modeSwitch;
+  /** The previous non-modifier keydown anywhere in the panel, read by `answerConfirm` through
+   *  `bypassYesCounts`. This stays one keystroke behind `currentKeyAtRef`: document capture runs
+   *  before the same event reaches the bubble handler. Using the current key's timestamp would
+   *  make a lone `y`/`Y` fail its own guard. Starting at `-Infinity` lets the first such key
+   *  depend only on how long the prompt has been visible. */
+  const lastKeyAtRef = useRef(-Infinity);
+  /** The running "most recent non-modifier keydown" clock `lastKeyAtRef` lags one keystroke behind;
+   *  private to the document-capture effect below. */
+  const currentKeyAtRef = useRef(-Infinity);
+  /** Defect 2 (2026-09-27 sandbox GUI pass): the key `answerConfirm` last consumed from a y/n
+   *  prompt -- answered or cancelled, either way -- so its own auto-repeats can be swallowed rather
+   *  than falling through as an ordinary key once `confirm` is null again. Mirrors
+   *  `shell::hint::Held`: remember the held
+   *  key, not a timer, and stop remembering it the moment its keyup arrives (the effect right
+   *  below) -- never on a fresh, different key, so an ordinary later hold of the SAME key (nothing
+   *  to do with any prompt) is never mistakenly swallowed just because this key answered a prompt
+   *  once, earlier in the session. `null` when nothing consumed by a prompt is still physically held. */
+  const promptSwallowKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    function clearPromptSwallow(event: globalThis.KeyboardEvent) {
+      if (event.key === promptSwallowKeyRef.current) promptSwallowKeyRef.current = null;
+    }
+    // Capture phase on the window, the same tier `swallowWhilePending` (HINT) uses below, so a
+    // keyup that some other handler stops from bubbling still clears this.
+    window.addEventListener("keyup", clearPromptSwallow, true);
+    return () => window.removeEventListener("keyup", clearPromptSwallow, true);
+  }, []);
   /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
    *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
   const keymapOverlayRef = useRef<HTMLDivElement>(null);
@@ -951,19 +977,29 @@ export default function App() {
      when WebKit runs out of focusable elements. */
   useEffect(() => {
     function onModeKey(event: globalThis.KeyboardEvent) {
+      // Record every non-modifier keydown before `isModeCycleKey` returns for keys other than
+      // Shift+Tab. The guard needs to see recent keys even when this handler does not act on them.
+      // Set `lastKeyAtRef` to the previous timestamp because this capture handler runs before
+      // `answerConfirm` reads it for the same event.
+      if (!["Shift", "Control", "Alt", "Meta"].includes(event.key)) {
+        lastKeyAtRef.current = currentKeyAtRef.current;
+        currentKeyAtRef.current = performance.now();
+      }
       if (!isModeCycleKey(event)) return;
       event.preventDefault();
+      const activeInfo = activeTabInfo(tabsRef.current);
       const route = modeKeyRoute({
         confirmOpen: confirmOpenRef.current,
         chooserOpen: chooserOpenRef.current,
-        tabState: activeTabInfo(tabsRef.current)?.state ?? null,
-        canSwitch: canSwitchRef.current,
+        tabState: activeInfo?.state ?? null,
+        tabMode: activeInfo?.mode ?? null,
       });
       if (route === "overlay") return;
       event.stopPropagation();
       if (route === "cycle") post({ type: "cycle_mode" });
-      else if (route === "starting") showFlash(MODE_STARTING_MESSAGE);
-      else if (route === "fixed") showFlash(modeFixedMessage(newTabChordRef.current));
+      // "r" (not a rebindable panel-table action, so nothing on the wire names it): reaching
+      // "fixed" always means the tab has already ended or failed.
+      else if (route === "fixed") showFlash(modeFixedMessage("r"));
     }
     document.addEventListener("keydown", onModeKey, true);
     return () => document.removeEventListener("keydown", onModeKey, true);
@@ -1350,6 +1386,9 @@ export default function App() {
         // The `/` prompt belongs to this panel, so it closes here like the `?` overlay.
         setSearch(null);
         setPaneFocused(payload.focused);
+        // Losing focus cancels the bypass prompt. Regaining focus does not answer or cancel it; answers
+        // come only from this pane's keydowns.
+        if (!payload.focused) cancelBypassConfirm();
         // Only regaining focus requests the keys back. WebKitGTK may not preserve DOM focus across a pane
         // switch, so ask for it here.
         if (payload.focused) setKeysRequest((n) => n + 1);
@@ -1360,6 +1399,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
+        cancelBypassConfirm();
         setEmptyLanding("input");
         setInputRequest((n) => n + 1);
       } else if (payload.kind === "arrive") {
@@ -1368,6 +1408,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
+        cancelBypassConfirm();
         // A reserved two-key prefix or a leader/table sequence armed from before this arrival means
         // nothing about it -- the same reason `pane_focus` cancels both.
         pendingRef.current = null;
@@ -1384,8 +1425,12 @@ export default function App() {
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
+        cancelBypassConfirm();
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "nav_key") {
+        // GTK claimed this key before the WebView could pass it to `answerConfirm`. Cancel the
+        // bypass prompt here because only a guarded `y`/`Y` may confirm it.
+        cancelBypassConfirm();
         // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees a keydown, so this is a key pressed
         // after any pending `g`/`z`/`[`/`]` prefix or leader sequence -- cancelled here for the same
         // reason `pane_focus` and `arrive` cancel them, whether the effect below claims the chord or
@@ -1410,10 +1455,12 @@ export default function App() {
           newTabChord: payload.newTabChord,
         });
       } else if (payload.kind === "literal_key") {
-        // `send-prefix`/`send-keys` from shell: WebKitGTK cannot be handed the key itself. `C-a` is
-        // what a text field does with it -- select all of the focused one; any other key is ignored.
-        // Deliberately NOT `isEditableElement`: this needs "has a text selection", which is exactly
-        // these two types.
+        // `send-prefix`/`send-keys` arrives from shell because WebKitGTK cannot receive the key
+        // itself. `C-a` selects all in the focused textarea or text input; other keys are ignored.
+        // Check those types rather than `isEditableElement` because this needs text selection.
+        // Cancel the bypass prompt here because GTK claimed the key before `answerConfirm` could
+        // see it.
+        cancelBypassConfirm();
         if (payload.key !== "C-a") return;
         const el = document.activeElement;
         if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
@@ -1421,7 +1468,9 @@ export default function App() {
         }
       } else if (payload.kind === "open_keymap") {
         // The start screen displays the keymap overlay through `? Keys`, so this request opens it there
-        // too.
+        // too. GTK claims `prefix ?` before `answerConfirm` sees it, so opening the overlay must
+        // also cancel the bypass prompt.
+        cancelBypassConfirm();
         setMode("browse");
         setKeymapOpen(true);
       } else if (payload.kind === "hint_collect") {
@@ -1433,6 +1482,9 @@ export default function App() {
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
+        // GTK handles `prefix f` and its label keys before the WebView. Cancel the bypass prompt here so a
+        // later copy key or composer keystroke cannot answer it. Rust cancels its prompt too.
+        cancelBypassConfirm();
         // Close the search prompt so HINT labels do not cover it or compete with `/` for keys.
         setSearch(null);
         // ...and the prefix the strip may still be waiting on, for the reason `pane_focus` does it.
@@ -1523,6 +1575,7 @@ export default function App() {
           setDetail(null);
           setHandoffOpen(false);
           setChooser(null);
+          cancelBypassConfirm(); // Cancel only when the active tab changes.
           // The `/` prompt belongs to the old tab's conversation and must close on a tab switch.
           setSearch(null);
           setTurnClock(null);
@@ -1561,6 +1614,9 @@ export default function App() {
         // The reply to `open_detail` (`StatusRow`, `prefix i`): opens the popover on this tab's
         // rows, cursor at the top. Forces BROWSE and closes the `?` overlay the same way
         // `open_keymap` does -- the two overlays are mutually exclusive over the conversation area.
+        // A route away from a bypass prompt: the popover's own `y` copies a row,
+        // and its handoff row is reached by clicks that never pass through `answerConfirm`.
+        cancelBypassConfirm();
         setDetail(payload.rows);
         setDetailCursor(0);
         setMode("browse");
@@ -1767,6 +1823,9 @@ export default function App() {
         setDetail(null);
         setHandoffOpen(false);
         setKeymapOpen(false);
+        // GTK claims `prefix ,`, so cancel the bypass prompt here before a name beginning with `y` can
+        // answer it. Rust cancels its prompt too.
+        cancelBypassConfirm();
         setRenaming({ tab: payload.tab, initial: payload.current ?? "" });
       } else if (payload.kind === "confirm_close") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
@@ -1791,6 +1850,20 @@ export default function App() {
         setHandoffOpen(false);
         setKeymapOpen(false);
         setConfirm({ kind: "close_others", lines: payload.lines });
+      } else if (payload.kind === "confirm_bypass") {
+        // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
+        // that bubble from an overlay must not advance a stale sequence. This bypass confirmation
+        // stays above an open chooser: Shift+Tab there requests a mode cycle without leaving it, so
+        // this confirmation must keep the chooser open.
+        pendingRef.current = null;
+        clearSequence();
+        setDetail(null);
+        setHandoffOpen(false);
+        setKeymapOpen(false);
+        // A second bypass envelope replaces the whole prompt even when one is open. This resets
+        // `openedAt` and the 250ms visibility guard, just as other confirmation envelopes replace
+        // their prompts.
+        setConfirm({ kind: "bypass", tab: payload.tab, scope: payload.scope, nonce: payload.nonce, lines: payload.lines, openedAt: performance.now() });
       } else if (payload.kind === "chooser") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
         // that bubble from an overlay must not advance a stale sequence.
@@ -1802,6 +1875,8 @@ export default function App() {
         setHandoffOpen(false);
         setKeymapOpen(false);
         setRenaming(null);
+        cancelBypassConfirm(); // Opening the chooser cancels the bypass prompt, not the
+        // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser.
         setChooser({ open: payload.open, records: payload.records });
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
@@ -1991,6 +2066,10 @@ export default function App() {
   function handoffToTerminal() {
     const tab = activeTabRef.current;
     if (tab === null) return;
+    // Reached by clicks (the detail popover's row, then the confirm's button) that never pass through
+    // `answerConfirm`, and the tab it acts on stops being the tab a bypass prompt was drawn for: that
+    // prompt goes.
+    cancelBypassConfirm();
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
     inFlight.current.set(requestId, { kind: "handoff", tab });
@@ -2137,16 +2216,73 @@ export default function App() {
     if (info !== null && info.state === "not_started") post({ type: "cycle_mode" });
     else postToRust({ type: "cycle_default_mode", request_id: nextRequestId() });
   }
+  /** `Shift+Tab` on an open tab's own row: that tab's own toggle, named by the
+   *  row -- `Chooser` offers it only where Rust acts on it (leaving bypass on any tab, entering it on
+   *  the active one). The chooser stays open; a bypass prompt this raises is answered inside it. */
+  function onChooserCycleTabMode(tab: TabId) {
+    postToRust({ type: "cycle_mode", request_id: nextRequestId(), tab });
+  }
 
-  /** The window-close prompt owns every key ahead of everything else, in BOTH layouts:
-   *  the conversation's own `onKeyDown` below, and `EmptyTab`'s root while the chat is on screen
-   *  with no session yet. Lifted out of either
-   *  handler so both call it first and agree. Returns whether it claimed the key -- only
-   *  `confirm === null` does not. */
-  function answerConfirm(event: KeyboardEvent<HTMLDivElement>): boolean {
-    if (confirm === null) return false;
+  /** Cancels a bypass prompt on focus loss, a tab switch, `arrive`, `focus_permission` or `enter_input`.
+   *  Also called for GTK-handled routes before the WebView sees a key: `hint_collect`,
+   *  `begin_rename`, `tab_detail`, `open_keymap`, `nav_key`, `literal_key`, and terminal handoff.
+   *  Rust drops its prompt on the same routes, so a stray `y` is refused by the nonce.
+   *  Leaves `close` and `close_others` confirmations to their own overlay handling. */
+  function cancelBypassConfirm() {
+    setConfirm((c) => (c?.kind === "bypass" ? null : c));
+  }
+
+  /** Handles confirmation keys before other controls in both the conversation and empty layouts.
+   *  Called in capture phase at each root and stops propagation of claimed keys, preventing a
+   *  chooser from answering twice or an input from sending, renaming or closing before cancellation.
+   *  Returns whether it claimed the key.
+   *
+   *  For a bypass prompt, only a plain, non-repeated `y`/`Y` passing the timing guard confirms.
+   *  Other non-modifier keys cancel the switch. A `y`/`Y` too soon after the prompt or another key
+   *  cancels with a specific flash. The prompt closes even on refusal, so another stray key cannot
+   *  retry without a fresh envelope. `lastKeyAtRef` observes keys throughout the panel.
+   *
+   *  Feed claimed keys to the typing guard here because they never reach `onKeyDown`.
+   *  Otherwise a key that cancels a prompt would be invisible to a later card approval's guard.
+   *  Repeats never confirm, since a fresh prompt may arrive while the same key is still held.
+   *
+   *  After cancellation, swallow that key's repeats until keyup through `promptSwallowKeyRef`,
+   *  even with `confirm === null`. Otherwise a held `y` could copy a row and overwrite the refusal
+   *  flash. A fresh prompt still reaches the normal branch, which rejects repeats itself. */
+  function answerConfirm(event: KeyboardEvent<HTMLElement>): boolean {
+    if (confirm === null) {
+      if (promptSwallowKeyRef.current !== null && event.key === promptSwallowKeyRef.current && event.repeat) {
+        event.preventDefault();
+        event.stopPropagation();
+        return true;
+      }
+      return false;
+    }
+    event.stopPropagation();
     if (!["Shift", "Control", "Alt", "Meta"].includes(event.key)) {
       event.preventDefault();
+      promptSwallowKeyRef.current = event.key;
+      typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
+      if (confirm.kind === "bypass") {
+        if (event.key === "y" || event.key === "Y") {
+          if (
+            !event.repeat &&
+            bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
+          ) {
+            postToRust({
+              type: "confirm_bypass",
+              request_id: nextRequestId(),
+              tab: confirm.tab,
+              scope: confirm.scope,
+              nonce: confirm.nonce,
+            });
+          } else {
+            showFlash("y must be pressed on its own to enter bypass — Shift+Tab to ask again");
+          }
+        }
+        setConfirm(null);
+        return true;
+      }
       // Panel confirmations accept both `y` and `Y`, matching `close_prompt.rs`. Any other
       // non-modifier key cancels.
       if (event.key === "y" || event.key === "Y") {
@@ -2200,8 +2336,11 @@ export default function App() {
         }}
         // The `?` overlay owns every key while it is open, as it does over a conversation (the
         // live layout's `onKeyDown`); in capture, ahead of `EmptyTab`'s own handler and its
-        // composer, which would otherwise take `m`, `j` or a typed letter under it.
+        // composer, which would otherwise take `m`, `j` or a typed letter under it. A y/n prompt
+        // comes before even that, in capture for the reason `answerConfirm`'s own doc
+        // gives: the chooser's inputs and the composer must not see a key the prompt takes.
         onKeyDownCapture={(event) => {
+          if (answerConfirm(event)) return;
           if (!keymapOpen) return;
           event.preventDefault();
           event.stopPropagation();
@@ -2330,7 +2469,9 @@ export default function App() {
             onCloseTab={onChooserCloseTab}
             onRenameTab={onChooserRenameTab}
             onCycleMode={onChooserCycleMode}
+            onCycleTabMode={onChooserCycleTabMode}
             onLeave={onChooserLeave}
+            answerConfirm={answerConfirm}
           />
         )}
         {/* `? Keys`, `?` on an empty draft and `prefix ?` open this overlay here too.
@@ -2400,6 +2541,11 @@ export default function App() {
     // Normalize WebKitGTK's Shift+Tab through `isShiftTab` to the walk key `Tab`.
     const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
     if (typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt)) showFlash(TYPING_FLASH);
+    // The chooser is modal. Keys it does not handle can bubble here and would otherwise
+    // reach `resolveKey`, where `a`/`d` could answer a card covered by the chooser. Return after
+    // the typing guard sees the key so it still counts as typing after the chooser closes.
+    // Do not prevent the default: filter and rename inputs still need to receive their text.
+    if (chooser !== null) return;
     // A `gf` picker with several paths takes the next key before other overlays. A valid letter
     // opens its path; Esc or any other key cancels without falling through, so the key cannot also
     // move the cursor.
@@ -2922,6 +3068,9 @@ export default function App() {
       // Real, focusable, so BROWSE's keydown handler has a DOM node to bubble from -- see the
       // effect above `onKeyDown` that keeps focus here whenever `mode` is "browse".
       tabIndex={0}
+      // A y/n prompt takes every key first, from wherever it was typed (the chooser and its inputs,
+      // the tab bar's rename, the `/` prompt, the composer): see `answerConfirm`'s own doc.
+      onKeyDownCapture={(event) => void answerConfirm(event)}
       onKeyDown={onKeyDown}
       onFocus={(event) => {
         const stop = (event.target as HTMLElement).closest("[data-nav-stop]");
@@ -3003,7 +3152,9 @@ export default function App() {
             onCloseTab={onChooserCloseTab}
             onRenameTab={onChooserRenameTab}
             onCycleMode={onChooserCycleMode}
+            onCycleTabMode={onChooserCycleTabMode}
             onLeave={onChooserLeave}
+            answerConfirm={answerConfirm}
           />
         )}
         {/* The which-key box: `WHICH_KEY_DELAY_MS` after a leader/table
@@ -3134,7 +3285,9 @@ export default function App() {
       <StatusBand
         facts={{
           mode,
-          pill: modePill(activeTab?.mode ?? "auto", state.capabilities.modeSwitch === true, true),
+          // `cycleOffered` is ignored in short form, so passing `true` does not affect
+          // this `modePill` result.
+          pill: modePill(activeTab?.mode ?? "auto", true, true),
           showcmd: box !== null ? `${box.title}…` : null,
           message: flash?.text ?? null,
           prompt: confirm !== null ? confirm.lines.join(" · ") : null,

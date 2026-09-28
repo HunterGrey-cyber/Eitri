@@ -131,7 +131,8 @@ export type EmptyTabProps = {
 };
 
 /** An empty session tab: Claude Code's fresh prompt. The composer is live in INPUT;
- *  the first send creates the session in Rust. `Shift+Tab` cycles the mode. Nothing here
+ *  the first send creates the session in Rust. `Shift+Tab` toggles the mode (O2 a; entering
+ *  bypass asks first). Nothing here
  *  spawns a process. */
 export function EmptyTab(props: EmptyTabProps) {
   const { hello, tab, handoff, failure } = props;
@@ -447,11 +448,12 @@ export function EmptyTab(props: EmptyTabProps) {
       return;
     }
     if (hello === null) return;
-    // The leader/which-key engine also runs on starting and failed tabs so `<leader>` `mode.cycle`
-    // can flash `mode is fixed ...` there. Only the dashboard menu keys below require a
-    // `not_started` tab. Try the leader/which-key engine before the dashboard's fixed
-    // `j`/`k`/`Enter`/letter handlers, matching `App.tsx`. Table bindings take keys not already
-    // claimed above; the reserved-key list prevents collisions with fixed bindings.
+    // The leader/which-key engine also runs on starting and failed tabs so `mode.cycle` reaches
+    // `modeKeyRoute`. Starting tabs cycle like live tabs; failed tabs flash `modeFixedMessage`
+    // unless already in bypass. Only the dashboard menu keys below require a `not_started` tab. Try
+    // the leader/which-key engine before the dashboard's fixed `j`/`k`/`Enter`/letter handlers,
+    // matching `App.tsx`. Table bindings take keys not already claimed above; the reserved-key list
+    // prevents collisions with fixed bindings.
     if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
     if (seqRef.current !== null) {
       event.preventDefault();

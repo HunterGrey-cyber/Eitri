@@ -109,7 +109,11 @@ impl SpawnedSidecar {
 ///
 /// The baseline sidecar explicitly passes `permissionMode: 'default'` for gated
 /// sessions to prevent local `.claude/settings.json` from widening permissions.
-pub const EXPECTED_VERDANDI_REVISION: &str = "b0f043f";
+///
+/// The protocol also includes `ClaudeHostPolicy.provider_permission_prompts`,
+/// `PermissionRequested.origin` and its `provider_*` fields, `PermissionOrigin`,
+/// `MatchedAskRule`, and the `provider_permission_prompts` capability.
+pub const EXPECTED_VERDANDI_REVISION: &str = "22400e8";
 
 /// Where `NEOVIBE_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.

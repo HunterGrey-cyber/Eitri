@@ -13,11 +13,11 @@
 //! `real_pretooluse_hook_allow_end_to_end` and `real_pretooluse_hook_deny_end_to_end` exercise
 //! the same `respond_permission` call.
 
-use agent::{AgentDomainEvent, AgentSession, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
+use agent::{AgentDomainEvent, AgentSession, CONSERVATIVE_DISALLOWED_TOOLS};
 
 fn main() {
     let project_dir = std::env::current_dir().expect("cwd");
-    let mut session = AgentSession::start(&project_dir, PermissionMode::Auto, CONSERVATIVE_DISALLOWED_TOOLS)
+    let mut session = AgentSession::start(&project_dir, CONSERVATIVE_DISALLOWED_TOOLS)
         .expect("failed to spawn `claude` -- is it installed and on PATH?");
 
     println!("== agent v2 demo ==\n");
@@ -137,6 +137,9 @@ fn print_event(event: &AgentDomainEvent) {
             println!(
                 "[permission mode changed] mode={mode:?} provider_mode={provider_mode} floor_applied={floor_applied}"
             );
+        }
+        AgentDomainEvent::UngatedCliMode { reported, detail } => {
+            println!("[ungated CLI mode] {reported} (from {detail}) -- the host closes such a session (R07)");
         }
     }
 }
