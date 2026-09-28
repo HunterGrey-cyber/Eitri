@@ -51,11 +51,32 @@ impl CommandRegistry {
     }
 }
 
+/// Whether `id` is safe in `main.rs`'s `cmd-{id}` GIO action name and
+/// `set_accels_for_action("app.cmd-{id}", ...)`. Spaces or parentheses in a bound id can trigger
+/// a GTK assertion that aborts the process. `::` can silently bind a different action:
+/// `x::y` parses as action `x` with target `y`.
+/// Validate at registration before GTK sees the id. Like GIO's `g_action_name_is_valid`,
+/// accept only a nonempty sequence of ASCII alphanumerics, `-` and `.`.
+/// This implementation keeps `core` independent of `gio`.
+fn is_valid_command_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+}
+
 /// `pub`: `LuaEngine::new` calls this.
 pub fn install(lua: &Lua, neovibe: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
     let command_table = lua.create_table()?;
     let register_fn = lua.create_function(move |lua, spec: Table| {
         let id: String = spec.get("id")?;
+        if !is_valid_command_id(&id) {
+            // Report through `LuaEngine::load_init_file`'s error path before an invalid id reaches GTK.
+            // The file runs as one `.exec()` chunk, so an uncaught error skips everything after this call,
+            // including later commands, keymaps, panels and `agent.account`. The shell still starts with
+            // whatever was registered before the error.
+            return Err(mlua::Error::RuntimeError(format!(
+                "neovibe.command.register: invalid command id {id:?} -- only ASCII letters, digits, \
+                 '-' and '.' are allowed (an invalid id crashes the whole process once bound to a keybinding)"
+            )));
+        }
         let title: String = spec.get("title")?;
         let keybinding: Option<String> = spec.get("keybinding")?;
         let action: mlua::Function = spec.get("action")?;
@@ -175,5 +196,111 @@ mod tests {
         f.call::<()>(()).unwrap();
 
         assert!(registry.borrow().get("second").is_some());
+    }
+
+    /// Registration refuses ids containing spaces, parentheses or `::` before they reach
+    /// `set_accels_for_action("app.cmd-{id}", ...)`. Spaces and parentheses can abort the process
+    /// with a GTK assertion; `x::y` silently targets action `x` with target `y`.
+    /// The error must name the invalid id.
+    #[test]
+    fn register_rejects_an_id_containing_a_space() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        let err = lua
+            .load(r#"neovibe.command.register({ id = "my command", title = "x", action = function() end })"#)
+            .exec()
+            .expect_err("an id containing a space must be refused, not crash GTK once bound");
+        assert!(
+            err.to_string().contains("my command"),
+            "error should name the bad id: {err}"
+        );
+        assert!(registry.borrow().get("my command").is_none());
+    }
+
+    #[test]
+    fn register_rejects_an_id_containing_parentheses() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        let err = lua
+            .load(r#"neovibe.command.register({ id = "foo(bar)", title = "x", action = function() end })"#)
+            .exec()
+            .expect_err("an id containing parentheses must be refused, not crash GTK once bound");
+        assert!(
+            err.to_string().contains("foo(bar)"),
+            "error should name the bad id: {err}"
+        );
+        assert!(registry.borrow().get("foo(bar)").is_none());
+    }
+
+    #[test]
+    fn register_rejects_an_id_containing_a_double_colon() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        let err = lua
+            .load(r#"neovibe.command.register({ id = "x::y", title = "x", action = function() end })"#)
+            .exec()
+            .expect_err(
+                "an id containing '::' must be refused -- it silently mis-binds the accel to a different action",
+            );
+        assert!(err.to_string().contains("x::y"), "error should name the bad id: {err}");
+        assert!(registry.borrow().get("x::y").is_none());
+    }
+
+    #[test]
+    fn register_accepts_alphanumerics_hyphen_and_dot() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        lua.load(r#"neovibe.command.register({ id = "my-command.v2", title = "x", action = function() end })"#)
+            .exec()
+            .unwrap();
+        assert!(registry.borrow().get("my-command.v2").is_some());
+    }
+
+    /// A Lua chunk run with `.exec()` stops at its first uncaught error. An invalid command id
+    /// therefore prevents all later statements in that chunk from running. Exercise the
+    /// registration closure from `install` directly to check this without starting the shell.
+    #[test]
+    fn an_invalid_id_stops_the_rest_of_the_chunk_not_just_that_call() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        let result = lua
+            .load(
+                r#"
+                before_the_bad_call = true
+                neovibe.command.register({ id = "bad id", title = "x", action = function() end })
+                after_the_bad_call = true
+                "#,
+            )
+            .exec();
+        assert!(result.is_err(), "the invalid id must still be refused");
+
+        let before: bool = lua.globals().get("before_the_bad_call").unwrap();
+        assert!(before, "the statement before the bad call should have run");
+        let after: mlua::Value = lua.globals().get("after_the_bad_call").unwrap();
+        assert!(
+            after.is_nil(),
+            "the statement after the bad call must NOT have run -- the chunk stops at the error, \
+             it does not keep loading"
+        );
     }
 }
