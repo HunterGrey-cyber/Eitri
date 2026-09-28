@@ -107,6 +107,16 @@ describe("TypingGuard: typed prose never answers", () => {
     expect(answers).toEqual([]);
   });
 
+  /* The shell withholds keys pressed with Super or Hyper. For `a` then `Super+x`, the page sees
+     only Super's keydown, which must cancel the waiting action as the hidden `x` would. */
+  it("a then Super at 100 ms: Super's own keydown cancels the waiting a (the chord after it never arrives)", () => {
+    key("a");
+    vi.advanceTimersByTime(100);
+    expect(guard.onKey("Super", Date.now())).toBe("cancelled");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+  });
+
   it("a key 1 ms before the wait ends still cancels it", () => {
     key("a");
     vi.advanceTimersByTime(TYPING_GUARD_MS - 1);

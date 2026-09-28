@@ -100,15 +100,14 @@ pub enum PermissionMode {
     Bypass,
 }
 
-/// What a permission mode the CLI reports about itself means for a gated session.
-///
-/// Neovibe asks for `default` on both backends, but a project's own `.claude/settings.json` can set
-/// `permissions.defaultMode`, and on the sidecar nothing outranks it. The fall-through that matters
-/// is a hook that gives no answer (the 600 s hook timeout, a relay failure that escapes
-/// `write_fail_closed_deny`): under `default` that is a denial (bar a project `permissions.allow`
-/// rule matching the call, which this tripwire does not see -- `spawn_hook_listener`'s doc), under a
-/// less restrictive mode the tool runs. So the report is checked wherever the CLI makes one, and
-/// anything not known to be at least as strict as `default` stops the session.
+/// Classifies the CLI's reported permission mode for a gated session.
+/// Sessions normally request `default` on both backends. The explicit legacy flag
+/// `--permission-mode default` overrides a project's `permissions.defaultMode`, and the
+/// sidecar also requests `default`. Checking reports guards against changes in that behavior.
+/// If a hook gives no answer, such as after its 600 s timeout or a relay failure that escapes
+/// `write_fail_closed_deny`, `default` denies unless a project `permissions.allow` rule matches.
+/// This check cannot detect those allow rules. A less restrictive mode can run the tool
+/// without a hook answer, so less restrictive or unknown reported modes stop the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliModeReport {
     /// `default`: what neovibe asked for.

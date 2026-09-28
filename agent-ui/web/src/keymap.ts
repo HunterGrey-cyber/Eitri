@@ -1,3 +1,5 @@
+import { superHeld } from "./heldSuper";
+
 /** Which of the panel's three keyboard states has the keys.
  *
  * `hint` is declared here and rendered by the status line's mode block, and nothing reaches it yet:
@@ -127,9 +129,9 @@ export type PanelAction =
  *  Optional modifier fields and methods mean "not held" when absent. Card-answer keys check
  *  Alt and Meta; the two-key pair lookup keeps its separate modifier handling.
  *  Super and Hyper are distinct from Meta and are read through `getModifierState`.
- *  Whether real WebKitGTK exposes physical Super/Hyper presses this way is unverified here;
- *  if it does not, the shell must intercept them before the WebView.
- *  The AltGraph modifier-state check has the same unverified WebKitGTK behavior. */
+ *  WebKitGTK 2.52.6 sets neither `metaKey` nor `getModifierState("Super")` while Super is held,
+ *  but its keydown/keyup events arrive. `heldSuper.ts` tracks them for `hasSuperOrHyper`.
+ *  The AltGraph modifier-state check has not been verified against real WebKitGTK. */
 export type KeyLike = {
   key: string;
   ctrlKey: boolean;
@@ -144,7 +146,11 @@ export type KeyLike = {
 /** Whether Super or Hyper is held according to `getModifierState`.
  *  These checks depend on WebKitGTK exposing the modifier state; see `KeyLike`. */
 function hasSuperOrHyper(event: KeyLike): boolean {
-  return event.getModifierState?.("Super") === true || event.getModifierState?.("Hyper") === true;
+  // WebKitGTK 2.52.6 reports neither on another key's event (sandbox pass, 2026-09-28), so the Super
+  // key's own keydown/keyup, tracked by `heldSuper.ts`, is what actually catches it there.
+  return (
+    superHeld() || event.getModifierState?.("Super") === true || event.getModifierState?.("Hyper") === true
+  );
 }
 
 /** Whether AltGr is held according to `getModifierState("AltGraph")`.

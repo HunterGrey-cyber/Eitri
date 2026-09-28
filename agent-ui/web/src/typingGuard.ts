@@ -87,6 +87,11 @@ export function isModifierKey(key: string): boolean {
   return MODIFIER_KEYS.has(key);
 }
 
+/** Modifiers whose own keydown counts as another key for the guard. The shell withholds keys
+ *  pressed with Super or Hyper (`shell/src/panel_super.rs`), so `a` then `Super+x` exposes only Super.
+ *  That keydown must cancel the waiting `a` as the hidden `x` would. */
+const CANCELLING_MODIFIERS = new Set(["Super", "Hyper", "OS"]);
+
 export type GuardTimers = {
   setTimeout: (run: () => void, ms: number) => unknown;
   clearTimeout: (handle: unknown) => void;
@@ -125,7 +130,7 @@ export class TypingGuard {
    *  `defer` named, so a cancelled `f` or `L` says what did not happen instead of talking about
    *  `a`/`d` -- or `null` when nothing was waiting. */
   onKey(key: string, t: number): string | null {
-    if (isModifierKey(key)) return null;
+    if (isModifierKey(key) && !CANCELLING_MODIFIERS.has(key)) return null;
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
     this.previousRunIsWalk = this.latestRunIsWalk;
     this.latestRunIsWalk = WALK_KEYS.has(key) && (!continuesRun || this.previousRunIsWalk);
