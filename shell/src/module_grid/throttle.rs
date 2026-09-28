@@ -9,6 +9,14 @@
 //! clipped to the target rectangle. It receives the target size after [`QUIET`] with no further
 //! change. A newly appearing host receives its target immediately. Moves that keep the size
 //! are never held. No input or stored field here is a natural size.
+//!
+//! A held size is capped to the target in both dimensions. GTK hit-tests the real allocation
+//! (`gtk_widget_do_pick` and `gtk_widget_contains`), so a paint clip alone cannot keep an oversized
+//! host from taking a sibling's clicks. Unzooming can shrink the target from the whole window
+//! in one step, making this cap necessary even without a preceding series of smaller targets.
+//! The cap leaves an already smaller held size unchanged. A continuously shrinking target can
+//! force a resize and page reflow on every pass. This module does not track which side of a
+//! split holds the host, so it cannot distinguish safe overflow from overflow into a sibling.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -48,7 +56,15 @@ impl WebThrottle {
     pub(crate) fn allocate(&mut self, id: &ModuleId, target: Rect, was_on_screen: bool) -> WebAllocation {
         match self.settled.get(id) {
             Some(&(w, h)) if was_on_screen && (w, h) != (target.w, target.h) => WebAllocation {
-                rect: Rect { w, h, ..target },
+                // Never bigger than the target (sw-layout-2): the held size is kept only up to what
+                // the target itself allows, so the real GTK allocation this pass -- what GTK hit-tests
+                // clicks against -- can never reach past the target and over whatever has settled
+                // into the space beyond it.
+                rect: Rect {
+                    w: w.min(target.w),
+                    h: h.min(target.h),
+                    ..target
+                },
                 held: true,
                 restart_quiet: self.held_for.insert(id.clone(), target) != Some(target),
             },
