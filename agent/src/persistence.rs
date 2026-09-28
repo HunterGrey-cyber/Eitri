@@ -951,6 +951,20 @@ mod tests {
             "the oldest record nobody holds goes instead, so the cap still binds"
         );
         drop(lease);
+        // A `flock` belongs to the open file description, and a child another test thread is
+        // spawning holds a copy of every fd until its `exec` closes them, so on a loaded machine
+        // the lock can outlive `drop` by a few milliseconds. Prune is right to spare it then; this
+        // test is about what happens once it is really free, so wait for that (bounded).
+        let released_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::lease::SessionLease::is_held("claude", cwd, "held-oldest").unwrap()
+            && std::time::Instant::now() < released_by
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::lease::SessionLease::is_held("claude", cwd, "held-oldest").unwrap(),
+            "the dropped lease should be free within 5s"
+        );
         save_conversation_record(&named(&conversation_id, cwd, "s-last", 1000)).unwrap();
         assert!(
             load_conversation_record(&conversation_id, "held-oldest").is_err(),

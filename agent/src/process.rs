@@ -2026,12 +2026,21 @@ mod tests {
     /// owning its path -- a fake `claude` binary standing in for the real one, so the preflight
     /// tests below can drive both its accept and refuse paths deterministically, with no real
     /// CLI, no network, and no tokens.
+    ///
+    /// A child writes it, never this process. A write fd held here would be copied into any child
+    /// another test thread forks in the meantime, and until that child `exec`s, running the script
+    /// fails with `ETXTBSY` -- which these tests did, a few runs in a hundred on a loaded machine.
     fn fake_binary_script(body: &str) -> FakeBinaryScript {
         let path = std::env::temp_dir().join(format!("agent-process-fake-binary-{}.sh", uuid::Uuid::new_v4()));
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+            .arg("sh")
+            .arg(format!("#!/bin/sh\n{body}\n"))
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "writing the fake binary failed: {status}");
         FakeBinaryScript(path)
     }
 
