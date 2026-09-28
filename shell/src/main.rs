@@ -1594,15 +1594,20 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
                 }
                 None => println!("[pane_switch] unknown direction {letter:?}, ignoring"),
             },
-            pane_switch::PaneMessage::QuitCancelled(g) => {
-                if editor_quitting.cancelled(g) {
+            pane_switch::PaneMessage::QuitCancelled(g) => match editor_quitting.cancelled(g) {
+                editor_quit::Cancel::Cleared => {
                     // The window close's `y`, if it had one, was already taken back when the close
                     // handed the quit to nvim (`EditorQuitting::window_close`), so a later exit asks.
                     println!("[modules] editor: nvim's quit {g} was cancelled; nothing is in flight");
-                } else {
-                    println!("[modules] editor: a quit-cancelled letter for quit {g}, not the one in flight; ignored");
                 }
-            }
+                editor_quit::Cancel::CloseWithdrawn => println!(
+                    "[modules] editor: nvim's quit {g}, a window close a later kill joined, was cancelled; \
+                     nvim's exit retires the editor only"
+                ),
+                editor_quit::Cancel::Ignored => {
+                    println!("[modules] editor: a quit-cancelled letter for quit {g}, not the one in flight; ignored")
+                }
+            },
         });
     }
 

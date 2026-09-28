@@ -6,9 +6,10 @@
 //! and toast. The GTK calls in that layer still need GUI verification.
 //!
 //! The quit path uses `:confirm qall`, never `:qa!`. If nvim stops answering or is unreachable,
-//! [`QuitHost::end_nvim`] closes stdin and sends SIGTERM, then SIGKILL by pid after the timeout.
-//! Closing stdin lets nvim exit while keeping swap files. The editor host's shutdown sends no
-//! quit command. Close and retirement actions run once, after the pane reports the process gone.
+//! [`QuitHost::end_nvim`] sends SIGTERM and closes stdin, then sends SIGKILL by pid after the
+//! timeout. SIGTERM goes first because nvim may still be in its prompt. Closing stdin lets nvim
+//! exit while keeping swap files. The editor host's shutdown sends no quit command.
+//! Close and retirement actions run once, after the pane reports the process gone.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -42,6 +43,18 @@ pub(crate) const UNREACHABLE_NVIM: &str = "nvim's launcher exited and nvim still
 pub(crate) const RETIRED_EDITOR_TEXT: &str =
     "nvim exited and cannot restart in this window \u{2014} relaunch neovibe to get the editor back";
 
+/// What nvim's quit-cancelled letter did ([`EditorQuitting::cancelled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cancel {
+    /// It was the quit in flight: nothing is in flight now.
+    Cleared,
+    /// It was the window close a kill of the editor carries ([`kill_pane::Asked::lent_by`]): the
+    /// close is taken back out, and nvim's exit retires the editor only.
+    CloseWithdrawn,
+    /// Neither: a letter from a quit already superseded, or with nothing in flight.
+    Ignored,
+}
+
 /// What the window's close request does now ([`EditorQuitting::window_close`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowClose {
@@ -64,12 +77,15 @@ pub(crate) trait QuitHost {
     /// The quit request's watch (`NeovideEditorPane::watched_call`).
     fn watched_call(&self) -> Option<CallWatch>;
     /// The quit request's watch once its worker has published how it ended, waited for briefly
-    /// (`NeovideEditorPane::settled_watched_call`).
+    /// (`NeovideEditorPane::settled_watched_call`). Read only at nvim's exit, when nvim-rs has
+    /// resolved the request already: for one still outstanding it blocks the GTK thread for the
+    /// whole bound.
     fn settled_watch(&self) -> Option<CallWatch>;
     /// Has nvim run `lua` as an RPC request (`NeovideEditorPane::exec_lua_watched`).
     fn send_quit(&self, lua: &str) -> bool;
-    /// Ends nvim without `:qa!` (`NeovideEditorPane::end_nvim`): stdin closed, then SIGTERM and
-    /// SIGKILL by pid on the pane's schedule. Idempotent.
+    /// Ends nvim without `:qa!` (`NeovideEditorPane::end_nvim`): stdin closed and SIGTERM (SIGTERM
+    /// first while the quit's request has not come back), then SIGKILL by pid on the pane's
+    /// schedule. Idempotent.
     fn end_nvim(&self) -> bool;
     /// `kill_pane::reveal_for_prompt` over the layout as it stands.
     fn reveal(&self) -> Reveal;
@@ -179,6 +195,7 @@ impl EditorQuitting {
             quit,
             revealed: reveal.rehide,
             sent: true,
+            lent_by: None,
         });
         if !host.send_quit(&kill_pane::editor_quit_lua(g)) {
             self.in_flight.borrow_mut().take();
@@ -215,16 +232,53 @@ impl EditorQuitting {
         AskedNvim::Ending
     }
 
-    /// A request that sends nothing to nvim gets its own entry and generation, whether nvim
-    /// just exited or is out of reach. Reusing an older quit's generation and `sent` state
-    /// could let that quit's cancellation clear the new request and close the whole window
-    /// instead of retiring the editor. A still-pending older quit joins the new request, with
-    /// a window close taking precedence over an editor kill. An answered quit is dropped,
-    /// including the `y` it carried.
+    /// A request that sends nothing to nvim gets a fresh in-flight entry and generation, whether
+    /// nvim has just exited or is out of reach. Reusing an older request's generation and `sent`
+    /// state could let a delayed cancellation erase the new request or close the wrong scope.
+    /// An unanswered older request is merged through `kill_pane::merge`, with a window close taking
+    /// precedence over an editor kill. An answered request and its confirmation are dropped.
+    ///
+    /// A kill that carries a window close must still allow that close to be withdrawn.
+    /// [`Asked::lent_by`] identifies the sent close even under the kill's new generation.
+    /// Its cancellation letter, an answer read by a later request, or an answer read at nvim's exit
+    /// removes that close regardless of how late it arrives.
+    /// Nothing here waits for the watch to settle on the GTK thread: a bounded wait could freeze
+    /// the window while the dialog is open and still miss an answer published after the bound.
     fn begin_unsent(&self, quit: EditorQuit, rehide: bool) {
+        // The last request nvim was sent came back with its answer: its Lua returned, so nvim did
+        // not quit. Every send replaces the watch, and nothing is sent once nvim is out of reach
+        // or gone, so the watch is the request of the sent quit in flight, or of the close a kill
+        // in flight carries.
         let answered = self.host.watched_call().is_some_and(|w| w.done && w.returned);
+        let older = self.in_flight.borrow_mut().take().and_then(|mut asked| {
+            if answered {
+                if asked.sent {
+                    return None;
+                }
+                if let Some(close) = asked.lent_by {
+                    println!(
+                        "[modules] editor: quit {close} was answered without quitting; quit {} kills the editor only",
+                        asked.generation
+                    );
+                    asked.withdraw_lent_close();
+                }
+            }
+            Some(asked)
+        });
+        // A kill joining a window close carries it, and remembers whose it is: the close's own
+        // generation when it was sent, or the one an unsent quit already carried. A window close
+        // of its own, sent nothing, has nothing nvim can answer, and joins as it is.
+        let lent_by = match (&older, &quit) {
+            (Some(older), EditorQuit::Module) if matches!(older.quit, EditorQuit::Window { .. }) => {
+                if older.sent {
+                    Some(older.generation)
+                } else {
+                    older.lent_by
+                }
+            }
+            _ => None,
+        };
         let mut in_flight = self.in_flight.borrow_mut();
-        let older = in_flight.take().filter(|asked| !(asked.sent && answered));
         let g = self.generation.get().wrapping_add(1);
         self.generation.set(g);
         *in_flight = Some(Asked {
@@ -235,6 +289,7 @@ impl EditorQuitting {
             },
             revealed: older.as_ref().is_some_and(|o| o.revealed) || rehide,
             sent: false,
+            lent_by,
         });
     }
 
@@ -298,24 +353,63 @@ impl EditorQuitting {
         cleared
     }
 
-    /// nvim's letter on the pane-switch socket: quit `g` was cancelled. `true` if it was the one in
-    /// flight.
-    pub(crate) fn cancelled(&self, g: u32) -> bool {
-        kill_pane::clear_if_cancelled(&mut self.in_flight.borrow_mut(), g).is_some()
+    /// At nvim's exit, [`EditorQuitting::settle`]'s rule for the window close a kill in flight
+    /// carries ([`Asked::lent_by`]), read off that close's own request: ended without nvim's answer
+    /// -- nvim went away with the close's prompt up -- the close stands, and wins over the kill as
+    /// it always has; answered, or still not known after the wait, it is taken back out, so an old
+    /// `y` is never trusted and nvim's exit retires the editor, which is what the kill asked.
+    fn settle_lent_close(&self, watch: Option<&CallWatch>) {
+        let mut in_flight = self.in_flight.borrow_mut();
+        let Some(asked) = in_flight.as_mut() else {
+            return;
+        };
+        let Some(close) = asked.lent_by else {
+            return;
+        };
+        let why = match watch {
+            Some(w) if w.done && !w.returned => return,
+            Some(w) if w.done => "was answered without quitting",
+            _ => "has not said how it ended",
+        };
+        println!(
+            "[modules] editor: the window close quit {} carries (quit {close}) {why}; it kills the editor only",
+            asked.generation
+        );
+        asked.withdraw_lent_close();
+    }
+
+    /// nvim's letter on the pane-switch socket: quit `g` was cancelled. The quit in flight if it is
+    /// `g`; the window close a kill in flight carries if that close is `g` ([`Asked::lent_by`]),
+    /// which leaves the kill.
+    pub(crate) fn cancelled(&self, g: u32) -> Cancel {
+        let mut in_flight = self.in_flight.borrow_mut();
+        if kill_pane::clear_if_cancelled(&mut in_flight, g).is_some() {
+            return Cancel::Cleared;
+        }
+        match in_flight.as_mut().filter(|asked| asked.lent_by == Some(g)) {
+            Some(asked) => {
+                asked.withdraw_lent_close();
+                Cancel::CloseWithdrawn
+            }
+            None => Cancel::Ignored,
+        }
     }
 
     /// nvim exited without the host asking the pane to shut down: whatever was asked of it is
     /// answered. A window close closes the window without asking what was already asked (the editor
     /// hidden again first if the close showed it for nvim's prompt, so the arrangement saved on
-    /// close is the user's); `prefix x` retires the editor; an exit nobody asked for -- or one after
-    /// a quit nvim already answered without quitting -- asks the window to close, which asks
-    /// whatever the close asks.
+    /// close is the user's); `prefix x` retires the editor (one that joined an older window close
+    /// closes the window only if that close's request ended with nvim gone,
+    /// [`EditorQuitting::settle_lent_close`]); an exit nobody asked for -- or one after a quit nvim
+    /// already answered without quitting -- asks the window to close, which asks whatever the close
+    /// asks.
     pub(crate) fn nvim_exited(&self) {
         // The request's answer may still be on its way to the watch.
         let watch = self.host.settled_watch();
         if self.settle(watch.as_ref()).is_some() {
             println!("[modules] editor: nvim exited, and the quit in flight is not what ended it");
         }
+        self.settle_lent_close(watch.as_ref());
         let asked = self.in_flight.borrow_mut().take();
         match asked {
             Some(Asked {
@@ -467,6 +561,8 @@ mod tests {
         pending: Cell<bool>,
         /// What the watch reads once its worker has published (`None`: the watch as it is).
         settled: RefCell<Option<CallWatch>>,
+        /// How often the flow waited for that (on the GTK thread, up to the pane's `SETTLE_WAIT`).
+        settle_waits: Cell<u32>,
         gone: Cell<bool>,
         reveal: Cell<Option<Reveal>>,
         watch: RefCell<Option<CallWatch>>,
@@ -532,6 +628,7 @@ mod tests {
         /// As nvim-rs settles a request: once nvim's process is gone its IO loop has ended, so a
         /// request still outstanding comes back unanswered -- unless a test says otherwise.
         fn settled_watch(&self) -> Option<CallWatch> {
+            self.settle_waits.set(self.settle_waits.get() + 1);
             if let Some(settled) = self.settled.borrow().clone() {
                 return Some(settled);
             }
@@ -776,8 +873,8 @@ mod tests {
         let quitting = flow(&fake);
         quitting.window_close();
         let g = quitting.in_flight.borrow().as_ref().unwrap().generation;
-        assert!(!quitting.cancelled(g + 1));
-        assert!(quitting.cancelled(g));
+        assert_eq!(quitting.cancelled(g + 1), Cancel::Ignored);
+        assert_eq!(quitting.cancelled(g), Cancel::Cleared);
         fake.running.set(false);
         fake.clear();
         quitting.nvim_exited();
@@ -1080,6 +1177,178 @@ mod tests {
         fake.exited.set(true);
         quitting.nvim_exited();
         assert_eq!(fake.log(), ["close_window_confirmed"]);
+    }
+
+    /// A window close sent to nvim with a `y` for a running tab, then cancelled in nvim's prompt; its
+    /// launcher exits and `prefix x` on the editor is confirmed while the watch still reads the
+    /// dialog -- the worker has not published nvim's answer, and the letter is not read yet.
+    /// Returns the close's generation.
+    fn a_kill_over_a_close_whose_cancel_is_late(fake: &Rc<Fake>, quitting: &Rc<EditorQuitting>) -> u32 {
+        *fake.prompt.borrow_mut() = Some(RUNNING.into());
+        fake.confirmed.set(true);
+        quitting.window_close();
+        let close = quitting.in_flight.borrow().as_ref().unwrap().generation;
+        fake.answer(false, false, "r?");
+        // Were the kill to wait for the worker, it would still see the request outstanding: the
+        // answer comes after any bound (codex's timing).
+        *fake.settled.borrow_mut() = fake.watch.borrow().clone();
+        fake.running.set(false);
+        fake.pending.set(true);
+        fake.clear();
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        assert_eq!(fake.log(), ["end_nvim"]);
+        assert_eq!(
+            fake.settle_waits.get(),
+            0,
+            "the kill waits for nothing on the GTK thread"
+        );
+        fake.clear();
+        close
+    }
+
+    /// The worker publishes, late: nvim answered the close without quitting.
+    fn publish_the_cancel(fake: &Fake) {
+        fake.answer(true, true, "n");
+        *fake.settled.borrow_mut() = None;
+    }
+
+    /// nvim's own process goes, and the pane reports its exit.
+    fn nvim_goes(fake: &Fake, quitting: &EditorQuitting) -> Vec<String> {
+        fake.pending.set(false);
+        fake.exited.set(true);
+        fake.clear();
+        quitting.nvim_exited();
+        fake.log()
+    }
+
+    /// A window close is cancelled in nvim's prompt, then its launcher exits and `prefix x`
+    /// is confirmed before the worker publishes the answer or the cancel letter is read.
+    /// The kill carries the potentially live close. A late cancel letter removes that close,
+    /// so nvim's exit retires the editor without reusing the cancelled `y` to close a window
+    /// that still has a running tab.
+    #[test]
+    fn a_close_cancelled_as_the_launcher_went_lends_no_y_to_a_kill() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        let close = a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        assert_eq!(quitting.cancelled(close), Cancel::CloseWithdrawn);
+        assert_eq!(
+            nvim_goes(&fake, &quitting),
+            ["retire_editor"],
+            "the editor, as asked -- not the window"
+        );
+    }
+
+    /// An answer published after a kill joins a window close must still withdraw the cancelled close.
+    /// Waiting on the watch with a 500 ms bound could miss it, ignore the old cancellation generation,
+    /// and close the window when nvim exited. Reading the answer again at exit removes the close
+    /// even without a cancellation letter from the pane-switch shim.
+    #[test]
+    fn a_cancel_published_after_any_bound_still_takes_the_close_back() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        publish_the_cancel(&fake);
+        assert_eq!(nvim_goes(&fake, &quitting), ["retire_editor"]);
+
+        // With the letter as well, read after the answer: the same.
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        let close = a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        publish_the_cancel(&fake);
+        assert_eq!(quitting.cancelled(close), Cancel::CloseWithdrawn);
+        assert_eq!(nvim_goes(&fake, &quitting), ["retire_editor"]);
+    }
+
+    /// A close carried by a kill needs the same known outcome as a standalone close. If its
+    /// request is still unsettled after the wait, keep only the kill: retire the editor and
+    /// leave the window open.
+    #[test]
+    fn a_carried_close_still_unsettled_at_the_exit_is_not_trusted() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        assert_eq!(nvim_goes(&fake, &quitting), ["retire_editor"]);
+    }
+
+    /// A later request that sends nothing reads the carried close's request too: answered, the close
+    /// is taken out there, and the exit -- even one that would let a live close stand -- retires the
+    /// editor.
+    #[test]
+    fn a_later_request_sees_the_carried_close_was_answered() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        publish_the_cancel(&fake);
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        let asked = quitting.in_flight.borrow().clone().unwrap();
+        assert_eq!((asked.quit, asked.lent_by), (EditorQuit::Module, None));
+        *fake.settled.borrow_mut() = Some(CallWatch {
+            sent_at: Instant::now(),
+            done: true,
+            returned: false,
+            last_answer: None,
+        });
+        assert_eq!(nvim_goes(&fake, &quitting), ["retire_editor"]);
+    }
+
+    /// A repeated `prefix x` while nvim is unreachable carries the pending close under the
+    /// new kill's generation but preserves the close's own identity. A late cancel letter
+    /// can therefore remove the close from the second kill too.
+    #[test]
+    fn a_repeated_kill_carries_the_close_on_and_the_letter_still_finds_it() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        let close = a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+        assert_eq!(quitting.in_flight.borrow().as_ref().unwrap().lent_by, Some(close));
+        assert_eq!(quitting.cancelled(close), Cancel::CloseWithdrawn);
+        *fake.settled.borrow_mut() = Some(CallWatch {
+            sent_at: Instant::now(),
+            done: true,
+            returned: false,
+            last_answer: None,
+        });
+        assert_eq!(nvim_goes(&fake, &quitting), ["retire_editor"]);
+    }
+
+    /// A window close asked after the kill is a close of its own, which no answer of nvim's to the
+    /// older one takes back: a late letter for that older close leaves it, and nvim's exit closes
+    /// the window.
+    #[test]
+    fn a_later_window_close_is_its_own_and_a_late_letter_leaves_it() {
+        let fake = Fake::new();
+        let quitting = flow(&fake);
+        let close = a_kill_over_a_close_whose_cancel_is_late(&fake, &quitting);
+        *fake.prompt.borrow_mut() = None;
+        assert_eq!(quitting.window_close(), WindowClose::Wait);
+        assert_eq!(quitting.cancelled(close), Cancel::Ignored);
+        publish_the_cancel(&fake);
+        assert_eq!(nvim_goes(&fake, &quitting), ["close_window_confirmed"]);
+    }
+
+    /// A request that sends nothing never waits on the GTK thread, whether a kill joins a close
+    /// whose dialog is still open, a close joins an older close, or a kill joins another kill.
+    #[test]
+    fn a_request_that_sends_nothing_never_waits_on_the_gtk_thread() {
+        let joins = [
+            (EditorQuit::Window { confirmed: None }, EditorQuit::Module),
+            (
+                EditorQuit::Window { confirmed: None },
+                EditorQuit::Window { confirmed: None },
+            ),
+            (EditorQuit::Module, EditorQuit::Module),
+        ];
+        for (older, newer) in joins {
+            let fake = Fake::new();
+            let quitting = flow(&fake);
+            quitting.ask(older.clone()).unwrap();
+            fake.answer(false, false, "r?");
+            fake.running.set(false);
+            fake.pending.set(true);
+            assert_eq!(quitting.ask(newer.clone()), Ok(AskedNvim::Ending));
+            assert_eq!(fake.settle_waits.get(), 0, "{older:?} then {newer:?}");
+        }
     }
 
     /// The quit's answer reaches a worker through the RPC oneshot, but nvim's exit does not

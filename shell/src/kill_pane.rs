@@ -99,6 +99,26 @@ pub(crate) struct Asked {
     /// A quit joined to nvim after it already exited has no request of its own and sets this
     /// to `false`.
     pub(crate) sent: bool,
+    /// A kill of the editor that sent nothing (nvim out of reach, or just exited) and joined an
+    /// older window close nvim was sent and had not answered: the close wins ([`merge`]), and this
+    /// is that close's generation, since its request -- not this quit's, which has none -- says
+    /// whether it still stands. Its cancel letter, or its request coming back answered, however
+    /// late either is read, takes the close back out ([`Asked::withdraw_lent_close`]): the kill is
+    /// what is left. Only
+    /// ever set on an unsent `Window` whose own request was a kill, so what it withdraws to is
+    /// always [`EditorQuit::Module`].
+    pub(crate) lent_by: Option<u32>,
+}
+
+impl Asked {
+    /// The window close this quit carries was cancelled in nvim ([`Asked::lent_by`]): nvim's exit
+    /// then does what the kill asked, retiring the editor, and never closes the window on that
+    /// close's `y`.
+    pub(crate) fn withdraw_lent_close(&mut self) {
+        if self.lent_by.take().is_some() {
+            self.quit = EditorQuit::Module;
+        }
+    }
 }
 
 pub(crate) type QuitInFlight = Option<Asked>;
@@ -146,7 +166,7 @@ pub(crate) enum NvimState {
     /// nvim's loop has not answered for [`NVIM_QUIT_PATIENCE`]: stuck (a Lua busy loop, a stopped
     /// process), or waiting on an external command (`system()`, `:!`, a formatter a save hook runs),
     /// during which nvim answers nothing (see [`NvimState::Busy`]). A second request then ends it
-    /// (`editor_quit`'s `QuitHost::end_nvim`: stdin closed, SIGTERM, SIGKILL by pid after the
+    /// (`editor_quit`'s `QuitHost::end_nvim`: SIGTERM and stdin closed, SIGKILL by pid after the
     /// patience), and [`not_answering_text`] says so.
     NotAnswering,
     /// Its `:confirm` dialog is up (`nvim_get_mode` says `r?`).
@@ -290,6 +310,7 @@ mod tests {
             quit,
             revealed: false,
             sent: true,
+            lent_by: None,
         }
     }
 
@@ -345,6 +366,29 @@ mod tests {
         let mut quitting: QuitInFlight = Some(older.clone());
         assert_eq!(clear_if_cancelled(&mut quitting, 5), None);
         assert_eq!(quitting, Some(older));
+    }
+
+    /// A kill carrying an older close takes it back out to itself; a close of its own, which no
+    /// request of nvim's can cancel, is never withdrawn.
+    #[test]
+    fn withdrawing_a_lent_close_leaves_the_kill_and_only_a_lent_one() {
+        let window = EditorQuit::Window {
+            confirmed: Some("x".into()),
+        };
+        let mut lent = Asked {
+            sent: false,
+            lent_by: Some(3),
+            ..asked(4, window.clone())
+        };
+        lent.withdraw_lent_close();
+        assert_eq!((lent.quit, lent.lent_by), (EditorQuit::Module, None));
+
+        let mut own = Asked {
+            sent: false,
+            ..asked(5, window.clone())
+        };
+        own.withdraw_lent_close();
+        assert_eq!(own.quit, window);
     }
 
     /// With no quit in flight, an editor quit, including a window close, asks nvim. Refuse a

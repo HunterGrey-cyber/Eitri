@@ -1,29 +1,33 @@
-//! Tracks the embedded nvim process and ends it without discarding unsaved buffers with `:qa!`.
+//! Tracks the embedded nvim process so the editor can end it without discarding swap files.
 //!
-//! `:qa!` discards unsaved buffers and deletes their swap files. Normal quitting uses
-//! `:confirm qall` so the user can respond. Closing stdin with `LiveHarness::hang_up` lets nvim
-//! exit while keeping swap files. If it remains running, [`end`] signals the held process with
-//! SIGTERM, which can also end a dialog that EOF does not. SIGKILL follows when [`SCHEDULE`]
-//! expires.
+//! `:qa!` discards unsaved buffers and deletes their swap files. `shell::editor_quit` uses
+//! `:confirm qall` to ask the user. `LiveHarness::hang_up` closes stdin, letting nvim exit
+//! with its swap files intact. If nvim stays running, [`end`] sends SIGTERM, then SIGKILL
+//! when [`SCHEDULE`] expires. SIGTERM also ends a dialog that EOF alone does not end.
+//! When a prompt may be open, [`SCHEDULE_IN_A_PROMPT`] sends SIGTERM before closing stdin:
+//! after EOF the fork's exit request fails, leaving nvim waiting for a key it cannot receive.
+//! `tests/no_force_quit.rs` checks that shutdown never sends `:qa!`.
 //!
-//! [`NvimProcess`] identifies nvim from two sources, in order of preference:
+//! [`NvimProcess`] uses nvim's own pid when available, with process discovery as a fallback.
+//! Once the session is up, [`NvimProcess::learn`] asks nvim `getpid()` over RPC on a separate
+//! thread. This identifies nvim even when a shell script on `PATH` or a `NEOVIM_BIN` launcher
+//! starts it without `exec`. The fork's direct child can be that launcher, with `--embed`
+//! in its argv; signalling the launcher alone would leave nvim running.
 //!
-//! 1. Once the session is running, [`NvimProcess::learn`] asks nvim for `getpid()` over RPC on a
-//!    separate thread. This identifies nvim even if a launcher script started it without `exec`.
-//!    Signalling only the direct child could kill that launcher and leave nvim running.
-//! 2. Before nvim can answer, [`NvimChild::find_new`] compares direct children before and after
-//!    `LiveHarness::with_options`. It accepts the new child carrying `--embed` only if its
-//!    `/proc/<pid>/exe` is named `nvim`. Otherwise it looks for that process's single `--embed`
-//!    child whose executable is nvim. It holds this child from launch, since an exiting launcher
-//!    leaves nvim reparented. If neither identifies nvim, [`Ended::Unknown`] signals nothing and
-//!    only the harness report indicates whether nvim ended.
+//! Before nvim answers, [`NvimChild::find_new`] compares direct children before and after
+//! `LiveHarness::with_options` to find the new child with `--embed` in its argv. It accepts
+//! that process only if `/proc/<pid>/exe` names `nvim`. Otherwise it looks for that process's
+//! `--embed` child whose executable is `nvim`. The process is held from launch because an
+//! exiting launcher leaves nvim re-parented. If neither can be identified, nothing is
+//! signalled ([`Ended::Unknown`]); only the fork's report says whether nvim ended.
 //!
-//! A pidfd pins the exact process, preventing a signal from reaching a later process that reuses
-//! its pid. Signalling an exited process yields `ESRCH`. Without pidfds, on kernels before 5.3,
-//! each signal first rechecks `--embed` and, for a direct child, that it is still our child.
+//! A pidfd pins the held process, preventing signals from reaching another process that
+//! reuses its pid. Signalling a process that has already exited is a no-op (`ESRCH`).
+//! Without a pidfd, as on kernels before 5.3, each signal first checks that the pid still
+//! carries `--embed` and, for the fork's direct child, still belongs to this process.
 //!
-//! Only Linux implements process tracking. Elsewhere no process is held or signalled, so only
-//! hanging up ends nvim.
+//! Only Linux is implemented. Elsewhere no process is held or signalled; only the hang-up
+//! ends nvim.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -170,9 +174,11 @@ impl NvimProcess {
     }
 }
 
-/// When [`end`] escalates, counted from the moment nvim's stdin was closed.
+/// When [`end`] closes nvim's stdin and escalates, counted from the moment the ending starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Schedule {
+    /// nvim's stdin is closed (the fork's `LiveHarness::hang_up`) then, if nvim still lives.
+    pub(crate) hang_up_after: Duration,
     /// SIGTERM from then on, once per `term_every`, while nvim lives.
     pub(crate) term_after: Duration,
     pub(crate) term_every: Duration,
@@ -193,42 +199,94 @@ pub(crate) enum Ended {
     Unknown,
 }
 
-/// The signal schedule used by [`end`] after closing nvim's stdin.
+/// The default ending schedule for [`end`]: close stdin immediately, send SIGTERM from 1 s,
+/// and send SIGKILL at 5 s if nvim has not exited.
 pub(crate) const SCHEDULE: Schedule = Schedule {
+    hang_up_after: Duration::ZERO,
     term_after: Duration::from_secs(1),
     term_every: Duration::from_secs(1),
     kill_after: Duration::from_secs(5),
 };
 
-/// Ends nvim after stdin was closed at `hung_up_at` and returns how it ended.
-/// EOF lets nvim preserve modified buffers in swap files instead of discarding them with `:qa!`.
-/// With nvim 0.12.5, EOF also writes edits that were not yet synced into those files.
-/// If EOF does not end nvim, such as in a `:confirm` dialog or after EOF was dropped during an
-/// external command, send SIGTERM from `term_after`, repeated every `term_every`.
-/// Nvim's `preserve_exit` handler preserves edits and swap files and can end the dialog.
-/// At `kill_after`, send SIGKILL to the held pid if needed; unsynced edits may then be lost.
-/// Blocks until exit, at most `kill_after` plus a reap. Returns `Unknown` immediately if no nvim
-/// process is known.
-pub(crate) fn end(process: &NvimProcess, hung_up_at: Instant, schedule: Schedule) -> Ended {
-    process
-        .with_nvim(|nvim| end_one(nvim, hung_up_at, schedule))
-        .unwrap_or(Ended::Unknown)
+/// The schedule for an nvim that may be in a prompt (the quit follow-up, 2026-09-28): SIGTERM at
+/// once, while nvim's stdin -- its one channel to the UI -- is still open; stdin closed at 1 s;
+/// SIGTERM again each second; SIGKILL at 5 s, still the last resort.
+///
+/// Why the order matters there, measured on nvim 0.12.5 under the pinned fork's own `lua/init.lua`
+/// (`an_nvim_in_its_quit_dialog_exits_on_sigterm_sent_first`, and the matrix in
+/// `ending_orders_in_a_quit_dialog`): EOF during `:confirm qall`'s dialog does nothing (the stdio
+/// channel's exit event skips `preserve_exit` while `exiting` is set, and `:qall` sets it before
+/// it asks). A SIGTERM after it runs `preserve_exit` -- the swap files get what nvim had not synced,
+/// deadly signals are refused from then on -- and `getout`, whose `VimLeavePre` runs the fork's
+/// `rpcrequest(neovide_channel_id, "neovide.quit", ...)` on the channel EOF already closed. That
+/// error sets `did_emsg`, so `getout` calls `wait_return`, which inside the dialog's own prompt
+/// (`vgetc_busy == 0`) waits for a key no UI can send; the later SIGTERMs are refused, and only the
+/// SIGKILL at 5 s ends it (the GUI re-check's 2/2). Sent first, SIGTERM finds the channel open, the
+/// fork answers, and nvim exits within milliseconds, the edit in the swap either way.
+pub(crate) const SCHEDULE_IN_A_PROMPT: Schedule = Schedule {
+    hang_up_after: Duration::from_secs(1),
+    term_after: Duration::ZERO,
+    term_every: Duration::from_secs(1),
+    kill_after: Duration::from_secs(5),
+};
+
+/// Uses [`SCHEDULE_IN_A_PROMPT`] while this pane's `:confirm qall` request is outstanding,
+/// when nvim may be in a prompt. Otherwise uses [`SCHEDULE`], which idle nvim answers on EOF alone.
+pub(crate) fn schedule(may_be_in_a_prompt: bool) -> Schedule {
+    if may_be_in_a_prompt {
+        SCHEDULE_IN_A_PROMPT
+    } else {
+        SCHEDULE
+    }
 }
 
-fn end_one(nvim: &NvimChild, hung_up_at: Instant, schedule: Schedule) -> Ended {
+/// Ends nvim on `schedule`, measured from `started_at`, and returns how it ended.
+/// Calls `hang_up` once at `hang_up_after`, or sooner if nvim is gone or no nvim process is known.
+/// A caller that already closed stdin passes a no-op.
+///
+/// EOF lets idle nvim preserve modified buffers in swap files instead of discarding them with
+/// `:qa!`. With nvim 0.12.5, it also writes edits not yet synced into those files.
+/// Send SIGTERM from `term_after`, repeated every `term_every`. Nvim's `preserve_exit` handler
+/// preserves edits and swap files and can end a dialog. When nvim may be in a prompt, send SIGTERM
+/// before closing stdin ([`SCHEDULE_IN_A_PROMPT`]) so its exit request can still reach the UI.
+/// At `kill_after`, send SIGKILL to the held pid if needed; unsynced edits may then be lost.
+/// Blocks until exit, at most `kill_after` plus a reap. Returns `Unknown` after hanging up if no
+/// nvim process is known.
+pub(crate) fn end(process: &NvimProcess, started_at: Instant, schedule: Schedule, hang_up: &mut dyn FnMut()) -> Ended {
+    match process.with_nvim(|nvim| end_one(nvim, started_at, schedule, &mut *hang_up)) {
+        Some(ended) => ended,
+        None => {
+            hang_up();
+            Ended::Unknown
+        }
+    }
+}
+
+fn end_one(nvim: &NvimChild, started_at: Instant, schedule: Schedule, hang_up: &mut dyn FnMut()) -> Ended {
+    let mut hung_up = false;
     let mut terminated = false;
     let mut next_term = schedule.term_after;
+    let mut hang_up_once = |hung_up: &mut bool| {
+        if !*hung_up {
+            *hung_up = true;
+            hang_up();
+        }
+    };
     loop {
-        let elapsed = hung_up_at.elapsed();
         let gone = |terminated| if terminated { Ended::Terminated } else { Ended::Exited };
+        if !imp::alive_within(nvim, Duration::ZERO) {
+            hang_up_once(&mut hung_up);
+            return gone(terminated);
+        }
+        let elapsed = started_at.elapsed();
+        if elapsed >= schedule.hang_up_after {
+            hang_up_once(&mut hung_up);
+        }
         if elapsed >= schedule.kill_after {
-            if !imp::alive_within(nvim, Duration::ZERO) {
-                return gone(terminated);
-            }
             let delivered = imp::signal(nvim, libc::SIGKILL);
             let reaped = nvim.reap(Duration::from_millis(500));
             println!(
-                "[live] nvim (pid {}) did not exit within {:?} of its hang-up: SIGKILL {}, {}",
+                "[live] nvim (pid {}) did not exit within {:?}: SIGKILL {}, {}",
                 nvim.pid(),
                 schedule.kill_after,
                 if delivered { "sent" } else { "not needed" },
@@ -236,17 +294,30 @@ fn end_one(nvim: &NvimChild, hung_up_at: Instant, schedule: Schedule) -> Ended {
             );
             return Ended::Killed;
         }
-        let checkpoint = next_term.min(schedule.kill_after);
-        if !imp::alive_within(nvim, checkpoint.saturating_sub(elapsed)) {
-            return gone(terminated);
-        }
-        if hung_up_at.elapsed() >= next_term && next_term < schedule.kill_after {
+        if elapsed >= next_term && next_term < schedule.kill_after {
             if imp::signal(nvim, libc::SIGTERM) && !terminated {
-                println!("[live] nvim (pid {}) did not exit on its hang-up; SIGTERM", nvim.pid());
+                terminated = true;
+                println!(
+                    "[live] nvim (pid {}): SIGTERM {}",
+                    nvim.pid(),
+                    if hung_up {
+                        "(it did not exit on its hang-up)"
+                    } else {
+                        "(its stdin still open: it may be in a prompt)"
+                    }
+                );
             }
-            terminated = true;
             next_term += schedule.term_every;
         }
+        let mut checkpoint = schedule.kill_after;
+        if !hung_up {
+            checkpoint = checkpoint.min(schedule.hang_up_after);
+        }
+        if next_term < schedule.kill_after {
+            checkpoint = checkpoint.min(next_term);
+        }
+        // Waits for the next step, or for nvim to go; `alive_within` answers at once when it has.
+        let _ = imp::alive_within(nvim, checkpoint.saturating_sub(started_at.elapsed()));
     }
 }
 
@@ -528,6 +599,7 @@ mod tests {
 
     /// Short enough for a test; the product's own is [`SCHEDULE`].
     const QUICK: Schedule = Schedule {
+        hang_up_after: Duration::ZERO,
         term_after: Duration::from_millis(300),
         term_every: Duration::from_millis(200),
         kill_after: Duration::from_millis(1500),
@@ -545,7 +617,7 @@ mod tests {
         nvim.kill().expect("kill");
         nvim.wait().expect("reaped by its owner");
         let started = Instant::now();
-        assert_eq!(end(&process, Instant::now(), QUICK), Ended::Exited);
+        assert_eq!(end(&process, Instant::now(), QUICK, &mut || {}), Ended::Exited);
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "no wait for what is gone"
@@ -627,8 +699,8 @@ mod tests {
         // SIGSTOP, so neither the hang-up nor SIGTERM ends it and `end` must reach the pid it holds.
         // SAFETY: a signal to the nvim this test's own wrapper started.
         unsafe { libc::kill(nvim as libc::pid_t, libc::SIGSTOP) };
-        drop(launched.stdin.take());
-        let ended = end(&process, Instant::now(), QUICK);
+        let mut stdin = launched.stdin.take();
+        let ended = end(&process, Instant::now(), QUICK, &mut || drop(stdin.take()));
         let nvim_gone = wait_gone(nvim, Duration::from_secs(2));
         // Cleanup first, by the pids this test started, so a failing assert leaves nothing behind.
         if !nvim_gone {
@@ -662,7 +734,7 @@ mod tests {
         }
         let process = NvimProcess::new(NvimChild::find_new(&before));
         let watched = process.nvim_pid();
-        let ended = end(&process, Instant::now(), QUICK);
+        let ended = end(&process, Instant::now(), QUICK, &mut || {});
         std::thread::sleep(Duration::from_millis(100));
         let alive = running(other.id());
         let _ = other.kill();
@@ -723,7 +795,7 @@ mod tests {
         assert!(!process.learn(launcher + 1_000_000), "a pid that is no nvim is refused");
         assert_eq!(process.nvim_pid(), Some(reported));
 
-        let ended = end(&process, Instant::now(), QUICK);
+        let ended = end(&process, Instant::now(), QUICK, &mut || {});
         let nvim_gone = wait_gone(reported, Duration::from_secs(2));
         if !nvim_gone {
             // SAFETY: a signal to the nvim this test's own wrapper started.
@@ -779,7 +851,7 @@ mod tests {
         let orphan_alive = running(reported);
         let seen_found = found.alive_within(Duration::from_millis(100));
         let seen_told = told.alive_within(Duration::from_millis(100));
-        let ended = end(&found, Instant::now(), QUICK);
+        let ended = end(&found, Instant::now(), QUICK, &mut || {});
         let gone_found = found.alive_within(Duration::from_secs(2));
         let gone_told = told.alive_within(Duration::from_secs(2));
         if running(reported) {
@@ -812,6 +884,9 @@ mod tests {
     /// Idle nvim exits on EOF. In a `:confirm` dialog, nvim 0.12.5 needs SIGTERM, whose handler writes
     /// the edit to the swap file. A stopped process needs SIGKILL, which cannot flush the edit.
     /// The original file is never written and the swap file remains in every case.
+    ///
+    /// This test UI answers no requests and installs no `VimLeavePre` hook, so SIGTERM after EOF ends
+    /// the dialog here. [`fork_nvim`] checks the ending order with the harness's own UI.
     fn ending(case: &str, dialog: bool, stop: bool) -> (Ended, bool, bool, bool) {
         use std::io::Write;
         let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
@@ -885,13 +960,14 @@ mod tests {
             // SAFETY: a signal to the child this test spawned and still holds.
             unsafe { libc::kill(nvim.id() as libc::pid_t, libc::SIGSTOP) };
         }
-        drop(stdin);
         let schedule = Schedule {
+            hang_up_after: Duration::ZERO,
             term_after: Duration::from_millis(500),
             term_every: Duration::from_millis(250),
             kill_after: Duration::from_millis(2000),
         };
-        let ended = end(&process, Instant::now(), schedule);
+        let mut stdin = Some(stdin);
+        let ended = end(&process, Instant::now(), schedule, &mut || drop(stdin.take()));
         let gone = !running(nvim.id());
         let swap_files: Vec<PathBuf> = std::fs::read_dir(&swap)
             .map(|d| d.flatten().map(|e| e.path()).collect())
@@ -934,13 +1010,370 @@ mod tests {
         assert_eq!(ended, Ended::Killed);
     }
 
+    /// The pinned fork's `lua/init.lua`, as cargo resolved the fork for this workspace
+    /// (`tests/no_force_quit.rs` finds it the same way): what the fork runs in every nvim it starts.
+    fn fork_init_lua() -> String {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the workspace root");
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+            ])
+            .arg(workspace.join("Cargo.toml"))
+            .output()
+            .expect("cargo metadata runs");
+        assert!(
+            output.status.success(),
+            "cargo metadata: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("metadata is JSON");
+        let manifest = metadata["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .find(|p| p["name"] == "neovide")
+            .expect("the neovide fork is a dependency")["manifest_path"]
+            .as_str()
+            .expect("a manifest path")
+            .to_owned();
+        let init = Path::new(&manifest)
+            .parent()
+            .expect("its directory")
+            .join("lua/init.lua");
+        let lua = std::fs::read_to_string(&init).unwrap_or_else(|e| panic!("{}: {e}", init.display()));
+        assert!(
+            lua.contains("\"VimLeavePre\"") && lua.contains("rpcrequest(\"neovide.quit\""),
+            "the case: the fork's VimLeavePre asks its UI, by request, to quit ({})",
+            init.display()
+        );
+        lua
+    }
+
+    /// The fork's own UI answers requests: `neovide.quit`, the one its `VimLeavePre` makes, with nil
+    /// (`bridge/handler.rs`). This answers every request with nil, which is all an exit asks of it.
+    /// Written out as `async_trait` expands it, which is how nvim-rs declares the trait.
+    #[derive(Clone)]
+    struct ForkUi;
+
+    impl nvim_rs::Handler for ForkUi {
+        type Writer = neovide::bridge::NeovimWriter;
+
+        fn handle_request<'life0, 'async_trait>(
+            &'life0 self,
+            _name: String,
+            _args: Vec<nvim_rs::Value>,
+            _neovim: nvim_rs::Neovim<Self::Writer>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<nvim_rs::Value, nvim_rs::Value>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Ok(nvim_rs::Value::Nil) })
+        }
+    }
+
+    /// nvim as the pinned fork starts it for neovibe, with an edit made half a second before its
+    /// ending: `--embed` over the fork's own session (whose `HangUp` closes stdin while the
+    /// connection lives), the fork's `lua/init.lua` run as `setup_neovide_specific_state` runs it, a
+    /// UI attached with the fork's options and answering as the fork does. `a.txt` holds "original"
+    /// on disk; the edit, "late edit", is not in the swap file when the ending starts
+    /// (`updatetime` as given, and asserted). With `dialog`, `:confirm qall` is open, sent as the
+    /// pane sends it.
+    struct ForkNvim {
+        runtime: tokio::runtime::Runtime,
+        session: neovide::bridge::session::NeovimSession,
+        process: NvimProcess,
+        pid: u32,
+        dir: PathBuf,
+        swap: PathBuf,
+    }
+
+    const LATE_EDIT: &[u8] = b"late edit";
+
+    fn swap_holds(swap: &Path, text: &[u8]) -> bool {
+        std::fs::read_dir(swap).is_ok_and(|dir| {
+            dir.flatten().any(|entry| {
+                std::fs::read(entry.path()).is_ok_and(|bytes| bytes.windows(text.len()).any(|w| w == text))
+            })
+        })
+    }
+
+    /// A request's answer, or a failed test naming it: nvim never hangs a test.
+    fn answered<T>(what: &str, within: Result<T, tokio::time::error::Elapsed>) -> T {
+        within.unwrap_or_else(|_| panic!("{what}: no answer within 5 s"))
+    }
+
+    fn fork_nvim(case: &str, updatetime: u32, dialog: bool) -> ForkNvim {
+        use nvim_rs::Value;
+        let dir = scratch(case);
+        let swap = dir.join("swap");
+        std::fs::create_dir_all(&swap).expect("swap dir");
+        std::fs::write(dir.join("a.txt"), "original\n").expect("a.txt");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut command = tokio::process::Command::new("nvim");
+        command
+            .args(["--clean", "--embed", "--cmd"])
+            .arg(format!("set directory={}//", swap.display()))
+            .arg("--cmd")
+            .arg(format!("set updatetime={updatetime}"))
+            .arg("a.txt")
+            .current_dir(&dir)
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"));
+        let session = runtime
+            .block_on(neovide::bridge::session::NeovimSession::new(
+                neovide::bridge::session::NeovimInstance::Embedded(command),
+                ForkUi,
+            ))
+            .expect("nvim must be on PATH for this test");
+        let nvim = session.neovim.clone();
+        let init_lua = fork_init_lua();
+        let pid = runtime.block_on(async {
+            let deadline = Duration::from_secs(5);
+            let info = answered(
+                "get_api_info",
+                tokio::time::timeout(deadline, nvim.get_api_info()).await,
+            )
+            .expect("api info");
+            let args = Value::Map(vec![
+                ("neovide_channel_id".into(), info[0].clone()),
+                ("neovide_version".into(), "test".into()),
+                ("config_path".into(), "".into()),
+                ("register_clipboard".into(), false.into()),
+                ("register_right_click".into(), false.into()),
+                ("remote".into(), false.into()),
+                ("global_variable_settings".into(), Value::Array(vec![])),
+                ("option_settings".into(), Value::Array(vec![])),
+            ]);
+            answered(
+                "init.lua",
+                tokio::time::timeout(deadline, nvim.exec_lua(&init_lua, vec![args])).await,
+            )
+            .expect("the fork's init.lua runs");
+            let mut options = nvim_rs::UiAttachOptions::new();
+            options.set_linegrid_external(true);
+            options.set_multigrid_external(true);
+            options.set_rgb(true);
+            answered(
+                "ui_attach",
+                tokio::time::timeout(deadline, nvim.ui_attach(80, 24, &options)).await,
+            )
+            .expect("ui_attach");
+            answered(
+                "getpid",
+                tokio::time::timeout(deadline, nvim.call_function("getpid", vec![])).await,
+            )
+            .expect("getpid")
+            .as_u64()
+            .expect("a pid") as u32
+        });
+        let process = NvimProcess::new(None);
+        assert!(process.learn(pid), "nvim is a live --embed process");
+        let edited_at = Instant::now();
+        runtime.block_on(async {
+            let edit = nvim.exec_lua("vim.api.nvim_buf_set_lines(0, 0, -1, false, {'late edit'})", vec![]);
+            answered("the edit", tokio::time::timeout(Duration::from_secs(5), edit).await).expect("the edit");
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_dir(&swap).map(|d| d.count()).unwrap_or(0) == 0 {
+            assert!(Instant::now() < deadline, "{case}: nvim never made its swap file");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if dialog {
+            // Sent as the pane sends its quit, an RPC request that comes back only when the dialog is
+            // answered -- here, never.
+            let quit = nvim.clone();
+            runtime.spawn(async move {
+                let _ = quit.exec_lua("pcall(vim.cmd, 'confirm qall')", vec![]).await;
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mode = runtime
+                    .block_on(async { tokio::time::timeout(Duration::from_secs(1), nvim.get_mode()).await })
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|pairs| {
+                        pairs
+                            .into_iter()
+                            .find(|(k, _)| k.as_str() == Some("mode"))
+                            .and_then(|(_, v)| v.as_str().map(str::to_owned))
+                    });
+                if mode.as_deref() == Some("r?") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{case}: the dialog never came up ({mode:?})");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500).saturating_sub(edited_at.elapsed()));
+        assert!(
+            !swap_holds(&swap, LATE_EDIT),
+            "{case}: the case -- the edit is not in the swap file yet"
+        );
+        ForkNvim {
+            runtime,
+            session,
+            process,
+            pid,
+            dir,
+            swap,
+        }
+    }
+
+    /// What one ending of a [`fork_nvim`] did.
+    #[derive(Debug)]
+    struct Outcome {
+        ended: Ended,
+        took: Duration,
+        /// The edit reached the swap file.
+        kept: bool,
+        /// nvim's own deadly-signal handler ran `preserve_exit` (it says so on stderr).
+        preserved: bool,
+    }
+
+    /// Ends a [`fork_nvim`] on `schedule`; the hang-up is the fork's own `HangUp`.
+    fn end_fork_nvim(case: &str, updatetime: u32, dialog: bool, schedule: Schedule) -> Outcome {
+        let _serial = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fork = fork_nvim(case, updatetime, dialog);
+        let hang_up = fork.session.hang_up.clone();
+        let started = Instant::now();
+        let ended = end(&fork.process, started, schedule, &mut || hang_up.hang_up());
+        let took = started.elapsed();
+        let gone = wait_gone(fork.pid, Duration::from_secs(2));
+        if !gone {
+            // SAFETY: a signal to the nvim this test started, by the pid it reported.
+            unsafe { libc::kill(fork.pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let stderr = fork.session.stderr_task.take().map_or_else(Vec::new, |task| {
+            fork.runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+        });
+        let kept = swap_holds(&fork.swap, LATE_EDIT);
+        let untouched = std::fs::read_to_string(fork.dir.join("a.txt")).is_ok_and(|text| text == "original\n");
+        let dir = fork.dir.clone();
+        drop(fork.session);
+        fork.runtime.shutdown_timeout(Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "{case}: nvim is gone after end() ({ended:?})");
+        assert!(untouched, "{case}: nothing was written over the file");
+        Outcome {
+            ended,
+            took,
+            kept,
+            preserved: stderr.iter().any(|line| line.contains("preserving files")),
+        }
+    }
+
+    /// Under the harness's UI, nvim in its `:confirm qall` dialog exits on SIGTERM while stdin is
+    /// still open. The edit made 0.5 s earlier reaches its swap file even with `updatetime` at 10 s.
+    /// Closing stdin first makes the UI exit request fail on the closed channel; nvim then waits
+    /// for a key in the dialog until SIGKILL at 5 s.
+    #[test]
+    fn an_nvim_in_its_quit_dialog_exits_on_sigterm_sent_first() {
+        let outcome = end_fork_nvim("fork-dialog", 10_000, true, schedule(true));
+        assert_eq!(outcome.ended, Ended::Terminated, "{outcome:?}");
+        assert!(
+            outcome.took < SCHEDULE_IN_A_PROMPT.hang_up_after,
+            "it exited before its stdin was closed: {outcome:?}"
+        );
+        assert!(outcome.kept && outcome.preserved, "{outcome:?}");
+    }
+
+    /// Without a known prompt, idle nvim under the harness's UI exits on EOF alone.
+    /// Its edit is preserved in the swap file and no signal is sent.
+    #[test]
+    fn an_idle_nvim_under_the_forks_ui_exits_on_the_hang_up() {
+        let outcome = end_fork_nvim("fork-idle", 10_000, false, schedule(false));
+        assert_eq!(outcome.ended, Ended::Exited, "{outcome:?}");
+        assert!(outcome.took < SCHEDULE.term_after, "{outcome:?}");
+        assert!(outcome.kept, "{outcome:?}");
+    }
+
+    /// Measures shutdown orders with nvim in its `:confirm qall` dialog under the fork's UI.
+    /// The edit is made 0.5 s before shutdown, with `updatetime` set to 4 s and 10 s.
+    /// Ignored because it takes about 25 s, mostly waiting for SIGKILLs. The assertions capture
+    /// nvim 0.12.5 behavior; a newer nvim or fork that differs fails rather than passing silently.
+    ///
+    /// | order | ends | edit in swap, 4 s | edit in swap, 10 s |
+    /// |---|---|---|---|
+    /// | EOF only | SIGKILL at 5 s | yes (nvim synced it idle, at 4 s) | **no** |
+    /// | SIGTERM only | SIGTERM, ms | yes | yes |
+    /// | EOF, SIGTERM from 1 s | SIGKILL at 5 s | yes (SIGTERM's `preserve_exit`) | yes |
+    /// | SIGTERM, EOF at 1 s | SIGTERM, ms | yes | yes |
+    ///
+    /// When idle, closing stdin first exits on EOF; signalling first exits on SIGTERM.
+    #[test]
+    #[ignore = "a measurement: about 25 s of real nvim endings; run with --include-ignored"]
+    fn ending_orders_in_a_quit_dialog() {
+        let never = Duration::from_secs(5);
+        let eof_only = Schedule {
+            hang_up_after: Duration::ZERO,
+            term_after: never,
+            ..SCHEDULE
+        };
+        let sigterm_only = Schedule {
+            hang_up_after: never,
+            term_after: Duration::ZERO,
+            ..SCHEDULE
+        };
+        let quick = Duration::from_millis(900);
+        for updatetime in [4_000, 10_000] {
+            let rows = [
+                ("eof-only", eof_only, true),
+                ("sigterm-only", sigterm_only, true),
+                ("eof-then-sigterm", SCHEDULE, true),
+                ("sigterm-then-eof", SCHEDULE_IN_A_PROMPT, true),
+                ("idle-eof-then-sigterm", SCHEDULE, false),
+                ("idle-sigterm-then-eof", SCHEDULE_IN_A_PROMPT, false),
+            ];
+            for (name, schedule, dialog) in rows {
+                let outcome = end_fork_nvim(&format!("fork-{name}-{updatetime}"), updatetime, dialog, schedule);
+                println!("updatetime {updatetime:>5}  {name:22} {outcome:?}");
+                let (ended, fast, kept) = match name {
+                    "eof-only" => (Ended::Killed, false, updatetime < 5_000),
+                    "sigterm-only" | "sigterm-then-eof" | "idle-sigterm-then-eof" => (Ended::Terminated, true, true),
+                    "eof-then-sigterm" => (Ended::Killed, false, true),
+                    "idle-eof-then-sigterm" => (Ended::Exited, true, true),
+                    _ => unreachable!(),
+                };
+                assert_eq!(outcome.ended, ended, "{name} at {updatetime}: {outcome:?}");
+                assert_eq!(outcome.took < quick, fast, "{name} at {updatetime}: {outcome:?}");
+                assert_eq!(outcome.kept, kept, "{name} at {updatetime}: {outcome:?}");
+                if name == "eof-then-sigterm" {
+                    assert!(outcome.preserved, "SIGTERM's handler ran before the wait: {outcome:?}");
+                }
+            }
+        }
+    }
+
+    /// No process known to be nvim: nothing is signalled, and the hang-up -- all that can end it --
+    /// happens at once, whatever the schedule says.
     #[test]
     fn nothing_known_is_nothing_ended() {
-        let schedule = Schedule {
-            term_after: Duration::ZERO,
-            term_every: Duration::from_millis(10),
-            kill_after: Duration::from_millis(10),
-        };
-        assert_eq!(end(&NvimProcess::new(None), Instant::now(), schedule), Ended::Unknown);
+        let mut hung_up = 0;
+        let started = Instant::now();
+        let ended = end(&NvimProcess::new(None), started, SCHEDULE_IN_A_PROMPT, &mut || {
+            hung_up += 1
+        });
+        assert_eq!(ended, Ended::Unknown);
+        assert_eq!(hung_up, 1);
+        assert!(started.elapsed() < Duration::from_millis(100), "nothing waited for");
     }
 }

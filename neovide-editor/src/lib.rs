@@ -163,9 +163,10 @@ pub struct LiveSession {
     nvim_process: Arc<nvim_child::NvimProcess>,
     /// The last [`NeovideEditorPane::exec_lua_watched`] request and its watch (`nvim_rpc`).
     watched: Option<nvim_rpc::WatchedCall>,
-    /// When nvim's stdin was closed ([`NeovideEditorPane::end_nvim`]), so a second ending -- the
-    /// window's shutdown after it -- keeps to the first one's schedule and starts no second watch.
-    hung_up_at: Cell<Option<Instant>>,
+    /// When the ending started, and on which schedule ([`NeovideEditorPane::end_nvim`]), so a
+    /// second ending -- the window's shutdown after it -- keeps to the first one's schedule and
+    /// starts no second watch.
+    ending: Cell<Option<(Instant, nvim_child::Schedule)>>,
     /// Whether [`NeovideEditorPane::on_nvim_unreachable`]'s callback has fired for this session.
     unreachable_said: Cell<bool>,
 }
@@ -198,7 +199,7 @@ impl LiveSession {
             last_logged_layout: Cell::new(None),
             nvim_process,
             watched: None,
-            hung_up_at: Cell::new(None),
+            ending: Cell::new(None),
             unreachable_said: Cell::new(false),
         }
     }
@@ -211,6 +212,14 @@ impl LiveSession {
     /// Returns `false` when no nvim process is known; only the harness report is available then.
     fn exit_pending(&self) -> bool {
         self.harness.has_neovim_exited() && self.nvim_process.alive_within(Duration::ZERO) == Some(true)
+    }
+
+    /// The schedule an ending starting now takes (`nvim_child::schedule`): nvim may be in a prompt
+    /// when its `:confirm qall` request -- the only prompt this pane knows of -- has not come back.
+    /// Without a process known to be nvim there is nothing to signal, and the hang-up comes first.
+    fn ending_schedule(&self) -> nvim_child::Schedule {
+        let quit_outstanding = self.watched.as_ref().is_some_and(|call| !call.watch().done);
+        nvim_child::schedule(quit_outstanding && self.nvim_process.nvim_pid().is_some())
     }
 
     /// Prints `[layout] fb=WxH cell=W×H grid=CxR band_top=Npx` when the layout differs from the
@@ -1830,27 +1839,48 @@ impl NeovideEditorPane {
         }
     }
 
-    /// Ends nvim by closing its stdin with `LiveHarness::hang_up`, preserving swap files instead of
-    /// sending `:qa!`. A worker targets nvim's held pid, sending SIGTERM after 1 s and SIGKILL after
-    /// 5 s if needed. SIGTERM also ends dialogs that EOF does not.
+    /// Ends nvim without `:qa!`, preserving swap files. Uses `nvim_child::schedule`: normally close
+    /// stdin now and send SIGTERM from 1 s; if this pane's `:confirm qall` is outstanding, send SIGTERM
+    /// now and close stdin at 1 s. The stdin timer runs here because the harness lives on this thread.
+    /// A worker signals nvim's held pid and escalates to SIGKILL at 5 s if needed.
     /// Exit reaches [`on_exited_unrequested`](Self::on_exited_unrequested) once the process is gone.
     /// Idempotent: another call starts no second watch. Returns `false` without a live session.
     pub fn end_nvim(&self) -> bool {
         let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() else {
             return false;
         };
-        if session.hung_up_at.get().is_some() {
+        if session.ending.get().is_some() {
             return true;
         }
         let at = Instant::now();
-        session.hung_up_at.set(Some(at));
-        session.harness.hang_up();
-        let process = session.nvim_process.clone();
+        let schedule = session.ending_schedule();
+        session.ending.set(Some((at, schedule)));
         let watched = session.nvim_process.nvim_pid();
-        println!("[live] end_nvim: nvim's stdin is closed; watching pid {watched:?} until it has gone");
+        if schedule.hang_up_after.is_zero() {
+            session.harness.hang_up();
+            println!("[live] end_nvim: nvim's stdin is closed; watching pid {watched:?} until it has gone");
+        } else {
+            let live = Rc::downgrade(&self.live_state);
+            glib::timeout_add_local_once(schedule.hang_up_after, move || {
+                let Some(live) = live.upgrade() else { return };
+                let mut live = live.borrow_mut();
+                if let LiveState::Ready(session) = &mut *live {
+                    // Idempotent, and harmless once nvim has gone.
+                    session.harness.hang_up();
+                    println!("[live] end_nvim: nvim's stdin is closed");
+                }
+            });
+            println!(
+                "[live] end_nvim: nvim may be in its prompt: SIGTERM first, stdin closed in {:?}; watching pid \
+                 {watched:?} until it has gone",
+                schedule.hang_up_after
+            );
+        }
+        let process = session.nvim_process.clone();
         run_detached(
             Box::new(move || {
-                let ended = nvim_child::end(&process, at, nvim_child::SCHEDULE);
+                // The hang-up is this thread's timer's, above: the harness is not `Send`.
+                let ended = nvim_child::end(&process, at, schedule, &mut || {});
                 println!("[live] end_nvim: {ended:?}");
             }),
             spawn_named("nvim end"),
@@ -1945,10 +1975,15 @@ impl NeovideEditorPane {
             // `LiveSession::close_requested`'s doc) is already tripped when nvim actually exits: a
             // shutdown the host itself initiated must not also reach it as an unrequested exit.
             session.close_requested.set(true);
-            let at = session.hung_up_at.get().unwrap_or_else(Instant::now);
-            session.hung_up_at.set(Some(at));
-            session.harness.hang_up();
-            let ended = nvim_child::end(&session.nvim_process, at, nvim_child::SCHEDULE);
+            let (at, schedule) = session
+                .ending
+                .get()
+                .unwrap_or_else(|| (Instant::now(), session.ending_schedule()));
+            session.ending.set(Some((at, schedule)));
+            // On this thread, blocking: `end` closes stdin itself when the schedule says, since an
+            // earlier `end_nvim`'s timer cannot run until this returns.
+            let harness = &mut session.harness;
+            let ended = nvim_child::end(&session.nvim_process, at, schedule, &mut || harness.hang_up());
             println!("[live] shutdown(): nvim's stdin is closed ({ended:?}); tearing the harness down");
             let exited_cleanly = session.harness.shutdown();
             println!("[live] LiveHarness::shutdown() returned {exited_cleanly}");

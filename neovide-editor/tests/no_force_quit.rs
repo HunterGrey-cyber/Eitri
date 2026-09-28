@@ -51,9 +51,9 @@ fn force_quits(text: &str) -> Vec<String> {
 }
 
 /// String literal contents and start offsets from Rust source, including plain, raw, byte and
-/// C strings. Comments, nested block comments, literals and char literals are blanked out
-/// byte for byte in the code copy so offsets agree. Closing quotes distinguish char literals
-/// from lifetimes.
+/// C strings. [`unescape`] decodes escapes in non-raw strings. Comments, nested block comments,
+/// literals and char literals are blanked out byte for byte in the code copy so offsets agree.
+/// Closing quotes distinguish char literals from lifetimes.
 struct Lexed {
     literals: Vec<(usize, String)>,
     code: String,
@@ -125,7 +125,7 @@ fn lex_rust(text: &str) -> Lexed {
                     while j < b.len() && b[j] != b'"' {
                         j += if b[j] == b'\\' { 2 } else { 1 };
                     }
-                    literals.push((i, text[start..j.min(b.len())].to_string()));
+                    literals.push((i, unescape(&text[start..j.min(b.len())])));
                     j + 1
                 };
                 blank(&mut code, i, end);
@@ -153,6 +153,71 @@ fn lex_rust(text: &str) -> Lexed {
         literals,
         code: String::from_utf8(code).expect("blanking keeps UTF-8"),
     }
+}
+
+/// Decode a plain, byte or C string literal's body so the matcher sees what nvim receives.
+/// Handle `\n`, `\r`, `\t`, `\\`, `\0`, `\'`, `\"`, two-digit `\x` escapes, and `\u{...}`
+/// with hex digits and optional underscores. A backslash ending a line drops the line break
+/// and following whitespace. Keep anything else as written. Raw strings have no escapes
+/// and never reach this function.
+fn unescape(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some(q @ ('\\' | '\'' | '"')) => out.push(q),
+            Some('x') => {
+                let hex: String = (0..2).filter_map(|_| chars.next_if(char::is_ascii_hexdigit)).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    // A byte string's `\x80`..`\xff` is one byte, not a char: as Latin-1 it cannot
+                    // spell an ASCII command, which is all the matcher looks for.
+                    Ok(byte) if hex.len() == 2 => out.push(char::from(byte)),
+                    _ => {
+                        out.push_str("\\x");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some('u') if chars.peek() == Some(&'{') => {
+                chars.next();
+                let mut hex = String::new();
+                while let Some(d) = chars.next_if(|d| *d != '}') {
+                    hex.push(d);
+                }
+                let closed = chars.next_if_eq(&'}').is_some();
+                let digits: String = hex.chars().filter(|d| *d != '_').collect();
+                match u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) if closed => out.push(decoded),
+                    _ => {
+                        out.push_str("\\u{");
+                        out.push_str(&hex);
+                        if closed {
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            Some('\n') => while chars.next_if(|w| w.is_whitespace()).is_some() {},
+            Some('\r') if chars.peek() == Some(&'\n') => {
+                chars.next();
+                while chars.next_if(|w| w.is_whitespace()).is_some() {}
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Where the test code starts: the first `#[cfg(test)]` or `#[cfg(all(test` in real code.
@@ -292,6 +357,62 @@ mod tests { const X: &str = \"qa!\"; }"
         found(r#"fn f() { g("ParallelCommand::Quit is gone"); }"#).is_empty(),
         "named in a string"
     );
+}
+
+/// Decode force-quit commands spelled with `\x`, `\u{...}` or line continuations in plain,
+/// byte and C strings, including escapes in the bang or command name. Raw strings and escaped
+/// backslashes preserve the backslash that nvim receives and do not form those commands.
+#[test]
+fn an_escaped_force_quit_is_read_as_the_compiler_decodes_it() {
+    let found = |src: &str| rust_offences(src);
+    assert_eq!(
+        found(r#"fn f() { pane.exec_lua_watched("vim.cmd('qa\x21')"); }"#),
+        ["qa!"],
+        "codex's own case"
+    );
+    assert_eq!(
+        found(r#"fn f() { g("\x71a!"); }"#),
+        ["qa!"],
+        "an escape in the command name"
+    );
+    assert_eq!(
+        found(r#"fn f() { g("q\u{61}ll\u{21}"); }"#),
+        ["qall!"],
+        "unicode escapes"
+    );
+    assert_eq!(
+        found(r#"fn f() { g("qa\u{0_0_21}"); }"#),
+        ["qa!"],
+        "underscores in a unicode escape"
+    );
+    assert_eq!(found(r#"fn f() { g("\x63q"); }"#), ["cq"], "cq needs no bang");
+    assert_eq!(found(r#"fn f() { g("\u{63}\u{71}"); }"#), ["cq"]);
+    assert_eq!(
+        found("fn f() { g(\"q\\\n        a!\"); }"),
+        ["qa!"],
+        "a line continuation drops the break and the indent"
+    );
+    assert_eq!(found(r#"const B: &[u8] = b"wq\x21";"#), ["wq!"], "a byte string");
+    assert_eq!(found(r#"const C: &CStr = c"qa\x21";"#), ["qa!"], "a C string");
+    assert_eq!(
+        found(r#"fn f() { g("a \"\x71a!\" b"); }"#),
+        ["qa!"],
+        "an escape next to escaped quotes"
+    );
+    assert!(
+        found(r#"fn f() { g(r"qa\x21"); }"#).is_empty(),
+        "a raw string has no escapes"
+    );
+    assert!(
+        found(r#"fn f() { g("qa\\x21"); }"#).is_empty(),
+        "an escaped backslash: nvim gets `qa\\x21`"
+    );
+    assert!(
+        found(r#"fn f() { g("qa\x2"); }"#).is_empty(),
+        "half an escape decodes to nothing"
+    );
+    assert_eq!(unescape(r"a\tb\n\0\'\\"), "a\tb\n\0'\\");
+    assert_eq!(unescape(r"\q\u{zz}\u{21"), r"\q\u{zz}\u{21", "kept as written");
 }
 
 #[test]
