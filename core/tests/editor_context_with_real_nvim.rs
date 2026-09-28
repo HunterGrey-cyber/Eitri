@@ -27,17 +27,32 @@ fn drive_nvim(
     file: &std::path::Path,
     normal_command: &str,
 ) -> Option<EditorContext> {
+    drive_nvim_with(feed, reader, file, &[], &[normal_command])
+}
+
+/// [`drive_nvim`] with extra startup arguments (`--clean`) ahead of the feed's own, and several
+/// commands run in order before the sleep.
+fn drive_nvim_with(
+    feed: &EditorContextFeed,
+    reader: &mut EditorContextReader,
+    file: &std::path::Path,
+    startup_args: &[&str],
+    commands: &[&str],
+) -> Option<EditorContext> {
     let mut command = std::process::Command::new("nvim");
     command.arg("--headless");
+    command.args(startup_args);
     for arg in feed.nvim_args() {
         command.arg(arg);
     }
     for (key, value) in feed.child_env() {
         command.env(key, value);
     }
+    command.args(["-c", &format!("edit {}", file.display())]);
+    for each in commands {
+        command.args(["-c", each]);
+    }
     let status = command
-        .args(["-c", &format!("edit {}", file.display())])
-        .args(["-c", normal_command])
         .args(["-c", "sleep 600m"])
         .args(["-c", "qa!"])
         .stdin(std::process::Stdio::null())
@@ -173,4 +188,192 @@ fn the_sender_marks_only_selections_longer_than_2000_unicode_characters() {
     assert_eq!(longer.selection.unwrap().text, format!("{text}{TRUNCATION_MARKER}"));
     feed.cleanup();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The 400-line cap can truncate a selection below `CONTENT_LIMIT` of 2000 characters.
+/// For 401 one-character lines, the retained 400 lines contain only 799 characters.
+/// Mark that truncation so the model cannot mistake a partial selection for a complete one.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_selection_past_the_line_cap_marks_truncation_even_under_the_character_limit() {
+    let dir = std::env::temp_dir().join(format!("nv-w1-linecap-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("short_lines.txt");
+
+    // The control: exactly 400 one-character lines, selected in full. Nothing is dropped, so no
+    // marker belongs here -- this is Codex's own positive control, reproduced against real nvim.
+    std::fs::write(&file, "x\n".repeat(400)).unwrap();
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let at_cap = drive_nvim(&feed, &mut reader, &file, "normal! 1GVG").expect("an update must arrive");
+    let selection = at_cap.selection.expect("V mode must report a selection");
+    assert_eq!((selection.start_line, selection.end_line), (1, 400));
+    assert_eq!(selection.text, "x\n".repeat(400).trim_end());
+    assert!(
+        !selection.text.contains(TRUNCATION_MARKER),
+        "exactly 400 lines drops nothing: {}",
+        selection.text
+    );
+    feed.cleanup();
+
+    // One line over: the reported range must still be the TRUE one (1 to 401), and the dropped
+    // 401st line must now be marked even though the kept 400 lines are only 799 characters.
+    std::fs::write(&file, "x\n".repeat(401)).unwrap();
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let over_cap = drive_nvim(&feed, &mut reader, &file, "normal! 1GVG").expect("an update must arrive");
+    let selection = over_cap.selection.expect("V mode must report a selection");
+    assert_eq!(
+        (selection.start_line, selection.end_line),
+        (1, 401),
+        "the reported range must be the TRUE one, never the capped one"
+    );
+    let expected_body = "x\n".repeat(400);
+    let expected_body = expected_body.trim_end();
+    assert_eq!(
+        selection.text,
+        format!("{expected_body}{TRUNCATION_MARKER}"),
+        "400 lines is what was actually sent, and it must say so"
+    );
+    feed.cleanup();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// When the line cap truncates a blockwise selection, keep the cursor's endpoint column.
+/// Using `i32::MAX` widens every retained line to its full width and sends unselected text
+/// to the model. The test selects two columns across 500 lines of `abcdefgh` and checks
+/// both the column boundary and the truncation marker.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_capped_block_selection_sends_only_the_selected_columns() {
+    let dir = std::env::temp_dir().join(format!("nv-w1-block-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("wide_lines.txt");
+
+    // Use 300 lines and columns 1-2 as the uncapped control, so the test also catches regressions
+    // in ordinary block selections. `\u{16}` is a literal Ctrl-V byte that `:normal!` reads as
+    // the key for entering blockwise visual mode, just as it would a real keypress.
+    std::fs::write(&file, "abcdefgh\n".repeat(300)).unwrap();
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let below_cap = drive_nvim(&feed, &mut reader, &file, "normal! 1G0\u{16}299jl").expect("an update must arrive");
+    let selection = below_cap.selection.expect("block mode must report a selection");
+    assert_eq!((selection.start_line, selection.end_line), (1, 300));
+    let expected = vec!["ab"; 300].join("\n");
+    assert_eq!(selection.text, expected);
+    assert!(!selection.text.contains(TRUNCATION_MARKER));
+    feed.cleanup();
+
+    // Above the cap: 500 lines, columns 1-2. Before the fix this sent 8-column "abcdefgh" lines,
+    // capped to 224 lines by the character limit the wide text hit early, with no marker.
+    std::fs::write(&file, "abcdefgh\n".repeat(500)).unwrap();
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let above_cap = drive_nvim(&feed, &mut reader, &file, "normal! 1G0\u{16}499jl").expect("an update must arrive");
+    let selection = above_cap.selection.expect("block mode must report a selection");
+    assert_eq!(
+        (selection.start_line, selection.end_line),
+        (1, 500),
+        "the reported range must be the TRUE one, never the capped one"
+    );
+    let expected_body = vec!["ab"; 400].join("\n");
+    assert_eq!(
+        selection.text,
+        format!("{expected_body}{TRUNCATION_MARKER}"),
+        "only the selected 2 columns of the kept 400 lines may travel, never the full 8-column width"
+    );
+    feed.cleanup();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A capped block must keep the selected display columns when the cap line contains a tab. This
+/// case selects columns 1-2 across 500 lines, with `\tXYZ` on line 400. Reusing byte column 2
+/// there would select through display column 9 and send `abcdefghi` instead of `ab`.
+///
+/// The same nvim writes `getregion` for the whole uncapped selection as the oracle. Each
+/// returned snippet line must match that line of the oracle exactly; truncation may remove
+/// lines but cannot change columns. `--clean` excludes user configuration so each case controls
+/// `virtualedit` and `selection`.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_capped_block_selection_keeps_its_display_columns_across_a_tab() {
+    let dir = std::env::temp_dir().join(format!("nv-w1-blocktab-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("tab_at_the_cap.txt");
+    let oracle = dir.join("uncapped.txt");
+    let mut lines = vec!["abcdefghijklmnop"; 500];
+    lines[399] = "\tXYZ";
+    std::fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+    let oracle_cmd = format!(
+        "lua vim.fn.writefile(vim.fn.getregion(vim.fn.getpos('v'), vim.fn.getpos('.'), \
+         {{ type = vim.fn.mode() }}), '{}')",
+        oracle.display()
+    );
+
+    // (settings, keys, the columns every plain line must show, how many lines must be kept).
+    // With 'virtualedit' off a position cannot sit inside the <Tab>, so no corner on line 400
+    // yields columns 1-2 and that line gives way to line 399. With `block` it can, and all 400
+    // lines are kept, the <Tab> line exactly as nvim's own getregion draws it.
+    let cases: [(&str, &str, &str, usize); 4] = [
+        ("set virtualedit=", "normal! 1G0\u{16}499jl", "ab", 399),
+        ("set virtualedit=block", "normal! 1G0\u{16}499jl", "ab", 400),
+        // The lower corner LEFT of the upper one: the block is still columns 1-2.
+        ("set virtualedit=", "normal! 1G0l\u{16}499jh", "ab", 399),
+        // 'selection' exclusive: the block ends just before the lower corner, so it is column 1.
+        (
+            "set selection=exclusive virtualedit=",
+            "normal! 1G0\u{16}499jl",
+            "a",
+            399,
+        ),
+    ];
+    for (settings, keys, columns, kept) in cases {
+        let _ = std::fs::remove_file(&oracle);
+        let mut feed = EditorContextFeed::new().expect("the feed must bind");
+        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+        let context = drive_nvim_with(&feed, &mut reader, &file, &["--clean"], &[settings, keys, &oracle_cmd])
+            .unwrap_or_else(|| panic!("{settings} / {keys:?}: an update must arrive"));
+        let selection = context
+            .selection
+            .unwrap_or_else(|| panic!("{settings} / {keys:?}: block mode must report a selection"));
+        assert_eq!(
+            (selection.start_line, selection.end_line),
+            (1, 500),
+            "{settings} / {keys:?}: the reported range must be the TRUE one"
+        );
+        let uncapped = std::fs::read_to_string(&oracle).expect("the oracle must have been written");
+        let uncapped: Vec<&str> = uncapped.lines().collect();
+        assert_eq!(
+            uncapped.len(),
+            500,
+            "{settings} / {keys:?}: the oracle is the whole block"
+        );
+        assert_eq!(
+            uncapped[0], columns,
+            "{settings} / {keys:?}: the case selects what it says"
+        );
+        let body = selection.text.strip_suffix(TRUNCATION_MARKER).unwrap_or_else(|| {
+            panic!(
+                "{settings} / {keys:?}: a capped block must say so: {:?}",
+                selection.text
+            )
+        });
+        let sent: Vec<&str> = body.split('\n').collect();
+        assert_eq!(
+            sent.len(),
+            kept,
+            "{settings} / {keys:?}: lines kept; first sent line {:?}",
+            sent[0]
+        );
+        assert_eq!(
+            sent[..],
+            uncapped[..kept],
+            "{settings} / {keys:?}: every line sent must be nvim's own for the uncapped block"
+        );
+        feed.cleanup();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

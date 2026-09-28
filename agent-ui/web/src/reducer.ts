@@ -134,7 +134,14 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return { ...state, transcript: [...state.transcript, { seq, text: event.text }], assistantMessageOpen: true };
     }
     case "tool_call_started": {
-      const record: ToolCallRecord = { seq, toolUseId: event.tool_use_id, name: event.name, input: event.input, result: null };
+      const record: ToolCallRecord = {
+        seq,
+        toolUseId: event.tool_use_id,
+        name: event.name,
+        input: event.input,
+        result: null,
+        turnId: event.turn_id,
+      };
       // A tool call only happens between assistant messages, so the streaming text ended here.
       return { ...state, toolCalls: [...state.toolCalls, record], assistantMessageOpen: false };
     }
@@ -304,13 +311,12 @@ export function keepAfterSidecarStop(state: AgentUiState, reason: string): Agent
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
-  // The snapshot omits `assistantMessageOpen`, `nextSeq` and `turnThinking`; `AgentUiSnapshot`
-  // excludes these reducer-internal fields. Supply them here. Reset `assistantMessageOpen` so the
-  // next content event starts a new transcript entry instead of appending to a potentially closed
-  // message. Also reset `turnThinking`: a thinking delta folded before the snapshot does not show
-  // that thinking is happening now. Resync or reload may degrade `thinking` to `sent` but must not
-  // invent activity.
-  return { ...snapshot, assistantMessageOpen: false, nextSeq: throughRevision, turnThinking: false };
+  // The snapshot omits `nextSeq` and `turnThinking`, which `AgentUiSnapshot` excludes as
+  // reducer-internal fields. Supply them here. Preserve `assistantMessageOpen` from the snapshot:
+  // Rust continues appending to an open reply, and resetting it would split that reply into two
+  // rows with broken markdown. Reset `turnThinking` because earlier thinking does not imply current
+  // activity. Resync or reload may degrade `thinking` to `sent` but must not invent activity.
+  return { ...snapshot, nextSeq: throughRevision, turnThinking: false };
 }
 
 /** Whether `resume_outcome` confirms the requested session. Share this predicate with

@@ -12,7 +12,10 @@ export function runSummary(calls: ToolCallRecord[]): string {
 
 /** Fold consecutive finished, ungated tool calls into one `run` row when there are at least
  *  two and another item follows or the turn has ended. Expanded runs and the detailed view keep
- *  every call. */
+ *  every call.
+ *
+ * Failed calls end a run and keep their own `✗` row. A run's fixed `✓` sign and count summary
+ * would otherwise hide the failure until the row was expanded. */
 export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineItem[] {
   if (opts.detailed) return timeline;
   const gated = new Set(
@@ -24,7 +27,7 @@ export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineI
     const start = i;
     while (i < timeline.length) {
       const item = timeline[i];
-      if (item.kind !== "tool" || item.call.result === null || gated.has(item.call.toolUseId)) break;
+      if (item.kind !== "tool" || item.call.result === null || item.call.result.isError || gated.has(item.call.toolUseId)) break;
       i++;
     }
     const length = i - start;

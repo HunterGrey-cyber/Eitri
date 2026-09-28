@@ -522,4 +522,55 @@ mod tests {
             "a highlight group changed after startup was never re-sent to the panel"
         );
     }
+    /// The periodic snapshot must not resend unchanged theme data. Each received payload
+    /// restyles the window, rethemes the WebView and queues editor and terminal renders on the
+    /// GTK thread; the shell does not deduplicate. An unconditional timer repeats that work
+    /// every three seconds in idle windows. With no changes after startup, no later connection
+    /// should arrive.
+    #[test]
+    #[ignore = "spawns a real nvim, and waits past two resnapshot intervals; run with: cargo test -p neovibe-core theme::feed -- --ignored"]
+    fn an_unchanged_theme_is_not_resent_by_the_periodic_resnapshot() {
+        let mut feed = ThemeFeed::new().expect("feed");
+        let listener = feed.take_listener().expect("listener");
+        let mut child = std::process::Command::new("nvim")
+            .args(["--headless", "--clean"])
+            .args(feed.nvim_args())
+            .args(["-c", "colorscheme retrobox"])
+            .envs(feed.child_env())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("nvim on PATH");
+
+        let started = Instant::now();
+        let mut arrivals = Vec::new();
+        while started.elapsed() < Duration::from_millis(7_500) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut line = String::new();
+                    let _ = std::io::Read::read_to_string(&mut stream, &mut line);
+                    arrivals.push((started.elapsed(), line));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        feed.cleanup();
+
+        assert!(!arrivals.is_empty(), "nvim never sent its startup payload");
+        let late: Vec<_> = arrivals
+            .iter()
+            .filter(|(at, _)| *at > Duration::from_millis(2_000))
+            .map(|(at, _)| *at)
+            .collect();
+        assert!(
+            late.is_empty(),
+            "an unchanged theme was re-sent at {late:?} ({} connections in all)",
+            arrivals.len()
+        );
+    }
 }

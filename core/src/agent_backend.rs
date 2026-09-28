@@ -20,7 +20,7 @@
 use agent::{
     AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
-    ResumableSession, UiDelivery,
+    ResumableSession, RevisedDelivery, UiDelivery,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -570,19 +570,59 @@ impl AgentBackend {
         approvals: &mut HumanApprovals,
         answered_for_you: &mut Vec<PromptAnsweredForYou>,
     ) -> UiDelivery {
+        self.take_revised_ui_delivery(project_root, rules, mode, host_answered, approvals, answered_for_you)
+            .without_revisions()
+    }
+
+    /// Notes that the panel received a snapshot at `revision`. The next drain takes this value through
+    /// [`Self::take_ui_snapshot_revision`] and excludes events tagged at or below it from its payload.
+    /// The backend keeps the revision so it cannot outlive the session whose snapshot was delivered.
+    ///
+    /// Only the sidecar needs this. Legacy folds events inside `take_revised_ui_delivery`
+    /// (`AgentSession::pump_revised`), so every event folded by the next drain is newer than a
+    /// snapshot taken between drains.
+    pub fn note_ui_snapshot(&mut self, revision: u64) {
+        match self {
+            AgentBackend::Legacy(_) => {}
+            AgentBackend::Sidecar(conversation) => conversation.note_ui_snapshot(revision),
+        }
+    }
+
+    /// Takes what [`Self::note_ui_snapshot`] recorded since the last take; always `None` on legacy.
+    pub fn take_ui_snapshot_revision(&mut self) -> Option<u64> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Sidecar(conversation) => conversation.take_ui_snapshot_revision(),
+        }
+    }
+
+    /// `take_ui_delivery_with_approvals`, preserving each event's fold revision (`agent::RevisedDelivery`).
+    /// `TabSet` uses these tags to exclude events already included in the last snapshot
+    /// ([`Self::note_ui_snapshot`]). Both backends tag events with the projection's `last_revision`
+    /// just after folding them, so the tags compare directly with snapshot revisions.
+    /// An event answered without a card is dropped with its tag; the others keep theirs in order.
+    pub fn take_revised_ui_delivery(
+        &mut self,
+        project_root: &Path,
+        rules: &agent::PrefixRules,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+        approvals: &mut HumanApprovals,
+        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+    ) -> RevisedDelivery {
         let delivery = match self {
             AgentBackend::Legacy(session) => {
-                let events = session.pump();
+                let events = session.pump_revised();
                 if events.is_empty() {
-                    UiDelivery::Nothing
+                    RevisedDelivery::Nothing
                 } else {
-                    UiDelivery::Events(events)
+                    RevisedDelivery::Events(events)
                 }
             }
-            AgentBackend::Sidecar(conversation) => conversation.take_ui_delivery(),
+            AgentBackend::Sidecar(conversation) => conversation.take_revised_ui_delivery(),
         };
         match delivery {
-            UiDelivery::Events(events) => {
+            RevisedDelivery::Events(events) => {
                 let kept = self.answer_what_needs_no_human(
                     events,
                     project_root,
@@ -595,9 +635,9 @@ impl AgentBackend {
                     },
                 );
                 if kept.is_empty() {
-                    UiDelivery::Nothing
+                    RevisedDelivery::Nothing
                 } else {
-                    UiDelivery::Events(kept)
+                    RevisedDelivery::Events(kept)
                 }
             }
             // A `Resync` carries no events to filter; the UI rebuilds from the projection.
@@ -641,12 +681,15 @@ impl AgentBackend {
     /// Otherwise the prompt is delivered as a card. A prompt marked `needs_a_human`, either
     /// forced by `permissions.ask` or of an unknown kind, is a card in every mode.
     /// Each prompt answered without a card adds its row note to `answered_for_you`.
+    ///
+    /// Each event keeps its fold revision from `take_revised_ui_delivery`. A kept event
+    /// retains its revision; a dropped event is removed together with its revision.
     fn answer_what_needs_no_human(
         &mut self,
-        events: Vec<AgentDomainEvent>,
+        events: Vec<(u64, AgentDomainEvent)>,
         project_root: &Path,
         cx: AnswerContext<'_>,
-    ) -> Vec<AgentDomainEvent> {
+    ) -> Vec<(u64, AgentDomainEvent)> {
         let AnswerContext {
             rules,
             mode,
@@ -658,7 +701,7 @@ impl AgentBackend {
         // the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK freeze).
         let mut tripped = self.projection().ungated_cli_mode.is_some();
         let mut kept = Vec::with_capacity(events.len());
-        for event in events {
+        for (revision, event) in events {
             tripped |= matches!(event, AgentDomainEvent::UngatedCliMode { .. });
             let AgentDomainEvent::PermissionRequested {
                 permission_id,
@@ -668,12 +711,12 @@ impl AgentBackend {
                 provider_prompt,
             } = &event
             else {
-                kept.push(event);
+                kept.push((revision, event));
                 continue;
             };
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the CLI reported an ungated mode");
-                kept.push(event);
+                kept.push((revision, event));
                 continue;
             }
             if let Some(prompt) = provider_prompt {
@@ -685,7 +728,7 @@ impl AgentBackend {
                         "[permission] asking the user: {tool_name} (the CLI's own prompt, only you answer it: {:?})",
                         prompt.label()
                     );
-                    kept.push(event);
+                    kept.push((revision, event));
                     continue;
                 }
                 if host_answered.contains(permission_id) {
@@ -702,7 +745,7 @@ impl AgentBackend {
                         "[permission] asking the user: {tool_name} (the CLI's own prompt: {:?})",
                         prompt.reason.as_deref().unwrap_or("no reason given")
                     );
-                    kept.push(event);
+                    kept.push((revision, event));
                     continue;
                 };
                 let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
@@ -726,7 +769,7 @@ impl AgentBackend {
                             "[permission] could not allow the CLI's own prompt for {tool_name}, showing a card instead: {}",
                             error.message
                         );
-                        kept.push(event);
+                        kept.push((revision, event));
                     }
                 }
                 continue;
@@ -748,7 +791,7 @@ impl AgentBackend {
                             "[permission] could not allow {tool_name} in bypass, showing a card instead: {}",
                             error.message
                         );
-                        kept.push(event);
+                        kept.push((revision, event));
                     }
                 }
                 continue;
@@ -763,7 +806,7 @@ impl AgentBackend {
                 // reading the classifier against the CLI's own `system/init`. One line per card,
                 // with the policy's own fixed reason, never anything the model wrote.
                 eprintln!("[permission] asking the user: {tool_name} ({})", classification.reason);
-                kept.push(event);
+                kept.push((revision, event));
                 continue;
             }
             // Cloned before the mutable borrow below, not for tidiness: `event` borrows from the
@@ -785,7 +828,7 @@ impl AgentBackend {
                         "[permission] could not auto-answer {tool_name}, showing a card instead: {}",
                         error.message
                     );
-                    kept.push(event);
+                    kept.push((revision, event));
                 }
             }
         }

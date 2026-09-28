@@ -113,6 +113,25 @@ describe("a tool call's result", () => {
     expect(pending).not.toEqual(done);
   });
 
+  it("sw-panel-render-6: renders a static notice instead of a permanent spinner for a call the panel knows is abandoned", () => {
+    // Before the fix, `result === null` meant "still running" unconditionally, so a call abandoned
+    // by session end or a resume/reload past its history boundary spun forever. `opts.abandoned` is
+    // `MessageList.tsx`'s own `isAbandonedCall` verdict, passed in here rather than recomputed --
+    // this level only asserts what `renderToolCall`/`ToolResult` draw once told.
+    const { container } = render(<>{renderToolCall(call({ result: null }), true, { abandoned: true })}</>);
+    const result = container.querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state")).toBe("none");
+    expect(result.getAttribute("aria-busy")).toBeNull();
+    expect(result.textContent).toContain("no result recorded");
+  });
+
+  it("keeps the running spinner for a null result the panel has no reason to call abandoned", () => {
+    const { container } = render(<>{renderToolCall(call({ result: null }), true, { abandoned: false })}</>);
+    const result = container.querySelector(".tool-result")!;
+    expect(result.getAttribute("data-state")).toBe("running");
+    expect(result.getAttribute("aria-busy")).toBe("true");
+  });
+
   it("marks an error result as an error and still shows what it said", () => {
     const { container } = render(
       <>{renderToolCall(call({ result: { content: "bash: nope: command not found", isError: true } }))}</>,

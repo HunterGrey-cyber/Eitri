@@ -122,21 +122,36 @@ export function stopsIn(root: HTMLElement): HTMLElement[] {
 
 /** The stop that currently holds the keyboard: the one containing the focused element, if focus
  *  is inside one; otherwise the conversation row at `cursor`, if there is one. `null` on a start
- *  screen before anything has been selected. */
-export function currentStop(root: HTMLElement, cursor: number | null): HTMLElement | null {
+ *  screen before anything has been selected.
+ *
+ *  `rows` is `conversationRows(root)` when the caller already holds it (`countedStop`), so the row
+ *  lookup costs no second scan of the whole tree; every other caller leaves it out. */
+export function currentStop(
+  root: HTMLElement,
+  cursor: number | null,
+  rows?: readonly HTMLElement[],
+): HTMLElement | null {
   const active = document.activeElement;
   if (active instanceof HTMLElement && active !== root && root.contains(active)) {
     const stop = stopOf(root, active);
     if (stop !== null) return stop;
   }
   if (cursor === null) return null;
-  return conversationRows(root)[cursor] ?? null;
+  return (rows ?? conversationRows(root))[cursor] ?? null;
 }
 
 /** Where `j` (+1) or `k` (-1) goes from the current stop. With nothing current (a start screen
- *  nobody has moved on yet), both land on the first stop. */
-export function nextStop(root: HTMLElement, cursor: number | null, delta: 1 | -1): HTMLElement | null {
-  const stops = stopsIn(root);
+ *  nobody has moved on yet), both land on the first stop.
+ *
+ *  `stops` defaults to a fresh `stopsIn(root)` (a DOM query). A caller that already holds that list
+ *  may pass it; a counted repeat no longer calls this per step at all (`countedStop`, below, whose
+ *  doc says why passing `stops` alone did not bound it). */
+export function nextStop(
+  root: HTMLElement,
+  cursor: number | null,
+  delta: 1 | -1,
+  stops: HTMLElement[] = stopsIn(root),
+): HTMLElement | null {
   if (stops.length === 0) return null;
   const current = currentStop(root, cursor);
   const index = current === null ? -1 : stops.indexOf(current);
@@ -150,6 +165,54 @@ export function rowIndexOf(root: HTMLElement, stop: HTMLElement): number | null 
   if (stop.getAttribute(STOP_ATTR) !== "row") return null;
   const index = conversationRows(root).indexOf(stop);
   return index === -1 ? null : index;
+}
+
+/** Where a counted `j`/`k` (`3j`, `1000j`) lands, and where it started. */
+export interface CountedLanding {
+  /** The stop the walk ends on. */
+  stop: HTMLElement;
+  /** Its index among the conversation rows, or `null` when it is not a row (a banner, Stop). */
+  row: number | null;
+  /** The stop the walk started from (`currentStop` before the first step), or `null`. */
+  from: HTMLElement | null;
+}
+
+/**
+ * A counted `j` (+1) or `k` (-1) takes `times` steps, each from the previous landing.
+ * The walk stops at a non-row stop or a clamped boundary, matching where single steps stop.
+ * Returns `null` when the region has no stops.
+ *
+ * Read the stops, rows and row indices once. Each step then moves along the index without DOM
+ * queries, so large counts do not trigger repeated full-tree scans.
+ *
+ * Steps after the first start from the walk's position rather than `document.activeElement`.
+ * Otherwise focus inside a stop would restart every step there and make `3j` move only once.
+ */
+export function countedStop(
+  root: HTMLElement,
+  cursor: number | null,
+  delta: 1 | -1,
+  times: number,
+): CountedLanding | null {
+  const own = ownStops(root);
+  const rows = own.filter((stop) => stop.getAttribute(STOP_ATTR) === "row");
+  const rowIndex = new Map(rows.map((row, i) => [row, i] as const));
+  const stops = own.filter((stop) => rowIndex.has(stop) || controlsOf(stop).length > 0);
+  if (stops.length === 0) return null;
+  const from = currentStop(root, cursor, rows);
+  let index = from === null ? -1 : stops.indexOf(from);
+  let landed: HTMLElement | null = null;
+  for (let n = 0; n < times; n++) {
+    const next = index === -1 ? 0 : clampStep(stops.length, index, delta);
+    // No progress: already at the boundary. The first step still lands (on the stop it started
+    // from), which is what tells the caller `j` could not move.
+    if (landed !== null && next === index) break;
+    landed = stops[next];
+    index = next;
+    if (!rowIndex.has(landed)) break;
+  }
+  if (landed === null) return null;
+  return { stop: landed, row: rowIndex.get(landed) ?? null, from };
 }
 
 /**

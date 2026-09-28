@@ -270,15 +270,20 @@ impl Screen {
     /// Clamp each grid dimension to at least one cell, matching `TIOCSWINSZ`, so `CSI 18 t`
     /// never reports `0x0`.
     ///
-    /// Resizing changes geometry without a parser dispatch, so it takes no snapshot here.
-    /// `Self::render` projects the resized live `term` once no update is open. Even an update
-    /// with no dispatched content clears `in_sync` when it ends or is aborted, regardless of
-    /// `SyncBarrier`'s `dirty` flag, so the next render sees the new size.
+    /// Resizing changes geometry without a parser dispatch, so it takes no frame snapshot here.
+    /// `Self::render` projects the resized live `term` once no update is open. Ending or
+    /// aborting even an empty update clears `in_sync`, regardless of `SyncBarrier`'s `dirty`
+    /// flag, so the next render sees the resize.
+    ///
+    /// Realign the scrollback anchor with [`ScrollView::observe`] because reflow can shift or
+    /// evict the retained line it points to. Resolving a stale anchor against the resized grid
+    /// could silently show a different line at the same index instead of reporting expiry.
     pub fn resize(&mut self, size: PtySize) {
         let size = size.clamped();
         self.size = size;
         self.term.resize(grid_size(size));
         self.dirty = true;
+        self.scroll.observe(&self.term);
     }
 
     /// Something outside the byte stream changed what the frame shows (focus).

@@ -194,6 +194,9 @@ export function Composer({
 
   useEffect(() => {
     if (restoredDraft === null) return;
+    // Show `restoredDraft` without mirroring it back to Rust. Tab switches and inbound draft echoes
+    // also trigger this effect, so unconditional mirroring would post an unwanted fresh draft.
+    // `App.tsx`'s send-refusal handler mirrors recovered text once, where it computes that text.
     setText(restoredDraft.text);
     caretRef.current = null;
     setWalk({ index: null, stash: "" });

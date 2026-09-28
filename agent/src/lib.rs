@@ -44,7 +44,7 @@ pub mod transcript;
 pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError};
 pub use event::{AgentEvent, PermissionSource};
-pub use ingestion::{IngestStats, ProjectionGuard, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
+pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UI_EVENT_QUEUE_CAPACITY};
 pub use permission_policy::{
     classify_permission_request, classify_with_rules, rule_that_allows, Classification, PermissionVerdict,
 };

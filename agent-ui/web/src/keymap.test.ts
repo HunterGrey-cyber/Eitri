@@ -1,9 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { BROWSE_KEYS, INPUT_KEYS, resolveKey } from "./keymap";
+import { BROWSE_KEYS, INPUT_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
-const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; isComposing: boolean; keyCode: number }> = {}) =>
-  ({ key: k, ctrlKey: false, shiftKey: false, isComposing: false, ...over });
+const key = (
+  k: string,
+  over: Partial<{
+    ctrlKey: boolean;
+    shiftKey: boolean;
+    isComposing: boolean;
+    keyCode: number;
+    altKey: boolean;
+    metaKey: boolean;
+    /** Creates a KeyLike whose getModifierState reports Super and Hyper held, matching the
+     *  modifier-query interface of KeyboardEvent. */
+    superKey: boolean;
+    /** `superKey` reports Super and Hyper together, so it cannot isolate a Hyper-only failure.
+     *  This reports Hyper alone, as a Hyper-only keypress would. */
+    hyperKey: boolean;
+    /** Creates a KeyLike whose getModifierState reports AltGraph held. This is the level-3
+     *  shift some layouts use to type ordinary characters such as @ and €. */
+    altGraphKey: boolean;
+  }> = {},
+) => {
+  const { superKey, hyperKey, altGraphKey, ...rest } = over;
+  return {
+    key: k,
+    ctrlKey: false,
+    shiftKey: false,
+    isComposing: false,
+    ...rest,
+    ...(superKey ? { getModifierState: (m: string) => m === "Super" || m === "Hyper" } : {}),
+    ...(hyperKey ? { getModifierState: (m: string) => m === "Hyper" } : {}),
+    ...(altGraphKey ? { getModifierState: (m: string) => m === "AltGraph" } : {}),
+  };
+};
 const ctx = { sessionEnded: false };
 
 /** Parses one BROWSE_KEYS[i].keys token after splitting on " / ". A two-key sequence such as
@@ -58,6 +88,28 @@ describe("resolveKey", () => {
     expect(resolveKey("input", key("a"), ctx)).toBeNull();
   });
 
+  /* Alt or Meta held with a card-answer key must not authorize or deny a card: OS shortcuts
+     such as Meta+A must not trigger permission answers. Bare a/d must still work. Super is a
+     separate GDK modifier and needs its own check. */
+  it("refuses Alt or Meta on a/d, but bare a/d still answer (R2)", () => {
+    expect(resolveKey("browse", key("a", { altKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a", { metaKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { altKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { metaKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
+    expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+  });
+
+  /* Checking altKey and metaKey alone misses Super and Hyper. This pure layer queries
+     getModifierState("Super"/"Hyper") to refuse modified card-answer keys. Whether WebKitGTK
+     supplies that state on another key's event must be checked separately. */
+  it("refuses Super (or Hyper) on a/d, but bare a/d still answer", () => {
+    expect(resolveKey("browse", key("a", { superKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { superKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a"), ctx)).toEqual({ kind: "answer", decision: "allow" });
+    expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
+  });
+
   it("offers restart only on a session that ended", () => {
     expect(resolveKey("browse", key("r"), ctx)).toBeNull();
     expect(resolveKey("browse", key("r"), { sessionEnded: true })).toEqual({ kind: "restart" });
@@ -93,6 +145,9 @@ describe("resolveKey", () => {
     // The three chords it DOES name (below) are named exactly: every other modifier set on the
     // same letters, and every other Ctrl/Shift letter a vim user might reach for, is still refused.
     expect(resolveKey("browse", key("d", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    // Ctrl+a reaches the blanket modifier refusal before `isPlainAnswerKey` is consulted.
+    // This checks Ctrl separately from the Alt, Meta and Super cases above.
+    expect(resolveKey("browse", key("a", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("U", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("G", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
@@ -120,6 +175,31 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("Y", { shiftKey: true }), ctx)).toEqual({ kind: "copy-output" });
     expect(resolveKey("browse", key("D", { shiftKey: true }), ctx)).toEqual({ kind: "deny-reason" });
     expect(resolveKey("browse", key("D", { shiftKey: true }), { sessionEnded: true })).toBeNull();
+  });
+
+  /* Shift+D is checked before the blanket modifier refusal, so Alt and Meta need their
+     own guard on this chord. */
+  it("refuses Alt or Meta on Shift+D (R2)", () => {
+    expect(resolveKey("browse", key("D", { shiftKey: true, altKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true, metaKey: true }), ctx)).toBeNull();
+  });
+
+  /* Shift+D needs its own Super/Hyper guard because it bypasses the blanket modifier refusal. */
+  it("refuses Super (or Hyper) on Shift+D", () => {
+    expect(resolveKey("browse", key("D", { shiftKey: true, superKey: true }), ctx)).toBeNull();
+  });
+
+  /* Card answers and bypass confirmation share `isPlainAnswerKey`. The a/d/D paths also reject
+     composing input at the start of `resolveKey`, before any chord or switch is checked.
+     Both `isComposing` and legacy WebKit's `keyCode === 229` must block answers, matching
+     `composerKeys.ts`'s `isImeKey`. */
+  it("refuses a/d/D while an input method is composing (C4, reconciled with the bypass y fix)", () => {
+    expect(resolveKey("browse", key("a", { isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true, isComposing: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("a", { keyCode: 229 }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("d", { keyCode: 229 }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("D", { shiftKey: true, keyCode: 229 }), ctx)).toBeNull();
   });
 
   /* The table keeps no memory: whether a `g` is the second of `gg` is the caller's fact, passed in. */
@@ -321,5 +401,98 @@ describe("the ? keymap tables", () => {
       expect(table.length).toBeGreaterThan(0);
       expect(new Set(table.map((row) => row.keys)).size).toBe(table.length);
     }
+  });
+});
+
+/* The a/d/D cases and `App.tsx`'s bypass-confirm y share `isPlainAnswerKey`.
+   Test it directly so callers can rely on its modifier and composition checks independently
+   of the routing in `resolveKey`. */
+describe("isPlainAnswerKey", () => {
+  it("is true for a bare key, and Shift alone does not disqualify it", () => {
+    expect(isPlainAnswerKey(key("a"))).toBe(true);
+    expect(isPlainAnswerKey(key("D", { shiftKey: true }))).toBe(true);
+  });
+
+  it("is false with Ctrl, Alt, or Meta held", () => {
+    expect(isPlainAnswerKey(key("a", { ctrlKey: true }))).toBe(false);
+    expect(isPlainAnswerKey(key("a", { altKey: true }))).toBe(false);
+    expect(isPlainAnswerKey(key("a", { metaKey: true }))).toBe(false);
+  });
+
+  it("is false with Super or Hyper held (the gap 325e007 had, before this reconciliation)", () => {
+    expect(isPlainAnswerKey(key("a", { superKey: true }))).toBe(false);
+  });
+
+  /* `superKey` reports Super and Hyper together, which cannot catch a check narrowed to Super
+     alone. Test Hyper alone directly through `isPlainAnswerKey`; routing the expected result
+     through `resolveKey` could reuse the same broken `hasSuperOrHyper` and agree with the bug. */
+  it("is false with Hyper held alone, not only together with Super (v1 audit fixes, finding 1)", () => {
+    expect(isPlainAnswerKey(key("a", { hyperKey: true }))).toBe(false);
+  });
+
+  /* AltGr is a level-3 shift key and needs its own `getModifierState("AltGraph")` check.
+     A key typed while AltGr is held must not answer a card or confirm bypass as a bare key.
+     `typingGuard.ts` separately treats a bare AltGraph press as a modifier.
+     These modifier-state reads have not been verified against real WebKitGTK. */
+  it("is false with AltGraph held", () => {
+    expect(isPlainAnswerKey(key("a", { altGraphKey: true }))).toBe(false);
+  });
+
+  it("is false while an input method is composing, by either signal", () => {
+    expect(isPlainAnswerKey(key("a", { isComposing: true }))).toBe(false);
+    expect(isPlainAnswerKey(key("a", { keyCode: 229 }))).toBe(false);
+  });
+});
+
+/** Check that the a/d cases and Shift+D agree with `isPlainAnswerKey` for each modifier.
+ *  Test Super and Hyper separately because the `superKey` helper reports both together.
+ *  Ctrl+Shift+D must use key "D" to reach the Shift+D arm; lowercase "d" does not exercise it.
+ *  Ctrl+d is excluded because it scrolls half a page before the answer switch is reached.
+ *
+ *  This matrix derives expectations from `isPlainAnswerKey`, so a bug in that predicate can
+ *  make both sides agree incorrectly. Its direct tests use hardcoded false expectations,
+ *  and `App.test.tsx` separately checks that no `confirm_bypass` is sent. */
+type ModifierCase = [
+  string,
+  Partial<{
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+    superKey: boolean;
+    hyperKey: boolean;
+    altGraphKey: boolean;
+    isComposing: boolean;
+    keyCode: number;
+  }>,
+];
+const MODIFIER_CASES: ModifierCase[] = [
+  ["bare", {}],
+  ["Ctrl", { ctrlKey: true }],
+  ["Alt", { altKey: true }],
+  ["Meta", { metaKey: true }],
+  ["Super alone", { superKey: true }],
+  ["Hyper alone", { hyperKey: true }],
+  ["AltGraph", { altGraphKey: true }],
+  ["composing", { isComposing: true }],
+  ["keyCode 229", { keyCode: 229 }],
+];
+
+describe("resolveKey's a/d/Shift+D agree with isPlainAnswerKey on every modifier it reads (v1 audit fixes, finding 1)", () => {
+  it.each(MODIFIER_CASES)("a: %s", (_name, mod) => {
+    const ev = key("a", mod);
+    const expected = isPlainAnswerKey(ev) ? { kind: "answer", decision: "allow" } : null;
+    expect(resolveKey("browse", ev, ctx)).toEqual(expected);
+  });
+
+  it.each(MODIFIER_CASES.filter(([name]) => name !== "Ctrl"))("d: %s", (_name, mod) => {
+    const ev = key("d", mod);
+    const expected = isPlainAnswerKey(ev) ? { kind: "answer", decision: "deny" } : null;
+    expect(resolveKey("browse", ev, ctx)).toEqual(expected);
+  });
+
+  it.each(MODIFIER_CASES)("Shift+D: %s", (_name, mod) => {
+    const ev = key("D", { ...mod, shiftKey: true });
+    const expected = isPlainAnswerKey(ev) ? { kind: "deny-reason" } : null;
+    expect(resolveKey("browse", ev, ctx)).toEqual(expected);
   });
 });

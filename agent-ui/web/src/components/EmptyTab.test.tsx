@@ -714,6 +714,30 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
+      /** A deferred `H` closes over the binding present at keydown. Replacing `panelTable` must
+       *  cancel the typing guard's deferred single-key callback as well as any multi-key sequence;
+       *  otherwise the old action still runs when `TYPING_GUARD_MS` elapses. */
+      it("replacing the table mid-guard-window drops the deferred H binding entirely (P2-A6)", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: "H" });
+          expect(onPanelAction).not.toHaveBeenCalled();
+          const replaced = {
+            ...TABLE,
+            bindings: TABLE.bindings.map((b) => (b.keys.join("") === "H" ? { ...b, action: "tab.next" as const } : b)),
+          };
+          rendered.rerender(<EmptyTab {...props} arriveRequest={1} panelTable={replaced} />);
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+          expect(onPanelAction).not.toHaveBeenCalled();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
       /** Typing "Looks good" in BROWSE must not switch tabs. The `o` within `TYPING_GUARD_MS` cancels
        *  the deferred `L` before it posts. */
       it('"Looks good" at 80 ms a key posts no tab_verb', () => {

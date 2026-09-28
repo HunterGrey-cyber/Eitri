@@ -1,26 +1,27 @@
-//! The toolkit-free pane-switch protocol: a private directory, a fake-`tmux` symlink, a socket
-//! receiving direction letters from the shim, and a parser. The same socket accepts `Q <generation>`
-//! from [`crate::layout::kill::editor_quit_lua`] when its requested `:confirm qall` is cancelled.
+//! The pane-switch protocol: a private directory, a fake-`tmux` symlink, a socket for
+//! one-letter directions, and a message parser. The same socket carries `Q <generation>`, sent by
+//! [`crate::layout::kill::editor_quit_lua`] when its `:confirm qall` request is cancelled.
+//! Toolkit-free.
 //!
-//! The directory also holds `nav_fallback.lua`, loaded with `--cmd`. It lets `Ctrl+h/j/k/l` leave
-//! the editor when vim-tmux-navigator is absent, and from Visual mode, sending the same letters
-//! to the same socket as the shim. It lives here because leaving can only work where the socket does.
+//! The directory also holds `nav_fallback.lua`, loaded with `--cmd`, which lets `Ctrl+h/j/k/l`
+//! leave the editor when vim-tmux-navigator is absent and from Visual mode.
+//! It writes the same direction letters to the same socket, so it lives beside the protocol.
 //!
-//! `shell::pane_switch` owns the polling driver. Its `glib::timeout_add_local` timer calls
-//! [`accept_pending_messages`] each tick and turns each message into a GTK focus grab, or clears a
-//! pending kill when a cancellation is reported. Keeping the protocol here and the polling in `shell`
-//! lets another host reuse the protocol with its own run-loop timer.
-//!
-//! `shell::pane_switch` documents why the shim impersonates `tmux` instead of intercepting keys,
-//! and how directions map to panes. That belongs with the pane and focus handling in `shell`.
+//! `shell::pane_switch` owns the `glib::timeout_add_local` timer. It constructs a
+//! [`PaneSwitchReader`] once and calls [`PaneSwitchReader::poll`] each tick, applying focus
+//! switches or kill-cancellation clears.
+//! Keeping the protocol separate lets another UI reuse it with its own run-loop timer.
+//! The reasons for faking tmux and the meaning of each focus direction are documented in
+//! `shell::pane_switch`, which owns panes and focus.
 
-use std::io::{BufRead, BufReader};
+use std::collections::VecDeque;
+use std::io::{ErrorKind, Read};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How often a host should call [`accept_pending_messages`]. A keypress-driven focus switch at
+/// How often a host should call [`PaneSwitchReader::poll`]. A keypress-driven focus switch at
 /// this cadence is imperceptible, and an idle poll of a non-blocking `accept()` costs one failing
 /// syscall.
 ///
@@ -29,11 +30,48 @@ use std::time::Duration;
 /// the main loop does; one number, two readers.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Bound on how long a single accepted connection may block the caller while its one short line
-/// arrives. The shim writes immediately after `connect()` returns, so in practice this is never
-/// reached; it exists because an accepted `UnixStream`'s blocking mode is not something a portable
-/// caller may assume -- see [`accept_pending_messages`], which sets it explicitly.
-const READ_TIMEOUT: Duration = Duration::from_millis(50);
+/// Bound on how large one message may grow before [`PaneSwitchReader`] drops it with a log rather
+/// than retaining it without bound. A pane-switch message is a handful of bytes (`"R\n"`,
+/// `"Q 4294967295\n"`); nothing legitimate comes close.
+const MAX_MESSAGE_BYTES: usize = 4096;
+
+/// Bound on how many bytes [`PaneSwitchReader::poll`] reads in one call, across every connection it
+/// looks at. Since `poll` only ever reads the oldest pending connection (see its own doc), this
+/// mainly bounds how much of one oversized sender's data a single poll copies before the byte cap
+/// above closes it -- a little over [`MAX_MESSAGE_BYTES`] so a message at that cap is judged within
+/// one poll rather than spread across several.
+const MAX_READ_BYTES_PER_POLL: usize = 2 * MAX_MESSAGE_BYTES;
+
+/// Wall-clock bound on how long one [`PaneSwitchReader::poll`] call may spend reading, independent
+/// of the byte budget above. Every read `poll` performs is already non-blocking, so this is a
+/// backstop against slow syscalls (e.g. under memory pressure) rather than the limiter that matters
+/// day to day -- the byte budget, and the fact that a `WouldBlock` returns immediately, are.
+///
+/// Measured on the real clock from the start of the read loop, not from the start of `poll` (the
+/// accepts before it are bounded by [`MAX_ACCEPTS_PER_POLL`] instead), and checked *after* each
+/// connection's read, never before the first: a poll that runs out of time still reads its front
+/// connection once, so it always makes progress.
+const MAX_POLL_DURATION: Duration = Duration::from_millis(5);
+
+/// How many new connections one [`PaneSwitchReader::poll`] call accepts. A burst of keypresses past
+/// this leaves the rest queued in the kernel's own (FIFO) backlog for the next poll, one
+/// [`POLL_INTERVAL`] later -- accept order is still preserved, just spread across polls.
+const MAX_ACCEPTS_PER_POLL: usize = 16;
+
+/// How long an accepted connection may sit with no complete message before [`PaneSwitchReader`]
+/// drops it with a log. The shim writes immediately after `connect()` returns, so in practice this
+/// is never reached for a real sender; it exists so a connection that never writes anything (a
+/// broken client, or a probe) cannot block every message behind it forever -- see
+/// [`PaneSwitchReader::poll`]'s own doc for why a stuck connection blocks the ones after it at all.
+const MAX_PENDING_AGE: Duration = Duration::from_secs(2);
+
+/// Hard cap on how many connections [`PaneSwitchReader`] retains at once, across every age.
+/// Without this, senders that connect without writing could accumulate about 1280 open descriptors
+/// before [`MAX_PENDING_AGE`] evicts the first one, exceeding a typical 1024-fd soft `RLIMIT_NOFILE`.
+/// The cap bounds retained descriptors independently of the accept rate and age limit. Once it is
+/// hit, `poll` stops accepting for that call; excess connections wait in the kernel backlog, just
+/// as they do past [`MAX_ACCEPTS_PER_POLL`].
+const MAX_PENDING_CONNECTIONS: usize = 64;
 
 /// The directory-name prefix [`crate::instance_dir`] keys this module's directories on.
 ///
@@ -288,59 +326,191 @@ pub enum PaneMessage {
     QuitCancelled(u32),
 }
 
-/// Every message already queued on the socket, in accept order.
+/// Reads [`PaneMessage`]s without blocking the caller on a slow or trickling sender.
+/// Construct once per channel and retain across polls: a fresh reader loses buffered bytes from
+/// partial connections.
 ///
-/// Drains rather than taking one per call: repeated keypresses can leave several connections
-/// pending between polls. The whole batch is returned before callbacks run, preserving accept
-/// order; focus grabs are idempotent.
+/// A per-read `SO_RCVTIMEO` does not bound a blocking `read_line`: each successful partial read
+/// resets the timeout, so a trickling sender can hold the caller and its main loop for the whole
+/// trickle. `poll` uses non-blocking reads and retains incomplete connections for the next call.
 ///
-/// Each accepted stream is explicitly made blocking. The listener is non-blocking for main-loop
-/// polling, but macOS copies that flag to accepted streams while Linux clears it. Without this
-/// step, `read_line` on macOS can return `WouldBlock` before the shim finishes writing and lose
-/// the message. `READ_TIMEOUT` only applies to blocking sockets. Linux tests cannot detect a
-/// missing mode change because accepted streams there already default to blocking.
+/// Delivers messages in accept order. [`crate::line_feed::NewestLineReader`] cannot be reused:
+/// it keeps only the newest snapshot, while each direction is a discrete keypress. Dropping or
+/// reordering a message could move focus or clear a kill flag without the requested sequence.
+/// Only the oldest connection is read until it completes, closes, or reaches [`MAX_PENDING_AGE`].
+/// A stuck sender therefore delays later messages rather than letting them overtake it.
 ///
-/// A stream whose mode cannot be set is skipped rather than read. A dropped message costs one
-/// focus switch or leaves a kill flag for the user to retry; inventing a message could move focus
-/// or clear a kill without a request.
-pub fn accept_pending_messages(listener: &UnixListener) -> Vec<PaneMessage> {
-    accept_pending_messages_within(listener, READ_TIMEOUT)
+/// Each accepted stream is explicitly made non-blocking. Linux does not copy the listener's flag
+/// to accepted streams, so omitting this step would reintroduce blocking reads. macOS copies it.
+/// Streams whose mode cannot be set are skipped; those exceeding [`MAX_MESSAGE_BYTES`] are
+/// logged and dropped. A dropped message costs a focus switch or leaves a kill flag for the user
+/// to retry; this channel does not gate tool execution.
+pub struct PaneSwitchReader {
+    listener: UnixListener,
+    pending: VecDeque<PendingConnection>,
+    /// [`MAX_POLL_DURATION`] in production. A field rather than the constant read inline only so
+    /// this module's tests can pin the budget's two edges deterministically: zero (every poll is
+    /// already past its deadline, which is what a preempted poll looks like) and effectively
+    /// unlimited (for a test asserting that one poll drains a burst, which the wall-clock backstop
+    /// would otherwise make depend on the scheduler).
+    read_time_budget: Duration,
 }
 
-/// [`accept_pending_messages`] with the per-connection read timeout as a parameter.
-///
-/// Private, and it exists for the tests rather than for a second production caller: the macOS
-/// regression test below has to let a connection sit accepted-but-silent for a measurable moment,
-/// and with `READ_TIMEOUT` fixed at 50ms that test's only lever was a sleep short enough to race
-/// its own bound. See `a_direction_written_after_the_reader_is_already_waiting_still_arrives`.
-fn accept_pending_messages_within(listener: &UnixListener, read_timeout: Duration) -> Vec<PaneMessage> {
-    let mut messages = Vec::new();
-    loop {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                if let Err(e) = stream.set_nonblocking(false) {
-                    eprintln!("[pane_switch] could not make an accepted connection blocking: {e} -- ignoring it");
-                    continue;
+struct PendingConnection {
+    stream: UnixStream,
+    bytes: Vec<u8>,
+    accepted_at: Instant,
+}
+
+enum ReadOutcome {
+    Pending,
+    Complete(Vec<u8>),
+    Closed,
+}
+
+impl PendingConnection {
+    /// Reads whatever is available without blocking, honouring the shared per-poll byte budget.
+    /// Retains a partial line across calls (in `self.bytes`); a line that would grow past
+    /// [`MAX_MESSAGE_BYTES`] is dropped -- logged, never buffered without bound.
+    fn read_available(&mut self, budget: &mut usize) -> ReadOutcome {
+        let mut buffer = [0u8; 512];
+        while *budget > 0 {
+            let limit = buffer.len().min(*budget);
+            match self.stream.read(&mut buffer[..limit]) {
+                // EOF: whatever was buffered is the whole message, newline or not -- the sender
+                // closing right after its one line is the ordinary case, not an error.
+                Ok(0) => return ReadOutcome::Complete(std::mem::take(&mut self.bytes)),
+                Ok(read) => {
+                    *budget -= read;
+                    let newline = buffer[..read].iter().position(|byte| *byte == b'\n');
+                    let length = newline.unwrap_or(read);
+                    if self.bytes.len() + length > MAX_MESSAGE_BYTES {
+                        eprintln!("[pane_switch] dropping a message over {MAX_MESSAGE_BYTES} bytes without a newline");
+                        return ReadOutcome::Closed;
+                    }
+                    self.bytes.extend_from_slice(&buffer[..length]);
+                    if newline.is_some() {
+                        return ReadOutcome::Complete(std::mem::take(&mut self.bytes));
+                    }
                 }
-                let _ = stream.set_read_timeout(Some(read_timeout));
-                let mut line = String::new();
-                if BufReader::new(stream).read_line(&mut line).is_err() {
-                    eprintln!("[pane_switch] failed to read a message from an accepted connection");
-                    continue;
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                    return ReadOutcome::Pending;
                 }
-                match parse_message(&line) {
-                    Some(message) => messages.push(message),
-                    None => eprintln!("[pane_switch] ignoring unrecognized message {line:?}"),
+                Err(_) => return ReadOutcome::Closed,
+            }
+        }
+        ReadOutcome::Pending
+    }
+}
+
+impl PaneSwitchReader {
+    /// Takes a channel's already-bound, non-blocking listener.
+    pub fn new(listener: UnixListener) -> Self {
+        Self {
+            listener,
+            pending: VecDeque::new(),
+            read_time_budget: MAX_POLL_DURATION,
+        }
+    }
+
+    /// Every message that became complete since the last call, in accept order. Never blocks: a
+    /// connection with no complete line yet is retained for the next call rather than waited on --
+    /// see this type's own doc for why that is the fix, and why a stuck connection blocks the
+    /// messages behind it rather than letting a later one overtake it.
+    pub fn poll(&mut self) -> Vec<PaneMessage> {
+        self.poll_at(Instant::now())
+    }
+
+    fn poll_at(&mut self, now: Instant) -> Vec<PaneMessage> {
+        for _ in 0..MAX_ACCEPTS_PER_POLL {
+            // Stop accepting at `MAX_PENDING_CONNECTIONS` so senders that never write cannot grow the
+            // queue without bound. Excess connections wait in the kernel backlog, as they do past
+            // `MAX_ACCEPTS_PER_POLL`.
+            if self.pending.len() >= MAX_PENDING_CONNECTIONS {
+                break;
+            }
+            match self.listener.accept() {
+                Ok((stream, _addr)) => {
+                    if let Err(e) = stream.set_nonblocking(true) {
+                        eprintln!(
+                            "[pane_switch] could not make an accepted connection non-blocking: {e} -- ignoring it"
+                        );
+                        continue;
+                    }
+                    self.pending.push_back(PendingConnection {
+                        stream,
+                        bytes: Vec::new(),
+                        accepted_at: now,
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
+                Err(e) => {
+                    eprintln!("[pane_switch] accept failed: {e}");
+                    break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                eprintln!("[pane_switch] accept failed: {e}");
+        }
+
+        // Read each front connection before deciding whether to evict it for staleness. A complete
+        // message may already be waiting behind a silent connection with the same `accepted_at`.
+        // An age-only sweep would discard both without reading the ready message. Deliver `Complete`
+        // results even when stale; evict only connections that remain `Pending` after the read.
+        //
+        // Start the read budget here on the real clock and check it after each read. The accept loop
+        // has its own bound, and a preemption before this point must not prevent the first read.
+        // `now` is for ageing connections, including simulated ageing in tests; using it for the
+        // wall-clock deadline could disable the budget or exhaust it before any work.
+        // Each poll with pending work tries its front connection at least once. The loop stays bounded
+        // because every pass either removes the front connection or stops.
+        let mut budget = MAX_READ_BYTES_PER_POLL;
+        let deadline = Instant::now() + self.read_time_budget;
+        let mut messages = Vec::new();
+        while budget > 0 {
+            let stale = match self.pending.front() {
+                Some(front) => now.duration_since(front.accepted_at) >= MAX_PENDING_AGE,
+                None => break,
+            };
+            // Scoped so the mutable borrow of `front` ends before `pop_front` needs `&mut self.pending`.
+            let outcome = self
+                .pending
+                .front_mut()
+                .expect("checked above")
+                .read_available(&mut budget);
+            match outcome {
+                ReadOutcome::Pending => {
+                    if stale {
+                        eprintln!(
+                            "[pane_switch] dropping a connection that never completed a message within {MAX_PENDING_AGE:?}"
+                        );
+                        // Keep going (budget permitting): the connection behind this one may
+                        // already have a complete message waiting, and it is not the one that was
+                        // stuck.
+                        self.pending.pop_front();
+                    } else {
+                        // Never skip ahead to a newer connection while this one is merely young
+                        // and quiet: that would be exactly the reordering this type exists to rule
+                        // out.
+                        break;
+                    }
+                }
+                ReadOutcome::Closed => {
+                    self.pending.pop_front();
+                }
+                ReadOutcome::Complete(bytes) => {
+                    self.pending.pop_front();
+                    let text = String::from_utf8_lossy(&bytes);
+                    match parse_message(&text) {
+                        Some(message) => messages.push(message),
+                        None => eprintln!("[pane_switch] ignoring unrecognized message {text:?}"),
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
                 break;
             }
         }
+        messages
     }
-    messages
 }
 
 /// The one line the shim or [`crate::layout::kill::editor_quit_lua`] writes, turned into a
@@ -375,6 +545,43 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    /// For a test asserting that **one** poll handles several connections.
+    /// [`MAX_POLL_DURATION`] is a wall-clock backstop, so under it such an assertion depends on the
+    /// scheduler: a stall of 5ms between two reads legitimately leaves the rest for the next poll.
+    /// The budget's own behaviour is pinned separately, at zero, by
+    /// `a_poll_past_its_time_budget_still_delivers_its_front_message_and_keeps_the_rest_in_order`.
+    const UNHURRIED: Duration = Duration::from_secs(60);
+
+    /// Test-only safety net: if a regression ever drops the explicit
+    /// `set_nonblocking(true)` [`PaneSwitchReader::poll`] depends on, the "must never block" family
+    /// of tests below would call a `poll()` that can block forever on a real syscall -- turning a
+    /// clean, fast test failure into a hung test *process* (mutation-checked: setting an accepted
+    /// stream back to blocking makes several of these tests run past 60s rather than fail). Running
+    /// the call on its own thread and giving up after `timeout` keeps the failure immediate: on the
+    /// fast path the reader (and its result) come back through the channel and the caller keeps
+    /// using it exactly as before; on a timeout the spawned thread -- still parked in the blocked
+    /// syscall, holding the reader -- is abandoned rather than joined. That leaked thread is
+    /// harmless here: it dies with the test binary's own process exit, and it touches nothing beyond
+    /// this one test's own socket and directory.
+    fn poll_within(
+        mut reader: PaneSwitchReader,
+        timeout: Duration,
+        at: Option<Instant>,
+    ) -> (PaneSwitchReader, Vec<PaneMessage>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let messages = match at {
+                Some(now) => reader.poll_at(now),
+                None => reader.poll(),
+            };
+            let _ = tx.send((reader, messages));
+        });
+        rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            panic!("poll() did not return within {timeout:?} -- looks like a blocking-read regression, not a slow poll")
+        })
+    }
 
     #[test]
     fn parses_exactly_the_four_directions_and_a_quit_generation() {
@@ -573,6 +780,8 @@ mod tests {
         let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
         let listener = UnixListener::bind(&socket_path).expect("bind");
         listener.set_nonblocking(true).expect("non-blocking");
+        let mut reader = PaneSwitchReader::new(listener);
+        reader.read_time_budget = UNHURRIED;
 
         for letter in ["R", "D", "nonsense", "Q 3"] {
             let mut stream = UnixStream::connect(&socket_path).expect("connect");
@@ -581,7 +790,7 @@ mod tests {
         // A garbled message is dropped, and never stops the letters or the quit generation around it
         // being delivered, in accept order.
         assert_eq!(
-            accept_pending_messages(&listener),
+            reader.poll(),
             vec![
                 PaneMessage::Direction('R'),
                 PaneMessage::Direction('D'),
@@ -590,58 +799,270 @@ mod tests {
         );
         // Nothing pending: the non-blocking `accept()` returns `WouldBlock` and this returns empty
         // rather than parking the caller's main loop.
-        assert!(accept_pending_messages(&listener).is_empty());
+        assert!(reader.poll().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The macOS regression test for PART B, and it is honest about being untestable here.
-    ///
-    /// The listener is non-blocking. Linux clears `O_NONBLOCK` on the fd `accept()` returns, so on
-    /// Linux this passes with or without the explicit `set_nonblocking(false)` --  **this test
-    /// cannot fail on this machine.** On macOS, where XNU copies the listener's flag, a `read_line`
-    /// reached before the writer has written returns `WouldBlock` and the letter is dropped; every
-    /// other test here writes before the accept, which is exactly why none of them discriminates.
-    /// This one connects, gives the reader long enough to have reached `read_line` with nothing to
-    /// read, and only then writes.
-    ///
-    /// **The two directions of that race are not symmetric, and only one of them is harmless.**
-    ///  - Writer **early** (it wins, and the line is already buffered when the read runs): the test
-    ///    still passes, on both platforms, but stops discriminating on macOS. Harmless.
-    ///  - Writer **late**, past the read timeout: the read times out, the letter is dropped and the
-    ///    assertion goes red -- **on either platform, with the fix in place**. That is a false red,
-    ///    and it would land where it costs most: the Mac mini has 8 GB and is the environment's only
-    ///    Xcode build machine, so a scheduling hiccup there is not hypothetical.
-    ///
-    /// So the read timeout is a parameter here, and generous: `SLACK` is three orders of magnitude
-    /// past `SLEEP`, where production's `READ_TIMEOUT` is only five times it. Widening the bound
-    /// costs this test nothing -- what it is *about* is whether a blocking read happens at all, not
-    /// how long one is allowed to take.
+    /// The time budget must still allow a poll to try its front connection. Previously, accepts
+    /// or a preemption could exhaust the budget before the first read even when a complete message
+    /// waited. The read budget now starts after acceptance.
+    /// A zero budget makes this deterministic: each poll must deliver its front message and retain
+    /// the rest for later polls in accept order.
     #[test]
-    fn a_direction_written_after_the_reader_is_already_waiting_still_arrives() {
-        /// Long enough that the reader has reached `read_line` with nothing to read.
-        const SLEEP: Duration = Duration::from_millis(10);
-        /// The per-connection bound for this test only. Nothing here is measuring latency, so it is
-        /// set far past any plausible scheduling hiccup rather than near `READ_TIMEOUT`.
-        const SLACK: Duration = Duration::from_secs(10);
-
+    fn a_poll_past_its_time_budget_still_delivers_its_front_message_and_keeps_the_rest_in_order() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
         std::fs::create_dir_all(&dir).expect("fixture");
         let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
         let listener = UnixListener::bind(&socket_path).expect("bind");
         listener.set_nonblocking(true).expect("non-blocking");
+        let mut reader = PaneSwitchReader::new(listener);
+        reader.read_time_budget = Duration::ZERO;
+
+        for letter in ["R", "D", "Q 3"] {
+            let mut stream = UnixStream::connect(&socket_path).expect("connect");
+            writeln!(stream, "{letter}").unwrap();
+        }
+        assert_eq!(reader.poll(), vec![PaneMessage::Direction('R')]);
+        assert_eq!(reader.poll(), vec![PaneMessage::Direction('D')]);
+        assert_eq!(reader.poll(), vec![PaneMessage::QuitCancelled(3)]);
+        assert!(reader.poll().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A per-read `SO_RCVTIMEO` cannot bound a blocking `read_line`: successful partial reads
+    /// reset the timeout, so a trickling sender can hold the caller and its main loop for the whole
+    /// trickle. `PaneSwitchReader::poll` must return promptly on each call while retaining incomplete
+    /// connections, then deliver the complete message once enough polls have run.
+    #[test]
+    fn p3_a1_a_trickled_message_never_holds_one_poll_past_its_budget() {
+        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let mut reader = PaneSwitchReader::new(listener);
 
         let mut stream = UnixStream::connect(&socket_path).expect("connect");
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(SLEEP);
-            writeln!(stream, "R").unwrap();
+            // Leading spaces are trimmed by `parse_message`, so this still parses as `Direction('R')`
+            // -- same shape as the verdict's own probe, enough bytes to make a stalled read measurable.
+            for byte in b"      R\n" {
+                std::thread::sleep(Duration::from_millis(10));
+                stream.write_all(&[*byte]).unwrap();
+            }
         });
-        assert_eq!(
-            accept_pending_messages_within(&listener, SLACK),
-            vec![PaneMessage::Direction('R')]
-        );
+
+        let mut messages = Vec::new();
+        let mut worst = Duration::ZERO;
+        for _ in 0..20 {
+            let before = Instant::now();
+            messages.extend(reader.poll());
+            worst = worst.max(before.elapsed());
+            if !messages.is_empty() {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
         writer.join().unwrap();
 
+        assert_eq!(messages, vec![PaneMessage::Direction('R')]);
+        assert!(
+            worst < Duration::from_millis(20),
+            "one poll took {worst:?}, expected well under one POLL_INTERVAL ({POLL_INTERVAL:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each accepted stream must be explicitly made non-blocking. Linux does not copy the
+    /// listener's non-blocking flag onto accepted sockets, so omitting `set_nonblocking(true)` in
+    /// [`PaneSwitchReader::poll`] would leave them blocking. An accepted connection with nothing
+    /// written yet must not block `poll`.
+    #[test]
+    fn a_connection_with_nothing_written_yet_never_blocks_a_poll() {
+        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let reader = PaneSwitchReader::new(listener);
+
+        let mut stream = UnixStream::connect(&socket_path).expect("connect");
+
+        let before = Instant::now();
+        let (mut reader, empty) = poll_within(reader, Duration::from_secs(2), None);
+        assert!(empty.is_empty(), "nothing written yet");
+        let elapsed = before.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "poll blocked for {elapsed:?} on an accepted, silent connection"
+        );
+
+        stream.write_all(b"R\n").unwrap();
+        assert_eq!(reader.poll(), vec![PaneMessage::Direction('R')]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An older incomplete connection must block a newer complete one from overtaking it.
+    /// Otherwise consecutive keys could reach the host out of order and move focus incorrectly.
+    #[test]
+    fn an_older_incomplete_connection_blocks_a_newer_complete_one_from_overtaking_it() {
+        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let mut reader = PaneSwitchReader::new(listener);
+        reader.read_time_budget = UNHURRIED;
+
+        // Accepted first, written last.
+        let mut older = UnixStream::connect(&socket_path).expect("connect (older)");
+        // Accepted second, but its whole line is already there.
+        let mut newer = UnixStream::connect(&socket_path).expect("connect (newer)");
+        newer.write_all(b"D\n").unwrap();
+
+        // `older` has nothing written yet at this point -- the call that would hang under a
+        // blocking-read regression, so it is the one worth the timeout guard.
+        let (mut reader, empty) = poll_within(reader, Duration::from_secs(2), None);
+        assert!(
+            empty.is_empty(),
+            "the newer, complete connection must not be delivered while the older one is still open"
+        );
+
+        older.write_all(b"L\n").unwrap();
+        assert_eq!(
+            reader.poll(),
+            vec![PaneMessage::Direction('L'), PaneMessage::Direction('D')],
+            "once the older connection completes, both arrive in accept order"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A message that never gets its newline and grows past [`MAX_MESSAGE_BYTES`] is dropped --
+    /// logged, never retained without bound -- and does not stop a later, well-formed message from
+    /// being delivered.
+    #[test]
+    fn an_oversized_message_is_dropped_without_blocking_a_later_one() {
+        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let reader = PaneSwitchReader::new(listener);
+
+        let mut oversized = UnixStream::connect(&socket_path).expect("connect");
+        // No newline: exactly at the cap is still retained... and this is the read that, under a
+        // blocking-read regression, would hang forever waiting for a 9th read past the 8 that fill
+        // exactly MAX_MESSAGE_BYTES (no more data is available yet, and the sender has not closed).
+        oversized.write_all(&[b'x'; MAX_MESSAGE_BYTES]).unwrap();
+        let (mut reader, empty) = poll_within(reader, Duration::from_secs(2), None);
+        assert!(empty.is_empty());
+        // ...one more byte tips it over, and it is closed rather than grown further. Data is already
+        // waiting by the time this call happens, so it cannot hang even under the same regression.
+        oversized.write_all(b"x").unwrap();
+        assert!(reader.poll().is_empty());
+
+        let mut good = UnixStream::connect(&socket_path).expect("connect");
+        good.write_all(b"U\n").unwrap();
+        assert_eq!(reader.poll(), vec![PaneMessage::Direction('U')]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale silent connection and a complete one accepted in the same poll share an
+    /// `accepted_at`, but must not both be discarded. Read the new front after evicting the silent
+    /// connection so its already-complete message is delivered despite its age.
+    #[test]
+    fn a_stale_connection_never_drops_a_ready_sibling_accepted_with_it() {
+        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let mut reader = PaneSwitchReader::new(listener);
+        // The second poll below must both evict the silent front and deliver its sibling; see
+        // `UNHURRIED` for why that assertion needs the wall-clock backstop out of the way.
+        reader.read_time_budget = UNHURRIED;
+
+        // Both accepted in the same poll, so both get the same `accepted_at` -- the shape the
+        // finding needs: a silent connection ahead of one whose whole message is already written.
+        let _silent = UnixStream::connect(&socket_path).expect("connect (silent)");
+        let mut ready = UnixStream::connect(&socket_path).expect("connect (ready)");
+        ready.write_all(b"D\n").unwrap();
+
+        let now = Instant::now();
+        // The first poll stops at the silent, non-stale `Pending` connection without reading its sibling.
+        // Both polls use `poll_within` because they read a connection that never writes; a blocking-read
+        // regression must fail within a bound instead of hanging the test binary.
+        let (reader, empty) = poll_within(reader, Duration::from_secs(2), Some(now));
+        assert!(empty.is_empty());
+
+        // Age both connections past the bound and poll again: the silent front is now stale, but a
+        // read is still attempted on it first (returns `Pending` again -- it really never wrote
+        // anything), so it is evicted for the right reason. The loop then continues to its sibling,
+        // which is *also* past the age cutoff by now but was never actually stuck -- its message
+        // must still be delivered rather than discarded by the same sweep.
+        let (reader, messages) = poll_within(reader, Duration::from_secs(2), Some(now + MAX_PENDING_AGE));
+        assert_eq!(
+            messages,
+            vec![PaneMessage::Direction('D')],
+            "the ready sibling's already-complete message must not be lost to the silent connection's eviction"
+        );
+        // And the genuinely stuck connection really was reclaimed, not merely spared by accident --
+        // the eviction this type exists to do must still happen, just not to the wrong connection.
+        assert!(
+            reader.pending.is_empty(),
+            "the truly silent connection should have been evicted, leaving nothing pending"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`MAX_PENDING_CONNECTIONS`] bounds retained descriptors behind a stuck front, even when
+    /// senders connect without writing and no connection has yet reached its age limit.
+    ///
+    /// Connect `MAX_PENDING_CONNECTIONS + MAX_ACCEPTS_PER_POLL` clients, one batch per poll, to
+    /// exceed the cap without filling the kernel backlog all at once. On Linux, a blocking `AF_UNIX`
+    /// `connect()` waits for backlog space without a std-socket timeout, so a larger simultaneous
+    /// flood could hang the test. Assert the queue reaches the cap as well as staying within it;
+    /// an upper-bound assertion alone would pass if nothing were accepted.
+    #[test]
+    fn pending_connections_are_capped_so_a_silent_flood_cannot_grow_without_bound() {
+        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let mut reader = PaneSwitchReader::new(listener);
+
+        // Kept open, deliberately, and never written to: a dropped `UnixStream` would close, and
+        // the reader would read its EOF and let it go rather than hold it as a silent connection.
+        let mut silent_clients = Vec::new();
+        let batches = MAX_PENDING_CONNECTIONS / MAX_ACCEPTS_PER_POLL + 1;
+        for _ in 0..batches {
+            for _ in 0..MAX_ACCEPTS_PER_POLL {
+                silent_clients.push(UnixStream::connect(&socket_path).expect("connect"));
+            }
+            // The front never writes, so under a blocking-read regression this would hang.
+            let (polled, messages) = poll_within(reader, Duration::from_secs(2), None);
+            reader = polled;
+            assert!(messages.is_empty(), "nothing was ever written");
+        }
+        assert_eq!(silent_clients.len(), MAX_PENDING_CONNECTIONS + MAX_ACCEPTS_PER_POLL);
+        // Exactly the cap: every batch up to it was accepted (so the cap was really reached), and
+        // the last batch was not (so it really held).
+        assert_eq!(reader.pending.len(), MAX_PENDING_CONNECTIONS);
+
+        // And it keeps holding: a poll at the cap accepts nothing, leaving that batch in the backlog.
+        let (reader, messages) = poll_within(reader, Duration::from_secs(2), None);
+        assert!(messages.is_empty());
+        assert_eq!(reader.pending.len(), MAX_PENDING_CONNECTIONS);
+
+        drop(silent_clients);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

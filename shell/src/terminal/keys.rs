@@ -100,6 +100,13 @@ impl RepeatTracker {
 /// Remembering delivered presses handles all three without checking modifiers again
 /// at release time.
 ///
+/// A forwarded press can also have a different keyval from its release. GDK uses the
+/// modifiers held at each event: releasing Shift before the letter changes `X` to `x`,
+/// even while Ctrl stays held. Matching raw keyvals would drop that release and leave
+/// the child's key state out of sync under the kitty keyboard protocol.
+/// [`mark`](Self::mark) and [`take`](Self::take) use `keyval.to_lower()` so both events
+/// match, as [`clipboard_chord`] also does.
+///
 /// A small `Vec` suffices because only a handful of keys can be down at once.
 #[derive(Debug, Default)]
 pub struct DeliveredKeys {
@@ -112,15 +119,19 @@ impl DeliveredKeys {
     }
 
     /// Records that this keyval's press was forwarded to the child.
+    /// Stores lowercase so its release still matches if Shift is released first.
     pub fn mark(&mut self, keyval: GdkKey) {
+        let keyval = keyval.to_lower();
         if !self.held.contains(&keyval) {
             self.held.push(keyval);
         }
     }
 
-    /// Whether this keyval's press was forwarded -- and forgets it either way, since a release
-    /// (delivered or not) ends that keyval's story until its next press.
+    /// Reports whether this keyval's press was forwarded, then forgets it.
+    /// A release ends the entry until the next press, whether forwarded or not.
+    /// Compares lowercase so releasing Shift before the letter still matches its press.
     pub fn take(&mut self, keyval: GdkKey) -> bool {
+        let keyval = keyval.to_lower();
         match self.held.iter().position(|&held| held == keyval) {
             Some(index) => {
                 self.held.remove(index);
@@ -629,6 +640,27 @@ mod tests {
         delivered.reset();
         assert!(!delivered.take(GdkKey::a));
         assert!(!delivered.take(GdkKey::b));
+    }
+
+    /// A forwarded `Ctrl+Shift+letter` press has an uppercase GDK keyval. If Shift is
+    /// released before the letter, GDK reports its release in lowercase with Ctrl held.
+    /// `take()` must match across this case change; otherwise the release is swallowed
+    /// and the child's key state goes out of sync under the kitty keyboard protocol.
+    #[test]
+    fn a_release_is_matched_even_if_shift_was_let_go_first() {
+        let mut delivered = DeliveredKeys::new();
+        // Ctrl+Shift+x pressed: GDK reports the shifted (uppercase) keyval while Shift is down.
+        delivered.mark(GdkKey::X);
+        // Shift released first, then the letter: GDK now reports the unshifted (lowercase) keyval
+        // for the very same physical key, Ctrl still down. This must still count as its release.
+        assert!(
+            delivered.take(GdkKey::x),
+            "the release must match the press despite Shift's case flip"
+        );
+        // The entry is consumed either way -- a second release of the same physical key (in either
+        // case) finds nothing left to take.
+        assert!(!delivered.take(GdkKey::x));
+        assert!(!delivered.take(GdkKey::X));
     }
 }
 

@@ -158,6 +158,12 @@ glib::wrapper! {
 impl ModuleGrid {
     pub(crate) fn new(layout: Rc<RefCell<Layout>>) -> Self {
         let grid: Self = glib::Object::new();
+        // A held web host's allocation may reach past the grid's own edge (`throttle`'s module
+        // doc, sw-layout-2). `Hidden` makes GTK's pick return nothing for a point outside the grid
+        // (`gtk_widget_do_pick`, gtkwidget.c, GTK 4.22.5: an early return for a point outside the
+        // padding box), so such an allocation can never take a click from the top bar above it,
+        // and clips its paint to the grid as well.
+        grid.set_overflow(gtk4::Overflow::Hidden);
         grid.add_css_class("content-area");
         grid.set_hexpand(true);
         grid.set_vexpand(true);
@@ -594,10 +600,12 @@ impl ModuleGrid {
             let rect = match host.kind {
                 HostKind::Direct => target,
                 HostKind::Web => {
-                    let web = imp
-                        .throttle
-                        .borrow_mut()
-                        .allocate(&host.id, target, was_on_screen.contains(&host.id));
+                    let web = imp.throttle.borrow_mut().allocate(
+                        &host.id,
+                        target,
+                        was_on_screen.contains(&host.id),
+                        Size { w: width, h: height },
+                    );
                     if web.held {
                         held = true;
                         clips.push((host.widget.clone(), target));
@@ -977,9 +985,10 @@ mod tests {
         // The agent is zoomed to the whole window, and settles there once quiet.
         layout.toggle_zoom(&agent);
         let zoomed_target = arrange(&layout, &frame).rect_of(&agent).unwrap();
-        throttle.allocate(&agent, zoomed_target, false);
+        let window = Size { w: 1280, h: 721 };
+        throttle.allocate(&agent, zoomed_target, false, window);
         throttle.settle();
-        let real_alloc_while_zoomed = throttle.allocate(&agent, zoomed_target, true).rect;
+        let real_alloc_while_zoomed = throttle.allocate(&agent, zoomed_target, true, window).rect;
         assert_eq!(real_alloc_while_zoomed, zoomed_target);
 
         // Unzoom: the agent goes back to its left column, the editor takes the right.
@@ -991,8 +1000,13 @@ mod tests {
         );
         assert!(editor_target.w > 0, "editor is shown again, unzoomed");
 
-        let held = throttle.allocate(&agent, agent_target, true);
+        let held = throttle.allocate(&agent, agent_target, true, window);
         assert!(held.held, "the target changed: the throttle holds the agent's old size");
+        assert!(
+            held.rect.x + held.rect.w <= agent_target.x + agent_target.w,
+            "the held allocation {:?} reaches past the agent's target {agent_target:?} toward the editor",
+            held.rect
+        );
 
         // What `main.rs` really allocates: the editor gets its own (unthrottled) target, the agent
         // whatever the throttle just returned.

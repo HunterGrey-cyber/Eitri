@@ -122,10 +122,55 @@ export type PanelAction =
   | { kind: "panel"; binding: PanelBinding }
   | null;
 
-/** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
- *  without a DOM. `keyCode` is read only for C4's legacy-WebKit IME check (some builds report an
- *  IME commit as `keyCode === 229` rather than `isComposing`); absent it is simply not that. */
-export type KeyLike = { key: string; ctrlKey: boolean; shiftKey: boolean; isComposing: boolean; keyCode?: number };
+/** The `KeyboardEvent` fields used here, kept as a plain object for tests without a DOM.
+ *  `keyCode === 229` detects legacy WebKit IME events that may not set `isComposing`.
+ *  Optional modifier fields and methods mean "not held" when absent. Card-answer keys check
+ *  Alt and Meta; the two-key pair lookup keeps its separate modifier handling.
+ *  Super and Hyper are distinct from Meta and are read through `getModifierState`.
+ *  Whether real WebKitGTK exposes physical Super/Hyper presses this way is unverified here;
+ *  if it does not, the shell must intercept them before the WebView.
+ *  The AltGraph modifier-state check has the same unverified WebKitGTK behavior. */
+export type KeyLike = {
+  key: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  isComposing: boolean;
+  keyCode?: number;
+  altKey?: boolean;
+  metaKey?: boolean;
+  getModifierState?: (key: string) => boolean;
+};
+
+/** Whether Super or Hyper is held according to `getModifierState`.
+ *  These checks depend on WebKitGTK exposing the modifier state; see `KeyLike`. */
+function hasSuperOrHyper(event: KeyLike): boolean {
+  return event.getModifierState?.("Super") === true || event.getModifierState?.("Hyper") === true;
+}
+
+/** Whether AltGr is held according to `getModifierState("AltGraph")`.
+ *  AltGr can produce ordinary characters, but holding it must block plain answers.
+ *  `typingGuard.ts` also treats bare AltGraph keydowns as modifiers.
+ *  This modifier-state signal has not been verified against real WebKitGTK. */
+function hasAltGraph(event: KeyLike): boolean {
+  return event.getModifierState?.("AltGraph") === true;
+}
+
+/** Shared plain-answer check for a/d/D and bypass-confirm y: reject Ctrl, Alt, Meta,
+ *  Super/Hyper, AltGraph and composing input so the two answer paths cannot drift apart.
+ *  The IME check mirrors `composerKeys.ts`'s `isImeKey` without importing it, keeping
+ *  `KeyLike` independent. Shift is allowed here because callers decide which shifted
+ *  letters count, including D and bypass Y. */
+export function isPlainAnswerKey(event: KeyLike): boolean {
+  return (
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    !hasSuperOrHyper(event) &&
+    !hasAltGraph(event) &&
+    !event.isComposing &&
+    event.keyCode !== 229
+  );
+}
 
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
  *  screen) and what REFUSES `i` (a dead session's composer is disabled, so INPUT has no box). The
@@ -201,7 +246,11 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // `Shift+Y`/`Shift+D` are checked before the blanket modifier refusal because most layouts
     // deliver them with Shift held. `D` requires a live session with a reason box to focus.
     if (event.shiftKey && !event.ctrlKey && event.key === "Y") return { kind: "copy-output" };
-    if (event.shiftKey && !event.ctrlKey && event.key === "D") return ctx.sessionEnded ? null : { kind: "deny-reason" };
+    // Shift+D uses `isPlainAnswerKey` to reject Ctrl/Alt/Meta/Super/Hyper/AltGraph.
+    // This check precedes the blanket Ctrl/Shift refusal, which does not read the other modifiers.
+    if (event.shiftKey && isPlainAnswerKey(event) && event.key === "D") {
+      return ctx.sessionEnded ? null : { kind: "deny-reason" };
+    }
     // C1a: `A` (`:h A`), named ahead of the blanket refusal the same reason G/N/Y/D are -- most
     // layouts deliver it with Shift held. Refused on an ended session for the same reason `i`/`o`
     // are just below: INPUT there has no box to place a caret in.
@@ -285,6 +334,11 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return { kind: "control", delta: -1 };
     case "a":
     case "d":
+      // Alt or Meta with a/d must not answer a card: the blanket refusal checks only Ctrl/Shift,
+      // and this switch matches `event.key` alone. `isPlainAnswerKey` shares the modifier and
+      // composition checks with bypass confirmation. Super/Hyper need separate checks from Meta;
+      // see `KeyLike` for the limitations of WebKitGTK's modifier signals.
+      if (!isPlainAnswerKey(event)) return null;
       // A dead session's cards are inert: there is nobody left to answer.
       return ctx.sessionEnded ? null : { kind: "answer", decision: event.key === "a" ? "allow" : "deny" };
     case "Enter":

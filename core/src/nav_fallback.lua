@@ -18,25 +18,18 @@ local KEYS = {
 }
 local DESC = "neovibe: window or pane "
 
--- Connect/write/close are asynchronous, exactly as in the nvim-keys feed: no process is spawned
--- (the shim is for the real plugin), and a missing listener costs one keypress, never an error.
+-- Send synchronously so a busy callback or an editor exit cannot lose a queued letter.
+-- `vim.fn.sockconnect`, `chansend` and `chanclose` finish before the mapping returns.
+-- An asynchronous `pipe:connect`/`pipe:write` would defer the write to a later event-loop turn.
+-- Each `pcall` absorbs connection or write errors, so a missing listener costs one keypress
+-- and never raises an error in the editor.
 local function send(letter)
-  local pipe = vim.uv.new_pipe(false)
-  if not pipe then
+  local ok, chan = pcall(vim.fn.sockconnect, "pipe", socket, { rpc = false })
+  if not ok or chan == 0 then
     return
   end
-  local ok = pipe:connect(socket, function(err)
-    if err then
-      pipe:close()
-      return
-    end
-    pipe:write(letter .. "\n", function()
-      pipe:close()
-    end)
-  end)
-  if not ok then
-    pipe:close()
-  end
+  pcall(vim.fn.chansend, chan, letter .. "\n")
+  pcall(vim.fn.chanclose, chan)
 end
 
 -- vim-tmux-navigator's s:VimNavigate: `wincmd`, an error (E11 in the command-line window) swallowed.

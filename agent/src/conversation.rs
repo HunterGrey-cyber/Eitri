@@ -316,6 +316,20 @@ pub struct AgentConversation {
     /// Whether `note_title` has already taken this conversation's title, so later turns touch
     /// neither the lock nor the disk.
     title_noted: bool,
+    /// Whether a `shutdown()` call has ever seen `close_session` fail.
+    ///
+    /// A struct field, not a local in `shutdown`, because `shutdown` is documented and tested as
+    /// idempotent: a second call takes `self.session_id` as `None` (already taken by the first) and
+    /// so never calls `close_session` again -- a fresh per-call local would forget the first call's
+    /// failure and let the second call's `if !close_failed { release_lease() }` release the lease
+    /// anyway, exactly the race this field exists to keep closed. Once set, stays set: the lease
+    /// must stay held for the rest of this conversation's life, never just until the next call.
+    close_failed: bool,
+    /// The revision of the last snapshot the caller handed its UI, until its next drain takes it
+    /// (`note_ui_snapshot`). Held here rather than by the caller so it cannot outlive this
+    /// conversation: another session's revisions start again from their own seed and mean nothing
+    /// against this one's snapshot.
+    ui_snapshot_revision: Option<u64>,
 }
 
 impl AgentConversation {
@@ -371,6 +385,8 @@ impl AgentConversation {
             session_id: Some(session_id),
             ingest,
             title_noted: false,
+            close_failed: false,
+            ui_snapshot_revision: None,
         }
     }
 
@@ -457,6 +473,8 @@ impl AgentConversation {
             session_id: Some(session_id),
             ingest,
             title_noted: false,
+            close_failed: false,
+            ui_snapshot_revision: None,
         };
 
         // A resume the provider ACCEPTS can still fail moments later. The sidecar's CreateSession
@@ -746,6 +764,26 @@ impl AgentConversation {
         self.ingest.take_delivery()
     }
 
+    /// [`Self::take_ui_delivery`], with each event's fold revision, for a caller that also reads
+    /// snapshots and must not deliver an event one already carried (`crate::ingestion::RevisedDelivery`).
+    pub fn take_revised_ui_delivery(&self) -> crate::ingestion::RevisedDelivery {
+        self.ingest.take_revised_delivery()
+    }
+
+    /// Records that the caller just handed its UI a snapshot of this conversation's projection,
+    /// read at `revision` (its `last_revision`, from the guard the snapshot was serialized from).
+    /// The caller's next drain takes it back ([`Self::take_ui_snapshot_revision`]): every queued
+    /// event tagged at or below it is one that snapshot already carried (`RevisedDelivery`'s doc).
+    /// A later snapshot replaces an earlier one's, which it covers.
+    pub fn note_ui_snapshot(&mut self, revision: u64) {
+        self.ui_snapshot_revision = Some(revision);
+    }
+
+    /// Takes what [`Self::note_ui_snapshot`] recorded, if anything since the last take.
+    pub fn take_ui_snapshot_revision(&mut self) -> Option<u64> {
+        self.ui_snapshot_revision.take()
+    }
+
     /// Closes the provider session and folds the terminal state.
     ///
     /// Fail-closed on the way out, mirroring `AgentSession::shutdown`: any permission still pending
@@ -753,9 +791,18 @@ impl AgentConversation {
     /// that is ending can never be genuinely answered and the provider's own terminal events may not
     /// be drained before this process goes away. Idempotent.
     pub fn shutdown(&mut self) {
+        // A failed close leaves provider teardown completion uncertain. A wedged or crashed sidecar may still
+        // be alive for up to `SIDECAR_EXIT_GRACE` before being killed. Keep the lease so another client
+        // cannot resume the same session and write its transcript during teardown.
+        //
+        // `self.close_failed` persists across calls because `shutdown` is idempotent. The first call
+        // takes `self.session_id`; later calls skip `close_session`. A local flag would forget the failure
+        // and allow a later call to release the lease. Once set, this field stays set for the rest of
+        // the conversation's lifetime.
         if let Some(session_id) = self.session_id.take() {
             if let Err(e) = self.provider.close_session(CloseSessionRequest { session_id }) {
                 eprintln!("agent: AgentConversation::shutdown: close_session failed: {e}");
+                self.close_failed = true;
             }
         }
         // Ingestion stops FIRST, so the terminal events folded below are the last word rather than
@@ -776,8 +823,14 @@ impl AgentConversation {
             });
         }
         // Released last: the lease must outlive the provider's own session teardown, so no other
-        // client can acquire it while this one is still closing.
-        self.ingest.release_lease();
+        // client can acquire it while this one is still closing. On a failed close, skip this
+        // entirely and leave the lease held inside `self.ingest`: `provider` is declared before
+        // `ingest` on this struct, so dropping the conversation (`drop(backend)` in `shell`) tears
+        // the provider down first and only then drops `ingest`, releasing the lease with it -- never
+        // before the provider's own teardown has actually run.
+        if !self.close_failed {
+            self.ingest.release_lease();
+        }
     }
 
     /// Folds an event this side produced rather than the provider.
@@ -816,6 +869,9 @@ mod tests {
         calls: Mutex<Vec<String>>,
         queued_events: Mutex<Vec<AgentDomainEvent>>,
         send_turn_error: Mutex<Option<ProviderError>>,
+        /// The error `close_session` returns once, so failed-close handling in `shutdown` can be tested
+        /// without a wedged or crashed provider.
+        close_session_error: Mutex<Option<ProviderError>>,
         /// Every event ever queued. A test waits for ingestion to reach exactly this, which is a
         /// real condition rather than a sleep long enough to probably be fine.
         queued_total: std::sync::atomic::AtomicU64,
@@ -888,6 +944,9 @@ mod tests {
         }
         fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
             self.calls.lock().unwrap().push("close_session".into());
+            if let Some(e) = self.close_session_error.lock().unwrap().take() {
+                return Err(e);
+            }
             Ok(())
         }
         fn pump(&self) -> Vec<AgentDomainEvent> {
@@ -1865,6 +1924,90 @@ mod tests {
             conversation.projection().last_revision,
             revision_after_first,
             "a repeat shutdown folds nothing"
+        );
+    }
+
+    /// A failed `close_session` keeps the lease held while the provider may still be tearing down,
+    /// including up to `SIDECAR_EXIT_GRACE` before a wedged child is killed. Releasing it sooner could
+    /// let another client resume the same session and write the same transcript concurrently.
+    /// The lease remains in `self.ingest`. Since `provider` is declared before `ingest` on
+    /// [`AgentConversation`], dropping the conversation tears down the provider before dropping the lease.
+    #[test]
+    fn a_failed_close_session_keeps_the_lease_held_until_the_conversation_is_dropped() {
+        let fake = Arc::new(FakeProvider::new());
+        *fake.close_session_error.lock().unwrap() = Some(ProviderError::Timeout);
+        let mut conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        settle(&fake, &conversation);
+        let cwd = conversation.canonical_cwd().to_string_lossy().into_owned();
+
+        conversation.shutdown();
+        assert_eq!(fake.calls().iter().filter(|c| *c == "close_session").count(), 1);
+
+        assert!(
+            matches!(
+                SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc"),
+                Err(LeaseError::AlreadyHeld)
+            ),
+            "a failed close must not release the lease: another client must not be able to \
+             re-acquire it while this one may still be tearing down"
+        );
+
+        // Not held forever: once the conversation -- and with it, in field-declaration order, the
+        // provider before the lease -- is actually dropped, the lease goes too.
+        drop(conversation);
+        assert!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc").is_ok(),
+            "the lease must still be released once the conversation itself is dropped"
+        );
+    }
+
+    /// Repeated `shutdown()` calls must keep the lease held after a failed `close_session`.
+    /// The first call takes `self.session_id`, so the second skips `close_session`. A per-call local
+    /// `close_failed` would start false again and allow the second call to release the lease while
+    /// the provider might still be tearing down. The failure must remain stored on the conversation.
+    #[test]
+    fn a_second_idempotent_shutdown_after_a_failed_close_still_does_not_release_the_lease() {
+        let fake = Arc::new(FakeProvider::new());
+        *fake.close_session_error.lock().unwrap() = Some(ProviderError::Timeout);
+        let mut conversation = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        settle(&fake, &conversation);
+        let cwd = conversation.canonical_cwd().to_string_lossy().into_owned();
+
+        conversation.shutdown();
+        assert_eq!(fake.calls().iter().filter(|c| *c == "close_session").count(), 1);
+        assert!(
+            matches!(
+                SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc"),
+                Err(LeaseError::AlreadyHeld)
+            ),
+            "sanity: the first, failing shutdown must not release the lease"
+        );
+
+        // The second call is the idempotent repeat the doc comment and the sibling test both say is
+        // supported. `session_id` is already `None`, so `close_session` cannot be asked again --
+        // this call learns nothing new about the close, and must not forget what the first call
+        // already learned.
+        conversation.shutdown();
+        assert_eq!(
+            fake.calls().iter().filter(|c| *c == "close_session").count(),
+            1,
+            "close_session must still not repeat on the second call"
+        );
+        assert!(
+            matches!(
+                SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc"),
+                Err(LeaseError::AlreadyHeld)
+            ),
+            "a second, idempotent shutdown() must not release a lease the first call's failed \
+             close was supposed to keep held"
+        );
+
+        drop(conversation);
+        assert!(
+            SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc").is_ok(),
+            "the lease must still be released once the conversation itself is dropped"
         );
     }
 }

@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::mpsc;
 
-use agent::{AgentDomainEvent, UiDelivery};
+use agent::{AgentDomainEvent, RevisedDelivery};
 
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind};
 use crate::agent_bridge::{
@@ -452,7 +452,25 @@ pub struct TabSet {
     removed_arrived: u64,
     /// Project prefix rules shared by the window. Every tab's pump applies them.
     rules: agent::PrefixRules,
+    /// One-shot test hook after `pump` drains a live tab's queue. Fold an event after the drain
+    /// and before the next snapshot read in `active_state_payloads` or `Resync`, so the test
+    /// reproduces the race without relying on timing.
+    #[cfg(test)]
+    after_drain: Option<BackendSeam>,
+    /// Test-only: also deliver events already covered by a snapshot, so tests can demonstrate
+    /// duplicate delivery and capture both versions for the reducer test.
+    #[cfg(test)]
+    redeliver_covered: bool,
+    /// One-shot test hook just before the `Resync` snapshot read, after the early turn-clock read,
+    /// the three `projection()` calls and `approve_pending`'s bypass sweep. This reaches the race
+    /// that `after_drain`, which runs before those lock cycles, cannot.
+    #[cfg(test)]
+    before_resync_snapshot: Option<BackendSeam>,
 }
+
+/// A test seam's one-shot hook: what a test folds into a backend at the exact point the seam names.
+#[cfg(test)]
+type BackendSeam = Box<dyn FnOnce(&AgentBackend)>;
 
 impl TabSet {
     /// Create one empty tab numbered 1. Open tabs are not restored across launches.
@@ -480,6 +498,12 @@ impl TabSet {
             next_nonce: 1,
             removed_arrived: 0,
             rules: agent::PrefixRules::default(),
+            #[cfg(test)]
+            after_drain: None,
+            #[cfg(test)]
+            redeliver_covered: false,
+            #[cfg(test)]
+            before_resync_snapshot: None,
         };
         set.open();
         set.last_active = None;
@@ -939,8 +963,10 @@ impl TabSet {
                 tab.user_answered.clear();
                 continue;
             };
-            let from_revision = backend.projection().last_revision;
             let mut turn_ended = false;
+            // Whether this tab's payload goes to the panel this tick (then `shell` prints a complete
+            // trace after dispatching it; otherwise this function does, below).
+            let mut dispatched = false;
             // `tab.mode`: the classifier's `Auto` path, or bypass answering
             // everything, and `tab.host_answered` collects every id either path answers so the
             // Resync arm and `active_state_payloads` can hide them.
@@ -948,7 +974,7 @@ impl TabSet {
             // the user approved on a card here is answered without a second card, once. What was
             // answered without a card becomes a note on its call's row when the call completes.
             let mut answered_for_you = Vec::new();
-            let delivery = backend.take_ui_delivery_with_approvals(
+            let delivery = backend.take_revised_ui_delivery(
                 project_root,
                 rules,
                 tab.mode.into(),
@@ -956,6 +982,22 @@ impl TabSet {
                 &mut tab.human_allowed,
                 &mut answered_for_you,
             );
+            #[cfg(test)]
+            {
+                if let Some(hook) = self.after_drain.take() {
+                    hook(backend);
+                }
+            }
+            // Take the revision covered by the last snapshot sent for this backend. The drain and snapshot
+            // use separate locks, so ingestion may fold and queue an event between them, leaving it in
+            // both the snapshot and this drain. Each event carries its fold's revision. Folding, queueing
+            // and reading the snapshot revision share one ingestion mutex, so every queued event at or
+            // below that revision was covered and is present in this drain. Take the revision now so no
+            // later drain reuses it. `AgentBackend::note_ui_snapshot` keeps it with the backend so it
+            // cannot outlive the session.
+            let covered = backend.take_ui_snapshot_revision();
+            #[cfg(test)]
+            let covered = covered.filter(|_| !self.redeliver_covered);
             tab.prompt_note_candidates.extend(
                 answered_for_you
                     .into_iter()
@@ -967,7 +1009,7 @@ impl TabSet {
             // whole batch is withheld, so no card in it is ever drawn to be approved; the session
             // is handed out to be shut down, which denies what is still pending in it.
             let reported = match &delivery {
-                UiDelivery::Events(events) => events.iter().find_map(|event| match event {
+                RevisedDelivery::Events(events) => events.iter().find_map(|(_, event)| match event {
                     AgentDomainEvent::UngatedCliMode { reported, detail } => Some((reported.clone(), detail.clone())),
                     _ => None,
                 }),
@@ -993,15 +1035,35 @@ impl TabSet {
                 }
                 continue;
             }
+            // Keeps `tab.turn_clock` in step for the `Events` arm, which builds its payload straight
+            // from the drained batch and takes no further lock after this -- there is no later,
+            // fresher read to prefer. The `Resync` arm is different (see its own comment below) and
+            // re-observes the clock itself from the snapshot it actually sends, rather than reading
+            // `tab.turn_clock` as this call left it.
             observe_turn_clock(
                 &mut tab.turn_clock,
                 backend.projection().active_turn_id.as_deref(),
                 wall_clock_ms(),
             );
-            let turn_started_at_ms = tab.turn_clock.as_ref().map(|(_, at)| *at);
             match delivery {
-                UiDelivery::Nothing => {}
-                UiDelivery::Events(events) => {
+                RevisedDelivery::Nothing => {}
+                RevisedDelivery::Events(tagged) => {
+                    // The tags strictly increase, so what the last snapshot already carried is a
+                    // prefix of the batch: `events[..shown]` reached the panel inside that snapshot,
+                    // `events[shown..]` has not reached it at all. Everything below folds the whole
+                    // batch into this tab's own bookkeeping -- none of it has been seen here yet --
+                    // and only the payload leaves the prefix out.
+                    let shown = covered.map_or(0, |through| {
+                        tagged.partition_point(|(revision, _)| *revision <= through)
+                    });
+                    // The envelope's bracket, from the events' own fold revisions: the revision
+                    // before the first one it carries, and that of the batch's last.
+                    let through_revision = tagged.last().map_or(0, |(revision, _)| *revision);
+                    let from_revision = tagged
+                        .get(shown)
+                        .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
+                    let events: Vec<AgentDomainEvent> = tagged.into_iter().map(|(_, event)| event).collect();
+                    let (in_snapshot, fresh) = events.split_at(shown);
                     for event in &events {
                         match event {
                             AgentDomainEvent::TurnStarted { .. } => tab.was_running = true,
@@ -1048,9 +1110,14 @@ impl TabSet {
                             &events,
                         ),
                     };
+                    // Every card in the batch is counted, those the snapshot drew included: they are
+                    // pending all the same, and this tab has not counted them yet.
                     tab.attention.observe(&events, on_screen);
                     if let Some(trace) = tab.turn_trace.as_mut() {
-                        let first_text = trace.observe(&events);
+                        if !in_snapshot.is_empty() {
+                            trace.observe_in_snapshot(in_snapshot);
+                        }
+                        let first_text = trace.observe(fresh);
                         if is_active {
                             out.first_text |= first_text;
                         } else if first_text {
@@ -1058,20 +1125,32 @@ impl TabSet {
                         }
                     }
                     if is_active {
-                        let through_revision = backend.projection().last_revision;
-                        out.active_payload = Some(serialize_events_with_notes_for_js(
-                            tab.id,
-                            from_revision,
-                            through_revision,
-                            &events,
-                            &fresh_notes,
-                        ));
+                        // Nothing to send when the snapshot carried the whole batch -- unless the
+                        // batch produced notes, which that snapshot (serialized before this tab had
+                        // folded these events) did not carry; the panel applies notes to what it
+                        // already holds (`applyCallNotes`), so they go on their own.
+                        if !fresh.is_empty() || !fresh_notes.is_empty() {
+                            out.active_payload = Some(serialize_events_with_notes_for_js(
+                                tab.id,
+                                from_revision,
+                                through_revision,
+                                fresh,
+                                &fresh_notes,
+                            ));
+                            dispatched = true;
+                        }
                     } else {
                         tab.stale = true;
                     }
                 }
-                UiDelivery::Resync => {
-                    // The events are gone; the snapshot is what the panel is shown now.
+                RevisedDelivery::Resync => {
+                    // The events are gone; show the panel a snapshot.
+                    //
+                    // The drain and `SnapshotView::of` take separate `Mutex<IngestState>` locks, with a bypass
+                    // `approve_pending` lock cycle between them because answering must happen outside the lock.
+                    // A batch folded in this gap is queued for the next tick and already in this snapshot.
+                    // Read the snapshot revision under its serialization guard and note it on the backend, so
+                    // the next drain omits that batch from the payload, as after `active_state_payloads`.
                     let running = backend.projection().active_turn_id.is_some();
                     turn_ended = tab.was_running && !running;
                     tab.was_running = running;
@@ -1118,19 +1197,45 @@ impl TabSet {
                     tab.attention
                         .resync(pending.iter().filter(|id| !tab.host_answered.contains(*id)).cloned());
                     if is_active {
-                        out.active_payload = Some(serialize_snapshot_with_notes_for_js(
-                            tab.id,
-                            &SnapshotView::of(backend, &tab.host_answered),
-                            turn_started_at_ms,
-                            &tab.notes,
-                        ));
+                        #[cfg(test)]
+                        {
+                            if let Some(hook) = self.before_resync_snapshot.take() {
+                                hook(backend);
+                            }
+                        }
+                        let (payload, revision) = {
+                            let view = SnapshotView::of(backend, &tab.host_answered);
+                            // Read the turn clock from this snapshot's view under its serialization guard. The earlier
+                            // read above `match delivery` can be stale after this arm's `projection()` calls and bypass
+                            // sweep. If a turn ends and another starts in that gap, the early read still names the old
+                            // turn while the snapshot names the new one. The panel treats the stamped time as exact,
+                            // so use the same guarded observation as `active_state_payloads`.
+                            observe_turn_clock(
+                                &mut tab.turn_clock,
+                                view.projection.active_turn_id.as_deref(),
+                                wall_clock_ms(),
+                            );
+                            let payload = serialize_snapshot_with_notes_for_js(
+                                tab.id,
+                                &view,
+                                tab.turn_clock.as_ref().map(|(_, at)| *at),
+                                &tab.notes,
+                            );
+                            // Under the guard the snapshot is serialized from (see the arm's comment).
+                            (payload, view.projection.last_revision)
+                        };
+                        backend.note_ui_snapshot(revision);
+                        out.active_payload = Some(payload);
+                        dispatched = true;
                     } else {
                         tab.stale = true;
                     }
                 }
             }
-            // A background trace has no dispatch to wait for: printed here when it finishes.
-            if !is_active {
+            // Print a completed trace here if there is no dispatch to wait for: a background tab, or an
+            // active tab with no panel delivery this tick. Its end may have arrived only in a snapshot.
+            // `shell` prints dispatched traces after stamping their dispatch.
+            if !dispatched {
                 if let Some(trace) = tab.turn_trace.as_mut() {
                     if trace.is_complete() {
                         trace.emit();
@@ -1217,19 +1322,45 @@ impl TabSet {
         collected
     }
 
-    /// After a switch or on `ready`: the active tab's own state. Its snapshot if it has a backend, or
-    /// its handoff card if it has one. Always sent, not only when stale.
+    /// After a switch or `ready`, send the active tab's snapshot if it has a backend, or its
+    /// handoff card if it has one, even when the tab is not stale.
+    ///
+    /// Read without draining. The sidecar's ingestion thread can fold and queue events after the
+    /// last drain, so the snapshot may already cover queued events. Read its revision under the
+    /// serialization guard and store it through `AgentBackend::note_ui_snapshot`. The next `pump`
+    /// omits covered events from the panel payload but still applies them to the tab's turn end,
+    /// attention, notes and trace. This leaves window attention unchanged here; `shell` reports
+    /// it around ticks and switches, but not panel reloads. A request folded in the roughly 33 ms
+    /// before a switch or reload can still draw a card until the next tick answers it and its
+    /// resolution arrives.
     pub fn active_state_payloads(&mut self) -> Vec<String> {
         let tab = self.active_tab_mut();
         tab.stale = false;
         let mut payloads = Vec::new();
-        match &tab.backend {
-            TabBackend::Live(backend) => payloads.push(serialize_snapshot_with_notes_for_js(
-                tab.id,
-                &SnapshotView::of(backend, &tab.host_answered),
-                tab.turn_clock.as_ref().map(|(_, at)| *at),
-                &tab.notes,
-            )),
+        match &mut tab.backend {
+            TabBackend::Live(backend) => {
+                let (payload, revision) = {
+                    let view = SnapshotView::of(backend, &tab.host_answered);
+                    // The clock follows the turn this very snapshot names: one that started since
+                    // the last tick is stamped now, as that tick would have, and a clock left from
+                    // the turn before it is never sent with this one's id (the panel trusts it as
+                    // exact).
+                    observe_turn_clock(
+                        &mut tab.turn_clock,
+                        view.projection.active_turn_id.as_deref(),
+                        wall_clock_ms(),
+                    );
+                    let payload = serialize_snapshot_with_notes_for_js(
+                        tab.id,
+                        &view,
+                        tab.turn_clock.as_ref().map(|(_, at)| *at),
+                        &tab.notes,
+                    );
+                    (payload, view.projection.last_revision)
+                };
+                backend.note_ui_snapshot(revision);
+                payloads.push(payload);
+            }
             TabBackend::NotStarted => payloads.extend(
                 tab.last_handoff
                     .iter()
@@ -1911,6 +2042,597 @@ mod tests {
         );
         assert_eq!(snapshot["state"]["pendingPermissions"][0]["permissionId"], "perm-write");
         assert!(!set.get(background).unwrap().stale);
+        shut_down_all(&mut set);
+    }
+
+    fn text_delta(turn: &str, text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: agent::ContentKind::Text,
+            text: text.into(),
+        }
+    }
+
+    /// The assistant text an `events` payload carries, concatenated in order; empty for no payload
+    /// or any other envelope.
+    fn events_text(payload: Option<&str>) -> String {
+        let Some(value) = payload.and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok()) else {
+            return String::new();
+        };
+        if value["kind"] != "events" {
+            return String::new();
+        }
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "content_delta")
+            .filter_map(|e| e["text"].as_str())
+            .collect()
+    }
+
+    /// The transcript a `snapshot` payload carries, concatenated.
+    fn snapshot_text(payload: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["kind"], "snapshot", "{payload}");
+        value["state"]["transcript"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["text"].as_str())
+            .collect()
+    }
+
+    /// The `snapshot` envelope among a live tab's `active_state_payloads`.
+    fn the_snapshot(payloads: Vec<String>) -> String {
+        payloads
+            .into_iter()
+            .find(|p| p.contains("\"kind\":\"snapshot\""))
+            .expect("a live tab's snapshot")
+    }
+
+    /// Waits until the tab's projection holds `text` (folded by the ingestion thread, as the
+    /// provider's own stream is).
+    fn wait_for_fold(set: &TabSet, tab: TabId, text: &str) {
+        until("the ingestion thread to fold the text", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            let projection = backend.projection();
+            projection.transcript.iter().any(|m| m.text.contains(text))
+        });
+    }
+
+    /// Arms the seam (`TabSet::after_drain`): `pump`'s next drain of a live tab's queue is followed,
+    /// before anything else, by `text` folding into that tab -- the provider streams it and this
+    /// waits for the ingestion thread to fold it. The fold lands right after a drain and before the
+    /// next snapshot read, where the race is, not wherever a timing probe happens to.
+    fn fold_after_next_drain(set: &mut TabSet, provider: &Arc<RecordingProvider>, text: &'static str) {
+        let provider = Arc::clone(provider);
+        set.after_drain = Some(Box::new(move |backend: &AgentBackend| {
+            provider.queue(text_delta("t1", text));
+            until("the fold right after the drain", || {
+                backend.projection().transcript.iter().any(|m| m.text.contains(text))
+            });
+        }));
+    }
+
+    /// The snapshot sent by a switch or reload (`active_state_payloads`), followed by the
+    /// active payload of each of the next two ticks.
+    struct P1a2Run {
+        snapshot: String,
+        next: Option<String>,
+        after: Option<String>,
+    }
+
+    /// The ingestion thread folds a turn's text without an intervening tick. A switch or reload
+    /// snapshot carries that text while it is still queued. `redeliver` disables the snapshot
+    /// coverage filter (`TabSet::redeliver_covered`).
+    fn p1a2_mid_stream(redeliver: bool) -> P1a2Run {
+        let dir = workspace("tabs-p1a2-mid-stream");
+        let mut set = set();
+        set.redeliver_covered = redeliver;
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(text_delta("t1", "P1-unique-text"));
+        wait_for_fold(&set, tab, "P1-unique-text");
+        let run = P1a2Run {
+            snapshot: the_snapshot(set.active_state_payloads()),
+            next: set.pump(&dir, true).active_payload,
+            after: set.pump(&dir, true).active_payload,
+        };
+        shut_down_all(&mut set);
+        run
+    }
+
+    /// A tick delivers the turn's first text. The seam folds `<between>` just after the next
+    /// drain, the switch or reload snapshot carries it, and `<after>` folds after that
+    /// snapshot. `redeliver` disables the snapshot coverage filter.
+    fn p1a2_fold_after_a_drain(redeliver: bool) -> P1a2Run {
+        let dir = workspace("tabs-p1a2-fold-after-drain");
+        let mut set = set();
+        set.redeliver_covered = redeliver;
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(text_delta("t1", "<first>"));
+        until("the turn's first text to reach the panel", || {
+            events_text(set.pump(&dir, true).active_payload.as_deref()).contains("<first>")
+        });
+        fold_after_next_drain(&mut set, &provider, "<between>");
+        assert_eq!(
+            set.pump(&dir, true).active_payload,
+            None,
+            "the tick the fold follows had drained nothing new"
+        );
+        assert!(set.after_drain.is_none(), "the seam ran, right after that tick's drain");
+        let snapshot = the_snapshot(set.active_state_payloads());
+        provider.queue(text_delta("t1", "<after>"));
+        wait_for_fold(&set, tab, "<after>");
+        let run = P1a2Run {
+            snapshot,
+            next: set.pump(&dir, true).active_payload,
+            after: set.pump(&dir, true).active_payload,
+        };
+        shut_down_all(&mut set);
+        run
+    }
+
+    /// A switch or reload snapshot carries the text folded mid-stream. Subsequent ticks send
+    /// nothing when the snapshot already covered the whole batch, preventing duplicate reply
+    /// text in the panel.
+    #[test]
+    fn a_mid_stream_snapshots_text_is_never_delivered_again() {
+        let run = p1a2_mid_stream(false);
+        assert!(
+            snapshot_text(&run.snapshot).contains("P1-unique-text"),
+            "the snapshot carries the text: {}",
+            snapshot_text(&run.snapshot)
+        );
+        assert_eq!(
+            run.next, None,
+            "the next tick must not redeliver what the snapshot carried"
+        );
+        assert_eq!(run.after, None);
+    }
+
+    /// The drain and snapshot read acquire the lock separately. An event folded between them is
+    /// both in the snapshot and still queued, so the next tick must filter it out. The seam
+    /// also checks that an event folded after the snapshot reaches the panel exactly once.
+    #[test]
+    fn a_fold_between_a_ticks_drain_and_a_switchs_snapshot_is_never_delivered_again() {
+        let run = p1a2_fold_after_a_drain(false);
+        assert!(
+            snapshot_text(&run.snapshot).contains("<first><between>"),
+            "the snapshot carries the fold: {}",
+            snapshot_text(&run.snapshot)
+        );
+        let delivered = events_text(run.next.as_deref());
+        assert!(
+            !delivered.contains("<between>"),
+            "the next tick must never redeliver what the snapshot carried: {delivered:?}"
+        );
+        assert_eq!(
+            delivered, "<after>",
+            "a fold after the snapshot reaches the panel, once, and nothing else does"
+        );
+        assert_eq!(events_text(run.after.as_deref()), "");
+    }
+
+    /// Disabling the snapshot coverage filter makes both cases repeat the snapshot's text on
+    /// the next tick. The reducer fixture replays the actual snapshots and following `events`
+    /// payloads with and without filtering through `reducer.ts`.
+    ///
+    /// The fixture is compared on every run and rewritten only when explicit fixture writing is
+    /// enabled and its contents differ. Automatic writes on failure dirty a tracked file, and
+    /// changes under `agent-ui/web/src` trigger the npm rebuild in `shell/build.rs`. Checkouts
+    /// without the web tree skip the comparison.
+    #[test]
+    fn with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both() {
+        let events_of = |payload: Option<&str>| -> serde_json::Value {
+            payload
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .map_or(serde_json::json!([]), |v| v["events"].clone())
+        };
+        let record = |text: &str, filtered: P1a2Run, unfiltered: P1a2Run| {
+            let snapshot: serde_json::Value = serde_json::from_str(&filtered.snapshot).unwrap();
+            let unfiltered_snapshot: serde_json::Value = serde_json::from_str(&unfiltered.snapshot).unwrap();
+            // `conversationId` is `AgentConversation::create`'s own random uuid, which the reducer
+            // test never reads: pinned so the bytes are the same on every run.
+            let mut state = snapshot["state"].clone();
+            state["conversationId"] = serde_json::json!("fixture-conversation-id");
+            let mut unfiltered_state = unfiltered_snapshot["state"].clone();
+            unfiltered_state["conversationId"] = serde_json::json!("fixture-conversation-id");
+            assert_eq!(state, unfiltered_state, "the two runs send the same snapshot");
+            assert_eq!(snapshot["throughRevision"], unfiltered_snapshot["throughRevision"]);
+            assert!(
+                snapshot_text(&filtered.snapshot).contains(text),
+                "the snapshot carries {text:?}"
+            );
+            assert!(
+                !events_text(filtered.next.as_deref()).contains(text),
+                "with the filter the next tick leaves {text:?} out: {:?}",
+                filtered.next
+            );
+            assert!(
+                events_text(unfiltered.next.as_deref()).contains(text),
+                "without the filter the next tick sends {text:?} again: {:?}",
+                unfiltered.next
+            );
+            serde_json::json!({
+                "text": text,
+                "snapshot": state,
+                "throughRevision": snapshot["throughRevision"],
+                "nextEvents": events_of(filtered.next.as_deref()),
+                "nextEventsUnfiltered": events_of(unfiltered.next.as_deref()),
+            })
+        };
+        let fixture = serde_json::json!({
+            "writtenBy": "core/src/tab_set.rs, tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both \
+                          -- compared on every run; NEOVIBE_WRITE_FIXTURES=1 rewrites it",
+            "midStream": record("P1-unique-text", p1a2_mid_stream(false), p1a2_mid_stream(true)),
+            "foldAfterADrain": record("<between>", p1a2_fold_after_a_drain(false), p1a2_fold_after_a_drain(true)),
+        });
+        let fixture_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/p1a2-mid-stream.json");
+        let fixture_json = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&fixture_path).ok();
+        if committed.as_deref() == Some(fixture_json.as_str()) {
+            return;
+        }
+        if std::env::var_os("NEOVIBE_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&fixture_path, &fixture_json).expect("write the p1a2 reducer fixture");
+        } else if let Some(committed) = committed {
+            assert_eq!(
+                committed, fixture_json,
+                "the committed p1a2 reducer fixture is not what this test produces; if the change is \
+                 intended, regenerate it with NEOVIBE_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    /// A `TurnCompleted` carried by a switch or reload snapshot must still reach
+    /// `PumpOutput::turn_ended` exactly once when the next tick drains it, even though the
+    /// payload filters it out. That signal triggers the panel's queue flush; losing it leaves
+    /// the next message waiting. The completion folds without an intervening tick.
+    #[test]
+    fn a_turn_end_a_switch_snapshot_carried_still_flushes_the_queue() {
+        let dir = workspace("tabs-p1a2-round1-turn-end");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(started("t1"));
+        until("the turn to be delivered as running", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().turn_running()
+        });
+
+        set.queue_message(tab, "follow-up", "follow-up-wire".into(), 0)
+            .expect("queuing behind a running turn");
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        until("the completion to fold into the projection", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .is_none()
+        });
+
+        // The switch/reload snapshot carries the completion; the queue still holds it.
+        let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
+        assert_eq!(snapshot["state"]["activeTurnId"], serde_json::Value::Null);
+
+        let mut turn_ended_reported = Vec::new();
+        for _ in 0..20 {
+            let out = set.pump(&dir, true);
+            assert!(
+                !out.active_payload
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("turn_completed"),
+                "the snapshot carried the completion; no tick sends it again"
+            );
+            turn_ended_reported.extend(out.turn_ended);
+        }
+        assert_eq!(
+            turn_ended_reported,
+            vec![tab],
+            "the turn's end must still be reported exactly once after a snapshot carried it"
+        );
+        assert_eq!(
+            set.get(tab).unwrap().queue.len(),
+            1,
+            "the queued message must still be waiting for the flush this enables"
+        );
+        let flush = set
+            .flush_queue(tab)
+            .expect("the turn having ended must let the queue flush");
+        assert_eq!(flush.typed, "follow-up");
+        shut_down_all(&mut set);
+    }
+
+    /// Without a drain ahead of the snapshot, its turn clock must still match its own turn: a turn
+    /// that started since the last tick is named by the snapshot, and the snapshot says when it
+    /// started -- never the start of the turn before it, which the panel would take as exact.
+    #[test]
+    fn a_snapshot_names_the_start_of_the_turn_it_carries_even_before_a_tick_saw_it() {
+        let dir = workspace("tabs-p1a2-turn-clock");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        let first = set.get(tab).unwrap().turn_started_at_ms().expect("t1 stamped");
+        std::thread::sleep(Duration::from_millis(20));
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        provider.queue(started("t2"));
+        until("t2 to fold, with no tick", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .as_deref()
+                == Some("t2")
+        });
+        let before = wall_clock_ms();
+        let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
+        assert_eq!(snapshot["state"]["activeTurnId"], "t2");
+        let at = snapshot["turnStartedAtMs"]
+            .as_u64()
+            .expect("the snapshot says when t2 started");
+        assert!(at > first && at >= before, "t2's start, not t1's ({first}): {at}");
+        set.pump(&dir, true);
+        assert_eq!(
+            set.get(tab).unwrap().turn_started_at_ms(),
+            Some(at),
+            "the tick keeps the clock the snapshot sent"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// In `pump`'s `Resync` arm, the snapshot is read after further lock acquisitions and a
+    /// bypass sweep. A delta folded after the drain is both in that snapshot and still queued,
+    /// so the next tick must filter it out. The seam folds a unique delta just after an
+    /// overflow drain.
+    #[test]
+    fn a_fold_between_a_resyncs_drain_and_its_snapshot_read_is_never_delivered_again() {
+        let dir = workspace("tabs-p1a2-round2-resync");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        let base = set.get(tab).unwrap().live().unwrap().projection().last_revision;
+        let overflow = agent::UI_EVENT_QUEUE_CAPACITY + 10;
+        provider.queue(started("t1"));
+        for _ in 0..overflow {
+            provider.queue(text_delta("t1", "."));
+        }
+        until("the overflow to fold with nothing draining it", || {
+            set.get(tab).unwrap().live().unwrap().projection().last_revision > base + overflow as u64
+        });
+
+        fold_after_next_drain(&mut set, &provider, "<between>");
+        let payload = set
+            .pump(&dir, true)
+            .active_payload
+            .expect("a resync sends the active tab a snapshot");
+        assert!(
+            set.after_drain.is_none(),
+            "the seam ran, between the drain and the read"
+        );
+        assert!(
+            snapshot_text(&payload).ends_with("<between>"),
+            "the drain was a Resync, and its snapshot carries the fold"
+        );
+
+        provider.queue(text_delta("t1", "<after>"));
+        wait_for_fold(&set, tab, "<after>");
+        let delivered = events_text(set.pump(&dir, true).active_payload.as_deref());
+        assert!(
+            !delivered.contains("<between>"),
+            "the next pump must never redeliver what the resync's snapshot carried: {delivered:?}"
+        );
+        assert_eq!(
+            delivered, "<after>",
+            "a fold after the snapshot reaches the panel, once"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// The `Resync` payload must carry the start time of the turn in its own `SnapshotView::of`
+    /// read. Reading the clock just after the drain can pair an old turn's start time with a
+    /// new turn's snapshot if the turn changes during later lock acquisitions and the bypass
+    /// sweep. This seam runs immediately before the snapshot read, beyond the reach of
+    /// `after_drain`.
+    #[test]
+    fn a_resyncs_snapshot_names_the_start_of_the_turn_it_carries_even_when_the_race_ends_it_first() {
+        let dir = workspace("tabs-p1a2-round4-resync-clock");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        let first = set.get(tab).unwrap().turn_started_at_ms().expect("t1 stamped");
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Overflows the queue so this tick's drain is a `Resync`, with nothing draining it meanwhile.
+        let base = set.get(tab).unwrap().live().unwrap().projection().last_revision;
+        let overflow = agent::UI_EVENT_QUEUE_CAPACITY + 10;
+        for _ in 0..overflow {
+            provider.queue(text_delta("t1", "."));
+        }
+        until("the overflow to fold with nothing draining it", || {
+            set.get(tab).unwrap().live().unwrap().projection().last_revision >= base + overflow as u64
+        });
+
+        let seam_provider = Arc::clone(&provider);
+        set.before_resync_snapshot = Some(Box::new(move |backend: &AgentBackend| {
+            seam_provider.queue(completed("t1", agent::TurnOutcome::Completed));
+            seam_provider.queue(started("t2"));
+            until("t1 to end and t2 to start, right before the snapshot read", || {
+                backend.projection().active_turn_id.as_deref() == Some("t2")
+            });
+        }));
+
+        let before = wall_clock_ms();
+        let payload = set
+            .pump(&dir, true)
+            .active_payload
+            .expect("a resync sends the active tab a snapshot");
+        assert!(
+            set.before_resync_snapshot.is_none(),
+            "the seam ran, right before the snapshot read"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            value["state"]["activeTurnId"], "t2",
+            "the resync's own snapshot names t2, not t1"
+        );
+        let at = value["turnStartedAtMs"]
+            .as_u64()
+            .expect("the snapshot says when t2 started");
+        assert!(at > first && at >= before, "t2's start, not t1's ({first}): {at}");
+
+        shut_down_all(&mut set);
+    }
+
+    /// A snapshot's revision belongs to its session. Replacing the session immediately after a
+    /// snapshot must not filter the new session's events against the old snapshot, since
+    /// revision numbers restart from the new session's seed. This test installs the replacement
+    /// through `collect_starts`.
+    #[test]
+    fn a_new_sessions_events_are_never_measured_against_the_old_sessions_snapshot() {
+        let dir = workspace("tabs-p1a2-round2-install");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        let base = backend.projection().last_revision;
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        for _ in 0..5 {
+            provider.queue(text_delta("t1", "."));
+        }
+        provider.queue(text_delta("t1", "<old>"));
+        wait_for_fold(&set, tab, "<old>");
+        let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
+        assert!(
+            snapshot["throughRevision"].as_u64().is_some_and(|r| r >= base + 7),
+            "the old session's snapshot covers more revisions than the new one will reach below"
+        );
+
+        let old = std::mem::replace(&mut set.get_mut(tab).unwrap().backend, TabBackend::NotStarted);
+        if let TabBackend::Live(mut old) = old {
+            old.shutdown();
+        }
+        let tx = starting(&mut set, tab, None, None);
+        let (new_provider, new_backend) = live(&dir);
+        tx.send(Ok(new_backend)).unwrap();
+        assert_eq!(set.collect_starts().len(), 1, "installed");
+        new_provider.queue(started("t2"));
+        new_provider.queue(text_delta("t2", "<new-session>"));
+        // Folded before the first drain, so that drain holds revisions the old snapshot would cover.
+        wait_for_fold(&set, tab, "<new-session>");
+        let delivered = events_text(set.pump(&dir, true).active_payload.as_deref());
+        assert_eq!(
+            delivered, "<new-session>",
+            "the new session's first text reaches the panel"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// Replacing a backend must discard its snapshot watermark. Fatal-command and never-opened
+    /// paths can install `Failed` without `collect_starts` or a pump. This test installs the
+    /// next session immediately afterward, with no intervening tick.
+    #[test]
+    fn a_replaced_backend_takes_its_snapshot_watermark_with_it() {
+        let dir = workspace("tabs-p1a2-watermark-replaced");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        let base = backend.projection().last_revision;
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        for _ in 0..5 {
+            provider.queue(text_delta("t1", "."));
+        }
+        provider.queue(text_delta("t1", "<old>"));
+        wait_for_fold(&set, tab, "<old>");
+        let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
+        assert!(
+            snapshot["throughRevision"].as_u64().is_some_and(|r| r >= base + 7),
+            "the old session's snapshot covers more revisions than the new one will reach below"
+        );
+
+        // As `shell::agent_panel` retires a session whose command failed fatally.
+        let old = std::mem::replace(
+            &mut set.get_mut(tab).unwrap().backend,
+            TabBackend::Failed {
+                reason: "a fatal command".into(),
+            },
+        );
+        if let TabBackend::Live(mut old) = old {
+            old.shutdown();
+        }
+        let (new_provider, new_backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(new_backend);
+        new_provider.queue(started("t2"));
+        new_provider.queue(text_delta("t2", "<new-session>"));
+        wait_for_fold(&set, tab, "<new-session>");
+        assert_eq!(
+            events_text(set.pump(&dir, true).active_payload.as_deref()),
+            "<new-session>",
+            "the new session's text is measured against no snapshot of the old one's"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// The shell reports tray attention around ticks and switches, but not panel reloads
+    /// (`InboundMessage::Ready`). Reading the active state must leave attention unchanged. The
+    /// snapshot draws a newly folded card, and the next pump counts it without sending the
+    /// request again.
+    #[test]
+    fn reading_the_active_tabs_state_leaves_the_windows_attention_alone() {
+        let dir = workspace("tabs-p1a2-attention");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(write("perm-write"));
+        until("the card to fold, with no pump", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            let projection = backend.projection();
+            projection.pending_permissions.contains_key("perm-write")
+        });
+
+        let before = set.attention();
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        assert_eq!(
+            set.attention(),
+            before,
+            "reading a tab's state reports nothing to the tray"
+        );
+        assert_eq!(snapshot["state"]["pendingPermissions"][0]["permissionId"], "perm-write");
+
+        let payload = set.pump(&dir, true).active_payload;
+        assert_eq!(set.attention().pending, 1, "the tick counts the card");
+        assert!(
+            !payload.as_deref().unwrap_or_default().contains("permission_requested"),
+            "the snapshot drew the card; the tick does not send it again: {payload:?}"
+        );
         shut_down_all(&mut set);
     }
 
@@ -3634,6 +4356,85 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// When a snapshot covers every event in the next drain, the payload filters them all out.
+    /// Notes produced when the tab processes those events still need delivery because the
+    /// snapshot predates those notes. An empty `events` envelope carries them to
+    /// `applyCallNotes`. The seam folds completion between the drain and the switch's snapshot
+    /// read.
+    #[test]
+    fn a_note_from_events_a_snapshot_carried_still_reaches_the_panel() {
+        let dir = workspace("tabs-p1a2-round2-notes");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_npm".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-npm".into(),
+            tool_use_id: Some("toolu_npm".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
+        });
+        until("the rule to answer the call's gate", || {
+            set.pump(&dir, true);
+            provider.resolutions() == vec![("perm-npm".to_string(), true)]
+        });
+
+        // The call completes right after a tick's drain, before the switch's snapshot read.
+        let completion = Arc::clone(&provider);
+        set.after_drain = Some(Box::new(move |backend: &AgentBackend| {
+            completion.queue(AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_npm".into(),
+                content: serde_json::json!("ok"),
+                is_error: false,
+            });
+            until("the completion to fold", || {
+                backend
+                    .projection()
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.tool_use_id == "toolu_npm" && call.result.is_some())
+            });
+        }));
+        set.pump(&dir, true);
+        assert!(set.after_drain.is_none(), "the seam ran");
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = &snapshot["state"]["toolCalls"][0];
+        assert_eq!(call["toolUseId"], "toolu_npm");
+        assert!(!call["result"].is_null(), "the snapshot carries the completion");
+        assert!(
+            call.get("allowedByRule").is_none(),
+            "but not its note: nothing had folded it yet"
+        );
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &set.pump(&dir, true)
+                .active_payload
+                .expect("the note is owed to the panel"),
+        )
+        .unwrap();
+        assert_eq!(payload["kind"], "events");
+        assert_eq!(
+            payload["events"],
+            serde_json::json!([]),
+            "the completion is not delivered twice"
+        );
+        assert_eq!(
+            payload["ruleNotes"],
+            serde_json::json!([{ "toolUseId": "toolu_npm", "rule": "Bash(npm ci *)" }])
+        );
+        shut_down_all(&mut set);
+    }
+
     /// A `Write` card whose file is not there when it is raised says it creates one,
     /// in the events payload and in later snapshots (on the card and on its call); a card over an
     /// existing file does not, nor does its file appearing later change what the card said.
@@ -3826,6 +4627,48 @@ mod tests {
             trace.is_emitted(),
             "the pump emits a background trace: nothing else will"
         );
+        shut_down_all(&mut set);
+    }
+
+    /// A turn folded entirely before the first tick can reach the active panel wholly through
+    /// `active_state_payloads`, with no `events` dispatch. No paint report will arrive, so
+    /// `observe_in_snapshot` completes its trace with `first_paint_frame=snapshot`. Emission
+    /// must use `!dispatched`: gating on inactivity would leave this active tab's trace
+    /// unprinted.
+    #[test]
+    fn a_turn_folded_entirely_inside_a_snapshot_still_completes_and_prints_its_trace() {
+        let dir = workspace("tabs-trace-in-snapshot");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.get_mut(tab).unwrap().turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
+
+        // The ingestion thread folds the whole turn independently, without a tick draining it.
+        provider.queue(started("t1"));
+        provider.queue(text_delta("t1", "hi"));
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        wait_for_fold(&set, tab, "hi");
+
+        // Reads the snapshot and stores its revision on the backend as the watermark for the
+        // next pump's `covered` filter.
+        let snapshot = the_snapshot(set.active_state_payloads());
+        assert!(snapshot_text(&snapshot).contains("hi"), "{snapshot}");
+
+        // The next pump drains the identical batch the snapshot already carried: `shown` covers
+        // all of it, `fresh` is empty, nothing dispatches.
+        let out = set.pump(&dir, true);
+        assert!(
+            out.active_payload.is_none(),
+            "the whole batch was already in the snapshot"
+        );
+
+        let trace = set.get(tab).unwrap().turn_trace.as_ref().unwrap();
+        assert!(
+            trace.is_emitted(),
+            "a turn folded entirely inside a snapshot must still be printed: nothing else will"
+        );
+        assert!(trace.line().contains("first_paint_frame=snapshot"), "{}", trace.line());
         shut_down_all(&mut set);
     }
 

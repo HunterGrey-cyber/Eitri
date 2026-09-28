@@ -3,7 +3,7 @@
 //! **This is the only place a fallback is decided.** The WebView and the GTK stylesheet both
 //! receive a complete set, so neither ever needs a default of its own.
 
-use super::color::{ensure_contrast, ensure_contrast_with_pole, Rgb};
+use super::color::{ensure_contrast, ensure_contrast_against_both, ensure_contrast_with_pole, Rgb};
 use super::payload::{HlAttrs, NvimThemePayload};
 
 /// nvim's own built-in default colorscheme (`NvimDarkGrey2` / `NvimLightGrey2`). Used only when
@@ -114,6 +114,11 @@ pub struct ThemeTokens {
     /// guarded toward whichever of `bg`/`fg` reads better against `surface`, with the same
     /// black/white pole fallback `hint_fg` has for when neither does.
     pub surface_fg: Rgb,
+    /// Secondary text drawn on `surface` (a card's description, a diff gutter, the which-key box's
+    /// footer): `muted` is guarded against `bg` and `cursorline`, never against `surface`, so under
+    /// `zaibatsu` it is as unreadable on a card as `fg` is. Derived the way `chrome_muted` is: the
+    /// Comment colour guarded against `surface`, toward `surface_fg`, with the pole fallback.
+    pub surface_muted: Rgb,
     pub chrome: Rgb,
     pub chrome_fg: Rgb,
     /// Secondary text drawn on `chrome`. Guarded against `chrome`, not `bg`: a reversed StatusLine
@@ -304,19 +309,29 @@ impl ThemeTokens {
         );
 
         // sw-theme-3: `muted` used to be guarded only against `bg`, though `index.css` also paints
-        // it directly on a `cursorline` fill (the detail popover's and chooser's current row). A
-        // second stage guards it there too, toward `fg` again rather than re-deriving which pole
-        // wins: mixing further toward `fg` only ever moves `muted` further from `bg` as well (`bg`
-        // and `fg` are opposite poles by construction), so the first stage's own guarantee against
-        // `bg` cannot regress -- unlike toward `bg`, which would fight the first stage directly.
-        let muted_on_bg = ensure_contrast(comment.unwrap_or_else(|| bg.mix(fg, 0.5)), bg, fg, TEXT_CONTRAST);
-        let muted = ensure_contrast_with_pole(muted_on_bg, cursorline, fg, TEXT_CONTRAST);
+        // it directly on a `cursorline` fill (the detail popover's and chooser's current row). It is
+        // guarded against both at once: a second guard run after the first, toward `fg`, walked a
+        // Comment colour sitting on the far side of `bg` from `fg` back across `bg` (whole-branch
+        // review: black on a `#767676` bg became `#e6e6e6`, 3.64:1 there).
+        let muted = ensure_contrast_against_both(
+            comment.unwrap_or_else(|| bg.mix(fg, 0.5)),
+            bg,
+            cursorline,
+            fg,
+            TEXT_CONTRAST,
+        );
 
         ThemeTokens {
             bg,
             fg,
             surface,
             surface_fg,
+            surface_muted: ensure_contrast_with_pole(
+                comment.unwrap_or_else(|| surface.mix(surface_fg, 0.5)),
+                surface,
+                surface_fg,
+                TEXT_CONTRAST,
+            ),
             chrome,
             chrome_fg,
             chrome_muted: ensure_contrast_with_pole(
@@ -356,6 +371,7 @@ impl ThemeTokens {
             ("fg", self.fg),
             ("surface", self.surface),
             ("surface-fg", self.surface_fg),
+            ("surface-muted", self.surface_muted),
             ("chrome", self.chrome),
             ("chrome-fg", self.chrome_fg),
             ("chrome-muted", self.chrome_muted),
@@ -449,13 +465,13 @@ mod tests {
         assert_eq!(t.fg.hex(), "#e0e2ea");
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
-        assert_eq!(vars.len(), 35);
+        assert_eq!(vars.len(), 36);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 35, "no duplicate variable names");
-        // The count alone would be satisfied by any 35th variable, and this one carries a UNIT --
+        assert_eq!(names.len(), 36, "no duplicate variable names");
+        // The count alone would be satisfied by any 36th variable, and this one carries a UNIT --
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
         assert_eq!(
@@ -726,6 +742,11 @@ mod tests {
             "surface_fg must read against surface, got {}",
             t.surface_fg.contrast(t.surface)
         );
+        assert!(
+            t.surface_muted.contrast(t.surface) >= TEXT_CONTRAST,
+            "surface_muted must read against surface, got {}",
+            t.surface_muted.contrast(t.surface)
+        );
     }
 
     /// sw-theme-3's own probe: the shipped `pablo` colorscheme's real highlight data (`Comment`
@@ -748,6 +769,32 @@ mod tests {
         assert!(
             t.muted.contrast(t.cursorline) >= TEXT_CONTRAST,
             "muted must also read on cursorline, got {}",
+            t.muted.contrast(t.cursorline)
+        );
+    }
+
+    /// Moving `muted` toward `fg` to improve contrast against `cursorline` can reduce its contrast
+    /// against `bg` when it starts on the opposite side of `bg` from `fg`. Here black Comment text
+    /// already passes on mid-grey `bg` at 4.62:1. Mixing toward white can produce `#e6e6e6`, passing
+    /// on `cursorline` at 4.60:1 but failing on `bg` at 3.64:1. Muted text appears on both surfaces,
+    /// so it must meet the contrast threshold on both at once.
+    #[test]
+    fn muted_reads_on_bg_and_cursorline_at_once_when_the_comment_sits_across_bg() {
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xffffff), Some(0x767676))),
+                ("Comment", hl(Some(0x000000), None)),
+                ("Visual", hl(None, Some(0x666666))),
+            ],
+        ));
+        assert!(
+            t.muted.contrast(t.bg) >= TEXT_CONTRAST && t.muted.contrast(t.cursorline) >= TEXT_CONTRAST,
+            "muted {} must read on bg {} ({:.2}) and on cursorline {} ({:.2})",
+            t.muted.hex(),
+            t.bg.hex(),
+            t.muted.contrast(t.bg),
+            t.cursorline.hex(),
             t.muted.contrast(t.cursorline)
         );
     }

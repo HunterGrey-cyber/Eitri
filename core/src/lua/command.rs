@@ -29,6 +29,9 @@ pub struct CommandEntry {
 #[derive(Default)]
 pub struct CommandRegistry {
     commands: HashMap<String, CommandEntry>,
+    /// The first refusal `register` raised (sw-lua-5), kept however init.lua handled the Lua error
+    /// -- a `pcall` included -- so the shell can refuse to start on it (`refused`).
+    refused: Option<String>,
 }
 
 impl CommandRegistry {
@@ -43,6 +46,12 @@ impl CommandRegistry {
     /// `pub`: `LuaEngine::invoke_command` calls this.
     pub fn get(&self, id: &str) -> Option<&CommandEntry> {
         self.commands.get(id)
+    }
+
+    /// The message of the first command id `register` refused, or `None`. `pub`:
+    /// `LuaEngine::load_init_file` makes it a startup failure once init.lua has run.
+    pub fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
     }
 
     /// `pub`: `main.rs` iterates every registered command to wire a real GTK action for it.
@@ -68,14 +77,16 @@ pub fn install(lua: &Lua, neovibe: &Table, registry: Rc<RefCell<CommandRegistry>
     let register_fn = lua.create_function(move |lua, spec: Table| {
         let id: String = spec.get("id")?;
         if !is_valid_command_id(&id) {
-            // Report through `LuaEngine::load_init_file`'s error path before an invalid id reaches GTK.
-            // The file runs as one `.exec()` chunk, so an uncaught error skips everything after this call,
-            // including later commands, keymaps, panels and `agent.account`. The shell still starts with
-            // whatever was registered before the error.
-            return Err(mlua::Error::RuntimeError(format!(
+            // An uncaught error here stops the rest of the `.exec()` chunk, including later commands,
+            // keymaps, panels and `agent.account`. A `pcall` can swallow that Lua error, so also retain the
+            // message in `CommandRegistry::refused`. `load_init_file` checks it and refuses startup with
+            // the message even if Lua caught the error. This keeps invalid ids from reaching GTK.
+            let message = format!(
                 "neovibe.command.register: invalid command id {id:?} -- only ASCII letters, digits, \
                  '-' and '.' are allowed (an invalid id crashes the whole process once bound to a keybinding)"
-            )));
+            );
+            registry.borrow_mut().refused.get_or_insert_with(|| message.clone());
+            return Err(mlua::Error::RuntimeError(message));
         }
         let title: String = spec.get("title")?;
         let keybinding: Option<String> = spec.get("keybinding")?;
@@ -302,5 +313,35 @@ mod tests {
             "the statement after the bad call must NOT have run -- the chunk stops at the error, \
              it does not keep loading"
         );
+    }
+    /// A refused command id is remembered even if `init.lua` catches the Lua error with `pcall`.
+    /// `LuaEngine::load_init_file` can then fail startup and name the id. A Lua error alone can skip
+    /// the rest of `init.lua` while allowing startup, with only stderr output that an app-menu launch
+    /// may not show.
+    #[test]
+    fn a_refused_id_is_remembered_even_when_init_lua_catches_the_error() {
+        let lua = Lua::new();
+        let neovibe = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &neovibe, registry.clone()).unwrap();
+        lua.globals().set("neovibe", neovibe).unwrap();
+
+        assert!(registry.borrow().refused().is_none());
+        lua.load(
+            r#"
+            local ok = pcall(neovibe.command.register, { id = "my command", title = "x", action = function() end })
+            assert(not ok)
+            neovibe.command.register({ id = "fine", title = "y", action = function() end })
+            "#,
+        )
+        .exec()
+        .expect("the chunk itself caught the refusal and went on");
+        let refused = registry
+            .borrow()
+            .refused()
+            .map(str::to_owned)
+            .expect("the refusal was remembered");
+        assert!(refused.contains("my command"), "names the id: {refused}");
+        assert!(registry.borrow().get("fine").is_some());
     }
 }

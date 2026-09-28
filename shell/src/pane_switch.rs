@@ -32,7 +32,7 @@ use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
 
 use crate::layout::Direction;
-use neovibe_core::pane_switch::{accept_pending_messages, sweep_stale_dirs, POLL_INTERVAL};
+use neovibe_core::pane_switch::{sweep_stale_dirs, PaneSwitchReader, POLL_INTERVAL};
 pub(crate) use neovibe_core::pane_switch::{PaneMessage, PaneSwitchChannel};
 
 /// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
@@ -143,23 +143,25 @@ pub(crate) fn open() -> Option<PaneSwitchChannel> {
     PaneSwitchChannel::bind(&shim)
 }
 
-/// Starts polling the socket from the GTK main loop, invoking `on_message` with a direction letter
-/// or a quit-cancelled generation for each message the shim, or a cancelled `:confirm qall`, sends.
+/// Polls the socket on the GTK main loop and calls `on_message` for each shim message
+/// or quit-cancelled generation sent by a cancelled `:confirm qall`.
 ///
-/// A poll loop on the main thread rather than a background thread with a blocking `accept()`:
-/// the callback has to touch GTK widgets (grabbing focus), which is main-thread-only anyway,
-/// and `agent`'s own hook listener already paid for the lesson that a blocking `accept()` with
-/// no stop signal is a real hang waiting to happen.
+/// The callback grabs GTK focus and must run on the main thread. Polling also avoids
+/// a background thread hanging in a blocking `accept()` without a stop signal.
+/// A single [`PaneSwitchReader`] stays in the timer closure and retains partial
+/// connections between polls, so a slow sender cannot block the GTK timer callback.
+/// It also keeps later messages from overtaking an earlier undelivered message.
 ///
-/// Takes the channel's listener, so a second call on the same channel logs and does nothing rather
-/// than installing a second timer that would race the first for every connection.
+/// Takes the channel's listener. A second call logs and does nothing, preventing
+/// two timers from racing for the same connections.
 pub(crate) fn listen(channel: &mut PaneSwitchChannel, on_message: impl Fn(PaneMessage) + 'static) {
     let Some(listener) = channel.take_listener() else {
         eprintln!("[pane_switch] listen() called twice -- ignoring");
         return;
     };
+    let mut reader = PaneSwitchReader::new(listener);
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        for message in accept_pending_messages(&listener) {
+        for message in reader.poll() {
             on_message(message);
         }
         glib::ControlFlow::Continue

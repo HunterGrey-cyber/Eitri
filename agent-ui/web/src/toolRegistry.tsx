@@ -299,8 +299,26 @@ export function lookupTool(name: string): ToolRenderConfig | undefined {
  * `applySnapshot`, which replaces the whole state object graph -- so every result re-stringifies
  * and re-truncates once per `UiDelivery::Resync` and once per panel reload. Those are rare and
  * bounded, which is why this is recorded rather than worked around. */
-const ToolResult = memo(function ToolResult({ result, detailed = false }: { result: ToolCallRecord["result"]; detailed?: boolean }) {
+const ToolResult = memo(function ToolResult({
+  result,
+  detailed = false,
+  abandoned = false,
+}: {
+  result: ToolCallRecord["result"];
+  detailed?: boolean;
+  abandoned?: boolean;
+}) {
   if (result === null) {
+    // sw-panel-render-6: a `null` result the panel knows can never arrive -- the call predates the
+    // restored-history boundary, or the session has ended -- draws a static notice instead of the
+    // spinner below. `data-state="none"` (not "running") and no `aria-busy`: nothing is in flight.
+    if (abandoned) {
+      return (
+        <div className="tool-result tool-result-abandoned" data-state="none">
+          no result recorded
+        </div>
+      );
+    }
     return (
       <div className="tool-result tool-result-pending" data-state="running" aria-busy="true">
         Running…
@@ -328,11 +346,13 @@ const ToolResult = memo(function ToolResult({ result, detailed = false }: { resu
  * Repeating a command or diff above a card asking to run it can make it look approved.
  * `opts.detailed` (`Ctrl+o`) widens the result's cut and never folds it.
  * `opts.expanded` is Enter's per-row toggle, used by `editConfig` to show the rest of a diff.
- * It defaults to `showResult` to preserve behaviour for callers passing only two arguments. */
+ * It defaults to `showResult` to preserve behaviour for callers passing only two arguments.
+ * `opts.abandoned` tells `ToolResult` that a null result will never arrive.
+ * `MessageList.tsx`'s `isAbandonedCall` determines this from state unavailable here. */
 export function renderToolCall(
   call: ToolCallRecord,
   showResult = true,
-  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean } = {},
+  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
   const invocation = opts.gated ? (
@@ -382,7 +402,7 @@ export function renderToolCall(
       {invocation}
       {ruleNote}
       {promptNote}
-      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} />}
+      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
     </div>
   );
 }

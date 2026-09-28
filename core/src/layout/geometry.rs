@@ -190,7 +190,13 @@ fn subtree_min(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame) ->
 /// `.max(min_a.min(avail))`) can leave a still-shown, still-focused leaf exactly 0 pixels wide or
 /// tall while giving every pixel to the sibling -- reachable through ordinary nested splits and
 /// resizes, not just a contrived minimum.
-const MIN_VISIBLE_LEAF_PX: i32 = 1;
+///
+/// **32, not the first version's 1**: a 1px editor is as invisible and as
+/// impossible to click as a 0px one, and a shown module has no tray chip to bring it back. 32 logical
+/// px holds a row of editor text at the default font and is a target a pointer lands on; it is below
+/// the 5% the ratio band already guarantees a directly placed leaf at any ordinary window size (36px
+/// of a 721px column), so it only bites where a sibling's own minimum overrides the band, as here.
+const MIN_VISIBLE_LEAF_PX: i32 = 32;
 
 /// Same recursion as [`subtree_min`], but every shown leaf's own minimum is floored to
 /// [`MIN_VISIBLE_LEAF_PX`] along both axes first. Used only inside [`place`]'s clamp math (both the
@@ -706,12 +712,18 @@ mod tests {
         };
         let a = arrange(&layout, &f);
         let editor_rect = a.rect_of(&editor()).expect("editor is shown");
+        // Not merely more than zero: the first floor was 1px, and a 1px
+        // editor is as invisible and as impossible to click as a 0px one.
         assert!(
-            editor_rect.h > 0,
+            editor_rect.h >= 24,
             "editor is shown and focused, but its rect is {editor_rect:?}"
         );
+        assert_eq!(
+            editor_rect.h, MIN_VISIBLE_LEAF_PX,
+            "the floor, and no more: the rest is the ratio's"
+        );
         let terminal_rect = a.rect_of(&ModuleId::terminal()).expect("terminal is shown");
-        assert!(terminal_rect.h > 0);
+        assert_eq!(terminal_rect.h, 80, "the terminal keeps its own real minimum");
     }
 
     /// The grid reports this as its own minimum (`ModuleGrid::measure`), so the window cannot be made

@@ -5,7 +5,7 @@ import { applyCallNotes, applyEvent, applySnapshot, initialState, keepAfterSidec
 import { installDispatch, postToRust, nextRequestId } from "./bridge";
 import type { NavKeyDirection, OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
-import { EMPTY_PANEL_TABLE, resolveKey } from "./keymap";
+import { EMPTY_PANEL_TABLE, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
@@ -22,11 +22,11 @@ import { SearchBar } from "./components/SearchBar";
 import {
   controlsOf,
   conversationRows,
+  countedStop,
   currentStop,
   hintTargets,
   isActivatableControl,
   nextControl,
-  nextStop,
   permissionTarget,
   rowIndexOf,
   rowOf,
@@ -105,6 +105,18 @@ const TOOL_RESULT_SCROLL_STEP_PX = 40;
  *  300ms wait for this panel's answer. */
 export const HINT_PENDING_TIMEOUT_MS = 1000;
 
+/** The maximum digit-prefix count before a motion repeats. The cap bounds repeated DOM work
+ *  even for an arbitrarily long digit string. Motion loops also stop as soon as a repeat makes
+ *  no progress; the count cap provides a second bound. */
+export const MAX_MOTION_COUNT = 9999;
+
+/** Fold one typed digit into a count, capped at `MAX_MOTION_COUNT` on every step so even a held
+ *  digit key cannot accumulate a value above the cap. Kept pure so the cap is testable without
+ *  a DOM; `onKeyDown` calls it for the "count" action. */
+export function accumulateMotionCount(count: number | null, digit: number): number {
+  return Math.min(MAX_MOTION_COUNT, (count ?? 0) * 10 + digit);
+}
+
 /** The band message when `a`/`d`/`D`, or Enter on a card button, is refused because another key
  *  came within `TYPING_GUARD_MS` (`./typingGuard`). It asks the user to pause because even
  *  `Esc` followed quickly by `a` is refused, without any prose being typed. */
@@ -121,7 +133,11 @@ const CARD_ELSEWHERE_FLASH = "a / d answer the card under the cursor — j / k o
  *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
 const STOP_TYPING_FLASH = "Stop takes a key only on its own — i or Ctrl+j to type";
 /** Envelopes that move keyboard focus or cover the conversation without a keydown
- *  cancel a waiting `a`/`d`/`D`. GTK handles `nav_key`'s Ctrl+j/Ctrl+k before the page sees a key. */
+ *  cancel a waiting `a`/`d`/`D`. GTK handles `nav_key`'s Ctrl+j/Ctrl+k before the page sees a key.
+ *  Shift+Tab is a real keydown, so it is handled outside this Set.
+ *  `onModeKey` must call `typingGuard.onKey` directly: its capture handler stops propagation
+ *  to prevent backward focus navigation, so the bubble handler cannot report it.
+ *  Calling only `cancel()` would drop the pending answer without recording the key's timing. */
 const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key"]);
 
 /** Scroll the cursor row's overflow box before applying a pending `j`/`k` cursor move.
@@ -1022,6 +1038,14 @@ export default function App() {
       });
       if (route === "overlay") return;
       event.stopPropagation();
+      // This capture-phase handler stops propagation, so Shift+Tab never reaches the bubble-phase typing
+      // guard. Call `typingGuard.onKey` here to cancel deferred answers and count Shift+Tab when
+      // guarding the next key. Show its returned cancellation flash. A bare `cancel()` would leave
+      // the last-key timestamp unchanged. Use the same `event.timeStamp` fallback as the other
+      // guard calls: fake timers can put `event.timeStamp` and `performance.now()` on different
+      // clocks.
+      const cancelled = typingGuard.onKey("Tab", event.timeStamp > 0 ? event.timeStamp : performance.now());
+      if (cancelled !== null) showFlash(cancelled);
       if (route === "cycle") post({ type: "cycle_mode" });
       // "r" (not a rebindable panel-table action, so nothing on the wire names it): reaching
       // "fixed" always means the tab has already ended or failed.
@@ -1480,6 +1504,11 @@ export default function App() {
         // run against the new one -- cancelled before the new table is even
         // stored, so nothing between these two statements could read a mismatched pair.
         clearSequence();
+        // `clearSequence` only clears multi-key sequences. A single-key binding deferred by
+        // `typingGuard.defer` still closes over the old table and could run after
+        // `TYPING_GUARD_MS`. Cancel that deferred action before storing the new table, so no old
+        // binding runs after replacement.
+        typingGuard.cancel();
         setKeymapHelp({
           prefix: payload.prefix,
           window: payload.window,
@@ -1608,6 +1637,10 @@ export default function App() {
           setDetail(null);
           setHandoffOpen(false);
           setChooser(null);
+          // Close a `gf` picker on a tab switch because its paths belong to the old conversation.
+          // Otherwise the next letter could open an old path: the `pathPick` key handler runs first
+          // and does not check the active tab.
+          setPathPick(null);
           cancelBypassConfirm(); // Cancel only when the active tab changes.
           // The `/` prompt belongs to the old tab's conversation and must close on a tab switch.
           setSearch(null);
@@ -1769,10 +1802,18 @@ export default function App() {
           console.warn("agent-ui: command failed", payload.requestId, payload.error);
           if (record?.kind === "send") {
             if (record.tab === activeTabRef.current) {
-              // The composer cleared this optimistically. Rust refused it, so it goes back — a
-              // message that vanishes with no trace is the outcome this exists to prevent.
+              // Restore the message the composer cleared optimistically when Rust refuses the send.
+              // `draftRef.current` mirrors every keystroke, including that clear, so it holds the
+              // current box contents. If the box is still empty, restore only the refused text;
+              // otherwise prepend it to the newer draft with a newline so neither is lost. Call
+              // `mirrorDraft` once here so a later tab switch restores the recovered text.
+              // Mirroring from the generic composer restore effect would also echo tab-switch
+              // clears and Rust's draft echoes back as spurious draft posts.
+              const typedSince = draftRef.current;
+              const recovered = typedSince === "" ? (record.text ?? "") : `${record.text ?? ""}\n${typedSince}`;
               restoreSeq.current += 1;
-              setRestoredDraft({ text: record.text ?? "", seq: restoreSeq.current });
+              setRestoredDraft({ text: recovered, seq: restoreSeq.current });
+              mirrorDraft(recovered);
               setCommandNotice(`That message was not sent (${payload.error}). It is back in the box.`);
             } else {
               // The tab this was sent from is no longer the active one (the user switched away
@@ -2165,6 +2206,15 @@ export default function App() {
     post({ type: "interrupt" });
   }
 
+  /** Resets an ended tab with `r`. `TabSet::reset` combines the queue with Rust's saved draft.
+   *  Recovered refusal text uses the normal 300ms draft debounce, so flush any pending mirror
+   *  before `reset_tab`. Otherwise Rust could reset from stale text and its draft echo could clear
+   *  the pending mirror, losing the recovered text. `flushDraft()` is a no-op with nothing pending. */
+  function resetTab() {
+    flushDraft();
+    post({ type: "reset_tab" });
+  }
+
   /** Every answer to a card goes through here -- its own buttons, Enter in its reason box, and
    *  `a`/`d` -- so one card is answered once, whichever of them gets there first. */
   function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) {
@@ -2323,7 +2373,13 @@ export default function App() {
       typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
       if (confirm.kind === "bypass") {
         if (event.key === "y" || event.key === "Y") {
+          // A `y` with modifiers or during input method composition must not confirm bypass; timing alone
+          // cannot distinguish it from a lone `y`. Shift is allowed for `Y`. Share
+          // `isPlainAnswerKey` with card answers so Super, Hyper and AltGraph are checked too. Pass
+          // `event.nativeEvent`, which carries `getModifierState`, as `resolveKey` does.
+          const plain = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike);
           if (
+            plain &&
             !event.repeat &&
             bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
           ) {
@@ -2462,7 +2518,7 @@ export default function App() {
             }}
             onResume={(id) => post({ type: "resume", provider_session_id: id })}
             onCycleMode={() => post({ type: "cycle_mode" })}
-            onReset={() => post({ type: "reset_tab" })}
+            onReset={resetTab}
             onHint={requestHint}
             // The dashboard's `w` item: the same window-level
             // `tab_verb choose` `runPanelAction`'s `tab.choose` case posts for `prefix w`.
@@ -2832,12 +2888,13 @@ export default function App() {
       table: panelTable,
     });
     if (action === null) return;
-    // Accumulate digits into the count for the next `j`/`k`/`[[`/`]]`. That key reads it from
-    // `countRef` as `count`. Return immediately so a bare digit cannot reach the scroll or
-    // row-motion code.
+    // Accumulate digits into the count read by the next `j`/`k`/`[[`/`]]` through `countRef`.
+    // Handle digits first and return so they cannot enter the scroll or row-motion code.
+    // `accumulateMotionCount` caps each digit at `MAX_MOTION_COUNT`, so even an unfinished
+    // count cannot exceed the limit.
     if (action.kind === "count") {
       event.preventDefault();
-      countRef.current = (count ?? 0) * 10 + action.digit;
+      countRef.current = accumulateMotionCount(count, action.digit);
       return;
     }
     // How many times THIS key repeats its move: the count just accumulated (cleared above, so this
@@ -2886,20 +2943,13 @@ export default function App() {
       event.preventDefault();
       if (root === null) return;
       if (action.kind === "move") {
-        // Repeat the step `times` times, starting each step from the previous landing. Do not leap
-        // by `times` rows: a banner or status-line stop has no row and must end the walk where a
-        // single `j`/`k` would.
-        let target: HTMLElement | null = null;
-        let row = cursor;
-        for (let n = 0; n < times; n++) {
-          const next = nextStop(root, row, action.delta);
-          if (next === null) break;
-          target = next;
-          const nextRow = rowIndexOf(root, next);
-          if (nextRow === null) break;
-          row = nextRow;
-        }
-        if (target === null) return;
+        // Repeat each step from the row reached by the previous step, so a banner or status
+        // line still ends the walk as a single `j`/`k` would. `countedStop` reads the tree once for
+        // the entire count, up to `MAX_MOTION_COUNT`, and stops at a boundary when a step makes
+        // no progress because `clampStep` clamps instead of returning `null`.
+        const landing = countedStop(root, cursor, action.delta, times);
+        if (landing === null) return;
+        const target = landing.stop;
         // C1c: `j` that cannot move -- `nextStop` clamps rather than returning `null` at
         // a boundary (`clampStep`'s own doc comment), so "the last stop" is the stop the keys are
         // already on (the last row, or Stop while a turn runs), not `target === null` (that case is
@@ -2909,14 +2959,14 @@ export default function App() {
         // Never again on the repeats after that. `k` at the FIRST stop stays silent, as vim's own `k`
         // on the first line does (`:h j`) -- only `j` names a route the reader might actually want next.
         if (action.delta === 1) {
-          if (target === currentStop(root, cursor)) {
+          if (target === landing.from) {
             if (!event.repeat || heldMoveRef.current) showFlash("i or Ctrl+j to type");
             heldMoveRef.current = false;
           } else {
             heldMoveRef.current = true;
           }
         }
-        const finalRow = rowIndexOf(root, target);
+        const finalRow = landing.row;
         if (finalRow !== null) {
           if (finalRow !== cursor) landingRef.current = action.delta;
           setCursor(finalRow);
@@ -3019,7 +3069,7 @@ export default function App() {
         // `r` on an ended tab resets it to `NotStarted` IN PLACE: the tab keeps its
         // number and its rename, and the `tabs` envelope that follows is what actually drops this
         // render back to the empty tab -- there is no local start-screen reset any more.
-        post({ type: "reset_tab" });
+        resetTab();
         break;
       case "keymap":
         // Only ever reached with the overlay closed -- the `keymapOpen` branch above returns

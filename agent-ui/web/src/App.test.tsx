@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import App, { HINT_PENDING_TIMEOUT_MS, statusWarning } from "./App";
+import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, MAX_MOTION_COUNT, statusWarning } from "./App";
 import { initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
+// A namespace import lets the test spy on the real `isPlainAnswerKey` export and check that the
+// bypass-y handler calls it.
+import * as keymapModule from "./keymap";
 import { binding, TABLE } from "./testFixtures";
 import { modeFixedMessage } from "./modeKey";
 import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "./typingGuard";
@@ -1539,6 +1542,29 @@ describe("the leader", () => {
     }
   });
 
+  /** `L`'s single-key binding waits `TYPING_GUARD_MS`. Replacing the `keymap` during that
+   *  window must cancel the deferred callback, which otherwise retains the old `binding`
+   *  and runs it after the wait. Cancelling only the pending multi-key sequence with
+   *  `clearSequence` leaves that stale callback armed. */
+  it("a table replaced mid-guard-window drops the deferred L binding entirely (P2-A6)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("L");
+      expect(tabVerbsPosted()).toEqual([]);
+      sendTable({
+        ...TABLE,
+        bindings: TABLE.bindings.map((b) => (b.keys.join("") === "L" ? { ...b, action: "tab.prev" as const } : b)),
+      });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   /** `H`/`L` use `defer` (both directions), not `mayActAfterMotion`: unlike the leader, a preceding
    *  run of motion keys does not exempt them -- the review's own reason not to reuse
    *  `mayActAfterMotion` here (there is no motion run behind the FIRST key of anything). */
@@ -1952,6 +1978,68 @@ describe("v1: typing never answers a card", () => {
     press("d");
     wait(250);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
+  });
+
+  /* Alt or Meta with `a` must never authorize a tool call through `resolveKey`.
+     Each modifier gets a fresh card: reusing one would let the second key cancel the first deferred
+     answer through `TypingGuard.onKey`, masking a missing modifier check. */
+  it.each([{ altKey: true }, { metaKey: true }])(
+    "a modified a is not permission approval: %j (v1 audit P2-A1)",
+    (modifier) => {
+      arrivedOnACard();
+      press("a", modifier);
+      wait(1000);
+      expect(answered()).toEqual([]);
+    },
+  );
+
+  /* `altKey`/`metaKey` alone do not cover Super or Hyper; check `getModifierState` too.
+     jsdom honours `modifierSuper`, and `fireEvent.keyDown` forwards it to `KeyboardEvent`.
+     This cannot detect a physical modifier that WebKitGTK never exposes to the DOM. */
+  it("a modified a is not permission approval: Super", () => {
+    arrivedOnACard();
+    press("a", { modifierSuper: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  /* AltGr is a level-3 shift used to type ordinary characters, so it must not approve a card.
+     jsdom honours `KeyboardEventInit.modifierAltGraph` just as it honours `modifierSuper`. */
+  it("a modified a is not permission approval: AltGraph (v1 audit fixes, finding 1)", () => {
+    arrivedOnACard();
+    press("a", { modifierAltGraph: true });
+    wait(1000);
+    expect(answered()).toEqual([]);
+  });
+
+  /* Document-capture `onModeKey` claims Shift+Tab and stops propagation on the `cycle` route.
+     The bubble-phase handler cannot feed it to `typingGuard.onKey`, so capture must do that itself.
+     Otherwise an earlier deferred card answer remains armed and fires after the mode key. */
+  it("Shift+Tab cancels a card answer deferred moments earlier (v1 audit P2-A2)", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(100);
+    press("Tab", { code: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    // Cancelling a deferred `a`/`d` shows its flash. A bare `typingGuard.cancel()` drops the answer
+    // without telling the user that it was discarded.
+    expect(band(container)).toBe(TYPING);
+    wait(TYPING_GUARD_MS);
+    expect(answered()).toEqual([]);
+  });
+
+  /* A bare `typingGuard.cancel()` drops a pending answer without recording Shift+Tab as typing.
+     `typingGuard.onKey("Tab", ...)` also protects the next key: `a` shortly after Shift+Tab must
+     be refused even when no earlier answer was pending. */
+  it("Shift+Tab counts as typing for the guard's before-half too", () => {
+    const { container } = arrivedOnACard();
+    press("Tab", { code: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    wait(100);
+    press("a");
+    expect(band(container)).toBe(TYPING);
+    wait(1000);
+    expect(answered()).toEqual([]);
   });
 
   it("a then j at 200 ms: the j cancels the answer, flashes, and still moves", () => {
@@ -3485,6 +3573,138 @@ describe("App refused commands", () => {
     }
   });
 
+  /* When nothing was typed after the optimistic clear, a refused send restores only its text.
+     The restored text must also reach Rust through the normal `draft` envelope so a later tab
+     switch can bring it back from `shell::tabs::set_draft`. */
+  it("mirrors a restored refused send back to Rust when the box was left untouched", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "please keep me" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+      expect(box.value).toBe("please keep me");
+      expect(lastOfType("draft")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "please keep me" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* Text typed while a send is in flight must survive a refusal. Restore the refused text
+     before the newer draft, separated by a newline, and mirror the combined text to Rust. */
+  it("keeps text typed while a send was refused, with the refused text placed before it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      // Typed after the optimistic clear, before Rust's refusal arrives.
+      fireEvent.change(box, { target: { value: "second unsent draft" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "transport refused" });
+      expect(box.value).toBe("first prompt\nsecond unsent draft");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent draft" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* The queue_message path (a refusal while a turn is showing as running) goes through the exact
+     same restore code as send_message -- this is the probe's own second case, unchanged-since-send
+     on that path. */
+  it("mirrors a restored refused queue_message back to Rust", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = runningApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "unqueued text" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("queue_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "session ended" });
+      expect(box.value).toBe("unqueued text");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "unqueued text" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* Mirroring recovered text to Rust lets a tab switch restore it like any other draft.
+     Switch within the refusal's 300ms debounce, before advancing timers, so `flushDraft`
+     in the `tabs` handler must deliver the text. Waiting out the debounce first would
+     miss the race this test checks. */
+  it("shows the recovered text again after switching tabs and back", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      dispatch({ kind: "command_result", requestId, ok: false, error: "transport refused" });
+      expect(box.value).toBe("first prompt");
+      // Not yet flushed -- the refusal's own debounce has not fired, and nothing has been posted.
+      expect(lastOfType("draft")).toBeUndefined();
+
+      const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+      dispatch({ kind: "tabs", active: 2, tabs: two });
+      // The switch itself flushed the still-pending mirror -- no timer was advanced.
+      const mirrored = lastOfType("draft");
+      expect(mirrored).toMatchObject({ tab: 1, text: "first prompt" });
+      dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
+      dispatch({ kind: "tabs", active: 1, tabs: two });
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
+      // Rust echoing back exactly what the switch mirrored to it -- the contract this task closes.
+      dispatch({ kind: "draft", tab: 1, text: mirrored!.text as string });
+      enterInputMode(container);
+      expect(container.querySelector("textarea")!.value).toBe("first prompt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* `reset_tab` joins `tab.queue` and `tab.draft`, which may lag the panel's 300ms draft debounce.
+     Flush the pending recovery mirror before reset, as on a tab switch. Otherwise a stale `draft`
+     echo can erase the composer and clear `pendingDraftRef` before the debounce sends its text. */
+  it("flushes a still-pending recovered draft before reset_tab, so a restart cannot erase it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "first prompt" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+      const requestId = lastOfType("send_message")!.request_id;
+      // Typed after the optimistic clear, before Rust's refusal arrives.
+      fireEvent.change(box, { target: { value: "second unsent draft" } });
+      dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
+      expect(box.value).toBe("first prompt\nsecond unsent draft");
+      // Not yet flushed -- the refusal's own `mirrorDraft` debounce has not fired.
+      expect(lastOfType("draft")).toBeUndefined();
+
+      // The same failure that refused the send also ended the tab, so `r` is on offer; pressed
+      // inside the still-pending debounce window, before any timer fires on its own.
+      dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "session_closed", reason: "provider exited" }] });
+      fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "r" });
+
+      // The recovered text reached Rust before reset_tab, not after it, and not a stray empty one.
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "first prompt\nsecond unsent draft" });
+      expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
+      expect(posted.indexOf(lastOfType("draft")!)).toBeLessThan(posted.indexOf(lastOfType("reset_tab")!));
+
+      // The now-superseded timer firing later must not post a second, stale (or empty) draft.
+      act(() => vi.advanceTimersByTime(300));
+      expect(posted.filter((m) => m.type === "draft")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   function runningApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -4387,6 +4607,29 @@ describe("a switch back to a tab whose reply streams (the small-defects GUI pass
   });
 });
 
+/** A digit prefix must stay bounded and must not require `O(count)` work.
+ *  These pure tests check accumulation without the DOM; keyboard wiring and DOM scans
+ *  are checked by the counted-motion tests below. */
+describe("accumulateMotionCount (v1 audit R4)", () => {
+  function typeCount(digits: string): number {
+    let count: number | null = null;
+    for (const ch of digits) count = accumulateMotionCount(count, Number(ch));
+    return count!;
+  }
+
+  it("keeps an ordinary count exact", () => {
+    expect(typeCount("3")).toBe(3);
+    expect(typeCount("12")).toBe(12);
+  });
+
+  it("caps a count past MAX_MOTION_COUNT, far below vim's own silent overflow cap", () => {
+    expect(typeCount("99999")).toBe(MAX_MOTION_COUNT);
+    // Capped on every digit, not only once the whole string is read: a long run of the same digit
+    // (someone holding a number key) never transiently builds a number past the cap either.
+    expect(typeCount("9".repeat(50))).toBe(MAX_MOTION_COUNT);
+  });
+});
+
 describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
   it("3j moves three rows, and ]] / [[ go from prompt to prompt", () => {
     const { container } = render(<App />);
@@ -4411,6 +4654,89 @@ describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
     fireEvent.keyDown(root, { key: "[" });
     fireEvent.keyDown(root, { key: "[" });
     expect(current()).toContain("first ask");
+  });
+
+  /** `nextStop`/`clampStep` clamp at a boundary instead of returning `null`, so a loop
+   *  that stops only on `null` repeats all `times` iterations without moving.
+   *  Stop when a repeat returns the same stop. Count `querySelectorAll` calls to measure
+   *  the scans made by `stopsIn`/`conversationRows` through `nextStop`/`rowIndexOf`. */
+  it("a large count at a one-row boundary does O(1) DOM scans, not O(count)", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "the only row" }] }), 2);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    gg(container);
+    const scans = vi.spyOn(root, "querySelectorAll");
+    for (const key of "1000") fireEvent.keyDown(root, { key });
+    scans.mockClear();
+    fireEvent.keyDown(root, { key: "j" });
+    expect(scans.mock.calls.length).toBeLessThan(50);
+    scans.mockRestore();
+  });
+
+  /** The same shape, past MAX_MOTION_COUNT -- proves the boundary early-exit alone already tames an
+   *  even larger count (the cap above is the second, independent bound, tested in isolation). */
+  it("an even larger count (past the cap) still does O(1) DOM scans", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "the only row" }] }), 2);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    gg(container);
+    const scans = vi.spyOn(root, "querySelectorAll");
+    for (const key of "99999") fireEvent.keyDown(root, { key });
+    scans.mockClear();
+    fireEvent.keyDown(root, { key: "j" });
+    expect(scans.mock.calls.length).toBeLessThan(50);
+    scans.mockRestore();
+  });
+
+  /** Boundary tests only show that a count which cannot move is cheap. Walking a count
+   *  also needs bounded DOM scans: the old loop queried `conversationRows` through both
+   *  `nextStop` and `rowIndexOf` on every step, making 2,001 queries for `1000j` across
+   *  1,001 rows. `countedStop` reads the tree once per motion. */
+  it("1000j from the first of 1,001 rows reads the tree a bounded number of times and lands on the last", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const transcript = Array.from({ length: 1001 }, (_, i) => ({ seq: i + 1, text: `row ${i + 1}` }));
+    dispatchLiveTab(snapshotState({ transcript }), 1002);
+    const root = container.querySelector(".agent-ui-conversation")!;
+    const current = () => container.querySelector(".row-current")!.textContent;
+    gg(container);
+    expect(current()).toContain("row 1");
+    const scans = vi.spyOn(root, "querySelectorAll");
+    for (const key of "1000") fireEvent.keyDown(root, { key });
+    scans.mockClear();
+    fireEvent.keyDown(root, { key: "j" });
+    expect(scans.mock.calls.length).toBeLessThan(50);
+    scans.mockRestore();
+    expect(current()).toContain("row 1001");
+  });
+
+  /** Found writing `countedStop`: every step of the old walk re-read `document.activeElement`, so
+   *  with the keys on a control inside a row (after `l` onto a card's Approve) each step started
+   *  again from that row, and `3j` moved once. Vim's `3j` moves three. */
+  it("3j from a card's Approve moves three stops, not one", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(
+      snapshotState({
+        transcript: [{ seq: 1, text: "alpha" }, { seq: 3, text: "bravo" }, { seq: 4, text: "charlie" }, { seq: 5, text: "delta" }],
+        pendingPermissions: [{ seq: 2, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "cargo fmt" } }],
+      }),
+      6,
+    );
+    const root = container.querySelector(".agent-ui-conversation")!;
+    const current = () => container.querySelector(".row-current")!;
+    gg(container);
+    fireEvent.keyDown(root, { key: "j" });
+    expect(current().classList.contains("row-permission")).toBe(true);
+    fireEvent.keyDown(root, { key: "l" });
+    const approve = document.activeElement as HTMLElement;
+    expect(approve.tagName).toBe("BUTTON");
+    expect(current().contains(approve)).toBe(true);
+    fireEvent.keyDown(approve, { key: "3" });
+    fireEvent.keyDown(approve, { key: "j" });
+    expect(current().textContent).toContain("delta");
   });
 
   it("Ctrl+c interrupts a running turn in BROWSE, even over a text selection", () => {
@@ -4700,6 +5026,23 @@ describe("N2 and R3: the editor round trips", () => {
     fireEvent.keyDown(root, { key: "Escape" });
     expect(container.querySelector(".path-pick")).toBeNull();
     expect(posted.filter((m) => m.type === "open_path")).toHaveLength(1);
+  });
+
+  /** Switching tabs must clear `pathPick`. Otherwise a `gf` picker from the old conversation
+   *  stays open and the next letter on the new tab can open one of the old tab's paths.
+   *  Resetting other conversation state alone leaves that stale picker active. */
+  it("switching tabs while gf's picker is open drops it: no open_path on the new tab (P2-A5)", () => {
+    const { container } = withPaths("compare a.rs and b.rs");
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "second conversation" }] }) });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "a" });
+    expect(posted.filter((m) => m.type === "open_path")).toEqual([]);
   });
 
   it("a click on an inline code path opens it", () => {
@@ -5500,6 +5843,58 @@ describe("v1 mode: entering bypass asks first", () => {
       fireEvent.keyDown(root, { key });
       expect(lastOfType("confirm_bypass")).toBeUndefined();
     } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** A `y` with Ctrl/Alt/Meta held, or one being composed by an input method, cancels
+   *  the bypass prompt even after the timing guard expires. Shift alone is allowed: `Y` counts.
+   *  Super, Hyper and AltGraph must also be checked. jsdom exposes `modifierSuper`, `modifierHyper`
+   *  and `modifierAltGraph` independently, so each case isolates one modifier.
+   *  This does not prove WebKitGTK exposes each as a DOM modifier. */
+  it.each([
+    ["Ctrl+y", { key: "y", ctrlKey: true }],
+    ["Alt+y", { key: "y", altKey: true }],
+    ["Meta+y", { key: "y", metaKey: true }],
+    ["Super+y", { key: "y", modifierSuper: true }],
+    ["Hyper+y", { key: "y", modifierHyper: true }],
+    ["AltGraph+y", { key: "y", modifierAltGraph: true }],
+    ["Ctrl+Shift+Y", { key: "Y", ctrlKey: true, shiftKey: true }],
+    ["a y an input method is composing", { key: "y", isComposing: true }],
+    ["an input method's keyCode 229 y", { key: "y", keyCode: 229 }],
+  ] as const)("h3. %s after the guard cancels and posts nothing", (_name, init) => {
+    fakeClock();
+    try {
+      const { container, root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      fireEvent.keyDown(root, init);
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+      expect(container.querySelector(".band-prompt")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** Spy on the exported `isPlainAnswerKey` to check that the bypass handler uses the shared rule.
+   *  Behavioral cases alone also pass with an equivalent local copy. The namespace spy intercepts
+   *  App's imported binding, but cannot intercept direct calls within `keymap.ts`.
+   *  The keymap matrix checks those callers; direct predicate tests check the rule itself. */
+  it("h3b. the bypass-y handler calls the real, exported isPlainAnswerKey, not a look-alike copy", () => {
+    const spy = vi.spyOn(keymapModule, "isPlainAnswerKey");
+    fakeClock();
+    try {
+      const { root } = liveConversation();
+      dispatchBypassConfirm();
+      act(() => vi.advanceTimersByTime(300));
+      spy.mockClear();
+      fireEvent.keyDown(root, { key: "y", ctrlKey: true });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(lastOfType("confirm_bypass")).toBeUndefined();
+    } finally {
+      spy.mockRestore();
       vi.useRealTimers();
       vi.unstubAllGlobals();
     }

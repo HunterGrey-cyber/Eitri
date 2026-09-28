@@ -44,6 +44,10 @@ impl LuaEngine {
         // Empty `package.path` and install a Rust searcher at `package.searchers[2]` that resolves
         // paths with `Path::join`, keeping directory names out of the pattern parser. Empty
         // `package.cpath` and remove searchers 3 and 4 to disable native module loading.
+        //
+        // The installed searchers ignore `package.path` and `package.cpath`. Extending either in
+        // `init.lua` has no effect, and `package.searchpath` describes paths `require` does not use.
+        // The filesystem search is confined to `<config_dir>/lua/`.
         let package: Table = lua.globals().get("package")?;
         package.set("path", "")?;
         package.set("cpath", "")?;
@@ -144,7 +148,21 @@ impl LuaEngine {
     /// error up to the caller -- a broken or missing init.lua must not crash the shell; this
     /// logs and the shell continues with whatever it registered before the error (the editor and
     /// the agent are not registered here at all: every window has them).
+    ///
+    /// **One exception, a startup failure: a command id `neovibe.command.register` refused**
+    /// (sw-lua-5, `CommandRegistry::refused`). It is a config value neovibe validates, and like
+    /// `agent.font_size` or a keybinding collision (`main.rs`) it exits 1 naming itself -- rather
+    /// than a window that silently lacks everything init.lua registered after it, the account pin
+    /// among them. Checked after the file has run, so a `pcall` around the call changes nothing.
     pub(crate) fn load_init_file(&self, path: &std::path::Path) {
+        self.run_init_file(path);
+        if let Some(refused) = self.commands.borrow().refused() {
+            eprintln!("neovibe: {} ({})", refused, path.display());
+            std::process::exit(1);
+        }
+    }
+
+    fn run_init_file(&self, path: &std::path::Path) {
         if !path.exists() {
             println!(
                 "[lua] no init.lua at {} -- continuing with built-ins only",
@@ -240,6 +258,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&config_dir);
 
         outcome.unwrap();
+    }
+
+    /// The documented consequence of the searcher above: extending
+    /// `package.path` from `init.lua` does not add a place `require` looks, even an absolute one.
+    #[test]
+    fn extending_package_path_adds_no_place_require_looks() {
+        let elsewhere = std::env::temp_dir().join(format!("nv-lua-test-elsewhere-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&elsewhere).expect("create a module directory outside the config dir");
+        std::fs::write(elsewhere.join("extra.lua"), "return 'from-elsewhere'").expect("plant a module there");
+        let config_dir = std::env::temp_dir().join(format!("nv-lua-test-config-{}", uuid::Uuid::new_v4()));
+
+        let engine = LuaEngine::new(config_dir.clone()).expect("construct LuaEngine");
+        let dir = elsewhere.display().to_string();
+        let found: mlua::Result<mlua::Value> = engine
+            .lua
+            .load(format!(
+                "package.path = {dir:?} .. '/?.lua;' .. package.path; return require('extra')"
+            ))
+            .eval();
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        assert!(found.is_err(), "require followed an edit to package.path: {found:?}");
     }
 
     /// Checks that a semicolon in `config_dir` cannot inject a relative Lua search entry.

@@ -276,6 +276,10 @@ export function EmptyTab(props: EmptyTabProps) {
   // against the new one.
   useEffect(() => {
     clearSequence();
+    // `clearSequence` drops only a pending multi-key sequence. A single-key binding deferred by
+    // `typingGuard.defer` closes over the old table binding at keydown, so cancel it too when
+    // the table changes to avoid running a stale binding.
+    typingGuard.cancel();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelTable]);
   // Leaving BROWSE by any route other than a key this engine itself consumed (a click into the

@@ -68,12 +68,33 @@ type Props = {
   unseenSeed?: { afterSeq: number; tick: number } | null;
 };
 
-/** Whether a finished tool call succeeded, failed, or is still running -- the state a row's sign
- * glyph carries. A call with no result yet is never "done with nothing to say"; see `ToolResult`
- * in `toolRegistry.tsx`, which draws the same three-way distinction in the body. */
-function toolSign(call: ToolCallRecord): string {
-  if (call.result === null) return "◐";
+/** Whether a finished tool call succeeded, failed, is still running, or was abandoned -- the state a
+ * row's sign glyph carries. A call with no result yet is never "done with nothing to say"; see
+ * `ToolResult` in `toolRegistry.tsx`, which draws the matching distinction in the body.
+ *
+ * `abandoned` (sw-panel-render-6) reuses the `·` glyph `App.tsx` already draws for an ended session
+ * row (`<Row kind="ended" sign="·" ...>`), rather than inventing a second "this is over" mark. */
+function toolSign(call: ToolCallRecord, abandoned: boolean): string {
+  if (call.result === null) return abandoned ? "·" : "◐";
   return call.result.isError ? "✗" : "✓";
+}
+
+/** Whether a `null` result can never arrive: the call predates the restored-history boundary (a
+ * resume/reload only ever replays what a transcript actually recorded, so a call from before that
+ * cut that has no result now never will), the session itself has ended, or the call's own turn is
+ * no longer the active one. Without this, `null`
+ * meant only "still running" -- so a tool call abandoned by a killed/interrupted session, or one
+ * that outlived the transcript it was restored from, rendered a permanent spinner (sw-panel-render-6).
+ * A call still genuinely running (an active turn, inside the live span) is untouched: this is never
+ * true for it, matching the pre-fix "◐" rendering exactly. */
+function isAbandonedCall(call: ToolCallRecord, state: AgentUiState, sessionEnded: boolean): boolean {
+  if (call.result !== null) return false;
+  if (sessionEnded) return true;
+  if (state.history !== null && call.seq < state.history.uptoSeq) return true;
+  // Both backends stamp each event with its turn id, so a result can only arrive in the call's own turn.
+  // An interrupted, failed or superseded turn cannot finish the call; leaving it running would show a permanent spinner.
+  // For a call without a turn id, treat it as abandoned when no turn is active.
+  return call.turnId ? call.turnId !== state.activeTurnId : state.activeTurnId === null;
 }
 
 /** How close to the true bottom of `.message-list` still counts as "following the tail," for the
@@ -569,8 +590,9 @@ export function MessageList({
             }
             case "tool": {
               const yanked = item.key === yankedKey ? "row-yanked" : undefined;
+              const abandoned = isAbandonedCall(item.call, state, sessionEnded);
               return (
-                <Row key={item.key} kind="tool" sign={toolSign(item.call)} current={current} className={yanked} navStop="row">
+                <Row key={item.key} kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yanked} navStop="row">
                   <div data-awaiting-permission={awaitingPermission.has(item.call.toolUseId) ? "true" : undefined}>
                     {/* A gated call shows "waiting for approval" because its permission card already shows
                         the invocation. Repeating it here would make a pending call look as if it had run. */}
@@ -578,6 +600,7 @@ export function MessageList({
                       gated: awaitingPermission.has(item.call.toolUseId),
                       detailed,
                       expanded: expanded[item.key] === true,
+                      abandoned,
                     })}
                   </div>
                 </Row>
