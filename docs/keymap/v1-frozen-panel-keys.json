@@ -1,0 +1,116 @@
+[
+  {
+    "keys": [
+      "H"
+    ],
+    "action": "tab.prev"
+  },
+  {
+    "keys": [
+      "L"
+    ],
+    "action": "tab.next"
+  },
+  {
+    "keys": [
+      "[",
+      "b"
+    ],
+    "action": "tab.prev"
+  },
+  {
+    "keys": [
+      "]",
+      "b"
+    ],
+    "action": "tab.next"
+  },
+  {
+    "keys": [
+      "g",
+      "t"
+    ],
+    "action": "tab.next"
+  },
+  {
+    "keys": [
+      "g",
+      "T"
+    ],
+    "action": "tab.prev"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "b",
+      "b"
+    ],
+    "action": "tab.last"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "b",
+      "d"
+    ],
+    "action": "tab.close"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "b",
+      "o"
+    ],
+    "action": "tab.close-others"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "f",
+      "n"
+    ],
+    "action": "tab.new"
+  },
+  {
+    "keys": [
+      "<leader>",
+      ","
+    ],
+    "action": "tab.choose"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "/"
+    ],
+    "action": "panel.search"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "i"
+    ],
+    "action": "tab.info"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "t"
+    ],
+    "action": "panel.handoff"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "m"
+    ],
+    "action": "mode.cycle"
+  },
+  {
+    "keys": [
+      "<leader>",
+      "?"
+    ],
+    "action": "panel.keymap"
+  }
+]

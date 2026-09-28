@@ -1,0 +1,260 @@
+{
+  "prefix": "C-b",
+  "bindings": [
+    {
+      "key": "C-b",
+      "repeatable": false,
+      "action": "send-prefix()"
+    },
+    {
+      "key": "%",
+      "repeatable": false,
+      "action": "split.right()"
+    },
+    {
+      "key": "\"",
+      "repeatable": false,
+      "action": "split.below()"
+    },
+    {
+      "key": "z",
+      "repeatable": false,
+      "action": "zoom()"
+    },
+    {
+      "key": "C-Up",
+      "repeatable": true,
+      "action": "resize.up(cells=1)"
+    },
+    {
+      "key": "C-Down",
+      "repeatable": true,
+      "action": "resize.down(cells=1)"
+    },
+    {
+      "key": "C-Left",
+      "repeatable": true,
+      "action": "resize.left(cells=1)"
+    },
+    {
+      "key": "C-Right",
+      "repeatable": true,
+      "action": "resize.right(cells=1)"
+    },
+    {
+      "key": "M-Up",
+      "repeatable": true,
+      "action": "resize.up(cells=5)"
+    },
+    {
+      "key": "M-Down",
+      "repeatable": true,
+      "action": "resize.down(cells=5)"
+    },
+    {
+      "key": "M-Left",
+      "repeatable": true,
+      "action": "resize.left(cells=5)"
+    },
+    {
+      "key": "M-Right",
+      "repeatable": true,
+      "action": "resize.right(cells=5)"
+    },
+    {
+      "key": "Up",
+      "repeatable": true,
+      "action": "select.up()"
+    },
+    {
+      "key": "Down",
+      "repeatable": true,
+      "action": "select.down()"
+    },
+    {
+      "key": "Left",
+      "repeatable": true,
+      "action": "select.left()"
+    },
+    {
+      "key": "Right",
+      "repeatable": true,
+      "action": "select.right()"
+    },
+    {
+      "key": "{",
+      "repeatable": false,
+      "action": "swap.prev()"
+    },
+    {
+      "key": "}",
+      "repeatable": false,
+      "action": "swap.next()"
+    },
+    {
+      "key": "M-1",
+      "repeatable": false,
+      "action": "layout.even-horizontal()"
+    },
+    {
+      "key": "M-2",
+      "repeatable": false,
+      "action": "layout.even-vertical()"
+    },
+    {
+      "key": "x",
+      "repeatable": false,
+      "action": "module.kill()"
+    },
+    {
+      "key": "c",
+      "repeatable": false,
+      "action": "tab.new()"
+    },
+    {
+      "key": "n",
+      "repeatable": false,
+      "action": "tab.next()"
+    },
+    {
+      "key": "p",
+      "repeatable": false,
+      "action": "tab.prev()"
+    },
+    {
+      "key": "l",
+      "repeatable": false,
+      "action": "tab.last()"
+    },
+    {
+      "key": "1",
+      "repeatable": false,
+      "action": "tab.select(n=1)"
+    },
+    {
+      "key": "2",
+      "repeatable": false,
+      "action": "tab.select(n=2)"
+    },
+    {
+      "key": "3",
+      "repeatable": false,
+      "action": "tab.select(n=3)"
+    },
+    {
+      "key": "4",
+      "repeatable": false,
+      "action": "tab.select(n=4)"
+    },
+    {
+      "key": "5",
+      "repeatable": false,
+      "action": "tab.select(n=5)"
+    },
+    {
+      "key": "6",
+      "repeatable": false,
+      "action": "tab.select(n=6)"
+    },
+    {
+      "key": "7",
+      "repeatable": false,
+      "action": "tab.select(n=7)"
+    },
+    {
+      "key": "8",
+      "repeatable": false,
+      "action": "tab.select(n=8)"
+    },
+    {
+      "key": "9",
+      "repeatable": false,
+      "action": "tab.select(n=9)"
+    },
+    {
+      "key": ",",
+      "repeatable": false,
+      "action": "tab.rename()"
+    },
+    {
+      "key": "&",
+      "repeatable": false,
+      "action": "tab.close()"
+    },
+    {
+      "key": "w",
+      "repeatable": false,
+      "action": "tab.choose()"
+    },
+    {
+      "key": "i",
+      "repeatable": false,
+      "action": "tab.info()"
+    },
+    {
+      "key": "f",
+      "repeatable": false,
+      "action": "hint()"
+    },
+    {
+      "key": "r",
+      "repeatable": false,
+      "action": "panel.reload()"
+    },
+    {
+      "key": "?",
+      "repeatable": false,
+      "action": "panel.keymap()"
+    },
+    {
+      "key": "C-l",
+      "repeatable": false,
+      "action": "send-keys(keys=C-l)"
+    },
+    {
+      "key": "C-h",
+      "repeatable": false,
+      "action": "send-keys(keys=C-h)"
+    },
+    {
+      "key": "C-j",
+      "repeatable": false,
+      "action": "send-keys(keys=C-j)"
+    },
+    {
+      "key": "C-k",
+      "repeatable": false,
+      "action": "send-keys(keys=C-k)"
+    },
+    {
+      "key": "F11",
+      "repeatable": false,
+      "action": "window.immersive()"
+    },
+    {
+      "key": "e",
+      "repeatable": false,
+      "action": "module.editor()"
+    },
+    {
+      "key": "a",
+      "repeatable": false,
+      "action": "module.agent()"
+    },
+    {
+      "key": "t",
+      "repeatable": false,
+      "action": "module.terminal()"
+    },
+    {
+      "key": "[",
+      "repeatable": false,
+      "action": "copy-mode()"
+    },
+    {
+      "key": "PPage",
+      "repeatable": false,
+      "action": "copy-mode(up=true)"
+    }
+  ]
+}
