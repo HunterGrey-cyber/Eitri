@@ -170,8 +170,10 @@ impl PanelSeq {
     }
 }
 
-/// Alone in BROWSE these already mean something.
-const FIXED: &str = "jkhladiyYDfrnNG/?0123456789";
+/// These keys already have meanings alone in BROWSE (`keymap.ts`'s `resolveKey`).
+/// `o` and `A` enter INPUT like `i`, so panel bindings and nvim leaders or mappings must not
+/// shadow them.
+const FIXED: &str = "jkhladioAyYDfrnNG/?0123456789";
 const PENDING: &str = "gz[]";
 const TAKEN_PAIRS: &[&str] = &["gg", "gf", "zh", "zl", "[[", "]]", "[]", "]["];
 
@@ -514,8 +516,10 @@ mod tests {
 
     #[test]
     fn the_fixed_browse_keys_are_reserved() {
+        // `o` is an alias for `i`, and `A` enters INPUT with the caret at the end.
+        // Both must be fixed BROWSE keys so a panel binding or nvim leader/mapping cannot shadow them.
         for key in [
-            "j", "k", "h", "l", "a", "d", "i", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", "5",
+            "j", "k", "h", "l", "a", "d", "i", "o", "A", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", "5",
         ] {
             assert!(reserved(&parse_seq(key).unwrap()).is_some(), "{key} alone");
             assert!(reserved(&parse_seq(&format!("{key}x")).unwrap()).is_some(), "{key}x");
@@ -528,6 +532,16 @@ mod tests {
         for free in ["[b", "]b", "H", "L", "<leader>bd", "<Space>x", "gt", "gT", "zb"] {
             assert_eq!(reserved(&parse_seq(free).unwrap()), None, "{free}");
         }
+    }
+
+    /// The panel binding API refuses `o` and `A` just as it refuses `i`,
+    /// so user bindings cannot shadow their built-in BROWSE meanings.
+    #[test]
+    fn o_and_a_are_refused_by_set_the_same_way_i_is() {
+        let mut table = PanelUserTable::default();
+        assert!(table.set("o", "tab.next").is_err(), "o");
+        assert!(table.set("A", "tab.next").is_err(), "A");
+        assert!(table.set("i", "tab.next").is_err(), "i, for comparison");
     }
 
     #[test]

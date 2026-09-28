@@ -12,7 +12,10 @@
 //! no show, placement or tray chip. After nvim quits, a second `nvim --embed` cannot start
 //! in this process because `LiveHarness` creates an event loop that can be created only
 //! once per process.
-//! Gone is not saved; the leaf is saved as hidden and reopens hidden on relaunch.
+//! Gone is not saved. `Layout::saved_hidden` also excludes hiding caused by retirement,
+//! so a module retired while shown reopens shown on relaunch. A module the user hid stays
+//! hidden. Saving preserves the user's arrangement, as `kill_pane::Reveal::rehide` does
+//! for the quit prompt.
 //!
 //! Focus moves first, as for a hide (`super::hide`). `kill` refuses the last shown module;
 //! `KillScope::Window` tells `shell` to close the window instead.
@@ -21,26 +24,28 @@ use super::geometry::{hide, Frame};
 use super::module::{ModuleId, Placement};
 use super::tree::{place_new, Layout, LayoutError};
 
-/// Lua typed into nvim to quit the editor. A single `<Cmd>lua` line keeps a cancelled
-/// prompt in the previous mode. `generation` is bumped by `shell` before each send
-/// (`kill_pane::QuitInFlight`) to distinguish a cancellation from a later quit.
+/// Lua run by `shell` for `prefix x` on the editor and for window close. `generation`
+/// is bumped before each send (`kill_pane::QuitInFlight`) so a cancellation can be
+/// distinguished from a later quit of the same editor.
 ///
-/// Use exactly one `<Cmd>...<CR>` with no other `<` inside the Lua source. A second
-/// command queued after `:confirm qall` in the same `send_keys` call would be read as
-/// the prompt's answer. `nvim_input` also parses `<...>` key notation inside the source.
-/// The key-notation literal lives here because `shell` sources contain none.
+/// Send this as an RPC request (`nvim_exec_lua`). Typed `<Cmd>` input can be consumed
+/// as a pending character after `f`/`t`/`r`/`m`/`q`/`Ctrl-W`, inside `getchar()`, or after
+/// an insert-mode `Ctrl-V`. The remaining Lua can then execute as Normal-mode commands
+/// and alter the buffer. A request types nothing and runs when nvim next handles it,
+/// which in these states is after the awaited key (`core/tests/editor_quit_with_real_nvim.rs`).
 ///
 /// `pcall(vim.cmd, 'confirm qall')` returns only if nvim stays alive, whether the quit was
 /// cancelled, interrupted with `Ctrl+c`, or stopped by an error in `QuitPre`/`ExitPre`.
 /// Only then is the generation sent on the existing pane-switch socket. Connection,
 /// write and close use `pcall`, as in `core/src/theme/nvim_theme.lua`, so a failed write
-/// does not raise E5108 in the editor.
-pub fn editor_quit_keys(generation: u32) -> String {
+/// does not raise E5108 in the editor. The request's response also reports that the chunk
+/// returned; `shell` reads it so cancellation is seen even without the socket shim.
+pub fn editor_quit_lua(generation: u32) -> String {
     format!(
-        "<Cmd>lua pcall(vim.cmd, 'confirm qall') \
+        "pcall(vim.cmd, 'confirm qall') \
          local p = os.getenv('NEOVIBE_PANE_SWITCH_SOCKET') \
          if p then local ok, c = pcall(vim.fn.sockconnect, 'pipe', p, {{rpc = false}}) \
-         if ok and c ~= 0 then pcall(vim.fn.chansend, c, 'Q {generation}\\n') pcall(vim.fn.chanclose, c) end end<CR>"
+         if ok and c ~= 0 then pcall(vim.fn.chansend, c, 'Q {generation}\\n') pcall(vim.fn.chanclose, c) end end"
     )
 }
 
@@ -92,6 +97,7 @@ pub fn kill(
     if layout.is_gone(id) {
         return Err(LayoutError::Gone(id.clone()));
     }
+    let was_shown = !layout.hidden().contains(id);
     let next = hide(layout, id, frame)?;
     match reopen {
         Reopen::At(placement) => {
@@ -107,7 +113,7 @@ pub fn kill(
             layout.replace_root(root);
         }
         Reopen::InPlace => {}
-        Reopen::Never => layout.retire(id),
+        Reopen::Never => layout.retire(id, was_shown),
     }
     Ok(next)
 }
@@ -270,14 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_quit_is_one_cmd_line_carrying_its_generation() {
-        let keys = editor_quit_keys(7);
-        assert!(keys.starts_with("<Cmd>lua "), "{keys}");
-        assert!(keys.ends_with("<CR>"), "{keys}");
-        assert!(keys.contains("confirm qall"), "{keys}");
-        assert!(keys.contains(r"'Q 7\n'"), "{keys}");
-        assert_eq!(keys.matches('<').count(), 2, "only <Cmd> and <CR>: {keys}");
-        assert_ne!(editor_quit_keys(7), editor_quit_keys(8));
+    fn the_editor_quit_is_lua_carrying_its_generation_and_no_key_notation() {
+        let lua = editor_quit_lua(7);
+        assert!(lua.starts_with("pcall(vim.cmd, 'confirm qall')"), "{lua}");
+        assert!(lua.contains(r"'Q 7\n'"), "{lua}");
+        assert!(
+            !lua.contains("<Cmd>") && !lua.contains("<CR>"),
+            "a chunk for nvim_exec_lua, not keys: {lua}"
+        );
+        assert_ne!(editor_quit_lua(7), editor_quit_lua(8));
     }
 
     /// Gone: never shown, placed, focused or offered in the tray again in this window.
@@ -299,8 +306,13 @@ mod tests {
             kill(&mut layout, &editor(), Reopen::Never, &frame()),
             Err(LayoutError::Gone(editor()))
         );
-        // Still a hidden leaf, which is what the state file writes.
+        // Still a hidden leaf -- and the state file writes it shown, as it was before (T6-5).
         assert!(layout.contains(&editor()));
         assert!(layout.hidden().contains(&editor()));
+        assert!(!layout.saved_hidden().contains(&editor()));
+        assert!(
+            layout.saved_hidden().contains(&term()),
+            "the terminal the user hid stays hidden"
+        );
     }
 }

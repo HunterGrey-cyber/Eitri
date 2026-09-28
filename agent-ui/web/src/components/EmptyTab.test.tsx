@@ -7,6 +7,7 @@ import type { EmptyTabProps } from "./EmptyTab";
 import type { Hello, ResumableSession, TabInfo } from "../types";
 import { TABLE } from "../testFixtures";
 import { WHICH_KEY_DELAY_MS } from "../leader";
+import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "../typingGuard";
 
 afterEach(cleanup);
 
@@ -215,29 +216,126 @@ describe("EmptyTab (F3)", () => {
       expect(container.querySelector("textarea")).not.toBeNull();
     });
 
-    it("r resumes the newest record directly, regardless of the cursor", () => {
+    /** v1 hardening, codex-release-p1 #7 (C1a): this screen had never grown `o`, the live tab's own
+     *  exact alias of `i` (`keymap.ts:284-292`) -- only `i` opened the composer here. */
+    it("o is an exact alias of i (C1a)", () => {
       const rendered = renderEmpty();
-      const { props } = rendered;
+      const { props, container } = rendered;
       const root = toBrowse(rendered, props);
-      fireEvent.keyDown(root, { key: "r" });
-      expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
+      expect(container.querySelector("textarea")).toBeNull();
+      fireEvent.keyDown(root, { key: "o" });
+      expect(container.querySelector("textarea")).not.toBeNull();
+    });
+
+    /** v1 hardening, codex-release-p1 #7 (C1a): `A` had no branch at all here, so the live tab's
+     *  second frozen alias -- open INPUT with the caret forced to the end -- was silently absent on
+     *  the very first screen a new user sees. Round trip mirrors `Composer`'s own suite: `i` leaves
+     *  the caret at 3 of "hello world", `Escape` returns to BROWSE, and `A` must move it to 11
+     *  regardless of where it was left (never simply "kept", which `i` already covers above). */
+    it("A opens the composer with the caret forced to the end, not wherever i last left it (C1a)", () => {
+      const rendered = renderEmpty();
+      const { props, container } = rendered;
+      const root = toBrowse(rendered, props);
+      fireEvent.keyDown(root, { key: "i" });
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: "hello world" } });
+      textarea.setSelectionRange(3, 3);
+      fireEvent.keyUp(textarea, { key: "ArrowLeft" });
+      fireEvent.keyDown(textarea, { key: "Escape" });
+      expect(container.querySelector("textarea")).toBeNull();
+      fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "A", shiftKey: true });
+      expect(container.querySelector("textarea")!.selectionStart).toBe("hello world".length);
+    });
+
+    /** v1 hardening: `r` still resumes the newest record, regardless of
+     *  the cursor -- `TYPING_GUARD_MS` later, like `f` and `H`/`L` on this screen, so typed prose
+     *  cannot run it (the next tests). */
+    it("r resumes the newest record directly, regardless of the cursor, TYPING_GUARD_MS later", () => {
+      vi.useFakeTimers();
+      try {
+        const rendered = renderEmpty();
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: "r" });
+        expect(props.onResume).not.toHaveBeenCalled();
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+        expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("r does nothing when there is no record to resume", () => {
-      const rendered = renderEmpty({ hello: { ...HELLO, resumableSessions: [] } });
-      const { props } = rendered;
-      const root = toBrowse(rendered, props);
-      fireEvent.keyDown(root, { key: "r" });
-      expect(props.onResume).not.toHaveBeenCalled();
+      vi.useFakeTimers();
+      try {
+        const rendered = renderEmpty({ hello: { ...HELLO, resumableSessions: [] } });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: "r" });
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+        expect(props.onResume).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
-    it("w opens the chooser", () => {
-      const onChooseSessions = vi.fn();
-      const rendered = renderEmpty({ onChooseSessions });
-      const { props } = rendered;
-      const root = toBrowse(rendered, props);
-      fireEvent.keyDown(root, { key: "w" });
-      expect(onChooseSessions).toHaveBeenCalledTimes(1);
+    it("w opens the chooser, TYPING_GUARD_MS later", () => {
+      vi.useFakeTimers();
+      try {
+        const onChooseSessions = vi.fn();
+        const rendered = renderEmpty({ onChooseSessions });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: "w" });
+        expect(onChooseSessions).not.toHaveBeenCalled();
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+        expect(onChooseSessions).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    /** Arrivals land the dashboard in BROWSE. Typing "run" immediately must cancel the deferred `r`
+     *  action instead of resuming the newest saved session. */
+    it('"run" at 80 ms a key resumes nothing, and the band names r', () => {
+      vi.useFakeTimers();
+      try {
+        const onFlash = vi.fn();
+        const rendered = renderEmpty({ onFlash });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        for (const key of ["r", "u", "n"]) {
+          fireEvent.keyDown(root, { key });
+          act(() => vi.advanceTimersByTime(80));
+        }
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+        expect(props.onResume).not.toHaveBeenCalled();
+        expect(onFlash).toHaveBeenCalledWith(tableKeyTypingFlash("r", "resume the newest session"));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    /** ...and "what's next" opened the modal chooser on its `w`, which then took the rest of the
+     *  sentence as its own keys. */
+    it('"what" at 80 ms a key opens no chooser, and the band names w', () => {
+      vi.useFakeTimers();
+      try {
+        const onChooseSessions = vi.fn();
+        const onFlash = vi.fn();
+        const rendered = renderEmpty({ onChooseSessions, onFlash });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        for (const key of ["w", "h", "a", "t"]) {
+          fireEvent.keyDown(root, { key });
+          act(() => vi.advanceTimersByTime(80));
+        }
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+        expect(onChooseSessions).not.toHaveBeenCalled();
+        expect(onFlash).toHaveBeenCalledWith(tableKeyTypingFlash("w", "all sessions"));
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("the Mode item still runs on Enter, and its key column now reads ⇧Tab (V1 S2)", () => {
@@ -374,6 +472,66 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
+      /** v1 hardening, codex-release-p1 #5 (agent-ui/web/src/components/EmptyTab.tsx:478): `f`
+       *  intercepted every keydown unconditionally, ahead of the pending-sequence check -- so once
+       *  `<leader>` (Space) armed a sequence, the very next `f` was stolen by HINT instead of
+       *  continuing it, and the advertised `<leader>fn` (new tab) binding could never complete. */
+      it("codex-release-p1 #5: Space f n completes <leader>fn instead of f stealing HINT mid-sequence", () => {
+        const onPanelAction = vi.fn();
+        const onHint = vi.fn();
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction, onHint });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: " " });
+        fireEvent.keyDown(root, { key: "f" });
+        fireEvent.keyDown(root, { key: "n" });
+        expect(onPanelAction).toHaveBeenCalledWith(expect.objectContaining({ keys: ["<leader>", "f", "n"], action: "tab.new" }));
+        expect(onHint).not.toHaveBeenCalled();
+      });
+
+      /** A bare Control or Shift keydown must leave the dashboard's pending leader sequence armed,
+       *  just as on a live tab. Otherwise the modifier needed to type a later chord would cancel
+       *  the sequence before that chord arrives. */
+      it("a bare Shift keydown keeps a pending leader sequence alive, so Space Shift b d still completes <leader>bd", () => {
+        const onPanelAction = vi.fn();
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: " " });
+        fireEvent.keyDown(root, { key: "Shift", shiftKey: true });
+        fireEvent.keyDown(root, { key: "b" });
+        fireEvent.keyDown(root, { key: "d" });
+        expect(onPanelAction).toHaveBeenCalledWith(expect.objectContaining({ keys: ["<leader>", "b", "d"], action: "tab.close" }));
+      });
+
+      /** A bare Control keydown preserves the pending sequence, but the following `d` still carries
+       *  `ctrlKey`. It must not complete `<leader>bd` as plain `d`: Space, b, Ctrl+d must not
+       *  run `tab.close`. */
+      it("Space b Ctrl+d (the Control keydown included) does not run tab.close", () => {
+        const onPanelAction = vi.fn();
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: " " });
+        fireEvent.keyDown(root, { key: "b" });
+        fireEvent.keyDown(root, { key: "Control", ctrlKey: true });
+        fireEvent.keyDown(root, { key: "d", ctrlKey: true });
+        expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
+      });
+
+      /** The control for the test above: with no modifier at all, Space b d still runs tab.close --
+       *  the fix narrows what a chord may complete, it does not touch the bare-key path. */
+      it("Space b d (no modifier) still runs tab.close", () => {
+        const onPanelAction = vi.fn();
+        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        fireEvent.keyDown(root, { key: " " });
+        fireEvent.keyDown(root, { key: "b" });
+        fireEvent.keyDown(root, { key: "d" });
+        expect(onPanelAction).toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
+      });
+
       it("Space b d runs the table's tab.close binding through onPanelAction, never a dashboard item", () => {
         const onPanelAction = vi.fn();
         const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
@@ -459,13 +617,142 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      it("a direct table binding (H) runs immediately, ahead of the dashboard's own fixed keys", () => {
-        const onPanelAction = vi.fn();
-        const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
-        const { props } = rendered;
-        const root = toBrowse(rendered, props);
-        fireEvent.keyDown(root, { key: "H" });
-        expect(onPanelAction).toHaveBeenCalledWith({ keys: ["H"], action: "tab.prev", desc: "tab.prev", source: "default" });
+      /** Defer `f` for `TYPING_GUARD_MS` before asking for a HINT, matching the live conversation. A
+       *  following key can then cancel an accidental `f` typed as part of a word. */
+      it("f asks for a HINT TYPING_GUARD_MS later, not at once", () => {
+        vi.useFakeTimers();
+        try {
+          const onHint = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onHint });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: "f" });
+          expect(onHint).not.toHaveBeenCalled();
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+          expect(onHint).toHaveBeenCalledWith(false);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** Typing "fix" in BROWSE must not request a HINT. The `i` within `TYPING_GUARD_MS` cancels the
+       *  deferred `f` and flashes the reason. */
+      it('"fix this" at 80 ms a key asks for no HINT, and flashes', () => {
+        vi.useFakeTimers();
+        try {
+          const onHint = vi.fn();
+          const onFlash = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onHint, onFlash });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          for (const key of ["f", "i", "x"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+          expect(onHint).not.toHaveBeenCalled();
+          // Display the cancelled `f`'s own flash returned by the typing guard's `onKey`.
+          expect(onFlash).toHaveBeenCalledWith(hintTypingFlash());
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** `f` itself arriving soon after another key refuses at once and says so, mirroring
+       *  `App.test.tsx`'s own "j then f at 80 ms a key". */
+      it("j then f at 80 ms a key: f refuses at once, and flashes", () => {
+        vi.useFakeTimers();
+        try {
+          const onHint = vi.fn();
+          const onFlash = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onHint, onFlash });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: "j" });
+          act(() => vi.advanceTimersByTime(80));
+          fireEvent.keyDown(root, { key: "f" });
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+          expect(onHint).not.toHaveBeenCalled();
+          expect(onFlash).toHaveBeenCalledWith(hintTypingFlash());
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** `f` still requests a HINT on a failed tab after the guard delay. Its mode can read "input",
+       *  but there is no live composer to disturb. */
+      it("f still asks for a HINT on a failed tab, TYPING_GUARD_MS later", () => {
+        vi.useFakeTimers();
+        try {
+          const onHint = vi.fn();
+          const rendered = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "boom", panelTable: TABLE, onHint });
+          const { container } = rendered;
+          const root = container.querySelector(".empty-tab")!;
+          fireEvent.keyDown(root, { key: "f" });
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+          expect(onHint).toHaveBeenCalledWith(false);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** Defer the direct `H` binding for `TYPING_GUARD_MS`, matching the live conversation. A lone
+       *  `H` still runs, while subsequent typing can cancel it. */
+      it("a direct table binding (H) runs TYPING_GUARD_MS later, ahead of the dashboard's own fixed keys", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: "H" });
+          expect(onPanelAction).not.toHaveBeenCalled();
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+          expect(onPanelAction).toHaveBeenCalledWith({ keys: ["H"], action: "tab.prev", desc: "tab.prev", source: "default" });
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** Typing "Looks good" in BROWSE must not switch tabs. The `o` within `TYPING_GUARD_MS` cancels
+       *  the deferred `L` before it posts. */
+      it('"Looks good" at 80 ms a key posts no tab_verb', () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          for (const key of ["L", "o", "o", "k", "s"]) {
+            fireEvent.keyDown(root, { key });
+            act(() => vi.advanceTimersByTime(80));
+          }
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+          expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.next" }));
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      /** `L` itself arriving soon after another key refuses at once and says so, mirroring
+       *  `App.test.tsx`'s own "k then L at 80 ms a key". */
+      it("k then H at 80 ms a key: H refuses at once, and flashes", () => {
+        vi.useFakeTimers();
+        try {
+          const onPanelAction = vi.fn();
+          const onFlash = vi.fn();
+          const rendered = renderEmpty({ panelTable: TABLE, onPanelAction, onFlash });
+          const { props } = rendered;
+          const root = toBrowse(rendered, props);
+          fireEvent.keyDown(root, { key: "k" });
+          act(() => vi.advanceTimersByTime(80));
+          fireEvent.keyDown(root, { key: "H" });
+          act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+          expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.prev" }));
+          expect(onFlash).toHaveBeenCalledWith(tableKeyTypingFlash("H", "tab.prev"));
+        } finally {
+          vi.useRealTimers();
+        }
       });
 
       /** `i` is one of the reserved fixed BROWSE keys (Global Constraint #4), so it can never START

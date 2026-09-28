@@ -34,6 +34,16 @@ pub(crate) struct PanelEntry<W = gtk4::Widget> {
     /// afresh when its key reopens it (2026-09-26).
     pub(crate) url: String,
     pub(crate) widget: W,
+    /// This panel's crash-loop guard. `main.rs`'s
+    /// revive-on-next-show path (`prefix x`, then this panel's own key) resets it right where it
+    /// reruns `load_uri` -- the manual recovery the panel's own give-up message tells the user to
+    /// try -- the same way `AgentPanelHandle::reload_document_by_hand` resets the chat's own guard.
+    /// Without that, a guard that already gave up stays terminal forever (see
+    /// `WebViewCrashGuard::reset`'s own doc), so a LATER, unrelated crash after a successful manual
+    /// recovery would be silently swallowed with no reload and no message. `Rc<RefCell<_>>` because
+    /// `install_crash_recovery`'s own closure, connected on the `WebView`, holds the other handle to
+    /// the same guard.
+    pub(crate) crash_guard: Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>>,
 }
 
 /// The Lua panels, in registration order -- the order `Layout::initial` places them in.
@@ -81,6 +91,7 @@ pub(crate) fn install(
         webview.load_uri(&resolved_url);
         webview.set_hexpand(true);
         webview.set_vexpand(true);
+        let crash_guard = install_crash_recovery(&webview, parsed.id.clone(), resolved_url.clone());
         registry.borrow_mut().register(PanelEntry {
             id: parsed.id,
             title: parsed.title,
@@ -88,12 +99,55 @@ pub(crate) fn install(
             key: parsed.key,
             url: resolved_url,
             widget: webview.upcast(),
+            crash_guard,
         });
         Ok(())
     })?;
     panel_table.set("register", register_fn)?;
     neovibe.set("panel", panel_table)?;
     Ok(())
+}
+
+/// Reloads a Lua panel after its web process crashes, using `WebViewCrashGuard` to limit crash
+/// loops. Skips `TerminatedByApi`: `kill_pane` deliberately terminates the process for
+/// `prefix x`, and showing the module again already reloads it. `id` is only for logging.
+///
+/// Returns the shared guard so the caller can reset it when reviving the panel on its next
+/// show.
+///
+/// The signal closure uses the callback's `WebView` argument rather than capturing an owned
+/// clone. Capturing a clone would create a strong reference cycle through the view's
+/// signal-handler storage, preventing a replaced panel from being freed.
+fn install_crash_recovery(
+    webview: &webkit6::WebView,
+    id: String,
+    url: String,
+) -> Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>> {
+    let guard = Rc::new(RefCell::new(
+        crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+    ));
+    let guard_for_signal = guard.clone();
+    webview.connect_web_process_terminated(move |webview, reason| {
+        if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
+            return;
+        }
+        use crate::webview_crash_guard::CrashResponse;
+        match guard_for_signal.borrow_mut().on_crash() {
+            CrashResponse::Reload => {
+                eprintln!("[lua] panel '{id}': the web process terminated ({reason:?}); reloading it");
+                webview.load_uri(&url);
+            }
+            CrashResponse::GiveUp => {
+                eprintln!("[lua] panel '{id}': the web process kept terminating; giving up on automatic reload");
+                let html = crate::webview_crash_guard::crash_message_html(
+                    "Close and reopen this panel (prefix x, then its key) to try again.",
+                );
+                webview.load_html(&html, None);
+            }
+            CrashResponse::AlreadyGivenUp => {}
+        }
+    });
+    guard
 }
 
 #[cfg(test)]
@@ -108,6 +162,12 @@ mod tests {
             key: None,
             url: format!("file:///{id}.html"),
             widget,
+            // `WebViewCrashGuard` is GTK-free (`shell::webview_crash_guard`'s own doc), so these
+            // registry-only tests -- which deliberately never touch a real `WebView` -- can still
+            // construct a real one rather than needing an `Option`.
+            crash_guard: Rc::new(RefCell::new(
+                crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+            )),
         }
     }
 

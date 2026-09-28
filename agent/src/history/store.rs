@@ -263,7 +263,7 @@ pub fn save(history: &StoredHistory) -> std::io::Result<()> {
     if !path.exists() {
         remove_orphans(&history.conversation_id);
     }
-    std::fs::create_dir_all(dir)?;
+    crate::persistence::create_private_state_dir(dir, crate::state_dirs::history_dir()?)?;
     let json = serde_json::to_string(history).map_err(std::io::Error::other)?;
     crate::persistence::write_record(&path, json.as_bytes())
 }
@@ -386,6 +386,23 @@ mod tests {
             vec![message(2, "it reads a file")],
             vec![tool_call(3, "toolu_1")],
         )
+    }
+
+    /// Stored prompts, replies, and tool calls use a `0600` file in `0700` directories so other
+    /// users cannot read them, regardless of the umask.
+    #[test]
+    fn a_saved_history_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let conv = setup();
+        save(&history(&conv, "prov-1")).unwrap();
+        let path = history_path(&conv, "prov-1").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        let history_dir = crate::state_dirs::history_dir().unwrap();
+        for dir in path.ancestors().skip(1).take_while(|d| d.starts_with(&history_dir)) {
+            assert_eq!(mode(dir), 0o700, "{}", dir.display());
+        }
+        assert_eq!(mode(history_dir.parent().unwrap()), 0o700, "the state root");
     }
 
     /// Writes a record so the session is one `remove_orphans` must keep.

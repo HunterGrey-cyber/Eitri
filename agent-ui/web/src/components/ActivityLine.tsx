@@ -52,7 +52,11 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       {pendingTool === null && <TurnActivity phase={phaseOf(state)} clock={turnClock} />}
       {pendingTool !== null ? (
         <span className="activity-card">
-          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, then a / d" : "a / d"}
+          {/* The hint names both requirements for answering: move the cursor onto the card with
+              `j`/`k`/`G`, then press `a`/`d` alone after `TYPING_GUARD_MS` without a key.
+              Without those details, a misplaced cursor or a key too soon after `Esc` produces
+              a refusal the hint does not explain. */}
+          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
         </span>
       ) : (
         queued > 0 && <span className="activity-keys">{queued} queued · </span>

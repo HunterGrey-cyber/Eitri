@@ -40,7 +40,7 @@ it("counts the queue, names the interrupt key, and names a card that waits (P1)"
   rerender(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" mode="input" />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, then a / d");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, j to it, a / d alone");
   expect(container.textContent).not.toContain("queued");
 });
 
@@ -51,7 +51,7 @@ it("the card row says a / d alone in BROWSE, and defaults to it", () => {
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} pendingTool="Bash" />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — a / d");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — j to it, a / d alone");
 });
 
 /** A waiting card gets the activity line without a phase word beside it.
@@ -61,8 +61,26 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Write" />,
   );
   expect(container.querySelector(".turn-activity")).toBeNull();
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — a / d");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — j to it, a / d alone");
   expect(container.querySelector("button.stop")).not.toBeNull();
+});
+
+/** The hint must explain both card targeting and the typing guard: move onto the card before
+ *  `a`/`d`, then wait `TYPING_GUARD_MS` after the last key. Otherwise moving away with `k` or
+ *  answering too soon after Escape produces a refusal the shorter hint did not explain. */
+it("codex-release-p1 #9: the hint names both S4's navigation and S1's pause, in both modes", () => {
+  const { container, rerender } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
+  );
+  const text = () => container.querySelector(".activity-card")!.textContent!;
+  expect(text()).toContain("j to it");
+  expect(text()).toContain("alone");
+  rerender(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" mode="input" />,
+  );
+  expect(text()).toContain("Esc");
+  expect(text()).toContain("j to it");
+  expect(text()).toContain("alone");
 });
 
 /** "the activity line already ends in `ctrl+c interrupt` ...; it is kept and

@@ -40,6 +40,12 @@ type Props = {
    *  `App.tsx` owns the timer; this component only reads the key. */
   yankedKey?: string | null;
   onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
+  /** v1 hardening: the cards already answered from this panel, by `permissionId` --
+   *  `App.tsx` owns the set, since `a`/`d` answer a card by its id rather than through its buttons.
+   *  Absent: none. */
+  answeredPermissions?: ReadonlySet<string>;
+  /** Each card's reason box as it is typed into, so `App.tsx`'s `d` can send it. */
+  onPermissionReason?: (permissionId: string, reason: string) => void;
   /** Open clicked path links and inline code that parses as a path, matching the keyboard's
    *  `gf` target through `App.tsx`'s `open-path` action. When absent, clicks retain their normal
    *  control behavior without opening paths. */
@@ -149,6 +155,8 @@ export function MessageList({
   ruleOffers,
   yankedKey = null,
   onAnswerPermission,
+  answeredPermissions,
+  onPermissionReason,
   onOpenPath,
   onUnreadChange,
   unseenSeed,
@@ -583,7 +591,9 @@ export function MessageList({
                     request={item.request}
                     sessionEnded={sessionEnded}
                     ruleOffer={ruleOffers?.[item.request.permissionId] ?? null}
+                    alreadyAnswered={answeredPermissions?.has(item.request.permissionId) ?? false}
                     onAnswer={onAnswerPermission}
+                    onReasonChange={onPermissionReason}
                   />
                 </Row>
               );

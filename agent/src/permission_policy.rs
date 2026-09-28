@@ -78,38 +78,36 @@ fn ask(reason: &'static str) -> Classification {
 /// CLI does exempt some documentation domains, and this version refuses to guess which.
 pub const ALWAYS_ASK_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit", "WebSearch", "WebFetch"];
 
-/// Tools that change no file, run no command and reach no network -- the CLI does not ask about
-/// these and neither does this.
+/// Tools allowed without a permission card, including checklist updates, subagent
+/// launches and tool discovery.
 ///
-/// **`Task` is here on documentation alone and is the weakest row in this table.** The CLI does not
-/// prompt for a subagent launch because the subagent's own tool calls are checked individually;
-/// that is stated in the docs and is *not* something this project has observed -- nothing here has
-/// confirmed that a subagent's inner calls reach this same `PreToolUse` gate. If that assumption is
-/// ever disproved, this entry is a hole and must be the first thing removed.
+/// `Task` and `Agent` rely on subagent tool calls being checked individually. That has
+/// not been verified here: no observation confirms that inner calls reach this same
+/// `PreToolUse` gate. Remove these entries if that assumption fails.
 ///
-/// **`ToolSearch` is here on a measurement, and it is the row that made auto mode usable**
-/// (2026-09-19, later). On CLI 2.1.272 the tools are *deferred*: the model is given their names
-/// only, and has to call `ToolSearch` to load a schema before it can call anything at all. Every
-/// one of those searches reaches this gate -- `agent/tests/backend_conformance.rs` records the same
-/// thing from the product side -- so while `ToolSearch` was "not in the policy's table" the user got
-/// a card before nearly every action the agent took, with auto mode
-/// still being a wall of popups. Measured against the oracle the same way as everything else here:
-/// `claude --print` with no `--permission-mode`, which denies where it would have prompted, **ran**
-/// `ToolSearch {"query": "select:Read"}` and returned the schema. It loads a description; it opens
-/// no file, runs no command and reaches no network.
-pub const NEVER_ASK_TOOLS: &[&str] = &["TodoWrite", "Task", "ToolSearch"];
+/// CLI 2.1.283 calls the subagent tool `Agent`; CLI 2.1.272 calls it `Task`. Both names
+/// are kept so either version can launch a subagent without an unknown-tool card.
+///
+/// On CLI 2.1.272, tools are deferred: the model receives names and calls `ToolSearch`
+/// to load a schema before using a tool. Each search reaches the gate, so treating it
+/// as unknown would prompt before nearly every action. Under `claude --print` without
+/// `--permission-mode`, `ToolSearch {"query": "select:Read"}` returned the schema.
+/// It loads a description without opening a file, running a command or using the network.
+pub const NEVER_ASK_TOOLS: &[&str] = &["TodoWrite", "Task", "Agent", "ToolSearch"];
 
-/// The tools CLI 2.1.272 actually offers, read off its own `system/init` on 2026-09-19 (later).
+/// Tools offered by CLI 2.1.272, read from its `system/init` output.
 ///
-/// It is here to keep one fact visible: **the two tables above were written against a tool set that
-/// is not this one.** `Grep`, `Glob`, `MultiEdit` and `TodoWrite` are named by the policy and do not
-/// exist on this build; eighteen tools that DO exist were unknown to it, and an unknown tool is a
-/// card. Most of those are rare enough that a card is the right answer and no worse than an
-/// annoyance -- and several (`SendMessage`, `PushNotification`, `RemoteTrigger`, `CronCreate`,
-/// `EnterWorktree`) reach outside this machine or change the tree, so they must stay cards. Only
-/// `ToolSearch` was frequent enough to matter, and only it has been measured. **Do not promote a
-/// name off this list without its own oracle run**; the list is a record of what exists, not a
-/// judgement about any of it.
+/// The policy tables use a different tool set: `Grep`, `Glob`, `MultiEdit` and `TodoWrite`
+/// are absent from this build, while eighteen offered tools were unknown to the policy.
+/// Unknown tools require a card. Several, including `SendMessage`, `PushNotification`,
+/// `RemoteTrigger`, `CronCreate` and `EnterWorktree`, reach outside the machine or change
+/// the tree. Only `ToolSearch` has been measured for allowance without a card.
+/// Check a tool against the running CLI before adding it to an allow list; presence
+/// in this table alone says nothing about its permission behavior.
+///
+/// The full CLI 2.1.283 tool set has not been captured here. A permission log confirms
+/// that its subagent tool is named `Agent`, but does not establish the rest of its tools.
+/// Read that version's `system/init` before adding a corresponding table.
 pub const TOOLS_OFFERED_BY_CLI_2_1_272: &[&str] = &[
     "Task",
     "Bash",
@@ -603,6 +601,25 @@ mod tests {
                 "{tool} must not interrupt the user"
             );
         }
+    }
+
+    /// CLI 2.1.283 names the subagent tool `Agent`; older versions use `Task`.
+    /// A call with `subagent_type` and `prompt` must get the same verdict under either name,
+    /// so the rename does not cause an unknown-tool card for every subagent launch.
+    #[test]
+    fn a_subagent_launch_is_never_a_card_under_either_of_its_two_names() {
+        let ws = Workspace::new();
+        let input = json!({ "subagent_type": "general-purpose", "description": "d", "prompt": "p" });
+        assert_eq!(
+            verdict("Agent", input.clone(), ws.path()),
+            PermissionVerdict::AllowWithoutAsking,
+            "CLI 2.1.283 spells the subagent tool Agent"
+        );
+        assert_eq!(
+            verdict("Task", input, ws.path()),
+            PermissionVerdict::AllowWithoutAsking,
+            "CLI 2.1.272 still spells it Task"
+        );
     }
 
     /// `ToolSearch` loads a tool's schema and does nothing else, and on this build the model must

@@ -63,6 +63,25 @@ describe("PermissionCard decisions", () => {
   });
 });
 
+describe("PermissionCard when the panel withdraws its answer", () => {
+  /** If Rust refuses an answer because an Always allow rule cannot be saved, the card stays pending.
+   *  When `alreadyAnswered` changes from true to false, clear the local click guard too,
+   *  so the user can answer again instead of leaving the buttons disabled. */
+  it("a click the panel took back leaves the buttons live again", () => {
+    const onAnswer = vi.fn();
+    const { container, rerender } = render(
+      <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
+    );
+    fireEvent.click(buttons(container).approve);
+    rerender(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered onAnswer={onAnswer} />);
+    expect(buttons(container).approve.disabled).toBe(true);
+    rerender(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered={false} onAnswer={onAnswer} />);
+    expect(buttons(container).approve.disabled).toBe(false);
+    fireEvent.click(buttons(container).approve);
+    expect(onAnswer).toHaveBeenCalledTimes(2);
+  });
+});
+
 /* A turn can have several tool calls in flight at once, so "Bash wants to run" does not identify
    anything on its own. The id is what ties the card to the exact call above it in the transcript --
    the same id `MessageList` keys that call's block on. */

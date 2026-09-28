@@ -176,6 +176,13 @@ pub struct Tab {
     /// Tool-use id -> the note for a call whose CLI prompt was answered without a card.
     /// On completion it becomes `notes.prompt_notes`, as a rule candidate does.
     prompt_note_candidates: std::collections::BTreeMap<String, String>,
+    /// Permission ids the user answered on a card here (`TabSet::answer_card`, any response)
+    /// that the projection still lists as pending until the provider's `PermissionResolved` arrives.
+    /// `refresh_offers` never offers a rule for them again, and [`Tab::card_is_waiting`] returns false,
+    /// so replaying a response after a tab switch or panel reload cannot save a rule. Removing an
+    /// offer only once is insufficient: a later pump could recreate it when another id arrives.
+    /// Pruned with `host_answered` once the id leaves the projection, and private for the same reason.
+    user_answered: BTreeSet<String>,
 }
 
 impl Tab {
@@ -206,7 +213,18 @@ impl Tab {
             host_answered: BTreeSet::new(),
             human_allowed: crate::agent_backend::HumanApprovals::default(),
             prompt_note_candidates: std::collections::BTreeMap::new(),
+            user_answered: BTreeSet::new(),
         }
+    }
+
+    /// Whether `permission_id` is still waiting for the user: a live backend's projection lists it
+    /// as pending and `user_answered` does not contain it. The panel checks this before saving an
+    /// "Always allow" rule.
+    pub fn card_is_waiting(&self, permission_id: &str) -> bool {
+        !self.user_answered.contains(permission_id)
+            && self
+                .live()
+                .is_some_and(|backend| backend.projection().pending_permissions.contains_key(permission_id))
     }
 
     /// When this tab's running turn started, if one is running (see `turn_clock`).
@@ -797,6 +815,10 @@ impl TabSet {
                 tab.human_allowed.record(&tool_use_id, &tool_name, &input);
             }
         }
+        // A successful answer removes the rule offer and adds the id to `user_answered`, preventing
+        // a new offer for this card. A failed answer leaves both the card and its offer open.
+        tab.rule_offers.remove(permission_id);
+        tab.user_answered.insert(permission_id.to_string());
         Ok(events)
     }
 
@@ -823,6 +845,7 @@ impl TabSet {
         tab.queue_error = None;
         tab.rule_offers.clear();
         tab.rule_offers_seen.clear();
+        tab.user_answered.clear();
         tab.was_running = false;
         let old = std::mem::replace(&mut tab.backend, TabBackend::NotStarted);
         tab.title = None;
@@ -913,6 +936,7 @@ impl TabSet {
                 tab.host_answered.clear();
                 tab.human_allowed.clear();
                 tab.prompt_note_candidates.clear();
+                tab.user_answered.clear();
                 continue;
             };
             let from_revision = backend.projection().last_revision;
@@ -1117,6 +1141,7 @@ impl TabSet {
                 backend.projection().pending_permissions.keys().cloned().collect();
             tab.attention.retain_pending(|id| still.contains(id));
             tab.host_answered.retain(|id| still.contains(id));
+            tab.user_answered.retain(|id| still.contains(id));
             if refresh_offers(tab, project_root) {
                 out.offers_changed.push(tab.id);
             }
@@ -1170,6 +1195,7 @@ impl TabSet {
                     tab.title = pending.resumed_title;
                     // A freshly installed backend has answered nothing yet on this tab's behalf.
                     tab.host_answered.clear();
+                    tab.user_answered.clear();
                     collected.push(StartCollected::Installed {
                         tab: tab.id,
                         request_id: pending.request_id,
@@ -1650,10 +1676,11 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
         let projection = backend.projection();
         // The CLI's own prompts are never offered a rule: no saved rule answers one,
         // and the CLI itself does not let a rule silence its check.
+        // A card the user already answered is never offered a rule again (`user_answered`'s doc).
         let mut ids: Vec<_> = projection
             .pending_permissions
             .values()
-            .filter(|p| p.provider_prompt.is_none())
+            .filter(|p| p.provider_prompt.is_none() && !tab.user_answered.contains(&p.permission_id))
             .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
             .collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));

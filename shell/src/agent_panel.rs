@@ -501,6 +501,10 @@ struct AgentPanelState {
     /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
     /// can be refused.
     nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
+    /// Counts recent crashes of this WebView's process and tracks whether automatic recovery
+    /// has given up. Manual recovery re-arms the guard; automatic recovery keeps the crash count
+    /// so repeated failures eventually stop reloading.
+    crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
 }
 
 /// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
@@ -608,8 +612,50 @@ impl AgentPanelHandle {
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
         // The page that said `ready` is going; the tick holds its envelopes until the new one does.
         self.state.borrow_mut().document_ready = false;
+        // And so is the mode it reported: until the new page's `ready`, nothing is BROWSE or INPUT.
+        forget_the_pages_nav_mode(&self.state.borrow());
         let vars = self.state.borrow().theme.css_vars();
         self.webview.load_html(&themed_document(&vars), Some(PANEL_BASE_URI));
+    }
+
+    /// Manual recovery for a wedged or crashed panel, invoked by `prefix r` or the top bar.
+    /// Re-arms `crash_guard` with `WebViewCrashGuard::reset` before calling
+    /// [`reload_document`](Self::reload_document).
+    /// Automatic recovery calls `reload_document` directly and must retain its crash history.
+    /// Resetting the guard in that shared method would prevent `GiveUp` from ever being reached.
+    pub(crate) fn reload_document_by_hand(&self) {
+        self.state.borrow_mut().crash_guard.reset();
+        self.reload_document();
+    }
+
+    /// Handles a WebView process crash by reloading the document through `reload_document`.
+    /// The session remains in Rust, and the new page rehydrates through its `ready`/`hello` exchange.
+    /// `crash_guard` stops automatic recovery when repeated crashes would cause a reload loop.
+    /// `TerminatedByApi` is ignored because a host-requested termination is not a crash.
+    pub(crate) fn on_web_process_terminated(&self, reason: webkit6::WebProcessTerminationReason) {
+        if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
+            return;
+        }
+        // The page that reported BROWSE or INPUT is dead, and the give-up document never sends
+        // `ready`: left as it was, `main.rs` would keep claiming `Ctrl+j`/`Ctrl+k` for a page that
+        // cannot answer.
+        forget_the_pages_nav_mode(&self.state.borrow());
+        let response = self.state.borrow_mut().crash_guard.on_crash();
+        match response {
+            crate::webview_crash_guard::CrashResponse::Reload => {
+                eprintln!("[agent_panel] the WebView's web process terminated ({reason:?}); reloading it");
+                self.reload_document();
+            }
+            crate::webview_crash_guard::CrashResponse::GiveUp => {
+                eprintln!("[agent_panel] the WebView's web process kept terminating; giving up on automatic reload");
+                self.state.borrow_mut().document_ready = false;
+                let html = crate::webview_crash_guard::crash_message_html(
+                    "Reload it by hand with \u{21bb} in the top bar, or prefix r.",
+                );
+                self.webview.load_html(&html, Some(PANEL_BASE_URI));
+            }
+            crate::webview_crash_guard::CrashResponse::AlreadyGivenUp => {}
+        }
     }
 
     /// Non-blocking: returns `true` if `neovibe-supervisor` asked this window to come to the
@@ -1222,6 +1268,7 @@ pub(crate) fn build_agent_panel(
         tab_verb_hook: None,
         nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
+        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     }));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
@@ -1264,6 +1311,16 @@ pub(crate) fn build_agent_panel(
         state: state.clone(),
         webview: webview.clone(),
     };
+
+    // Recover WebView crashes automatically with a guard, so the chat does not stay blank
+    // until a manual reload. See `AgentPanelHandle::on_web_process_terminated`.
+    {
+        let handle = handle.clone();
+        webview.connect_web_process_terminated(move |_webview, reason| {
+            handle.on_web_process_terminated(reason);
+        });
+    }
+
     (webview.upcast(), handle)
 }
 
@@ -2099,6 +2156,15 @@ fn reset_nav_mode_for_ready(state: &AgentPanelState) {
     state.nav_mode.set(PanelKeys::Other);
 }
 
+/// The other half of the same rule: when the page that reported a mode goes -- its web process
+/// died (`on_web_process_terminated`, both the reload and the give-up path) or it is being
+/// replaced (`reload_document`) -- the mirror is `Other` until a new page says otherwise. The
+/// give-up document (`webview_crash_guard::crash_message_html`) never sends `ready`, so the reset
+/// on `ready` alone left `Ctrl+j` claimed for a page that could not take it.
+fn forget_the_pages_nav_mode(state: &AgentPanelState) {
+    state.nav_mode.set(PanelKeys::Other);
+}
+
 /// A window-level envelope for the tick: `Some` when the page can take it and it changed since the
 /// last one sent. Recorded as sent only when it is returned.
 fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool) -> Option<String> {
@@ -2109,7 +2175,7 @@ fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool
     Some(now)
 }
 
-/// Fields from a `permission_response` message, used by `answer_permission_response`.
+/// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
 struct PermissionAnswer {
     permission_id: String,
     decision: neovibe_core::agent_bridge::DecisionChoice,
@@ -2151,7 +2217,18 @@ fn answer_permission_response(
 ) -> Result<Result<Vec<agent::AgentDomainEvent>, BackendError>, String> {
     let remembered = {
         let t = tabs.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
-        rule_to_remember(t, &answer.permission_id, answer.decision, answer.remember).map_err(str::to_string)?
+        // Read immediately before saving so a request that is no longer waiting saves no rule.
+        // `Tab::card_is_waiting` also excludes requests already answered by this tab, even while
+        // the sidecar projection still lists them pending until `PermissionResolved` arrives.
+        let still_pending = t.card_is_waiting(&answer.permission_id);
+        rule_to_remember(
+            t,
+            &answer.permission_id,
+            answer.decision,
+            answer.remember,
+            still_pending,
+        )
+        .map_err(str::to_string)?
     };
     if let Some(rule) = remembered {
         let Some(dir) = rules_dir else {
@@ -2174,17 +2251,28 @@ fn answer_permission_response(
     Ok(tabs.answer_card(tab, &answer.permission_id, decision))
 }
 
+/// Returns the rule offered for `permission_id` to remember, only with an allow while the card waits.
+/// The caller reads `still_pending` through `Tab::card_is_waiting` immediately before this call.
+/// Passing it in keeps this check testable without a live backend.
+///
+/// `TabSet::answer_card` removes the offer after the first successful answer, regardless of
+/// the decision. The tab's `user_answered` prevents `refresh_offers` from recreating it while
+/// the sidecar projection still lists the request pending before `PermissionResolved` arrives.
 fn rule_to_remember(
     tab: &Tab,
     permission_id: &str,
     decision: neovibe_core::agent_bridge::DecisionChoice,
     remember: bool,
+    still_pending: bool,
 ) -> Result<Option<agent::PrefixRule>, &'static str> {
     if !remember {
         return Ok(None);
     }
     if decision != neovibe_core::agent_bridge::DecisionChoice::Allow {
         return Err("only an allow can be remembered");
+    }
+    if !still_pending {
+        return Err("this request was already answered");
     }
     tab.rule_offers
         .get(permission_id)
@@ -3309,7 +3397,7 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
     // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
     // takes it by move.
     let handle = handle.clone();
-    action.connect_activate(move |_, _| handle.reload_document());
+    action.connect_activate(move |_, _| handle.reload_document_by_hand());
     app.add_action(&action);
 }
 
@@ -3634,6 +3722,7 @@ mod tests {
             tab_verb_hook: None,
             nav_mode: Cell::new(PanelKeys::Other),
             nav_fallthrough_hook: None,
+            crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
         }))
     }
 
@@ -3726,6 +3815,22 @@ mod tests {
                 PanelKeys::Other,
                 "stale {stale:?} must clear"
             );
+        }
+    }
+
+    /// A crashed or replaced page's BROWSE/INPUT state is cleared immediately, since the fallback
+    /// error document never sends `ready`. `on_web_process_terminated` and `reload_document` need
+    /// a real `WebView`, so this tests the state mutation they both call.
+    #[test]
+    fn a_dead_pages_nav_mode_is_forgotten_before_any_ready() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        for stale in [PanelKeys::Input, PanelKeys::Browse] {
+            state.borrow().nav_mode.set(stale);
+            forget_the_pages_nav_mode(&state.borrow());
+            assert_eq!(state.borrow().nav_mode.get(), PanelKeys::Other, "stale {stale:?}");
         }
     }
 
@@ -4006,25 +4111,145 @@ mod tests {
             .insert("perm-1".into(), agent::PrefixRule::parse("Bash(git push *)").unwrap());
         let t = set.get(tab).unwrap();
         assert_eq!(
-            rule_to_remember(t, "perm-1", DecisionChoice::Allow, false),
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, false, true),
             Ok(None),
             "a plain allow"
         );
         assert_eq!(
-            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true)
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true, true)
                 .unwrap()
                 .unwrap()
                 .display(),
             "git push *"
         );
         assert!(
-            rule_to_remember(t, "perm-2", DecisionChoice::Allow, true).is_err(),
+            rule_to_remember(t, "perm-2", DecisionChoice::Allow, true, true).is_err(),
             "never offered"
         );
         assert!(
-            rule_to_remember(t, "perm-1", DecisionChoice::Deny, true).is_err(),
+            rule_to_remember(t, "perm-1", DecisionChoice::Deny, true, true).is_err(),
             "remember is an allow"
         );
+    }
+
+    /// An already answered request saves no rule even if its offer remains in `rule_offers`.
+    /// Offers are only recomputed once per pump tick.
+    #[test]
+    fn a_no_longer_pending_request_saves_no_rule_even_if_still_offered() {
+        use neovibe_core::agent_bridge::DecisionChoice;
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        set.get_mut(tab)
+            .unwrap()
+            .rule_offers
+            .insert("perm-1".into(), agent::PrefixRule::parse("Bash(git push *)").unwrap());
+        let t = set.get(tab).unwrap();
+        assert!(
+            rule_to_remember(t, "perm-1", DecisionChoice::Allow, true, false).is_err(),
+            "not pending any more, whatever the offer still says"
+        );
+    }
+
+    /// `answer_permission_response` must reject repeated answers even before the provider's event
+    /// updates the projection. A projection read alone cannot detect that interval.
+    /// The first successful answer removes the rule offer and marks the card answered through
+    /// `TabSet::answer_card`, regardless of the decision. A later pump that recomputes offers for
+    /// another permission must not restore the answered card's offer.
+    #[test]
+    fn an_answered_cards_offer_never_comes_back_and_a_replayed_remember_saves_nothing() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-permission-remember-race");
+        let rules_dir = dir.join("rules");
+        let mut set = TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        );
+        let tab = set.active();
+        let (provider, backend) = live_backend(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let pump_until = |set: &mut TabSet, what: &str, done: &dyn Fn(&TabSet) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !done(set) {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                set.pump(&dir, true);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let bash = |id: &str, command: &str| agent::AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+            provider_prompt: None,
+        };
+        let response = |id: &str, decision: &str, remember: bool| {
+            let message = parse_inbound_message(&format!(
+                r#"{{"type":"permission_response","request_id":"r","tab":{},"permission_id":"{id}","decision":"{decision}","remember":{remember}}}"#,
+                tab.0
+            ))
+            .unwrap();
+            PermissionAnswer::of(message).unwrap()
+        };
+        provider.queue(bash("perm-1", "git push origin main"));
+        pump_until(&mut set, "the offer", &|set| {
+            !set.get(tab).unwrap().rule_offers.is_empty()
+        });
+        assert_eq!(set.get(tab).unwrap().rule_offers["perm-1"].display(), "git push *");
+        assert!(set.get(tab).unwrap().card_is_waiting("perm-1"));
+
+        // The first response: a deny, never remembered, through the production route.
+        let outcome =
+            answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "deny", false));
+        assert!(matches!(outcome, Ok(Ok(_))));
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), false)]);
+        assert!(
+            !set.get(tab).unwrap().rule_offers.contains_key("perm-1"),
+            "the route itself drops the offer"
+        );
+
+        // A parallel call's card arrives before the provider's `PermissionResolved` for perm-1, so
+        // the pump recomputes the offers from a projection that still lists perm-1 as pending.
+        provider.queue(bash("perm-2", "git push origin other"));
+        pump_until(&mut set, "the second card's offer", &|set| {
+            set.get(tab).unwrap().rule_offers.contains_key("perm-2")
+        });
+        assert!(
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .pending_permissions
+                .contains_key("perm-1"),
+            "the premise: the sidecar has not folded perm-1's resolution yet"
+        );
+        let t = set.get(tab).unwrap();
+        assert!(
+            !t.rule_offers.contains_key("perm-1"),
+            "the recompute must not bring back an answered card's offer"
+        );
+        assert!(!t.card_is_waiting("perm-1"), "answered, whatever the projection says");
+        assert!(t.card_is_waiting("perm-2"));
+
+        // A replayed "Always allow" for perm-1 (a tab switch or a reload re-drew the card): refused,
+        // and no rule reaches the file.
+        let replay =
+            answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "allow", true));
+        assert_eq!(replay.map(|_| ()), Err("this request was already answered".to_string()));
+        assert_eq!(
+            neovibe_core::permission_store::load(&rules_dir, &dir),
+            neovibe_core::permission_store::LoadedRules::Missing,
+            "no rule was saved"
+        );
+        assert_eq!(provider.resolutions().len(), 1, "and nothing more reached the provider");
+        for mut tab in set.take_all() {
+            if let TabBackend::Live(backend) = &mut tab.backend {
+                backend.shutdown();
+            }
+        }
     }
 
     #[test]

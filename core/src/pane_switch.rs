@@ -1,19 +1,21 @@
-//! The pane-switch protocol: a private directory, a fake-`tmux` symlink, a socket for
-//! one-letter directions, and a message parser. The same socket carries `Q <generation>`, sent by
-//! [`crate::layout::kill::editor_quit_keys`] when its `:confirm qall` request is cancelled.
-//! Toolkit-free.
+//! The toolkit-free pane-switch protocol: a private directory, a fake-`tmux` symlink, a socket
+//! receiving direction letters from the shim, and a parser. The same socket accepts `Q <generation>`
+//! from [`crate::layout::kill::editor_quit_lua`] when its requested `:confirm qall` is cancelled.
 //!
-//! The directory also holds `nav_fallback.lua`, loaded with `--cmd`, which lets `Ctrl+h/j/k/l`
-//! leave the editor when vim-tmux-navigator is absent and from Visual mode.
-//! It writes the same direction letters to the same socket, so it lives beside the protocol.
+//! The directory also holds `nav_fallback.lua`, loaded with `--cmd`. It lets `Ctrl+h/j/k/l` leave
+//! the editor when vim-tmux-navigator is absent, and from Visual mode, sending the same letters
+//! to the same socket as the shim. It lives here because leaving can only work where the socket does.
 //!
-//! `shell::pane_switch` owns the `glib::timeout_add_local` timer that calls
-//! [`accept_pending_messages`] each tick and applies focus switches or kill-cancellation clears.
-//! Keeping the protocol separate lets another UI reuse it with its own run-loop timer.
-//! The reasons for faking tmux and the meaning of each focus direction are documented in
-//! `shell::pane_switch`, which owns panes and focus.
+//! `shell::pane_switch` owns the polling driver. Its `glib::timeout_add_local` timer calls
+//! [`accept_pending_messages`] each tick and turns each message into a GTK focus grab, or clears a
+//! pending kill when a cancellation is reported. Keeping the protocol here and the polling in `shell`
+//! lets another host reuse the protocol with its own run-loop timer.
+//!
+//! `shell::pane_switch` documents why the shim impersonates `tmux` instead of intercepting keys,
+//! and how directions map to panes. That belongs with the pane and focus handling in `shell`.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -114,10 +116,16 @@ impl PaneSwitchChannel {
         // No `remove_dir_all` first: `instance_dir_path` returns a path that has never existed, so
         // there is nothing to clear -- and an unconditional recursive delete of a `TMPDIR`-derived
         // path this process has not yet created is worth not having at all.
-        if let Err(e) = std::fs::create_dir_all(&bin_dir) {
+        //
+        // 0700, as the three sibling feeds create theirs, and `create` rather than `create_dir_all`
+        // for the same reason they use it: a path that already exists is someone else's. `bin/` is
+        // first on nvim's `PATH` and the nav snippet is `dofile`d by nvim, so under umask 002 with a
+        // shared primary group the old `0775` let another member of that group plant an executable
+        // or rewrite the Lua -- code run as this user.
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             eprintln!(
                 "[pane_switch] could not create {}: {e} -- Ctrl+h/j/k/l out of nvim disabled",
-                bin_dir.display()
+                dir.display()
             );
             return None;
         }
@@ -125,6 +133,10 @@ impl PaneSwitchChannel {
             eprintln!("[pane_switch] {what} -- Ctrl+h/j/k/l out of nvim disabled");
             let _ = std::fs::remove_dir_all(&dir);
         };
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&bin_dir) {
+            fail(format!("could not create {}: {e}", bin_dir.display()));
+            return None;
+        }
 
         let fake_tmux = bin_dir.join("tmux");
         if let Err(e) = std::os::unix::fs::symlink(shim, &fake_tmux) {
@@ -161,7 +173,7 @@ impl PaneSwitchChannel {
         // Optional, unlike everything above: without it vim-tmux-navigator still leaves through the
         // shim, so a failed write costs only the fallback, never the channel.
         let nav_path = dir.join(NAV_LUA_NAME);
-        let nav_lua = match std::fs::write(&nav_path, NAV_FALLBACK_LUA) {
+        let nav_lua = match agent::private_fs::write_private(&nav_path, NAV_FALLBACK_LUA.as_bytes()) {
             Ok(()) => Some(nav_path),
             Err(e) => {
                 eprintln!(
@@ -269,7 +281,7 @@ impl Drop for PaneSwitchChannel {
 
 /// A message accepted off the socket: a pane-switch direction letter from the `vim-tmux-navigator`
 /// shim, or a kill's generation from a cancelled `:confirm qall`
-/// ([`crate::layout::kill::editor_quit_keys`]).
+/// ([`crate::layout::kill::editor_quit_lua`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneMessage {
     Direction(char),
@@ -331,7 +343,7 @@ fn accept_pending_messages_within(listener: &UnixListener, read_timeout: Duratio
     messages
 }
 
-/// The one line the shim or [`crate::layout::kill::editor_quit_keys`] writes, turned into a
+/// The one line the shim or [`crate::layout::kill::editor_quit_lua`] writes, turned into a
 /// [`PaneMessage`]. Anything else is rejected rather than guessed at -- the socket is only ever
 /// written to by those two senders, but a garbled message must not be able to move the user's focus
 /// or clear a kill nobody asked for.
@@ -502,6 +514,20 @@ mod tests {
         );
         channel.cleanup();
         assert!(!nav.exists());
+    }
+
+    /// The instance directory and `bin/`, which comes first on nvim's `PATH`, have mode 0700.
+    /// The `dofile`d snippet has mode 0600, regardless of the umask.
+    #[test]
+    fn the_shim_directory_and_the_nav_snippet_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/neovibe-tmux-shim")).expect("bind");
+        let dir = channel.socket_path().parent().unwrap().to_path_buf();
+        assert_eq!(mode(&dir), 0o700, "the instance directory");
+        assert_eq!(mode(&dir.join("bin")), 0o700, "bin/, first on nvim's PATH");
+        assert_eq!(mode(&dir.join(NAV_LUA_NAME)), 0o600, "the snippet nvim runs");
+        channel.cleanup();
     }
 
     #[test]

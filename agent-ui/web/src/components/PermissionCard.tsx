@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { MatchedAskRule, PermissionRequestRecord, ProviderPrompt } from "../types";
 import type { PermissionDecision } from "../bridge";
 import { editPreview } from "../diff";
@@ -13,23 +13,45 @@ type Props = {
    *  Show Rust's words unchanged so `remember: true` is offered only for a request Rust can
    *  answer with that rule. The card never generates its own suggestion. */
   ruleOffer?: string | null;
+  /** v1 hardening: the panel already answered this card -- by `a`/`d`, which answer by
+   *  the card's id and never press these buttons, or by a click it has already sent. The panel's
+   *  own guard (`App.tsx`'s `answerPermission`) refuses a second answer either way; this is what
+   *  draws the card inert once it did. */
+  alreadyAnswered?: boolean;
   onAnswer: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
+  /** The reason box as it is typed into, and `""` when the card goes away: `d` sends the same
+   *  reason this card's Deny would. */
+  onReasonChange?: (permissionId: string, reason: string) => void;
 };
 
-export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: Props) {
+export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswered = false, onAnswer, onReasonChange }: Props) {
   const [reason, setReason] = useState("");
-  const [answered, setAnswered] = useState(false);
+  const [clicked, setClicked] = useState(false);
+  const answered = clicked || alreadyAnswered;
+  // When the panel withdraws an answer, clear this card's click guard so its buttons work again.
+  // This can happen when Rust cannot save an Always allow rule and leaves the card pending.
+  // The reset follows `alreadyAnswered` changing from true to false; a card without panel updates keeps its local guard.
+  useEffect(() => {
+    if (!alreadyAnswered) setClicked(false);
+  }, [alreadyAnswered]);
+  // A card that goes away takes its typed reason with it, so `d` never sends a reason from a box
+  // that is no longer on screen. The latest callback, read at unmount, without re-running on it.
+  const reasonChangeRef = useRef(onReasonChange);
+  reasonChangeRef.current = onReasonChange;
+  useEffect(() => () => reasonChangeRef.current?.(request.permissionId, ""), [request.permissionId]);
 
   /* A card belonging to a dead session must not be able to submit into it. The card is not removed
      when the session ends -- an unanswered request is real history, and making it vanish would read
      as a resolution nobody made -- so it is made inert and says why instead. `answered` covers the
      other direction: the SAME decision must not be sendable twice while the real PermissionResolved
-     event is still in flight. Neither of these clears the card; only a provider event does that. */
+     event is still in flight -- set here the moment a button is used (`clicked`), and by the panel
+     (`alreadyAnswered`) when `a`/`d` answered it. Neither of these clears the card; only a provider
+     event does that. */
   const inert = answered || sessionEnded;
 
   function handleAnswer(decision: PermissionDecision, remember = false) {
     if (inert) return;
-    setAnswered(true);
+    setClicked(true);
     onAnswer(
       request.permissionId,
       decision,
@@ -59,7 +81,10 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: P
         data-nav-order={ruleOffer ? 4 : 3}
         placeholder="Reason (shown to the agent if you deny) — Enter denies"
         value={reason}
-        onChange={(e) => setReason(e.target.value)}
+        onChange={(e) => {
+          setReason(e.target.value);
+          onReasonChange?.(request.permissionId, e.target.value);
+        }}
         onKeyDown={(e) => {
           // Enter denies with the reason; leave IME Enter to the input method.
           if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -69,10 +94,10 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, onAnswer }: P
         disabled={inert}
       />
       <div className="permission-card-buttons">
-        {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the third
-            (Always allow) button when Rust offered one, then the reason box above them.
-            `data-nav-action` is how `a`/`d` press these very buttons, so the card's own
-            `inert`/`answered` guard against a double answer applies to the keyboard too. */}
+        {/* `data-nav-order` puts Approve first for `l`, then Deny, then Always allow when offered,
+            then the reason box. `a`/`d` answer through `answerPermission` by `permissionId`, using
+            its shared guard against a second answer. `alreadyAnswered` then makes the card inert.
+            `data-nav-action` lets `App.tsx` identify card buttons for its Enter/Space guard. */}
         <button data-nav-order={1} data-nav-action="allow" onClick={() => handleAnswer("allow")} disabled={inert}>Approve</button>
         <button data-nav-order={2} data-nav-action="deny" onClick={() => handleAnswer("deny")} disabled={inert}>Deny</button>
         {ruleOffer && (

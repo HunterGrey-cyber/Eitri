@@ -31,6 +31,7 @@ pub mod lease;
 pub mod permission_policy;
 pub mod permission_rules;
 pub mod persistence;
+pub mod private_fs;
 #[doc(hidden)]
 pub mod process_probe;
 pub mod providers;

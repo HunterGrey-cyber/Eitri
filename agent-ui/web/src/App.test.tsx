@@ -10,6 +10,7 @@ import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
 import { binding, TABLE } from "./testFixtures";
 import { modeFixedMessage } from "./modeKey";
+import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "./typingGuard";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -1448,20 +1449,115 @@ describe("the leader", () => {
     }
   });
 
-  it("H posts tab_verb prev, [ b posts prev via the table, [ [ is still a prompt jump", () => {
-    const { container } = started();
-    sendTable();
-    act(() => root(container).focus());
-    press("H");
-    expect(tabVerbsPosted()).toEqual(["prev"]);
-    posted.length = 0;
-    press("[");
-    press("b");
-    expect(tabVerbsPosted()).toEqual(["prev"]);
-    posted.length = 0;
-    press("[");
-    press("[");
-    expect(posted.length).toBe(0);
+  /** `H`/`L`, like `f`, can start typed text, so they wait `TYPING_GUARD_MS`, like `a`/`d`.
+   *  A lone `H` still runs after the wait. `[ b` and `[ [` complete a reserved two-key
+   *  prefix in `resolveKey` and still run at once on the second key. */
+  it("H posts tab_verb prev TYPING_GUARD_MS later, [ b posts prev via the table at once, [ [ is still a prompt jump", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("H");
+      expect(tabVerbsPosted()).toEqual([]);
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual(["prev"]);
+      posted.length = 0;
+      press("[");
+      press("b");
+      expect(tabVerbsPosted()).toEqual(["prev"]);
+      posted.length = 0;
+      press("[");
+      press("[");
+      expect(posted.length).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** A sentence starting with `L` in BROWSE must not switch tabs before the next letter arrives.
+   *  `o` within `TYPING_GUARD_MS` cancels the deferred `L`; `mayActAfterMotion` cannot guard the first key.
+   *  `TypingGuard.defer`'s `cancelledFlash` must name `L`, even when no card is waiting. */
+  it('"Looks good" at 80 ms a key posts no tab_verb, and the band names L, not a / d', () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      sendTable();
+      act(() => root(container).focus());
+      for (const key of ["L", "o", "o", "k", "s"]) {
+        press(key);
+        act(() => vi.advanceTimersByTime(80));
+      }
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(tabVerbsPosted()).toEqual([]);
+      expect(container.querySelector(".band-message")?.textContent).toBe(tableKeyTypingFlash("L", "tab.next"));
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** `L` itself arriving soon after another key (rather than being cancelled by one that follows)
+   *  refuses at once and says so with its own message: `k` (an ordinary move) then `L` within the
+   *  window. */
+  it("k then L at 80 ms a key: L refuses at once, and the band names it", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      sendTable();
+      act(() => root(container).focus());
+      press("k");
+      act(() => vi.advanceTimersByTime(80));
+      press("L");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(tabVerbsPosted()).toEqual([]);
+      expect(container.querySelector(".band-message")?.textContent).toBe(tableKeyTypingFlash("L", "tab.next"));
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** The same key alone after a pause still works: a real deliberate `L`, nothing else typed near
+   *  it, runs `TYPING_GUARD_MS` later exactly as the fixed test above already pins for `H`. */
+  it("a lone L still posts tab_verb next, just TYPING_GUARD_MS later", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("L");
+      expect(tabVerbsPosted()).toEqual([]);
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual(["next"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** `H`/`L` use `defer` (both directions), not `mayActAfterMotion`: unlike the leader, a preceding
+   *  run of motion keys does not exempt them -- the review's own reason not to reuse
+   *  `mayActAfterMotion` here (there is no motion run behind the FIRST key of anything). */
+  it("k k then H at 80 ms a key still defers (no motion-run exception, unlike the leader)", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable();
+      act(() => root(container).focus());
+      press("k");
+      act(() => vi.advanceTimersByTime(80));
+      press("k");
+      act(() => vi.advanceTimersByTime(80));
+      press("H");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(tabVerbsPosted()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   /** Vim's `gt`/`gT` (`:help gt`) step session tabs like `L`/`H`. `gT` arrives as a
@@ -1483,6 +1579,46 @@ describe("the leader", () => {
     press("g");
     press("g");
     expect(tabVerbsPosted()).toEqual([]);
+  });
+
+  /** Bare modifier keydowns must leave a pending leader sequence intact. Without an
+   *  `isModifierKey` guard, `Control` in Ctrl+c cancelled the sequence as an unmatched key.
+   *  The following `c` then reached `resolveKey` with `seqRef.current === null` and
+   *  interrupted a running turn instead of being swallowed as an unbound continuation. */
+  it("a bare Ctrl keydown keeps a pending leader sequence alive, so Ctrl+c is swallowed rather than interrupting", () => {
+    const { container } = started({ activeTurnId: "t1", capabilities: { ...initialState().capabilities, interrupt: true } });
+    sendTable();
+    act(() => root(container).focus());
+    press(" "); // arms <leader>; TABLE's own bindings start with m/b/f, never c
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Control", ctrlKey: true });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "c", ctrlKey: true });
+    expect(posted.some((m) => m.type === "interrupt")).toBe(false);
+  });
+
+  /** A bare Control keydown keeps a pending leader sequence alive, but the following character
+   *  must retain its modifiers. Ctrl+d must not reach `advanceSequence` as plain `d` and complete
+   *  `<leader>bd` (`tab.close`) when the table has no Ctrl+d binding. */
+  it("Space b Ctrl+d (the Control keydown included) does not run tab.close", () => {
+    const { container } = started();
+    sendTable();
+    act(() => root(container).focus());
+    press(" ");
+    press("b");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Control", ctrlKey: true });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "d", ctrlKey: true });
+    expect(tabVerbsPosted()).toEqual([]);
+  });
+
+  /** The control for the test above: with no modifier at all, Space b d still runs tab.close -- the
+   *  fix narrows what a chord may complete, it does not touch the bare-key path. */
+  it("Space b d (no modifier) still runs tab.close", () => {
+    const { container } = started();
+    sendTable();
+    act(() => root(container).focus());
+    press(" ");
+    press("b");
+    press("d");
+    expect(tabVerbsPosted()).toEqual(["close"]);
   });
 
   it("Space with the Approve button focused starts no sequence, and no longer activates it (v1 S5)", () => {
@@ -1701,8 +1837,10 @@ describe("the leader", () => {
    Space on a card button does nothing. Vitest's fake clock controls the gap between keydowns,
    which jsdom stamps with `Date.now()`. */
 describe("v1: typing never answers a card", () => {
-  const TYPING = "a / d answer a card only on their own — i or Ctrl+j to type";
+  const TYPING = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
   const NO_CARD = "no card here — i, o, A or Ctrl+j to type";
+  /** When a card waits on another row, the refusal message tells how to move onto it. */
+  const ELSEWHERE = "a / d answer the card under the cursor — j / k onto it, then a / d";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1761,6 +1899,43 @@ describe("v1: typing never answers a card", () => {
     wait(1000);
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(TYPING);
+  });
+
+  it("with no card waiting anywhere, a says there is no card here (F13)", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(1000);
+    expect(answered()).toHaveLength(1);
+    press("j");
+    wait(300);
+    press("a");
+    expect(band(container)).toBe(NO_CARD);
+  });
+
+  /** A refused permission response leaves the card waiting, so the panel must clear its answered id.
+   *  This lets `a`/`d` and the card buttons answer again, including when an allow rule cannot be saved. */
+  it("a refused permission_response gives the card back: a and its buttons answer again", () => {
+    const { container } = arrivedOnACard();
+    press("a");
+    wait(1000);
+    const first = answered();
+    expect(first).toHaveLength(1);
+    const approve = () =>
+      Array.from(container.querySelectorAll<HTMLButtonElement>(".permission-card button")).find(
+        (b) => b.textContent === "Approve",
+      )!;
+    expect(approve().disabled).toBe(true);
+    dispatch({
+      kind: "command_result",
+      requestId: first[0].request_id as string,
+      ok: false,
+      error: "could not save the rule: Permission denied",
+    });
+    expect(approve().disabled).toBe(false);
+    press("a");
+    wait(1000);
+    expect(answered()).toHaveLength(2);
+    expect(answered()[1]).toEqual(expect.objectContaining({ permission_id: "perm-1", decision: "allow" }));
   });
 
   it("a lone a approves the card under the cursor 250 ms later (R32 unchanged, only delayed)", () => {
@@ -1828,14 +2003,14 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  it("two rows below a lone card, a answers nothing and says there is no card here (S4, F13)", () => {
+  it("two rows below a lone card, a answers nothing and points back to the card (S4, F13, R2-10)", () => {
     const { container } = arrivedOnACard();
     press("j");
     press("j");
     expect(container.querySelector(".row-current")!.textContent).toContain("and the docs");
     wait(300);
     press("a");
-    expect(band(container)).toBe(NO_CARD);
+    expect(band(container)).toBe(ELSEWHERE);
     wait(1000);
     expect(answered()).toEqual([]);
   });
@@ -2212,18 +2387,71 @@ describe("App global HINT: the panel's half", () => {
    *  Its details remain reachable through `<leader>i`, `prefix i` or a click. */
   const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
 
-  it("f in BROWSE asks shell for a HINT, and f in INPUT is just a letter", () => {
-    const { container } = conversation();
-    press("f");
-    expect(lastOfType("hint_request")).toMatchObject({ type: "hint_request" });
-    expect(typeof lastOfType("hint_request")!.request_id).toBe("string");
-    // shell answers and the HINT ends; only then are the panel's keys its own again.
-    collect(1);
-    dispatch({ kind: "hint_end", sessionId: 1 });
-    posted = [];
-    fireEvent.keyDown(root(container), { key: "i" });
-    fireEvent.keyDown(container.querySelector("textarea")!, { key: "f" });
-    expect(lastOfType("hint_request")).toBeUndefined();
+  it("f in BROWSE asks shell for a HINT TYPING_GUARD_MS later, and f in INPUT is just a letter", () => {
+    // `f` can start typed text, so it waits `TYPING_GUARD_MS`, like `a`/`d`, before asking
+    // `shell` for a HINT. A lone `f` still asks after that wait.
+    vi.useFakeTimers();
+    try {
+      const { container } = conversation();
+      press("f");
+      expect(lastOfType("hint_request")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(lastOfType("hint_request")).toMatchObject({ type: "hint_request" });
+      expect(typeof lastOfType("hint_request")!.request_id).toBe("string");
+      // shell answers and the HINT ends; only then are the panel's keys its own again.
+      collect(1);
+      dispatch({ kind: "hint_end", sessionId: 1 });
+      posted = [];
+      fireEvent.keyDown(root(container), { key: "i" });
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "f" });
+      expect(lastOfType("hint_request")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** Typing "fix this" in BROWSE must not start a HINT on its first `f`.
+   *  The `i` within `TYPING_GUARD_MS` cancels the deferred `f` before it posts.
+   *  The band names `f` in the cancellation message rather than showing `a`/`d` text
+   *  when there is no card. */
+  it('"fix this" at 80 ms a key asks shell for no HINT, and the band names f, not a / d', () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = conversation();
+      act(() => widen(container));
+      for (const key of ["f", "i", "x", " ", "t", "h", "i", "s"]) {
+        press(key);
+        act(() => vi.advanceTimersByTime(80));
+      }
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("hint_request")).toBeUndefined();
+      expect(container.querySelector(".band-message")?.textContent).toBe(hintTypingFlash());
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  /** `f` itself arriving soon after another key (rather than being cancelled by one that follows)
+   *  refuses at once and says so with its own message: `j` (an ordinary move) then `f` within the
+   *  window. */
+  it("j then f at 80 ms a key: f refuses at once, and the band names it", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = conversation();
+      act(() => widen(container));
+      press("j");
+      act(() => vi.advanceTimersByTime(80));
+      press("f");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+      expect(lastOfType("hint_request")).toBeUndefined();
+      expect(container.querySelector(".band-message")?.textContent).toBe(hintTypingFlash());
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 
   /* After `f` posts `hint_request`, shell attaches its window key controller asynchronously.
@@ -2249,14 +2477,22 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("i does not open the composer, j does not move, a second f asks nothing", () => {
-      const { container } = onTheCard();
-      press("f");
-      press("i");
-      press("j");
-      press("f");
-      expect(container.querySelector("textarea")).toBeNull();
-      expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
-      expect(posted.filter((m) => m.type === "hint_request")).toHaveLength(1);
+      vi.useFakeTimers();
+      try {
+        const { container } = onTheCard();
+        // Let the first, lone `f` run after `TYPING_GUARD_MS` before testing the gap while
+        // the HINT request waits for a reply.
+        press("f");
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+        press("i");
+        press("j");
+        press("f");
+        expect(container.querySelector("textarea")).toBeNull();
+        expect(container.querySelector(".row-current")).toBe(container.querySelector(".row-permission"));
+        expect(posted.filter((m) => m.type === "hint_request")).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("once the HINT it asked for has ended, the keys are the panel's again", () => {
@@ -2282,6 +2518,9 @@ describe("App global HINT: the panel's half", () => {
       try {
         const { container } = onTheCard();
         press("f");
+        // Let the lone `f` run after `TYPING_GUARD_MS` before counting the interval
+        // when keys are blocked while waiting for a HINT reply.
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
         act(() => vi.advanceTimersByTime(HINT_PENDING_TIMEOUT_MS - 1));
         press("i");
         expect(container.querySelector("textarea")).toBeNull();
@@ -2379,17 +2618,27 @@ describe("App global HINT: the panel's half", () => {
 
   it("f on the empty tab asks shell for a HINT too, once the composer stops taking the keys", () => {
     // A `starting` tab's composer can queue behind the connection, so `f` types text in INPUT. Outside
-    // INPUT, `EmptyTab` handles `f` as HINT. It has no Escape handler, so this test uses blur to
-    // leave INPUT.
-    const { container } = render(<App />);
-    dispatch({ kind: "hello", ...HELLO });
-    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
-    const textarea = container.querySelector("textarea")!;
-    fireEvent.keyDown(textarea, { key: "f" });
-    expect(lastOfType("hint_request")).toBeUndefined();
-    fireEvent.blur(textarea);
-    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "f" });
-    expect(lastOfType("hint_request")).toBeDefined();
+    // INPUT, `EmptyTab` handles `f` as HINT after `TYPING_GUARD_MS`, as in the live conversation.
+    // It has no Escape handler, so this test uses blur to leave INPUT. The composer's first `f`
+    // still reaches `typingGuard.onKey` before the mode check, so the second `f` needs a gap to
+    // avoid being treated as typing.
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.keyDown(textarea, { key: "f" });
+      expect(lastOfType("hint_request")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      fireEvent.blur(textarea);
+      fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "f" });
+      expect(lastOfType("hint_request")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+      expect(lastOfType("hint_request")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
@@ -3963,7 +4212,7 @@ describe("P1: the keys land on a card that waits", () => {
       events: [{ type: "permission_requested", permission_id: "p", tool_use_id: null, tool_name: "Bash", input: { command: "rm x" } }],
     });
     expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("input");
-    expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, then a / d");
+    expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, j to it, a / d alone");
   });
 
   it("a switch to a tab holding a card lands on it while the panel has the keys", () => {

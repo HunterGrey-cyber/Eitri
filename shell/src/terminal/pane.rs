@@ -1019,10 +1019,14 @@ fn connect_pointer(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontex
                 return;
             };
             let (x, y) = (start_x + offset_x, start_y + offset_y);
-            let modes = state.borrow().routing_modes();
-            let shift = shift_held(gesture);
-            if pointer::route(shift, modes) == pointer::PointerRoute::Program {
-                report_release(&state, gesture.current_event_state(), x, y);
+            // Use `reports.is_held()` to remember whether the press was reported. `route()` uses the
+            // current Shift state, so a release with Shift newly held can route locally even though
+            // the program received the press. Skipping that release would strand `ReportTracker::held`
+            // and make the next ordinary motion report a phantom drag. Always call `report_release`;
+            // it is a no-op when no button is held, as `connect_cancel` also relies on.
+            let was_held = state.borrow().reports.is_held();
+            report_release(&state, gesture.current_event_state(), x, y);
+            if was_held {
                 return;
             }
             if gesture.current_button() == BUTTON_PRIMARY {

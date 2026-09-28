@@ -6,7 +6,8 @@
  * row or mode button on the start screen. `j`/`k` walk stops in document order. The bottom band is
  * not a stop: `j` at the last stop stays there. Session details open with `<leader>i`, `prefix i`
  * or a click on the band. Stops without usable controls are skipped except for rows, which hold
- * the conversation cursor for `Enter`/`y` even when they have no button.
+ * the conversation cursor for `Enter`/`y` even when they have no button. A stop inside another stop
+ * is content (`isOwnStop`), so reply HTML cannot add conversation rows.
  *
  * `h`/`l` walk enabled buttons, inputs, textareas and radios within a stop. Document order applies
  * unless `data-nav-order` overrides it. Permission cards put Approve before Deny and the reason
@@ -62,11 +63,61 @@ export function controlsOf(stop: HTMLElement): HTMLElement[] {
     .map(({ el }) => el);
 }
 
+/**
+ * **A stop is never inside another stop**. An element carrying
+ * `data-nav-stop` inside a stop is that stop's CONTENT, not a stop of its own.
+ *
+ * The panel's own stops never nest: every conversation row is a direct child of `.message-list`,
+ * and the banners, the activity line, the handoff area and the empty tab's items sit beside them.
+ * What can nest is model content: an assistant reply is rendered as HTML inside its row
+ * (`MessageList`'s `renderMarkdown`, the one raw-HTML sink in this panel), so a reply carrying
+ * `<div data-nav-stop="row" hidden>` put extra "rows" in a subtree-wide `querySelectorAll`. Every
+ * row below them then sat at a DOM index that no longer matched its timeline index, and `a` on the
+ * card the cursor visibly showed answered the card above it (the verdict's probe: `echo` shown,
+ * `rm -rf` approved). Whatever the sanitizer strips, a reply can only ever add elements INSIDE its
+ * own row, so this rule excludes all of them by structure.
+ *
+ * The walk stops at `root`: a stop is judged only by its ancestors inside the region being walked.
+ */
+function isOwnStop(root: HTMLElement, el: HTMLElement): boolean {
+  for (let a = el.parentElement; a !== null && a !== root; a = a.parentElement) {
+    if (a.hasAttribute(STOP_ATTR)) return false;
+  }
+  return true;
+}
+
+/** Every stop under `root`, in document order, whether or not it is worth landing on. */
+function ownStops(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}]`)).filter((stop) => isOwnStop(root, stop));
+}
+
+/** The conversation rows under `root`, in document order: index `i` here is timeline index `i`.
+ *  Only real rows -- a `data-nav-stop="row"` inside another stop (a reply's own HTML) is never
+ *  one. Every site that turns the cursor into an element goes through this. */
+export function conversationRows(root: HTMLElement): HTMLElement[] {
+  return ownStops(root).filter((stop) => stop.getAttribute(STOP_ATTR) === "row");
+}
+
+/** The stop `el` sits in (or is), or `null`: the OUTERMOST `data-nav-stop` between `el` and
+ *  `root`, so an element inside a reply's own HTML belongs to the reply's row, never to a "stop"
+ *  the reply drew. */
+export function stopOf(root: HTMLElement, el: Element): HTMLElement | null {
+  let found: HTMLElement | null = null;
+  for (let a: Element | null = el; a !== null && a !== root; a = a.parentElement) {
+    if (a instanceof HTMLElement && a.hasAttribute(STOP_ATTR)) found = a;
+  }
+  return found;
+}
+
+/** The conversation row `el` sits in (or is), or `null` when it is in none. */
+export function rowOf(root: HTMLElement, el: Element): HTMLElement | null {
+  const stop = stopOf(root, el);
+  return stop !== null && stop.getAttribute(STOP_ATTR) === "row" ? stop : null;
+}
+
 /** Every stop under `root` worth landing on, in document order. */
 export function stopsIn(root: HTMLElement): HTMLElement[] {
-  return Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}]`)).filter(
-    (stop) => stop.getAttribute(STOP_ATTR) === "row" || controlsOf(stop).length > 0,
-  );
+  return ownStops(root).filter((stop) => stop.getAttribute(STOP_ATTR) === "row" || controlsOf(stop).length > 0);
 }
 
 /** The stop that currently holds the keyboard: the one containing the focused element, if focus
@@ -75,12 +126,11 @@ export function stopsIn(root: HTMLElement): HTMLElement[] {
 export function currentStop(root: HTMLElement, cursor: number | null): HTMLElement | null {
   const active = document.activeElement;
   if (active instanceof HTMLElement && active !== root && root.contains(active)) {
-    const stop = active.closest<HTMLElement>(`[${STOP_ATTR}]`);
+    const stop = stopOf(root, active);
     if (stop !== null) return stop;
   }
   if (cursor === null) return null;
-  const rows = Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}="row"]`));
-  return rows[cursor] ?? null;
+  return conversationRows(root)[cursor] ?? null;
 }
 
 /** Where `j` (+1) or `k` (-1) goes from the current stop. With nothing current (a start screen
@@ -94,11 +144,11 @@ export function nextStop(root: HTMLElement, cursor: number | null, delta: 1 | -1
   return stops[clampStep(stops.length, index, delta)];
 }
 
-/** The index of `stop` among the conversation rows, or `null` if it is not a row. */
+/** The index of `stop` among the conversation rows (`conversationRows`), or `null` if it is not
+ *  one -- including an element that merely carries `data-nav-stop="row"` inside another stop. */
 export function rowIndexOf(root: HTMLElement, stop: HTMLElement): number | null {
   if (stop.getAttribute(STOP_ATTR) !== "row") return null;
-  const rows = Array.from(root.querySelectorAll<HTMLElement>(`[${STOP_ATTR}="row"]`));
-  const index = rows.indexOf(stop);
+  const index = conversationRows(root).indexOf(stop);
   return index === -1 ? null : index;
 }
 
@@ -198,14 +248,19 @@ export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
  *  order among the stops. "Visible" is `hintVisible` above. */
 export function hintTargets(root: HTMLElement): HintTarget[] {
   const targets: HintTarget[] = [];
-  const composerEl = root.querySelector<HTMLElement>(`[${HINT_COMPOSER_ATTR}]`);
+  // The composer is in no stop; a marker inside one is a reply's own HTML, not the composer.
+  const markers = Array.from(root.querySelectorAll<HTMLElement>(`[${HINT_COMPOSER_ATTR}]`));
+  const composerEl = markers.find((el) => stopOf(root, el) === null) ?? null;
   let composer = composerEl !== null && hintVisible(composerEl, root) ? composerEl : null;
+  // Once, not per stop: a row's index is its place in this list.
+  const rows = conversationRows(root);
   for (const stop of stopsIn(root)) {
     if (composer !== null && composer.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING) {
       targets.push({ kind: "composer", el: composer });
       composer = null;
     }
-    const rowIndex = stop.getAttribute(STOP_ATTR) === "row" ? rowIndexOf(root, stop) : null;
+    const found = rows.indexOf(stop);
+    const rowIndex = found === -1 ? null : found;
     if (rowIndex !== null && hintVisible(stop, root)) targets.push({ kind: "row", el: stop, rowIndex });
     if (rowIndex !== null) {
       for (const block of stop.querySelectorAll<HTMLElement>("pre.code-block")) {
