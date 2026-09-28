@@ -4449,6 +4449,7 @@ dependencies = [
  "alacritty_terminal",
  "libc",
  "rustix-openpty",
+ "unicode-width",
 ]
 
 [[package]]
