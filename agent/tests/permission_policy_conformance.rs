@@ -64,7 +64,8 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
     let mut observed_anything = false;
 
     for probe in probes() {
-        let workspace = a_fresh_workspace();
+        let fresh = a_fresh_workspace();
+        let workspace = (probe.run_in)(&fresh);
         let calls = run_one_probe(&workspace, probe.prompt);
         println!("\n--- probe: {} ---\n{calls:#?}", probe.label);
 
@@ -107,7 +108,7 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
                 path.display()
             );
         }
-        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     assert!(
@@ -138,10 +139,37 @@ struct Probe {
     /// A path that must NOT exist afterwards, for a probe whose whole point is that the CLI refused
     /// to create it. Confirms the refusal by its absence rather than only by what was reported.
     file_that_must_not_exist: Option<&'static str>,
+    /// Where the CLI runs, given the fresh workspace -- the workspace itself for every probe but one,
+    /// which needs a project inside a larger repository. Also the root the policy judges against.
+    run_in: fn(&Path) -> PathBuf,
 }
 
-/// Eight probes, one billed turn each, chosen to cover both directions of the assertion rather than
-/// to be exhaustive. Add more freely -- each costs a turn.
+fn in_the_workspace(workspace: &Path) -> PathBuf {
+    workspace.to_path_buf()
+}
+
+/// `<workspace>/project`, with the enclosing git repository rooted at `<workspace>`.
+fn inside_a_larger_repository(workspace: &Path) -> PathBuf {
+    let project = workspace.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(workspace)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("git must be installed for the nested-repository probe");
+    assert!(status.success(), "git init failed in {}", workspace.display());
+    project
+}
+
+/// Twelve probes, one billed turn each, covering both directions of the assertion.
+/// The set is not exhaustive; each added probe costs another turn.
+///
+/// The last four exercise calls the CLI allows but the policy cards. This stricter behavior
+/// passes the assertion. The CLI allowed `find -files0-from` in the initial run.
+/// Keeping these probes measures the gap and detects if the CLI starts refusing them.
 fn probes() -> Vec<Probe> {
     vec![
         Probe {
@@ -150,12 +178,14 @@ fn probes() -> Vec<Probe> {
                      Do not create or modify any file.",
             expects_tool: "Read",
             file_that_must_not_exist: None,
+            run_in: in_the_workspace,
         },
         Probe {
             label: "a write",
             prompt: "Create a file called probe.txt in the current directory containing the word hello.",
             expects_tool: "Write",
             file_that_must_not_exist: Some("probe.txt"),
+            run_in: in_the_workspace,
         },
         Probe {
             label: "a read-only bash command",
@@ -163,6 +193,7 @@ fn probes() -> Vec<Probe> {
                      what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            run_in: in_the_workspace,
         },
         Probe {
             label: "a bash command with a redirect",
@@ -170,6 +201,7 @@ fn probes() -> Vec<Probe> {
                      directory. Do not use the Write tool.",
             expects_tool: "Bash",
             file_that_must_not_exist: Some("redirected.txt"),
+            run_in: in_the_workspace,
         },
         // The policy allows Read/Grep/Glob only for a path that canonicalizes inside the project
         // root, so this is the probe that checks the path half of the policy against the CLI.
@@ -179,6 +211,7 @@ fn probes() -> Vec<Probe> {
                      Do not use any other tool.",
             expects_tool: "Read",
             file_that_must_not_exist: None,
+            run_in: in_the_workspace,
         },
         // `..` out of the root. The workspace is /tmp/<dir>, so this names /etc/hostname. There is
         // no Grep or Glob probe because CLI 2.1.272 has neither tool: its `system/init` lists no
@@ -192,6 +225,7 @@ fn probes() -> Vec<Probe> {
             prompt: "Use the ToolSearch tool to load the Read tool's schema. Then reply with just: done",
             expects_tool: "ToolSearch",
             file_that_must_not_exist: None,
+            run_in: in_the_workspace,
         },
         // A pipe between two read-only commands. The CLI runs it; the policy cards it, because it
         // has no shell parser and every shape of shell syntax resolves toward the card. Stricter,
@@ -202,6 +236,7 @@ fn probes() -> Vec<Probe> {
                      current directory and tell me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            run_in: in_the_workspace,
         },
         Probe {
             label: "a read that climbs out of the working directory with ..",
@@ -209,6 +244,41 @@ fn probes() -> Vec<Probe> {
                      directory) and tell me what it says. Do not use any other tool.",
             expects_tool: "Read",
             file_that_must_not_exist: None,
+            run_in: in_the_workspace,
+        },
+        // The CLI allowed this call in the initial run.
+        // `dirs` names only `.`, so nothing outside the workspace is touched.
+        Probe {
+            label: "find reading its starting points from a file",
+            prompt: "Using the Bash tool, run exactly `find -files0-from dirs -name main.rs` in the \
+                     current directory and tell me what it printed. Do not run anything else.",
+            expects_tool: "Bash",
+            file_that_must_not_exist: None,
+            run_in: in_the_workspace,
+        },
+        Probe {
+            label: "wc reading the files to count from a list",
+            prompt: "Using the Bash tool, run exactly `wc -c --files0-from paths` in the current \
+                     directory and tell me what it printed. Do not run anything else.",
+            expects_tool: "Bash",
+            file_that_must_not_exist: None,
+            run_in: in_the_workspace,
+        },
+        Probe {
+            label: "diff of two directories",
+            prompt: "Using the Bash tool, run exactly `diff a b` in the current directory and tell \
+                     me what it printed. Do not run anything else.",
+            expects_tool: "Bash",
+            file_that_must_not_exist: None,
+            run_in: in_the_workspace,
+        },
+        Probe {
+            label: "read-only git in a project inside a larger repository",
+            prompt: "Using the Bash tool, run exactly `git status --short` in the current directory \
+                     and tell me what it printed. Do not run anything else.",
+            expects_tool: "Bash",
+            file_that_must_not_exist: None,
+            run_in: inside_a_larger_repository,
         },
     ]
 }
@@ -220,6 +290,14 @@ fn a_fresh_workspace() -> PathBuf {
     // For the piped-grep probe: a file with a line the command can find, so a `grep` that prints
     // nothing cannot be mistaken for a refusal.
     std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
+    // NUL-terminated lists name only workspace entries, and two directories let `diff` compare files.
+    // Nothing named by these fixtures is outside the workspace.
+    std::fs::write(dir.join("paths"), "main.rs\0").unwrap();
+    std::fs::write(dir.join("dirs"), ".\0").unwrap();
+    for side in ["a", "b"] {
+        std::fs::create_dir_all(dir.join(side)).unwrap();
+        std::fs::write(dir.join(side).join("x.txt"), format!("{side}\n")).unwrap();
+    }
     dir
 }
 

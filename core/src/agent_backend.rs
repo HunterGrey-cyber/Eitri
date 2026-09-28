@@ -1756,34 +1756,29 @@ mod tests {
         dir
     }
 
-    /// Drives the pump until it yields something or the deadline passes. The sidecar's events cross
-    /// the ingestion thread, so the first call after a queue is normally empty.
+    /// Drives the pump until all queued events arrive or the deadline passes.
+    /// Sidecar events cross the ingestion thread, so the first pump after a queue is normally empty.
+    /// The thread folds every 5 ms, and events queued together can arrive in separate deliveries.
+    /// Collects until 100 ms pass with nothing new so later events are not left undelivered.
     fn pump_until_delivery(
         backend: &mut AgentBackend,
         project_root: &Path,
         mode: PermissionMode,
     ) -> Vec<AgentDomainEvent> {
-        // Every batch the ingestion thread folds, not only the first: under a loaded test run three
-        // queued prompts can reach the UI in two deliveries (the same flake `deliver` below had;
-        // `approve_pending_never_answers_a_prompt_only_a_human_answers` failed that way, 2 of 3).
-        // Collected until 100 ms pass after the last delivery; a first delivery that is empty (the
-        // policy answered everything) still returns within those 100 ms.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let quiet = std::time::Duration::from_millis(100);
         let mut delivered = Vec::new();
-        let mut last: Option<std::time::Instant> = None;
+        let mut last_new: Option<std::time::Instant> = None;
         loop {
             let now = std::time::Instant::now();
-            if let UiDelivery::Events(events) = backend.take_ui_delivery(project_root, mode) {
-                if !events.is_empty() || last.is_none() {
-                    last = Some(now);
+            match backend.take_ui_delivery(project_root, mode) {
+                UiDelivery::Events(events) if !events.is_empty() => {
+                    delivered.extend(events);
+                    last_new = Some(now);
                 }
-                delivered.extend(events);
+                _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => return delivered,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
-            if last.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline {
-                return delivered;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
