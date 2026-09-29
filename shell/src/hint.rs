@@ -208,6 +208,8 @@ pub(crate) struct HintWidgets {
     pub(crate) overlay: gtk4::Overlay,
     pub(crate) top_items: Vec<gtk4::Widget>,
     pub(crate) editor: Rc<NeovideEditorPane>,
+    /// The panel's `WebView` itself, which a panel landing grabs -- never its module host, a
+    /// `WebHost` that refuses a grab (`web_host`'s module doc).
     pub(crate) agent_widget: gtk4::Widget,
     /// Every module and its host **in the layout's tree order** (`ModuleGrid::hosts_in_tree_order`):
     /// HINT feeds it straight into `WindowLayout::modules`, which orders its labels by it. The alias

@@ -2,7 +2,8 @@
 //! `layout::build_content_area`, `layout::build_vertical_split` and `PaneLayout`'s index matches.
 //!
 //! **It never reparents.** Every module host gets its parent exactly once, in [`ModuleGrid::add`],
-//! and loses it only in `dispose`, when the window goes away. Hiding is `set_child_visible(false)`;
+//! and loses it only in `dispose`, when the window goes away. (A web module's `WebView` gets its own
+//! once, before that: its [`WebHost`], `web_host`'s module doc.) Hiding is `set_child_visible(false)`;
 //! zoom, resize, split, swap, move and even (modules P2) are new allocations of the same children. The
 //! reason is the editor: its Skia `DirectContext` is made once, on the `GLArea`'s GL context, and
 //! nothing in `neovide-editor` survives an unrealize (spec §2) -- and unparenting unrealizes. S3
@@ -32,6 +33,8 @@ use neovibe_core::layout::{
 
 use throttle::{WebThrottle, QUIET};
 
+use crate::web_host::WebHost;
+
 /// The grid's CSS node name. `theme::gtk_css` styles its dividers as `modulegrid.content-area >
 /// separator`, the rule `paned.content-area > separator` was before the grid replaced the paneds.
 pub(crate) const CSS_NAME: &str = "modulegrid";
@@ -41,7 +44,7 @@ pub(crate) const CSS_NAME: &str = "modulegrid";
 pub(crate) enum HostKind {
     /// Allocated its rectangle on every pass, as the editor always was.
     Direct,
-    /// A WebView: held at its settled size while being resized ([`throttle`]).
+    /// A `WebView`, in its [`WebHost`]: held at its settled size while being resized ([`throttle`]).
     Web,
 }
 
@@ -68,9 +71,13 @@ fn frame_size(width: i32, height: i32) -> Size {
     }
 }
 
-struct Host {
+/// A module's host and its focus target. Generic over the widget only so [`focus_target_of`] is
+/// tested on these same records without a display; the grid holds `gtk4::Widget`s.
+struct Host<W = gtk4::Widget> {
     id: ModuleId,
-    widget: gtk4::Widget,
+    widget: W,
+    /// What takes the keys when the module is given them ([`ModuleGrid::add`]'s `focus`).
+    focus: W,
     kind: HostKind,
 }
 
@@ -201,8 +208,39 @@ impl ModuleGrid {
     /// on its right. Appended after a handle, a Lua `main` panel took every press on the root
     /// divider (the 2026-09-23 GUI pass, item 11). The handles themselves are appended
     /// ([`Self::new_handle`]), so they stay above every host.
-    pub(crate) fn add(&self, id: ModuleId, widget: &impl IsA<gtk4::Widget>, kind: HostKind) {
+    ///
+    /// **`focus` is what takes the keys when the module is given them** ([`ModuleGrid::focus_target`]):
+    /// the host itself, or a widget inside it. It is not always the host. The editor's host is the
+    /// overlay carrying its start-failure notice (`editor_start_failure`), and a web module's is a
+    /// [`WebHost`] around its `WebView` (2026-09-29), which is not focusable itself -- it forwards a
+    /// grab to its one child, but module focus does not rely on that; `web_host`'s module doc says why
+    /// it is there. A `HostKind::Web` host must be a `WebHost`: a `WebView` placed in the grid
+    /// directly has its input method's candidate window off by the module's position -- and a
+    /// `WebHost`'s focus target is the one child it holds. These are wiring rules, checked here once
+    /// per module as it is added.
+    pub(crate) fn add(
+        &self,
+        id: ModuleId,
+        widget: &impl IsA<gtk4::Widget>,
+        focus: &impl IsA<gtk4::Widget>,
+        kind: HostKind,
+    ) {
         let widget: gtk4::Widget = widget.clone().upcast();
+        let focus: gtk4::Widget = focus.clone().upcast();
+        assert!(
+            focus == widget || focus.is_ancestor(&widget),
+            "{id}: its focus target must be its host or inside it"
+        );
+        if let Some(web) = widget.downcast_ref::<WebHost>() {
+            assert!(
+                web.content().as_ref() == Some(&focus),
+                "{id}: a WebHost's focus target is the one child it holds"
+            );
+        }
+        assert!(
+            kind != HostKind::Web || widget.is::<WebHost>(),
+            "{id}: a web module's host must be a WebHost (web_host's module doc)"
+        );
         {
             let handles: Vec<gtk4::Widget> = self
                 .imp()
@@ -237,7 +275,12 @@ impl ModuleGrid {
             });
         }
         let needs_handle = !self.imp().hosts.borrow().is_empty();
-        self.imp().hosts.borrow_mut().push(Host { id, widget, kind });
+        self.imp().hosts.borrow_mut().push(Host {
+            id,
+            widget,
+            focus,
+            kind,
+        });
         if needs_handle {
             let handle = self.new_handle();
             self.imp().handles.borrow_mut().push(handle);
@@ -306,6 +349,14 @@ impl ModuleGrid {
             .iter()
             .map(|h| (h.id.clone(), h.widget.clone()))
             .collect()
+    }
+
+    /// The widget that takes the keys when `id` is given them ([`ModuleGrid::add`]'s `focus`), never
+    /// a web module's host, which is not focusable itself (`web_host`'s module doc). `None` for a
+    /// module this grid has no host for. Read live, as [`ModuleGrid::hosts`] is. The choice is
+    /// [`focus_target_of`]'s, on the grid's own records.
+    pub(crate) fn focus_target(&self, id: &ModuleId) -> Option<gtk4::Widget> {
+        focus_target_of(&self.imp().hosts.borrow(), id).cloned()
     }
 
     /// Every module and its host in the layout's tree order: HINT's order.
@@ -758,6 +809,12 @@ fn leave_then_unmap(
 /// The drawing order follows too: handles now paint after every host.
 fn host_stack_index<T>(children: &[T], is_handle: impl Fn(&T) -> bool) -> usize {
     children.iter().position(is_handle).unwrap_or(children.len())
+}
+
+/// [`ModuleGrid::focus_target`]'s choice, made on the grid's own host records (generic over the
+/// widget so it is tested without a display): the focus target recorded for `id`, never its host.
+fn focus_target_of<'a, W>(hosts: &'a [Host<W>], id: &ModuleId) -> Option<&'a W> {
+    hosts.iter().find(|h| h.id == *id).map(|h| &h.focus)
 }
 
 /// Whether `module` may be placed into the tree: only a module this window has a host for. The
@@ -1300,5 +1357,44 @@ mod tests {
         for id in [ModuleId::parse("canvas").unwrap(), ModuleId::lua("nots")] {
             assert_eq!(placeable(&hosted, &id), Err(LayoutError::NotInTree(id.clone())));
         }
+    }
+
+    /// Module focus grabs what `add` was given as the focus target, never the host (2026-09-29): a
+    /// web module's host is a `WebHost`, which is not focusable itself, and grabbing a `GtkBox` in its
+    /// place left the keys where they were in the sandbox's first wrapped run. These are the grid's
+    /// own records, with each module's host and focus target told apart, so an answer taken from
+    /// the host fails here (review round 1: the first version of this test never saw a host at all).
+    #[test]
+    fn a_module_is_focused_through_its_focus_target_not_its_host() {
+        let host = |id: ModuleId, widget: &'static str, focus: &'static str, kind| Host {
+            id,
+            widget,
+            focus,
+            kind,
+        };
+        let hosts = [
+            host(ModuleId::editor(), "editor-overlay", "editor-glarea", HostKind::Direct),
+            host(ModuleId::agent(), "agent-webhost", "agent-webview", HostKind::Web),
+            host(
+                ModuleId::terminal(),
+                "terminal-glarea",
+                "terminal-glarea",
+                HostKind::Direct,
+            ),
+            host(ModuleId::lua("notes"), "notes-webhost", "notes-webview", HostKind::Web),
+        ];
+        assert_eq!(focus_target_of(&hosts, &ModuleId::agent()), Some(&"agent-webview"));
+        assert_eq!(focus_target_of(&hosts, &ModuleId::lua("notes")), Some(&"notes-webview"));
+        assert_eq!(focus_target_of(&hosts, &ModuleId::editor()), Some(&"editor-glarea"));
+        assert_eq!(
+            focus_target_of(&hosts, &ModuleId::terminal()),
+            Some(&"terminal-glarea"),
+            "a module that is its own focus target"
+        );
+        assert_eq!(
+            focus_target_of(&hosts, &ModuleId::parse("canvas").unwrap()),
+            None,
+            "a module this grid has no host for"
+        );
     }
 }

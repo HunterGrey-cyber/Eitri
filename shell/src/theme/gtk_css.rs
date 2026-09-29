@@ -436,6 +436,17 @@ mod tests {
         }
     }
 
+    /// A web module's `WebHost` exists only to hold its `WebView` at (0,0) (`web_host`'s module doc)
+    /// and must add nothing around it: the host's rectangle is the module's and the `WebView`'s. No
+    /// rule here names the host's node, so neovibe's own stylesheet gives it no padding, border or
+    /// background of its own.
+    #[test]
+    fn no_rule_names_the_web_host() {
+        for t in [dawn(), ThemeTokens::fallback(), lunaperche()] {
+            assert!(!gtk_css(&t).contains(crate::web_host::CSS_NAME));
+        }
+    }
+
     /// The refusal flash is the prefix indicator's block (spec §3.2), and like it wins over the
     /// app name's own colours by coming later.
     #[test]

@@ -24,7 +24,8 @@ pub fn withheld_from_panel(state: ModifierType) -> bool {
     state.intersects(ModifierType::SUPER_MASK | ModifierType::HYPER_MASK)
 }
 
-/// Installs the filter on the agent panel's module host.
+/// Installs the filter on the agent panel's module host: the `WebHost` around its `WebView` since
+/// 2026-09-29 (`web_host`), whose capture phase runs before anything on the `WebView` itself.
 pub fn install(host: &gtk4::Widget) {
     let controller = gtk4::EventControllerKey::new();
     controller.set_propagation_phase(gtk4::PropagationPhase::Capture);

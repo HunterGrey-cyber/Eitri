@@ -31,6 +31,7 @@ mod theme;
 mod toast;
 mod tray;
 mod version;
+mod web_host;
 mod webkit_sandbox;
 mod webkit_zoom;
 mod webview_crash_guard;
@@ -55,6 +56,7 @@ use neovibe_core::layout::{
     Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
 };
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
+use web_host::WebHost;
 
 const APP_ID: &str = "cn.huntergrey.neovibe";
 
@@ -594,7 +596,7 @@ fn build_ui(
     // bare `GtkGLArea` -- see `editor_start_failure`'s own doc for why this has to wrap the widget
     // before it is ever handed to the grid.
     let (editor_host, editor_start_failure_label) = editor_start_failure::install(pane.widget());
-    grid.add(ModuleId::editor(), &editor_host, HostKind::Direct);
+    grid.add(ModuleId::editor(), &editor_host, pane.widget(), HostKind::Direct);
     // With no `WebView` in this process (`webkit_sandbox`), the chat's and each Lua panel's place is
     // a plain GTK notice: allocated directly, as the editor is, rather than held at a settled size
     // like a `WebView` being resized.
@@ -603,16 +605,29 @@ fn build_ui(
     } else {
         HostKind::Direct
     };
-    grid.add(ModuleId::agent(), &agent_widget, web_host);
+    // Every web module -- the chat and each Lua panel -- sits at (0,0) of a `WebHost` of its own
+    // rather than in the grid directly, and takes the keys through its `WebView` (its focus target):
+    // WebKitGTK adds the `WebView`'s position in its parent to the input method's caret rectangle,
+    // which GTK4's input methods then translate to the window a second time, so a `WebView` at the
+    // module's own x put the candidate window that far right of the caret (`web_host`'s module doc).
+    // The notice that stands in for a `WebView` where WebKit cannot start is wrapped the same way, so
+    // the shape does not depend on `webkit_sandbox`.
+    grid.add(ModuleId::agent(), &WebHost::new(&agent_widget), &agent_widget, web_host);
     // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to zero
     // reports a 1-row grid to its shell.
     terminal.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
-    grid.add(ModuleId::terminal(), terminal.widget(), HostKind::Direct);
+    grid.add(
+        ModuleId::terminal(),
+        terminal.widget(),
+        terminal.widget(),
+        HostKind::Direct,
+    );
     for (id, slot, widget) in &lua_panels {
+        // On the `WebView`: its host measures its one child, so the grid sees the same floor.
         if *slot == PanelSlot::Bottom {
             widget.set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
         }
-        grid.add(id.clone(), widget, web_host);
+        grid.add(id.clone(), &WebHost::new(widget), widget, web_host);
     }
     // The terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
     // `Ctrl+a \ t`, its tray chip, `neovibe.layout.show`, a saved layout -- rather than only on the
@@ -649,8 +664,11 @@ fn build_ui(
     }
 
     // Gives a module the keys. The editor goes through `NeovideEditorPane::grab_focus`, which also
-    // tells the input method; any other module is its host widget's own `grab_focus`. A hidden
-    // module is refused: GTK4's `grab_focus` does not refuse an unmapped widget, so the keys would
+    // tells the input method; any other module is its focus target's own `grab_focus`
+    // (`ModuleGrid::focus_target`), never its host's: a web module's host is a `WebHost`, which is
+    // not focusable itself -- it forwards a grab to its `WebView`, but this does not rely on that
+    // (`web_host`'s module doc).
+    // A hidden module is refused: GTK4's `grab_focus` does not refuse an unmapped widget, so the keys would
     // go to a module nobody can see (the editor under a Lua `main` panel). Every caller today
     // already avoids one -- `navigate` sees only shown modules, HINT only mapped ones, and the
     // layout's `focus` is never hidden (`Layout::set_focus`) -- so this holds it for the next caller.
@@ -677,10 +695,7 @@ fn build_ui(
                 return pane.widget().is_focus();
             }
             // Read live (modules P2): a module added after startup is found too.
-            grid.hosts()
-                .iter()
-                .find(|(m, _)| m == id)
-                .is_some_and(|(_, host)| host.grab_focus())
+            grid.focus_target(id).is_some_and(|target| target.grab_focus())
         })
     };
 
@@ -1759,6 +1774,11 @@ fn build_ui(
 
     // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host
     // (`install_module_nav`), one per web module here; a web module added later installs its own.
+    // The host is the `WebHost` around the `WebView` since 2026-09-29, an ancestor of the focus
+    // widget rather than the focus widget itself. That changes nothing here: GTK runs capture-phase
+    // controllers on every ancestor of the target, top down, before any controller on the target
+    // (`gtk_propagate_event_internal`, gtkmain.c, GTK 4.22.5), and WebKit's second delivery of a key
+    // the page did not handle starts at the window again (`pane_switch::LetThrough`).
     // Only the agent host gets an intercept (C1, spec §3.1, §3.5): `Ctrl+j`/`Ctrl+k` claimed for the
     // composer, decided from the panel's own `panel_keys` mirror. A Lua panel has no such mode and
     // passes `None`, so every chord there still goes straight to `move_focus` as before.
