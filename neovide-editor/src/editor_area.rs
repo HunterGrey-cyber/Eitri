@@ -15,8 +15,9 @@
 //! the same. This emits it before the first frame, whenever the device-pixel size changes, and on
 //! the first own frame after a fallback frame -- so a scale change that leaves the device size
 //! unchanged gets no `resize` here. That is harmless for this pane: its render arm applies the
-//! scale itself (`sync_os_scale`) and its tick re-syncs the grid from the framebuffer size every
-//! tick. A host relying on `resize` to learn of a scale-only change would miss it.
+//! scale itself (`sync_os_scale`), and its service re-syncs the grid from the framebuffer size
+//! whenever it runs (the render arm asks for a run after a scale change). A host relying on
+//! `resize` to learn of a scale-only change would miss it.
 //!
 //! One more `GtkGLArea` behaviour is not reproduced: with `auto-render` off, `GtkGLArea` re-presents
 //! its last texture on a snapshot nobody asked `queue_render` for. This always renders, which is

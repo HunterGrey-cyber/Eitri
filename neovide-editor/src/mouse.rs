@@ -160,7 +160,7 @@ pub(crate) fn handle_mouse_button(
     } else {
         None
     });
-    session.wants_frame.set(true);
+    // nvim's reply requests the frame.
 }
 
 /// `EventControllerMotion`'s `motion` handler -- sends a `Drag` RPC via
@@ -212,7 +212,7 @@ pub(crate) fn handle_mouse_motion(
         button: drag.button,
         last_grid_pos: grid_pos,
     }));
-    session.wants_frame.set(true);
+    // nvim's reply requests the frame.
 }
 
 /// Handles `EventControllerScroll` deltas using the same accumulation as
@@ -302,10 +302,7 @@ pub(crate) fn handle_mouse_scroll(
         }
     }
 
-    if vertical_direction.is_some() || horizontal_direction.is_some() {
-        session.wants_frame.set(true);
-    }
-
+    // Scroll is forwarded to nvim; its reply requests the frame.
     glib::Propagation::Stop
 }
 
