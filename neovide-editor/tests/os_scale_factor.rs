@@ -36,9 +36,12 @@
 //! 6. `set_os_scale_factor(1.0)` returns `true` and the cell width returns to the original,
 //!    unscaled baseline.
 //!
-//! Ignored unless asked for: it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to the
-//! session's display for the clipboard (no window). A plain `main` (`harness = false`) because
-//! winit allows one `EventLoop` per process, on the main thread only. Run with:
+//! Ignored unless asked for: it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to a display
+//! for the clipboard (no window) -- **its own `Xvfb`** since 2026-09-29
+//! (`shell/tests/support/own_x_server.rs`), started and pointed to before winit connects, with any
+//! inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took the session's display, the
+//! desktop's from any agent shell. A plain `main` (`harness = false`) because winit allows one
+//! `EventLoop` per process, on the main thread only. Run with, and no wrapper is needed:
 //!
 //!     cargo test -p neovide-editor --test os_scale_factor -- --ignored
 use std::time::{Duration, Instant};
@@ -48,6 +51,11 @@ use neovide::{
     units::{GridSize, PixelRect},
 };
 use skia_safe::{surfaces, Color, Surface};
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29). The one helper
+// every display-connecting test in the workspace shares, so it lives with `shell`'s.
+#[path = "../../shell/tests/support/own_x_server.rs"]
+mod own_x_server;
 
 struct Frames {
     surface: Surface,
@@ -137,6 +145,15 @@ fn main() {
         println!("os_scale_factor: ignored (spawns a real nvim); run with `-- --ignored`");
         return;
     }
+    // As `shell`'s own `main` and `cursor_animation` do (fix round 3, 2026-09-29): a pipe or socket on
+    // stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer and
+    // blocks it at startup (`neovide_editor::stdin`), which failed this test as "nvim never became ready".
+    if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+        println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
+    }
+    // Before winit or the clipboard connects to anything: its own Xvfb, the only display left to find.
+    // Declared first, so a failed assertion below drops (and stops) it last, after the harness.
+    let _server = own_x_server::isolate("os_scale_factor", "640x480x24");
 
     let mut harness = LiveHarness::with_options(LiveHarnessOptions {
         os_scale_factor: 1.0,

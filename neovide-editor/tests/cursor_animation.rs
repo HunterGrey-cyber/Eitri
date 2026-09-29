@@ -2,6 +2,42 @@
 //!
 //! Run ONLY in the one, isolated GUI sandbox permitted by AGENTS.md:
 //! `cargo test -p neovide-editor --test cursor_animation -- --ignored`
+//! Since 2026-09-29 it refuses anything else before GTK initialises (`sandbox_wayland_socket`): a
+//! `WAYLAND_DISPLAY` that is unset, missing, not a socket, or resolves into the login runtime
+//! directory (`/run/user/`, where a desktop's sockets live; every sandbox harness here uses a
+//! private runtime directory of its own), and any X display -- `DISPLAY` and `WAYLAND_SOCKET` are
+//! dropped and `GDK_BACKEND=wayland` set. Unlike the Xvfb tests (`shell/tests/support/own_x_server.rs`)
+//! it cannot start a display of its own: it measures GL/dmabuf presentation on a real compositor.
+//! **Fix round 1 (the same day):** a path is not an identity, so it also refuses a socket that IS one
+//! of the login runtime directory's, reached through a bind mount or a hard link (same device and
+//! inode), and -- once GTK has connected, before any window exists -- a compositor with any output
+//! that is not `HEADLESS-<n>` (`require_headless_outputs`): a real screen, or a window on one, as a
+//! nested compositor's output is. And it runs GTK's own input method, never an inherited
+//! `GTK_IM_MODULE`: with `fcitx` the pane's input context reached for fcitx5 over the session bus as
+//! soon as it took focus -- on the desktop's bus, the owner's live one.
+//! **Fix round 2 (the same day):** the output check ran only after `gtk4::init()` had connected, so a
+//! desktop whose runtime directory is not `/run/user/` (`/tmp/runtime-<user>`) was connected to before
+//! it was refused. Now, before GTK, the process listening on the socket is found through `/proc`
+//! without connecting, and must have been started with `WLR_BACKENDS=headless`
+//! (`require_headless_compositor`); the output check stays as the second, after-connect half. A
+//! headless compositor someone watches remotely (wayvnc) still passes both.
+//! **Fix round 3 (the same day):** the listener is found by the socket file itself, as the kernel
+//! records it, not by the name `/proc/net/unix` prints (a rename, a bind mount or another mount
+//! namespace could make that name lead to a desktop's socket); its holder must also map `libwlroots`
+//! (a compositor that is not wlroots ignores `WLR_BACKENDS`); and it runs with no session bus, as the
+//! Xvfb tests do (`own_x_server::cut_session_bus`). Every run, `--ignored` or not, first holds the
+//! refusal chain against fake compositors (`refusal_chain_self_test`), and
+//! `shell/tests/own_display_scan.rs` checks that `main` still calls it all, in order.
+//! **Fix round 4 (the same day):** the kernel's answer is believed only whole. A `NLMSG_DONE` carrying a
+//! negative errno (a dump that failed part way), a reply flagged `NLM_F_DUMP_INTR` (the table changed
+//! under it) and an attribute that does not add up are each an error, not the listeners found so far
+//! (`parse_unix_diag_reply`, held on synthetic replies by `netlink_parser_self_test`). The refusal chain
+//! skips, and says so, a case its machine cannot construct: with no `NETLINK_SOCK_DIAG` nothing can be
+//! looked up, and as root or with `CAP_SYS_PTRACE` a non-dumpable holder is readable; the runtime check
+//! is relaxed for neither. The scan now also requires GTK to be initialised exactly once, after the checks,
+//! and every refusal in `main` to exit. The headless sway this test runs against must be started inside
+//! the same `bwrap` wrapper as the test: a sway started outside it is not dumpable (`cap_sys_nice=ep`), so
+//! the test refuses it, whatever it was started with.
 //! A plain main keeps GTK and winit on the main thread. The test starts a real clean nvim,
 //! drives the product pane, and reads its actual GL framebuffer after GTK paints. Red cursor
 //! pixels on a black background prove intermediate positions; the harness's cursor getter only
@@ -23,6 +59,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CString};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -32,6 +69,11 @@ use gtk4::glib::{self, translate::IntoGlib};
 use gtk4::prelude::*;
 use gtk4::{GLArea, Window};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
+
+// For `own_x_server::cut_session_bus` only (fix round 3, 2026-09-29): this test cannot use that file's
+// Xvfb (`sandbox_wayland_socket` says why), but it runs with no session bus the same way.
+#[path = "../../shell/tests/support/own_x_server.rs"]
+mod own_x_server;
 
 type Point = (f64, f64);
 
@@ -398,6 +440,7 @@ fn region_for(area: &GLArea, from: Point, to: Point, cell: Point) -> Region {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one call per motion case, every argument a different fact of it
 fn idle_move(
     pane: &NeovideEditorPane,
     capture: &Capture,
@@ -937,7 +980,889 @@ fn run(
     failures
 }
 
+/// The Wayland socket this test may draw on: the headless-sway sandbox's, never the desktop's.
+///
+/// "Run ONLY in the isolated GUI sandbox" was a sentence in this file's header until 2026-09-29,
+/// when a sibling test that said the same (`shell/tests/panel_stream_scroll.rs`) was run without its
+/// wrapper and opened its windows on the owner's own screen. Every sandbox harness in use starts its
+/// compositor with a private `XDG_RUNTIME_DIR` of its own (`<harness>/run`), and a desktop session's
+/// sockets live in the login runtime directory, `/run/user/<uid>/`. So the socket `WAYLAND_DISPLAY`
+/// names -- an absolute path, or relative to `XDG_RUNTIME_DIR`, as libwayland resolves it -- must
+/// exist and must resolve (symlinks followed) outside `/run/user/`. `DISPLAY` is not accepted at all:
+/// XWayland's `:0` cannot be told apart from an X server of the test's own by its name.
+fn sandbox_wayland_socket() -> Result<PathBuf, String> {
+    let name = std::env::var_os("WAYLAND_DISPLAY")
+        .filter(|name| !name.is_empty())
+        .ok_or(
+            "WAYLAND_DISPLAY is not set -- run it inside the headless-sway sandbox, with that sandbox's own \
+         WAYLAND_DISPLAY and XDG_RUNTIME_DIR",
+        )?;
+    let socket = if Path::new(&name).is_absolute() {
+        PathBuf::from(&name)
+    } else {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|dir| !dir.is_empty())
+            .ok_or("WAYLAND_DISPLAY is relative and XDG_RUNTIME_DIR is not set")?;
+        PathBuf::from(runtime).join(&name)
+    };
+    let resolved = socket
+        .canonicalize()
+        .map_err(|e| format!("the Wayland socket {} cannot be resolved ({e})", socket.display()))?;
+    let is_socket = std::fs::metadata(&resolved).is_ok_and(|meta| meta.file_type().is_socket());
+    if !is_socket {
+        return Err(format!(
+            "WAYLAND_DISPLAY resolves to {}, which is not a socket",
+            resolved.display()
+        ));
+    }
+    if resolved.starts_with("/run/user") {
+        return Err(format!(
+            "WAYLAND_DISPLAY resolves to {}, in the login session's runtime directory -- a desktop, not the sandbox",
+            resolved.display()
+        ));
+    }
+    // `canonicalize` follows symlinks, not bind mounts or hard links: compare the socket itself.
+    let meta = std::fs::metadata(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    if let Some((_, _, login)) = login_runtime_sockets()
+        .into_iter()
+        .find(|(dev, ino, _)| (*dev, *ino) == (meta.dev(), meta.ino()))
+    {
+        return Err(format!(
+            "WAYLAND_DISPLAY resolves to {}, which is the login session's own socket {} (a bind mount or hard link) \
+             -- a desktop, not the sandbox",
+            resolved.display(),
+            login.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Every socket in this user's login runtime directory, `/run/user/<uid>/`, and one level below it,
+/// as `(st_dev, st_ino, path)`: what a desktop session's compositor listens on.
+fn login_runtime_sockets() -> Vec<(u64, u64, PathBuf)> {
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let root = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
+    let mut found = Vec::new();
+    let mut dirs = vec![(root, 0)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.file_type().is_socket() {
+                found.push((meta.dev(), meta.ino(), entry.path()));
+            } else if meta.is_dir() && depth < 1 {
+                dirs.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    found
+}
+
+/// The compositor listening on the socket file at `resolved` was started as a headless wlroots
+/// compositor (`WLR_BACKENDS=headless`, what every sandbox harness here sets), found **without
+/// connecting to it** (fix round 2, 2026-09-29): the listener bound to that very file, the process
+/// holding it by its `/proc/<pid>/fd` link, and that process's own initial environment and mapped
+/// libraries. A desktop compositor -- GNOME's, KDE's, a sway on real outputs, wherever its runtime
+/// directory is -- has no such variable, and a nested one (`WLR_BACKENDS=wayland`/`x11`) has
+/// another; either is refused before `gtk4::init()` makes a single request of it. A socket file no
+/// listener in this network namespace is bound to, or one no process this test can read holds, is
+/// refused too, and every holder it can read must have been started so.
+/// `require_headless_outputs` still checks, once GTK has connected, what the compositor reports.
+///
+/// **Fix round 3 (2026-09-29), two ways round 2's version could be satisfied by a desktop** (the
+/// round-3 Codex review; both need a deliberately built environment, and both ended at the output
+/// check after one connection, before any window):
+/// - It found the listener by the path `/proc/net/unix` prints, which is the name the listener was
+///   bound under, not the file this test would connect to: a rename, a bind mount or another mount
+///   namespace can make that name lead to a different socket (an overlay of the sandbox's runtime
+///   directory with the desktop's, in this test's mount namespace, passed it). Now the kernel says
+///   which listener is bound to the file itself (`unix_listeners_by_file`: `NETLINK_SOCK_DIAG`'s
+///   device and inode of each listener's socket file), compared with this test's own `stat` of it.
+/// - `WLR_BACKENDS=headless` in a process's environment says what it was asked, not what it is: a
+///   compositor that is not wlroots (Mutter) ignores the variable and runs on real outputs with it
+///   inherited. Now the holder must also map a `libwlroots` library -- the only kind of compositor
+///   the variable governs.
+fn require_headless_compositor(resolved: &Path) -> Result<u32, String> {
+    let meta = std::fs::metadata(resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let file = kernel_file_id(&meta);
+    let listeners: Vec<u32> = unix_listeners_by_file()?
+        .into_iter()
+        .filter(|&(_, dev, ino)| (dev, ino) == file)
+        .map(|(socket, _, _)| socket)
+        .collect();
+    if listeners.is_empty() {
+        return Err(format!(
+            "no listener in this network namespace is bound to the socket file {} -- its owner cannot be \
+             checked",
+            resolved.display()
+        ));
+    }
+    let (owners, unreadable) = socket_holders(&listeners);
+    if owners.is_empty() {
+        return Err(if unreadable.is_empty() {
+            format!("no process holds the socket at {}", resolved.display())
+        } else {
+            format!(
+                "no process this test can read holds the socket at {}; these processes of this user could \
+                 not be read, so whether one is its compositor, and how it was started, cannot be checked: \
+                 {unreadable:?}. A process is unreadable when it is not dumpable: `/usr/bin/sway` carries \
+                 `cap_sys_nice=ep`, so a sway started outside a user namespace is not, while one started \
+                 inside the sandbox's `bwrap` is readable",
+                resolved.display()
+            )
+        });
+    }
+    for &pid in &owners {
+        let unreadable = |what: &str, e: std::io::Error| {
+            format!(
+                "/proc/{pid}/{what}: {e} (the compositor at {} is not dumpable, or another user's)",
+                resolved.display()
+            )
+        };
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).map_err(|e| unreadable("environ", e))?;
+        let backends = environ
+            .split(|&b| b == 0)
+            .find_map(|var| var.strip_prefix(b"WLR_BACKENDS="))
+            .map(|v| String::from_utf8_lossy(v).into_owned());
+        match backends {
+            Some(b) if !b.is_empty() && b.split(',').all(|backend| backend == "headless") => {}
+            other => {
+                return Err(format!(
+                    "the compositor at {} (pid {pid}) was started with WLR_BACKENDS={other:?}, not \"headless\" -- \
+                     a desktop's, or one on a screen",
+                    resolved.display()
+                ))
+            }
+        }
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).map_err(|e| unreadable("maps", e))?;
+        if !maps_wlroots(&maps) {
+            return Err(format!(
+                "the process holding {} (pid {pid}) was started with WLR_BACKENDS=headless but maps no \
+                 libwlroots: not a wlroots compositor, the only kind that variable governs (Mutter ignores it)",
+                resolved.display()
+            ));
+        }
+    }
+    Ok(owners[0])
+}
+
+/// Whether a `/proc/<pid>/maps` text maps a `libwlroots` shared library.
+fn maps_wlroots(maps: &str) -> bool {
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .any(|path| {
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("libwlroots"))
+        })
+}
+
+/// A file's device and inode as `NETLINK_SOCK_DIAG`'s `UNIX_DIAG_VFS` reports them: the device in the
+/// kernel's own encoding (`MKDEV`, major << 20 | minor, not `st_dev`'s), the inode's low 32 bits.
+fn kernel_file_id(meta: &std::fs::Metadata) -> (u32, u32) {
+    let dev = meta.dev();
+    ((libc::major(dev) << 20) | libc::minor(dev), meta.ino() as u32)
+}
+
+/// The `NETLINK_SOCK_DIAG` messages' constants (linux/netlink.h, linux/sock_diag.h, linux/unix_diag.h) and
+/// `TCP_LISTEN` (net/tcp_states.h).
+mod diag {
+    pub const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    pub const UDIAG_SHOW_VFS: u32 = 0x2;
+    pub const UNIX_DIAG_VFS: u16 = 1;
+    pub const TCP_LISTEN: u8 = 10;
+    pub const NLMSG_NOOP: u16 = 1;
+    pub const NLMSG_ERROR: u16 = 2;
+    pub const NLMSG_DONE: u16 = 3;
+    pub const NLMSG_OVERRUN: u16 = 4;
+    pub const NLM_F_MULTI: u16 = 0x2;
+    pub const NLM_F_DUMP_INTR: u16 = 0x10;
+    pub const HEADER: usize = 16; // struct nlmsghdr
+}
+
+/// One datagram of a `NETLINK_SOCK_DIAG` dump reply, parsed: every listener it lists goes into `found` as
+/// `(socket inode, device, file inode)`. `Ok(true)` when the datagram ends the dump, `Ok(false)` when
+/// more is to come.
+///
+/// **Fail closed (fix round 4, 2026-09-29):** anything that is not a whole, consistent, successful dump is
+/// an error, and the listeners found before it are not returned -- a partial list would be judged as if it
+/// were the whole one. Round 3's parser returned what it had on a `NLMSG_DONE` carrying a negative errno
+/// (the kernel's way of saying the dump failed part way), ignored `NLM_F_DUMP_INTR` (the dump changed
+/// underneath it), and stopped only its attribute loop, not the parse, on an attribute that did not add up.
+fn parse_unix_diag_reply(data: &[u8], found: &mut Vec<(u32, u32, u32)>) -> Result<bool, String> {
+    use diag::*;
+    let u32_at = |data: &[u8], at: usize| u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+    let u16_at = |data: &[u8], at: usize| u16::from_ne_bytes(data[at..at + 2].try_into().unwrap());
+    let n = data.len();
+    let mut at = 0;
+    while at < n {
+        if n - at < HEADER {
+            return Err(format!(
+                "NETLINK_SOCK_DIAG: {} stray bytes after the last message",
+                n - at
+            ));
+        }
+        let len = u32_at(data, at) as usize;
+        if len < HEADER || at + len > n {
+            return Err(format!(
+                "NETLINK_SOCK_DIAG: a malformed reply ({len} bytes at {at} of {n})"
+            ));
+        }
+        if u16_at(data, at + 6) & NLM_F_DUMP_INTR != 0 {
+            return Err(
+                "NETLINK_SOCK_DIAG: the dump was interrupted (NLM_F_DUMP_INTR): the table changed under it, \
+                        so what it listed is not a snapshot"
+                    .into(),
+            );
+        }
+        let payload = &data[at + HEADER..at + len];
+        match u16_at(data, at + 4) {
+            NLMSG_NOOP => {}
+            NLMSG_DONE => {
+                // The dump's own status: 0, or the negative errno it failed with.
+                let status = payload
+                    .get(..4)
+                    .map_or(0, |b| i32::from_ne_bytes(b.try_into().unwrap()));
+                if status < 0 {
+                    return Err(format!(
+                        "NETLINK_SOCK_DIAG: the dump failed part way: {}",
+                        std::io::Error::from_raw_os_error(-status)
+                    ));
+                }
+                return Ok(true);
+            }
+            NLMSG_ERROR => {
+                let errno = if len >= HEADER + 4 {
+                    -(u32_at(data, at + HEADER) as i32)
+                } else {
+                    0
+                };
+                return Err(format!(
+                    "NETLINK_SOCK_DIAG: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ));
+            }
+            NLMSG_OVERRUN => {
+                return Err(
+                    "NETLINK_SOCK_DIAG: the dump had an overrun and the kernel dropped part of it (NLMSG_OVERRUN)"
+                        .into(),
+                );
+            }
+            SOCK_DIAG_BY_FAMILY => {
+                // struct unix_diag_msg (16 bytes), then its attributes.
+                if payload.len() < 16 {
+                    return Err(format!(
+                        "NETLINK_SOCK_DIAG: a message of {} bytes, shorter than a unix_diag_msg's 16",
+                        payload.len()
+                    ));
+                }
+                if payload[2] == TCP_LISTEN {
+                    let socket = u32_at(payload, 4);
+                    let mut attr = 16;
+                    while attr < payload.len() {
+                        let attr_len = if payload.len() - attr >= 4 {
+                            u16_at(payload, attr) as usize
+                        } else {
+                            0
+                        };
+                        if attr_len < 4 || attr + attr_len > payload.len() {
+                            return Err(format!(
+                                "NETLINK_SOCK_DIAG: a malformed attribute (length {attr_len} at {attr} of a \
+                                 {}-byte message)",
+                                payload.len()
+                            ));
+                        }
+                        if u16_at(payload, attr + 2) & 0x3fff == UNIX_DIAG_VFS {
+                            // struct unix_diag_vfs { udiag_vfs_ino, udiag_vfs_dev }
+                            if attr_len < 12 {
+                                return Err(format!(
+                                    "NETLINK_SOCK_DIAG: a UNIX_DIAG_VFS attribute of {attr_len} bytes, too short \
+                                     to hold a device and an inode (12)"
+                                ));
+                            }
+                            found.push((socket, u32_at(payload, attr + 8), u32_at(payload, attr + 4)));
+                        }
+                        attr += (attr_len + 3) & !3;
+                    }
+                }
+            }
+            other => return Err(format!("NETLINK_SOCK_DIAG: an unexpected message type {other}")),
+        }
+        at += (len + 3) & !3;
+    }
+    Ok(false)
+}
+
+/// Every listening Unix socket in this network namespace that is bound to a file, as `(socket inode,
+/// device, file inode)` with the device and file inode as [`kernel_file_id`] encodes them: the kernel's
+/// own record of the file each listener is bound to (fix round 3, 2026-09-29). `/proc/net/unix`'s path
+/// is only the name it was bound under.
+fn unix_listeners_by_file() -> Result<Vec<(u32, u32, u32)>, String> {
+    use diag::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let error = |what: &str| format!("NETLINK_SOCK_DIAG {what}: {}", std::io::Error::last_os_error());
+
+    // SAFETY: a plain syscall; the descriptor it returns is owned by `fd` alone.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            libc::NETLINK_SOCK_DIAG,
+        )
+    };
+    if fd < 0 {
+        return Err(error("socket"));
+    }
+    // SAFETY: `fd` was just opened here and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // struct nlmsghdr, then struct unix_diag_req: every listening Unix socket, with its file.
+    let mut request = Vec::with_capacity(40);
+    request.extend_from_slice(&40u32.to_ne_bytes());
+    request.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    request.extend_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+    request.extend_from_slice(&1u32.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&[libc::AF_UNIX as u8, 0, 0, 0]);
+    request.extend_from_slice(&(1u32 << TCP_LISTEN).to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&UDIAG_SHOW_VFS.to_ne_bytes());
+    request.extend_from_slice(&[0xff; 8]);
+    // SAFETY: an all-zero `sockaddr_nl` is a valid value (the kernel's address, once the family is set).
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: `request` and `kernel` are valid for reads of the lengths given.
+    let sent = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            request.as_ptr().cast(),
+            request.len(),
+            0,
+            (&kernel as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if sent != request.len() as isize {
+        return Err(error("send"));
+    }
+    let mut found = Vec::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        // SAFETY: `buffer` is valid for writes of its length.
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+        if n <= 0 {
+            return Err(error("recv"));
+        }
+        if parse_unix_diag_reply(&buffer[..n as usize], &mut found)? {
+            return Ok(found);
+        }
+    }
+}
+
+/// The processes holding any of the sockets `inodes` (a `/proc/<pid>/fd` link to `socket:[<inode>]`),
+/// and, as `pid (name)`, every process of this user whose descriptors this test may not read.
+fn socket_holders(inodes: &[u32]) -> (Vec<u32>, Vec<String>) {
+    let links: Vec<String> = inodes.iter().map(|inode| format!("socket:[{inode}]")).collect();
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let mut owners = Vec::new();
+    let mut unreadable = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        match std::fs::read_dir(entry.path().join("fd")) {
+            Ok(fds) => {
+                let holds = fds.flatten().any(|fd| {
+                    std::fs::read_link(fd.path())
+                        .is_ok_and(|target| links.iter().any(|l| target.as_os_str() == l.as_str()))
+                });
+                if holds {
+                    owners.push(pid);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // `status` stays readable when `fd` is not: its first `Uid:` field is the real uid.
+                let status = std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+                let mine = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Uid:"))
+                    .and_then(|ids| ids.split_whitespace().next())
+                    .is_some_and(|real| real == uid);
+                if mine {
+                    let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                    unreadable.push(format!("{pid} ({})", name.trim()));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    (owners, unreadable)
+}
+
+/// The compositor GTK connected to has only headless outputs (wlroots' `HEADLESS-<n>`, what every
+/// sandbox harness here runs): no real screen, and no window on one. Checked right after
+/// `gtk4::init()`, before any surface exists. A desktop -- or a compositor nested in one, whose
+/// output (`WL-<n>`, `X11-<n>`) is a window on the owner's screen -- is refused whatever its socket's
+/// path, which the checks in `sandbox_wayland_socket` cannot establish on their own.
+fn require_headless_outputs() -> Result<Vec<String>, String> {
+    let display = gtk4::gdk::Display::default().ok_or("GTK has no default display")?;
+    let monitors = display.monitors();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let connectors = loop {
+        let connectors: Vec<Option<String>> = (0..monitors.n_items())
+            .filter_map(|i| monitors.item(i).and_downcast::<gtk4::gdk::Monitor>())
+            .map(|monitor| monitor.connector().map(|c| c.to_string()))
+            .collect();
+        if (!connectors.is_empty() && connectors.iter().all(Option::is_some)) || Instant::now() > deadline {
+            break connectors;
+        }
+        glib::MainContext::default().iteration(false);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let names: Vec<String> = connectors
+        .into_iter()
+        .map(|c| c.unwrap_or_else(|| "<unnamed>".into()))
+        .collect();
+    if !names.is_empty() && names.iter().all(|name| name.starts_with("HEADLESS-")) {
+        Ok(names)
+    } else {
+        Err(format!(
+            "the compositor's outputs are {names:?}, not only headless ones -- a real screen, or a window on one"
+        ))
+    }
+}
+
+/// Set on a copy of this binary that plays a compositor for [`refusal_chain_self_test`]: the socket
+/// path it listens on. [`FAKE_WLROOTS`] names a library it maps without running any of it, and
+/// [`FAKE_UNDUMPABLE`] makes it non-dumpable, as a sway with file capabilities is.
+const FAKE_COMPOSITOR: &str = "CURSOR_ANIMATION_FAKE_COMPOSITOR";
+const FAKE_WLROOTS: &str = "CURSOR_ANIMATION_FAKE_WLROOTS";
+const FAKE_UNDUMPABLE: &str = "CURSOR_ANIMATION_FAKE_UNDUMPABLE";
+
+/// A fake compositor: listens on `socket`, says so on stdout, and exits once its stdin closes (when
+/// the self-test is done with it, or has died).
+fn fake_compositor(socket: &Path) -> ! {
+    use std::io::{Read, Write};
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap_or_else(|e| {
+        eprintln!("fake compositor: cannot listen on {}: {e}", socket.display());
+        std::process::exit(1)
+    });
+    if let Some(library) = std::env::var_os(FAKE_WLROOTS) {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(&library).expect("the library to map");
+        // SAFETY: a private, read-only mapping of an open file; nothing ever reads it.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED, "mapping {library:?}");
+    }
+    if std::env::var_os(FAKE_UNDUMPABLE).is_some() {
+        // SAFETY: `prctl` with constant arguments.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+    }
+    println!("listening");
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stdin().read(&mut [0u8; 1]);
+    drop(listener);
+    std::process::exit(0)
+}
+
+/// A `libwlroots` shared library on this machine, if there is one: what a real wlroots compositor maps.
+fn find_libwlroots() -> Option<PathBuf> {
+    [
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/local/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+    ]
+    .iter()
+    .filter_map(|dir| std::fs::read_dir(dir).ok())
+    .flat_map(|entries| entries.flatten())
+    .map(|entry| entry.path())
+    .find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("libwlroots") && name.contains(".so"))
+    })
+}
+
+/// `require_headless_compositor` against fake compositors -- copies of this binary that only listen
+/// on a socket, so no display is opened -- run by every plain `cargo test` (fix round 3, 2026-09-29).
+/// Until then this refusal chain's only evidence was scratch scripts outside the repository, and
+/// deleting a check changed nothing that ran. Each case is one way a compositor that is not a headless
+/// wlroots one could pass, and a positive control shows the check can pass at all.
+///
+/// **A case this machine cannot construct is skipped, with a note, not failed (fix round 4, 2026-09-29):**
+/// the chain is a property of `require_headless_compositor`, and two environments cannot exercise it
+/// without changing what it is. Without `NETLINK_SOCK_DIAG` (a container's seccomp filter, a kernel
+/// without `CONFIG_UNIX_DIAG`) it refuses every socket -- correctly: it fails closed -- so no case can be
+/// told from another. As root, or with `CAP_SYS_PTRACE` (a user namespace's root has it there), it can read
+/// a non-dumpable process, so "a holder it cannot read" does not exist. Neither skip relaxes the check
+/// itself, and a dump that answers wrongly -- empty, or without the listener this test just bound -- is a
+/// failure, not a skip.
+fn refusal_chain_self_test() {
+    use std::io::BufRead;
+    use std::process::{Child, Stdio};
+    let dir = std::env::temp_dir().join(format!("cursor-animation-refusals-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory for the fake compositors' sockets");
+    // Can the kernel be asked who listens on a socket file at all? Ask about a listener made just now.
+    let probe = dir.join("probe");
+    let probe_listener = std::os::unix::net::UnixListener::bind(&probe).expect("a listener to look for");
+    let probe_file = kernel_file_id(&std::fs::metadata(&probe).expect("the probe's socket file"));
+    let listed = unix_listeners_by_file();
+    if let Err(why) = &listed {
+        // What the skip rests on, held rather than assumed: with no way to look a listener up, the check
+        // refuses the socket, and never accepts it.
+        let verdict = require_headless_compositor(&probe);
+        drop(probe_listener);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            verdict.is_err(),
+            "`require_headless_compositor` accepted a socket it could not look up: {verdict:?}"
+        );
+        println!(
+            "cursor_animation: refusal chain: skipped, no case can be constructed: NETLINK_SOCK_DIAG is \
+             unavailable here ({why}). `require_headless_compositor` refuses every socket without it (it \
+             fails closed), so one case cannot be told from another here"
+        );
+        return;
+    }
+    // A dump that answers, but does not list a listener this test just bound (or lists nothing at all), is
+    // not an environment that lacks the interface: it is a defect -- in the parser, in `kernel_file_id`, or
+    // in the kernel's answer -- and skipping it would hide the very thing the chain below stands on.
+    let listed = listed.unwrap_or_default();
+    let missing = !listed.iter().any(|&(_, dev, ino)| (dev, ino) == probe_file);
+    drop(probe_listener);
+    if missing {
+        let _ = std::fs::remove_dir_all(&dir);
+        panic!(
+            "NETLINK_SOCK_DIAG answers ({} listeners) but not with the socket this test just bound at {}: \
+             `unix_listeners_by_file` or `kernel_file_id` is wrong for this kernel",
+            listed.len(),
+            probe.display()
+        );
+    }
+    let wlroots = find_libwlroots();
+    let mut fakes: Vec<Child> = Vec::new();
+    let mut start = |name: &str, backends: Option<&str>, maps_wlroots: bool, undumpable: bool| -> (PathBuf, u32) {
+        let socket = dir.join(name);
+        let mut command = Command::new(std::env::current_exe().expect("this test's own binary"));
+        command
+            .env(FAKE_COMPOSITOR, &socket)
+            .env_remove("WLR_BACKENDS")
+            .env_remove(FAKE_WLROOTS);
+        command
+            .env_remove(FAKE_UNDUMPABLE)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(backends) = backends {
+            command.env("WLR_BACKENDS", backends);
+        }
+        if let (true, Some(library)) = (maps_wlroots, &wlroots) {
+            command.env(FAKE_WLROOTS, library);
+        }
+        if undumpable {
+            command.env(FAKE_UNDUMPABLE, "1");
+        }
+        let mut child = command.spawn().expect("starting a fake compositor");
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line);
+        assert_eq!(line.trim(), "listening", "the fake compositor {name} did not start");
+        let pid = child.id();
+        fakes.push(child);
+        (socket, pid)
+    };
+    let mut failures = Vec::new();
+    let mut expect_refusal = |case: &str, socket: &Path, naming: &str| match require_headless_compositor(socket) {
+        Err(e) if e.contains(naming) => println!("cursor_animation: refusal chain: {case}: refused ({e})"),
+        other => failures.push(format!("{case}: expected a refusal naming {naming:?}, got {other:?}")),
+    };
+
+    // WLR_BACKENDS says a nested or real backend.
+    let (socket, _) = start("nested", Some("wayland"), true, false);
+    expect_refusal("WLR_BACKENDS=wayland", &socket, "WLR_BACKENDS=Some(\"wayland\")");
+    // No WLR_BACKENDS at all: a desktop's compositor.
+    let (socket, _) = start("desktop", None, true, false);
+    expect_refusal("no WLR_BACKENDS", &socket, "WLR_BACKENDS=None");
+    // Codex's (b): WLR_BACKENDS=headless inherited by a compositor that is not wlroots.
+    let (socket, pid) = start("not-wlroots", Some("headless"), false, false);
+    expect_refusal(
+        "headless, not wlroots",
+        &socket,
+        &format!("(pid {pid}) was started with WLR_BACKENDS=headless but maps no libwlroots"),
+    );
+    // Codex's (a): the name a headless listener was bound under now leads to a different socket
+    // (renamed here; a bind mount or another mount namespace does the same). `/proc/net/unix` still
+    // prints the headless one's path, so round 2's check approved it; the file is the other's.
+    let (headless, _) = start("renamed", Some("headless"), true, false);
+    let (other, other_pid) = start("impostor", None, true, false);
+    std::fs::rename(&headless, dir.join("renamed.moved")).expect("moving the headless socket away");
+    std::fs::rename(&other, &headless).expect("putting the other socket in its place");
+    expect_refusal(
+        "a re-pointed name",
+        &headless,
+        &format!("(pid {other_pid}) was started with WLR_BACKENDS=None"),
+    );
+    // A socket file nothing listens on any more.
+    let orphan = dir.join("orphan");
+    drop(std::os::unix::net::UnixListener::bind(&orphan).expect("a listener to close"));
+    expect_refusal(
+        "nobody listening",
+        &orphan,
+        "no listener in this network namespace is bound to",
+    );
+    // A holder this test cannot read (sway started outside a user namespace, with its capability).
+    let (socket, pid) = start("undumpable", Some("headless"), true, true);
+    if std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok() {
+        println!(
+            "cursor_animation: refusal chain: not dumpable: skipped, this process can read a non-dumpable \
+             one's /proc/{pid}/fd (root, or CAP_SYS_PTRACE), so a holder it cannot read cannot be constructed here"
+        );
+    } else {
+        expect_refusal(
+            "not dumpable",
+            &socket,
+            "could not be read, so whether one is its compositor",
+        );
+        expect_refusal("not dumpable, named", &socket, &format!("{pid} ("));
+    }
+    // The positive control: a check that cannot pass proves nothing.
+    match &wlroots {
+        Some(library) => {
+            let (socket, pid) = start("headless", Some("headless"), true, false);
+            match require_headless_compositor(&socket) {
+                Ok(found) if found == pid => {
+                    println!(
+                        "cursor_animation: refusal chain: headless and mapping {}: accepted",
+                        library.display()
+                    )
+                }
+                other => failures.push(format!(
+                    "a headless wlroots fake (pid {pid}): expected Ok({pid}), got {other:?}"
+                )),
+            }
+        }
+        None => {
+            println!("cursor_animation: refusal chain: no libwlroots on this machine; the positive control is skipped")
+        }
+    }
+
+    for mut fake in fakes {
+        drop(fake.stdin.take());
+        let _ = fake.wait();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "the refusal chain:\n{}", failures.join("\n"));
+    println!("cursor_animation: refusal chain: all cases held");
+}
+
+/// [`parse_unix_diag_reply`] on synthetic replies -- no socket, so it runs anywhere -- for the ways a dump
+/// can fail or lie that the kernel's real one never shows this test (fix round 4, 2026-09-29): a `NLMSG_DONE`
+/// that carries an error, a dump flagged inconsistent, an attribute that does not add up. Each must be an
+/// error: a parser that returned what it had found so far would leave the caller judging a compositor by
+/// half a list.
+fn netlink_parser_self_test() {
+    use diag::*;
+    /// A netlink message (`struct nlmsghdr`, then `payload`), padded to four bytes.
+    fn message(ty: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&((HEADER + payload.len()) as u32).to_ne_bytes());
+        m.extend_from_slice(&ty.to_ne_bytes());
+        m.extend_from_slice(&flags.to_ne_bytes());
+        m.extend_from_slice(&1u32.to_ne_bytes());
+        m.extend_from_slice(&0u32.to_ne_bytes());
+        m.extend_from_slice(payload);
+        m.resize(m.len().next_multiple_of(4), 0);
+        m
+    }
+    /// One attribute (`struct nlattr`, then `payload`), padded to four bytes.
+    fn attribute(ty: u16, payload: &[u8]) -> Vec<u8> {
+        let mut a = Vec::new();
+        a.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+        a.extend_from_slice(&ty.to_ne_bytes());
+        a.extend_from_slice(payload);
+        a.resize(a.len().next_multiple_of(4), 0);
+        a
+    }
+    /// A `struct unix_diag_msg` for a socket in `state` with inode `socket`, then `attributes`, as a message.
+    fn diag_message(state: u8, socket: u32, attributes: &[u8], flags: u16) -> Vec<u8> {
+        let mut payload = vec![libc::AF_UNIX as u8, 0, state, 0];
+        payload.extend_from_slice(&socket.to_ne_bytes());
+        payload.extend_from_slice(&[0; 8]); // udiag_cookie
+        payload.extend_from_slice(attributes);
+        message(SOCK_DIAG_BY_FAMILY, flags, &payload)
+    }
+    let vfs = |ino: u32, dev: u32| attribute(UNIX_DIAG_VFS, &[ino.to_ne_bytes(), dev.to_ne_bytes()].concat());
+    let listener = |socket: u32, attributes: &[u8]| diag_message(TCP_LISTEN, socket, attributes, NLM_F_MULTI);
+    let done = |status: i32| message(NLMSG_DONE, NLM_F_MULTI, &status.to_ne_bytes());
+    let raw_attribute = |len: u16, ty: u16| [len.to_ne_bytes(), ty.to_ne_bytes()].concat();
+
+    #[derive(Debug)]
+    enum Want {
+        Done(Vec<(u32, u32, u32)>),
+        More(Vec<(u32, u32, u32)>),
+        Error(&'static str),
+    }
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    let mut check = |name: &str, parts: &[Vec<u8>], want: Want| {
+        cases += 1;
+        let mut found = Vec::new();
+        let got = parse_unix_diag_reply(&parts.concat(), &mut found);
+        let held = match (&want, &got) {
+            (Want::Done(list), Ok(true)) | (Want::More(list), Ok(false)) => &found == list,
+            (Want::Error(needle), Err(e)) => e.contains(needle),
+            _ => false,
+        };
+        if !held {
+            failures.push(format!("  {name}: wanted {want:?}, got {got:?} with {found:?}"));
+        }
+    };
+
+    // What a good dump looks like, so the builders are known to build one.
+    check(
+        "a listener, then the end",
+        &[listener(7, &vfs(100, 200)), done(0)],
+        Want::Done(vec![(7, 200, 100)]),
+    );
+    check(
+        "a listener, no end yet",
+        &[listener(7, &vfs(100, 200))],
+        Want::More(vec![(7, 200, 100)]),
+    );
+    check(
+        "the file attribute after another, padded one",
+        &[listener(7, &[attribute(2, b"/x\0"), vfs(100, 200)].concat()), done(0)],
+        Want::Done(vec![(7, 200, 100)]),
+    );
+    check(
+        "a listener with no file (abstract)",
+        &[listener(8, &[]), done(0)],
+        Want::Done(vec![]),
+    );
+    check(
+        "a socket that is not listening",
+        &[diag_message(1, 9, &vfs(1, 2), NLM_F_MULTI), done(0)],
+        Want::Done(vec![]),
+    );
+    check(
+        "a no-op message",
+        &[message(NLMSG_NOOP, 0, &[]), done(0)],
+        Want::Done(vec![]),
+    );
+
+    // A dump that failed: the listeners found before the failure are not a list.
+    check(
+        "done carrying ENOMEM after a listener (Codex)",
+        &[listener(7, &vfs(100, 200)), done(-12)],
+        Want::Error("dump failed"),
+    );
+    check("done carrying EIO alone", &[done(-5)], Want::Error("dump failed"));
+    check(
+        "an error message",
+        &[message(
+            NLMSG_ERROR,
+            0,
+            &[(-13i32).to_ne_bytes().to_vec(), vec![0; 16]].concat(),
+        )],
+        Want::Error("Permission denied"),
+    );
+    check(
+        "an overrun",
+        &[listener(7, &vfs(100, 200)), message(NLMSG_OVERRUN, 0, &[])],
+        Want::Error("overrun"),
+    );
+    // A dump that changed underneath it.
+    check(
+        "a listener flagged NLM_F_DUMP_INTR (Codex)",
+        &[
+            diag_message(TCP_LISTEN, 7, &vfs(100, 200), NLM_F_MULTI | NLM_F_DUMP_INTR),
+            done(0),
+        ],
+        Want::Error("interrupted"),
+    );
+    check(
+        "a done flagged NLM_F_DUMP_INTR",
+        &[
+            listener(7, &vfs(100, 200)),
+            message(NLMSG_DONE, NLM_F_MULTI | NLM_F_DUMP_INTR, &0i32.to_ne_bytes()),
+        ],
+        Want::Error("interrupted"),
+    );
+    // A reply that does not add up: the whole parse fails, not just the loop it was in.
+    check(
+        "an attribute shorter than its own header, after a good one (Codex)",
+        &[listener(7, &[vfs(100, 200), raw_attribute(2, 99)].concat()), done(0)],
+        Want::Error("malformed attribute"),
+    );
+    check(
+        "two stray bytes after the last attribute",
+        &[listener(7, &[vfs(100, 200), vec![1, 2]].concat()), done(0)],
+        Want::Error("malformed attribute"),
+    );
+    check(
+        "an attribute longer than its message",
+        &[listener(7, &[vfs(100, 200), raw_attribute(40, 99)].concat()), done(0)],
+        Want::Error("malformed attribute"),
+    );
+    check(
+        "a file attribute too short to hold a file",
+        &[listener(7, &attribute(UNIX_DIAG_VFS, &[0; 4])), done(0)],
+        Want::Error("UNIX_DIAG_VFS"),
+    );
+    check(
+        "a message shorter than a unix_diag_msg",
+        &[message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, &[0; 8]), done(0)],
+        Want::Error("shorter"),
+    );
+    check(
+        "a message of a type no dump sends",
+        &[message(99, 0, &[0; 16]), done(0)],
+        Want::Error("unexpected message type"),
+    );
+    check(
+        "stray bytes after the last message",
+        &[listener(7, &vfs(100, 200)), vec![1, 2, 3]],
+        Want::Error("stray"),
+    );
+    check(
+        "a message longer than the datagram",
+        &[{
+            let mut m = listener(7, &vfs(100, 200));
+            m[..4].copy_from_slice(&500u32.to_ne_bytes());
+            m
+        }],
+        Want::Error("malformed reply"),
+    );
+
+    assert!(
+        failures.is_empty(),
+        "the NETLINK_SOCK_DIAG reply parser, {} of {cases} cases:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    println!("cursor_animation: netlink parser: {cases} cases held");
+}
+
 fn main() {
+    if let Some(socket) = std::env::var_os(FAKE_COMPOSITOR) {
+        fake_compositor(Path::new(&socket));
+    }
+    // The refusal chain below, held against fake compositors first -- on every run, `--ignored` or
+    // not, so a plain `cargo test` fails if a check stops refusing (fix round 3, 2026-09-29).
+    refusal_chain_self_test();
+    netlink_parser_self_test();
     if !std::env::args().any(|arg| arg == "--ignored") {
         println!("cursor_animation: skipped (requires an isolated GUI sandbox; pass --ignored)");
         return;
@@ -958,7 +1883,59 @@ fn main() {
     if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
         println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
     }
+    // No session bus, as every guarded test runs (`own_x_server::cut_session_bus`, fix round 3): a
+    // bare run on the desktop's own bus would ask it for the accessibility bus and D-Bus-activate the
+    // portal and GVfs services, which then run with the owner's real `HOME`.
+    own_x_server::cut_session_bus("cursor_animation");
+    let sandbox_socket = match sandbox_wayland_socket() {
+        Ok(socket) => {
+            println!("cursor_animation: sandbox Wayland display {}", socket.display());
+            socket
+        }
+        Err(e) => {
+            eprintln!("cursor_animation: refusing to open a window: {e}");
+            std::process::exit(1);
+        }
+    };
+    match require_headless_compositor(&sandbox_socket) {
+        Ok(pid) => println!("cursor_animation: compositor pid {pid}, started headless"),
+        Err(e) => {
+            eprintln!("cursor_animation: refusing to connect: {e}");
+            std::process::exit(1);
+        }
+    }
+    // Before GTK initialises, while no other thread reads the environment: nothing left to fall back
+    // to but the checked Wayland socket (no X server, XWayland's included), named by the absolute
+    // path that was checked, so libwayland cannot resolve the name to anything else.
+    // `WAYLAND_SOCKET` (an inherited, already-connected fd) would win over `WAYLAND_DISPLAY` in
+    // libwayland; a compositor sets it for a client it spawns, so it may name the desktop's.
+    std::env::set_var("WAYLAND_DISPLAY", &sandbox_socket);
+    std::env::remove_var("WAYLAND_SOCKET");
+    std::env::remove_var("DISPLAY");
+    std::env::set_var("GDK_BACKEND", "wayland");
+    // GTK's own input method, as `own_x_server::isolate` sets: an inherited `GTK_IM_MODULE=fcitx`
+    // makes the pane's input context reach for fcitx5 over the session bus the moment it takes focus
+    // (seen 2026-09-29 on a private bus: `GetNameOwner("org.fcitx.Fcitx5")` and a `NameOwnerChanged`
+    // match for it). On the desktop's bus that is the owner's live fcitx5, and this test's focus-in
+    // would reach it.
+    for var in ["GTK_IM_MODULE", "XMODIFIERS"] {
+        if let Some(inherited) = std::env::var_os(var) {
+            println!(
+                "cursor_animation: ignoring the inherited {var}={}; GTK's own input method",
+                inherited.to_string_lossy()
+            );
+        }
+    }
+    std::env::set_var("GTK_IM_MODULE", "gtk-im-context-simple");
+    std::env::remove_var("XMODIFIERS");
     gtk4::init().expect("GTK initialization requires the isolated sandbox display");
+    match require_headless_outputs() {
+        Ok(outputs) => println!("cursor_animation: headless outputs {outputs:?}"),
+        Err(e) => {
+            eprintln!("cursor_animation: refusing to open a window: {e}");
+            std::process::exit(1);
+        }
+    }
     let scratch = PathBuf::from(format!("/tmp/neovibe-cursor-animation-{}", std::process::id()));
     std::fs::create_dir(&scratch).expect("create unique test scratch directory");
     let socket = scratch.join("nvim.sock");

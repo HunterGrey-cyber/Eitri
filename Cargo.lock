@@ -4014,6 +4014,7 @@ dependencies = [
  "alacritty_terminal",
  "futures-channel",
  "gtk4",
+ "libc",
  "libloading 0.9.0",
  "mlua",
  "neovibe-core",

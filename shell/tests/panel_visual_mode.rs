@@ -17,7 +17,10 @@
 //! points `DISPLAY` at it before GTK initialises (any inherited `DISPLAY`/`WAYLAND_DISPLAY` is
 //! dropped, never used), checks GDK really opened that display, passes it explicitly to every
 //! `xdotool` it runs, and stops the server by the pid it captured. `xvfb-run` is not needed, and
-//! running under it changes nothing (its display is ignored too).
+//! running under it changes nothing (its display is ignored too). **Since 2026-09-29 that server is
+//! the shared one, `support/own_x_server.rs`**, which every other display-opening test here uses
+//! too; this file's own copy lacked `-nolisten unix` and, run from a shell with a network namespace
+//! of its own, could unlink the desktop's `/tmp/.X11-unix/X0` (that file's header has the story).
 //!
 //! **No window manager runs on that server**, so nothing here uses `xdotool windowactivate` (fix
 //! round 2, reviewer finding): libxdo aborts activation when `_NET_ACTIVE_WINDOW` is unsupported,
@@ -132,9 +135,8 @@
 //!   budget runs out.
 
 use std::cell::{Cell, RefCell};
-use std::io::BufRead;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -152,6 +154,10 @@ use neovibe_core::theme::ThemeTokens;
 use serde_json::json;
 use webkit6::prelude::*;
 use webkit6::{UserContentManager, WebView};
+
+// The display this test runs on: its own Xvfb, never an inherited one (shared since 2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 /// `shell/src/agent_panel.rs`'s own private `const PANEL_BASE_URI`, duplicated (review finding 6):
 /// this crate has no `[lib]` target an integration test can reach a private item through, the same
@@ -244,86 +250,8 @@ fn long_markdown() -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The X server this file owns, and the only one it will talk to.
+// The X server this file owns, and the only one it will talk to: `support/own_x_server.rs`.
 // ---------------------------------------------------------------------------------------------
-
-/// An `Xvfb` this process started, stopped by the pid captured at spawn -- never found by name.
-struct OwnXServer {
-    child: Option<Child>,
-    display: String,
-}
-
-impl OwnXServer {
-    /// `Xvfb -displayfd 1`: the server picks a free display number itself and writes it to its own
-    /// stdout once it accepts connections, so there is no race on a guessed number and no wait on a
-    /// socket appearing.
-    fn start() -> Result<Self, String> {
-        let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("panel_visual_mode-xvfb-{}.log", std::process::id()));
-        let stderr = std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
-        let mut child = Command::new("Xvfb")
-            .args([
-                "-displayfd",
-                "1",
-                "-nolisten",
-                "tcp",
-                "-noreset",
-                "-screen",
-                "0",
-                "1280x900x24",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|e| format!("`Xvfb` could not be started ({e}) -- install xorg-server-xvfb"))?;
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
-            let _ = tx.send(line);
-        });
-        let mut server = OwnXServer {
-            child: Some(child),
-            display: String::new(),
-        };
-        match rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(line) if line.trim().parse::<u32>().is_ok() => {
-                server.display = format!(":{}", line.trim());
-                Ok(server)
-            }
-            Ok(line) => Err(format!(
-                "Xvfb wrote {line:?} instead of a display number (log: {})",
-                log.display()
-            )),
-            Err(_) => Err(format!("Xvfb reported no display within 15 s (log: {})", log.display())),
-        }
-        // On either error `server` drops here, which stops the child.
-    }
-
-    /// SIGTERM by the captured pid (so Xvfb removes its own lock file and socket), then SIGKILL if
-    /// it has not exited within 3 s. Idempotent.
-    fn stop(&mut self) {
-        let Some(mut child) = self.child.take() else { return };
-        let _ = Command::new("kill").args(["-TERM", &child.id().to_string()]).status();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-impl Drop for OwnXServer {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
 
 /// Runs `xdotool` against `display` -- always passed explicitly, never inherited -- and returns its
 /// stdout, or its stderr as the error on a non-zero exit.
@@ -1936,6 +1864,8 @@ fn num(v: &serde_json::Value, k: &str) -> f64 {
 /// the caret, and says so. A `j` with room below moves nothing and says nothing; `40j` leaves the
 /// caret's line at the list's bottom edge (least, not centred) and is announced; `gg` scrolls back up
 /// and is announced as `up` (following stops, as BROWSE's own `k` stops it).
+// `!(a > b)` on purpose: a missing field reads as NaN, and a NaN must fail the check too.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn w11_caret_view(h: &Harness) -> Result<(), String> {
     h.xdotool_keys(&["g", "g", "5", "j", "v"]);
     if h.mode()?.as_str() != Some("caret") {
@@ -1966,7 +1896,7 @@ fn w11_caret_view(h: &Harness) -> Result<(), String> {
     if after_j
         .get("said")
         .and_then(|s| s.as_array())
-        .map_or(true, |a| !a.is_empty())
+        .is_none_or(|a| !a.is_empty())
     {
         return Err(format!(
             "W11 view: a j that moved nothing announced a scroll: {after_j}"
@@ -1986,7 +1916,7 @@ fn w11_caret_view(h: &Harness) -> Result<(), String> {
     if after_40
         .get("said")
         .and_then(|s| s.as_array())
-        .map_or(true, |a| a.is_empty())
+        .is_none_or(|a| a.is_empty())
     {
         return Err(format!(
             "W11 view: 40j scrolled the list but announced nothing (follow.ts never learns): {after_40}"
@@ -2333,61 +2263,32 @@ fn main() {
         println!("panel_visual_mode: ignored (drives a real WebKitGTK WebView); run with `-- --ignored`");
         return;
     }
+    // Spec §3: the harness refuses a DISPLAY it did not start -- so it starts one, and nothing below
+    // ever reads the inherited one. GTK's own built-in input method, never the one the desktop session
+    // names (fix round 2): an inherited `GTK_IM_MODULE=fcitx` routed every key of this window through
+    // the owner's live fcitx5 daemon over the session bus -- asynchronously, so a `/` search's `Return`
+    // still sat in flight when the next key arrived (W6/W7 failed intermittently, about one run in
+    // three, with the search prompt still open and the following `v` typed into it), and with the
+    // owner's rime switched on a letter would have been composed, not typed. The IME half is the GUI
+    // pass's. `init_gtk` sets both, and refuses unless GDK opened this server's display.
+    let server = own_x_server::init_gtk("panel_visual_mode", "1280x900x24");
+    // After `init_gtk`, not before (fix round 3, 2026-09-29): the probe then inherits this test's own
+    // display and no other. Today's `xdotool version` connects to nothing, but a release that opens its
+    // display before reading the subcommand would otherwise have reached the session's.
     if Command::new("xdotool").arg("version").output().is_err() {
         eprintln!("panel_visual_mode: `xdotool` is not on PATH -- install it (this test sends every key through it)");
-        std::process::exit(1);
+        server.exit(1);
     }
-    // Spec §3: the harness refuses a DISPLAY it did not start -- so it starts one, and nothing below
-    // ever reads the inherited one.
-    let mut server = match OwnXServer::start() {
-        Ok(server) => server,
-        Err(e) => {
-            eprintln!("panel_visual_mode: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Ok(inherited) = std::env::var("DISPLAY") {
-        println!(
-            "panel_visual_mode: ignoring the inherited DISPLAY={inherited}; using its own Xvfb {}",
-            server.display
-        );
-    }
-    // Before GTK initialises, while this thread is the only one reading the environment (the Xvfb
-    // reader thread has already delivered and exited).
-    std::env::set_var("DISPLAY", &server.display);
-    std::env::set_var("GDK_BACKEND", "x11");
-    std::env::remove_var("WAYLAND_DISPLAY");
-    // Fix round 2: GTK's own built-in input method, never the one the desktop session names. An
-    // inherited `GTK_IM_MODULE=fcitx` routed every key of this window through the owner's live
-    // fcitx5 daemon over the session bus -- asynchronously, so a `/` search's `Return` still sat in
-    // flight when the next key arrived (W6/W7 failed intermittently, about one run in three, with
-    // the search prompt still open and the following `v` typed into it), and with the owner's rime
-    // switched on a letter would have been composed, not typed. The IME half is the GUI pass's.
-    std::env::set_var("GTK_IM_MODULE", "gtk-im-context-simple");
-    std::env::remove_var("XMODIFIERS");
 
-    let code = run(&server.display);
+    let code = run(server.display());
     // Every window is destroyed by now and nothing iterates the main loop after this point, so GDK
     // never reads its dropped X connection (its I/O error handler would exit with its own status).
     // Closing the GdkDisplay first was the alternative, and was not taken: WebKit may still hold
     // display-bound resources at this point, and a crash in teardown would read as a failed run.
-    server.stop();
-    std::process::exit(code);
+    server.exit(code);
 }
 
 fn run(own_display: &str) -> i32 {
-    if let Err(e) = gtk4::init() {
-        eprintln!("panel_visual_mode: GTK could not initialise on {own_display} ({e})");
-        return 1;
-    }
-    match gtk4::gdk::Display::default().map(|d| d.name().to_string()) {
-        Some(name) if name == own_display => {}
-        other => {
-            eprintln!("panel_visual_mode: GDK opened {other:?}, not this harness's own Xvfb {own_display} -- refusing");
-            return 1;
-        }
-    }
-
     let mut failed: Vec<String> = Vec::new();
     for zoom in [1.0, 1.5] {
         for (label, result) in run_zoom(zoom, own_display) {

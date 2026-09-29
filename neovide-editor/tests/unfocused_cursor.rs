@@ -5,10 +5,14 @@
 //! that differ from nvim's own `Normal` background. The cursor sits on an empty buffer's first
 //! cell, so with no cursor drawn every pixel of that cell is exactly the background.
 //!
-//! Ignored unless asked for, because it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to
-//! the session's Wayland/X11 display for the clipboard (no window is created). It is a plain `main`
+//! Ignored unless asked for, because it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to a
+//! display for the clipboard (no window is created) -- **each case's own `Xvfb`** since 2026-09-29
+//! (`shell/tests/support/own_x_server.rs`), started in the case's child process and pointed to
+//! before winit connects, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took
+//! the session's Wayland/X11 display, the desktop's from any agent shell. It is a plain `main`
 //! (`harness = false`) that re-executes itself once per case, because winit allows one `EventLoop`
-//! per process, on the main thread only. Run with:
+//! per process, on the main thread only; the parent connects to no display. Run with, and no
+//! wrapper is needed:
 //!
 //!     cargo test -p neovide-editor --test unfocused_cursor -- --ignored
 use std::time::{Duration, Instant};
@@ -18,6 +22,11 @@ use neovide::{
     units::{GridSize, PixelRect},
 };
 use skia_safe::{surfaces, Color, Surface};
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29). The one helper
+// every display-connecting test in the workspace shares, so it lives with `shell`'s.
+#[path = "../../shell/tests/support/own_x_server.rs"]
+mod own_x_server;
 
 const CANVAS: (i32, i32) = (640, 320);
 const FRAME_DT: f32 = 1.0 / 60.0;
@@ -222,6 +231,17 @@ fn cases() -> Vec<Case> {
 
 fn main() {
     if let Ok(spec) = std::env::var(CASE_ENV) {
+        // As `shell`'s own `main` and `cursor_animation` do (fix round 3, 2026-09-29): a pipe or socket
+        // on stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer
+        // and blocks it at startup (`neovide_editor::stdin`). The cases this binary starts get
+        // `/dev/null` from `Command::output`; this is for one started by hand.
+        if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+            println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
+        }
+        // The case's own Xvfb, before its `LiveHarness` connects to anything; a copy of this binary
+        // started with `CASE_ENV` by hand gets one too. Dropped, and stopped, when the case returns
+        // or its assertions unwind.
+        let _server = own_x_server::isolate("unfocused_cursor", "640x480x24");
         let mut lines = spec.split('\n');
         let scale: f64 = lines.next().unwrap().parse().unwrap();
         let insert: bool = lines.next().unwrap().parse().unwrap();

@@ -10,18 +10,22 @@
 //! one -- a top bar of the real height with the prefix strip in it, over an overlay -- and reads
 //! where the label was really allocated.
 //!
-//! Needs a display, and never the real desktop: run it under its own X server, with GTK told to use
-//! it rather than a Wayland session the shell may have exported --
+//! Needs a display, and never the real desktop: **it starts its own** (2026-09-29,
+//! `support/own_x_server.rs`) -- an `Xvfb` with a 1024x768 screen, pointed to before GTK
+//! initialises, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped --
 //!
-//!     xvfb-run -a -s "-nolisten tcp -screen 0 1024x768x24" env GDK_BACKEND=x11 \
-//!         cargo test -p shell --test close_prompt_placement -- --ignored
+//!     cargo test -p shell --test close_prompt_placement -- --ignored
 //!
-//! A plain `main` (`harness = false`), because GTK must own the main thread; it refuses to start
-//! unless `GDK_BACKEND=x11`. About 1s.
+//! A plain `main` (`harness = false`), because GTK must own the main thread. It used to refuse only a
+//! missing `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on a desktop session satisfies. About 1s.
 
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 // `close_prompt.rs` reads `crate::toast::TOAST_MARGIN`: the real module, so Immersive's corner is
 // the product's own.
@@ -117,18 +121,8 @@ fn main() {
         println!("close_prompt_placement: ignored (drives real GTK on a display); run with `-- --ignored`");
         return;
     }
-    if std::env::var("GDK_BACKEND").as_deref() != Ok("x11") {
-        eprintln!("close_prompt_placement: refusing to open windows without GDK_BACKEND=x11 -- run it under its own X server:");
-        eprintln!(
-            "    xvfb-run -a -s \"-nolisten tcp -screen 0 1024x768x24\" env GDK_BACKEND=x11 \
-             cargo test -p shell --test close_prompt_placement -- --ignored"
-        );
-        std::process::exit(1);
-    }
-    if let Err(e) = gtk4::init() {
-        eprintln!("close_prompt_placement: GTK could not initialise ({e}); it needs an X server of its own");
-        std::process::exit(1);
-    }
+    // Its own Xvfb, GTK initialised on it and checked to be on it -- never an inherited display.
+    let server = own_x_server::init_gtk("close_prompt_placement", "1024x768x24");
     match prompt_box() {
         Ok((top, bottom)) if top >= 0.0 && bottom <= BAR_HEIGHT as f32 && bottom - top > 4.0 => {
             println!("close_prompt_placement: ok (label {top}..{bottom} inside a {BAR_HEIGHT}px bar)");
@@ -137,11 +131,11 @@ fn main() {
             eprintln!(
                 "close_prompt_placement: FAILED: the prompt spans {top}..{bottom}, not inside the {BAR_HEIGHT}px bar"
             );
-            std::process::exit(1);
+            server.exit(1);
         }
         Err(e) => {
             eprintln!("close_prompt_placement: FAILED: {e}");
-            std::process::exit(1);
+            server.exit(1);
         }
     }
 }

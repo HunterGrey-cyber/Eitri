@@ -62,6 +62,10 @@ neovibe-core = { path = "../core", features = ["test-support"] }
 # already resolved this exact commit for that crate, so this adds no second build, only visibility
 # from this crate's own test code.
 neovide = { path = "../neovide" }
+# Only for `tests/support/own_x_server.rs` (2026-09-29): `prctl(PR_SET_PDEATHSIG)` on the `Xvfb` a
+# display-opening test starts, and `kill` by its captured pid. The version `neovide-editor` already
+# depends on directly, so this adds no crate to the graph and ships in no binary.
+libc = "0.2"
 
 # Guards the GTK 4.14 / WebKit 2.40 toolkit floor (spec 2026-09-27-v1-dist-design.md §2.2, plan
 # Task 2): a plain #[test] harness (unlike the three below), added explicitly so its presence in
@@ -74,31 +78,40 @@ name = "toolkit_floor"
 [[test]]
 name = "web_bundle_freshness"
 
+# Guards the rule that every test opening a display starts its own (fix round 3 of GUI tests' own
+# display, 2026-09-29): reads `tests/` here and in `neovide-editor` as text, and fails on a file that
+# opens a display without `tests/support/own_x_server.rs`. A plain #[test] harness that opens nothing,
+# in the default run for the same reason `toolkit_floor` is above: the merge that brings in the next
+# unguarded test must turn red, not wait for someone to run it under `--ignored`.
+[[test]]
+name = "own_display_scan"
+
 # The panel keeps a streaming reply where the reader put it, in the real WebKitGTK (2026-09-24).
-# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs a display
-# of its own, big enough for its windows (`xvfb-run -a -s "-screen 0 1920x1200x24" env GDK_BACKEND=x11
-# ...`; the default 640x480 screen fails every run as "did not exercise the trigger"). See the file's
-# own header.
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Since 2026-09-29 it
+# starts its own 1920x1200 `Xvfb` (`tests/support/own_x_server.rs`) and ignores any inherited display,
+# so no wrapper is needed and none can be forgotten. See the file's own header.
 [[test]]
 name = "panel_stream_scroll"
 harness = false
 
-# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
-# server of its own (`xvfb-run -a ... env GDK_BACKEND=x11 ...`, see the file's header). Holds the GUI
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
+# `Xvfb` (`tests/support/own_x_server.rs`, 2026-09-29; see the file's header). Holds the GUI
 # pass's D1 (2026-09-24): a colorscheme change reaching a widget that first shows after it.
 [[test]]
 name = "hidden_widget_restyle"
 harness = false
 
-# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
-# server of its own (see the file's header). Holds the integration GUI pass's finding (2026-09-26):
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
+# `Xvfb` (`tests/support/own_x_server.rs`, 2026-09-29; see the file's header). Holds the integration
+# GUI pass's finding (2026-09-26):
 # the y/n prompt placed as if it had no height, half below the top bar.
 [[test]]
 name = "close_prompt_placement"
 harness = false
 
-# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
-# server of its own (see the file's header). Holds the v1-scale GUI pass's defect A (2026-09-27): the
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
+# `Xvfb` (`tests/support/own_x_server.rs`, 2026-09-29; see the file's header). Holds the v1-scale GUI
+# pass's defect A (2026-09-27): the
 # band one editor row high in GTK logical px while WebKitGTK zooms the page for `gtk-xft-dpi`.
 [[test]]
 name = "band_xft_zoom"
@@ -106,24 +119,38 @@ harness = false
 
 # A plain `main`, because winit allows one `EventLoop` per process, on the main thread only (the
 # same reason `neovide-editor`'s own ignored `LiveHarness` tests are `harness = false`). Needs `nvim`
-# (>= 0.10) on `PATH` and the session's display (no window is ever shown). Proves the pinned fork
+# (>= 0.10) on `PATH` and a display for winit's clipboard (no window is ever shown) -- since 2026-09-29
+# its own `Xvfb` (`tests/support/own_x_server.rs`), never the session's. Proves the pinned fork
 # honours `NEOVIM_BIN` (v1-dist plan Task 6, spec §7): see the file's own header.
 [[test]]
 name = "nvim_bin_override"
 harness = false
 
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. It starts an
-# `Xvfb` of its own and refuses any other display, since it sends real keys and clicks and writes
-# the clipboard (see the file's header; needs `Xvfb` and `xdotool`). BROWSE visual mode (spec
+# `Xvfb` of its own (`tests/support/own_x_server.rs`, shared since 2026-09-29) and refuses any other
+# display, since it sends real keys and clicks and writes the clipboard (see the file's header; needs
+# `Xvfb` and `xdotool`). BROWSE visual mode (spec
 # docs/superpowers/specs/2026-09-28-browse-visual-mode-design.md), driven against the real
 # WebKitGTK `Selection.modify` jsdom does not have.
 [[test]]
 name = "panel_visual_mode"
 harness = false
 
-# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
-# server of its own (see the file's header). Holds the 2026-09-29 IME fix: a web module's `WebView` at
-# (0,0) of its `WebHost`, so the position WebKitGTK adds to the input method's caret rectangle is zero.
+# A plain `main`, opt-in with `-- --ignored`. Holds `tests/support/own_x_server.rs` to its one
+# property: a client of the display it hands out reaches that `Xvfb` or nothing, never another
+# server's socket file -- recreating incident 2's shell (own network namespace, shared `/tmp`) with a
+# stand-in for the desktop's `/tmp/.X11-unix/X0` (2026-09-29, fix round 1). It builds that namespace
+# itself (fix round 2): it re-executes under `bwrap` with a fresh `/tmp` holding a random-token
+# marker, a fresh `/run/user/<uid>` and `--unshare-net`, and refuses only where `bwrap` is missing or
+# the marker is not there -- so it needs no wrapper of its own. Needs `Xvfb` and `bwrap`.
+[[test]]
+name = "own_display_guard"
+harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
+# `Xvfb` (`tests/support/own_x_server.rs`, since fix round 3 of GUI tests' own display, 2026-09-29;
+# see the file's header). Holds the 2026-09-29 IME fix: a web module's `WebView` at (0,0) of its
+# `WebHost`, so the position WebKitGTK adds to the input method's caret rectangle is zero.
 [[test]]
 name = "web_host_origin"
 harness = false

@@ -25,27 +25,28 @@
 //! with the same change), and that capture-phase key controllers on the host see the `WebView`'s keys
 //! (GTK has no public way to synthesize a key event; `gtk_propagate_event_internal` is read, not run).
 //!
-//! Needs a display, and never the real desktop. Run it only inside a private `/tmp` and runtime dir,
-//! under its own X server that listens on no socket file, with GTK told to use it rather than a
-//! Wayland session the shell may have exported. Build first (outside is fine), then --
+//! Needs a display, and never the real desktop: **it starts its own** (fix round 3 of GUI tests' own
+//! display, 2026-09-29, `support/own_x_server.rs`) -- an `Xvfb` with a 1600x900 screen, pointed to
+//! before GTK initialises, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` and session bus dropped --
 //!
-//!     bwrap --dev-bind / / --tmpfs /tmp --tmpfs /run/user/$(id -u) --unsetenv WAYLAND_DISPLAY \
-//!         --unsetenv DISPLAY --unsetenv XAUTHORITY --setenv TMPDIR /tmp -- sh -c '
-//!       Xvfb :573 -nolisten tcp -nolisten unix -screen 0 1600x900x24 & x=$!; sleep 1
-//!       DISPLAY=:573 GDK_BACKEND=x11 cargo test -p shell --test web_host_origin -- --ignored; r=$?
-//!       kill $x; exit $r'
+//!     cargo test -p shell --test web_host_origin -- --ignored
 //!
-//! Not `xvfb-run -a` on the host: it picks a display by lock file, so beside a desktop whose X socket
-//! has no lock file (this machine's `/tmp/.X11-unix/X0` on 2026-09-29) it can take `:0` and unlink
-//! that socket. `-nolisten unix` leaves only the abstract socket (the wrapper shares the network
-//! namespace, so the test still reaches it), and the private `/tmp` keeps `/tmp/.X11-unix` apart.
+//! Until then it refused only a missing `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on a desktop
+//! session satisfies -- run from an agent shell, its window would have opened on the owner's screen --
+//! and its refusal printed an `xvfb-run -a` command, whose own `Xvfb` writes a socket file and a lock
+//! file in `/tmp` (this header warned against that one and started an `Xvfb` by hand inside `bwrap`).
+//! Neither is needed now, and `xvfb-run` must not be used: `shell/MANUAL_VERIFICATION.md`'s standing
+//! rule on GUI tests says how to run these.
 //!
-//! A plain `main` (`harness = false`), because GTK must own the main thread; it refuses to start
-//! unless `GDK_BACKEND=x11`. About 1s.
+//! A plain `main` (`harness = false`), because GTK must own the main thread. About 1s.
 
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 // `dead_code`: the product calls more of the module than this test does.
 #[allow(dead_code)]
@@ -181,30 +182,19 @@ fn main() {
         println!("web_host_origin: ignored (drives real GTK on a display); run with `-- --ignored`");
         return;
     }
-    if std::env::var("GDK_BACKEND").as_deref() != Ok("x11") {
-        eprintln!(
-            "web_host_origin: refusing to open windows without GDK_BACKEND=x11 -- run it under its own X server:"
-        );
-        eprintln!(
-            "    xvfb-run -a -s \"-nolisten tcp -screen 0 1600x900x24\" env GDK_BACKEND=x11 \
-             cargo test -p shell --test web_host_origin -- --ignored"
-        );
-        std::process::exit(1);
-    }
-    if let Err(e) = gtk4::init() {
-        eprintln!("web_host_origin: GTK could not initialise ({e}); it needs an X server of its own");
-        std::process::exit(1);
-    }
+    // Its own Xvfb, GTK initialised on it and checked to be on it -- never an inherited display.
+    let server = own_x_server::init_gtk("web_host_origin", "1600x900x24");
     match run() {
         Ok(report) => {
             for line in report {
                 println!("web_host_origin: {line}");
             }
             println!("web_host_origin: ok");
+            server.exit(0);
         }
         Err(e) => {
             eprintln!("web_host_origin: FAILED: {e}");
-            std::process::exit(1);
+            server.exit(1);
         }
     }
 }

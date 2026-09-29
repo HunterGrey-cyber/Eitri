@@ -124,15 +124,18 @@
 //! body, whose offset only tracks `scrollTop` -- seen in one S2 configuration by the review,
 //! harmless, since the `scrollTop` checks already cover it.
 //!
-//! Needs a display, and never the real desktop: run it under its own X server, which has no input
-//! devices of its own, or inside the repo's headless-sway sandbox --
+//! Needs a display, and never the real desktop: **it starts its own** (2026-09-29,
+//! `support/own_x_server.rs`) -- an `Xvfb` with a 1920x1200 screen and no input devices, pointed to
+//! before GTK initialises, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped, so
 //!
-//!     xvfb-run -a -s "-screen 0 1920x1200x24" env GDK_BACKEND=x11 \
-//!         cargo test -p shell --test panel_stream_scroll -- --ignored
+//!     cargo test -p shell --test panel_stream_scroll -- --ignored
 //!
-//! The screen size matters: `xvfb-run`'s default 640x480 clamps the 1110px-tall window, and the run
-//! then fails as "did not exercise the trigger" rather than measuring the wrong size. A plain `main`
-//! (`harness = false`) because GTK must run on the main thread. Traces (every frame and scroll
+//! can no longer reach the desktop it is run from. Until then it took whatever display it inherited,
+//! and one GUI pass that ran it without the `xvfb-run` wrapper this header named opened its windows
+//! on the owner's own screen. The screen size matters: a 640x480 screen (`xvfb-run`'s default) clamps
+//! the 1110px-tall window, and the run then fails as "did not exercise the trigger" rather than
+//! measuring the wrong size. A plain `main` (`harness = false`) because GTK must run on the main
+//! thread. Traces (every frame and scroll
 //! event, per run) are written to `$PANEL_STREAM_SCROLL_TRACE_DIR`, default
 //! `<target tmp>/panel_stream_scroll/`. `PANEL_STREAM_SCROLL_ONLY=S1,S2` narrows the scenarios; the
 //! configuration matrix is fixed. About 15s per run, thirty-six runs.
@@ -149,12 +152,17 @@ use gtk4::prelude::*;
 use neovibe_core::agent_backend::{BackendGreeting, BackendKind, ProjectionRef, CLIENT_IMPLEMENTED_PERMISSION_MODES};
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_events_for_js, serialize_hello_for_js,
-    serialize_pane_focus_for_js, serialize_snapshot_for_js, serialize_theme_for_js, InboundMessage, SnapshotView,
+    serialize_pane_focus_for_js, serialize_snapshot_for_js, serialize_tabs_for_js, serialize_theme_for_js,
+    InboundMessage, SessionModeChoice, SnapshotView, TabStateWire, TabView,
 };
 use neovibe_core::theme::ThemeTokens;
 use serde_json::{json, Value};
 use webkit6::prelude::*;
 use webkit6::{UserContentInjectedFrames, UserContentManager, UserScript, UserScriptInjectionTime, WebView};
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 /// The document `shell/src/agent_panel.rs` embeds, byte for byte: the same `include_str!` of the
 /// same file, which `shell/build.rs` rebuilds before this test compiles.
@@ -211,9 +219,13 @@ const S7_MIN_PAUSE_MS: f64 = 1500.0;
 const LIVE_COMMAND: &str =
     "cargo test -p agent-ui-width -- --nocapture --test-threads=1 --include-ignored and-a-few-more-args-so-it-is-long";
 /// An earlier `Read` of a path with no space in it -- a real absolute path in this repository is
-/// often this long.
+/// often this long. Outside the harness's own project root (`/nonexistent/panel-stream-scroll`,
+/// 2026-09-29): since v1 polish F21 (2026-09-27, `projectPath.ts`) a path under the root is drawn
+/// relative to it, so the token search below, which looks for this exact text, found nothing and
+/// every scenario read "the long path was not found". A path outside the root is drawn as sent, and
+/// this one is exactly as long as the old one.
 const LONG_PATH: &str =
-    "/nonexistent/panel-stream-scroll/a/deeply/nested/directory/with/no/space/in/it/src/components/MessageList.tsx";
+    "/nonexistent/outside-the-project/a/deeply/nested/directory/with/no/space/in/it/src/components/MessageList.tsx";
 /// A URL in an earlier reply's prose, which `marked` turns into a link.
 const LONG_URL: &str =
     "https://docs.example.com/reference/a/long/path/with/no/space/in/it/anywhere/index.html?query=abcdefghijklmnopqrstuvwxyz";
@@ -539,6 +551,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
     let on_ready = vec![
         serialize_hello_for_js(&greeting),
         serialize_theme_for_js(&tokens),
+        sole_tab_envelope(sole_tab),
         snapshot,
         serialize_pane_focus_for_js(true),
         // `request_id` is filled in when the page's own `ready` arrives; see `run_one`.
@@ -1240,7 +1253,8 @@ fn judge(config: Config, scenario: Scenario, probe: &Probe) -> Verdict {
         vacuous: Vec::new(),
     };
     // The run measured the size it was asked for. `xvfb-run`'s default screen is 640x480, which
-    // silently clamps a 740px-tall window to 480 -- found the first time this ran.
+    // silently clamps a 740px-tall window to 480 -- found the first time this ran, under `xvfb-run`;
+    // the test's own Xvfb (2026-09-29, `main`) is 1920x1200.
     let want_w = f64::from(config.width);
     let want_h = f64::from(config.height);
     // As the turn found it: S9 resizes the window after the turn, before the probe is read.
@@ -1252,7 +1266,7 @@ fn judge(config: Config, scenario: Scenario, probe: &Probe) -> Verdict {
     let (got_w, got_h) = (num(viewport, "innerWidth"), num(viewport, "innerHeight"));
     if got_w.is_none_or(|w| (w - want_w).abs() > 2.0) || got_h.is_none_or(|h| (h - want_h).abs() > 2.0) {
         v.vacuous.push(format!(
-            "the page is {got_w:?}x{got_h:?} CSS px, not the {want_w:.0}x{want_h:.0} asked for (is the X screen big enough? `xvfb-run -s \"-screen 0 1920x1200x24\"`)"
+            "the page is {got_w:?}x{got_h:?} CSS px, not the {want_w:.0}x{want_h:.0} asked for (is the X screen big enough? `main` starts its own Xvfb at 1920x1200x24)"
         ));
     }
     let (Some(t_start), Some(t_end)) = (probe.mark("turn_started"), probe.mark("turn_completed")) else {
@@ -2409,6 +2423,7 @@ fn ctrl_e_y_replay() -> Replay {
     let on_ready = vec![
         serialize_hello_for_js(&greeting),
         serialize_theme_for_js(&tokens),
+        sole_tab_envelope(sole_tab),
         snapshot,
         serialize_pane_focus_for_js(true),
     ];
@@ -2672,6 +2687,31 @@ fn trace_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("panel_stream_scroll"))
 }
 
+/// The `tabs` envelope a real launch's `TabSet` sends before the active tab's snapshot (2026-09-29).
+/// `tabs.ts`'s `acceptsEnvelope` drops a snapshot for a tab the page does not know yet while
+/// `activeTab` is still `null`, so without it nothing rendered and every scenario read "did not
+/// exercise the trigger" (no message list), `ctrl_e_y` "gg did not scroll" -- since session tabs moved
+/// the panel onto `TabSet` (2026-09-25), and unseen because the test was not run until the display
+/// guard's own verification. `panel_visual_mode.rs` found and fixed the same harness bug on
+/// 2026-09-28 (its `on_ready_batch`); this is that envelope. One live tab, the id every snapshot
+/// here is built for.
+fn sole_tab_envelope(sole_tab: neovibe_core::tabs::TabId) -> String {
+    let tabs = vec![TabView {
+        id: sole_tab,
+        number: 1,
+        label: "1".into(),
+        name: None,
+        state: TabStateWire::Live,
+        mode: SessionModeChoice::Auto,
+        marker: None,
+        pending: 0,
+        resumable: false,
+        failure: None,
+        title: None,
+    }];
+    serialize_tabs_for_js(sole_tab, &tabs, SessionModeChoice::Auto)
+}
+
 fn main() {
     // The judge's own tests need no display, so they run every time, `--ignored` or not.
     match judge_self_test() {
@@ -2687,13 +2727,8 @@ fn main() {
         println!("panel_stream_scroll: ignored (drives a real WebKitGTK WebView); run with `-- --ignored`");
         return;
     }
-    if let Err(e) = gtk4::init() {
-        eprintln!("panel_stream_scroll: GTK could not initialise ({e}). It needs a display of its own:");
-        eprintln!(
-            "    xvfb-run -a -s \"-screen 0 1920x1200x24\" env GDK_BACKEND=x11 cargo test -p shell --test panel_stream_scroll -- --ignored"
-        );
-        std::process::exit(1);
-    }
+    // Its own Xvfb, GTK initialised on it and checked to be on it -- never an inherited display.
+    let server = own_x_server::init_gtk("panel_stream_scroll", "1920x1200x24");
     let mut failed: Vec<String> = Vec::new();
 
     // v1 trial item 5: run first, and unconditionally (it is not one of `Scenario::ALL`, so
@@ -2800,6 +2835,6 @@ fn main() {
         for f in &failed {
             println!("  - {f}");
         }
-        std::process::exit(1);
+        server.exit(1);
     }
 }

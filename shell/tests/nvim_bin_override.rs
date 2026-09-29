@@ -14,11 +14,12 @@
 //!
 //! `#[ignore]`d (mirrored here by hand, `harness = false` means cargo's own skip does not apply --
 //! see the check in `main` below): it needs `nvim` (>= 0.10) on `PATH`, and -- like every
-//! `LiveHarness`-driving test in this workspace, `neovide-editor`'s own ignored ones included -- the
-//! session's real display connection, even though it never opens a window (winit's `EventLoop`
-//! needs one for the clipboard). **Never run this against the real desktop**: bring up a display of
-//! its own first, the same way this crate's other GUI-needing ignored tests do (their own headers
-//! name the exact invocation for each), then:
+//! `LiveHarness`-driving test in this workspace, `neovide-editor`'s own ignored ones included -- a
+//! display connection, even though it never opens a window (winit's `EventLoop` needs one for the
+//! clipboard). **It starts its own** (2026-09-29, `support/own_x_server.rs`): an `Xvfb` pointed to
+//! before winit connects, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Until then it
+//! connected to whatever display it inherited, and this header's "never the real desktop" was only a
+//! sentence -- from an agent shell, the desktop's. So, with no wrapper:
 //!
 //!     cargo test -p shell --test nvim_bin_override -- --ignored
 //!
@@ -33,6 +34,10 @@ use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::{GridSize, PixelRect};
 use skia_safe::surfaces;
 
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
+
 fn main() {
     // Mirrors `#[ignore]` under a plain `main`: `cargo test --workspace` needs no nvim and writes
     // nothing to disk.
@@ -41,6 +46,15 @@ fn main() {
         println!("nvim_bin_override: ignored (spawns a real nvim, needs a display); run with `-- --ignored`");
         return;
     }
+    // As `shell`'s own `main` and `cursor_animation` do (fix round 3, 2026-09-29): a pipe or socket on
+    // stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer and
+    // blocks it at startup (`neovide_editor::stdin`), which failed this test as "nvim never became ready".
+    if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+        println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
+    }
+    // Before winit or the clipboard connects to anything: its own Xvfb, the only display left to find.
+    // Declared first, so a failed assertion below drops (and stops) it last, after the harness.
+    let _server = own_x_server::isolate("nvim_bin_override", "640x480x24");
 
     // `$TMPDIR` (`/tmp` when unset), like every other test in this workspace that needs a throwaway
     // directory -- this project's own dev-scratch convention (`~/.cache/nv-v1dist-*`) is for a human
