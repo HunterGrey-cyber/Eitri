@@ -452,6 +452,23 @@ STUB
 	printf '%s\n' "$T/stubs-getent"
 }
 
+# shared_primary_gid_stubs: a PRE_STUBS directory whose getent lists a second account ("bob") whose
+# primary group is this user's own -- a member getent's group entry never shows.
+shared_primary_gid_stubs() {
+	mkdir -p "$T/stubs-getent-passwd"
+	cat >"$T/stubs-getent-passwd/getent" <<'STUB'
+#!/bin/sh
+if [ "$1" = passwd ] && [ $# -eq 1 ]; then
+	/usr/bin/getent passwd
+	printf 'bob:x:%s:%s::/home/bob:/bin/sh\n' 59999 "$(id -g)"
+	exit 0
+fi
+exec /usr/bin/getent "$@"
+STUB
+	chmod +x "$T/stubs-getent-passwd/getent"
+	printf '%s\n' "$T/stubs-getent-passwd"
+}
+
 # own_private_group_here: 0 when the test user has a user-private group (the case own_private_group
 # accepts), so the tests that rely on it can say when they are not exercising it.
 own_private_group_here() {
@@ -551,6 +568,23 @@ t_cache_group_writable_own_private_group_allowed() {
 	inst_net
 	expect_rc 0 "a 0775 ~/.cache and ~/.cache/neovibe on the user's own private group"
 	expect_eq "$(installed_version)" 1.0.0 "the version with a 0775 cache on a private group"
+}
+
+TESTS="$TESTS t_cache_group_writable_shared_primary_gid_refused"
+t_cache_group_writable_shared_primary_gid_refused() {
+	# An account whose primary group matches this user's group may be absent from getent's
+	# member list yet still write a 0775 directory in that group. Check the account list too.
+	if ! own_private_group_here; then
+		printf 'note: the test user has no private group here; nothing to check\n'
+		return 0
+	fi
+	serve 1.0.0
+	mkdir -p "$TH/.cache"
+	chmod 0775 "$TH/.cache"
+	PRE_STUBS=$(shared_primary_gid_stubs)
+	inst_net
+	expect_fail "a 0775 cache parent whose group is another account's primary group too"
+	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
 }
 
 TESTS="$TESTS t_cache_other_writable_own_private_group_still_refused"
