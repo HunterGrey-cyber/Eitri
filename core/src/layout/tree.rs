@@ -19,10 +19,13 @@
 //! **A split divides by its ratio, unless it is pinned** (modules P2). A [`Pin`] keeps one side's
 //! length in pixels when the space the split divides changes, as an IDE's bottom panel keeps its
 //! height when the window grows -- the owner's call on the spec's §14 question, "a bottom row keeps
-//! its height when the window grows". Only a module placed below the whole root is pinned
-//! ([`Placement::BelowRoot`]: the bottom terminal, a Lua `bottom` panel). Its first show still
-//! divides by the ratio, a third of the height at whatever size the window has then, as `main`'s
-//! `shown_position` did; [`super::geometry::settle_pins`] then freezes that length.
+//! its height when the window grows". A module placed below the whole root is pinned
+//! ([`Placement::BelowRoot`]: a Lua `bottom` panel), and so, since v1 trial item 6 (2026-09-28), is
+//! one placed below the editor's own leaf alone ([`Placement::BelowEditor`]: the terminal's default
+//! place, "extended" from the same rule -- the owner's "a bottom row keeps its height", applied to a
+//! row that is not full width). Either module's first show still divides by the ratio, a third of
+//! the height at whatever size the window has then, as `main`'s `shown_position` did;
+//! [`super::geometry::settle_pins`] then freezes that length.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -80,80 +83,17 @@ pub(super) fn place_new(root: Node, id: &ModuleId, placement: Placement) -> (Nod
             Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
             false,
         ),
-        Placement::BelowEditorAndAgent => {
-            let present = root.leaves();
-            let ids: Vec<ModuleId> = if present.contains(&ModuleId::editor()) && present.contains(&ModuleId::agent()) {
-                vec![ModuleId::editor(), ModuleId::agent()]
-            } else if present.contains(&ModuleId::agent()) {
-                vec![ModuleId::agent()]
-            } else {
-                Vec::new()
-            };
-            if ids.is_empty() {
-                (
-                    Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
-                    false,
-                )
-            } else {
-                (wrap_below_editor_and_agent(root, &ids, leaf), false)
-            }
+        Placement::BelowEditor if root.leaves().contains(&ModuleId::editor()) => {
+            let mut root = root;
+            root.replace_leaf(&ModuleId::editor(), |editor| {
+                Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, editor, leaf)
+            });
+            (root, false)
         }
-    }
-}
-
-/// [`Placement::BelowEditorAndAgent`]'s own placement: wraps the smallest subtree of `node` that
-/// contains every id in `ids` (the editor and the agent, or the agent alone) in a column split
-/// below it, with the same pin/share [`Placement::BelowRoot`] uses. `ids` is never empty here --
-/// `place_new` falls back to [`Placement::BelowRoot`] itself when neither leaf is in the tree --
-/// so this always wraps exactly one subtree on its way down.
-fn wrap_below_editor_and_agent(node: Node, ids: &[ModuleId], leaf: Node) -> Node {
-    match node {
-        Node::Leaf(id) => Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, Node::Leaf(id), leaf),
-        Node::Split {
-            axis,
-            ratio,
-            pin,
-            first,
-            second,
-        } => {
-            let first_leaves = first.leaves();
-            if ids.iter().all(|id| first_leaves.contains(id)) {
-                let first = wrap_below_editor_and_agent(*first, ids, leaf);
-                return Node::Split {
-                    axis,
-                    ratio,
-                    pin,
-                    first: Box::new(first),
-                    second,
-                };
-            }
-            let second_leaves = second.leaves();
-            if ids.iter().all(|id| second_leaves.contains(id)) {
-                let second = wrap_below_editor_and_agent(*second, ids, leaf);
-                return Node::Split {
-                    axis,
-                    ratio,
-                    pin,
-                    first,
-                    second: Box::new(second),
-                };
-            }
-            // Neither child alone holds every id in `ids`: this split is the smallest subtree that
-            // does, so it is what gets wrapped.
-            Node::pinned(
-                Axis::Column,
-                BELOW_ROOT_SHARE,
-                Branch::Second,
-                Node::Split {
-                    axis,
-                    ratio,
-                    pin,
-                    first,
-                    second,
-                },
-                leaf,
-            )
-        }
+        Placement::BelowEditor => (
+            Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
+            false,
+        ),
     }
 }
 
@@ -789,11 +729,11 @@ mod tests {
         assert_eq!(layout.focus(), &lua("m"));
     }
 
-    /// `Placement::BelowEditorAndAgent` (task 6, 2026-09-26): with a side panel already wrapping the
-    /// whole root, a module placed this way wraps only `[editor | agent]`, not the side panel too --
-    /// the smallest subtree that holds both.
+    /// `Placement::BelowEditor` (v1 trial item 6, 2026-09-28): with the agent right of the editor and
+    /// a side panel wrapping the whole root, a module placed this way wraps the editor's own leaf
+    /// only -- neither the agent nor the side panel move or lose any height.
     #[test]
-    fn below_editor_and_agent_wraps_only_the_editor_and_agent_subtree() {
+    fn below_editor_wraps_only_the_editors_own_leaf() {
         let root = Node::split(
             Axis::Row,
             RIGHT_OF_ROOT_SHARE,
@@ -805,79 +745,72 @@ mod tests {
             ),
             Node::Leaf(lua("side")),
         );
-        let (placed, took_editors_place) = place_new(root, &lua("term"), Placement::BelowEditorAndAgent);
+        let (placed, took_editors_place) = place_new(root, &lua("term"), Placement::BelowEditor);
         assert!(!took_editors_place);
         assert_eq!(
             placed,
             Node::split(
                 Axis::Row,
                 RIGHT_OF_ROOT_SHARE,
-                Node::pinned(
-                    Axis::Column,
-                    BELOW_ROOT_SHARE,
-                    Branch::Second,
-                    Node::split(
-                        Axis::Row,
-                        DEFAULT_EDITOR_SHARE,
+                Node::split(
+                    Axis::Row,
+                    DEFAULT_EDITOR_SHARE,
+                    Node::pinned(
+                        Axis::Column,
+                        BELOW_ROOT_SHARE,
+                        Branch::Second,
                         Node::Leaf(ModuleId::editor()),
-                        Node::Leaf(ModuleId::agent())
+                        Node::Leaf(lua("term"))
                     ),
-                    Node::Leaf(lua("term"))
+                    Node::Leaf(ModuleId::agent())
                 ),
                 Node::Leaf(lua("side")),
             )
         );
     }
 
-    /// With no side panel, `[editor | agent]` is the whole root, so this is the same tree
-    /// `Placement::BelowRoot` would build.
+    /// The default window, `[editor | agent]`: the module goes below the editor's own leaf, and the
+    /// agent keeps the whole column's height -- not the tree `Placement::BelowRoot` would build,
+    /// which is exactly the shape v1 trial item 6 moved the terminal away from.
     #[test]
-    fn below_editor_and_agent_is_below_root_when_they_are_the_whole_tree() {
+    fn below_editor_keeps_the_agent_at_full_height_in_the_default_window() {
         let root = Node::split(
             Axis::Row,
             DEFAULT_EDITOR_SHARE,
             Node::Leaf(ModuleId::editor()),
             Node::Leaf(ModuleId::agent()),
         );
-        let (with_ea, _) = place_new(root.clone(), &lua("term"), Placement::BelowEditorAndAgent);
+        let (placed, _) = place_new(root.clone(), &lua("term"), Placement::BelowEditor);
+        assert_eq!(
+            placed,
+            Node::split(
+                Axis::Row,
+                DEFAULT_EDITOR_SHARE,
+                Node::pinned(
+                    Axis::Column,
+                    BELOW_ROOT_SHARE,
+                    Branch::Second,
+                    Node::Leaf(ModuleId::editor()),
+                    Node::Leaf(lua("term"))
+                ),
+                Node::Leaf(ModuleId::agent())
+            )
+        );
         let (with_below, _) = place_new(root, &lua("term"), Placement::BelowRoot);
-        assert_eq!(with_ea, with_below);
+        assert_ne!(placed, with_below, "below-editor, not below-root, is the new default");
     }
 
-    /// The editor is gone (`super::kill::Reopen::Never`): the module is placed below the agent's
-    /// leaf alone.
+    /// The editor is gone (`super::kill::Reopen::Never`): falls back to `Placement::BelowRoot`, below
+    /// the whole root -- there is no editor column left to go under.
     #[test]
-    fn below_editor_and_agent_falls_back_to_the_agent_alone_when_the_editor_is_gone() {
+    fn below_editor_falls_back_to_below_root_when_the_editor_is_not_in_the_tree() {
         let root = Node::split(
             Axis::Row,
             RIGHT_OF_ROOT_SHARE,
             Node::Leaf(ModuleId::agent()),
             Node::Leaf(lua("side")),
         );
-        let (placed, _) = place_new(root, &lua("term"), Placement::BelowEditorAndAgent);
-        assert_eq!(
-            placed,
-            Node::split(
-                Axis::Row,
-                RIGHT_OF_ROOT_SHARE,
-                Node::pinned(
-                    Axis::Column,
-                    BELOW_ROOT_SHARE,
-                    Branch::Second,
-                    Node::Leaf(ModuleId::agent()),
-                    Node::Leaf(lua("term"))
-                ),
-                Node::Leaf(lua("side")),
-            )
-        );
-    }
-
-    /// Neither the editor nor the agent is in the tree: falls back to `Placement::BelowRoot`, below
-    /// the whole root.
-    #[test]
-    fn below_editor_and_agent_falls_back_to_below_root_when_neither_leaf_is_present() {
-        let root = Node::Leaf(lua("side"));
-        let (placed, _) = place_new(root.clone(), &lua("term"), Placement::BelowEditorAndAgent);
+        let (placed, _) = place_new(root.clone(), &lua("term"), Placement::BelowEditor);
         let (expected, _) = place_new(root, &lua("term"), Placement::BelowRoot);
         assert_eq!(placed, expected);
     }

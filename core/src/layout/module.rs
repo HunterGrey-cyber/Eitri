@@ -110,13 +110,16 @@ pub enum Placement {
     /// The editor's own leaf: the module takes the editor's place and the editor is **hidden**,
     /// not gone. Lua `position = "main"`.
     InPlaceOfEditor,
-    /// A new column split below the smallest subtree that holds both the editor and the agent
-    /// (hidden or shown; the editor may be gone, then the agent's leaf alone), never below the
-    /// whole root -- `kill::reopen`'s answer for the terminal (task 6, 2026-09-26), so a terminal
-    /// killed next to a Lua `side` panel comes back under `[editor | agent]` as a first launch puts
-    /// it, not full width below the side panel too. Falls back to [`Placement::BelowRoot`] if
-    /// neither leaf is in the tree. Never a first-launch placement itself -- `place_new`'s own doc.
-    BelowEditorAndAgent,
+    /// A new column split below the editor's own leaf only, pinned the way [`Placement::BelowRoot`]
+    /// is -- the terminal's default place since v1 trial item 6 (2026-09-28, the owner: "同意，默认
+    /// 放到编辑器下面"): below the editor column only, so the agent panel (and any side panel) keep
+    /// their full height. Superseded `Placement::BelowEditorAndAgent` (task 6, 2026-09-26), which
+    /// wrapped `[editor | agent]` together -- in the default window that was the whole root, so the
+    /// terminal used to come back full width below everything, exactly what this variant now avoids.
+    /// Falls back to [`Placement::BelowRoot`] if the editor is not in the tree (it was killed with
+    /// [`super::kill::Reopen::Never`]). Never a first-launch placement of anything but the terminal
+    /// today -- `place_new`'s own doc.
+    BelowEditor,
 }
 
 /// A module the layout is built with beyond the two built-ins every window has (the editor and the

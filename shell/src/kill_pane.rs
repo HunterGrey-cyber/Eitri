@@ -300,10 +300,10 @@ pub(crate) fn close_is_confirmed(confirmed: Option<&str>, now: Option<&str>) -> 
 /// panels as `init.lua` registered them.
 pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     match id.kind() {
-        // `BelowEditorAndAgent`, not `BelowRoot`: a terminal killed next to a Lua `side` panel
-        // comes back under `[editor | agent]` only (as a first launch puts it), not full width
-        // below the side panel too (`neovibe_core::layout::tree::place_new`'s own doc, task 6).
-        ModuleKind::Terminal => Reopen::At(Placement::BelowEditorAndAgent),
+        // `BelowEditor`, not `BelowRoot`: a terminal killed next to a Lua `side` panel comes back
+        // below the editor's own leaf only (as a first launch puts it, v1 trial item 6, 2026-09-28),
+        // not full width below the side panel too (`neovibe_core::layout::tree::place_new`'s own doc).
+        ModuleKind::Terminal => Reopen::At(Placement::BelowEditor),
         ModuleKind::LuaWebview => decls
             .iter()
             .find(|d| d.id == *id)
@@ -660,7 +660,7 @@ mod tests {
         }];
         assert_eq!(
             reopen(&ModuleId::terminal(), &decls),
-            Reopen::At(Placement::BelowEditorAndAgent)
+            Reopen::At(Placement::BelowEditor)
         );
         assert_eq!(
             reopen(&ModuleId::lua("side"), &decls),

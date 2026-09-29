@@ -31,7 +31,7 @@ import { describe, expect, it } from "vitest";
 import resolveKeyFixtureText from "./fixtures/v1-frozen-resolve-key.json?raw";
 // Shared with core/tests/keymap_v1_freeze.rs -- one file, one freeze, for both languages.
 import panelFixtureText from "../../../docs/keymap/v1-frozen-panel-keys.json?raw";
-import { resolveKey } from "./keymap";
+import { CARET_KEYS, resolveKey, VISUAL_KEYS } from "./keymap";
 import type { KeyLike, PanelAction, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 import { advanceSequence, startSequence } from "./leader";
 
@@ -44,9 +44,23 @@ const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> =
   ...over,
 });
 
+/** `CARET_KEYS`/`VISUAL_KEYS`' own token spelling -> a `KeyLike`, the same rule `keymap.test.ts`'s
+ *  `parseVisualToken` uses: `"Esc"` is the display spelling of the real `key: "Escape"`, `"1-9"` a
+ *  representative digit, `"gg"` (added for 3a) the FIRST of its two presses (a non-`pending` case
+ *  below covers the second), `"Ctrl+x"` -> Ctrl held with `x` (seam review finding 3, 2026-09-28:
+ *  the new "Ctrl+e / Ctrl+y" row), and every bare uppercase letter or `?` carries Shift. */
+function visualToken(token: string): KeyLike {
+  if (token === "Esc") return key("Escape");
+  if (token === "1-9") return key("3");
+  if (token === "gg") return key("g");
+  if (token.startsWith("Ctrl+")) return key(token.slice("Ctrl+".length), { ctrlKey: true });
+  if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
+  return key(token);
+}
+
 type ResolveKeyCase = {
   label: string;
-  mode: "browse" | "input";
+  mode: "browse" | "input" | "caret" | "visual" | "vline";
   event: KeyLike;
   ctx: { sessionEnded: boolean; turnRunning?: boolean; pending?: PendingPrefix };
 };
@@ -99,6 +113,53 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   { label: "Escape, browse, idle", mode: "browse", event: key("Escape"), ctx: { sessionEnded: false, turnRunning: false } },
   { label: "Escape, browse, a turn is running", mode: "browse", event: key("Escape"), ctx: { sessionEnded: false, turnRunning: true } },
   { label: "Escape, input", mode: "input", event: key("Escape"), ctx: { sessionEnded: false } },
+  // v1 trial item 5 -- new bindings, additive under F10 ("keys are only ever added"), appended
+  // rather than inserted so the regenerated fixture diffs as additions only.
+  { label: "Ctrl+e", mode: "browse", event: key("e", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  { label: "Ctrl+y", mode: "browse", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  // Visual-mode spec (docs/superpowers/specs/2026-09-28-browse-visual-mode-design.md) §2, additions
+  // only: BROWSE's own entry keys, the reservation `gv` makes, one case per VISUAL_KEYS row in each
+  // of VISUAL and V-LINE, and the review's own three "never an answer" pins (§7, finding 7) plus the
+  // one Ctrl chord VISUAL keeps a BROWSE meaning for.
+  { label: "v", mode: "browse", event: key("v"), ctx: { sessionEnded: false } },
+  { label: "Shift+V", mode: "browse", event: key("V", { shiftKey: true }), ctx: { sessionEnded: false } },
+  { label: "gv", mode: "browse", event: key("v"), ctx: { sessionEnded: false, pending: "g" } },
+  ...(["visual", "vline"] as const).flatMap((mode) =>
+    VISUAL_KEYS.flatMap(({ keys }) =>
+      keys.split(" / ").map((token) => ({
+        label: `${mode}: ${token}`,
+        mode,
+        event: visualToken(token),
+        ctx: { sessionEnded: false },
+      })),
+    ),
+  ),
+  { label: "visual: d", mode: "visual", event: key("d"), ctx: { sessionEnded: false } },
+  { label: "visual: a", mode: "visual", event: key("a"), ctx: { sessionEnded: false } },
+  { label: "visual: Shift+D", mode: "visual", event: key("D", { shiftKey: true }), ctx: { sessionEnded: false } },
+  { label: "visual: Ctrl+c, a turn is running", mode: "visual", event: key("c", { ctrlKey: true }), ctx: { sessionEnded: false, turnRunning: true } },
+  // Revision for 3a (§9): one case per CARET_KEYS row, plus the review's own three "never an
+  // answer" pins and the Ctrl+c pair, this time for CARET -- where idle Ctrl+c is CLAIMED (D12), the
+  // opposite of VISUAL's own pin just above.
+  ...CARET_KEYS.flatMap(({ keys }) =>
+    keys.split(" / ").map((token) => ({
+      label: `caret: ${token}`,
+      mode: "caret" as const,
+      event: visualToken(token),
+      ctx: { sessionEnded: false },
+    })),
+  ),
+  { label: "caret: d", mode: "caret", event: key("d"), ctx: { sessionEnded: false } },
+  { label: "caret: a", mode: "caret", event: key("a"), ctx: { sessionEnded: false } },
+  { label: "caret: Shift+D", mode: "caret", event: key("D", { shiftKey: true }), ctx: { sessionEnded: false } },
+  { label: "caret: Enter", mode: "caret", event: key("Enter"), ctx: { sessionEnded: false } },
+  { label: "caret: Ctrl+c, idle", mode: "caret", event: key("c", { ctrlKey: true }), ctx: { sessionEnded: false, turnRunning: false } },
+  {
+    label: "caret: Ctrl+c, a turn is running",
+    mode: "caret",
+    event: key("c", { ctrlKey: true }),
+    ctx: { sessionEnded: false, turnRunning: true },
+  },
 ];
 
 function readJson<T>(text: string): T {

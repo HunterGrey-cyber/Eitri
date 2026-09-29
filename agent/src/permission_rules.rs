@@ -226,6 +226,9 @@ mod tests {
     fn no_rule_is_offered_that_would_span_every_subcommand_or_any_program() {
         let root = std::env::temp_dir().join(format!("agent-permission-rules-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("sub")).unwrap();
+        // Canonical, as a session's root is: the policy cards a root that does not resolve to itself
+        // (macOS's `$TMPDIR` is under `/var -> private/var`).
+        let root = root.canonicalize().unwrap();
         let bash = |command: &str| offer("Bash", &json!({ "command": command }), &root).map(|r| r.display());
 
         // The shapes the review reproduced, each still a card the policy refused for a

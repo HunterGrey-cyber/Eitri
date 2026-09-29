@@ -255,6 +255,17 @@ export type CallNotes = {
   createsFile?: readonly { permissionId: string; toolUseId: string | null }[];
   /** O3 review item 7: calls whose CLI prompt was answered without a card, with their row's note. */
   promptNotes?: readonly { toolUseId: string; note: string }[];
+  /** v1 trial item 7: tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path
+   *  answered with no card. No message of its own, unlike `ruleNotes` -- there is only one fast
+   *  path, so the row just says "allowed by auto" (`toolRegistry.tsx`). */
+  autoNotes?: readonly string[];
+  /** Fix round finding 1: tool-use ids of a `Write` answered with no card -- by the acceptEdits
+   *  fast path, or in bypass (whole-branch review finding 6) -- over a path where nothing existed
+   *  just before the answer was sent. `createsFile`'s own signal is keyed by permission id and only
+   *  ever set for a call that raised a card (F22) -- a `Write` answered without one raises none, so
+   *  without this its row kept `createsFile`'s absence and showed the overwrite warning for a file
+   *  that never existed. */
+  autoCreatesFile?: readonly string[];
 };
 
 /** Folds an events envelope's `CallNotes` into the state, after that envelope's events, so a call
@@ -264,20 +275,31 @@ export function applyCallNotes(state: AgentUiState, notes: CallNotes): AgentUiSt
   const rules = new Map((notes.ruleNotes ?? []).map((n) => [n.toolUseId, n.rule]));
   const newFileCards = new Set((notes.createsFile ?? []).map((n) => n.permissionId));
   const newFileCalls = new Set((notes.createsFile ?? []).flatMap((n) => (n.toolUseId === null ? [] : [n.toolUseId])));
+  const autoNewFileCalls = new Set(notes.autoCreatesFile ?? []);
   const promptNotes = new Map((notes.promptNotes ?? []).map((n) => [n.toolUseId, n.note]));
-  if (rules.size === 0 && newFileCards.size === 0 && promptNotes.size === 0) return state;
+  const autoNotes = new Set(notes.autoNotes ?? []);
+  if (
+    rules.size === 0 &&
+    newFileCards.size === 0 &&
+    autoNewFileCalls.size === 0 &&
+    promptNotes.size === 0 &&
+    autoNotes.size === 0
+  )
+    return state;
   return {
     ...state,
     toolCalls: state.toolCalls.map((call) => {
       const rule = rules.get(call.toolUseId);
-      const creates = newFileCalls.has(call.toolUseId);
+      const creates = newFileCalls.has(call.toolUseId) || autoNewFileCalls.has(call.toolUseId);
       const promptNote = promptNotes.get(call.toolUseId);
-      if (rule === undefined && !creates && promptNote === undefined) return call;
+      const auto = autoNotes.has(call.toolUseId);
+      if (rule === undefined && !creates && promptNote === undefined && !auto) return call;
       return {
         ...call,
         ...(rule === undefined ? {} : { allowedByRule: rule }),
         ...(creates ? { createsFile: true } : {}),
         ...(promptNote === undefined ? {} : { promptNote }),
+        ...(auto ? { allowedByAuto: true } : {}),
       };
     }),
     pendingPermissions: state.pendingPermissions.map((p) => (newFileCards.has(p.permissionId) ? { ...p, createsFile: true } : p)),

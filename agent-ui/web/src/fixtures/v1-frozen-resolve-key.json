@@ -268,5 +268,510 @@
       "kind": "mode",
       "to": "browse"
     }
+  },
+  {
+    "label": "Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
+    }
+  },
+  {
+    "label": "v",
+    "expected": {
+      "kind": "caret"
+    }
+  },
+  {
+    "label": "Shift+V",
+    "expected": {
+      "kind": "visual",
+      "line": true
+    }
+  },
+  {
+    "label": "gv",
+    "expected": null
+  },
+  {
+    "label": "visual: h",
+    "expected": {
+      "kind": "vmove",
+      "motion": "h"
+    }
+  },
+  {
+    "label": "visual: l",
+    "expected": {
+      "kind": "vmove",
+      "motion": "l"
+    }
+  },
+  {
+    "label": "visual: j",
+    "expected": {
+      "kind": "vmove",
+      "motion": "j"
+    }
+  },
+  {
+    "label": "visual: k",
+    "expected": {
+      "kind": "vmove",
+      "motion": "k"
+    }
+  },
+  {
+    "label": "visual: w",
+    "expected": {
+      "kind": "vmove",
+      "motion": "w"
+    }
+  },
+  {
+    "label": "visual: b",
+    "expected": {
+      "kind": "vmove",
+      "motion": "b"
+    }
+  },
+  {
+    "label": "visual: e",
+    "expected": {
+      "kind": "vmove",
+      "motion": "e"
+    }
+  },
+  {
+    "label": "visual: 0",
+    "expected": {
+      "kind": "vmove",
+      "motion": "0"
+    }
+  },
+  {
+    "label": "visual: $",
+    "expected": {
+      "kind": "vmove",
+      "motion": "$"
+    }
+  },
+  {
+    "label": "visual: gg",
+    "expected": {
+      "kind": "pending",
+      "prefix": "g"
+    }
+  },
+  {
+    "label": "visual: G",
+    "expected": {
+      "kind": "vmove",
+      "motion": "G"
+    }
+  },
+  {
+    "label": "visual: 1-9",
+    "expected": {
+      "kind": "count",
+      "digit": 3
+    }
+  },
+  {
+    "label": "visual: o",
+    "expected": {
+      "kind": "vswap"
+    }
+  },
+  {
+    "label": "visual: v",
+    "expected": {
+      "kind": "vback"
+    }
+  },
+  {
+    "label": "visual: V",
+    "expected": {
+      "kind": "vtoggle",
+      "line": true
+    }
+  },
+  {
+    "label": "visual: y",
+    "expected": {
+      "kind": "vyank"
+    }
+  },
+  {
+    "label": "visual: >",
+    "expected": {
+      "kind": "vquote"
+    }
+  },
+  {
+    "label": "visual: Esc",
+    "expected": {
+      "kind": "vback"
+    }
+  },
+  {
+    "label": "visual: Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "visual: Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
+    }
+  },
+  {
+    "label": "visual: ?",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "vline: h",
+    "expected": {
+      "kind": "vmove",
+      "motion": "h"
+    }
+  },
+  {
+    "label": "vline: l",
+    "expected": {
+      "kind": "vmove",
+      "motion": "l"
+    }
+  },
+  {
+    "label": "vline: j",
+    "expected": {
+      "kind": "vmove",
+      "motion": "j"
+    }
+  },
+  {
+    "label": "vline: k",
+    "expected": {
+      "kind": "vmove",
+      "motion": "k"
+    }
+  },
+  {
+    "label": "vline: w",
+    "expected": {
+      "kind": "vmove",
+      "motion": "w"
+    }
+  },
+  {
+    "label": "vline: b",
+    "expected": {
+      "kind": "vmove",
+      "motion": "b"
+    }
+  },
+  {
+    "label": "vline: e",
+    "expected": {
+      "kind": "vmove",
+      "motion": "e"
+    }
+  },
+  {
+    "label": "vline: 0",
+    "expected": {
+      "kind": "vmove",
+      "motion": "0"
+    }
+  },
+  {
+    "label": "vline: $",
+    "expected": {
+      "kind": "vmove",
+      "motion": "$"
+    }
+  },
+  {
+    "label": "vline: gg",
+    "expected": {
+      "kind": "pending",
+      "prefix": "g"
+    }
+  },
+  {
+    "label": "vline: G",
+    "expected": {
+      "kind": "vmove",
+      "motion": "G"
+    }
+  },
+  {
+    "label": "vline: 1-9",
+    "expected": {
+      "kind": "count",
+      "digit": 3
+    }
+  },
+  {
+    "label": "vline: o",
+    "expected": {
+      "kind": "vswap"
+    }
+  },
+  {
+    "label": "vline: v",
+    "expected": {
+      "kind": "vtoggle",
+      "line": false
+    }
+  },
+  {
+    "label": "vline: V",
+    "expected": {
+      "kind": "vback"
+    }
+  },
+  {
+    "label": "vline: y",
+    "expected": {
+      "kind": "vyank"
+    }
+  },
+  {
+    "label": "vline: >",
+    "expected": {
+      "kind": "vquote"
+    }
+  },
+  {
+    "label": "vline: Esc",
+    "expected": {
+      "kind": "vback"
+    }
+  },
+  {
+    "label": "vline: Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "vline: Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
+    }
+  },
+  {
+    "label": "vline: ?",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "visual: d",
+    "expected": {
+      "kind": "vend",
+      "key": "d"
+    }
+  },
+  {
+    "label": "visual: a",
+    "expected": {
+      "kind": "vend",
+      "key": "a"
+    }
+  },
+  {
+    "label": "visual: Shift+D",
+    "expected": {
+      "kind": "vend",
+      "key": "D"
+    }
+  },
+  {
+    "label": "visual: Ctrl+c, a turn is running",
+    "expected": {
+      "kind": "interrupt"
+    }
+  },
+  {
+    "label": "caret: h",
+    "expected": {
+      "kind": "vmove",
+      "motion": "h"
+    }
+  },
+  {
+    "label": "caret: l",
+    "expected": {
+      "kind": "vmove",
+      "motion": "l"
+    }
+  },
+  {
+    "label": "caret: j",
+    "expected": {
+      "kind": "vmove",
+      "motion": "j"
+    }
+  },
+  {
+    "label": "caret: k",
+    "expected": {
+      "kind": "vmove",
+      "motion": "k"
+    }
+  },
+  {
+    "label": "caret: w",
+    "expected": {
+      "kind": "vmove",
+      "motion": "w"
+    }
+  },
+  {
+    "label": "caret: b",
+    "expected": {
+      "kind": "vmove",
+      "motion": "b"
+    }
+  },
+  {
+    "label": "caret: e",
+    "expected": {
+      "kind": "vmove",
+      "motion": "e"
+    }
+  },
+  {
+    "label": "caret: 0",
+    "expected": {
+      "kind": "vmove",
+      "motion": "0"
+    }
+  },
+  {
+    "label": "caret: $",
+    "expected": {
+      "kind": "vmove",
+      "motion": "$"
+    }
+  },
+  {
+    "label": "caret: gg",
+    "expected": {
+      "kind": "pending",
+      "prefix": "g"
+    }
+  },
+  {
+    "label": "caret: G",
+    "expected": {
+      "kind": "vmove",
+      "motion": "G"
+    }
+  },
+  {
+    "label": "caret: 1-9",
+    "expected": {
+      "kind": "count",
+      "digit": 3
+    }
+  },
+  {
+    "label": "caret: v",
+    "expected": {
+      "kind": "vtoggle",
+      "line": false
+    }
+  },
+  {
+    "label": "caret: V",
+    "expected": {
+      "kind": "vtoggle",
+      "line": true
+    }
+  },
+  {
+    "label": "caret: Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "caret: Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
+    }
+  },
+  {
+    "label": "caret: Esc",
+    "expected": {
+      "kind": "vend",
+      "key": "Escape"
+    }
+  },
+  {
+    "label": "caret: ?",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "caret: d",
+    "expected": {
+      "kind": "vend",
+      "key": "d"
+    }
+  },
+  {
+    "label": "caret: a",
+    "expected": {
+      "kind": "vend",
+      "key": "a"
+    }
+  },
+  {
+    "label": "caret: Shift+D",
+    "expected": {
+      "kind": "vend",
+      "key": "D"
+    }
+  },
+  {
+    "label": "caret: Enter",
+    "expected": {
+      "kind": "vend",
+      "key": "Enter"
+    }
+  },
+  {
+    "label": "caret: Ctrl+c, idle",
+    "expected": {
+      "kind": "vswallow"
+    }
+  },
+  {
+    "label": "caret: Ctrl+c, a turn is running",
+    "expected": {
+      "kind": "interrupt"
+    }
   }
 ]

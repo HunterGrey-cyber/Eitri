@@ -10,6 +10,13 @@ export function runSummary(calls: ToolCallRecord[]): string {
   return Array.from(counts, ([name, n]) => `${name} ×${n}`).join(" · ");
 }
 
+/** v1 trial item 7: with 4A (the acceptEdits fast path), a `Write`/`Edit`/`NotebookEdit` can now
+ *  finish with no card at all, exactly as an ordinary read does -- so without this exclusion the
+ *  loop below would fold it into a `Read ×4 · Edit ×1`-shaped run and the change it made would
+ *  never be its own row. A run of other tools now stops at one of these three, on both sides, the
+ *  same way a failed or still-gated call already does; reads and searches keep folding as before. */
+const NEVER_FOLDED_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+
 /** P2 (ruling 21): consecutive finished, ungated tool calls -- two or more, with something after
  *  them or a turn that is over -- become one `run` row. Expanded runs and the detailed view keep
  *  every call.
@@ -30,7 +37,14 @@ export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineI
     const start = i;
     while (i < timeline.length) {
       const item = timeline[i];
-      if (item.kind !== "tool" || item.call.result === null || item.call.result.isError || gated.has(item.call.toolUseId)) break;
+      if (
+        item.kind !== "tool" ||
+        item.call.result === null ||
+        item.call.result.isError ||
+        gated.has(item.call.toolUseId) ||
+        NEVER_FOLDED_TOOLS.has(item.call.name)
+      )
+        break;
       i++;
     }
     const length = i - start;

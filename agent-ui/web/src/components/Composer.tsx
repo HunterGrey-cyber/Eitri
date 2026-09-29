@@ -228,8 +228,9 @@ export function Composer({
     if (disabled || editingInNvim) return;
     const body = text;
     // Spec §9.2: a held-back slash command (no-op/error/hangs classed, or interactive-only --
-    // `/login`, `/config`, `/resume` always, `/model` only without an argument) is never sent, not
-    // even queued or "sent now": the draft stays exactly as typed and the flash names it.
+    // `/login`, `/config`, `/resume`) is never sent, not even queued or "sent now": the draft stays
+    // exactly as typed and the flash names it. (A bare `/model` or `/effort` is sent since the v1
+    // trial's item 2 and opens a picker parsed from the CLI's reply.)
     const held = heldBackSlashCommand(body);
     if (held !== null) {
       showSlashFlash(slashCommandFlashText(held));

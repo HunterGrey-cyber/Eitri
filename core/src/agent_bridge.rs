@@ -757,22 +757,47 @@ pub struct CallNotes {
     /// Tool-use id -> the note for a call whose CLI prompt neovibe answered without a card (O3 review
     /// item 7): "Claude Code safety check — allowed in bypass" / "— allowed with your approval".
     pub prompt_notes: BTreeMap<String, String>,
+    /// Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered without a
+    /// card (v1 trial item 7, `agent::permission_policy`'s module doc, "The acceptEdits fast path").
+    /// No message of its own -- unlike `allowed_by_rule` there is only one fast path, so the row just
+    /// says "allowed by auto" (`tab_set::note_auto_edit_answers`). Recorded where the fast path
+    /// answers (`AgentBackend::answer_what_needs_no_human`), never inferred from a missing card
+    /// (whole-branch review finding 2, 2026-09-28).
+    pub allowed_by_auto: BTreeSet<String>,
+    /// Tool-use ids of a `Write` answered `allow` without a card -- by the acceptEdits fast path in
+    /// Auto, or in bypass -- over a path where nothing existed just before the answer was sent (fix
+    /// round finding 1; bypass since whole-branch review finding 6). `creates_file` above only ever
+    /// learns this from a delivered `PermissionRequested`, which neither answer leaves -- so without
+    /// this, such a call kept `creates_file_call` false forever and its row showed the overwrite
+    /// warning ("Writes the whole file...") for a file that never existed, exactly backwards. Its
+    /// only source is `AgentBackend::answer_what_needs_no_human`'s `AnsweredForYou::creates_file`.
+    /// The name (and the wire key `autoCreatesFile`) predate bypass joining it.
+    pub auto_creates_file: BTreeSet<String>,
 }
 
 impl CallNotes {
     pub fn is_empty(&self) -> bool {
-        self.allowed_by_rule.is_empty() && self.creates_file.is_empty() && self.prompt_notes.is_empty()
+        self.allowed_by_rule.is_empty()
+            && self.creates_file.is_empty()
+            && self.prompt_notes.is_empty()
+            && self.allowed_by_auto.is_empty()
+            && self.auto_creates_file.is_empty()
     }
 
-    /// Whether this tool-use id's `Write` created its file (see `creates_file`).
+    /// Whether this tool-use id's `Write` created its file (see `creates_file` and, for the
+    /// fast-path case a card never raised, `auto_creates_file`).
     fn creates_file_call(&self, tool_use_id: &str) -> bool {
         self.creates_file.values().any(|id| id.as_deref() == Some(tool_use_id))
+            || self.auto_creates_file.contains(tool_use_id)
     }
 }
 
 /// [`serialize_events_for_js`], plus what `notes` says about this batch:
-/// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]` (v1 polish F18) and
-/// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]` (F22). Each is left out when empty.
+/// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]` (v1 polish F18),
+/// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]` (F22),
+/// `"autoNotes":["toolu_..", ...]` (v1 trial item 7), and
+/// `"autoCreatesFile":["toolu_..", ...]` (fix round finding 1; a bypass `Write` too since
+/// whole-branch review finding 6). Each is left out when empty.
 pub fn serialize_events_with_notes_for_js(
     tab: crate::tabs::TabId,
     from_revision: u64,
@@ -807,6 +832,12 @@ pub fn serialize_events_with_notes_for_js(
             .iter()
             .map(|(permission_id, tool_use_id)| json!({ "permissionId": permission_id, "toolUseId": tool_use_id }))
             .collect();
+    }
+    if !notes.allowed_by_auto.is_empty() {
+        payload["autoNotes"] = notes.allowed_by_auto.iter().cloned().collect();
+    }
+    if !notes.auto_creates_file.is_empty() {
+        payload["autoCreatesFile"] = notes.auto_creates_file.iter().cloned().collect();
     }
     payload.to_string()
 }
@@ -877,9 +908,12 @@ pub fn serialize_snapshot_for_js(
 }
 
 /// [`serialize_snapshot_for_js`], with what `notes` says so a reload or a tab switch keeps it:
-/// `allowedByRule` on each tool call a saved prefix rule answered (v1 polish F18), and
+/// `allowedByRule` on each tool call a saved prefix rule answered (v1 polish F18),
 /// `createsFile: true` on a `Write` card, and on its tool call, whose file did not exist when the
-/// card was raised (F22). Absent on every other entry, as in the events payload.
+/// card was raised (F22) OR when a card was never raised at all because the acceptEdits fast path
+/// answered it (fix round finding 1, `CallNotes::creates_file_call`), and `allowedByAuto: true` on
+/// a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered (v1 trial item 7). Absent on
+/// every other entry, as in the events payload.
 pub fn serialize_snapshot_with_notes_for_js(
     tab: crate::tabs::TabId,
     view: &SnapshotView<'_>,
@@ -929,6 +963,9 @@ pub fn serialize_snapshot_with_notes_for_js(
             }
             if notes.creates_file_call(&call.tool_use_id) {
                 entry["createsFile"] = json!(true);
+            }
+            if notes.allowed_by_auto.contains(&call.tool_use_id) {
+                entry["allowedByAuto"] = json!(true);
             }
             if let Some(note) = notes.prompt_notes.get(&call.tool_use_id) {
                 entry["promptNote"] = json!(note);

@@ -3724,12 +3724,14 @@ mod tests {
         set.get_mut(other).unwrap().backend = TabBackend::Live(backend);
         assert_eq!(set.active(), other, "the user has switched away");
         // `perm-1` must really be pending on the asking tab: a conversation refuses an answer to a
-        // permission it never asked for. A `Write` needs a human, so the pump leaves it a card.
+        // permission it never asked for. A `Write` needs a human, so the pump leaves it a card --
+        // `.git/main.rs` rather than plain `main.rs` since fix round 1 (2026-09-28, v1 trial item
+        // 4A): an ordinary in-project `Write` no longer cards at all under the acceptEdits fast path.
         asking_provider.queue(agent::AgentDomainEvent::PermissionRequested {
             permission_id: "perm-1".into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
             provider_prompt: None,
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

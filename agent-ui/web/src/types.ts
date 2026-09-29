@@ -33,11 +33,19 @@ export type ToolCallRecord = {
   /** v1 polish F18: the saved prefix rule that answered this call's permission request
    *  (`Bash(git log *)`), when a rule and not the user did. Absent on every other call. */
   allowedByRule?: string;
-  /** v1 polish F22: this `Write`'s card was raised over no file (see `PermissionRequestRecord`). */
+  /** v1 polish F22: this `Write`'s card was raised over no file (see `PermissionRequestRecord`),
+   *  OR (fix round finding 1) this `Write` was answered by the acceptEdits fast path with no card
+   *  raised at all, over a path that did not exist when the call started. Either way: a completed
+   *  row reads "Creates a new file" rather than the overwrite warning. */
   createsFile?: boolean;
   /** O3 review item 7: the CLI's own prompt for this call was answered without a card -- "Claude Code
    *  safety check — allowed in bypass" / "— allowed with your approval". Absent on every other call. */
   promptNote?: string;
+  /** v1 trial item 7: this `Write`/`Edit`/`NotebookEdit` was answered by the acceptEdits fast path
+   *  (`agent::permission_policy`) with no card. Absent on every other call, a carded or
+   *  rule-answered one (`allowedByRule`) included -- the two are mutually exclusive, since no rule
+   *  ever fires for these three tools at all. */
+  allowedByAuto?: boolean;
 };
 /** `toolUseId` is the link back to the `ToolCallRecord` this request gates -- the same id that
  * call is keyed on.

@@ -36,9 +36,18 @@ export function dashItems(hello: Hello): DashItem[] {
  *  `agent/src/permission_policy.rs` and the owner's 2026-09-20 Bypass ruling actually do -- not the
  *  mockup's own wording, which this project has no way to keep in sync with the policy by
  *  construction. A mode this build does not know (neither key present) draws no line at all,
- *  rather than a guess. */
+ *  rather than a guess.
+ *
+ *  **v1 trial item 4C (owner trial feedback §4, §4b, "C: say what the mode is"):** `auto`'s line
+ *  describes Claude Code's acceptEdits fast path, item 4A: `Write`/`Edit`/`NotebookEdit` inside the
+ *  project, outside its protected paths, run with no card, as project reads and read-only `Bash`
+ *  already did; anything else is a card. That is what `agent/src/permission_policy.rs` does in this
+ *  build -- 4A merged into `fix/v1-trial` (`5559877`); the line was written ahead of it, on the
+ *  owner's instruction, and the two disagreed only until then (dated record, 2026-09-28 (v1 trial,
+ *  item 4C) and (v1 trial, whole-branch review fixes)). The key and the name "auto" are unchanged
+ *  (owner: "The key stays and its name stays 'auto'"). `bypass`'s line is untouched. */
 export const MODE_CONSEQUENCE: Record<string, string> = {
-  auto: "Reads inside the project run by themselves; edits and other commands ask you.",
+  auto: "Edits in this project and safe reads run; anything else asks.",
   bypass: "Nothing asks: edits and commands run unasked.",
 };
 
@@ -66,11 +75,13 @@ function narrowCwd(path: string): string {
   return short.startsWith("~") ? `~/…/${base}` : `…/${base}`;
 }
 
-/** `<cwd, ~-abbreviated> · <backend> · <account>` (spec §7); narrow drops the account and cuts the
- *  cwd, backend stays either way. */
+/** `<cwd, ~-abbreviated> · <account>` (v1 trial item 1, correcting spec §7: the line used to read
+ *  `<cwd> · <backend> · <account>`, but the backend reads "sidecar" in every release build and
+ *  carries nothing -- decision 6 already said it lives only in `prefix i` / `<leader>i`). narrow
+ *  drops the account and cuts the cwd. */
 function whereLine(hello: Hello, narrow: boolean): string {
   const cwd = narrow ? narrowCwd(hello.projectDir) : abbreviateHome(hello.projectDir);
-  const parts = [cwd, hello.backend];
+  const parts = [cwd];
   if (!narrow && hello.account !== null) parts.push(hello.account);
   return parts.join(" · ");
 }

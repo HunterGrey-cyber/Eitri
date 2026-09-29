@@ -55,12 +55,19 @@ const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map(SLASH_COMMANDS.m
 /** Spec §9.2's own list: held back regardless of the table's class above, because a real
  *  interactive terminal opens a picker/wizard for these that a headless turn cannot draw --
  *  `docs/canonical/2026-09-27-slash-commands.md`'s "Overlap with spec §9.2" note records that all
- *  four degraded to a plain-text summary instead when Task 10 sent them anyway. `/model` is
- *  interactive-only only WITHOUT an argument: `/model sonnet` is an ordinary, sendable turn (the
- *  probe's own evidence row shows `/model` alone printing "Usage: /model <name>" -- a menu prompt,
- *  not a menu). */
+ *  four degraded to a plain-text summary instead when Task 10 sent them anyway.
+ *
+ *  `/model` used to be held back only WITHOUT an argument (the spec's own reasoning: a real
+ *  interactive terminal opens a menu there). Owner trial item 2 (2026-09-28,
+ *  `the private review notes` §2, agreed per the same day's probe): a bare
+ *  `/model`/`/effort` prints real, parseable text headless (`"Current model: ... Usage: /model
+ *  <name>. Available: ..."` / `"Usage: /effort <low|medium|high|xhigh|max|auto>"`), so this panel
+ *  now sends it too and opens a picker built from that reply (`../components/SlashPicker`,
+ *  `./slashPicker`'s `parseModelReply`/`parseEffortReply`) rather than refusing it -- `/model` is
+ *  therefore no longer in this set at all. `/effort` was never in it (it has no row in
+ *  `SLASH_COMMANDS` -- an unknown slash word already falls through `heldBackSlashCommand` unheld,
+ *  the same route `/model` now takes). Dated record, 2026-09-28 (v1 trial, item 2). */
 const INTERACTIVE_ONLY_UNCONDITIONAL: ReadonlySet<string> = new Set(["login", "config", "resume"]);
-const INTERACTIVE_ONLY_WITHOUT_ARGUMENT = "model";
 
 /** Classes that are always held back, regardless of name (spec §9.2: "no-op, error, hangs"). No row
  *  in `SLASH_COMMANDS` carries one of these today -- kept as real classes rather than folded away so
@@ -68,8 +75,9 @@ const INTERACTIVE_ONLY_WITHOUT_ARGUMENT = "model";
 const HELD_BACK_CLASSES: ReadonlySet<SlashCommandClass> = new Set(["no-op", "error", "hangs"]);
 
 /** A draft's first word, if it is a slash command: `/name` alone, or `/name` followed by something
- *  else non-whitespace anywhere after it (an "argument", for `/model`'s own carve-out). Returns
- *  `null` for a draft that is not a slash command at all -- ordinary text, sent as always. */
+ *  else non-whitespace anywhere after it (an "argument" -- what tells `barePickerCommand` below a
+ *  bare `/model`/`/effort` apart from `/model sonnet`). Returns `null` for a draft that is not a
+ *  slash command at all -- ordinary text, sent as always. */
 function parseSlashCommand(text: string): { name: string; hasArgument: boolean } | null {
   const trimmed = text.trimStart();
   if (!trimmed.startsWith("/")) return null;
@@ -82,17 +90,28 @@ function parseSlashCommand(text: string): { name: string; hasArgument: boolean }
 
 /** Spec §9.2: whether Enter must refuse to send this draft. Returns the command name (without the
  *  leading "/", for the flash text below) when held back; `null` means send it as today -- a
- *  **works** or **sent-as-text** command, `/model`/anything else with an argument, and any unknown
- *  `/word` all fall through to `null` here. */
+ *  **works** or **sent-as-text** command, `/model`/`/effort` (bare or with an argument), and any
+ *  other unknown `/word` all fall through to `null` here. */
 export function heldBackSlashCommand(text: string): string | null {
   const parsed = parseSlashCommand(text);
   if (parsed === null) return null;
-  const { name, hasArgument } = parsed;
+  const { name } = parsed;
   if (INTERACTIVE_ONLY_UNCONDITIONAL.has(name)) return name;
-  if (name === INTERACTIVE_ONLY_WITHOUT_ARGUMENT && !hasArgument) return name;
   const entry = BY_NAME.get(name);
   if (entry !== undefined && HELD_BACK_CLASSES.has(entry.class)) return name;
   return null;
+}
+
+/** Owner trial item 2 (2026-09-28): whether `text` is exactly a bare `/model` or `/effort` -- no
+ *  argument, nothing else typed -- the shape whose reply this panel now parses into a picker
+ *  (`../components/SlashPicker`). Anything else (an argument present, a different command, plain
+ *  text) is `null`: `App.tsx` arms the picker's "watch the next turn_completed" state only on this,
+ *  never on `/model sonnet` (an ordinary, already-working send) or on the picker's own `onChoose`
+ *  send, which always carries an argument and so is never mistaken for a fresh bare command. */
+export function barePickerCommand(text: string): "model" | "effort" | null {
+  const parsed = parseSlashCommand(text);
+  if (parsed === null || parsed.hasArgument) return null;
+  return parsed.name === "model" || parsed.name === "effort" ? parsed.name : null;
 }
 
 /** Spec §9.2's own wording, verbatim: "the band flashes `/<name> does not work in neovibe — ? lists
@@ -112,11 +131,8 @@ export function worksSlashCommands(): string[] {
 /** What the `?` overlay lists (the v1-ui GUI pass, 2026-09-27): the **works** rows that Enter would
  *  actually send. The pass saw `/config` refused with "does not work in neovibe — ? lists the ones that
  *  do" while `?` listed `/config`, so the two contradicted each other on one screen. A command held
- *  back unconditionally (`/config`) is left out; `/model`, sendable only with an argument, is listed
- *  in that form. `worksSlashCommands` above stays the table's own class, unchanged. */
+ *  back unconditionally (`/config`, the only one left since owner trial item 2 removed `/model`'s own
+ *  holdback) is left out; `worksSlashCommands` above stays the table's own class, unchanged. */
 export function listedSlashCommands(): string[] {
-  return worksSlashCommands().flatMap((name) => {
-    if (heldBackSlashCommand(`/${name}`) === null) return [name];
-    return name === INTERACTIVE_ONLY_WITHOUT_ARGUMENT ? [`${name} <name>`] : [];
-  });
+  return worksSlashCommands().flatMap((name) => (heldBackSlashCommand(`/${name}`) === null ? [name] : []));
 }

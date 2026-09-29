@@ -40,9 +40,12 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
         ) : (
           /* Said rather than implied. A Write request carries only what the file WILL contain, so a
              patch-shaped rendering would suggest the rest of the file survives. It may not. Also
-             what is shown when nobody looked (a snapshot from before F22, a call no card gated). */
+             what is shown when nobody looked (a snapshot from before F22, a call no card gated).
+             v1 trial item 7: `preview.wholeFileNote` overrides this wording for a tool whose whole
+             content is not a whole file (`NotebookEdit`'s cell) -- `undefined` for `Write` keeps
+             this exact pinned sentence. */
           <div className="permission-card-edit-note">
-            Writes the whole file. The request does not say what is there now.
+            {preview.wholeFileNote ?? "Writes the whole file. The request does not say what is there now."}
           </div>
         ))}
       {preview.replaceAll && (

@@ -28,6 +28,12 @@ describe("the band degrades by priority (spec §5.3)", () => {
   it("shows mode and pill before the width is known (Review Focus 3)", () => {
     expect(ids(0, running)).toEqual(["mode", "pill"]);
   });
+  it("names CARET's own mode word and narrow letter (D16, added for 3a)", () => {
+    const caret: BandFacts = { ...idle, mode: "caret" };
+    expect(bandLayout(caret, 520, 7.2).find((s) => s.id === "mode")!.text).toBe("CARET");
+    const tiny = bandLayout({ ...caret, warn: "skew" }, 120, 7.2);
+    expect(tiny.find((s) => s.id === "mode")!.text).toBe("C");
+  });
   it("counts East Asian wide characters twice (Review Focus 3)", () => {
     expect(textWidth("zsh 补全")).toBe(8);
     // 8 + 9 + 31 (the wide name) + 10 + 7 = 65 > 50: model and position go, the context fits after.

@@ -68,8 +68,12 @@ export function textWidth(text: string): number {
  *  queue, context, model, position, unread) are untouched: they still degrade by priority, below. */
 
 const PAD = 2; // one character of padding each side (8px at --fs-sm)
-const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT" };
-const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H" };
+// Visual-mode spec D16 (O7's kept default, revised for 3a): CARET / VISUAL / V-LINE (V-LINE's own
+// word from lualine: utils/mode.lua:17,19, what his LazyVim statusline says; CARET has no lualine
+// precedent -- neovibe-only, qutebrowser's own caret mode is the source, D16's own note), narrow
+// C / V / VL.
+const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
+const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H", caret: "C", visual: "V", vline: "VL" };
 
 /** The bottom band's degrade rule (spec §5.3), a pure function of the facts and the measured
  *  width so it is testable without a browser. `widthPx <= 0` (before the first measurement,

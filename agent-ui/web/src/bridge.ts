@@ -147,6 +147,14 @@ type InboundHandler = (
         createsFile?: { permissionId: string; toolUseId: string | null }[];
         /** O3 review item 7: calls in this batch whose CLI prompt was answered without a card. */
         promptNotes?: { toolUseId: string; note: string }[];
+        /** v1 trial item 7: tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast
+         *  path answered with no card; absent when none were. */
+        autoNotes?: string[];
+        /** Fix round finding 1: tool-use ids of a `Write` answered with no card -- by the
+         *  acceptEdits fast path, or in bypass (whole-branch review finding 6) -- over a path where
+         *  nothing existed just before the answer -- `createsFile`'s own signal, but for a call that
+         *  never raised a card to carry it on. */
+        autoCreatesFile?: string[];
       }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`

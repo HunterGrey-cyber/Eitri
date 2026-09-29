@@ -199,7 +199,11 @@ pub fn test_workspace_dir(label: &str) -> PathBuf {
         .join("workspaces")
         .join(format!("{label}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("creating a test workspace directory should succeed");
-    dir
+    // Canonical, as a session's own project root always is: the permission policy cards every
+    // path-judged call under a root that does not resolve to itself, and macOS's `$TMPDIR` is under
+    // `/var -> private/var`.
+    dir.canonicalize()
+        .expect("a test workspace directory just created should resolve")
 }
 
 /// Removes every sibling root whose owning process is gone.

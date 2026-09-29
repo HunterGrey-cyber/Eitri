@@ -951,8 +951,29 @@ mod tests {
                     Axis::Column => [(r.x + r.w / 2, r.y), (r.x + r.w / 2, r.y + r.h)],
                 };
                 for (x, y) in presses {
+                    let got = pick(&children, &arrangement, x, y);
+                    // v1 trial item 6 (2026-09-28): the terminal's own pinned split now nests
+                    // around the editor's leaf, a subtree that can itself hold another split --
+                    // two Lua `main` panels, both shown, is the one case this matrix reaches.
+                    // Newly reachable: the single corner pixel where the terminal's own divider
+                    // begins is also the bottom edge of the nested main1/main2 divider, and the
+                    // later-added (so higher, by the very same "last in the child list wins"
+                    // rule host_stack_index relies on) handle wins there. Both targets are real,
+                    // adjacent dividers -- never a host -- so this is not the item 11 failure
+                    // mode this test exists to catch; it is named here rather than silently
+                    // accepted by loosening the assertion below.
+                    if panels.len() == 2
+                        && panels[0].0 == "main1"
+                        && panels[1].0 == "main2"
+                        && terminal_shown
+                        && n == 1
+                        && (x, y) == (r.x + r.w / 2, r.y)
+                    {
+                        assert_eq!(got, Some(Child::Handle(2)), "the known corner exception moved");
+                        continue;
+                    }
                     assert_eq!(
-                        pick(&children, &arrangement, x, y),
+                        got,
                         Some(Child::Handle(n)),
                         "{panels:?} (terminal shown: {terminal_shown}): a press at ({x}, {y}) on divider {n} {:?}",
                         divider.path
@@ -1127,7 +1148,7 @@ mod tests {
                 neovibe_core::layout::kill(
                     l,
                     &id,
-                    Reopen::At(neovibe_core::layout::Placement::BelowRoot),
+                    Reopen::At(neovibe_core::layout::Placement::BelowEditor),
                     &Frame::new(UNALLOCATED, 1),
                 )
             },
@@ -1230,29 +1251,31 @@ mod tests {
 
     /// The drag on the bottom terminal's divider, which is pinned (modules P2): the divider stays
     /// under the pointer, and what the drag leaves is a height in pixels that a taller window keeps.
+    /// Since v1 trial item 6 (2026-09-28) that divider is nested one level in (below the editor's
+    /// own leaf, not the root split), so it is found by its `Column` axis rather than an empty path.
     #[test]
     fn a_dragged_pinned_divider_stays_under_the_pointer_and_keeps_its_height() {
         let mut layout = crate::terminal::initial_layout(&[]).unwrap();
         layout.show(&ModuleId::terminal()).unwrap();
         let frame = Frame::new(UNALLOCATED, 1);
         assert!(neovibe_core::layout::settle_pins(&mut layout, &frame));
-        let root_divider = |layout: &Layout| {
+        let terminal_divider = |layout: &Layout| {
             arrange(layout, &frame)
                 .dividers
                 .into_iter()
-                .find(|d| d.path.is_empty())
+                .find(|d| d.axis == Axis::Column)
                 .unwrap()
         };
-        let begin = root_divider(&layout);
+        let begin = terminal_divider(&layout);
         assert_eq!(begin.rect.y, 480, "the terminal's first show, a third of 721");
         for step in 1..=10 {
             let pointer = begin.rect.y - 10 * step;
-            let now = root_divider(&layout);
+            let now = terminal_divider(&layout);
             let dy = f64::from(pointer - now.rect.y);
             let first_px = dragged_first_px(&begin, &now, 0.0, dy).unwrap();
             neovibe_core::layout::move_divider(&mut layout, &now, first_px).unwrap();
         }
-        assert_eq!(root_divider(&layout).rect.y, 380);
+        assert_eq!(terminal_divider(&layout).rect.y, 380);
         let taller = Frame::new(neovibe_core::layout::Size { w: 1280, h: 1041 }, 1);
         assert_eq!(
             arrange(&layout, &taller).rect_of(&ModuleId::terminal()).map(|r| r.h),

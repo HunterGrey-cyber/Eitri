@@ -87,6 +87,11 @@ export interface EditPreview {
   replaceAll: boolean;
   /** True when the whole file is being written, so the card can say so rather than imply a patch. */
   wholeFile: boolean;
+  /** The note `EditDiff` shows under a `wholeFile` change instead of `Write`'s own wording ("Writes
+   *  the whole file..."), for a tool whose whole-content write is not a whole file -- `NotebookEdit`
+   *  writes one cell's `new_source`, and the tool's own schema carries no "before" to diff against.
+   *  `undefined` when `wholeFile` is `false`, or for `Write`, which keeps its pinned wording. */
+  wholeFileNote?: string;
 }
 
 /** A reviewable preview for the tools that change a file, or `null` for every other tool.
@@ -131,6 +136,47 @@ export function editPreview(toolName: string, input: unknown): EditPreview | nul
       removed: 0,
       replaceAll: false,
       wholeFile: true,
+    };
+  }
+
+  // v1 trial item 7: `NotebookEdit`'s own schema (`notebook_path`, `new_source`) has no "before"
+  // field to diff against -- the tool is never told what a cell held, only asked what it should
+  // hold now -- so this is a whole-content write of one cell, the same shape `Write` is for a whole
+  // file, filed under `notebook_path` rather than `file_path`.
+  //
+  // Fix round finding 3: `edit_mode: "delete"` carries no `new_source` at all (there is nothing to
+  // write), so treating it like every other `NotebookEdit` produced an empty diff, "+0 −0" and
+  // "Writes the whole cell" -- true of nothing, and silent about the one thing that actually
+  // happened. `edit_mode` defaults to "replace" when the field is absent, matching the tool's own
+  // schema; only "delete" gets its own wording here, named by `cell_id` when the call gives one.
+  if (toolName === "NotebookEdit") {
+    const notebookPath = str("notebook_path");
+    const cellId = str("cell_id");
+    if (fields["edit_mode"] === "delete") {
+      if (notebookPath === "") return null;
+      return {
+        filePath: notebookPath,
+        diff: [],
+        added: 0,
+        removed: 0,
+        replaceAll: false,
+        wholeFile: true,
+        wholeFileNote: cellId
+          ? `Deletes cell ${cellId}. The request carries no record of what it held.`
+          : "Deletes a cell. The request carries no record of what it held.",
+      };
+    }
+    const newSource = str("new_source");
+    if (newSource === "" && notebookPath === "") return null;
+    const diff = lineDiff("", newSource);
+    return {
+      filePath: notebookPath,
+      diff,
+      added: lines(newSource).length,
+      removed: 0,
+      replaceAll: false,
+      wholeFile: true,
+      wholeFileNote: "Writes the whole cell. The request does not say what is there now.",
     };
   }
 

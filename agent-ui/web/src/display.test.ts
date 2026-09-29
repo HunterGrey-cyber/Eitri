@@ -59,6 +59,32 @@ describe("P2 runs", () => {
     expect(shown.map((i) => i.kind)).toEqual(["run", "tool", "message"]);
   });
 
+  it("v1 trial item 7: an edit between reads is never counted into a fold, on either side", () => {
+    // 4A (the acceptEdits fast path) auto-allows in-project Write/Edit/NotebookEdit with no card,
+    // so nothing else marks an edit as different from an ordinary finished, ungated call -- without
+    // this rule it would have folded into "Read ×4 · Edit ×1" and the change would have vanished
+    // behind a count. A run of other tools now stops at it instead, on both sides.
+    const items = [tool(call(1, "Read")), tool(call(2, "Read")), tool(call(3, "Edit")), tool(call(4, "Read")), tool(call(5, "Read"))];
+    const shown = buildDisplay(items, opts);
+    expect(shown.map((i) => i.kind)).toEqual(["run", "tool", "run"]);
+    const [before, edit, after] = shown as [Extract<TimelineItem, { kind: "run" }>, Extract<TimelineItem, { kind: "tool" }>, Extract<TimelineItem, { kind: "run" }>];
+    expect(runSummary(before.calls)).toBe("Read ×2");
+    expect(edit.call.toolUseId).toBe("t3");
+    expect(runSummary(after.calls)).toBe("Read ×2");
+  });
+
+  it("v1 trial item 7: Write, Edit and NotebookEdit never fold into a count-only run", () => {
+    const items = [tool(call(1, "Edit")), tool(call(2, "Edit")), tool(call(3, "Edit")), tool(call(4, "Edit")), tool(call(5, "Edit"))];
+    const shown = buildDisplay(items, opts);
+    expect(shown.map((i) => i.kind)).toEqual(["tool", "tool", "tool", "tool", "tool"]);
+    expect(shown.map((i) => (i as Extract<TimelineItem, { kind: "tool" }>).call.toolUseId)).toEqual(["t1", "t2", "t3", "t4", "t5"]);
+  });
+
+  it("v1 trial item 7: Write and NotebookEdit stop a fold the same way Edit does", () => {
+    const items = [tool(call(1, "Read")), tool(call(2, "Write")), tool(call(3, "Read")), tool(call(4, "NotebookEdit")), tool(call(5, "Read"))];
+    expect(buildDisplay(items, opts).map((i) => i.kind)).toEqual(["tool", "tool", "tool", "tool", "tool"]);
+  });
+
   it("finds a row by key, inside a run too", () => {
     const shown = buildDisplay([msg(1), tool(call(2, "Read")), tool(call(3, "Read")), msg(4)], opts);
     expect(indexOfKey(shown, "m-4")).toBe(2);

@@ -154,9 +154,43 @@ pub struct Tab {
     /// rule that answered a call (v1 polish F18, `note_rule_answers`), and the `Write` cards whose
     /// file did not exist when they were raised (F22, `note_new_files`).
     notes: CallNotes,
-    /// Tool-use id -> the rule that will answer it, for a call started but not yet finished. It
-    /// becomes a note only once the call completes with no card having been kept for it.
-    rule_candidates: std::collections::BTreeMap<String, String>,
+    /// Tool-use id -> the rule (and the `(tool_name, input)` its answer saw) whose gate
+    /// `AgentBackend::answer_what_needs_no_human` answered, until the call completes; it then
+    /// becomes `notes.allowed_by_rule`, exactly as `auto_edit_candidates` does (v1 trial
+    /// whole-branch review, fix round 3 -- the same fix as finding 2, moved to this pre-existing F18
+    /// note). Filled only from what that function reports it answered (`AnsweredForYou`'s
+    /// `by_rule`) -- never from a call that merely started and a rule WOULD answer, re-derived from
+    /// that `ToolCallStarted`'s own arguments, which was also true of a call that failed the CLI's
+    /// own validation before any gate, and of a gate a switch to bypass answered instead of the
+    /// rule. A card naming this id later kept for the same call drops it (the CLI's own prompt after
+    /// the gate); so does a later card naming NO id at all, whose own `(tool_name, input)` matches a
+    /// candidate's (review item 2: Verdandi's `permissionBroker.ts` sends `toolUseId: ''` when the
+    /// CLI gave none, and `translate.rs` maps that to `None`, so such a card can never be found by
+    /// id at all -- without this it would still read "allowed by rule" once a human approved it and
+    /// the call completed). A `Resync` turns one whose call finished among the dropped events into
+    /// its note. Cleared when a fresh backend is installed (`collect_starts`); on a `Resync`, an
+    /// entry whose id is still among the projection's pending permissions that nobody answered for
+    /// the user is dropped rather than kept -- the removing `PermissionRequested` a queue overflow
+    /// can drop, the same sibling gap `auto_edit_candidates` has.
+    rule_candidates: std::collections::BTreeMap<String, RuleCandidate>,
+    /// Tool-use id -> the `(tool_name, input)` its answer saw, for a `Write`/`Edit`/`NotebookEdit`
+    /// whose gate the acceptEdits fast path answered (v1 trial item 7), until the call completes; it
+    /// then becomes `notes.allowed_by_auto`, as a prompt-note candidate does
+    /// (`note_auto_edit_answers`). Filled only from what `AgentBackend::take_revised_ui_delivery`
+    /// reports it answered (`AnsweredForYou`'s `by_the_fast_path`) -- never from a call that merely
+    /// started and finished with no card, which was also true of a call that failed the CLI's own
+    /// validation before any gate (whole-branch review finding 2). A card naming this id later kept
+    /// for the same call drops it (the CLI's own prompt after the gate); so does a later card naming
+    /// NO id at all whose own `(tool_name, input)` matches (review item 2, the same fix as
+    /// `rule_candidates`'s own). A `Resync` turns one whose call finished among the dropped events
+    /// into its note. Cleared with `prompt_note_candidates`.
+    auto_edit_candidates: std::collections::BTreeMap<String, CandidateCall>,
+    /// Tool-use ids already in `notes.auto_creates_file` that no events payload has carried yet
+    /// (whole-branch review finding 6). The note is made when the gate is answered, and a gate
+    /// usually arrives in a batch of its own that the answer leaves empty (`RevisedDelivery::
+    /// Nothing`, no payload), so it waits here for the next one; a `Resync`'s snapshot carries every
+    /// note and empties it. Cleared with `auto_edit_candidates`.
+    creates_file_unsent: BTreeSet<String>,
     /// The pending permission ids `rule_offers` was last computed for, sorted, so the classifier
     /// (which canonicalizes `Bash` arguments) runs once per change rather than every tick.
     rule_offers_seen: Vec<String>,
@@ -221,6 +255,8 @@ impl Tab {
             rule_offers_seen: Vec::new(),
             notes: CallNotes::default(),
             rule_candidates: std::collections::BTreeMap::new(),
+            auto_edit_candidates: std::collections::BTreeMap::new(),
+            creates_file_unsent: BTreeSet::new(),
             turn_clock: None,
             host_answered: BTreeSet::new(),
             human_allowed: crate::agent_backend::HumanApprovals::default(),
@@ -912,6 +948,8 @@ impl TabSet {
         // re-check would reprompt anyway; this is the belt to that brace.
         tab.human_allowed.clear();
         tab.prompt_note_candidates.clear();
+        tab.auto_edit_candidates.clear();
+        tab.creates_file_unsent.clear();
         self.pending_bypass = None;
         Ok(match old {
             TabBackend::Live(backend) => Some(backend),
@@ -987,6 +1025,8 @@ impl TabSet {
                 tab.host_answered.clear();
                 tab.human_allowed.clear();
                 tab.prompt_note_candidates.clear();
+                tab.auto_edit_candidates.clear();
+                tab.creates_file_unsent.clear();
                 tab.user_answered.clear();
                 continue;
             };
@@ -1000,7 +1040,7 @@ impl TabSet {
             // `tab.human_allowed` (O3 ruling 5): in `Auto`, the CLI's own prompt for exactly a call
             // the user approved on a card here is answered without a second card, once. What was
             // answered without a card becomes a note on its call's row when the call completes.
-            let mut answered_for_you = Vec::new();
+            let mut answered_for_you = crate::agent_backend::AnsweredForYou::default();
             let delivery = backend.take_revised_ui_delivery(
                 project_root,
                 rules,
@@ -1029,9 +1069,44 @@ impl TabSet {
             let covered = covered.filter(|_| !self.redeliver_covered);
             tab.prompt_note_candidates.extend(
                 answered_for_you
+                    .prompts
                     .into_iter()
                     .map(|answered| (answered.tool_use_id, answered.note)),
             );
+            // Whole-branch review findings 2 and 6, and the same fix applied to the pre-existing F18
+            // rule note (fix round 3): what the fast path answered, what a saved rule answered, and
+            // each `Write` answered without a card over no file, all as recorded at the answer
+            // itself. The first two wait for their call to complete (`note_auto_edit_answers`,
+            // `note_rule_answers`); the third is true already, and waits only for a payload to carry
+            // it (`creates_file_unsent`).
+            tab.auto_edit_candidates
+                .extend(answered_for_you.by_the_fast_path.into_iter().map(|a| {
+                    (
+                        a.tool_use_id,
+                        CandidateCall {
+                            tool_name: a.tool_name,
+                            input: a.input,
+                        },
+                    )
+                }));
+            tab.rule_candidates
+                .extend(answered_for_you.by_rule.into_iter().map(|a| {
+                    (
+                        a.tool_use_id,
+                        RuleCandidate {
+                            rule: a.rule,
+                            call: CandidateCall {
+                                tool_name: a.tool_name,
+                                input: a.input,
+                            },
+                        },
+                    )
+                }));
+            for id in answered_for_you.creates_file {
+                if tab.notes.auto_creates_file.insert(id.clone()) {
+                    tab.creates_file_unsent.insert(id);
+                }
+            }
             // The CLI-mode tripwire (spec §2.3, D12), before anything of this delivery reaches the
             // panel or the attention count: from the batch itself, or -- for a report a `Resync`
             // dropped, or one folded ahead of its delivery -- from the projection's record. The
@@ -1123,18 +1198,11 @@ impl TabSet {
                             _ => {}
                         }
                     }
-                    // Read, never written (the mode code is not this function's): a bypass session
-                    // answers without the classifier, so no rule answered anything there. `Tab::mode`
-                    // is the only authority (v1-mode, R07/S2): the CLI itself never runs ungated.
-                    let bypass = tab.mode == SessionModeChoice::Bypass;
                     let fresh_notes = CallNotes {
                         allowed_by_rule: note_rule_answers(
                             &mut tab.rule_candidates,
                             &mut tab.notes.allowed_by_rule,
                             &events,
-                            project_root,
-                            rules,
-                            bypass,
                         ),
                         creates_file: note_new_files(&mut tab.notes.creates_file, &events, project_root),
                         prompt_notes: note_prompt_answers(
@@ -1142,6 +1210,12 @@ impl TabSet {
                             &mut tab.notes.prompt_notes,
                             &events,
                         ),
+                        allowed_by_auto: note_auto_edit_answers(
+                            &mut tab.auto_edit_candidates,
+                            &mut tab.notes.allowed_by_auto,
+                            &events,
+                        ),
+                        auto_creates_file: std::mem::take(&mut tab.creates_file_unsent),
                     };
                     // Every card in the batch is counted, those the snapshot drew included: they are
                     // pending all the same, and this tab has not counted them yet.
@@ -1214,6 +1288,95 @@ impl TabSet {
                                 tab.notes.prompt_notes.insert(id, note);
                             }
                         }
+                        // Whole-branch review finding 2: a fast-path answer is a fact, recorded when
+                        // it was given, so a call that finished among the dropped events becomes its
+                        // note here the same way -- it used to linger as a candidate for good.
+                        let finished: Vec<String> = tab
+                            .auto_edit_candidates
+                            .keys()
+                            .filter(|id| {
+                                projection
+                                    .tool_calls
+                                    .iter()
+                                    .any(|call| &call.tool_use_id == *id && call.result.is_some())
+                            })
+                            .cloned()
+                            .collect();
+                        for id in finished {
+                            tab.auto_edit_candidates.remove(&id);
+                            tab.notes.allowed_by_auto.insert(id);
+                        }
+                        // The same fix, applied to the pre-existing F18 rule note (this task, v1
+                        // trial whole-branch review, fix round 3): a rule's own answer is a fact
+                        // recorded when it was given, so a call that finished among the dropped
+                        // events becomes its note here too. Before this there was no analogous sweep
+                        // at all for `rule_candidates`, so such a candidate lingered here forever --
+                        // the still-pending sweep below only catches a permission genuinely still
+                        // pending, never a call that already finished.
+                        let finished: Vec<String> = tab
+                            .rule_candidates
+                            .keys()
+                            .filter(|id| {
+                                projection
+                                    .tool_calls
+                                    .iter()
+                                    .any(|call| &call.tool_use_id == *id && call.result.is_some())
+                            })
+                            .cloned()
+                            .collect();
+                        for id in finished {
+                            if let Some(candidate) = tab.rule_candidates.remove(&id) {
+                                tab.notes.allowed_by_rule.insert(id, candidate.rule);
+                            }
+                        }
+                        // The snapshot below carries every note, these included.
+                        tab.creates_file_unsent.clear();
+                    }
+                    // Fix round finding 2: a candidate whose removing `PermissionRequested` was
+                    // itself among the dropped events is not swept above (`prompt_note_candidates`'
+                    // sweep only catches a candidate whose call ALSO finished inside the same drop)
+                    // -- so it can survive a resync as a live candidate while the projection already
+                    // shows its permission still pending, about to be drawn as a real card by the
+                    // snapshot below. `answer_what_needs_no_human` never runs on a dropped batch (see
+                    // its own doc), so nothing here was silently fast-pathed: whatever answers this
+                    // card from here is a human, in every mode. Removed rather than turned into a
+                    // note, the same as the event this stands in for would have done -- left in
+                    // place, the human's own later approval would complete the call through the
+                    // ordinary path and wrongly read "allowed by auto" for a call they answered on
+                    // screen.
+                    //
+                    // v1 trial item 7 review, follow-up: `rule_candidates` has the identical shape --
+                    // its own `PermissionRequested` removal step (`note_rule_answers`) is exactly as
+                    // droppable, and left alone it would wrongly read "allowed by rule" instead. Swept
+                    // the same way, by id rather than by value.
+                    //
+                    // Whole-branch review finding 2: a request this tab answered for the user
+                    // (`host_answered` -- the fast path's, a rule's, bypass's) can still be listed as
+                    // pending until the provider's own `PermissionResolved` is folded, and is no card
+                    // (the snapshot below hides it): it is left out, or a fast-path answer recorded
+                    // at the answer itself would be dropped by a `Resync` that merely came early.
+                    // Since then an auto candidate exists only once the fast path answered its gate,
+                    // so the card this still catches for one is the CLI's own later prompt for the
+                    // same call. **The same has been true of a rule candidate since this task's own
+                    // fix** (it used to exist from a `ToolCallStarted` alone, before any gate was
+                    // answered) -- so the card this still catches for one is exactly the same shape,
+                    // the CLI's own later prompt for the same call. The `host_answered` filter itself
+                    // is load-bearing for both -- without it, a candidate whose own gate this tab just
+                    // answered, but whose resolution the provider has not folded yet, would wrongly
+                    // count as still needing a human and be swept away before its call even finishes:
+                    // `a_resync_before_the_call_finishes_keeps_its_fast_path_answer` and
+                    // `a_resync_before_the_call_finishes_keeps_its_rule_answer` each fail with it
+                    // removed (checked by mutation in this task).
+                    {
+                        let still_pending: BTreeSet<String> = backend
+                            .projection()
+                            .pending_permissions
+                            .values()
+                            .filter(|p| !tab.host_answered.contains(&p.permission_id))
+                            .filter_map(|p| p.tool_use_id.clone())
+                            .collect();
+                        tab.auto_edit_candidates.retain(|id, _| !still_pending.contains(id));
+                        tab.rule_candidates.retain(|id, _| !still_pending.contains(id));
                     }
                     let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
                     // D9: a resync in bypass sweeps whatever the overflow dropped through the same
@@ -1337,6 +1500,8 @@ impl TabSet {
                     tab.attention.restart();
                     tab.notes = CallNotes::default();
                     tab.rule_candidates.clear();
+                    tab.auto_edit_candidates.clear();
+                    tab.creates_file_unsent.clear();
                     tab.prompt_note_candidates.clear();
                     tab.last_handoff = None;
                     tab.reported_start_failure = false;
@@ -1668,47 +1833,91 @@ impl TabSet {
     }
 }
 
+/// The exact `(tool_name, input)` a rule's or the fast path's own answer saw, kept alongside a
+/// candidate so a LATER card for the very same call -- but whose own `PermissionRequested` names
+/// NO tool-use id -- can still be matched by content and drop the candidate (review item 2:
+/// Verdandi's `permissionBroker.ts` sends `toolUseId: ''` when the CLI gave none, and `translate.rs`
+/// maps that to `None`, so such a card has no id for the ordinary "same id" removal to find at
+/// all). Equality is exact (`Value` equality, which ignores object key order), the same choice
+/// `HumanApprovals` makes and for the same reason: small, short-lived sets, no canonical form to
+/// get wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateCall {
+    tool_name: String,
+    input: serde_json::Value,
+}
+
+/// A saved prefix rule's own candidate (v1 polish F18): its display string, and the call its answer
+/// saw, for the id-less-card match `CandidateCall`'s own doc describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuleCandidate {
+    rule: String,
+    call: CandidateCall,
+}
+
+/// A later `PermissionRequested` in this batch that drops a candidate: the ordinary case, naming
+/// this exact tool-use id; or -- review item 2 -- one naming no id at all, whose own
+/// `(tool_name, input)` matches a candidate's. The second case picks the first match in id order
+/// (stable, since candidates are a `BTreeMap`); two identical concurrent calls answered the same way
+/// could in principle collide here, matching the wrong one of the two, but each is `Bash`/`Write`/
+/// `Edit`/`NotebookEdit` with identical arguments and an identical downstream note either way, so
+/// nothing a row shows can actually differ.
+fn dropped_candidate_id<'a, V>(
+    candidates: &'a std::collections::BTreeMap<String, V>,
+    tool_use_id: &Option<String>,
+    tool_name: &str,
+    input: &serde_json::Value,
+    call_of: impl Fn(&'a V) -> &'a CandidateCall,
+) -> Option<String> {
+    if let Some(id) = tool_use_id {
+        return candidates.contains_key(id).then(|| id.clone());
+    }
+    for (id, value) in candidates {
+        let call = call_of(value);
+        if call.tool_name == tool_name && call.input == *input {
+            return Some(id.clone());
+        }
+    }
+    None
+}
+
 /// v1 polish F18: which tool calls in this batch a saved prefix rule answered, as (tool-use id,
 /// `Bash(git log *)`), recorded in the tab's `notes` for later snapshots too.
 ///
-/// The auto-answer itself happens in `AgentBackend::take_ui_delivery_with_rules`, which drops the
-/// request and says so only on stderr; this re-asks `agent::rule_that_allows` -- the very condition
-/// `classify_with_rules` answers by -- for each `ToolCallStarted`, and keeps the answer as a
-/// candidate. A card kept for that call (`PermissionRequested` naming its tool-use id: the
-/// auto-answer failed, or the rules changed in between) drops the candidate; the call completing
-/// without one makes it a note, because a gated call cannot complete before its gate is answered.
-/// Never in bypass, where nothing was classified. A card that names no tool-use id cannot drop a
-/// candidate, so a failed auto-answer on such a request could still be noted as the rule's.
+/// `candidates` holds only what `AgentBackend::answer_what_needs_no_human` reported it answered by
+/// a saved rule, recorded at that answer (v1 trial whole-branch review, fix round 3 -- the same
+/// fix as finding 2, applied to this pre-existing note). A `PermissionRequested` in this batch
+/// naming one of them drops it: a card was delivered for the same call after all (the CLI's own
+/// prompt after the gate), by id in the ordinary case and by content when the card names no id at
+/// all (review item 2, `dropped_candidate_id`'s own doc). A `ToolCallCompleted` turns a surviving
+/// candidate into a note. This used to make every `ToolCallStarted` a rule WOULD answer a
+/// candidate, by re-asking `agent::rule_that_allows` on that event's own arguments -- before any
+/// gate existed to answer -- and infer the answer from no card ever having arrived: also true of a
+/// call the CLI's `validateInput` failed before any hook ran (no gate at all), and of a gate a
+/// switch to bypass answered instead of the rule. Each read "allowed by rule <rule>" with nothing
+/// having allowed it by that rule.
 fn note_rule_answers(
-    candidates: &mut std::collections::BTreeMap<String, String>,
+    candidates: &mut std::collections::BTreeMap<String, RuleCandidate>,
     notes: &mut std::collections::BTreeMap<String, String>,
     events: &[AgentDomainEvent],
-    project_root: &Path,
-    rules: &agent::PrefixRules,
-    bypass: bool,
 ) -> std::collections::BTreeMap<String, String> {
     let mut fresh = std::collections::BTreeMap::new();
     for event in events {
         match event {
-            AgentDomainEvent::ToolCallStarted {
+            AgentDomainEvent::PermissionRequested {
                 tool_use_id,
-                name,
+                tool_name,
                 input,
                 ..
-            } if !bypass && !rules.is_empty() => {
-                if let Some(rule) = agent::rule_that_allows(name, input, project_root, rules) {
-                    candidates.insert(tool_use_id.clone(), rule);
+            } => {
+                if let Some(id) = dropped_candidate_id(candidates, tool_use_id, tool_name, input, |c| &c.call) {
+                    candidates.remove(&id);
                 }
             }
-            AgentDomainEvent::PermissionRequested {
-                tool_use_id: Some(id), ..
-            } => {
-                candidates.remove(id);
-            }
             AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
-                if let Some(rule) = candidates.remove(tool_use_id) {
-                    notes.insert(tool_use_id.clone(), rule.clone());
-                    fresh.insert(tool_use_id.clone(), rule);
+                if let Some(candidate) = candidates.remove(tool_use_id) {
+                    notes.insert(tool_use_id.clone(), candidate.rule.clone());
+                    fresh.insert(tool_use_id.clone(), candidate.rule);
                 }
             }
             _ => {}
@@ -1717,16 +1926,56 @@ fn note_rule_answers(
     fresh
 }
 
+/// v1 trial item 7: which `Write`/`Edit`/`NotebookEdit` calls in this batch the acceptEdits fast
+/// path (`agent::permission_policy`'s module doc, "The acceptEdits fast path") answered without a
+/// card, as tool-use ids, recorded in the tab's `notes.allowed_by_auto` for later snapshots too.
+///
+/// `candidates` holds only what `AgentBackend::answer_what_needs_no_human` reported it answered by
+/// the fast path, recorded at that answer (whole-branch review finding 2, 2026-09-28). A
+/// `PermissionRequested` in this batch naming one of them drops it: a card was delivered for the
+/// same call after all (the CLI's own prompt after the gate, `agent::permission_policy`'s module doc
+/// on the fast path), so a human answered too -- by id in the ordinary case and by content when the
+/// card names no id at all (review item 2, `dropped_candidate_id`'s own doc). A `ToolCallCompleted`
+/// turns a surviving candidate into a note. This used to make every `ToolCallStarted` of those tools
+/// in `Auto` a candidate and infer the answer from no card having been delivered, which was also
+/// true of a call the CLI's `validateInput` failed before any hook ran, of a card whose request
+/// named no tool-use id, and of a gate a switch to bypass answered: each read "allowed by auto" with
+/// nothing having allowed it.
+fn note_auto_edit_answers(
+    candidates: &mut std::collections::BTreeMap<String, CandidateCall>,
+    notes: &mut BTreeSet<String>,
+    events: &[AgentDomainEvent],
+) -> BTreeSet<String> {
+    let mut fresh = BTreeSet::new();
+    for event in events {
+        match event {
+            AgentDomainEvent::PermissionRequested {
+                tool_use_id,
+                tool_name,
+                input,
+                ..
+            } => {
+                if let Some(id) = dropped_candidate_id(candidates, tool_use_id, tool_name, input, |c| c) {
+                    candidates.remove(&id);
+                }
+            }
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
+                if candidates.remove(tool_use_id).is_none() {
+                    continue;
+                }
+                notes.insert(tool_use_id.clone());
+                fresh.insert(tool_use_id.clone());
+            }
+            _ => {}
+        }
+    }
+    fresh
+}
+
 /// v1 polish F22: the `Write` cards in this batch whose file does not exist now, when the card is
-/// raised -- recorded in `notes` for later snapshots and returned as this batch's own. Nothing at
-/// all at the path counts, a dangling symlink included, since the write would follow it; a relative
+/// raised -- recorded in `notes` for later snapshots and returned as this batch's own. A relative
 /// `file_path` (the tool asks for an absolute one) is read against the project root. Checked once,
 /// here: after an approval the file exists, and the card must go on meaning what it meant.
-///
-/// Only a lookup that says "not found" counts as no file. Any other failure (a parent directory
-/// this process may not search, a path through a regular file) says nothing about whether the
-/// write would replace something, so the card keeps its overwrite warning: an uncertain answer
-/// resolves toward the warning, as the permission policy's own uncertainties resolve toward a card.
 fn note_new_files(
     notes: &mut std::collections::BTreeMap<String, Option<String>>,
     events: &[AgentDomainEvent],
@@ -1754,11 +2003,7 @@ fn note_new_files(
         else {
             continue;
         };
-        let absent = matches!(
-            std::fs::symlink_metadata(project_root.join(file_path)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        );
-        if absent {
+        if crate::agent_backend::file_absent(&project_root.join(file_path)) {
             notes.insert(permission_id.clone(), tool_use_id.clone());
             fresh.insert(permission_id.clone(), tool_use_id.clone());
         }
@@ -1943,12 +2188,20 @@ mod tests {
         }
     }
 
+    /// A `Write` that still needs a human, on purpose: `.git/main.rs` is a protected path (fix round
+    /// 1, 2026-09-28, v1 trial item 4A -- an ordinary in-project `Write` like plain `main.rs` no
+    /// longer cards at all under the acceptEdits fast path, and every test below that uses this
+    /// helper as a stand-in for "some permission request that needs asking" would otherwise be
+    /// asserting on a card that never arrives). What is under test here is the queueing, attention
+    /// and confirmation machinery, not the fast path itself -- that has its own unit tests in
+    /// `agent::permission_policy` -- so any reliably-carding call would do; `.git/` keeps this one
+    /// recognizably a `Write`.
     fn write(id: &str) -> AgentDomainEvent {
         AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
             provider_prompt: None,
         }
     }
@@ -4430,6 +4683,811 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// v1 trial item 7: an in-project `Write` the acceptEdits fast path answers with no card is
+    /// named "allowed by auto" -- on the events envelope as it happens, and on the snapshot after --
+    /// while a `Write` into a protected path (`.git/`, still carded, `write()`'s own reason for
+    /// existing) carries no such note and stays a pending card.
+    #[test]
+    fn an_edit_the_fast_path_allowed_is_named_auto_in_events_and_snapshots() {
+        let dir = workspace("tabs-auto-notes");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let started_call = |id: &str, name: &str, input: serde_json::Value| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: name.into(),
+            input,
+        };
+        let gate = |perm: &str, id: &str, name: &str, input: serde_json::Value| AgentDomainEvent::PermissionRequested {
+            permission_id: perm.into(),
+            tool_use_id: Some(id.into()),
+            tool_name: name.into(),
+            input,
+            provider_prompt: None,
+        };
+        let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        };
+        provider.queue(started("t1"));
+        provider.queue(started_call(
+            "toolu_write",
+            "Write",
+            serde_json::json!({ "file_path": "new.rs", "content": "fn new() {}" }),
+        ));
+        provider.queue(gate(
+            "perm-write",
+            "toolu_write",
+            "Write",
+            serde_json::json!({ "file_path": "new.rs", "content": "fn new() {}" }),
+        ));
+        provider.queue(done("toolu_write"));
+        provider.queue(started_call(
+            "toolu_gitwrite",
+            "Write",
+            serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+        ));
+        provider.queue(gate(
+            "perm-gitwrite",
+            "toolu_gitwrite",
+            "Write",
+            serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+        ));
+        let mut payloads = Vec::new();
+        until(
+            "the fast path to answer the in-project write, and the protected one to card",
+            || {
+                payloads.extend(set.pump(&dir, true).active_payload);
+                payloads
+                    .iter()
+                    .any(|p| p.contains("toolu_write") && p.contains("tool_call_completed"))
+                    && payloads.iter().any(|p| p.contains("perm-gitwrite"))
+            },
+        );
+        let auto_notes: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("autoNotes").cloned())
+            .collect();
+        assert_eq!(auto_notes, vec![serde_json::json!(["toolu_write"])]);
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let calls = snapshot["state"]["toolCalls"].as_array().unwrap();
+        let auto_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c["toolUseId"] == id)
+                .unwrap()
+                .get("allowedByAuto")
+                .cloned()
+        };
+        assert_eq!(auto_of("toolu_write"), Some(serde_json::json!(true)));
+        assert_eq!(auto_of("toolu_gitwrite"), None, "a card was shown, not the fast path");
+        let pending = snapshot["state"]["pendingPermissions"].as_array().unwrap();
+        assert!(
+            pending.iter().any(|p| p["permissionId"] == "perm-gitwrite"),
+            "the protected write is still a card, not silently allowed"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// A rule can never fire for `Write`/`Edit`/`NotebookEdit` at all
+    /// (`agent::permission_policy`'s module doc), so a fast-path allow can never carry a rule note
+    /// too -- pinned directly rather than left to follow from the two features never overlapping in
+    /// practice.
+    #[test]
+    fn an_auto_allowed_edit_never_also_carries_a_rule_note() {
+        let dir = workspace("tabs-auto-notes-no-rule");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" }),
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-edit".into(),
+            tool_use_id: Some("toolu_edit".into()),
+            tool_name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" }),
+            provider_prompt: None,
+        });
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        until("the edit to finish", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_edit") && p.contains("tool_call_completed"))
+        });
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = &snapshot["state"]["toolCalls"][0];
+        assert_eq!(call["allowedByAuto"], serde_json::json!(true));
+        assert!(call.get("allowedByRule").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Fix round finding 1: a `Write` the acceptEdits fast path answers with no card still marks
+    /// its completed row as creating a file, when the target did not exist -- F22's own
+    /// `note_new_files` never runs for this call, since it is driven by a delivered
+    /// `PermissionRequested`, which `answer_what_needs_no_human` drops. Before this, the row kept
+    /// the overwrite warning for a file that never existed. Since whole-branch review finding 6 the
+    /// check is made by `answer_what_needs_no_human` itself, just before its `allow` is sent (it was
+    /// a `ToolCallStarted`-driven `note_auto_creates_file`, gated to Auto).
+    #[test]
+    fn an_auto_allowed_write_over_no_file_is_marked_as_creating_one() {
+        let dir = workspace("tabs-auto-new-file");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_new".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "brand_new.rs", "content": "fn x() {}" }),
+        });
+        // The gate the fast path answers (whole-branch review finding 2: the note is recorded where
+        // that answer happens, so a test with no gate has nothing to note -- this one used to leave
+        // it out, the very shape of a call that failed validation before the CLI asked).
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-new".into(),
+            tool_use_id: Some("toolu_new".into()),
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": "brand_new.rs", "content": "fn x() {}" }),
+            provider_prompt: None,
+        });
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_new".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        let mut payloads = Vec::new();
+        until("the fast-path write to complete", || {
+            payloads.extend(set.pump(&dir, true).active_payload);
+            payloads
+                .iter()
+                .any(|p| p.contains("toolu_new") && p.contains("tool_call_completed"))
+        });
+        let auto_creates: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("autoCreatesFile").cloned())
+            .collect();
+        assert_eq!(auto_creates, vec![serde_json::json!(["toolu_new"])]);
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == "toolu_new")
+            .unwrap();
+        assert_eq!(call["createsFile"], serde_json::json!(true));
+        assert_eq!(call["allowedByAuto"], serde_json::json!(true));
+        shut_down_all(&mut set);
+    }
+
+    /// Codex's finding (fix round finding 2), and this task's own correction (v1 trial whole-branch
+    /// review, fix round 3): the `Resync` arm's still-pending sweep protects a genuine fast-path
+    /// candidate -- a queue overflow can drop a follow-up card's own `PermissionRequested` (the event
+    /// that would ordinarily remove it from `auto_edit_candidates`) while the projection (complete by
+    /// construction) still shows the permission pending, so the `Resync` snapshot draws a real card
+    /// for it. Left alone, the human's later approval on that card would complete the call through
+    /// the ordinary path and wrongly read "allowed by auto" for a call answered on screen.
+    ///
+    /// **Correction (this task):** the previous version of this test edited `.git/probe`, which item
+    /// 4A (2026-09-28) cards outright -- no fast-path candidate was ever created, so the assertions
+    /// below passed even with the still-pending sweep's `retain` deleted, pinning nothing. This
+    /// version edits an in-project file the fast path genuinely answers, then overflows the CLI's own
+    /// follow-up prompt for the same call so a real candidate survives to be swept.
+    #[test]
+    fn a_resync_drops_a_fast_path_candidate_whose_further_card_survived_the_overflow() {
+        let dir = workspace("tabs-resync-drops-candidate");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input =
+            serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" });
+
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_edit", "Edit", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("toolu_edit".into()),
+            tool_name: "Edit".into(),
+            input: input.clone(),
+            provider_prompt: None,
+        });
+        until("the fast path to answer the gate", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-gate")
+        });
+        assert!(set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_edit"));
+
+        // The CLI's own follow-up prompt for the same call (O3), plus filler enough to overflow the
+        // queue so the whole batch -- the prompt's `PermissionRequested` included -- is dropped and
+        // this tick's drain is a `Resync`. Queued as one batch (`queue_all`'s doc): a `queue` call
+        // per event would let the ingestion thread fold the follow-up card alone, well before the
+        // filler loop even finishes pushing the rest, so the `until` below could succeed before the
+        // batch had actually overflowed.
+        let mut batch = vec![
+            resolved("perm-gate"),
+            cli_prompt("perm-edit", "toolu_edit", "Edit", input, None),
+        ];
+        batch.extend((0..(agent::UI_EVENT_QUEUE_CAPACITY + 20)).map(|i| text_delta("t1", &format!("chunk {i}"))));
+        provider.queue_all(batch);
+        until("the projection to carry the follow-up card", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            backend.projection().pending_permissions.contains_key("perm-edit")
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert!(
+            !set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_edit"),
+            "the still-pending sweep must drop a candidate whose own further card is genuinely pending"
+        );
+
+        set.answer_card(tab, "perm-edit", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-edit"));
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        until("the edit to complete", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_edit") && p.contains("tool_call_completed"))
+        });
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == "toolu_edit")
+            .unwrap();
+        assert!(
+            call.get("allowedByAuto").is_none(),
+            "a human approved this on screen; it must never read allowed by auto"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review finding 2 (v1 trial, 2026-09-28), the helpers for the three shapes below.
+    fn call_started(id: &str, name: &str, input: serde_json::Value) -> AgentDomainEvent {
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: name.into(),
+            input,
+        }
+    }
+
+    fn call_done(id: &str, is_error: bool) -> AgentDomainEvent {
+        AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            content: serde_json::json!(if is_error { "File has not been read yet." } else { "ok" }),
+            is_error,
+        }
+    }
+
+    /// Pumps until `id`'s completion was delivered, returning every payload the pumps produced.
+    fn pump_until_done(set: &mut TabSet, dir: &Path, id: &str) -> Vec<String> {
+        let mut payloads = Vec::new();
+        until("the call to complete", || {
+            payloads.extend(set.pump(dir, true).active_payload);
+            payloads
+                .iter()
+                .any(|p| p.contains(id) && p.contains("tool_call_completed"))
+        });
+        payloads
+    }
+
+    fn call_in_snapshot(set: &mut TabSet, id: &str) -> serde_json::Value {
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == id)
+            .cloned()
+            .unwrap()
+    }
+
+    fn auto_notes_in(payloads: &[String]) -> Vec<serde_json::Value> {
+        payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("autoNotes").cloned())
+            .collect()
+    }
+
+    /// Whole-branch review finding 2: the CLI runs a tool's `validateInput` BEFORE its `PreToolUse`
+    /// hooks, so an `Edit` of a file not read yet, or whose `old_string` is not there, completes
+    /// with `is_error` and no gate call at all. Nothing answered it -- the note used to be inferred
+    /// from the missing card, so an `Edit` of `/etc/hosts` that failed validation read "allowed by
+    /// auto".
+    #[test]
+    fn an_edit_that_failed_validation_before_the_gate_is_never_named_auto() {
+        let dir = workspace("tabs-auto-validation-failed");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_hosts",
+            "Edit",
+            serde_json::json!({ "file_path": "/etc/hosts", "old_string": "a", "new_string": "b" }),
+        ));
+        provider.queue(call_done("toolu_hosts", true));
+        provider.queue(call_started(
+            "toolu_main",
+            "Edit",
+            serde_json::json!({ "file_path": "main.rs", "old_string": "not there", "new_string": "b" }),
+        ));
+        provider.queue(call_done("toolu_main", true));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_main");
+        assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
+        for id in ["toolu_hosts", "toolu_main"] {
+            assert!(call_in_snapshot(&mut set, id).get("allowedByAuto").is_none(), "{id}");
+        }
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review finding 2: a card whose request names no tool-use id (the wire's empty id
+    /// maps to `None`) could never drop the candidate its `ToolCallStarted` made, so the human's own
+    /// approval of an out-of-project `Write` completed it as "allowed by auto".
+    #[test]
+    fn a_carded_edit_whose_request_names_no_tool_use_id_is_never_named_auto() {
+        let dir = workspace("tabs-auto-card-without-id");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input = serde_json::json!({ "file_path": "/etc/neovibe-out.txt", "content": "x" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_out", "Write", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-out".into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input,
+            provider_prompt: None,
+        });
+        until("the card to be delivered", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("perm-out"))
+        });
+        set.answer_card(tab, "perm-out", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-out"));
+        provider.queue(call_done("toolu_out", false));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_out");
+        assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
+        assert!(call_in_snapshot(&mut set, "toolu_out").get("allowedByAuto").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review finding 2: a switch to bypass between the call's start and its gate means
+    /// bypass answered it (`answer_what_needs_no_human`'s bypass branch), never the fast path -- the
+    /// candidate made in Auto used to survive into a note anyway.
+    #[test]
+    fn an_edit_bypass_answered_after_a_switch_is_never_named_auto() {
+        let dir = workspace("tabs-auto-then-bypass");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input =
+            serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_sw", "Edit", input.clone()));
+        until("the call to be delivered in Auto", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_sw"))
+        });
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Bypass;
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-sw".into(),
+            tool_use_id: Some("toolu_sw".into()),
+            tool_name: "Edit".into(),
+            input,
+            provider_prompt: None,
+        });
+        provider.queue(call_done("toolu_sw", false));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_sw");
+        assert!(
+            set.get(tab).unwrap().host_answered.contains("perm-sw"),
+            "bypass answered it"
+        );
+        assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
+        assert!(call_in_snapshot(&mut set, "toolu_sw").get("allowedByAuto").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review finding 6: bypass answers a `Write`'s gate and drops the request, so
+    /// F22's `note_new_files` (driven by a delivered `PermissionRequested`) never saw it, and the
+    /// fast path's own note was gated to Auto -- a bypass `Write` that created a file read "Writes the
+    /// whole file. The request does not say what is there now." The check now runs where the answer
+    /// is given, before it is sent, in both modes; a file that exists gets no such note.
+    #[test]
+    fn a_bypass_write_over_no_file_is_marked_as_creating_one() {
+        let dir = workspace("tabs-bypass-new-file");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Bypass;
+        provider.queue(started("t1"));
+        for (id, perm, path) in [
+            ("toolu_new", "perm-new", "fresh.rs"),
+            ("toolu_old", "perm-old", "main.rs"),
+        ] {
+            let input = serde_json::json!({ "file_path": path, "content": "fn x() {}" });
+            provider.queue(call_started(id, "Write", input.clone()));
+            provider.queue(AgentDomainEvent::PermissionRequested {
+                permission_id: perm.into(),
+                tool_use_id: Some(id.into()),
+                tool_name: "Write".into(),
+                input,
+                provider_prompt: None,
+            });
+            provider.queue(call_done(id, false));
+        }
+        pump_until_done(&mut set, &dir, "toolu_old");
+        let fresh = call_in_snapshot(&mut set, "toolu_new");
+        assert_eq!(fresh["createsFile"], serde_json::json!(true));
+        assert!(fresh.get("allowedByAuto").is_none(), "bypass, not the fast path");
+        assert!(call_in_snapshot(&mut set, "toolu_old").get("createsFile").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Finding 6's note must reach the panel on the events path too, not only in a later snapshot.
+    /// A gate usually arrives in a batch of its own, after its call's start; answered and dropped, it
+    /// leaves that batch empty (`RevisedDelivery::Nothing`), so a note made from the answer is held
+    /// for the next events payload rather than lost with the batch.
+    #[test]
+    fn a_created_file_note_answered_in_a_batch_of_its_own_reaches_the_next_events_payload() {
+        let dir = workspace("tabs-creates-file-alone");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Bypass;
+        let input = serde_json::json!({ "file_path": "alone.rs", "content": "fn x() {}" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_alone", "Write", input.clone()));
+        let mut payloads = Vec::new();
+        until("the call to be delivered", || {
+            payloads.extend(set.pump(&dir, true).active_payload);
+            payloads.iter().any(|p| p.contains("toolu_alone"))
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-alone".into(),
+            tool_use_id: Some("toolu_alone".into()),
+            tool_name: "Write".into(),
+            input,
+            provider_prompt: None,
+        });
+        until("bypass to answer the gate", || {
+            payloads.extend(set.pump(&dir, true).active_payload);
+            set.get(tab).unwrap().host_answered.contains("perm-alone")
+        });
+        provider.queue(call_done("toolu_alone", false));
+        payloads.extend(pump_until_done(&mut set, &dir, "toolu_alone"));
+        let creates: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("autoCreatesFile").cloned())
+            .collect();
+        assert_eq!(creates, vec![serde_json::json!(["toolu_alone"])]);
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review finding 2, the other half of recording the note where the answer is: a
+    /// fast-path answer is a candidate until its call completes, and a queue overflow that drops the
+    /// completion must still turn it into its note. **Correction (v1 trial fix round 2):** this test
+    /// lets the call finish before the `Resync`, so the finished sweep consumes the candidate before
+    /// the still-pending sweep's `host_answered` filter is reached; that filter is pinned by
+    /// `a_resync_before_the_call_finishes_keeps_its_fast_path_answer` below.
+    #[test]
+    fn a_resync_turns_a_fast_path_answer_whose_call_finished_into_its_note() {
+        let dir = workspace("tabs-resync-keeps-auto-answer");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input =
+            serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_fp", "Edit", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-fp".into(),
+            tool_use_id: Some("toolu_fp".into()),
+            tool_name: "Edit".into(),
+            input,
+            provider_prompt: None,
+        });
+        until("the fast path to answer the edit", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-fp")
+        });
+        assert!(set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_fp"));
+        // One batch, not one `queue` call per event (`queue_all`'s doc): otherwise the ingestion
+        // thread can fold the completion alone, before the filler loop even finishes pushing the
+        // rest of the batch, so the `until` below could succeed before the overflow actually did.
+        let mut batch = vec![call_done("toolu_fp", false)];
+        batch.extend((0..(agent::UI_EVENT_QUEUE_CAPACITY + 20)).map(|i| text_delta("t1", &format!("chunk {i}"))));
+        provider.queue_all(batch);
+        until("the projection to carry the completion", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            backend
+                .projection()
+                .tool_calls
+                .iter()
+                .any(|c| c.tool_use_id == "toolu_fp" && c.result.is_some())
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert_eq!(
+            call_in_snapshot(&mut set, "toolu_fp")["allowedByAuto"],
+            serde_json::json!(true)
+        );
+        assert!(!set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_fp"));
+        shut_down_all(&mut set);
+    }
+
+    /// v1 trial fix round 2 (re-review of finding 2, part a): a `Resync` that lands after the fast
+    /// path answered an edit's gate but BEFORE its call completes. The provider has not reported the
+    /// request resolved, so the projection still lists it pending; the still-pending sweep must leave
+    /// it out (`host_answered`) and keep the candidate, or the finished call would lose its "allowed
+    /// by auto" note to a `Resync` that merely came early.
+    #[test]
+    fn a_resync_before_the_call_finishes_keeps_its_fast_path_answer() {
+        let dir = workspace("tabs-resync-before-completion");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input =
+            serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_pa", "Edit", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-pa".into(),
+            tool_use_id: Some("toolu_pa".into()),
+            tool_name: "Edit".into(),
+            input,
+            provider_prompt: None,
+        });
+        until("the fast path to answer the edit", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-pa")
+        });
+        // One batch (`queue_all`'s doc), for the same reason every other prefix+filler sequence in
+        // this file uses it, even though this particular `until` loops on `pump` itself below and so
+        // has no premature-success race of its own.
+        provider.queue_all(
+            (0..(agent::UI_EVENT_QUEUE_CAPACITY + 20))
+                .map(|i| text_delta("t1", &format!("chunk {i}")))
+                .collect(),
+        );
+        let mut saw_snapshot = false;
+        until("a resync", || {
+            if let Some(p) = set.pump(&dir, true).active_payload {
+                let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+                saw_snapshot |= v["kind"] == "snapshot";
+            }
+            saw_snapshot
+        });
+        assert!(
+            set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_pa"),
+            "the resync dropped a fast-path candidate whose call had not finished"
+        );
+        provider.queue(call_done("toolu_pa", false));
+        pump_until_done(&mut set, &dir, "toolu_pa");
+        assert_eq!(
+            call_in_snapshot(&mut set, "toolu_pa")["allowedByAuto"],
+            serde_json::json!(true)
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// v1 trial fix round 2 (re-review of finding 2, part b): the fast path allowed the gate, then the
+    /// CLI raised its own prompt for the same call (its sensitive-file check, O3), a human approved
+    /// that card, and the call completed. A human answered it, so it must not read "allowed by auto"
+    /// -- the `PermissionRequested` arm of `note_auto_edit_answers` drops the candidate.
+    #[test]
+    fn the_clis_own_prompt_after_the_fast_path_drops_the_auto_note() {
+        let dir = workspace("tabs-cli-prompt-drops-auto");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input =
+            serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_pb", "Edit", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-pb-gate".into(),
+            tool_use_id: Some("toolu_pb".into()),
+            tool_name: "Edit".into(),
+            input: input.clone(),
+            provider_prompt: None,
+        });
+        until("the fast path to answer the gate", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-pb-gate")
+        });
+        assert!(set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_pb"));
+        provider.queue(resolved("perm-pb-gate"));
+        provider.queue(cli_prompt("perm-pb-cli", "toolu_pb", "Edit", input, None));
+        until("the CLI's own prompt as a card", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("perm-pb-cli"))
+        });
+        set.answer_card(tab, "perm-pb-cli", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-pb-cli"));
+        provider.queue(call_done("toolu_pb", false));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_pb");
+        assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
+        assert!(call_in_snapshot(&mut set, "toolu_pb").get("allowedByAuto").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// v1 trial fix round 2 (re-review of finding 2, part c): only `Write`/`Edit`/`NotebookEdit`
+    /// (`ACCEPT_EDITS_TOOLS`) answered by the fast path become candidates. A `Read` the classifier
+    /// allowed is answered by the same `answer_what_needs_no_human` and must not read "allowed by
+    /// auto" -- auto's note names the acceptEdits fast path (item 4A), not the read-only rules
+    /// every mode already had.
+    #[test]
+    fn a_classifier_allowed_read_is_never_named_auto() {
+        let dir = workspace("tabs-read-not-auto");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input = serde_json::json!({ "file_path": "main.rs" });
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_pc", "Read", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-pc".into(),
+            tool_use_id: Some("toolu_pc".into()),
+            tool_name: "Read".into(),
+            input,
+            provider_prompt: None,
+        });
+        until("the classifier to answer the read", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-pc")
+        });
+        assert!(!set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_pc"));
+        provider.queue(call_done("toolu_pc", false));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_pc");
+        assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
+        assert!(call_in_snapshot(&mut set, "toolu_pc").get("allowedByAuto").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// The item-7 review's finding 2 sibling gap (dated record, 2026-09-28, v1 trial, item 7), and
+    /// this task's own fix (whole-branch review, fix round 3): the `Resync` arm's still-pending
+    /// sweep protects `rule_candidates` the same way it protects `auto_edit_candidates` -- a queue
+    /// overflow can drop a follow-up card's own `PermissionRequested` (the event that would
+    /// ordinarily remove the candidate) while the projection (complete by construction) still shows
+    /// the permission pending, so the `Resync` snapshot draws a real card for it. Left alone, the
+    /// human's later approval on that card would complete the call through the ordinary path and
+    /// wrongly read "allowed by rule" for a call answered on screen.
+    ///
+    /// **Correction (this task):** the setup used to create the candidate from a bare
+    /// `ToolCallStarted`, which is exactly the pre-existing bug this task fixes -- `rule_candidates`
+    /// is now populated only from an answer `AgentBackend::answer_what_needs_no_human` actually gave.
+    /// The gate is answered by the rule first (a real candidate, recorded at that answer), then the
+    /// CLI's own follow-up prompt for the same call is the one whose overflow-dropped
+    /// `PermissionRequested` this test pins.
+    #[test]
+    fn a_resync_drops_a_rule_candidate_whose_further_card_survived_the_overflow() {
+        let dir = workspace("tabs-resync-drops-rule-candidate");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input = serde_json::json!({ "command": "npm ci" });
+
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_npm", "Bash", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("toolu_npm".into()),
+            tool_name: "Bash".into(),
+            input: input.clone(),
+            provider_prompt: None,
+        });
+        until("the rule to answer the gate as a candidate", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().rule_candidates.contains_key("toolu_npm")
+        });
+
+        // The CLI's own follow-up prompt for the same call (O3), plus filler enough to overflow the
+        // queue so the whole batch -- the prompt's `PermissionRequested` included -- is dropped and
+        // this tick's drain is a `Resync`. Queued as one batch (`queue_all`'s doc): a `queue` call
+        // per event would let the ingestion thread fold the follow-up card alone, well before the
+        // filler loop even finishes pushing the rest, so the `until` below could succeed before the
+        // batch had actually overflowed.
+        let mut batch = vec![
+            resolved("perm-gate"),
+            cli_prompt("perm-npm", "toolu_npm", "Bash", input, None),
+        ];
+        batch.extend((0..(agent::UI_EVENT_QUEUE_CAPACITY + 20)).map(|i| text_delta("t1", &format!("chunk {i}"))));
+        provider.queue_all(batch);
+        until("the projection to carry the follow-up card", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            backend.projection().pending_permissions.contains_key("perm-npm")
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert!(
+            !set.get(tab).unwrap().rule_candidates.contains_key("toolu_npm"),
+            "the still-pending sweep must drop a candidate whose own further card is genuinely pending"
+        );
+
+        set.answer_card(tab, "perm-npm", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-npm"));
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_npm".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        until("the npm call to complete", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_npm") && p.contains("tool_call_completed"))
+        });
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == "toolu_npm")
+            .unwrap();
+        assert!(
+            call.get("allowedByRule").is_none(),
+            "a human approved this on screen; it must never read allowed by rule"
+        );
+        shut_down_all(&mut set);
+    }
+
     /// P1-A2 round 2: when a snapshot already carried every event of the next drain, the payload
     /// leaves them all out -- but a note those events produce was not in that snapshot (it was read
     /// before this tab folded them), so it still goes to the panel, on an `events` envelope with no
@@ -4514,8 +5572,13 @@ mod tests {
     /// existing file does not, nor does its file appearing later change what the card said.
     #[test]
     fn a_write_card_over_no_file_is_marked_as_creating_one() {
+        // Fix round 1 (2026-09-28, v1 trial item 4A): both targets are now under `.git/` -- an
+        // ordinary top-level `new.txt`/`old.txt` no longer cards at all under the acceptEdits fast
+        // path, so this test (which is about the card's `createsFile` flag, not about the fast path
+        // itself) needs a target that still reaches a card either way.
         let dir = workspace("tabs-new-file");
-        std::fs::write(dir.join("old.txt"), "there").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/old.txt"), "there").unwrap();
         let mut set = set();
         let tab = set.active();
         let (provider, backend) = live(&dir);
@@ -4531,10 +5594,10 @@ mod tests {
             turn_id: "t1".into(),
             tool_use_id: "toolu_new".into(),
             name: "Write".into(),
-            input: serde_json::json!({ "file_path": dir.join("new.txt"), "content": "x" }),
+            input: serde_json::json!({ "file_path": dir.join(".git/new.txt"), "content": "x" }),
         });
-        provider.queue(write("perm-new", "toolu_new", dir.join("new.txt")));
-        provider.queue(write("perm-old", "toolu_old", dir.join("old.txt")));
+        provider.queue(write("perm-new", "toolu_new", dir.join(".git/new.txt")));
+        provider.queue(write("perm-old", "toolu_old", dir.join(".git/old.txt")));
         let mut payloads = Vec::new();
         until("both cards", || {
             payloads.extend(set.pump(&dir, true).active_payload);
@@ -4549,7 +5612,7 @@ mod tests {
             marked,
             vec![serde_json::json!([{ "permissionId": "perm-new", "toolUseId": "toolu_new" }])]
         );
-        std::fs::write(dir.join("new.txt"), "now there").unwrap();
+        std::fs::write(dir.join(".git/new.txt"), "now there").unwrap();
         let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
         let cards = snapshot["state"]["pendingPermissions"].as_array().unwrap();
         let creates = |id: &str| {
@@ -4605,19 +5668,14 @@ mod tests {
         assert_eq!(notes, fresh);
     }
 
-    /// v1 polish F18, the local review: the paths `a_call_a_rule_answered_is_named_in_events_and_snapshots`
-    /// cannot reach through a fake provider -- a card kept for a call a rule matched (the
-    /// auto-answer failed to send) drops the note, and a bypass session notes nothing.
+    /// v1 polish F18, the local review, rewritten for this task's fix (whole-branch review, fix
+    /// round 3): `note_rule_answers` no longer creates its own candidates from a `ToolCallStarted`'s
+    /// arguments (that was the pre-existing bug), so this seeds `candidates` directly, the way `pump`
+    /// extends `tab.rule_candidates` from `AnsweredForYou::by_rule`. A card kept for a candidate (the
+    /// rule's own auto-answer failed, or the CLI's own follow-up prompt after the gate) drops the
+    /// note; a candidate with no such card becomes one once its call completes.
     #[test]
-    fn a_kept_card_or_bypass_leaves_a_rule_matched_call_unnoted() {
-        let dir = workspace("tabs-rule-notes-direct");
-        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
-        let started = |id: &str| AgentDomainEvent::ToolCallStarted {
-            turn_id: "t1".into(),
-            tool_use_id: id.into(),
-            name: "Bash".into(),
-            input: serde_json::json!({ "command": "npm ci" }),
-        };
+    fn note_rule_answers_drops_a_kept_card_and_notes_a_surviving_candidate() {
         let card = |id: &str| AgentDomainEvent::PermissionRequested {
             permission_id: format!("perm-{id}"),
             tool_use_id: Some(id.into()),
@@ -4631,42 +5689,352 @@ mod tests {
             content: serde_json::json!("ok"),
             is_error: false,
         };
+        let rule_call = |command: &str| RuleCandidate {
+            rule: "Bash(npm ci *)".to_string(),
+            call: CandidateCall {
+                tool_name: "Bash".to_string(),
+                input: serde_json::json!({ "command": command }),
+            },
+        };
         let mut candidates = std::collections::BTreeMap::new();
+        candidates.insert("toolu_carded".to_string(), rule_call("npm ci"));
+        candidates.insert("toolu_ruled".to_string(), rule_call("npm ci"));
         let mut notes = std::collections::BTreeMap::new();
         // Spread over two batches, as a card and its answer are: the candidate outlives the first.
-        let first = note_rule_answers(
-            &mut candidates,
-            &mut notes,
-            &[started("toolu_carded"), card("toolu_carded"), started("toolu_ruled")],
-            &dir,
-            &rules,
-            false,
-        );
+        let first = note_rule_answers(&mut candidates, &mut notes, &[card("toolu_carded")]);
         assert!(first.is_empty());
         let second = note_rule_answers(
             &mut candidates,
             &mut notes,
             &[done("toolu_carded"), done("toolu_ruled")],
-            &dir,
-            &rules,
-            false,
         );
         assert_eq!(
             second.into_iter().collect::<Vec<_>>(),
             vec![("toolu_ruled".to_string(), "Bash(npm ci *)".to_string())]
         );
         assert!(candidates.is_empty());
-        let mut candidates = std::collections::BTreeMap::new();
-        let mut notes = std::collections::BTreeMap::new();
-        let bypassed = note_rule_answers(
-            &mut candidates,
-            &mut notes,
-            &[started("toolu_b"), done("toolu_b")],
-            &dir,
-            &rules,
-            true,
+        assert!(!notes.contains_key("toolu_carded"), "a card was delivered for it");
+        assert_eq!(notes.get("toolu_ruled"), Some(&"Bash(npm ci *)".to_string()));
+    }
+
+    /// Whole-branch review (v1 trial, fix round 3): the pre-existing F18 rule note had the same
+    /// defect class as finding 2 -- `note_rule_answers` used to re-ask `agent::rule_that_allows` on a
+    /// `ToolCallStarted`'s own arguments and infer the answer from no card ever having arrived. The
+    /// CLI runs a tool's `validateInput` BEFORE its `PreToolUse` hooks, so a `Bash` call that fails
+    /// validation completes with `is_error` and no `PermissionRequested` -- and no gate at all for a
+    /// rule to have answered -- but used to read "allowed by rule npm ci *" all the same.
+    #[test]
+    fn a_bash_call_that_failed_validation_before_the_gate_is_never_named_by_rule() {
+        let dir = workspace("tabs-rule-validation-failed");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_ci",
+            "Bash",
+            serde_json::json!({ "command": "npm ci" }),
+        ));
+        provider.queue(call_done("toolu_ci", true));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_ci");
+        let notes: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("ruleNotes").cloned())
+            .collect();
+        assert!(notes.is_empty(), "{payloads:?}");
+        assert!(call_in_snapshot(&mut set, "toolu_ci").get("allowedByRule").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review (v1 trial, fix round 3): a switch to bypass between the call's start and
+    /// its gate means bypass answered it (`answer_what_needs_no_human`'s bypass branch, which never
+    /// classifies), never the rule -- the candidate the old speculative check made from the started
+    /// call's own arguments used to survive into a note anyway.
+    #[test]
+    fn a_bash_call_bypass_answered_after_a_switch_is_never_named_by_rule() {
+        let dir = workspace("tabs-rule-then-bypass");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_sw",
+            "Bash",
+            serde_json::json!({ "command": "npm ci" }),
+        ));
+        until("the call to be delivered in Auto", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_sw"))
+        });
+        set.get_mut(tab).unwrap().mode = SessionModeChoice::Bypass;
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-sw".into(),
+            tool_use_id: Some("toolu_sw".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
+        });
+        provider.queue(call_done("toolu_sw", false));
+        let payloads = pump_until_done(&mut set, &dir, "toolu_sw");
+        assert!(
+            set.get(tab).unwrap().host_answered.contains("perm-sw"),
+            "bypass answered it"
         );
-        assert!(bypassed.is_empty() && notes.is_empty());
+        let notes: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("ruleNotes").cloned())
+            .collect();
+        assert!(notes.is_empty(), "{payloads:?}");
+        assert!(call_in_snapshot(&mut set, "toolu_sw").get("allowedByRule").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Review item 2: the CLI's own follow-up prompt for a call a rule already answered can carry
+    /// an EMPTY tool-use id (Verdandi's `permissionBroker.ts` sends `toolUseId: ''` when the CLI
+    /// gave none; `translate.rs` maps that to `None`), so the ordinary "same id" removal in
+    /// `note_rule_answers` can never find the candidate it should drop -- before this fix, the row
+    /// still read "allowed by rule" once a human approved that id-less card and the call completed.
+    /// Matched by content instead (`dropped_candidate_id`).
+    #[test]
+    fn an_id_less_follow_up_card_a_human_answers_drops_the_rule_candidate_by_content() {
+        let dir = workspace("tabs-rule-id-less-follow-up");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let input = serde_json::json!({ "command": "npm ci" });
+
+        provider.queue(started("t1"));
+        provider.queue(call_started("toolu_idless", "Bash", input.clone()));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("toolu_idless".into()),
+            tool_name: "Bash".into(),
+            input: input.clone(),
+            provider_prompt: None,
+        });
+        until("the rule to answer the gate as a candidate", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().rule_candidates.contains_key("toolu_idless")
+        });
+
+        // The CLI's own follow-up prompt for the same call, with NO tool-use id at all: the shape
+        // this review item is about. `needs_a_human()` is false (no ask rule, no unrecognized
+        // origin), and in Auto `HumanApprovals::matches` never matches an id-less prompt ("a prompt
+        // with no id matches nothing"), so this becomes a real card rather than being silently
+        // re-answered by the rule a second time.
+        provider.queue(resolved("perm-gate"));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-follow-up".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: input.clone(),
+            provider_prompt: Some(agent::ProviderPrompt {
+                reason: Some("Claude requested permissions to run this command.".into()),
+                description: None,
+                blocked_path: None,
+                matched_ask_rule: None,
+                unrecognized_origin: None,
+            }),
+        });
+        until("the id-less follow-up card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert!(
+            !set.get(tab).unwrap().rule_candidates.contains_key("toolu_idless"),
+            "the id-less follow-up card must still drop the candidate, matched by content"
+        );
+
+        set.answer_card(tab, "perm-follow-up", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-follow-up"));
+        provider.queue(call_done("toolu_idless", false));
+        pump_until_done(&mut set, &dir, "toolu_idless");
+        assert!(
+            call_in_snapshot(&mut set, "toolu_idless")
+                .get("allowedByRule")
+                .is_none(),
+            "a human approved the follow-up card; it must never read allowed by rule"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// Missing test (this task's own review, item 3): a rule-eligible call whose auto-answer the
+    /// provider refuses stays a real card (`answer_what_needs_no_human`'s "fail toward a card" doc,
+    /// mirroring `a_failed_allow_in_bypass_draws_the_card` in `agent_backend`'s own tests) -- with no
+    /// `by_rule` candidate ever recorded, since that is only ever extended in the `Ok` arm. The gate
+    /// itself carries an empty tool-use id, the shape review item 2 is about, to prove the new
+    /// content match in `note_rule_answers` (`dropped_candidate_id`) finds nothing to drop here and
+    /// stays inert: a human's own approval of this card must never read "allowed by rule".
+    #[test]
+    fn a_carded_rule_request_a_human_approves_is_never_named_by_rule() {
+        let dir = workspace("tabs-rule-refused-answer");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.refuse_resolutions(true);
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_refused",
+            "Bash",
+            serde_json::json!({ "command": "npm ci" }),
+        ));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-refused".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
+        });
+        until("the refused rule answer to fall back to a card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert!(
+            set.get(tab).unwrap().rule_candidates.is_empty(),
+            "the answer failed; no candidate was ever recorded"
+        );
+        provider.refuse_resolutions(false);
+        set.answer_card(tab, "perm-refused", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-refused"));
+        provider.queue(call_done("toolu_refused", false));
+        pump_until_done(&mut set, &dir, "toolu_refused");
+        assert!(call_in_snapshot(&mut set, "toolu_refused")
+            .get("allowedByRule")
+            .is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// Whole-branch review (v1 trial, fix round 3): the sibling gap `a_resync_turns_a_fast_path_
+    /// answer_whose_call_finished_into_its_note` fixed for `auto_edit_candidates` never had a rule
+    /// counterpart -- the `Resync` arm's "finished" sweep only ever covered `prompt_note_candidates`
+    /// and `auto_edit_candidates`, so a rule candidate whose call finished among a queue overflow's
+    /// dropped events lingered as a live candidate for good and never became its note at all.
+    #[test]
+    fn a_resync_turns_a_rule_answer_whose_call_finished_into_its_note() {
+        let dir = workspace("tabs-resync-keeps-rule-answer");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_rp",
+            "Bash",
+            serde_json::json!({ "command": "npm ci" }),
+        ));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-rp".into(),
+            tool_use_id: Some("toolu_rp".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
+        });
+        until("the rule to answer the call", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-rp")
+        });
+        assert!(set.get(tab).unwrap().rule_candidates.contains_key("toolu_rp"));
+        // One batch, not one `queue` call per event (`queue_all`'s doc): otherwise the ingestion
+        // thread can fold the completion alone, before the filler loop even finishes pushing the
+        // rest of the batch, so the `until` below could succeed before the overflow actually did.
+        let mut batch = vec![call_done("toolu_rp", false)];
+        batch.extend((0..(agent::UI_EVENT_QUEUE_CAPACITY + 20)).map(|i| text_delta("t1", &format!("chunk {i}"))));
+        provider.queue_all(batch);
+        until("the projection to carry the completion", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            backend
+                .projection()
+                .tool_calls
+                .iter()
+                .any(|c| c.tool_use_id == "toolu_rp" && c.result.is_some())
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert_eq!(
+            call_in_snapshot(&mut set, "toolu_rp")["allowedByRule"],
+            serde_json::json!("Bash(npm ci *)")
+        );
+        assert!(!set.get(tab).unwrap().rule_candidates.contains_key("toolu_rp"));
+        shut_down_all(&mut set);
+    }
+
+    /// Item (b) of this task's own review: the still-pending sweep's `host_answered` filter, pinned
+    /// for `auto_edit_candidates` by `a_resync_before_the_call_finishes_keeps_its_fast_path_answer`,
+    /// had no rule counterpart either. A `Resync` that lands after the rule answered a call's gate
+    /// but BEFORE its call completes: the provider has not reported the request resolved, so the
+    /// projection still lists it pending; the still-pending sweep must leave it out (`host_answered`)
+    /// and keep the candidate, or the finished call would lose its "allowed by rule" note to a
+    /// `Resync` that merely came early. Fails, exactly like its auto sibling, if the filter is
+    /// removed (verified by mutation in this task).
+    #[test]
+    fn a_resync_before_the_call_finishes_keeps_its_rule_answer() {
+        let dir = workspace("tabs-resync-before-rule-completion");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(call_started(
+            "toolu_rb",
+            "Bash",
+            serde_json::json!({ "command": "npm ci" }),
+        ));
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-rb".into(),
+            tool_use_id: Some("toolu_rb".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
+        });
+        until("the rule to answer the call", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().host_answered.contains("perm-rb")
+        });
+        // One batch (`queue_all`'s doc), for the same reason every other prefix+filler sequence in
+        // this file uses it, even though this particular `until` loops on `pump` itself below and so
+        // has no premature-success race of its own.
+        provider.queue_all(
+            (0..(agent::UI_EVENT_QUEUE_CAPACITY + 20))
+                .map(|i| text_delta("t1", &format!("chunk {i}")))
+                .collect(),
+        );
+        let mut saw_snapshot = false;
+        until("a resync", || {
+            if let Some(p) = set.pump(&dir, true).active_payload {
+                let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+                saw_snapshot |= v["kind"] == "snapshot";
+            }
+            saw_snapshot
+        });
+        assert!(
+            set.get(tab).unwrap().rule_candidates.contains_key("toolu_rb"),
+            "the resync dropped a rule candidate whose call had not finished"
+        );
+        provider.queue(call_done("toolu_rb", false));
+        pump_until_done(&mut set, &dir, "toolu_rb");
+        assert_eq!(
+            call_in_snapshot(&mut set, "toolu_rb")["allowedByRule"],
+            serde_json::json!("Bash(npm ci *)")
+        );
+        shut_down_all(&mut set);
     }
 
     /// Defect 8 (phase 2's sandbox pass): a background tab's turn trace was never observed.

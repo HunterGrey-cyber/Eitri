@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import type { BackendKind, ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
+import type { ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
 import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
@@ -11,7 +11,6 @@ type Props = {
   tabs: TabInfo[];
   active: TabId | null;
   defaultMode: PermissionModeChoice;
-  backend: BackendKind;
   projectDir: string;
   newTabChord: string;
   /** Wave 3 Task 1: bumped by `App` on `pane_focus` regaining focus, `enter_input` and `arrive`,
@@ -169,7 +168,6 @@ export function Chooser({
   tabs,
   active,
   defaultMode,
-  backend,
   projectDir,
   newTabChord,
   focusRequest,
@@ -365,7 +363,6 @@ export function Chooser({
                   row={row}
                   current={index === cursor}
                   needle={needle}
-                  backend={backend}
                   newTabChord={newTabChord}
                   renaming={renaming}
                   renameRef={renameRef}
@@ -394,7 +391,6 @@ function ChooserRowItem({
   row,
   current,
   needle,
-  backend,
   newTabChord,
   renaming,
   renameRef,
@@ -406,7 +402,6 @@ function ChooserRowItem({
   row: ChooserRow;
   current: boolean;
   needle: string;
-  backend: BackendKind;
   newTabChord: string;
   renaming: { tab: TabId; value: string } | null;
   renameRef: RefObject<HTMLInputElement>;
@@ -436,6 +431,11 @@ function ChooserRowItem({
     const sign = word === "running" ? "running" : word === "done, unread" ? "unread" : null;
     const mode = row.info?.mode ?? "auto";
     const title = row.info?.title ?? null;
+    // v1 trial item 1 (owner: "⏵⏵ auto · sidecar，这个东西应该出现在all session的选择上吗，是参考了别人的
+    // 设计，还是我们自己的设计失误" -- our own design mistake, not copied): bypass is the one mode worth
+    // a glance here (auto is the default and carries nothing new); the backend name is gone
+    // entirely (decision 6: it lives only in `prefix i` / `<leader>i`, `DetailPopover`).
+    const bypass = mode === "bypass";
     return (
       <div className={classes} onClick={onClick}>
         {current ? cursorSign : <span className={sign === null ? "chooser-sign" : `chooser-sign chooser-sign-${sign}`} />}
@@ -468,13 +468,24 @@ function ChooserRowItem({
           )}
           <span className="chooser-right">
             {row.tab.marker === "needs_input" && `⚑${row.tab.pending > 1 ? row.tab.pending : ""} `}
-            {word}
+            {/* An empty (not-started) tab's own label already says "new" (`tabs::label`); its state
+                word would only repeat it (v1 trial item 1). */}
+            {word !== "new" && word}
           </span>
         </span>
-        <span className="chooser-line2 chooser-muted">
-          <ModeGlyph mode={mode} /> {mode} · {backend}
-          {title !== null && ` · ${title}`}
-        </span>
+        {(bypass || title !== null) && (
+          <span className="chooser-line2 chooser-muted">
+            {/* The same `.mode-glyph[data-mode-name="bypass"]` token the band and the mode line
+                above already colour bypass with (`--nv-error`) -- no new colour invented. */}
+            {bypass && (
+              <>
+                <ModeGlyph mode="bypass" /> bypass
+              </>
+            )}
+            {bypass && title !== null && " · "}
+            {title}
+          </span>
+        )}
       </div>
     );
   }
@@ -489,7 +500,9 @@ function ChooserRowItem({
         <span className="chooser-right">{relativeWhen(Date.now(), record.updatedAt)}</span>
       </span>
       <span className="chooser-line2 chooser-muted">
-        {record.heldElsewhere ? "open in another window, can't be resumed here" : `sidecar · ${shortId(record.providerSessionId)}`}
+        {/* v1 trial item 1: no longer "sidecar · <id>" -- the backend carries nothing (every
+            release build reads "sidecar"), the short id is what tells an untitled record apart. */}
+        {record.heldElsewhere ? "open in another window, can't be resumed here" : shortId(record.providerSessionId)}
       </span>
     </div>
   );

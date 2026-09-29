@@ -12,14 +12,16 @@
 //! 2. refuses a tree without the editor or without the agent: every window has both, so a tree
 //!    missing one is not a layout of this window, and the caller falls back to the default;
 //! 3. **`init.lua`'s default only** ([`reconcile_default`]): pins a bottom row a first launch would
-//!    have pinned -- a module placed below the root (the terminal, a Lua `bottom` panel) that is a
-//!    full-width row at the bottom of the window. `init.lua` has no way to say "pin", and a bottom
-//!    row that grew with the window would be the P1 behaviour the owner turned down (the plan
+//!    have pinned -- a module placed below the root (a Lua `bottom` panel, or the terminal if an
+//!    `init.lua` default explicitly puts it there -- no longer where a first launch puts it itself,
+//!    v1 trial item 6, 2026-09-28, but still a shape this step recognises and pins the same way) that
+//!    is a full-width row at the bottom of the window. `init.lua` has no way to say "pin", and a
+//!    bottom row that grew with the window would be the P1 behaviour the owner turned down (the plan
 //!    review's finding 7). A file is not pinned here: it holds its pins as the window left them, and
 //!    a row `Ctrl+a _` un-pinned (the owner's decision 8) must come back un-pinned;
-//! 4. places the terminal below everything, hidden, if the tree does not have it -- where and how a
-//!    first launch puts it -- and places each registered Lua panel the tree does not have by its
-//!    `position`, as a first launch would;
+//! 4. places the terminal below the editor's own leaf, hidden, if the tree does not have it -- where
+//!    and how a first launch puts it since v1 trial item 6 (2026-09-28) -- and places each registered
+//!    Lua panel the tree does not have by its `position`, as a first launch would;
 //! 5. keeps `hidden` only for leaves still in the tree, and gives the keys to `focus` if it is
 //!    shown -- else where a first launch gives them: the editor, else the first registered Lua panel
 //!    placed in the editor's place, else the first shown module in tree order. `init.lua`'s default
@@ -123,10 +125,10 @@ fn reconcile_with(
     }
     let terminal = ModuleId::terminal();
     if !root.leaves().contains(&terminal) {
-        root = place_new(root, &terminal, Placement::BelowRoot).0;
+        root = place_new(root, &terminal, Placement::BelowEditor).0;
         hidden.insert(terminal.clone());
         notes.push(format!(
-            "placed '{terminal}' below everything, hidden, as a first launch does"
+            "placed '{terminal}' below the editor, hidden, as a first launch does"
         ));
     }
     for decl in lua {
@@ -359,18 +361,22 @@ mod tests {
     }
 
     /// A file written before the terminal existed, or `init.lua`'s default tree without one: it goes
-    /// where a first launch puts it, hidden until `Ctrl+a t`.
+    /// where a first launch puts it, hidden until `Ctrl+a t` -- below the editor's own leaf only
+    /// (v1 trial item 6, 2026-09-28), leaving the agent untouched.
     #[test]
-    fn a_missing_terminal_is_placed_below_everything_and_hidden() {
+    fn a_missing_terminal_is_placed_below_the_editor_and_hidden() {
         let r = reconcile(row(leaf(editor()), leaf(agent())), &BTreeSet::new(), None, &[]).unwrap();
         assert_eq!(
             r.layout.root(),
-            &Node::pinned(
-                Axis::Column,
-                BELOW_ROOT_SHARE,
-                Branch::Second,
-                row(leaf(editor()), leaf(agent())),
-                leaf(term())
+            &row(
+                Node::pinned(
+                    Axis::Column,
+                    BELOW_ROOT_SHARE,
+                    Branch::Second,
+                    leaf(editor()),
+                    leaf(term())
+                ),
+                leaf(agent())
             )
         );
         assert_eq!(r.layout.hidden(), &set(&[term()]));

@@ -2302,6 +2302,370 @@ fn judge_self_test() -> Result<usize, String> {
     Ok(ran)
 }
 
+// ---------------------------------------------------------------------------------------------
+// v1 trial item 5 (owner: "能不能给browse 加上contrl e/y", copying vim's own `:help CTRL-E`/
+// `:help CTRL-Y`). This is a real WebKitGTK check for exactly what jsdom (`App.test.tsx`) cannot
+// lay out: a real computed line height actually moves `.message-list`'s `scrollTop`, a real capped
+// tool-result box (`.tool-result-body`'s own max-height + overflow-y) takes the box-first
+// precedence over the list while it has room, and a real re-home moves the cursor once a scroll
+// large enough carries its row off screen. It reuses this file's own bring-up (`Replay`, `Step`,
+// `themed_document`, the `on_ready`/`neovibeAgent` handshake) and the real `agent`/
+// `neovibe_core::agent_bridge` wire the scenarios above use, but has none of their follow-during-
+// streaming machinery (no `INSTRUMENT`, no `Scenario`, no `judge`) -- there is nothing here for
+// that judge to weigh, only a handful of direct assertions against one settled history.
+// ---------------------------------------------------------------------------------------------
+
+/// `window.__ctrlEYMark(label)`'s own tiny probe, injected instead of the S1-S9 `INSTRUMENT`: the
+/// list's scroll geometry, the current row's own capped tool-result box (if any and if expanded),
+/// and which row is current -- appended to `window.__ctrlEYLog` under `label` each time a step
+/// calls it, so the whole run's log can be read back in one final `JSON.stringify`.
+const CTRL_E_Y_PROBE: &str = r#"
+(() => {
+  window.__ctrlEYLog = [];
+  window.__ctrlEYMark = (label) => {
+    const l = document.querySelector(".message-list");
+    const cur = document.querySelector(".row-current");
+    const box = cur ? cur.querySelector(".tool-result-body") : null;
+    window.__ctrlEYLog.push({
+      label,
+      st: l ? l.scrollTop : null,
+      sh: l ? l.scrollHeight : null,
+      ch: l ? l.clientHeight : null,
+      cur: cur ? cur.textContent : null,
+      boxSt: box ? box.scrollTop : null,
+      boxSh: box ? box.scrollHeight : null,
+      boxCh: box ? box.clientHeight : null,
+    });
+  };
+})();
+"#;
+
+/// A history long enough to scroll (five rows: a prompt, a `Bash` tool call, four more prompts),
+/// with the tool call's own result 80 lines long -- long enough to overflow the product's own
+/// capped `.tool-result-body` (260px, `index.css`) once really laid out, which jsdom cannot do.
+/// Mirrors `App.test.tsx`'s own `startedAppWithExpandedResult` shape (a prompt, the tool call, more
+/// prompts, `j` then `Enter` to reach and expand it) rather than inventing a new one.
+fn ctrl_e_y_replay() -> Replay {
+    let mut projection = AgentSessionProjection::default();
+    projection.apply(&AgentDomainEvent::SessionOpened {
+        session_id: "ctrl-e-y-test".into(),
+        provider_session_id: "claude-test".into(),
+        model: "claude-sonnet-5".into(),
+        cwd: "/nonexistent/ctrl-e-y".into(),
+    });
+    let events = [
+        AgentDomainEvent::UserPromptSubmitted { text: "r0".into() },
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_ctrl_e_y".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "long" }),
+        },
+        AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_ctrl_e_y".into(),
+            content: json!(numbered_lines("row", 80)),
+            is_error: false,
+        },
+        AgentDomainEvent::UserPromptSubmitted { text: "r1".into() },
+        AgentDomainEvent::UserPromptSubmitted { text: "r2".into() },
+        AgentDomainEvent::UserPromptSubmitted { text: "r3".into() },
+        AgentDomainEvent::UserPromptSubmitted { text: "r4".into() },
+    ];
+    for event in &events {
+        projection.apply(event);
+    }
+
+    let tokens = ThemeTokens::fallback();
+    let greeting = BackendGreeting {
+        kind: BackendKind::Sidecar,
+        project_dir: PathBuf::from("/nonexistent/ctrl-e-y"),
+        permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
+        expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
+        resumable: Vec::new(),
+        account: None,
+    };
+    let sole_tab = neovibe_core::tabs::TabId(1);
+    let snapshot = serialize_snapshot_for_js(
+        sole_tab,
+        &SnapshotView {
+            backend: "sidecar",
+            conversation_id: Some("conversation-ctrl-e-y"),
+            session_id: Some("ctrl-e-y-test"),
+            provider_session_id: Some("claude-test".into()),
+            capabilities: agent::ProviderCapabilities {
+                resume: true,
+                fork: false,
+                interrupt: true,
+                bypass_permission_mode: true,
+                interactive_permission_mode: true,
+            },
+            provider: None,
+            projection: ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        },
+        None,
+    );
+    let on_ready = vec![
+        serialize_hello_for_js(&greeting),
+        serialize_theme_for_js(&tokens),
+        snapshot,
+        serialize_pane_focus_for_js(true),
+    ];
+
+    // A real `KeyboardEvent`, dispatched on the real focusable root `App.tsx` attaches its BROWSE
+    // handler to -- the same kind of synthetic dispatch S5's `parkByKey` (`INSTRUMENT`, above)
+    // already relies on in this exact engine, just aimed at `resolveKey`'s own chords instead of
+    // the browser's default PageUp action.
+    let key = |k: &str, ctrl: bool, shift: bool| -> Step {
+        Step::Script(format!(
+            "document.querySelector('.agent-ui-conversation').dispatchEvent(new KeyboardEvent('keydown', {{ key: {}, ctrlKey: {ctrl}, shiftKey: {shift}, bubbles: true, cancelable: true }}));",
+            serde_json::to_string(k).unwrap_or_default()
+        ))
+    };
+    let mark = |label: &str| -> Step {
+        Step::Script(format!(
+            "window.__ctrlEYMark({});",
+            serde_json::to_string(label).unwrap_or_default()
+        ))
+    };
+
+    let mut steps: Vec<Step> = Vec::new();
+    for _ in 0..SETTLE_AFTER_SNAPSHOT_TICKS {
+        steps.push(Step::Idle);
+    }
+    steps.push(key("g", false, false));
+    steps.push(key("g", false, false)); // gg: top, cursor on "r0"
+    steps.push(mark("top"));
+    steps.push(key("j", false, false)); // down onto the tool row
+    steps.push(key("Enter", false, false)); // unfold its result -- `.tool-result-body` exists now
+    steps.push(mark("expanded"));
+    steps.push(key("e", true, false)); // Ctrl+e: the box first, while it has room
+    steps.push(mark("box-e1"));
+    steps.push(key("y", true, false)); // Ctrl+y: the box back up
+    steps.push(mark("box-y1"));
+    steps.push(key("G", false, true)); // Shift+G: the very last row, "r4", at the very end
+    steps.push(mark("bottom"));
+    steps.push(key("y", true, false)); // Ctrl+y on an ordinary row: one real line up
+    steps.push(mark("plain-y1"));
+    steps.push(key("e", true, false)); // Ctrl+e: one real line back down
+    steps.push(mark("plain-e1"));
+    steps.push(key("9", false, false)); // a count -- "99 Ctrl+y", far more than one screen's worth
+    steps.push(key("9", false, false));
+    // Fix round 1 (Codex review, v1 trial item 5, finding 1): a real Ctrl+y arrives as the bare
+    // `Control` keydown FIRST (`ctrlKey: true` already set on that very event), then `y` -- this
+    // step used to go straight from the digits to `key("y", true, false)`, which never exercised the
+    // production bug (a bare `Control` keydown between a count and its Ctrl chord used to clear
+    // `countRef`) even in this real engine, since a single synthetic event carrying `ctrlKey` has no
+    // separate `Control` keydown to trip it.
+    steps.push(key("Control", true, false));
+    steps.push(key("y", true, false));
+    steps.push(mark("rehomed"));
+
+    Replay { on_ready, steps }
+}
+
+/// One run: a fresh window, a fresh WebView, `ctrl_e_y_replay`'s own steps, the log. Structurally
+/// `run_one` without a `Scenario` or its `INSTRUMENT` -- see this section's own header for why a
+/// second near-duplicate function is simpler and safer here than bending that one to a check it was
+/// never shaped for.
+fn run_ctrl_e_y(config: Config) -> Result<Value, String> {
+    let replay = ctrl_e_y_replay();
+    let window = gtk4::Window::new();
+    let (window_width, window_height) = config.window_size();
+    window.set_default_size(window_width, window_height);
+    window.set_title(Some(&format!("panel_stream_scroll ctrl_e_y {config:?}")));
+
+    let content_manager = UserContentManager::new();
+    content_manager.add_script(&UserScript::new(
+        CTRL_E_Y_PROBE,
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+    let webview = WebView::builder().user_content_manager(&content_manager).build();
+    webview.set_hexpand(true);
+    webview.set_vexpand(true);
+    webview.set_zoom_level(config.zoom);
+    window.set_child(Some(&webview));
+
+    let queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
+    let started = Rc::new(Cell::new(false));
+    content_manager.register_script_message_handler("neovibeAgent", None);
+    {
+        let queue = queue.clone();
+        let started = started.clone();
+        let on_ready = replay.on_ready;
+        content_manager.connect_script_message_received(Some("neovibeAgent"), move |_manager, js_value| {
+            if let Some(InboundMessage::Ready { request_id }) = parse_inbound_message(&js_value.to_str()) {
+                if !started.replace(true) {
+                    let mut q = queue.borrow_mut();
+                    q.extend(on_ready.iter().cloned());
+                    q.push_back(serialize_command_result_for_js(&request_id, Ok(())));
+                }
+            }
+        });
+    }
+    webview.load_html(&themed_document(&ThemeTokens::fallback().css_vars()), None);
+    window.present();
+
+    let main_loop = glib::MainLoop::new(None, false);
+    let outcome: Rc<RefCell<Option<Result<Value, String>>>> = Rc::new(RefCell::new(None));
+    let step_index = Rc::new(Cell::new(0usize));
+    let ready_drained = Rc::new(Cell::new(false));
+    let steps: Rc<Vec<Step>> = Rc::new(replay.steps);
+    {
+        let window = window.clone();
+        let webview = webview.clone();
+        let main_loop = main_loop.clone();
+        let outcome = outcome.clone();
+        let queue = queue.clone();
+        let started = started.clone();
+        glib::timeout_add_local(TICK, move || {
+            if !started.get() {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(payload) = queue.borrow_mut().pop_front() {
+                evaluate_js_dispatch(&webview, &payload);
+                return glib::ControlFlow::Continue;
+            }
+            if !ready_drained.replace(true) {
+                return glib::ControlFlow::Continue;
+            }
+            let i = step_index.get();
+            if i < steps.len() {
+                match &steps[i] {
+                    Step::Dispatch(payload) => evaluate_js_dispatch(&webview, payload),
+                    Step::Idle => {}
+                    Step::Resize { width, height } => window.set_default_size(
+                        (f64::from(window_width) * width).round() as i32,
+                        (f64::from(window_height) * height).round() as i32,
+                    ),
+                    Step::Script(js) => {
+                        webview.evaluate_javascript(js, None, None, None::<&gtk4::gio::Cancellable>, |result| {
+                            if let Err(e) = result {
+                                eprintln!("[panel_stream_scroll] ctrl_e_y step failed: {e}");
+                            }
+                        })
+                    }
+                }
+                step_index.set(i + 1);
+                return glib::ControlFlow::Continue;
+            }
+            let outcome = outcome.clone();
+            let main_loop = main_loop.clone();
+            webview.evaluate_javascript(
+                "JSON.stringify(window.__ctrlEYLog)",
+                None,
+                None,
+                None::<&gtk4::gio::Cancellable>,
+                move |r| {
+                    let parsed = r
+                        .map_err(|e| format!("reading the log failed: {e}"))
+                        .and_then(|v| serde_json::from_str::<Value>(&v.to_str()).map_err(|e| format!("log JSON: {e}")));
+                    outcome.borrow_mut().get_or_insert(parsed);
+                    main_loop.quit();
+                },
+            );
+            glib::ControlFlow::Break
+        });
+    }
+    {
+        let outcome = outcome.clone();
+        let main_loop = main_loop.clone();
+        glib::timeout_add_local_once(RUN_TIMEOUT, move || {
+            outcome
+                .borrow_mut()
+                .get_or_insert(Err(format!("run did not finish within {RUN_TIMEOUT:?}")));
+            main_loop.quit();
+        });
+    }
+    main_loop.run();
+    window.destroy();
+    let ctx = glib::MainContext::default();
+    for _ in 0..50 {
+        while ctx.iteration(false) {}
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = outcome.borrow_mut().take();
+    result.unwrap_or_else(|| Err("no outcome".into()))
+}
+
+/// Reads `ctrl_e_y_replay`'s marks back and checks the real WebKitGTK layout did what jsdom
+/// (`App.test.tsx`) can only assert on stubbed rects.
+fn check_ctrl_e_y(log: &[Value]) -> Result<(), String> {
+    let by_label = |label: &str| -> Result<&Value, String> {
+        log.iter()
+            .find(|v| text(v, "label").as_deref() == Some(label))
+            .ok_or_else(|| format!("no mark named {label:?} in the log of {} entries", log.len()))
+    };
+    let top = by_label("top")?;
+    if num(top, "st") != Some(0.0) {
+        return Err(format!("gg did not scroll the conversation to the very top: {top}"));
+    }
+    let expanded = by_label("expanded")?;
+    let box_sh = num(expanded, "boxSh").ok_or("no .tool-result-body after Enter -- the tool row never expanded")?;
+    let box_ch = num(expanded, "boxCh").ok_or("no .tool-result-body after Enter -- the tool row never expanded")?;
+    if box_sh <= box_ch + 1.0 {
+        return Err(format!(
+            "the tool result's own box is not actually scrollable in this real layout (scrollHeight {box_sh}, clientHeight {box_ch}) -- the corpus needs more lines"
+        ));
+    }
+    let box_e1 = by_label("box-e1")?;
+    let box_st_e1 = num(box_e1, "boxSt").ok_or("no box after Ctrl+e")?;
+    if box_st_e1 <= 0.0 {
+        return Err(format!("Ctrl+e did not scroll the tool result's own box: {box_e1}"));
+    }
+    if num(box_e1, "st") != num(expanded, "st") {
+        return Err(format!(
+            "Ctrl+e moved the conversation itself while the box still had room to scroll: {expanded} then {box_e1}"
+        ));
+    }
+    let box_y1 = by_label("box-y1")?;
+    let box_st_y1 = num(box_y1, "boxSt").ok_or("no box after Ctrl+y")?;
+    if box_st_y1 >= box_st_e1 {
+        return Err(format!(
+            "Ctrl+y did not scroll the tool result's own box back up: {box_e1} then {box_y1}"
+        ));
+    }
+    let bottom = by_label("bottom")?;
+    let bottom_cur = text(bottom, "cur").unwrap_or_default();
+    if !bottom_cur.contains("r4") {
+        return Err(format!(
+            "Shift+G did not land the cursor on the last row (\"r4\"): {bottom}"
+        ));
+    }
+    let bottom_st = num(bottom, "st").ok_or("no list after Shift+G")?;
+    let plain_y1 = by_label("plain-y1")?;
+    let plain_y1_st = num(plain_y1, "st").ok_or("no list after the plain Ctrl+y")?;
+    if plain_y1_st >= bottom_st {
+        return Err(format!(
+            "Ctrl+y did not scroll the conversation by a real line on an ordinary row: {bottom_st} then {plain_y1_st}"
+        ));
+    }
+    if !text(plain_y1, "cur").unwrap_or_default().contains("r4") {
+        return Err(format!(
+            "one line's worth of Ctrl+y moved the cursor off a row still on screen: {plain_y1}"
+        ));
+    }
+    let plain_e1 = by_label("plain-e1")?;
+    let plain_e1_st = num(plain_e1, "st").ok_or("no list after the plain Ctrl+e")?;
+    if plain_e1_st <= plain_y1_st {
+        return Err(format!(
+            "Ctrl+e did not scroll back down by a real line: {plain_y1_st} then {plain_e1_st}"
+        ));
+    }
+    let rehomed = by_label("rehomed")?;
+    let rehomed_cur = text(rehomed, "cur").unwrap_or_default();
+    if rehomed_cur.contains("r4") {
+        return Err(format!(
+            "99 Ctrl+y did not carry the last row off screen and re-home the cursor: {rehomed}"
+        ));
+    }
+    Ok(())
+}
+
 fn trace_dir() -> PathBuf {
     std::env::var_os("PANEL_STREAM_SCROLL_TRACE_DIR")
         .map(PathBuf::from)
@@ -2330,6 +2694,28 @@ fn main() {
         );
         std::process::exit(1);
     }
+    let mut failed: Vec<String> = Vec::new();
+
+    // v1 trial item 5: run first, and unconditionally (it is not one of `Scenario::ALL`, so
+    // `PANEL_STREAM_SCROLL_ONLY` does not touch it) -- one config is enough, since the arithmetic
+    // and the box precedence are the same document at every size the sweep below covers.
+    match run_ctrl_e_y(config(560, 740, 1.0)) {
+        Err(e) => {
+            println!("\n[ctrl_e_y] ERROR: {e}");
+            failed.push(format!("ctrl_e_y: {e}"));
+        }
+        Ok(raw) => {
+            let log: Vec<Value> = raw.as_array().cloned().unwrap_or_default();
+            match check_ctrl_e_y(&log) {
+                Ok(()) => println!("\n[ctrl_e_y] pass"),
+                Err(e) => {
+                    println!("\n[ctrl_e_y] FAIL: {e}");
+                    failed.push(format!("ctrl_e_y: {e}"));
+                }
+            }
+        }
+    }
+
     let only: Option<Vec<String>> = std::env::var("PANEL_STREAM_SCROLL_ONLY")
         .ok()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
@@ -2352,8 +2738,6 @@ fn main() {
         CONFIGS.len(),
         dir.display()
     );
-
-    let mut failed: Vec<String> = Vec::new();
     for config in CONFIGS {
         for &scenario in &scenarios {
             let label = format!(

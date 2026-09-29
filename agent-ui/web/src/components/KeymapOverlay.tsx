@@ -1,5 +1,5 @@
 import { forwardRef } from "react";
-import { BROWSE_KEYS, INPUT_KEYS } from "../keymap";
+import { BROWSE_KEYS, CARET_KEYS, INPUT_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -95,13 +95,93 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
   );
 }
 
+/** Whether `key` (`"v"`/`"V"`) reaches `resolveKey`'s VISUAL branch at all, or is claimed first by
+ *  the leader engine (`App.tsx`, ahead of every call to `resolveKey`) -- the leader itself, or a
+ *  binding's first key, the same two ways `startSequence` (`../leader`) can claim any key: its own
+ *  `step` matches on `keys[0]`, not on `keys.length === 1` (fix round 1, reviewer finding, minor --
+ *  a two-key binding such as `["v", "x"]` armed a sequence on `v` exactly the same as a single-key
+ *  one would, and this note still called it free). */
+function visualKeyClaim(panel: PanelTable, key: string): "leader" | "binding" | null {
+  if (key === panel.leader) return "leader";
+  return panel.bindings.some((b) => b.keys[0] === key) ? "binding" : null;
+}
+
+/** Visual-mode spec §2 (revised for 3a): what the "Selecting" section says about how `v`/`V` are
+ *  actually reached, once a configured leader or panel binding may have taken one or both (D2).
+ *  Only `v` gates CARET's own entry now -- `V` still reaches the region directly (O8's kept
+ *  default), so losing it alone costs nothing the region's own `v`/`V` cannot still reach. Fix
+ *  round 2 (reviewer finding, minor): the note names what actually took the key -- "is your leader"
+ *  only when it IS the leader; a plain panel binding on it is "bound elsewhere", never a leader the
+ *  user does not have. */
+function visualEntryNote(panel: PanelTable): string {
+  const vClaim = visualKeyClaim(panel, "v");
+  const capitalVClaim = visualKeyClaim(panel, "V");
+  if (vClaim === null && capitalVClaim === null) {
+    // v1 trial seam review finding 3 (2026-09-28): Ctrl+e/Ctrl+y scroll the region instead of
+    // ending it now (CARET_KEYS/VISUAL_KEYS' own new row), so "any other key leaves" needs its
+    // one exception named here too.
+    return "Any other key leaves (Ctrl+e/Ctrl+y scroll instead). The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.";
+  }
+  if (vClaim !== null && capitalVClaim !== null) {
+    return "v and V are both bound elsewhere in this panel, so nothing here reaches CARET or VISUAL.";
+  }
+  if (vClaim !== null) {
+    return vClaim === "leader" ? "v is your leader: V selects lines, Esc there gives the caret" : "v is bound elsewhere in this panel: V selects lines, Esc there gives the caret";
+  }
+  return capitalVClaim === "leader"
+    ? "V is your leader: v reaches the caret, then V selects lines"
+    : "V is bound elsewhere in this panel: v reaches the caret, then V selects lines";
+}
+
+/** One `<table>` of `KeyHelp` rows, under its own `<h3>` sub-heading -- the building block `Selecting`
+ *  uses twice below, once for CARET and once for VISUAL, so the two groups are never merged into one
+ *  table a reader (or a test) cannot tell apart. */
+function KeyTable({ heading, rows }: { heading: string; rows: KeyHelp[] }) {
+  return (
+    <>
+      <h3>{heading}</h3>
+      <table>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.keys}>
+              <td>
+                <kbd className="keycap">{row.keys}</kbd>
+              </td>
+              <td>{row.what}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  );
+}
+
+/** Visual-mode spec §2 (revised for 3a): one section, "Selecting (v)", between "This panel" and
+ *  "Leader and tab keys" -- CARET's table then VISUAL's (D2/CARET_KEYS/VISUAL_KEYS, the same
+ *  source `keymap.test.ts` ties to `resolveKey`'s region branches both ways). Fix round 2 (reviewer
+ *  finding, minor): these used to be ONE table with no sub-heading, so a "gg"/"Esc" pair that looks
+ *  the same in both modes (or any two rows sharing a key) rendered as 21 indistinguishable rows with
+ *  two conflicting `Esc` lines and no way to tell which mode either belonged to. Two separate tables,
+ *  each headed by its own mode name, so CARET's rows and VISUAL's rows are never merged. */
+function Selecting({ panel }: { panel: PanelTable }) {
+  return (
+    <section>
+      <h2>Selecting (v)</h2>
+      <KeyTable heading="CARET" rows={CARET_KEYS} />
+      <KeyTable heading="VISUAL" rows={VISUAL_KEYS} />
+      <p>{visualEntryNote(panel)}</p>
+    </section>
+  );
+}
+
 /** Spec §9.2 (P10): "The `?` overlay gets a 'Slash commands' section listing the **works** row." A
  *  plain list rather than the two-column `Section` layout above -- nothing here is a keybinding, and
  *  a bare `<ul>` keeps this section out of every existing `tr`-counting test in this file's own
  *  test suite (`KeymapOverlay.test.tsx`'s "lists every row..."). Names come from
  *  `../slashCommands`'s own table (Task 10's real-CLI record), in that table's order, less what Enter
- *  holds back: `/config` is left out and `/model` reads `/model <name>` (`listedSlashCommands`; the
- *  v1-ui GUI pass, 2026-09-27, saw the held-back flash send the reader here to find `/config`). */
+ *  holds back: `/config` is left out (`listedSlashCommands`; the v1-ui GUI pass, 2026-09-27, saw the
+ *  held-back flash send the reader here to find `/config`). `/model` reads plainly now (owner trial
+ *  item 2, 2026-09-28): a bare `/model` sends too, and opens a picker (`../SlashPicker`). */
 function SlashCommands() {
   return (
     <section>
@@ -150,6 +230,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
           "Typing" section below already does the same for its own two GTK-decided rows. */}
       <Section title="This panel" rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]} />
+      <Selecting panel={panel} />
       <LeaderAndTabKeys panel={panel} />
       <Section
         title="Typing"

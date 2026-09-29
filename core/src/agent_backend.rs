@@ -603,7 +603,7 @@ impl AgentBackend {
             mode,
             host_answered,
             &mut HumanApprovals::default(),
-            &mut Vec::new(),
+            &mut AnsweredForYou::default(),
         )
     }
 
@@ -612,7 +612,9 @@ impl AgentBackend {
     /// CLI's own prompt for exactly such a call -- same non-empty tool-use id, same tool, same input --
     /// is answered `allow` here, once, and the approval is used up (O3 ruling 5, tightened by the
     /// review): the user approved that call, and the real CLI asks once. `answered_for_you` receives
-    /// every CLI prompt answered without a card, for the muted note on its call's row.
+    /// what was answered without a card that a row says so about ([`AnsweredForYou`]): every CLI
+    /// prompt, every gate the acceptEdits fast path answered, every gate a saved prefix rule
+    /// answered, and every `Write` so answered over no file.
     pub fn take_ui_delivery_with_approvals(
         &mut self,
         project_root: &Path,
@@ -620,7 +622,7 @@ impl AgentBackend {
         mode: PermissionMode,
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
-        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+        answered_for_you: &mut AnsweredForYou,
     ) -> UiDelivery {
         self.take_revised_ui_delivery(project_root, rules, mode, host_answered, approvals, answered_for_you)
             .without_revisions()
@@ -663,7 +665,7 @@ impl AgentBackend {
         mode: PermissionMode,
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
-        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+        answered_for_you: &mut AnsweredForYou,
     ) -> RevisedDelivery {
         let delivery = match self {
             AgentBackend::Legacy(session) => {
@@ -761,6 +763,39 @@ impl AgentBackend {
     /// auto-approving must not approve a rule-forced ask (ruling 4; review #3 for the unknown kind).
     /// Each answered without a card goes into `answered_for_you` with its row's note.
     ///
+    /// **The acceptEdits fast path's own row note is recorded here too, never inferred elsewhere**
+    /// (whole-branch review finding 2, v1 trial, 2026-09-28). A `Write`/`Edit`/`NotebookEdit` this
+    /// function allowed under the classifier -- which only the fast path ever does for those three
+    /// (`agent::permission_policy`'s module doc: no saved rule touches them) -- goes into
+    /// `answered_for_you.by_the_fast_path` by tool-use id, with the `(tool_name, input)` the answer
+    /// saw (review item 2: a LATER card for the same call can carry an empty tool-use id, so the tab
+    /// set's own "same id" removal cannot always find the candidate this leaves), once
+    /// `respond_permission` succeeded. The tab set used to infer the same thing from absence (a call
+    /// that started in Auto and completed with no card delivered for it), which was also true of a
+    /// call the CLI's `validateInput` failed before any hook ran, of a card whose request carried no
+    /// tool-use id, and of a gate a switch to bypass answered instead. A request with no tool-use id
+    /// is answered as ever and noted nowhere: there is no row to name.
+    ///
+    /// **So is a `Write` that creates its file** (finding 6), in the fast path and in bypass alike:
+    /// whether anything exists at its `file_path` is checked just before the `allow` is sent, when
+    /// the CLI cannot have written it yet, and a `Write` over nothing goes into
+    /// `answered_for_you.creates_file`. F22's `note_new_files` only ever sees a delivered card, which
+    /// neither of these two answers leaves behind.
+    ///
+    /// **So is a saved prefix rule's own note** (v1 polish F18, pre-existing on `main`; fixed here by
+    /// the same whole-branch review that found finding 2, fix round 3). `classify_with_rules`
+    /// checks `agent::rule_that_allows` before anything else, so `classification.reason ==
+    /// REASON_ALLOWED_BY_A_PROJECT_RULE` means a rule, not the read-only classifier, is why this call
+    /// is being allowed here; `agent::rule_that_allows` is asked again for the rule's own display
+    /// string (cheap, and the same re-ask the tab set used to make -- only moved to where the answer
+    /// is actually given) and the pair goes into `answered_for_you.by_rule` by tool-use id, with the
+    /// `(tool_name, input)` the answer saw for the same reason `by_the_fast_path` carries it (review
+    /// item 2), once `respond_permission` succeeded. The tab set used to make every `ToolCallStarted` a rule WOULD
+    /// answer -- re-asking `agent::rule_that_allows` on that event's own arguments, before any gate
+    /// existed to answer -- a candidate, and infer the answer from no card ever having arrived: also
+    /// true of a call the CLI's `validateInput` failed before any hook ran (no gate at all), and of a
+    /// gate a switch to bypass answered instead of the rule.
+    ///
     /// Each event travels with its fold revision (`take_revised_ui_delivery`), untouched: a kept
     /// event keeps its own, a dropped one takes its with it.
     fn answer_what_needs_no_human(
@@ -836,7 +871,7 @@ impl AgentBackend {
                             // Used up (ruling 5, once per call): a later prompt under this id is a
                             // card. In bypass this is a no-op -- nothing was consulted.
                             approvals.consume(&id);
-                            answered_for_you.push(PromptAnsweredForYou {
+                            answered_for_you.prompts.push(PromptAnsweredForYou {
                                 tool_use_id: id,
                                 note: format!("{label} — allowed {because}"),
                             });
@@ -860,9 +895,13 @@ impl AgentBackend {
                     continue;
                 }
                 let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+                // Before the answer: once it is sent, the CLI may already have written the file.
+                let creates_file =
+                    named_call(tool_use_id).filter(|_| write_over_no_file(&tool_name, input, project_root));
                 match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                     Ok(_resolution) => {
                         host_answered.insert(permission_id);
+                        answered_for_you.creates_file.extend(creates_file);
                         eprintln!("[permission] allowed in bypass: {tool_name}");
                     }
                     Err(error) => {
@@ -891,8 +930,41 @@ impl AgentBackend {
             // Cloned before the mutable borrow below, not for tidiness: `event` borrows from the
             // same value `respond_permission` needs `&mut self` for.
             let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+            // The fast path is the only allow any of these three tools gets here (this function's
+            // doc); its row note, and whether a `Write` creates its file -- read before the answer,
+            // since once it is sent the CLI may already have written it.
+            let call_id = named_call(tool_use_id);
+            let fast_path = call_id
+                .clone()
+                .filter(|_| ACCEPT_EDITS_TOOLS.contains(&tool_name.as_str()))
+                .map(|id| FastPathAnsweredForYou {
+                    tool_use_id: id,
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                });
+            let creates_file = call_id
+                .clone()
+                .filter(|_| write_over_no_file(&tool_name, input, project_root));
+            // A saved rule's own row note (v1 polish F18, fixed here the same way as finding 2):
+            // `classify_with_rules` checks `agent::rule_that_allows` before anything else, so this
+            // reason means a rule -- never the read-only classifier -- is why this call is being
+            // allowed. Ask it again for the rule's own display string, the one thing this branch
+            // does not already have; a request with no tool-use id is answered as ever and noted
+            // nowhere, the same as the fast path leaves it.
+            let rule = (classification.reason == agent::permission_policy::REASON_ALLOWED_BY_A_PROJECT_RULE)
+                .then(|| agent::rule_that_allows(&tool_name, input, project_root, rules))
+                .flatten();
+            let by_rule = call_id.zip(rule).map(|(id, rule)| RuleAnsweredForYou {
+                tool_use_id: id,
+                rule,
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+            });
             match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                 Ok(_resolution) => {
+                    answered_for_you.by_the_fast_path.extend(fast_path);
+                    answered_for_you.creates_file.extend(creates_file);
+                    answered_for_you.by_rule.extend(by_rule);
                     // Said on stderr rather than silently: this is the only record anywhere of a
                     // tool call that ran without the user being asked. One short line, whose reason
                     // is a fixed label from the policy rather than anything the model wrote.
@@ -1029,7 +1101,7 @@ struct AnswerContext<'a> {
     mode: PermissionMode,
     host_answered: &'a mut BTreeSet<String>,
     approvals: &'a mut HumanApprovals,
-    answered_for_you: &'a mut Vec<PromptAnsweredForYou>,
+    answered_for_you: &'a mut AnsweredForYou,
 }
 
 /// The calls the user approved on a card in one tab, each kept with the tool and the exact input the
@@ -1090,6 +1162,86 @@ impl HumanApprovals {
 pub struct PromptAnsweredForYou {
     pub tool_use_id: String,
     pub note: String,
+}
+
+/// A `Write`/`Edit`/`NotebookEdit` call whose gate the acceptEdits fast path answered `allow`
+/// ("allowed by auto" on the row once the call completes), with the exact `(tool_name, input)` the
+/// answer saw. Kept alongside the tool-use id (review item 2, v1 trial whole-branch review fix round
+/// 3's own follow-up) so a LATER card for the exact same call -- the CLI's own follow-up prompt,
+/// whose request can carry an EMPTY tool-use id (Verdandi's `permissionBroker.ts` sends `toolUseId:
+/// ''` when the CLI gave none; `translate.rs` maps that to `None`) -- can still be matched by
+/// content and drop the candidate in `note_auto_edit_answers`, which the ordinary "same id" removal
+/// there can never see at all: it has no id to compare against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastPathAnsweredForYou {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
+/// A call whose gate a saved prefix rule answered `allow`, with the rule in Claude Code's own syntax
+/// (v1 polish F18's note, "allowed by rule `Bash(npm ci *)`" once the call completes) and the exact
+/// `(tool_name, input)` the answer saw, kept for the same reason and matched the same way as
+/// [`FastPathAnsweredForYou`] (review item 2) in `note_rule_answers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAnsweredForYou {
+    pub tool_use_id: String,
+    pub rule: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
+/// What one delivery answered without a card that a call's row says something about, each by
+/// tool-use id, recorded by `answer_what_needs_no_human` at the moment it answered (whole-branch
+/// review findings 2 and 6, v1 trial; the same fix applied to the pre-existing rule note, v1 trial
+/// whole-branch review, fix round 3): the tab set turns these into row notes and never infers them
+/// from a card's absence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnsweredForYou {
+    /// The CLI's own prompts (O3), each with its note.
+    pub prompts: Vec<PromptAnsweredForYou>,
+    /// `Write`/`Edit`/`NotebookEdit` calls whose gate the acceptEdits fast path answered `allow`.
+    pub by_the_fast_path: Vec<FastPathAnsweredForYou>,
+    /// Calls whose gate a saved prefix rule answered `allow`. Every entry here came from
+    /// `classify_with_rules` actually answering THIS gate -- never from re-asking
+    /// `agent::rule_that_allows` on a `ToolCallStarted`'s own arguments, which is true of a call
+    /// whose gate never arrived at all (the CLI's `validateInput` failed first), of a gate a switch
+    /// to bypass answered instead of the rule, and of a card whose request named no tool-use id
+    /// (there is no row to name, so it is answered as ever and noted nowhere).
+    pub by_rule: Vec<RuleAnsweredForYou>,
+    /// `Write` calls answered `allow` without a card -- by the fast path in `Auto`, or in bypass --
+    /// whose `file_path` named nothing just before the answer was sent: the row says the call
+    /// creates the file, never that it overwrites one it cannot see.
+    pub creates_file: Vec<String>,
+}
+
+/// The tools the acceptEdits fast path applies to -- `agent::permission_policy`'s own (private)
+/// `EDIT_TOOLS`, restated here only to recognise its answer, never to decide one.
+const ACCEPT_EDITS_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
+
+/// A request's tool-use id, when it names a call a row can show: `None` for a missing or empty id.
+fn named_call(tool_use_id: &Option<String>) -> Option<String> {
+    tool_use_id.clone().filter(|id| !id.is_empty())
+}
+
+/// Whether nothing exists at `path` at all -- a dangling symlink counts (a `Write` there, or a
+/// check of what it is about to replace, would follow it). Any lookup failure OTHER than "not
+/// found" (a parent directory this process may not search, a path through a regular file) says
+/// nothing about what is there, so it does NOT count as absent: an uncertain answer resolves toward
+/// the overwrite warning, as the permission policy's own uncertainties resolve toward a card.
+pub(crate) fn file_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether `tool_name`/`input` is a `Write` whose `file_path` (read against `project_root` when
+/// relative, as the tool's own absolute path needs no root) names nothing right now.
+fn write_over_no_file(tool_name: &str, input: &serde_json::Value, project_root: &Path) -> bool {
+    tool_name == "Write"
+        && input
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| file_absent(&project_root.join(p)))
 }
 
 /// Every permission policy this CLIENT can drive end to end, in the order a start screen should
@@ -2080,7 +2232,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // fix round 1 (2026-09-28): still cards under item 4A's fast path
             provider_prompt: None,
         });
 
@@ -2191,7 +2343,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // fix round 1 (2026-09-28): still cards under item 4A's fast path
             provider_prompt: None,
         });
         let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
@@ -2442,7 +2594,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // fix round 1 (2026-09-28): still cards under item 4A's fast path
             provider_prompt: None,
         });
 
@@ -2473,7 +2625,7 @@ mod tests {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // fix round 1 (2026-09-28): still cards under item 4A's fast path
             provider_prompt: None,
         };
 
@@ -2574,7 +2726,7 @@ mod tests {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // fix round 1 (2026-09-28): still cards under item 4A's fast path
             provider_prompt: None,
         };
 
@@ -2682,7 +2834,7 @@ mod tests {
         // nothing new, as the panel's own pump keeps taking deliveries.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let quiet = std::time::Duration::from_millis(100);
-        let mut answered = Vec::new();
+        let mut answered = AnsweredForYou::default();
         let mut delivered = Vec::new();
         let mut last_new: Option<std::time::Instant> = None;
         loop {
@@ -2693,7 +2845,7 @@ mod tests {
                     last_new = Some(now);
                 }
                 _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
-                    return (delivered, answered)
+                    return (delivered, answered.prompts)
                 }
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
@@ -2841,6 +2993,62 @@ mod tests {
                 backend.shutdown();
             }
         }
+    }
+
+    /// Item 4A fix round 2 (2026-09-28): the acceptEdits fast path answers the GATE's request for an
+    /// in-project `Write`, and nothing more. When the user's own `permissions.ask` rule
+    /// (`Edit(notes.txt)`) makes the CLI raise its own prompt for that same call after the gate's
+    /// `allow` -- CLI 2.1.283's `EQn` runs `DR` after a hook allow, and `DR` returns an ask a rule
+    /// forced -- that prompt is a card in Auto. So is the CLI's own prompt for the call with no rule
+    /// behind it: the fast path's allow is not a human approval (`HumanApprovals` stays empty).
+    /// Before 4A every edit carded here anyway; now this chain is what keeps a user's ask rule for an
+    /// edit from being answered silently. Bypass is covered by the test above.
+    #[test]
+    fn a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        let write = serde_json::json!({ "file_path": "notes.txt", "content": "fast path" });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("tu-1".into()),
+            tool_name: "Write".into(),
+            input: write.clone(),
+            provider_prompt: None,
+        });
+        provider.queue(provider_prompt(
+            "perm-ruled",
+            Some("tu-1"),
+            "Write",
+            write.clone(),
+            Some("notes.txt"),
+        ));
+        provider.queue(provider_prompt("perm-cli", Some("tu-1"), "Write", write, None));
+        let mut host_answered = BTreeSet::new();
+        let mut approvals = HumanApprovals::default();
+        let (delivered, answered) = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut approvals,
+        );
+        assert!(
+            !carded(&delivered, "perm-gate"),
+            "the gate's request is the fast path's to answer: {delivered:?}"
+        );
+        assert!(
+            carded(&delivered, "perm-ruled"),
+            "the user's ask rule wins: {delivered:?}"
+        );
+        assert!(
+            carded(&delivered, "perm-cli"),
+            "the fast path is no human approval: {delivered:?}"
+        );
+        assert_eq!(provider.resolutions(), vec![("perm-gate".to_string(), true)]);
+        assert_eq!(host_answered, BTreeSet::from(["perm-gate".to_string()]));
+        assert!(approvals.is_empty() && answered.is_empty());
+        backend.shutdown();
     }
 
     /// O3 ruling 5, as the review tightened it: in Auto the human's approval answers the CLI's own

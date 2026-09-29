@@ -1,11 +1,19 @@
 import { superHeld } from "./heldSuper";
+import { isModifierKey } from "./typingGuard";
 
-/** Which of the panel's three keyboard states has the keys.
+/** Which of the panel's keyboard states has the keys.
  *
  * `hint` is declared here and rendered by the status line's mode block, and nothing reaches it yet:
  * `f` lands in sub-project 4 along with counts, search, `]p`/`[p` and which-key. It is in the union
- * because the mode-block label table is data over this union, not because anything is stubbed. */
-export type PanelMode = "browse" | "input" | "hint";
+ * because the mode-block label table is data over this union, not because anything is stubbed.
+ *
+ * `caret`/`visual`/`vline` (BROWSE caret and visual mode, spec
+ * `docs/superpowers/specs/2026-09-28-browse-visual-mode-design.md`, revised for item 3a, D1): a
+ * precise-copy region entered from BROWSE with `v` (CARET, a moving block caret) or `V` (V-LINE
+ * directly, O8's kept default); `v`/`V` from CARET start VISUAL/V-LINE. Fail-closed by design --
+ * every BROWSE-only path in `App.tsx` already tests `mode === "browse"` rather than `mode !==
+ * "input"`, so none of them act while any of the three is current unless named. */
+export type PanelMode = "browse" | "input" | "hint" | "caret" | "visual" | "vline";
 
 /** The first key of a two-key BROWSE sequence (`gg`, `[[`, `]]`), held by the caller between the
  *  two presses. See `KeyContext.pending`. */
@@ -90,6 +98,13 @@ export type PanelAction =
   /** `Ctrl+d` (+1) / `Ctrl+u` (-1): scroll the conversation by half its visible height. `App.tsx`
    *  measures the list and re-homes the cursor if the scroll carried its row out of sight. */
   | { kind: "half-page"; delta: 1 | -1 }
+  /** `Ctrl+e` (+1) / `Ctrl+y` (-1) (v1 trial item 5, owner: "能不能给browse 加上contrl e/y",
+   *  copying vim's own `:help CTRL-E`/`:help CTRL-Y`): scroll the conversation by one text line --
+   *  the prose line height -- rather than half a view. Counted (`5 Ctrl+e`, R4's own count),
+   *  unlike `half-page` just above, which never was. `App.tsx` scrolls a long tool result's own
+   *  capped box first, exactly the way `j`/`k` do, and re-homes the cursor the same way
+   *  `half-page` does (reusing `clampCursorToView`) if the scroll carried its row out of sight. */
+  | { kind: "scroll-line"; delta: 1 | -1 }
   /** `gg` (first) / `G` (last): the cursor to that end row, the list scrolled to that very end. */
   | { kind: "jump"; to: "first" | "last" }
   /** The first key of a two-key sequence: nothing happens yet. `App.tsx` remembers which prefix
@@ -126,7 +141,54 @@ export type PanelAction =
    *  leader itself and longer sequences run through `./leader`'s `startSequence`/`advanceSequence`,
    *  not this function (panel round 2 plan, Task 7). */
   | { kind: "panel"; binding: PanelBinding }
+  /** `v` in BROWSE (spec D2, revised for 3a): start CARET, a moving block caret. `App.tsx` itself
+   *  decides whether there is anywhere to start from (a row under the cursor, not a banner or Stop)
+   *  -- this table has no DOM to check that with. */
+  | { kind: "caret" }
+  /** `V` in BROWSE (spec D1, O8's kept default): start V-LINE directly, skipping CARET -- the only
+   *  entry route this table still names `"visual"` for; `line` is always `true` here. */
+  | { kind: "visual"; line: boolean }
+  /** A motion inside CARET/VISUAL/V-LINE (D5): `App.tsx` runs `./visual`'s `stepOnce`/
+   *  `repeatMotion` this many times (the count, applied the same way BROWSE's own `j`/`k`/`[[`/`]]`
+   *  are). Both ends move in CARET, only `cursor` in VISUAL/V-LINE -- `App.tsx` decides that from
+   *  which mode is current, not from this action. */
+  | { kind: "vmove"; motion: VisualMotion }
+  /** `o` inside VISUAL/V-LINE (D5, `nvim: visual.txt, v_o`): swap `anchor` and `cursor`. Not bound
+   *  in CARET (there is only one point to swap). */
+  | { kind: "vswap" }
+  /** `y` inside VISUAL/V-LINE (D9): copy what is highlighted and end the region, back to BROWSE. */
+  | { kind: "vyank" }
+  /** `>` inside VISUAL/V-LINE (D10): quote the highlighted text into the tab's draft and end the
+   *  region into INPUT. `App.tsx` does the whole thing (the D9 check, `./quote`'s formatting, the
+   *  draft/mode/caret side effects) -- this table only names the key. */
+  | { kind: "vquote" }
+  /** `v`/`V` pressed from CARET, or the OTHER of `v`/`V` pressed from inside VISUAL/V-LINE (D1):
+   *  start (from CARET) or switch to (from the sibling mode) VISUAL (`line: false`) or V-LINE
+   *  (`line: true`), anchor = cursor = the caret in either case. Never reached for the mode's OWN
+   *  key from inside VISUAL/V-LINE -- that is `vback` below. */
+  | { kind: "vtoggle"; line: boolean }
+  /** `Esc`, or the mode's own `v`/`V`, pressed from inside VISUAL/V-LINE (D1, revised for 3a): back
+   *  to CARET, on the moving end -- the region and its freeze stay on. Distinct from `vend`, which
+   *  ends the WHOLE region back to BROWSE. */
+  | { kind: "vback" }
+  /** `Esc`, or any other plain key the current mode does not bind (D12): ends the WHOLE region back
+   *  to BROWSE with nothing copied. `key` is `"Escape"` for the former (`App.tsx` shows no flash)
+   *  and the key itself for the latter (`App.tsx` builds the "<MODE> ended: <key> is not a <MODE>
+   *  key (...)" flash, naming CARET's own hint or VISUAL/V-LINE's). */
+  | { kind: "vend"; key: string }
+  /** A key carrying Ctrl/Alt/Meta/Super/Hyper/AltGraph inside CARET/VISUAL/V-LINE that this table
+   *  does not otherwise claim (D10), or an idle `Ctrl+c` in CARET specifically (D12, a consequence
+   *  of D3): swallowed, the mode stays exactly as it was. `App.tsx` flashes "nothing selected — v,
+   *  then y" for the CARET-`Ctrl+c` case and says nothing for every other one. */
+  | { kind: "vswallow" }
   | null;
+
+/** The nine motions CARET/VISUAL/V-LINE bind (`./visual`'s own table, D5): `h`/`l` by character,
+ *  `j`/`k` by screen line, `w`/`e`/`b` by word, `0`/`$` to the hard line's start/end, `gg`/`G` to
+ *  the list's first/last selectable character (added for 3a, §9). Declared here, next to the
+ *  `PanelAction` variant that carries it, so `resolveKey` and `./visual` share one name for it
+ *  rather than each inventing its own union. */
+export type VisualMotion = "h" | "l" | "j" | "k" | "w" | "e" | "b" | "0" | "$" | "gg" | "G";
 
 /** The parts of a `KeyboardEvent` this decision needs. A plain object so the table is testable
  *  without a DOM. `keyCode` is read only for C4's legacy-WebKit IME check (some builds report an
@@ -237,6 +299,177 @@ export type KeyContext = {
   table?: PanelTable;
 };
 
+/** D5's `gg`/`G`, and D2's `gv` reservation, shared by CARET and VISUAL/V-LINE (both bind `gg`/`G`
+ *  the same way, through a region-local pending `g` -- distinct from BROWSE's own `ctx.pending`,
+ *  which this only reuses as a carrier, never as BROWSE's actual two-key prefix state). Returns a
+ *  `PanelAction` when the pending-`g` case is fully handled (the pending marker itself, the `gg`
+ *  motion, or `gv`'s own "nothing"); `"fallthrough"` means "not a pending-`g` case, keep resolving
+ *  this key normally" -- which is how `g` followed by any other key ends up handled on its own
+ *  (D5's own text: "`g` then any key but `g` drops the `g` and handles that key alone"). `G`
+ *  (Shift+`g`) never reaches this at all: it is a single keystroke, resolved as its own motion in
+ *  each caller's switch below. */
+function resolveRegionPendingG(event: KeyLike, ctx: KeyContext): PanelAction | "fallthrough" {
+  if (ctx.pending === "g") {
+    if (event.key === "g") return { kind: "vmove", motion: "gg" };
+    // D2: `gv` is reserved for vim's reselect, even unbuilt -- swallowed as "nothing" rather than
+    // falling through to `vtoggle`'s own `v` handling.
+    if (event.key === "v") return null;
+    return "fallthrough";
+  }
+  if (event.key === "g") return { kind: "pending", prefix: "g" };
+  return "fallthrough";
+}
+
+/** The Ctrl/Alt/Meta/Super/Hyper/AltGraph checks D10/D12 give CARET and VISUAL/V-LINE in common:
+ *  `Ctrl+c` keeps interrupting a running turn in every mode, and any other held modifier is
+ *  swallowed. `idleCtrlC` is the one place the two callers genuinely differ (D12: claimed in
+ *  CARET, left to the browser's native copy in VISUAL/V-LINE) -- passed in rather than branched on
+ *  `mode` here, so this function stays a pure function of the event and that one flag.
+ *
+ *  v1 trial seam review finding 3 (2026-09-28): Ctrl+e/Ctrl+y used to fall straight through to the
+ *  generic swallow just below, with no feedback at all -- even though the `?` overlay's own note
+ *  said "Any other key leaves" and CARET_KEYS' `?` row said "any other key ends the caret too".
+ *  vim scrolls on these keys in Visual mode (`:help CTRL-E`/`:help CTRL-Y`); this table now does
+ *  too, reusing BROWSE's own `scroll-line` action (`resolveKey`'s `mode !== "input"` block below,
+ *  which CARET/VISUAL/V-LINE never reach -- they return from `resolveCaretKey`/`resolveVisualKey`
+ *  before that point) rather than a second copy of the chord check. `App.tsx`'s region switch scrolls
+ *  the frozen list one line per press without moving the caret/selection or ending the region --
+ *  D10's own list of what the region swallows is otherwise unchanged. */
+function resolveRegionModifierKey(event: KeyLike, ctx: KeyContext, idleCtrlC: PanelAction): PanelAction | "fallthrough" {
+  if (isModifierKey(event.key)) return null;
+  if (event.key === "c" && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && !hasSuperOrHyper(event) && !hasAltGraph(event)) {
+    return ctx.turnRunning === true ? { kind: "interrupt" } : idleCtrlC;
+  }
+  if (
+    event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    !hasSuperOrHyper(event) &&
+    !hasAltGraph(event) &&
+    (event.key === "e" || event.key === "y")
+  ) {
+    return { kind: "scroll-line", delta: event.key === "e" ? 1 : -1 };
+  }
+  if (event.ctrlKey || event.altKey || event.metaKey || hasSuperOrHyper(event) || hasAltGraph(event)) {
+    return { kind: "vswallow" };
+  }
+  return "fallthrough";
+}
+
+/**
+ * CARET's own key table (spec §1/§9, D2-D5/D10/D12): a block caret, moved by the same motions
+ * VISUAL/V-LINE use, that starts VISUAL/V-LINE rather than being either of them. Called by
+ * `resolveKey` for `mode === "caret"`, never directly: every CARET key is decided here, with no
+ * fallthrough to BROWSE/INPUT or to `resolveVisualKey` below it.
+ */
+function resolveCaretKey(event: KeyLike, ctx: KeyContext): PanelAction {
+  // D12 (3a): idle `Ctrl+c` is CLAIMED in CARET (D3's own consequence: the engine would otherwise
+  // copy the one character the caret sits on) -- `App.tsx` reads `vswallow` plus `mode === "caret"`
+  // to flash "nothing selected — v, then y", rather than a dedicated action kind, per spec §8.
+  const modifierResult = resolveRegionModifierKey(event, ctx, { kind: "vswallow" });
+  if (modifierResult !== "fallthrough") return modifierResult;
+  // D12: `?` ends CARET and opens the full keymap.
+  if (event.key === "?") return { kind: "keymap" };
+  const pendingResult = resolveRegionPendingG(event, ctx);
+  if (pendingResult !== "fallthrough") return pendingResult;
+  // R4/D5: `1`-`9` starts a count, `0`-`9` continues one; a LONE `0` (no count running) is the `0`
+  // motion instead of a digit, since CARET binds `0` to a real motion where BROWSE does not.
+  if (/^[0-9]$/.test(event.key)) {
+    const digit = Number(event.key);
+    if (digit === 0 && (ctx.count ?? null) === null) return { kind: "vmove", motion: "0" };
+    return { kind: "count", digit };
+  }
+  switch (event.key) {
+    case "h":
+    case "l":
+    case "j":
+    case "k":
+    case "w":
+    case "e":
+    case "b":
+    case "$":
+      return { kind: "vmove", motion: event.key as VisualMotion };
+    case "G":
+      return { kind: "vmove", motion: "G" };
+    case "v":
+      // D1: CARET's `v`/`V` always START a selection mode, anchor = cursor = the caret -- never
+      // "ends" the way VISUAL/V-LINE's OWN key does (that comparison does not exist in CARET).
+      return { kind: "vtoggle", line: false };
+    case "V":
+      return { kind: "vtoggle", line: true };
+    case "Escape":
+      // D1: CARET's `Esc` ends the WHOLE region, back to BROWSE on the caret's row -- `App.tsx`
+      // tells this apart from an ordinary unbound key by `action.key === "Escape"`.
+      return { kind: "vend", key: "Escape" };
+    default:
+      // D12: any other plain key CARET does not bind ends the region, clears it, and does nothing
+      // else -- never its BROWSE meaning (`a`/`d`/`D`/`i`/`o`/Enter/Space included).
+      return { kind: "vend", key: event.key };
+  }
+}
+
+/**
+ * VISUAL/V-LINE's own key table (spec §1/§9, D4/D5/D9/D10/D12). Called by `resolveKey` for either
+ * mode, never directly: every VISUAL/V-LINE key is decided here, with no fallthrough to the
+ * BROWSE/INPUT logic below it. `mode` tells the mode's OWN `v`/`V` (D1: back to CARET, `vback`)
+ * apart from the OTHER one (switch to the sibling selection mode, `vtoggle`) -- `App.tsx` still
+ * reads `vswap`/`vmove` off nothing but the action itself, since neither depends on which of the
+ * two this is.
+ */
+function resolveVisualKey(mode: "visual" | "vline", event: KeyLike, ctx: KeyContext): PanelAction {
+  // D10: `Ctrl+c` keeps its BROWSE meaning in VISUAL/V-LINE -- idle, unclaimed (the engine's own
+  // native copy of the visible selection runs and the mode stays, exactly as an unclaimed key
+  // always leaves it). Bare modifiers (Shift on the way to `$`/`V`) are exempted the same way.
+  const modifierResult = resolveRegionModifierKey(event, ctx, null);
+  if (modifierResult !== "fallthrough") return modifierResult;
+  // D10: `?` ends VISUAL/V-LINE and opens the full keymap -- `App.tsx` ends the region itself on
+  // this action, the same as every other route into the overlay.
+  if (event.key === "?") return { kind: "keymap" };
+  const pendingResult = resolveRegionPendingG(event, ctx);
+  if (pendingResult !== "fallthrough") return pendingResult;
+  // R4/D5: `1`-`9` starts a count, `0`-`9` continues one; a LONE `0` (no count running) is the `0`
+  // motion instead of a digit, since VISUAL binds `0` to a real motion where BROWSE does not.
+  if (/^[0-9]$/.test(event.key)) {
+    const digit = Number(event.key);
+    if (digit === 0 && (ctx.count ?? null) === null) return { kind: "vmove", motion: "0" };
+    return { kind: "count", digit };
+  }
+  switch (event.key) {
+    case "h":
+    case "l":
+    case "j":
+    case "k":
+    case "w":
+    case "e":
+    case "b":
+    case "$":
+      return { kind: "vmove", motion: event.key as VisualMotion };
+    case "G":
+      return { kind: "vmove", motion: "G" };
+    case "o":
+      return { kind: "vswap" };
+    case "y":
+      return { kind: "vyank" };
+    case ">":
+      return { kind: "vquote" };
+    case "v":
+      // D1: VISUAL's OWN key (`v`) goes back to CARET; V-LINE's OTHER key switches to VISUAL.
+      return mode === "visual" ? { kind: "vback" } : { kind: "vtoggle", line: false };
+    case "V":
+      // D1: V-LINE's OWN key (`V`) goes back to CARET; VISUAL's OTHER key switches to V-LINE.
+      return mode === "vline" ? { kind: "vback" } : { kind: "vtoggle", line: true };
+    case "Escape":
+      // D1: `Esc` from VISUAL/V-LINE goes back to CARET (not all the way to BROWSE) -- the region
+      // and its freeze stay on (D13/D14: "Esc from VISUAL is not an exit").
+      return { kind: "vback" };
+    default:
+      // D12: any other plain key VISUAL/V-LINE does not bind ends the WHOLE region, clears it, and
+      // does nothing else -- never its BROWSE meaning (`a`/`d`/`D`/Enter/`g`/Space included).
+      return { kind: "vend", key: event.key };
+  }
+}
+
 /**
  * The key table, as a pure function: mode plus key plus context in, one action or nothing out.
  *
@@ -252,6 +485,13 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // dependency of its own). INPUT's own, older `!event.isComposing` check below is now redundant
   // with this one and is kept only because deleting it would change nothing but the diff.
   if (event.isComposing || event.keyCode === 229) return null;
+  // CARET/VISUAL/V-LINE (spec §2, revised for 3a §9, D2-D5/D9/D10/D12): a whole branch of its own,
+  // right after the IME check and ahead of `Ctrl+o` just below -- `Ctrl+o` must NOT toggle the
+  // detailed view while the region is on (D10/D12: it is one of the chords the region swallows
+  // rather than lets through to its BROWSE meaning). `resolveCaretKey`/`resolveVisualKey` never
+  // fall through to anything below them; every region key is decided in one of the two or nowhere.
+  if (mode === "caret") return resolveCaretKey(event, ctx);
+  if (mode === "visual" || mode === "vline") return resolveVisualKey(mode, event, ctx);
   // R3: `Ctrl+o` toggles the detailed view in EITHER mode -- named here, ahead of the `mode !==
   // "input"` block below (whose chords are BROWSE/HINT-only) and ahead of the blanket modifier
   // refusal further down, the same reason `?`/`G`/`N` are. It works while typing (spec: "it works
@@ -278,6 +518,14 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     }
     if (event.ctrlKey && !event.shiftKey && (event.key === "d" || event.key === "u")) {
       return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
+    }
+    // v1 trial item 5: vim's own `Ctrl+e`/`Ctrl+y`, checked here for the same reason as Ctrl+d/
+    // Ctrl+u just above -- `key` reports "e"/"y" the same under Ctrl as bare, and bare `y` (the
+    // plain-key switch below) copies the current row, so an unchecked Ctrl+y would copy instead
+    // of scrolling. INPUT's own `Ctrl+e` (end of line) is untouched: this whole block is gated on
+    // `mode !== "input"` already.
+    if (event.ctrlKey && !event.shiftKey && (event.key === "e" || event.key === "y")) {
+      return { kind: "scroll-line", delta: event.key === "e" ? 1 : -1 };
     }
     // D1/N1/D5: Claude Code's `Ctrl+c` interrupt, minus the exit half -- this table never closes
     // anything. Idle, it is left to the browser (a text selection's native copy); `Ctrl+c` in INPUT
@@ -312,6 +560,23 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // edit-in-nvim) is a different action entirely, which is exactly why this is gated on `mode !==
     // "input"` rather than named unconditionally -- it must never shadow the composer's chord.
     if (event.ctrlKey && !event.shiftKey && event.key === "g") return { kind: "view-in-editor" };
+    // D2: `gv` is reserved for vim's reselect (`nvim: visual.txt, gv`), even though nothing
+    // implements it yet -- claimed the same way `[` then `]` is (both below, in the pending-prefix
+    // switch), ahead of the plain `v` entry just below so a leftover `g` prefix cannot start VISUAL
+    // instead of being dropped for the reservation's sake. A user's own `gv` panel binding still
+    // wins: the table lookup at the top of this `mode !== "input"` block runs before this.
+    if (ctx.pending === "g" && event.key === "v" && !event.ctrlKey && !event.shiftKey) return null;
+    // D2 (revised for 3a, §9): BROWSE's `v` starts CARET (was `{kind: "visual", line: false}` in
+    // the first design); `V` still starts V-LINE directly (O8's kept default). Named here ahead of
+    // the blanket modifier refusal below the same reason `G`/`N`/`Y`/`D`/`A` are -- `V` carries
+    // Shift on most layouts. A configured leader or panel binding on `v`/`V` wins over this: both
+    // reach here only once the leader engine (`App.tsx`, ahead of every call to this function) has
+    // already passed on the key. Fix round 2 (reviewer finding, minor): `isPlainAnswerKey`, the
+    // same predicate the sibling `D` row above reads, not a hand-written `!ctrlKey` -- that let
+    // Alt+v, Meta+v, Super+v and AltGr+v start a mode. Each of those falls through unclaimed now,
+    // exactly what it did before the region existed (the switch below has no `v`).
+    if (isPlainAnswerKey(event) && !event.shiftKey && event.key === "v") return { kind: "caret" };
+    if (isPlainAnswerKey(event) && event.shiftKey && event.key === "V") return { kind: "visual", line: true };
   }
   // A key carrying a modifier this table does not name is not claimed. Apart from the chords just
   // above, no row needs Ctrl or Shift, so any other chord holding either falls through unclaimed --
@@ -437,6 +702,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "1-9", what: "A count for j / k / [[ / ]] (3j moves three rows)" },
   { keys: "[[ / ]]", what: "Previous / next prompt of yours" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
+  { keys: "Ctrl+e / Ctrl+y", what: "One line down / up (a count repeats it, e.g. 5 Ctrl+e)" },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
   { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
   { keys: "Enter", what: "Show or hide a tool's result or a collapsed run" },
@@ -444,6 +710,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
     keys: "y / Y",
     what: "Copy the row (message, command, path), or the code block HINT landed on / its whole output",
   },
+  { keys: "v / V", what: "A caret to move with h j k l, w b e, 0 $, gg G; V selects lines at once" },
   { keys: "D", what: "Deny with a reason: into the card's reason box, Enter denies" },
   { keys: "i / o", what: "Start typing, caret where you left it (C1a: o is an exact alias of i)" },
   { keys: "A", what: "Start typing at the end of the draft" },
@@ -456,6 +723,42 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "gf", what: "Open the path on this row in the editor (several: pick by letter)" },
   { keys: "Ctrl+g", what: "This row's whole text in an nvim scratch buffer" },
   { keys: "?", what: "This list (?, Esc or q closes it)" },
+];
+
+/** CARET, i.e. everything `resolveCaretKey` claims (spec §1/§9, D2-D5/D12). Tied to `resolveKey`'s
+ *  CARET branch both ways by `keymap.test.ts`, the same discipline `BROWSE_KEYS` is held to.
+ *  `KeymapOverlay`'s "Selecting" section renders this ahead of `VISUAL_KEYS`. */
+export const CARET_KEYS: KeyHelp[] = [
+  { keys: "h / l", what: "Previous / next character" },
+  { keys: "j / k", what: "Next / previous screen line, same column" },
+  { keys: "w / b / e", what: "Next word / previous word / end of this or the next word" },
+  { keys: "0 / $", what: "Start / end of the line" },
+  { keys: "gg / G", what: "First / last character of the conversation" },
+  { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
+  { keys: "v / V", what: "Select from here: VISUAL by character, V-LINE by line" },
+  { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the caret stays put" },
+  { keys: "Esc", what: "Back to BROWSE, cursor on this row" },
+  { keys: "?", what: "This list (any other key ends the caret too, except Ctrl+e/Ctrl+y, which scroll instead)" },
+];
+
+/** VISUAL/V-LINE, i.e. everything `resolveVisualKey` claims (spec §1/§9, D4/D5/D9/D10). Tied to
+ *  `resolveKey`'s VISUAL/V-LINE branch both ways by `keymap.test.ts`, the same discipline
+ *  `BROWSE_KEYS` is held to. `KeymapOverlay` renders this after `CARET_KEYS`, both inside the one
+ *  "Selecting" section, once `v`/`V` is reachable at all. */
+export const VISUAL_KEYS: KeyHelp[] = [
+  { keys: "h / l", what: "Previous / next character" },
+  { keys: "j / k", what: "Next / previous screen line, same column" },
+  { keys: "w / b / e", what: "Next word / previous word / end of this or the next word" },
+  { keys: "0 / $", what: "Start / end of the line" },
+  { keys: "gg / G", what: "Extend to the conversation's first / last character" },
+  { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
+  { keys: "o", what: "Swap which end of the selection moves" },
+  { keys: "v / V", what: "Switch to VISUAL / V-LINE; the mode's own key goes back to the caret" },
+  { keys: "y", what: "Copy the highlighted text and return to BROWSE" },
+  { keys: ">", what: "Quote into the message below, then type" },
+  { keys: "Esc", what: "Back to the caret, at the moving end" },
+  { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the selection stays put" },
+  { keys: "?", what: "This list (any other key ends the region too, except Ctrl+e/Ctrl+y, which scroll instead)" },
 ];
 
 export const INPUT_KEYS: KeyHelp[] = [

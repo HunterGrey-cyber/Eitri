@@ -1028,7 +1028,7 @@ mod tests {
             notes,
             [
                 "neovibe.layout.default: left out 'lua:gone': this window has no such module",
-                "neovibe.layout.default: placed 'terminal' below everything, hidden, as a first launch does"
+                "neovibe.layout.default: placed 'terminal' below the editor, hidden, as a first launch does"
             ]
         );
     }

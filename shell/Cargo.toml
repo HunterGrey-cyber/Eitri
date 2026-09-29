@@ -111,3 +111,12 @@ harness = false
 [[test]]
 name = "nvim_bin_override"
 harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. It starts an
+# `Xvfb` of its own and refuses any other display, since it sends real keys and clicks and writes
+# the clipboard (see the file's header; needs `Xvfb` and `xdotool`). BROWSE visual mode (spec
+# docs/superpowers/specs/2026-09-28-browse-visual-mode-design.md), driven against the real
+# WebKitGTK `Selection.modify` jsdom does not have.
+[[test]]
+name = "panel_visual_mode"
+harness = false

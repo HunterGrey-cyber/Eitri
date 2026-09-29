@@ -195,22 +195,28 @@ function oneLine(label: string): ToolRenderConfig {
   return { label, renderInvocation: (input) => <div className="tool-card">{label}: {summarizeInput(input)}</div> };
 }
 
-/** `Edit`/`Write`: a real diff (`EditDiff`), folded to 6 lines everywhere except the detailed view
- *  and an expanded row (P3). Falls back to a plain path line when the input carries no reviewable
- *  change (neither `old_string` nor `new_string`, or `Write` with neither `content` nor a path) --
- *  `editPreview` returning `null` is what decides that, not this function. */
-function editConfig(label: string): ToolRenderConfig {
+/** `Edit`/`Write`/`NotebookEdit`: a real diff (`EditDiff`). Folded to a one-line path+counts
+ *  summary (`maxLines: 0`) everywhere except the detailed view and an expanded row (P3; v1 trial
+ *  item 7 lowered this from a 6-line fold once these three tools stopped ever folding into a
+ *  count-only run -- every one of them now draws its own row, so each has to be this compact by
+ *  default). `toolName` names the real tool this input belongs to (`editPreview`'s own first
+ *  argument), since `Write file` and `NotebookEdit` are display labels, not tool names. Falls back
+ *  to a plain path line when the input carries no reviewable change (neither `old_string` nor
+ *  `new_string`, `Write` with neither `content` nor a path, or `NotebookEdit` with neither
+ *  `new_source` nor `notebook_path`) -- `editPreview` returning `null` is what decides that, not
+ *  this function. */
+function editConfig(label: string, toolName: string, pathField = "file_path"): ToolRenderConfig {
   return {
     label,
     renderInvocation: (input, { expanded, createsFile }) => {
-      const preview = editPreview(label === "Write file" ? "Write" : "Edit", input);
+      const preview = editPreview(toolName, input);
       if (preview === null)
         return (
           <div className="tool-card">
-            {label}: <PathLink path={pathOf(input, "file_path")} />
+            {label}: <PathLink path={pathOf(input, pathField)} />
           </div>
         );
-      return <EditDiff preview={preview} maxLines={expanded ? undefined : 6} createsFile={createsFile} />;
+      return <EditDiff preview={preview} maxLines={expanded ? undefined : 0} createsFile={createsFile} />;
     },
   };
 }
@@ -234,8 +240,8 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
       </div>
     ),
   },
-  Write: editConfig("Write file"),
-  Edit: editConfig("Edit file"),
+  Write: editConfig("Write file", "Write"),
+  Edit: editConfig("Edit file", "Edit"),
   Grep: {
     label: "Search",
     renderInvocation: (input) => <div className="tool-card">Grep: {pathOf(input, "pattern")}</div>,
@@ -260,7 +266,9 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     quiet: true,
     renderInvocation: (input) => <div className="tool-card tool-card-muted">ToolSearch {summarizeInput(input)}</div>,
   },
-  NotebookEdit: oneLine("NotebookEdit"),
+  // v1 trial item 7: a real diff (its `new_source` against nothing -- the tool's own schema has no
+  // "before" field, see `editPreview`'s own doc), not just a one-line summary of the raw input.
+  NotebookEdit: editConfig("NotebookEdit", "NotebookEdit", "notebook_path"),
   // Ordinary `tool_use` blocks named "Skill" -- no distinct wire event -- so this stays a
   // rendering-layer special case (kept out of `renderToolCall` itself since Task 13, review draft).
   Skill: {
@@ -371,10 +379,18 @@ export function renderToolCall(
   opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
+  // Fix round finding 4: `opts.detailed` (Ctrl+o) used to reach only `ToolResult`'s own head/tail
+  // cut, never `editConfig`'s `maxLines`, so a folded (unexpanded) Edit/Write/NotebookEdit row
+  // stayed folded even in the detailed view -- silently, since `EditDiff`'s own doc already
+  // promised "everywhere except the detailed view and an expanded row" (`editConfig`'s comment
+  // above). `Ctrl+o` now widens a diff exactly as it widens a `Bash`/`Read` result.
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : config ? (
-    config.renderInvocation(call.input, { expanded: opts.expanded ?? showResult, createsFile: call.createsFile })
+    config.renderInvocation(call.input, {
+      expanded: (opts.expanded ?? showResult) || opts.detailed === true,
+      createsFile: call.createsFile,
+    })
   ) : (
     // Generic fallback for unrecognized tools -- never "Unrecognized" (P2): a name and a one-line
     // summary of its input is honest, where that word reads as an error the panel hit.
@@ -417,11 +433,17 @@ export function renderToolCall(
   // muted like the rule note, which it sits beside.
   const promptNote =
     call.promptNote === undefined ? null : <div className="tool-rule-note tool-prompt-note">{call.promptNote}</div>;
+  // v1 trial item 7: a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered with no
+  // card says so, muted, the same way a rule-answered row does -- the two never both apply (no rule
+  // ever fires for these three tools, `agent::permission_policy`'s module doc), so this and
+  // `ruleNote` are never both non-null for the same call.
+  const autoNote = call.allowedByAuto === true ? <div className="tool-rule-note">allowed by auto</div> : null;
   const shown = call.result === null || showResult || opts.detailed === true;
   return (
     <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
       {invocation}
       {ruleNote}
+      {autoNote}
       {promptNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
     </div>

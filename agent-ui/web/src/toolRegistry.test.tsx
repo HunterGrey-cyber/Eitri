@@ -43,6 +43,20 @@ describe("renderToolCall", () => {
     expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
   });
 
+  /** v1 trial item 7: a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path allowed with no
+   *  card says so, muted, the same way a rule-answered row does -- and a call without the note says
+   *  nothing of the kind, the carded/rule-answered case included. */
+  it("names an edit the acceptEdits fast path allowed, and says nothing of the kind otherwise", () => {
+    const { container } = render(<>{renderToolCall(call({ name: "Edit", allowedByAuto: true }))}</>);
+    expect(container.querySelector(".tool-rule-note")?.textContent).toBe("allowed by auto");
+    cleanup();
+    const plain = render(<>{renderToolCall(call({ name: "Edit" }))}</>);
+    expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
+    cleanup();
+    const ruled = render(<>{renderToolCall(call({ allowedByRule: "Bash(echo *)" }))}</>);
+    expect(ruled.container.textContent).not.toContain("allowed by auto");
+  });
+
   /** O3 review item 7: a call whose CLI prompt neovibe answered without a card says so, muted, the
    *  way a call a saved rule answered does; a call without one says nothing of the kind. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {
@@ -298,8 +312,11 @@ describe("a tool named after an Object.prototype member", () => {
 });
 
 /* Task 13: P2 (every real tool is named, ToolSearch is one muted line, a finished run collapses),
-   P3 (an edit's diff, folded to 6 lines anywhere except the detailed view or an expanded row), P4
-   (a gated row says it waits rather than repeating the call), R3 (the detailed view's wider cuts). */
+   P3 (an edit's diff, folded to a one-line path+counts summary anywhere except the detailed view
+   or an expanded row -- v1 trial item 7 replaced its original 6-line fold with this, once Write/
+   Edit/NotebookEdit stopped folding into count-only runs and every one of them needed to be this
+   compact by default), P4 (a gated row says it waits rather than repeating the call), R3 (the
+   detailed view's wider cuts). */
 describe("P2, P3, P4, R3 in the registry", () => {
   const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
 
@@ -326,16 +343,74 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect(out).not.toContain("Enter to expand");
   });
 
-  it("shows an edit's diff folded to 6 lines with its counts, in any mode (P3)", () => {
+  it("collapses an edit's diff to a one-line path+counts summary by default; Enter (opts.expanded) shows it whole (P3, v1 trial item 7)", () => {
     const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
     const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
     const input = { file_path: "/p/a.rs", old_string, new_string };
     const folded = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false }));
     expect(folded).toContain("/p/a.rs");
     expect(folded).toContain("+10 −10");
-    expect((folded.match(/class="diff-line/g) ?? []).length).toBe(6);
+    expect((folded.match(/class="diff-line/g) ?? []).length).toBe(0);
+    // `expanded` is the same per-row flag `Enter` (`toggle-expand`, MessageList.tsx) already
+    // toggles for every tool row -- no new key, just a lower default fold.
     const full = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, true, { expanded: true }));
     expect((full.match(/class="diff-line/g) ?? []).length).toBe(20);
+  });
+
+  /** Fix round finding 4: `opts.detailed` (`Ctrl+o`) used to reach only `ToolResult`'s own
+   *  head/tail cut, never `editConfig`'s `maxLines` -- a folded row stayed folded in the detailed
+   *  view too, so `Ctrl+o` alone never showed the diff `editConfig`'s own doc promised it would. */
+  it("Ctrl+o (opts.detailed) widens a folded edit's diff too, not only Enter (fix round finding 4)", () => {
+    const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
+    const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
+    const input = { file_path: "/p/a.rs", old_string, new_string };
+    const detailedButUnexpanded = html(
+      renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false, detailed: true }),
+    );
+    expect((detailedButUnexpanded.match(/class="diff-line/g) ?? []).length).toBe(20);
+    // Neither flag: still folded.
+    const neither = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false, detailed: false }));
+    expect((neither.match(/class="diff-line/g) ?? []).length).toBe(0);
+  });
+
+  /** v1 trial item 7: a `Write` over a path with nothing there says so instead of warning about an
+   *  overwrite it cannot see -- collapsed or not, since the note sits beside the diff body rather
+   *  than inside its line budget. */
+  it("says a Write creates a new file even collapsed, and NotebookEdit gets the same real diff view", () => {
+    const created = html(
+      renderToolCall({ seq: 1, toolUseId: "t", name: "Write", input: { file_path: "/p/new.rs", content: "fn new() {}" }, result: null, createsFile: true }, false, { expanded: false }),
+    );
+    expect(created).toContain("Creates a new file.");
+    expect((created.match(/class="diff-line/g) ?? []).length).toBe(0);
+
+    const notebook = html(
+      renderToolCall(
+        { seq: 1, toolUseId: "t", name: "NotebookEdit", input: { notebook_path: "/p/a.ipynb", new_source: "one\ntwo\n" }, result: null },
+        true,
+        { expanded: true },
+      ),
+    );
+    expect(notebook).toContain("a.ipynb");
+    expect(notebook).toContain("+2 −0");
+    expect(notebook.toLowerCase()).toContain("cell");
+    expect((notebook.match(/class="diff-line/g) ?? []).length).toBe(2);
+  });
+
+  /** Fix round finding 3, rendered end to end: a deleted cell reads as a deletion, not a
+   *  content-free "Writes the whole cell" note (`PermissionCard` and a completed row share this
+   *  same `EditDiff` view, so the fix at `editPreview` reaches both). */
+  it("names a deleted notebook cell instead of drawing an empty diff for it (fix round finding 3)", () => {
+    const out = html(
+      renderToolCall(
+        { seq: 1, toolUseId: "t", name: "NotebookEdit", input: { notebook_path: "/p/a.ipynb", cell_id: "c1", edit_mode: "delete" }, result: null },
+        false,
+        { expanded: false },
+      ),
+    );
+    expect(out).toContain("a.ipynb");
+    expect(out).toContain("Deletes cell c1");
+    expect(out).not.toContain("Writes the whole cell");
+    expect((out.match(/class="diff-line/g) ?? []).length).toBe(0);
   });
 
   it("says a gated call waits for approval instead of repeating it (P4)", () => {

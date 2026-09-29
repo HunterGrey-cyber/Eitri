@@ -42,6 +42,132 @@ pub struct EditorContext {
 pub const CONTENT_LIMIT: usize = 2000;
 pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 
+/// The built-in slash commands Claude Code 2.1.283 defines as `type: "local"` under a fixed name,
+/// with their aliases -- the commands its own code runs, rather than handing their argument to the
+/// model as prompt text.
+///
+/// Whole-branch review finding 1 (v1 trial, 2026-09-28): a turn whose first word is one of these
+/// never carries the context block. The CLI's router splits a slash turn at the first whitespace
+/// (`ZEe` in the 2.1.283 bundle: `name` up to the first `\s`, `args` everything after it, trimmed)
+/// and each of these commands parses `args` itself, so a block appended after the user's text
+/// becomes part of the argument -- the model name (`/model haiku\n\nThe user opened ...`, which
+/// `/model` rejects), the effort level ("Invalid argument"), a session name (`/rename`, `/clear
+/// <name>`), a path (`/add-dir`), a `key=value` (`/config`), compaction instructions (`/compact`) or a
+/// goal (`/goal`). None of them wants it.
+///
+/// **How it was read, not remembered.** `/scratch/auto-parity/cli-2.1.283.strings`: every object
+/// literal carrying `type:"local"`, in any key order, and its `aliases:[…]`. The first extraction
+/// matched only the literal `{type:"local",name:"…"` and missed four (v1 trial fix round 2): two whose
+/// `name` comes before `type` (`keybindings`; `rewind`, with `checkpoint` and `undo`) and two whose name
+/// is a variable (`Sae` = `low-priority`, `MOt` = `claim-credit`). A re-read should search the same
+/// way. The lookup is exact (`e.name===n || e.aliases?.includes(n)`), and so is
+/// [`names_a_cli_local_command`]. Included whether or not the entry says `supportsNonInteractive`
+/// (nine do not: `claim-credit`, `install-slack-app`, `keybindings`, `low-priority`, `radio`,
+/// `rewind`, `stickers`, `update`, `voice`) -- a headless CLI answers those without the model either,
+/// so a block there is never read.
+///
+/// **Two kinds of `type: "local"` command this list cannot name, left off on purpose.**
+/// - The Claude-for-Enterprise upsell stubs `z0()` builds (`ultraplan`, `teleport`/`tp`,
+///   `remote-control`/`rc`, `schedule`/`routines`, `autofix-pr`): each answers an upsell message
+///   without reading its argument, and a name like `schedule` is one a user's skill can have too,
+///   whose argument is prompt text that should keep the block.
+/// - A command a plugin registers at run time through its hooks module (`$.command.register`, built
+///   by `Jgn` as `type:"local"`, `supportsNonInteractive:!0`, `loadedFrom:"plugin"`): its
+///   `command.run` hook receives `args` the same way, so `/choose-profile staging` with a file open
+///   reaches it as `staging` plus the block. Its name is whatever the plugin chose, and neovibe never
+///   sees the CLI's command table: `system/init`'s `slash_commands` lists names with no type, and the
+///   sidecar does not forward it. Hooks modules are early access in 2.1.283 -- off for installed
+///   plugins unless `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is set or the `tengu_plugin_hooks_modules`
+///   rollout turns them on (built-in plugins load regardless; the one built-in registration found,
+///   the diff panel's `/diff`, takes no argument). Still open: closing it needs the command's type on
+///   the wire, or the context sent apart from the text.
+///
+/// **What keeps the block, and why.** The CLI's `type: "prompt"` commands (`/init`, `/review`,
+/// `/security-review`, `/doctor`, and every skill) substitute their argument into a prompt the model
+/// reads, which is where the block goes on any ordinary turn; an unknown `/word` is either a
+/// user's skill or reaches the model as text. Its `type: "local-jsx"` commands (the interactive
+/// pickers and wizards: `/help`, `/export`, ...) reply "isn't available in this environment"
+/// headless without reading their argument (`docs/canonical/2026-09-27-slash-commands.md`), so
+/// they are left out rather than listed for no effect -- `/model` and `/effort` have a `local-jsx`
+/// twin too, and it is their `local` definition a headless CLI runs.
+///
+/// A newer CLI can add a local command this list does not name; that command then gets the block
+/// until this list is re-read -- the failure this finding was, for one command, not a wider one.
+pub const CLI_LOCAL_COMMANDS: &[&str] = &[
+    "__remote-workflow",
+    "add-dir",
+    "advisor",
+    "agents",
+    "auto-mode-setup",
+    "autocompact",
+    "claim-credit",
+    "clear",
+    "reset",
+    "new",
+    "color",
+    "compact",
+    "config",
+    "settings",
+    "context",
+    "design-consent",
+    "design-revoke",
+    "effort",
+    "exit",
+    "extra-usage",
+    "fast",
+    "focus",
+    "goal",
+    "heapdump",
+    "import",
+    "install-slack-app",
+    "keybindings",
+    "list-agents",
+    "low-priority",
+    "peers",
+    "mcp",
+    "model",
+    "output-style",
+    "pause-memory",
+    "memory-pause",
+    "toggle-memory",
+    "plugin-types",
+    "radio",
+    "recap",
+    "reload-plugins",
+    "reload-skills",
+    "rewind",
+    "checkpoint",
+    "undo",
+    "rename",
+    "name",
+    "skill-doctor",
+    "stickers",
+    "stop",
+    "ultrareview",
+    "update",
+    "restart",
+    "usage",
+    "cost",
+    "stats",
+    "usage-credits",
+    "version",
+    "voice",
+    "workflow-launch-exec",
+];
+
+/// Whether the CLI would run `user_text` as one of [`CLI_LOCAL_COMMANDS`], argument or not: the
+/// CLI's own parse -- the text trimmed, a leading `/`, the name up to the first whitespace -- and
+/// its own exact match (`/Model` is not `/model` there, so not here). Replaces owner trial item 2's
+/// fix-round `is_bare_slash_picker_command`, which exempted only a bare `/model`/`/effort` and so
+/// left the argument form -- what the picker itself sends -- broken.
+fn names_a_cli_local_command(user_text: &str) -> bool {
+    let Some(rest) = user_text.trim().strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    CLI_LOCAL_COMMANDS.contains(&name)
+}
+
 /// Appends what the editor is showing to the user's own text.
 ///
 /// The two templates are the CLI's, verbatim. The trailing hedge sentence is **load-bearing**: with
@@ -50,12 +176,17 @@ pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 ///
 /// Returns the user's text unchanged when there is nothing worth saying -- no context at all, or a
 /// buffer with no file. A turn that carries a context block saying nothing is worse than one
-/// carrying none: it spends the model's attention and teaches the reader to ignore the block.
+/// carrying none: it spends the model's attention and teaches the reader to ignore the block. Also
+/// returns it unchanged for a turn the CLI runs as one of its own local commands, with or without an
+/// argument ([`CLI_LOCAL_COMMANDS`]) -- appended there, the block becomes that command's argument.
 pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> String {
     let Some(context) = context else {
         return user_text.to_string();
     };
     if context.file.trim().is_empty() {
+        return user_text.to_string();
+    }
+    if names_a_cli_local_command(user_text) {
         return user_text.to_string();
     }
     let block = match &context.selection {
@@ -179,6 +310,132 @@ mod tests {
             ),
             "q"
         );
+    }
+
+    /// Owner trial item 2, fix round: without this check, a bare `/model` or `/effort` with a file
+    /// open -- the ordinary case in an editor -- reached the CLI with a context block glued on right
+    /// after it, which the CLI's local-command router reads as an argument, so it never replied with
+    /// the text this panel's picker parses.
+    #[test]
+    fn a_bare_model_or_effort_command_gets_no_context_appended() {
+        assert_eq!(
+            compose_turn_text("/model", Some(&ctx("/p/src/main.rs", None))),
+            "/model"
+        );
+        assert_eq!(
+            compose_turn_text("/effort", Some(&ctx("/p/src/main.rs", None))),
+            "/effort"
+        );
+        // Whitespace-only padding is still the command: the CLI trims before it looks for `/`.
+        assert_eq!(
+            compose_turn_text("  /model  ", Some(&ctx("/p/src/main.rs", None))),
+            "  /model  "
+        );
+    }
+
+    /// Whole-branch review finding 1 (2026-09-28, v1 trial): the argument form is broken the same
+    /// way, and it is the form the picker itself sends (`chooseSlashOption`: `/model <choice>`,
+    /// `/effort <level>`). The CLI takes everything after the command name as the argument,
+    /// trimmed (`ZEe` in 2.1.283's bundle), so `/model haiku` with a file open reached it as the
+    /// model name `haiku\n\nThe user opened the file ...`, and `/effort low` as an invalid level.
+    /// This test used to pin exactly that broken shape as intended.
+    #[test]
+    fn a_local_command_with_an_argument_gets_no_context_either() {
+        let selection = Some(Selection {
+            start_line: 1,
+            end_line: 2,
+            text: "fn a() {}".into(),
+        });
+        for typed in ["/model sonnet", "/effort low", "/model haiku\n", "  /effort   max  "] {
+            assert_eq!(compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))), typed);
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", selection.clone()))),
+                typed
+            );
+        }
+    }
+
+    /// The rule is the CLI's own `type: "local"` list, not just the two picker commands: every one of
+    /// them parses its argument itself, so a block would become a session name (`/rename`,
+    /// `/clear <name>`), a path (`/add-dir`), a `key=value` (`/config`), compaction instructions
+    /// (`/compact`) or a goal (`/goal`). Aliases resolve to the same command in the CLI
+    /// (`aliases.includes`), so they are covered too; the CLI's match is exact, and so is this one.
+    #[test]
+    fn every_cli_local_command_and_alias_is_sent_as_typed() {
+        for typed in [
+            "/rename refactor",
+            "/name refactor",
+            "/clear",
+            "/reset",
+            "/new fresh start",
+            "/compact keep the test names",
+            "/config autoCompact=false",
+            "/settings autoCompact=false",
+            "/add-dir ../other",
+            "/goal all tests pass",
+            "/usage",
+            "/cost",
+            "/output-style Concise",
+            "/mcp reconnect",
+        ] {
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))),
+                typed,
+                "{typed}"
+            );
+        }
+        assert!(CLI_LOCAL_COMMANDS.contains(&"model") && CLI_LOCAL_COMMANDS.contains(&"effort"));
+    }
+
+    /// v1 trial fix round 2 (re-review of finding 1): the first list came from the literal pattern
+    /// `{type:"local",name:"…"`, which misses a definition with its `name` before its `type`
+    /// (`keybindings`, `rewind` with `checkpoint`/`undo`) or a name held in a variable (`Sae` is
+    /// `low-priority`, `MOt` is `claim-credit`). All four are built in and fixed by name.
+    #[test]
+    fn local_commands_defined_name_first_or_by_variable_are_sent_as_typed() {
+        for typed in [
+            "/keybindings",
+            "/rewind",
+            "/checkpoint",
+            "/undo last",
+            "/low-priority",
+            "/claim-credit",
+        ] {
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))),
+                typed,
+                "{typed}"
+            );
+        }
+    }
+
+    /// Everything else still carries the context: ordinary text, a command whose argument becomes
+    /// prompt text the model reads (`/review`, `/init`, a skill -- the CLI's `type: "prompt"`
+    /// commands, where the block is the same context it is on any turn), an unknown `/word`, a
+    /// slash that is not the first thing typed, and a local command's name in another case (the
+    /// CLI's own match is case-sensitive, so `/Model` is not its model command). Also `/schedule`,
+    /// one of the Claude-for-Enterprise upsell stubs (`z0()` in the bundle) left off the list: a stub
+    /// ignores its argument, and the name is one a skill can have, whose argument is prompt text.
+    #[test]
+    fn prompt_commands_and_ordinary_text_still_get_context_appended() {
+        const BLOCK: &str =
+            "\n\nThe user opened the file /p/src/main.rs in the IDE. This may or may not be related to the current task.";
+        for typed in [
+            "/review this change",
+            "/init",
+            "/my-skill do the thing",
+            "/schedule every morning",
+            "/modelx",
+            "/Model sonnet",
+            "use /model sonnet later",
+            "why is this slow?",
+        ] {
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))),
+                format!("{typed}{BLOCK}"),
+                "{typed}"
+            );
+        }
     }
 
     #[test]
