@@ -19,7 +19,7 @@ import { describe, expect, it } from "vitest";
 import resolveKeyFixtureText from "./fixtures/v1-frozen-resolve-key.json?raw";
 // Shared with core/tests/keymap_v1_freeze.rs -- one file, one freeze, for both languages.
 import panelFixtureText from "../../../docs/keymap/v1-frozen-panel-keys.json?raw";
-import { resolveKey } from "./keymap";
+import { CARET_KEYS, resolveKey, VISUAL_KEYS } from "./keymap";
 import type { KeyLike, PanelAction, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 import { advanceSequence, startSequence } from "./leader";
 
@@ -32,9 +32,21 @@ const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> =
   ...over,
 });
 
+/** `CARET_KEYS`/`VISUAL_KEYS`' own token spelling -> a `KeyLike`, the same rule `keymap.test.ts`'s
+ *  `parseVisualToken` uses: `"Esc"` is the display spelling of the real `key: "Escape"`, `"1-9"` a
+ *  representative digit, `"gg"` (added for 3a) the FIRST of its two presses (a non-`pending` case
+ *  below covers the second), and every bare uppercase letter or `?` carries Shift. */
+function visualToken(token: string): KeyLike {
+  if (token === "Esc") return key("Escape");
+  if (token === "1-9") return key("3");
+  if (token === "gg") return key("g");
+  if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
+  return key(token);
+}
+
 type ResolveKeyCase = {
   label: string;
-  mode: "browse" | "input";
+  mode: "browse" | "input" | "caret" | "visual" | "vline";
   event: KeyLike;
   ctx: { sessionEnded: boolean; turnRunning?: boolean; pending?: PendingPrefix };
 };
@@ -90,6 +102,46 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   // Append new binding cases so regenerated fixture diffs show only additions.
   { label: "Ctrl+e", mode: "browse", event: key("e", { ctrlKey: true }), ctx: { sessionEnded: false } },
   { label: "Ctrl+y", mode: "browse", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  // Add cases for BROWSE's visual entry keys, the gv reservation, and each VISUAL_KEYS row
+  // in VISUAL and V-LINE. Also pin keys that must never answer a card and Ctrl+c's interrupt.
+  { label: "v", mode: "browse", event: key("v"), ctx: { sessionEnded: false } },
+  { label: "Shift+V", mode: "browse", event: key("V", { shiftKey: true }), ctx: { sessionEnded: false } },
+  { label: "gv", mode: "browse", event: key("v"), ctx: { sessionEnded: false, pending: "g" } },
+  ...(["visual", "vline"] as const).flatMap((mode) =>
+    VISUAL_KEYS.flatMap(({ keys }) =>
+      keys.split(" / ").map((token) => ({
+        label: `${mode}: ${token}`,
+        mode,
+        event: visualToken(token),
+        ctx: { sessionEnded: false },
+      })),
+    ),
+  ),
+  { label: "visual: d", mode: "visual", event: key("d"), ctx: { sessionEnded: false } },
+  { label: "visual: a", mode: "visual", event: key("a"), ctx: { sessionEnded: false } },
+  { label: "visual: Shift+D", mode: "visual", event: key("D", { shiftKey: true }), ctx: { sessionEnded: false } },
+  { label: "visual: Ctrl+c, a turn is running", mode: "visual", event: key("c", { ctrlKey: true }), ctx: { sessionEnded: false, turnRunning: true } },
+  // Cover every CARET_KEYS row, three keys that must never answer, and running/idle Ctrl+c.
+  // Idle Ctrl+c is claimed in CARET, unlike the VISUAL case above.
+  ...CARET_KEYS.flatMap(({ keys }) =>
+    keys.split(" / ").map((token) => ({
+      label: `caret: ${token}`,
+      mode: "caret" as const,
+      event: visualToken(token),
+      ctx: { sessionEnded: false },
+    })),
+  ),
+  { label: "caret: d", mode: "caret", event: key("d"), ctx: { sessionEnded: false } },
+  { label: "caret: a", mode: "caret", event: key("a"), ctx: { sessionEnded: false } },
+  { label: "caret: Shift+D", mode: "caret", event: key("D", { shiftKey: true }), ctx: { sessionEnded: false } },
+  { label: "caret: Enter", mode: "caret", event: key("Enter"), ctx: { sessionEnded: false } },
+  { label: "caret: Ctrl+c, idle", mode: "caret", event: key("c", { ctrlKey: true }), ctx: { sessionEnded: false, turnRunning: false } },
+  {
+    label: "caret: Ctrl+c, a turn is running",
+    mode: "caret",
+    event: key("c", { ctrlKey: true }),
+    ctx: { sessionEnded: false, turnRunning: true },
+  },
 ];
 
 function readJson<T>(text: string): T {

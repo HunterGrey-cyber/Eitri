@@ -701,6 +701,64 @@ body,
   color: var(--nv-fg);
   box-shadow: inset 0 0 0 1.5px var(--nv-fg);
 }
+/* In visual mode, the DOM
+   selection while VISUAL/V-LINE is on reads in nvim's own Visual colour (the same `--nv-cursorline`
+   token the cursor row already fills with, `.row-current` above) -- text keeps its own colour, only
+   the background changes. `.row-current`'s own fill is turned off for as long as VISUAL is on, so
+   the highlight would not vanish where the two coincide (a bare `v`/`V` always starts on the cursor
+   row). No new Rust token for v1 -- an exact reverse `Visual` (`invert_selection`) would need
+   `visual_bg`/`visual_fg` in `ThemeTokens`/`css_vars`, guarded like `cursorline`. */
+.message-list[data-visual] ::selection {
+  background: var(--nv-cursorline);
+}
+/* The caret is a one-character reverse-video selection -- the theme's own
+   text/background contrast pair, reversed, so it is visible on every theme rather than nvim's
+   Visual colour it would otherwise share with a genuine VISUAL/V-LINE selection. Placed AFTER the
+   general `[data-visual]` rule above so source order wins the tie between two selectors of equal
+   specificity (`.message-list[data-visual]` vs. `.message-list[data-visual="caret"]`, both
+   (0,2,0)): the caret's own colours must win on a caret, the cursorline colour everywhere else. */
+.message-list[data-visual="caret"] ::selection {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+}
+.message-list[data-visual] .row-current {
+  background: none;
+}
+/* `VISUAL_CHROME` (visual.ts), everywhere but `.row-sign` (already `user-select: none` above,
+   just before `.message-list[data-visual]`): a selection built by VISUAL must never rest in, or
+   copy from, any of these. `[aria-hidden="true"]` already covers the diff gutter (`EditDiff.tsx`'s
+   `.diff-gutter` carries the attribute) with no separate rule needed there. `indexCss.test.ts`
+   holds this whole list equal to `visual.ts`'s own `VISUAL_CHROME`, so the two cannot drift apart. */
+[aria-hidden="true"],
+button,
+input,
+textarea,
+[data-nav-action],
+.fold-marker {
+  user-select: none;
+}
+/* `copySelectionText` (`visual.ts`) sets `data-visual-copying` on every row the selection
+   touches -- and on every other block of `.message-list` it crosses, such as the
+   history notice and its button -- for the one synchronous `Selection.toString()` read a `y` performs, and removes it again
+   before the next frame paints -- so `user-select: none` above (whether or not WebKit's own
+   `toString`/native copy actually honours it) is never what keeps a row sign, a button label, a
+   form control's value or a fold marker's glyph out of the copied text; THIS rule is.
+   Previously the attribute was set and read, but this rule
+   never existed, so what `y` actually copied depended on WebKit's own unverified handling of
+   `user-select: none` rather than on anything this file asserts. `.row-sign` is included here (it
+   is not above, since it is drawn WITH `user-select: none` regardless of VISUAL) for the same reason
+   every other member is: `display: none` removes it from `Selection.toString()` outright, which
+   `user-select: none` alone does not guarantee. `indexCss.test.ts` holds this list equal to
+   `VISUAL_CHROME` too. */
+[data-visual-copying] .row-sign,
+[data-visual-copying] [aria-hidden="true"],
+[data-visual-copying] button,
+[data-visual-copying] input,
+[data-visual-copying] textarea,
+[data-visual-copying] [data-nav-action],
+[data-visual-copying] .fold-marker {
+  display: none;
+}
 .row-body {
   font-family: var(--nv-font-prose);
   font-size: var(--fs-prose);

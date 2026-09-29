@@ -42,14 +42,104 @@ pub struct EditorContext {
 pub const CONTENT_LIMIT: usize = 2000;
 pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 
-/// Whether `user_text` is a bare `/model` or `/effort`, with only whitespace around it.
-/// Matches `agent-ui/web/src/slashCommands.ts`'s `barePickerCommand`, which controls picker replies.
-/// This copy only decides whether appending editor context is safe.
+/// Fixed-name built-in CLI commands with `type: "local"`, including aliases, in version 2.1.283.
+/// These commands execute locally instead of passing their arguments to the model.
+/// A turn beginning with one of these commands gets no appended editor context.
 ///
-/// The CLI reads everything after the command name as an argument. Appending a file context
-/// block to a bare command makes it an invalid argument instead of a picker request.
-fn is_bare_slash_picker_command(user_text: &str) -> bool {
-    matches!(user_text.trim(), "/model" | "/effort")
+/// The router splits at the first whitespace: `name` is the command and `args` is the trimmed
+/// remainder. Each local command parses its own arguments, so appended context would become
+/// part of a model name, effort level, session name, path, configuration value or other argument.
+///
+/// Command definitions can put `name` before `type`, or hold the name in a variable.
+/// Matching only `{type:"local",name:...}` misses `keybindings`, `rewind` and its aliases
+/// `checkpoint` and `undo`, plus `low-priority` and `claim-credit`. The lookup matches exact names
+/// or aliases, as does [`names_a_cli_local_command`]. Commands are included even when they lack
+/// `supportsNonInteractive`: a headless reply still does not pass their arguments to the model.
+///
+/// Upsell stubs are omitted because they ignore their arguments, and their names can also name
+/// user skills whose arguments should keep editor context. Plugin commands registered at runtime
+/// are also omitted because their names are unknown here. Their `command.run` hooks receive
+/// `args`, so appended context can still corrupt those arguments. The `system/init` command list
+/// has no type information and is not forwarded by the sidecar. Handling this case requires
+/// command types on the wire or context sent separately from command text.
+///
+/// Prompt commands and skills keep the block because their arguments reach the model.
+/// Unknown slash commands may be skills or ordinary model text, so they keep it too.
+/// Interactive `local-jsx` commands are omitted because headless replies ignore their arguments.
+/// For `/model` and `/effort`, the headless CLI uses their `local` definitions.
+/// A newer CLI can add local commands that receive context until this list is updated.
+pub const CLI_LOCAL_COMMANDS: &[&str] = &[
+    "__remote-workflow",
+    "add-dir",
+    "advisor",
+    "agents",
+    "auto-mode-setup",
+    "autocompact",
+    "claim-credit",
+    "clear",
+    "reset",
+    "new",
+    "color",
+    "compact",
+    "config",
+    "settings",
+    "context",
+    "design-consent",
+    "design-revoke",
+    "effort",
+    "exit",
+    "extra-usage",
+    "fast",
+    "focus",
+    "goal",
+    "heapdump",
+    "import",
+    "install-slack-app",
+    "keybindings",
+    "list-agents",
+    "low-priority",
+    "peers",
+    "mcp",
+    "model",
+    "output-style",
+    "pause-memory",
+    "memory-pause",
+    "toggle-memory",
+    "plugin-types",
+    "radio",
+    "recap",
+    "reload-plugins",
+    "reload-skills",
+    "rewind",
+    "checkpoint",
+    "undo",
+    "rename",
+    "name",
+    "skill-doctor",
+    "stickers",
+    "stop",
+    "ultrareview",
+    "update",
+    "restart",
+    "usage",
+    "cost",
+    "stats",
+    "usage-credits",
+    "version",
+    "voice",
+    "workflow-launch-exec",
+];
+
+/// Whether the CLI runs `user_text` as one of [`CLI_LOCAL_COMMANDS`], with or without
+/// arguments. Matches its parsing: trim text, require `/`, take the name up to whitespace,
+/// and compare exactly, so `/Model` differs from `/model`. Argument forms must match too
+/// because the picker sends them.
+fn names_a_cli_local_command(user_text: &str) -> bool {
+    let Some(rest) = user_text.trim().strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    CLI_LOCAL_COMMANDS.contains(&name)
 }
 
 /// Appends what the editor is showing to the user's own text.
@@ -61,9 +151,8 @@ fn is_bare_slash_picker_command(user_text: &str) -> bool {
 /// Returns the user's text unchanged when there is nothing worth saying -- no context at all, or a
 /// buffer with no file. A turn that carries a context block saying nothing is worse than one
 /// carrying none: it spends the model's attention and teaches the reader to ignore the block. Also
-/// returns it unchanged for a bare `/model`/`/effort` (`is_bare_slash_picker_command`) -- appending
-/// anything there breaks the CLI's own local-command parsing, which is the one reply this panel
-/// depends on being able to parse back out.
+/// returns it unchanged for a turn the CLI runs as one of its own local commands, with or without an
+/// argument ([`CLI_LOCAL_COMMANDS`]) -- appended there, the block becomes that command's argument.
 pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> String {
     let Some(context) = context else {
         return user_text.to_string();
@@ -71,7 +160,7 @@ pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> St
     if context.file.trim().is_empty() {
         return user_text.to_string();
     }
-    if is_bare_slash_picker_command(user_text) {
+    if names_a_cli_local_command(user_text) {
         return user_text.to_string();
     }
     let block = match &context.selection {
@@ -199,7 +288,6 @@ mod tests {
 
     /// A bare `/model` or `/effort` gets no appended context, even with a file open.
     /// The CLI would read that block as an argument and omit the reply the picker expects.
-    /// Selections and ordinary non-bare commands still compose context normally.
     #[test]
     fn a_bare_model_or_effort_command_gets_no_context_appended() {
         assert_eq!(
@@ -210,23 +298,112 @@ mod tests {
             compose_turn_text("/effort", Some(&ctx("/p/src/main.rs", None))),
             "/effort"
         );
-        // Whitespace-only padding is still bare -- matches `barePickerCommand`'s own `trim()` rule.
+        // Whitespace-only padding is still the command: the CLI trims before it looks for `/`.
         assert_eq!(
             compose_turn_text("  /model  ", Some(&ctx("/p/src/main.rs", None))),
             "  /model  "
         );
     }
 
-    /// The command must be EXACTLY bare: an argument (already a working send before this feature),
-    /// a different command, or ordinary text all still get the context block -- this check is
-    /// narrowly scoped to the one shape whose reply this panel depends on parsing back out.
+    /// Local commands with arguments also get no appended context, including picker choices
+    /// such as `/model haiku` and `/effort low`. The CLI treats the trimmed text after the command
+    /// name as its argument, so context would corrupt the model name or effort level.
     #[test]
-    fn a_model_command_with_an_argument_still_gets_context_appended() {
-        let out = compose_turn_text("/model sonnet", Some(&ctx("/p/src/main.rs", None)));
-        assert_eq!(
-            out,
-            "/model sonnet\n\nThe user opened the file /p/src/main.rs in the IDE. This may or may not be related to the current task."
-        );
+    fn a_local_command_with_an_argument_gets_no_context_either() {
+        let selection = Some(Selection {
+            start_line: 1,
+            end_line: 2,
+            text: "fn a() {}".into(),
+        });
+        for typed in ["/model sonnet", "/effort low", "/model haiku\n", "  /effort   max  "] {
+            assert_eq!(compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))), typed);
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", selection.clone()))),
+                typed
+            );
+        }
+    }
+
+    /// The rule is the CLI's own `type: "local"` list, not just the two picker commands: every one of
+    /// them parses its argument itself, so a block would become a session name (`/rename`,
+    /// `/clear <name>`), a path (`/add-dir`), a `key=value` (`/config`), compaction instructions
+    /// (`/compact`) or a goal (`/goal`). Aliases resolve to the same command in the CLI
+    /// (`aliases.includes`), so they are covered too; the CLI's match is exact, and so is this one.
+    #[test]
+    fn every_cli_local_command_and_alias_is_sent_as_typed() {
+        for typed in [
+            "/rename refactor",
+            "/name refactor",
+            "/clear",
+            "/reset",
+            "/new fresh start",
+            "/compact keep the test names",
+            "/config autoCompact=false",
+            "/settings autoCompact=false",
+            "/add-dir ../other",
+            "/goal all tests pass",
+            "/usage",
+            "/cost",
+            "/output-style Concise",
+            "/mcp reconnect",
+        ] {
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))),
+                typed,
+                "{typed}"
+            );
+        }
+        assert!(CLI_LOCAL_COMMANDS.contains(&"model") && CLI_LOCAL_COMMANDS.contains(&"effort"));
+    }
+
+    /// Local command definitions can put `name` before `type` or hold the name in a variable.
+    /// The fixed names include `keybindings`, `rewind` with `checkpoint` and `undo`,
+    /// `low-priority` and `claim-credit`; all must be sent without appended context.
+    #[test]
+    fn local_commands_defined_name_first_or_by_variable_are_sent_as_typed() {
+        for typed in [
+            "/keybindings",
+            "/rewind",
+            "/checkpoint",
+            "/undo last",
+            "/low-priority",
+            "/claim-credit",
+        ] {
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))),
+                typed,
+                "{typed}"
+            );
+        }
+    }
+
+    /// Everything else still carries the context: ordinary text, a command whose argument becomes
+    /// prompt text the model reads (`/review`, `/init`, a skill -- the CLI's `type: "prompt"`
+    /// commands, where the block is the same context it is on any turn), an unknown `/word`, a
+    /// slash that is not the first thing typed, and a local command's name in another case (the
+    /// CLI's own match is case-sensitive, so `/Model` is not its model command). Also `/schedule`,
+    /// one of the Claude-for-Enterprise upsell stubs (`z0()` in the bundle) left off the list: a stub
+    /// ignores its argument, and the name is one a skill can have, whose argument is prompt text.
+    #[test]
+    fn prompt_commands_and_ordinary_text_still_get_context_appended() {
+        const BLOCK: &str =
+            "\n\nThe user opened the file /p/src/main.rs in the IDE. This may or may not be related to the current task.";
+        for typed in [
+            "/review this change",
+            "/init",
+            "/my-skill do the thing",
+            "/schedule every morning",
+            "/modelx",
+            "/Model sonnet",
+            "use /model sonnet later",
+            "why is this slow?",
+        ] {
+            assert_eq!(
+                compose_turn_text(typed, Some(&ctx("/p/src/main.rs", None))),
+                format!("{typed}{BLOCK}"),
+                "{typed}"
+            );
+        }
     }
 
     #[test]

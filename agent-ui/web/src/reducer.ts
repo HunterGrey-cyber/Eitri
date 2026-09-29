@@ -246,9 +246,9 @@ export type CallNotes = {
    *  path without a card. Unlike `ruleNotes`, these have no separate message: `toolRegistry.tsx`
    *  labels their rows "allowed by auto". */
   autoNotes?: readonly string[];
-  /** Tool-use ids for `Write` calls allowed by acceptEdits without a card when the path did not
-   *  exist at call start. `createsFile` is keyed by permission id and only covers calls with cards.
-   *  This signal keeps a new-file write from showing an overwrite warning. */
+  /** Tool-use ids for `Write` calls answered without a card, through acceptEdits or bypass, when
+   *  the path did not exist just before the answer. `createsFile` is keyed by permission id and only
+   *  covers calls with cards. This signal keeps a new-file write from showing an overwrite warning. */
   autoCreatesFile?: readonly string[];
 };
 

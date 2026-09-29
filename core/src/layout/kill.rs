@@ -124,7 +124,7 @@ mod tests {
     use super::super::module::ModuleDecl;
     use super::super::ops::place;
     use super::super::tray::tray;
-    use super::super::tree::{Axis, Branch, Node, Pin, BELOW_ROOT_SHARE};
+    use super::super::tree::{Axis, Node, Pin};
     use super::*;
 
     fn frame() -> Frame<'static> {

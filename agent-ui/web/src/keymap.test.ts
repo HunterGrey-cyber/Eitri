@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { noteKey } from "./heldSuper";
-import { BROWSE_KEYS, INPUT_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
+import { BROWSE_KEYS, CARET_KEYS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
 const key = (
@@ -428,9 +428,169 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
   });
 });
 
+/** VISUAL/V-LINE's own token parser, mirroring `parseKeyToken` above but for the shape `VISUAL_KEYS`
+ *  rows actually take: no two-key sequences, `"1-9"` a representative digit, `"Esc"` the display
+ *  spelling of the real `key: "Escape"`, and every bare uppercase letter or `?` carrying Shift, the
+ *  same reason `parseKeyToken` does. */
+function parseVisualToken(token: string): KeyLike {
+  if (token === "Esc") return key("Escape");
+  if (token === "1-9") return key("3");
+  // For `gg`, the table tests only need the first press, which arms a pending marker.
+  // Separate tests check the complete sequence alongside `G`.
+  if (token === "gg") return key("g");
+  if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
+  return key(token);
+}
+
+describe("VISUAL_KEYS <-> resolveKey", () => {
+  it("every key VISUAL_KEYS lists actually does something in either VISUAL or V-LINE", () => {
+    for (const { keys } of VISUAL_KEYS) {
+      for (const token of keys.split(" / ")) {
+        const ev = parseVisualToken(token);
+        expect(resolveKey("visual", ev, ctx), `"${token}" (from "${keys}") in visual`).not.toBeNull();
+        expect(resolveKey("vline", ev, ctx), `"${token}" (from "${keys}") in vline`).not.toBeNull();
+      }
+    }
+  });
+
+  /* An unbound plain letter in VISUAL ends the region as `vend`, so check that every letter
+     absent from `VISUAL_KEYS` does that rather than a named action. Listed keys must resolve to
+     something else. Exclude `g`: only `gg` is listed, and a lone `g` arms the region's pending
+     marker instead of ending it. That case is checked separately below. */
+  it("every other plain letter ends VISUAL (vend) rather than doing one of VISUAL_KEYS's own things", () => {
+    const known = new Set(VISUAL_KEYS.flatMap((row) => row.keys.split(" / ")));
+    for (const letter of "abcdefhijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")) {
+      if (known.has(letter)) continue;
+      const ev = /[A-Z]/.test(letter) ? key(letter, { shiftKey: true }) : key(letter);
+      const result = resolveKey("visual", ev, ctx);
+      expect(result, `"${letter}"`).toEqual({ kind: "vend", key: letter });
+    }
+  });
+
+  it("a lone g arms the region-local pending marker rather than ending the region", () => {
+    expect(resolveKey("visual", key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
+    expect(resolveKey("vline", key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
+  });
+
+  it("gg places the caret at the list's first selectable character", () => {
+    expect(resolveKey("visual", key("g"), { ...ctx, pending: "g" })).toEqual({ kind: "vmove", motion: "gg" });
+    expect(resolveKey("visual", key("G", { shiftKey: true }), ctx)).toEqual({ kind: "vmove", motion: "G" });
+  });
+
+  it("gv is reserved: does nothing, dropping the pending g rather than starting VISUAL", () => {
+    expect(resolveKey("visual", key("v"), { ...ctx, pending: "g" })).toBeNull();
+  });
+
+  it("> quotes the selection into the draft", () => {
+    expect(resolveKey("visual", key(">", { shiftKey: true }), ctx)).toEqual({ kind: "vquote" });
+    expect(resolveKey("vline", key(">", { shiftKey: true }), ctx)).toEqual({ kind: "vquote" });
+  });
+
+  it("VISUAL's own key or Esc goes back to CARET (vback); the other key switches (vtoggle)", () => {
+    expect(resolveKey("visual", key("v"), ctx)).toEqual({ kind: "vback" });
+    expect(resolveKey("visual", key("V", { shiftKey: true }), ctx)).toEqual({ kind: "vtoggle", line: true });
+    expect(resolveKey("visual", key("Escape"), ctx)).toEqual({ kind: "vback" });
+    expect(resolveKey("vline", key("V", { shiftKey: true }), ctx)).toEqual({ kind: "vback" });
+    expect(resolveKey("vline", key("v"), ctx)).toEqual({ kind: "vtoggle", line: false });
+    expect(resolveKey("vline", key("Escape"), ctx)).toEqual({ kind: "vback" });
+  });
+});
+
+describe("CARET_KEYS <-> resolveKey", () => {
+  it("every key CARET_KEYS lists actually does something in CARET", () => {
+    for (const { keys } of CARET_KEYS) {
+      for (const token of keys.split(" / ")) {
+        const ev = parseVisualToken(token);
+        expect(resolveKey("caret", ev, ctx), `"${token}" (from "${keys}") in caret`).not.toBeNull();
+      }
+    }
+  });
+
+  it("every other plain letter ends CARET (vend), g arms the pending gg marker instead", () => {
+    const known = new Set(CARET_KEYS.flatMap((row) => row.keys.split(" / ")));
+    for (const letter of "abcdefhijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")) {
+      if (known.has(letter)) continue;
+      const ev = /[A-Z]/.test(letter) ? key(letter, { shiftKey: true }) : key(letter);
+      const result = resolveKey("caret", ev, ctx);
+      expect(result, `"${letter}"`).toEqual({ kind: "vend", key: letter });
+    }
+    expect(resolveKey("caret", key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
+  });
+
+  it("v/V from CARET always start a selection mode (vtoggle), never vback", () => {
+    expect(resolveKey("caret", key("v"), ctx)).toEqual({ kind: "vtoggle", line: false });
+    expect(resolveKey("caret", key("V", { shiftKey: true }), ctx)).toEqual({ kind: "vtoggle", line: true });
+  });
+
+  it("Esc ends CARET (vend), back to BROWSE -- not vback", () => {
+    expect(resolveKey("caret", key("Escape"), ctx)).toEqual({ kind: "vend", key: "Escape" });
+  });
+
+  it("idle Ctrl+c in CARET is claimed (vswallow), not left to the engine's native copy", () => {
+    expect(resolveKey("caret", key("c", { ctrlKey: true }), ctx)).toEqual({ kind: "vswallow" });
+    expect(resolveKey("caret", key("c", { ctrlKey: true }), { ...ctx, turnRunning: true })).toEqual({ kind: "interrupt" });
+  });
+
+  it("o and y are VISUAL-only, not bound in CARET", () => {
+    expect(resolveKey("caret", key("o"), ctx)).toEqual({ kind: "vend", key: "o" });
+    expect(resolveKey("caret", key("y"), ctx)).toEqual({ kind: "vend", key: "y" });
+  });
+});
+
+/* Keys with Ctrl, Alt, Meta, Super, Hyper or AltGraph return `vswallow` in VISUAL and
+   V-LINE so browser defaults cannot run.
+   Alt+j must not move the caret, and Ctrl+o must not re-render rows under the selection.
+   Ctrl+c is handled separately and is covered by the freeze fixture. */
+describe("a modified key in VISUAL is swallowed, VISUAL stays", () => {
+  it.each([
+    ["Ctrl+o", key("o", { ctrlKey: true })],
+    ["Ctrl+g", key("g", { ctrlKey: true })],
+    ["Ctrl+d", key("d", { ctrlKey: true })],
+    ["Alt+j", key("j", { altKey: true })],
+    ["Alt+y", key("y", { altKey: true })],
+    ["Meta+l", key("l", { metaKey: true })],
+    ["Super+a", key("a", { superKey: true })],
+    ["Hyper+d", key("d", { hyperKey: true })],
+    ["AltGraph+e", key("e", { altGraphKey: true })],
+    ["Ctrl+Shift+V", key("V", { ctrlKey: true, shiftKey: true })],
+  ] as const)("%s in VISUAL and in V-LINE is vswallow", (_name, ev) => {
+    expect(resolveKey("visual", ev, ctx)).toEqual({ kind: "vswallow" });
+    expect(resolveKey("vline", ev, ctx)).toEqual({ kind: "vswallow" });
+  });
+
+  it("Ctrl+c stays the exception: interrupt while a turn runs, unclaimed idle -- never vswallow", () => {
+    const ctrlC = key("c", { ctrlKey: true });
+    expect(resolveKey("visual", ctrlC, { ...ctx, turnRunning: true })).toEqual({ kind: "interrupt" });
+    expect(resolveKey("visual", ctrlC, ctx)).toBeNull();
+    // With any other modifier as well it is an ordinary modified key again.
+    expect(resolveKey("visual", key("c", { ctrlKey: true, altKey: true }), ctx)).toEqual({ kind: "vswallow" });
+  });
+});
+
+describe("v / V entry reads isPlainAnswerKey", () => {
+  it("a plain v starts CARET, Shift+V starts V-LINE directly", () => {
+    expect(resolveKey("browse", key("v"), ctx)).toEqual({ kind: "caret" });
+    expect(resolveKey("browse", key("V", { shiftKey: true }), ctx)).toEqual({ kind: "visual", line: true });
+  });
+
+  /* Mode entry must reject Ctrl, Alt, Meta, Super, Hyper and AltGraph. Checking only `ctrlKey`
+     lets modified `v` or Shift+V start a mode; these chords must remain unclaimed. */
+  it.each([
+    ["Alt", { altKey: true }],
+    ["Meta", { metaKey: true }],
+    ["Super", { superKey: true }],
+    ["Hyper", { hyperKey: true }],
+    ["AltGraph", { altGraphKey: true }],
+    ["Ctrl", { ctrlKey: true }],
+  ] as const)("%s+v, and Shift+V with the same modifier, start nothing", (_name, over) => {
+    expect(resolveKey("browse", key("v", over), ctx)).toBeNull();
+    expect(resolveKey("browse", key("V", { ...over, shiftKey: true }), ctx)).toBeNull();
+  });
+});
+
 describe("the ? keymap tables", () => {
   it("are each non-empty and free of duplicate keys", () => {
-    for (const table of [BROWSE_KEYS, INPUT_KEYS]) {
+    for (const table of [BROWSE_KEYS, INPUT_KEYS, CARET_KEYS, VISUAL_KEYS]) {
       expect(table.length).toBeGreaterThan(0);
       expect(new Set(table.map((row) => row.keys)).size).toBe(table.length);
     }

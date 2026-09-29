@@ -15,6 +15,7 @@ import { PermissionCard } from "./components/PermissionCard";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { EMPTY_PANEL_TABLE } from "./keymap";
+import { VISUAL_CHROME } from "./visual";
 
 /** Strip CSS comments while preserving comment markers inside strings.
  *
@@ -67,12 +68,11 @@ const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
 /** A selector branch that sits inside the winbar or the status line -- `.winbar`, `.status-line`,
  *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
-/** The solid cursor block: the current row's sign cell, a focused button with its children (every
- *  control is keyboard-reachable and the selected one is drawn as the cursor), the band's own
- *  `↓N` button,
- *  and the chooser's current row's sign cell. Nothing
- *  else. */
-const CURSOR_BRANCH = /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread|\.chooser-row\.current \.chooser-sign)$/;
+/** Solid cursor surfaces use the body's foreground/background pair reversed: the current
+ *  row's sign cell, a focused button and its children, the band's `↓N` button, the chooser's
+ *  current sign cell, and CARET's one-character selection. Nothing else. */
+const CURSOR_BRANCH =
+  /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread|\.chooser-row\.current \.chooser-sign|\.message-list\[data-visual="caret"\] ::selection)$/;
 /** The global `f` HINT's label, and nothing else. */
 const HINT_BRANCH = /^\.hint-label$/;
 /** The which-key box's own keycap glyph, and nothing else -- a
@@ -2554,5 +2554,46 @@ describe("text on a --nv-surface fill (sw-theme-2)", () => {
     }
     expect(offSurface, "the fixture must put text on another fill too").toBeGreaterThan(3);
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("VISUAL mode", () => {
+  it("index.css's user-select: none selectors equal visual.ts's own VISUAL_CHROME, exactly", () => {
+    const rules = splitRules(stripComments(css));
+    const found = new Set<string>();
+    for (const rule of rules) {
+      if (!/user-select\s*:\s*none\s*;?/.test(rule.declarations)) continue;
+      for (const selector of rule.selector.split(",")) found.add(selector.trim());
+    }
+    expect(found).toEqual(new Set(VISUAL_CHROME));
+  });
+
+  it("hides every VISUAL_CHROME member under data-visual-copying -- the rule copySelectionText's attribute actually needed", () => {
+    const rules = splitRules(stripComments(css));
+    const found = new Set<string>();
+    for (const rule of rules) {
+      if (!/display\s*:\s*none\s*;?/.test(rule.declarations)) continue;
+      for (const selector of rule.selector.split(",")) {
+        const trimmed = selector.trim();
+        const match = /^\[data-visual-copying\]\s+(.+)$/.exec(trimmed);
+        if (match) found.add(match[1].trim());
+      }
+    }
+    expect(found).toEqual(new Set(VISUAL_CHROME));
+  });
+
+  it("highlights a selection in nvim's Visual colour while VISUAL/V-LINE is on, and turns off the cursorline fill where the two coincide", () => {
+    // Comments stripped first: `rulesMatching` is a naive substring matcher, and this file's own
+    // doc comment on the rule below mentions ".row-current" in backticks -- without stripping,
+    // that comment text (attached to the WRONG rule's captured selector) is what "found" it.
+    const stripped = stripComments(css);
+    const selectionRule = rulesMatching(stripped, "::selection").find((r) => r.selector.includes("[data-visual]"));
+    expect(selectionRule, "no .message-list[data-visual] ::selection rule").toBeDefined();
+    expect(selectionRule!.body).toContain("background: var(--nv-cursorline)");
+    // Text keeps its own colour: this rule must not also set `color`.
+    expect(selectionRule!.body).not.toMatch(/(?<!background-)color\s*:/);
+    const rowCurrentOverride = rulesMatching(stripped, ".row-current").find((r) => r.selector.includes("[data-visual]"));
+    expect(rowCurrentOverride, "no .message-list[data-visual] .row-current rule").toBeDefined();
+    expect(rowCurrentOverride!.body).toContain("background: none");
   });
 });

@@ -54,9 +54,8 @@ describe("dashItems", () => {
 });
 
 describe("MODE_CONSEQUENCE", () => {
-  /** Auto's text describes the acceptEdits fast path even though this build still uses interactive
-   *  default behavior. `MODE_CONSEQUENCE` documents the temporary mismatch. The bypass text is
-   *  unchanged. */
+  /** Auto's text describes the acceptEdits fast path used by this build's policy. The bypass text
+   *  is unchanged. */
   it("says what auto and bypass actually do", () => {
     expect(MODE_CONSEQUENCE.auto).toBe("Edits in this project and safe reads run; anything else asks.");
     expect(MODE_CONSEQUENCE.bypass).toBe("Nothing asks: edits and commands run unasked.");

@@ -28,10 +28,10 @@ export function dashItems(hello: Hello): DashItem[] {
   return items;
 }
 
-/** Text explaining permission modes. Unknown modes draw no consequence line. The auto label
- *  describes project edits outside protected paths running without a card, but this build's
- *  `agent/src/permission_policy.rs` still asks for every edit or write. Only project reads and
- *  read-only `Bash` run without a card. Bypass runs edits and commands without asking. */
+/** Text explaining permission modes. Unknown modes draw no consequence line. In auto mode,
+ *  project reads, read-only `Bash`, and `Write`/`Edit`/`NotebookEdit` inside the project
+ *  outside protected paths run without a card; other operations ask. This matches
+ *  `agent/src/permission_policy.rs`. Bypass runs edits and commands without asking. */
 export const MODE_CONSEQUENCE: Record<string, string> = {
   auto: "Edits in this project and safe reads run; anything else asks.",
   bypass: "Nothing asks: edits and commands run unasked.",

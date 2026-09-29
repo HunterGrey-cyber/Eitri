@@ -2399,6 +2399,11 @@ fn ctrl_e_y_replay() -> Replay {
     steps.push(mark("plain-e1"));
     steps.push(key("9", false, false)); // a count -- "99 Ctrl+y", far more than one screen's worth
     steps.push(key("9", false, false));
+    // Ctrl+y first sends a bare `Control` keydown with `ctrlKey: true`, then a `y` keydown.
+    // Send both after the digits to check that the bare modifier preserves `countRef`.
+    // Going straight to `key("y", true, false)` skips the separate `Control` event,
+    // so it cannot catch the modifier clearing the count before the chord.
+    steps.push(key("Control", true, false));
     steps.push(key("y", true, false));
     steps.push(mark("rehomed"));
 

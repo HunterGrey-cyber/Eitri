@@ -574,15 +574,16 @@ impl AgentBackend {
             mode,
             host_answered,
             &mut HumanApprovals::default(),
-            &mut Vec::new(),
+            &mut AnsweredForYou::default(),
         )
     }
 
     /// `take_ui_delivery_with_rules`, plus the tab's `approvals` from `TabSet::answer_card`.
     /// In `Auto`, a CLI prompt matching an approval's non-empty tool-use id, tool and exact input
     /// is answered `allow` once and consumes that approval, which authorizes only that call.
-    /// `answered_for_you` receives every CLI prompt answered without a card, for the muted note
-    /// on its call's row.
+    /// `answered_for_you` ([`AnsweredForYou`]) tracks answers made without a card for the call's row:
+    /// every CLI prompt, every gate answered by the acceptEdits fast path,
+    /// and every `Write` so answered whose target does not yet exist.
     pub fn take_ui_delivery_with_approvals(
         &mut self,
         project_root: &Path,
@@ -590,7 +591,7 @@ impl AgentBackend {
         mode: PermissionMode,
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
-        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+        answered_for_you: &mut AnsweredForYou,
     ) -> UiDelivery {
         self.take_revised_ui_delivery(project_root, rules, mode, host_answered, approvals, answered_for_you)
             .without_revisions()
@@ -630,7 +631,7 @@ impl AgentBackend {
         mode: PermissionMode,
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
-        answered_for_you: &mut Vec<PromptAnsweredForYou>,
+        answered_for_you: &mut AnsweredForYou,
     ) -> RevisedDelivery {
         let delivery = match self {
             AgentBackend::Legacy(session) => {
@@ -703,6 +704,18 @@ impl AgentBackend {
     /// Otherwise the prompt is delivered as a card. A prompt marked `needs_a_human`, either
     /// forced by `permissions.ask` or of an unknown kind, is a card in every mode.
     /// Each prompt answered without a card adds its row note to `answered_for_you`.
+    ///
+    /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by
+    /// the acceptEdits fast path is added to `answered_for_you.by_the_fast_path` by tool-use id.
+    /// Saved prefix rules do not allow these tools. An absent card cannot prove fast-path
+    /// approval: `validateInput` may fail before any hook runs, a request may lack a tool-use
+    /// id, or a switch to bypass may answer it. Requests without a tool-use id are answered
+    /// but have no row to annotate.
+    ///
+    /// For `Write`, existence at `file_path` is checked just before sending `allow`, before
+    /// the CLI can write the file. A write to a missing file is added to
+    /// `answered_for_you.creates_file` in both the fast path and bypass. `note_new_files`
+    /// only sees delivered cards, so it cannot annotate these automatic answers.
     ///
     /// Each event keeps its fold revision from `take_revised_ui_delivery`. A kept event
     /// retains its revision; a dropped event is removed together with its revision.
@@ -779,7 +792,7 @@ impl AgentBackend {
                             // Used up: a later prompt under this id is a
                             // card. In bypass this is a no-op -- nothing was consulted.
                             approvals.consume(&id);
-                            answered_for_you.push(PromptAnsweredForYou {
+                            answered_for_you.prompts.push(PromptAnsweredForYou {
                                 tool_use_id: id,
                                 note: format!("{label} — allowed {because}"),
                             });
@@ -803,9 +816,13 @@ impl AgentBackend {
                     continue;
                 }
                 let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+                // Before the answer: once it is sent, the CLI may already have written the file.
+                let creates_file =
+                    named_call(tool_use_id).filter(|_| write_over_no_file(&tool_name, input, project_root));
                 match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                     Ok(_resolution) => {
                         host_answered.insert(permission_id);
+                        answered_for_you.creates_file.extend(creates_file);
                         eprintln!("[permission] allowed in bypass: {tool_name}");
                     }
                     Err(error) => {
@@ -834,8 +851,17 @@ impl AgentBackend {
             // Cloned before the mutable borrow below, not for tidiness: `event` borrows from the
             // same value `respond_permission` needs `&mut self` for.
             let (permission_id, tool_name) = (permission_id.clone(), tool_name.clone());
+            // The fast path is the only allow any of these three tools gets here (this function's
+            // doc); its row note, and whether a `Write` creates its file -- read before the answer,
+            // since once it is sent the CLI may already have written it.
+            let fast_path = named_call(tool_use_id).filter(|_| ACCEPT_EDITS_TOOLS.contains(&tool_name.as_str()));
+            let creates_file = fast_path
+                .clone()
+                .filter(|_| write_over_no_file(&tool_name, input, project_root));
             match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                 Ok(_resolution) => {
+                    answered_for_you.by_the_fast_path.extend(fast_path);
+                    answered_for_you.creates_file.extend(creates_file);
                     // Said on stderr rather than silently: this is the only record anywhere of a
                     // tool call that ran without the user being asked. One short line, whose reason
                     // is a fixed label from the policy rather than anything the model wrote.
@@ -963,7 +989,7 @@ struct AnswerContext<'a> {
     mode: PermissionMode,
     host_answered: &'a mut BTreeSet<String>,
     approvals: &'a mut HumanApprovals,
-    answered_for_you: &'a mut Vec<PromptAnsweredForYou>,
+    answered_for_you: &'a mut AnsweredForYou,
 }
 
 /// The calls the user approved on a card in one tab, each kept with the tool and the exact input the
@@ -1023,6 +1049,51 @@ impl HumanApprovals {
 pub struct PromptAnsweredForYou {
     pub tool_use_id: String,
     pub note: String,
+}
+
+/// Answers made without a card in one delivery, keyed by tool-use id.
+/// `answer_what_needs_no_human` captures them when answering so the tab set can attach row
+/// notes without inferring approval from a missing card.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnsweredForYou {
+    /// The CLI's own prompts (O3), each with its note.
+    pub prompts: Vec<PromptAnsweredForYou>,
+    /// `Write`/`Edit`/`NotebookEdit` calls whose gate the acceptEdits fast path answered `allow`
+    /// ("allowed by auto" on the row once the call completes).
+    pub by_the_fast_path: Vec<String>,
+    /// `Write` calls answered `allow` without a card -- by the fast path in `Auto`, or in bypass --
+    /// whose `file_path` named nothing just before the answer was sent: the row says the call
+    /// creates the file, never that it overwrites one it cannot see.
+    pub creates_file: Vec<String>,
+}
+
+/// The tools the acceptEdits fast path applies to -- `agent::permission_policy`'s own (private)
+/// `EDIT_TOOLS`, restated here only to recognise its answer, never to decide one.
+const ACCEPT_EDITS_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
+
+/// A request's tool-use id, when it names a call a row can show: `None` for a missing or empty id.
+fn named_call(tool_use_id: &Option<String>) -> Option<String> {
+    tool_use_id.clone().filter(|id| !id.is_empty())
+}
+
+/// Whether nothing exists at `path` at all -- a dangling symlink counts (a `Write` there, or a
+/// check of what it is about to replace, would follow it). Any lookup failure OTHER than "not
+/// found" (a parent directory this process may not search, a path through a regular file) says
+/// nothing about what is there, so it does NOT count as absent: an uncertain answer resolves toward
+/// the overwrite warning, as the permission policy's own uncertainties resolve toward a card.
+pub(crate) fn file_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether `tool_name`/`input` is a `Write` whose `file_path` (read against `project_root` when
+/// relative, as the tool's own absolute path needs no root) names nothing right now.
+fn write_over_no_file(tool_name: &str, input: &serde_json::Value, project_root: &Path) -> bool {
+    tool_name == "Write"
+        && input
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| file_absent(&project_root.join(p)))
 }
 
 /// Every permission policy this CLIENT can drive end to end, in the order a start screen should
@@ -2572,7 +2643,7 @@ mod tests {
         // nothing new, as the panel's own pump keeps taking deliveries.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let quiet = std::time::Duration::from_millis(100);
-        let mut answered = Vec::new();
+        let mut answered = AnsweredForYou::default();
         let mut delivered = Vec::new();
         let mut last_new: Option<std::time::Instant> = None;
         loop {
@@ -2583,7 +2654,7 @@ mod tests {
                     last_new = Some(now);
                 }
                 _ if last_new.is_some_and(|at| now.duration_since(at) >= quiet) || now > deadline => {
-                    return (delivered, answered)
+                    return (delivered, answered.prompts)
                 }
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }

@@ -12,6 +12,19 @@ import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TypingGuard } from "./typingGuard";
+import {
+  compareCarets,
+  copySelectionText,
+  entrySelectableCaret,
+  firstSelectableCaret,
+  rebuildSelection,
+  repeatMotion,
+  revealCaret,
+  selectionMatchesBuild,
+  swapEnds,
+} from "./visual";
+import type { BuiltSelection, Caret, SelectionLike, VisualModel } from "./visual";
+import { appendQuote, formatQuote } from "./quote";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
@@ -137,6 +150,9 @@ const CARD_ELSEWHERE_FLASH = "a / d answer the card under the cursor — j / k o
  *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
  *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
 const STOP_TYPING_FLASH = "Stop takes a key only on its own — i or Ctrl+j to type";
+/** What an open `/model`/`/effort` picker shows. */
+type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: string | null };
+
 /** Envelopes that move keyboard focus or cover the conversation without a keydown
  *  cancel a waiting `a`/`d`/`D`. GTK handles `nav_key`'s Ctrl+j/Ctrl+k before the page sees a key.
  *  Shift+Tab is a real keydown, so it is handled outside this Set.
@@ -163,15 +179,42 @@ function scrollCursorRowBox(row: HTMLElement | null, direction: 1 | -1): boolean
     const b = box.getBoundingClientRect();
     const l = list.getBoundingClientRect();
     if (b.bottom <= l.top || b.top >= l.bottom) {
+      // `scrollIntoView({block:"nearest"})` cannot move a row that already spans both viewport edges.
+      // Check the row being scrolled, even when its result box is off screen, so counted `Ctrl+e`
+      // can fall through to scrolling the conversation. Use inclusive bounds with sub-pixel slack:
+      // a tall row aligned exactly with the list's top still spans the view.
+      const r = row.getBoundingClientRect();
+      if (r.top <= l.top + EDGE_SLACK_PX && r.bottom >= l.bottom - EDGE_SLACK_PX) return false;
       row.scrollIntoView({ block: "nearest" });
       return true;
     }
   }
+  return scrollBoxOneStep(box, direction);
+}
+
+/** One `TOOL_RESULT_SCROLL_STEP_PX` step of a tool result's capped box, or `false` when the box is
+ *  already at the end of travel that way. Shared by `scrollCursorRowBox` (`j`/`k`) and
+ *  `scrollVisibleRowBox` (`Ctrl+e`/`Ctrl+y`). */
+function scrollBoxOneStep(box: HTMLElement, direction: 1 | -1): boolean {
   const atStart = box.scrollTop <= 0;
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
   if (direction > 0 ? atEnd : atStart) return false;
   box.scrollTop += direction * TOOL_RESULT_SCROLL_STEP_PX;
   return true;
+}
+
+/** `Ctrl+e`/`Ctrl+y` scroll the cursor row's capped result only while part of it is visible
+ *  and it can move in that direction. Otherwise return `false` so the conversation scrolls.
+ *  Do not use `scrollCursorRowBox`'s off-screen reveal: a view scroll must not jump toward the cursor,
+ *  or held scrolling can repeatedly return to the same row. */
+function scrollVisibleRowBox(row: HTMLElement | null, direction: 1 | -1): boolean {
+  const box = row?.querySelector<HTMLElement>(".tool-result-body") ?? null;
+  const list = box?.closest(".message-list") ?? null;
+  if (box === null || list === null) return false;
+  const b = box.getBoundingClientRect();
+  const l = list.getBoundingClientRect();
+  if (b.bottom <= l.top || b.top >= l.bottom) return false;
+  return scrollBoxOneStep(box, direction);
 }
 
 /** How many lines of the current row's own text one `j`/`k` press scrolls, when that row is taller
@@ -196,10 +239,23 @@ function computedLineHeight(el: HTMLElement): number {
   return line;
 }
 
-/** One `j`/`k` step inside a tall row: `ROW_SCROLL_LINES` of the row's own computed line height.
- *  Derived, not a pixel constant, so it follows the theme's font size and the display's scale. */
+/** The element whose text the reader actually reads on a row: `.row-body` (`Row.tsx`'s own text
+ *  cell), which is the only part of a row `index.css` gives a font-size and line-height of its own
+ *  (`--fs-prose`, `1.65`) -- `.row` itself (the sign-column grid wrapper `computedLineHeight` used to
+ *  be called on directly) sets neither, so it read whatever was ambient there instead: `line-height:
+ *  normal` on a 14px base is ~16.8px against `.row-body`'s real ~24.75px, well under one displayed
+ *  line. Falls back to `row` itself for
+ *  anything with no `.row-body` child (there is always one on a real conversation row; this is only
+ *  a safety net). */
+function rowTextElement(row: HTMLElement): HTMLElement {
+  return row.querySelector<HTMLElement>(".row-body") ?? row;
+}
+
+/** One `j`/`k` step inside a tall row: `ROW_SCROLL_LINES` of the row's own TEXT's computed line
+ *  height (`rowTextElement`). Derived, not a pixel constant, so it follows the theme's font size and
+ *  the display's scale. */
 function rowScrollStep(row: HTMLElement): number {
-  return ROW_SCROLL_LINES * computedLineHeight(row);
+  return ROW_SCROLL_LINES * computedLineHeight(rowTextElement(row));
 }
 
 /** `j`/`k` while the `?` keymap overlay is open: scrolls the overlay itself, by the
@@ -282,6 +338,18 @@ export function clampCursorToView(list: HTMLElement, rows: HTMLElement[], cursor
   const index = rows.indexOf(target);
   return index === -1 ? null : index;
 }
+
+/** The live inputs to `MessageList`, captured when VISUAL starts and held unchanged while it
+ *  remains active. Only `cursor`/`focused`/`visual` keep moving; the snapshot is `null` outside
+ *  VISUAL/V-LINE. */
+type FrozenSnapshot = {
+  state: AgentUiState;
+  expanded: Record<string, boolean>;
+  detailed: boolean;
+  ruleOffers: Record<string, string>;
+  answeredPermissions: ReadonlySet<string>;
+  sessionEnded: boolean;
+};
 
 /** The tool name of the oldest pending permission, selected by lowest `seq`, for
  *  `ActivityLine`'s "needs approval" slot. Returns `null` when nothing waits. */
@@ -489,6 +557,34 @@ export default function App() {
   expandedRef.current = expanded;
   const detailedRef = useRef(detailed);
   detailedRef.current = detailed;
+  /** The VISUAL/V-LINE model between keys: both caret ends, the linewise flag, and the goal
+   *  column. Also holds the last built native selection for checking that the selection still
+   *  matches. Both are `null` outside VISUAL/V-LINE; `mode` indicates whether selection mode is
+   *  active. */
+  const visualModelRef = useRef<VisualModel | null>(null);
+  const visualBuiltRef = useRef<BuiltSelection | null>(null);
+  /** The digit count for VISUAL/V-LINE, applied to the next motion and reset by it. Kept
+   *  separate from `countRef` because the capture handler stops region keys before BROWSE's
+   *  `onKeyDown` can run. Sharing a ref could leave a stale count in the other mode. */
+  const visualCountRef = useRef<number | null>(null);
+  /** The region's pending `g` for `gg` and the reserved `gv`. Kept separate from BROWSE's
+   *  `pendingRef` because the capture handler stops region keys before `onKeyDown` runs.
+   *  Carries `PendingPrefix`'s "g" through `resolveKey`'s `ctx.pending`; "z"/"["/"]" prefixes
+   *  remain BROWSE-only. */
+  const regionPendingGRef = useRef<PendingPrefix | null>(null);
+  /** The frozen props passed to `MessageList` while VISUAL is active (`FrozenSnapshot`). Kept
+   *  in state because rendering `MessageList` depends on them. */
+  const [frozenSnapshot, setFrozenSnapshot] = useState<FrozenSnapshot | null>(null);
+  /** `frozenSnapshot` from the last render, indicating whether the displayed DOM is frozen.
+   *  Cursor reveal, scroll clamping, and `focus_permission` reveal must not use a live timeline
+   *  index against frozen rows: arriving prompts or cards can make those indexes differ.
+   *  Assigned during render like `cursorRefForScroll`, so `exitRegion` requesting
+   *  `setFrozenSnapshot(null)` does not clear this until the thawed list renders. */
+  const frozenSnapshotRef = useRef<FrozenSnapshot | null>(null);
+  frozenSnapshotRef.current = frozenSnapshot;
+  /** A `focus_permission` reveal waiting for the thawed list (see its layout effect, below the
+   *  `permissionRequest` effect). */
+  const revealAfterThawRef = useRef<number | null>(null);
   /** The composer's own unsent text, kept only so a tab switch can save it -- never
    *  read to render anything itself; `restoredDraft` is what actually reaches `Composer`. Updated
    *  from `Composer`/`EmptyTab`'s `onDraftChange`, which fires on every keystroke and once more
@@ -847,9 +943,12 @@ export default function App() {
   /** The picker opened by a bare `/model` or `/effort` reply, or `null` when closed. The client
    *  opens it without a Rust envelope when the events handler parses `turn_completed` after that
    *  send. See `pendingSlashPickerRef` and `../slashPicker`. */
-  const [slashPicker, setSlashPicker] = useState<{ kind: SlashPickerKind; options: string[]; current: string | null } | null>(
-    null,
-  );
+  const [slashPicker, setSlashPicker] = useState<SlashPickerState | null>(null);
+  /** A parsed `/model` or `/effort` reply held for one render before opening `slashPicker`.
+   *  The effect can read current overlay state; the `events` handler installed once cannot.
+   *  If another overlay is open, leave the reply as transcript text. Opening the picker over
+   *  another overlay could let `takeKeys` restore focus underneath it and send Enter there. */
+  const [slashReply, setSlashReply] = useState<SlashPickerState | null>(null);
   /** Set by `sendMessage` the moment it sends a BARE `/model`/`/effort` (`barePickerCommand`), read
    *  and cleared by the very next `turn_completed` this tab sees, whether or not that reply parses
    *  -- a ref, not state, because it is read and written from inside the `events` handler's own
@@ -966,6 +1065,20 @@ export default function App() {
     () => buildDisplay(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }),
     [state, expanded, detailed],
   );
+  /** Compute the displayed timeline from `frozenSnapshot` using the same transformation as the
+   *  live timeline and `MessageList`. This lets `rowIndexOf` map a frozen DOM row to its key
+   *  without using a live cursor index during VISUAL. `null` outside VISUAL/V-LINE. */
+  const frozenTimeline = useMemo(
+    () =>
+      frozenSnapshot === null
+        ? null
+        : buildDisplay(buildTimeline(frozenSnapshot.state), {
+            expanded: frozenSnapshot.expanded,
+            detailed: frozenSnapshot.detailed,
+            turnRunning: frozenSnapshot.state.activeTurnId !== null,
+          }),
+    [frozenSnapshot],
+  );
   const answerableItems = useMemo(
     (): AnswerableItem[] =>
       timeline.map((item) =>
@@ -1001,6 +1114,14 @@ export default function App() {
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
+  /* `slashReply` opens a picker only when no other overlay is open. Either way, consume it here. */
+  useEffect(() => {
+    if (slashReply === null) return;
+    setSlashReply(null);
+    const covered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null;
+    if (!covered) setSlashPicker(slashReply);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slashReply]);
   /** Kept focused so BROWSE's keydown handler actually receives keys: a keydown bubbles from
    *  whatever DOM node has real focus, which is a browser fact, not a React one. `Escape` leaving
    *  INPUT removes the composer's textarea from the DOM, which drops focus onto whatever the
@@ -1082,6 +1203,14 @@ export default function App() {
       }
       if (!isModeCycleKey(event)) return;
       event.preventDefault();
+      // Shift+Tab does nothing in CARET/VISUAL/V-LINE: its bypass prompt could consume a `y`
+      // intended to copy the selection. Require Esc before opening this overlay.
+      if (isRegionMode(modeRef.current)) {
+        event.stopPropagation();
+        const cancelled = typingGuard.onKey("Tab", event.timeStamp > 0 ? event.timeStamp : performance.now());
+        showFlash(cancelled ?? `Esc first: Shift+Tab does not act in ${regionModeName(modeRef.current)}`);
+        return;
+      }
       const activeInfo = activeTabInfo(tabsRef.current);
       const route = modeKeyRoute({
         confirmOpen: confirmOpenRef.current,
@@ -1192,6 +1321,11 @@ export default function App() {
     const landing = landingRef.current;
     landingRef.current = 0;
     if (landing === "keep") return;
+    // During VISUAL, the displayed list is frozen while `cursor` indexes the live timeline. A new
+    // prompt can move that cursor beyond the frozen rows, so revealing it could scroll an unrelated
+    // row under the selection. Only VISUAL's caret moves the view; restore the row cursor by key
+    // through `landCursorOnRowKey` when VISUAL ends.
+    if (frozenSnapshotRef.current !== null) return;
     const root = containerRef.current;
     const row = root === null ? undefined : conversationRows(root)[cursor];
     if (row === undefined) return;
@@ -1207,6 +1341,10 @@ export default function App() {
     const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
     if (!list) return;
     const onListScroll = () => {
+      // During VISUAL, these rows belong to the frozen list. Writing their index into the live
+      // cursor could select a different row after new rows arrive. Only VISUAL's caret scrolls the
+      // list; restore the row cursor by key when VISUAL ends.
+      if (frozenSnapshotRef.current !== null) return;
       const rows = conversationRows(list);
       const next = clampCursorToView(list, rows, cursorRefForScroll.current);
       if (next !== null && next !== cursorRefForScroll.current) {
@@ -1309,7 +1447,13 @@ export default function App() {
      hint that a Tab could land on. This effect is the third case, a session that dies while the
      user is already in INPUT, which neither of those can reach. */
   useEffect(() => {
-    if (sessionEnded) setMode("browse");
+    // End the region when the session dies to clear `frozenSnapshot` and the DOM selection before
+    // returning to BROWSE. Calling `exitRegion` is harmless when no region is active.
+    if (sessionEnded) {
+      exitRegion();
+      setMode("browse");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionEnded]);
   // The `?` keymap belongs to a live conversation; a session that just
   // ended is not a reason to keep it up, and the ended/lost banners' own `r` must be reachable
@@ -1345,6 +1489,9 @@ export default function App() {
      falls straight into a live turn's box. Keyed on the request alone, like `inputRequest`. */
   useEffect(() => {
     if (arriveRequest === 0) return;
+    // End the region before an arrival changes mode or cursor. Otherwise `frozenSnapshot` can keep the
+    // old tab's conversation visible over the new one. This is a no-op when no region is active.
+    exitRegion();
     // An open overlay keeps the keys and the conversation cursor stays put. Landing BROWSE on the last
     // row would interfere with both.
     if (overlayOpen) {
@@ -1371,6 +1518,9 @@ export default function App() {
      composer, as `enter_input` gives it. Keyed on the request alone, like `inputRequest`. */
   useEffect(() => {
     if (permissionRequest === 0) return;
+    // End the region before landing directly on a permission card, as for `arrive`. A frozen snapshot
+    // must not keep showing a different row.
+    exitRegion();
     // Keep the keys in an open overlay, as for `arriveRequest`. The `focus_permission` dispatch already
     // closes the chooser, so this preserves focus in a rename field or the `/` prompt.
     if (overlayOpen) {
@@ -1392,13 +1542,83 @@ export default function App() {
     // effect, so the row is revealed here -- after the restore's own scroll, which is a layout effect.
     landingRef.current = 0;
     if (index === cursorRef.current) {
-      const root = containerRef.current;
-      const row = root === null ? undefined : conversationRows(root)[index];
-      if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
+      // `exitRegion` above has only asked for the thawed list. If VISUAL was on,
+      // the DOM here is still the frozen one and `index` is a live index -- a card that arrived
+      // during VISUAL is not in it -- so the reveal waits for the live list to render.
+      if (frozenSnapshotRef.current !== null) revealAfterThawRef.current = index;
+      else {
+        const root = containerRef.current;
+        const row = root === null ? undefined : conversationRows(root)[index];
+        if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
+      }
     } else setCursor(index);
     containerRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [permissionRequest]);
+  /** `focus_permission`'s own reveal, deferred while the list on screen was still the frozen one
+   *: run once the thawed, live list has rendered, and only then indexed by the
+   *  live cursor. A layout effect so the reveal lands before that list is painted. */
+  useLayoutEffect(() => {
+    if (frozenSnapshot !== null) return;
+    const index = revealAfterThawRef.current;
+    revealAfterThawRef.current = null;
+    if (index === null) return;
+    const root = containerRef.current;
+    const row = root === null ? undefined : conversationRows(root)[index];
+    if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
+  }, [frozenSnapshot]);
+
+  /** Clears `frozenSnapshot` and the built selection whenever `mode` leaves a region mode.
+   *  Explicit `exitRegion` calls handle normal exits; this catches paths that change `mode`
+   *  without using them. `clearVisualLeftovers` does nothing once everything is already `null`. */
+  useEffect(() => {
+    if (!isRegionMode(mode)) clearVisualLeftovers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+  /** Ends the region when `sessionStarted` becomes false, since there is no conversation to select.
+   *  Catches routes that remove the conversation without changing `mode`, which the `[mode]`
+   *  cleanup cannot see. `error` and `handoff` also call `exitRegion` directly. */
+  useEffect(() => {
+    if (!sessionStarted) exitRegion();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStarted]);
+
+  /** Watches `.message-list` for changes to either end of the region's built selection.
+   *  `frozenSnapshot` normally keeps the list still, but other DOM writes may bypass that freeze.
+   *  A `childList` or `characterData` change touching an endpoint ends the region with a flash,
+   *  like a failed selection check when copying. Changes to unrelated rows must not interrupt
+   *  the selection merely because a card arrives or a reply streams. */
+  useEffect(() => {
+    if (!isRegionMode(mode)) return;
+    if (typeof MutationObserver === "undefined") return;
+    const list = messageListEl();
+    if (list === null) return;
+    const observer = new MutationObserver((mutations) => {
+      const built = visualBuiltRef.current;
+      if (built === null) return;
+      const touches = (node: Node) =>
+        node === built.anchorNode || node === built.focusNode || node.contains(built.anchorNode) || node.contains(built.focusNode);
+      for (const mutation of mutations) {
+        // `characterData`'s own `target` IS the changed text node -- typically the anchor/focus
+        // node itself, since both are text positions. `childList`'s `target` is the still-attached
+        // PARENT whose children changed, which stays true (and so keeps `touches` reporting a hit)
+        // for content inserted nearby; a REMOVAL is the case that check alone would miss, because a
+        // detached anchor/focus's old parent no longer contains it once the removal has happened --
+        // `removedNodes` is checked for exactly that.
+        if (touches(mutation.target) || Array.from(mutation.removedNodes).some(touches)) {
+          // Name the mode that actually ended, as `vend` and the Shift+Tab refusal do, so CARET is not
+          // reported as VISUAL.
+          showFlash(`the conversation changed under it — ${regionModeName(modeRef.current)} ended; v to start again`);
+          exitRegion();
+          return;
+        }
+      }
+    });
+    observer.observe(list, { childList: true, characterData: true, subtree: true });
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
   /** The start screen's own DOM anchor -- `HintLayer`'s containing block and the `containerRef ??
    *  startScreenRef` fallback a couple of handlers below use. It used to also be focused whenever
    *  `!sessionStarted` (so `y`, handled by the now-deleted `handleStartScreenKeyDown`, was reachable
@@ -1424,6 +1644,43 @@ export default function App() {
   const frozenRef = useRef<HintTarget[]>([]);
   const [hints, setHints] = useState<ShownHint[]>([]);
   const [hintTyped, setHintTyped] = useState("");
+  /** A `hint_collect` sessionId waiting for the thawed list, the same deferral
+   *  `revealAfterThawRef`/`focus_permission` uses: set only when `hint_collect`
+   *  arrived while `frozenSnapshotRef.current` was still non-null, consumed by the layout effect just
+   *  below `collectHintTargets`'s own declaration. */
+  const pendingHintCollectRef = useRef<number | null>(null);
+  /** `hint_collect`'s actual target freeze: read the live DOM, remember it by session, tell `shell` how
+   *  many labels to draw. Split out of the dispatch arm so both the immediate path (VISUAL was already
+   *  off) and the deferred one (below) call the same code. */
+  function collectHintTargets(sessionId: number) {
+    const root = containerRef.current ?? startScreenRef.current;
+    frozenRef.current = root === null ? [] : hintTargets(root);
+    hintSessionRef.current = sessionId;
+    // A newer session supersedes whatever an older one still had on screen.
+    setHints([]);
+    setHintTyped("");
+    postToRust({
+      type: "hint_targets",
+      request_id: nextRequestId(),
+      session_id: sessionId,
+      count: frozenRef.current.length,
+    });
+  }
+  /** The deferred half of `collectHintTargets`: `hint_collect`'s dispatch arm only *asks* `exitRegion`
+   *  to thaw the list -- it
+   *  does not repaint synchronously, so collecting from `containerRef.current` right there could still
+   *  read the frozen VISUAL DOM and miss a row that arrived during VISUAL (a linked permission card, a
+   *  queued prompt): probed at 3 targets with VISUAL framing the collect versus 7 once thawed. Run once
+   *  the thawed, live list has rendered -- a layout effect so the freeze lands before HINT's labels are
+   *  painted on top of it, same as `revealAfterThawRef`'s own effect. */
+  useLayoutEffect(() => {
+    if (frozenSnapshot !== null) return;
+    const sessionId = pendingHintCollectRef.current;
+    pendingHintCollectRef.current = null;
+    if (sessionId === null) return;
+    collectHintTargets(sessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frozenSnapshot]);
   /** A code block HINT landed on: the next `y` copies exactly that block's code rather than the
    *  whole message. Cleared by that copy and by any other key the table resolves. */
   const copyCodeRef = useRef<HTMLElement | null>(null);
@@ -1499,6 +1756,9 @@ export default function App() {
         // Losing focus cancels the bypass prompt. Regaining focus does not answer or cancel it; answers
         // come only from this pane's keydowns.
         if (!payload.focused) cancelBypassConfirm();
+        // `pane_focus` false ends VISUAL explicitly because this branch does not otherwise set
+        // `mode`.
+        if (!payload.focused) exitRegion();
         // Only regaining focus requests the keys back. WebKitGTK may not preserve DOM focus across a pane
         // switch, so ask for it here.
         if (payload.focused) setKeysRequest((n) => n + 1);
@@ -1586,17 +1846,25 @@ export default function App() {
         // too. GTK claims `prefix ?` before `answerConfirm` sees it, so opening the overlay must
         // also cancel the bypass prompt.
         cancelBypassConfirm();
+        // `?` exits VISUAL through `onVisualKeyDownCapture`. GTK captures `prefix ?`, so that route
+        // reaches this panel as an envelope and must exit VISUAL here.
+        exitRegion();
         setMode("browse");
         setKeymapOpen(true);
       } else if (payload.kind === "hint_collect") {
-        // A HINT started elsewhere in the window must not label rows hidden under this overlay
-        //. It also frees the keys `hint_collect`'s own reply is about to swallow --
-        // this and HINT never actually contend for them, but closing here keeps that true by
-        // construction rather than by the two features happening not to overlap in practice.
+        // Close overlays before collecting HINT targets so labels cannot land on hidden rows and
+        // overlays cannot consume HINT keys. A HINT also ends VISUAL explicitly because this branch
+        // does not otherwise set `mode`.
+        exitRegion();
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
+        // HINT cancels the `/model`/`/effort` picker and any reply still pending. Otherwise a reply could
+        // open it under the labels and leave it holding the keys after a composer landing.
+        setSlashPicker(null);
+        setSlashReply(null);
+        pendingSlashPickerRef.current = null;
         // GTK handles `prefix f` and its label keys before the WebView. Cancel the bypass prompt here so a
         // later copy key or composer keystroke cannot answer it. Rust cancels its prompt too.
         cancelBypassConfirm();
@@ -1605,18 +1873,15 @@ export default function App() {
         // ...and the prefix the strip may still be waiting on, for the reason `pane_focus` does it.
         pendingRef.current = null;
         clearSequence();
-        const root = containerRef.current ?? startScreenRef.current;
-        frozenRef.current = root === null ? [] : hintTargets(root);
-        hintSessionRef.current = payload.sessionId;
-        // A newer session supersedes whatever an older one still had on screen.
-        setHints([]);
-        setHintTyped("");
-        postToRust({
-          type: "hint_targets",
-          request_id: nextRequestId(),
-          session_id: payload.sessionId,
-          count: frozenRef.current.length,
-        });
+        // `exitRegion` above has only asked for the thawed list to render -- it does
+        // not repaint synchronously, so the DOM here can still be the frozen VISUAL one. Collecting
+        // targets from it misses any row that arrived during VISUAL (a linked permission card, a queued
+        // prompt), the same gap `focus_permission`'s own reveal had: a probe posted 3
+        // targets with VISUAL still framing the collect versus 7 once thawed. Defer to `collectHintTargets`'s
+        // own layout effect (above, by `pendingHintCollectRef`) when that is the case; collect at once
+        // otherwise, unchanged from before this round.
+        if (frozenSnapshotRef.current !== null) pendingHintCollectRef.current = payload.sessionId;
+        else collectHintTargets(payload.sessionId);
       } else if (payload.kind === "hint_show") {
         if (payload.sessionId !== hintSessionRef.current) return;
         const frozen = frozenRef.current;
@@ -1642,6 +1907,10 @@ export default function App() {
         // takes this branch, since `activeTabRef.current` starts `null`.
         if (payload.active !== activeTabRef.current) {
           switchedRef.current = true;
+          // End VISUAL before `saveView` reads the old tab's mode. `exitRegion` updates
+          // `modeRef.current` synchronously so the saved mode is never `"visual"` or `"vline"`,
+          // which this panel cannot restore.
+          exitRegion();
           // A waiting `a`/`d`/`D` targets the old tab's card, so cancel it on a tab switch.
           typingGuard.cancel();
           // Cancel sequences from the old tab so a key in the new conversation cannot complete
@@ -1695,6 +1964,7 @@ export default function App() {
           // which is not tab-scoped. The old tab's reply is filtered out by `acceptsEnvelope`, so
           // leaving the flag armed could match the new tab's next `turn_completed`.
           setSlashPicker(null);
+          setSlashReply(null);
           pendingSlashPickerRef.current = null;
           // Close a `gf` picker on a tab switch because its paths belong to the old conversation.
           // Otherwise the next letter could open an old path: the `pathPick` key handler runs first
@@ -1745,6 +2015,8 @@ export default function App() {
         // A route away from a bypass prompt: the popover's own `y` copies a row,
         // and its handoff row is reached by clicks that never pass through `answerConfirm`.
         cancelBypassConfirm();
+        // Opening the detail popover ends VISUAL.
+        exitRegion();
         setDetail(payload.rows);
         setDetailCursor(0);
         setMode("browse");
@@ -1840,12 +2112,14 @@ export default function App() {
           if (event.type === "turn_completed") {
             const pending = pendingSlashPickerRef.current;
             pendingSlashPickerRef.current = null;
+            // Pass the parsed reply through `slashReply`, whose effect opens the picker only if no other
+            // overlay is open by then.
             if (pending === "model") {
               const parsed = parseModelReply(event.result_text);
-              if (parsed !== null) setSlashPicker({ kind: "model", options: parsed.options, current: parsed.current });
+              if (parsed !== null) setSlashReply({ kind: "model", options: parsed.options, current: parsed.current });
             } else if (pending === "effort") {
               const parsed = parseEffortReply(event.result_text);
-              if (parsed !== null) setSlashPicker({ kind: "effort", options: parsed.options, current: null });
+              if (parsed !== null) setSlashReply({ kind: "effort", options: parsed.options, current: null });
             }
           }
         }
@@ -1928,6 +2202,11 @@ export default function App() {
         // `not_started` again is what actually drops this render back to the empty tab.
         setHandoffRequests((current) => withoutHandoff(current, payload.tab));
         setCommandNotice(null);
+        // End the region before resetting state. `initialState()` returns status to `starting` without
+        // changing mode, so the session-ended effect cannot clear VISUAL or `frozenSnapshot`.
+        // Leaving them active would block the empty tab's Shift+Tab with no region handler left to
+        // accept Escape.
+        exitRegion();
         setState(initialState());
         setKeymapOpen(false);
         // "when done" (this component's own doc comment on `handoffOpen`): the session really is
@@ -1968,6 +2247,10 @@ export default function App() {
             ? keepAfterSidecarStop(stateRef.current, failureEvidence(payload.message))
             : null;
         if (kept !== null) keptStates.current.set(payload.tab, kept);
+        // End the region before replacing state, as in `handoff`. A reset to `initialState()` does not
+        // trigger the session-ended effect, so the old frozen conversation could cover the
+        // restarted tab's snapshot until Escape.
+        exitRegion();
         setState(kept ?? initialState());
         setKeymapOpen(false);
         setHandoffOpen(false);
@@ -1984,6 +2267,8 @@ export default function App() {
         // that bubble from an overlay must not advance a stale sequence.
         pendingRef.current = null;
         clearSequence();
+        // A tab rename ends VISUAL explicitly because this branch does not otherwise set `mode`.
+        exitRegion();
         // `prefix ,`: the tab bar stays on screen with an inline field open
         // over this tab, prefilled and selected. The two other overlays over the conversation area
         // must not fight it for the keys.
@@ -1999,6 +2284,8 @@ export default function App() {
         // that bubble from an overlay must not advance a stale sequence.
         pendingRef.current = null;
         clearSequence();
+        // A close-tab confirmation ends VISUAL before taking the keys.
+        exitRegion();
         // `prefix &`: drawn in the footer in place of the which-key strip,
         // and takes every key -- see `onKeyDown`'s dedicated branch, checked before every other
         // overlay. The other two overlays are closed for the same reason `begin_rename` closes them.
@@ -2011,6 +2298,8 @@ export default function App() {
         // that bubble from an overlay must not advance a stale sequence.
         pendingRef.current = null;
         clearSequence();
+        // A close-others confirmation ends VISUAL before taking the keys.
+        exitRegion();
         // `<leader>bo` opens a window-level confirmation. Close the conversation overlays so they cannot
         // compete for its keys, as for `confirm_close`.
         setDetail(null);
@@ -2024,6 +2313,9 @@ export default function App() {
         // this confirmation must keep the chooser open.
         pendingRef.current = null;
         clearSequence();
+        // A bypass y/n prompt ends VISUAL so its next `y` answers the prompt
+        // instead of copying the selection.
+        exitRegion();
         setDetail(null);
         setHandoffOpen(false);
         setKeymapOpen(false);
@@ -2036,14 +2328,20 @@ export default function App() {
         // that bubble from an overlay must not advance a stale sequence.
         pendingRef.current = null;
         clearSequence();
+        // The chooser ends VISUAL before taking the keys.
+        exitRegion();
         // `prefix w`: the other two overlays over the conversation area must not fight
         // it for the keys, the same reason `begin_rename` and `confirm_close` close them.
         setDetail(null);
         setHandoffOpen(false);
         setKeymapOpen(false);
         setRenaming(null);
-        // Opening `prefix w` closes an existing picker so both overlays cannot compete for keys.
+        // Opening `prefix w` closes the slash picker so the overlays cannot compete for keys. Clear pending
+        // `/model`/`/effort` replies too, since they belong to a command sent before the user
+        // opened the chooser.
         setSlashPicker(null);
+        setSlashReply(null);
+        pendingSlashPickerRef.current = null;
         cancelBypassConfirm(); // Opening the chooser cancels the bypass prompt, not the
         // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser.
         setChooser({ open: payload.open, records: payload.records });
@@ -2127,7 +2425,10 @@ export default function App() {
       postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction });
       return;
     }
-    if (direction === "down" && mode === "browse") {
+    // `Ctrl+j` enters INPUT and ends any CARET, VISUAL or V-LINE region. Include region modes here so
+    // the chord cannot fall through to Rust's `move_focus` instead.
+    if (direction === "down" && (mode === "browse" || isRegionMode(mode))) {
+      if (isRegionMode(mode)) exitRegion();
       // Keep the caret where it was left, as `i`/`o` do. Set `composerCaret` explicitly so this chord
       // cannot reuse an earlier `A`'s end-of-draft setting.
       setMode("input");
@@ -2278,11 +2579,16 @@ export default function App() {
     const command = slashPicker.kind === "model" ? "/model" : "/effort";
     setSlashPicker(null);
     sendMessage(`${command} ${value}`);
+    // Restore focus after the picker unmounts so the keys do not stay on `<body>`. `takeKeys` runs
+    // after the render that closed it.
+    setKeysRequest((n) => n + 1);
   }
 
-  /** The picker's own Escape/q: closes it, sends nothing. */
+  /** Closes the picker on Escape/q, sends nothing, and returns the keys,
+   *  as `chooseSlashOption` does. */
   function cancelSlashPicker() {
     setSlashPicker(null);
+    setKeysRequest((n) => n + 1);
   }
 
   /** Queues what is typed behind the running turn. Recorded as a `"send"` for the same reason
@@ -2790,6 +3096,403 @@ export default function App() {
       answerPermission(permissionId, decision, reason);
     });
   }
+  // BROWSE visual mode is handled in the root's `onKeyDownCapture` before `onKeyDown`.
+  // `resolveKey` resolves VISUAL/V-LINE keys here. Stopping propagation prevents cards,
+  // buttons and reason boxes from handling the same key, especially a reason box's Enter.
+
+  function visualRoot(): HTMLElement | null {
+    return containerRef.current;
+  }
+
+  /** Restricts selection motions and highlight checks to `.message-list`.
+   *  `visualRoot()` also contains the activity line, composer and status band.
+   *  Using that root would let a motion leave the last row and let `y` copy live controls. */
+  function messageListEl(): HTMLElement | null {
+    return visualRoot()?.querySelector<HTMLElement>(".message-list") ?? null;
+  }
+
+  /** Returns the caret row's key from `frozenTimeline`, or `null` outside a row.
+   *  Match rows by key because linked cards arriving during VISUAL can give a row different
+   *  positions in the frozen and live timelines. Each row in the frozen DOM belongs to
+   *  `frozenTimeline`, and caret movement stays inside `.message-list`. */
+  function rowKeyOfCaret(caret: Caret): string | null {
+    const root = visualRoot();
+    if (root === null || frozenTimeline === null) return null;
+    const el = caret.node instanceof Element ? caret.node : caret.node.parentElement;
+    if (el === null) return null;
+    const row = rowOf(root, el);
+    if (row === null) return null;
+    const frozenIndex = rowIndexOf(root, row);
+    if (frozenIndex === null) return null;
+    return frozenTimeline[frozenIndex]?.key ?? null;
+  }
+
+  /** Places the live cursor on the row named by `key` without moving the view.
+   *  A key absent from the live timeline leaves the cursor alone.
+   *  Set `landingRef` to "keep" only when the index changes. An unchanged cursor runs no reveal
+   *  effect, so a leftover "keep" would suppress the next unrelated landing's reveal. */
+  function landCursorOnRowKey(key: string | null) {
+    if (key === null) return;
+    const liveIndex = indexOfKey(timeline, key);
+    if (liveIndex === null) return;
+    if (liveIndex !== cursorRef.current) landingRef.current = "keep";
+    setCursor(liveIndex);
+  }
+
+  /** Reveals the caret through each scrollable box and the message list using `revealCaret`.
+   *  Each box moves only enough to show the caret. `scrollIntoView` on a containing box would
+   *  move its ancestors without changing that box's own `scrollTop`.
+   *  Announce scrolling for the whole key, including geometry probes before this call.
+   *  Compare against `listTopBefore`, captured when the key arrived, so an upward move stops
+   *  following even if the caret is already visible here. Other moves use "unknown" direction.
+   *  Without layout, use the coarse `scrollIntoView` fallback. */
+  function scrollCaretIntoView(caret: Caret, listTopBefore: number | null) {
+    const list = messageListEl();
+    if (list === null) return;
+    const moved = revealCaret(caret, list);
+    if (!moved && caretRectMissing(caret)) {
+      const startEl = caret.node instanceof Element ? caret.node : caret.node.parentElement;
+      startEl?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    }
+    const listMoved = listTopBefore !== null && list.scrollTop !== listTopBefore;
+    if (listMoved) noteUserScroll(list, list.scrollTop < listTopBefore! ? "up" : "unknown");
+    else if (moved) noteUserScroll(list, "unknown");
+  }
+
+  /** Whether `caret` has no usable client rect at all (jsdom, or a node with nothing laid out) --
+   *  `scrollCaretIntoView`'s cue to fall back to the element's own `scrollIntoView`. */
+  function caretRectMissing(caret: Caret): boolean {
+    if (typeof Range === "undefined" || typeof Range.prototype.getBoundingClientRect !== "function") return true;
+    const range = document.createRange();
+    try {
+      range.setStart(caret.node, caret.offset);
+    } catch {
+      return true;
+    }
+    range.collapse(true);
+    const rect = range.getBoundingClientRect();
+    return rect.width === 0 && rect.height === 0 && rect.top === 0 && rect.left === 0;
+  }
+
+  /** `v` from BROWSE starts CARET; `V` starts V-LINE. Flash without entering if no row can
+   *  supply a caret, including when focus is on a banner or Stop. After a HINT lands on code,
+   *  start at that block's first character. Otherwise use the cursor row's first selectable
+   *  character on screen. Drop any pending BROWSE count.
+   *  The caller captures `landedCodeBlock` before `onKeyDown` clears `copyCodeRef.current`;
+   *  reading the ref here would lose the block that HINT just landed on. */
+  function enterRegion(line: boolean, landedCodeBlock: HTMLElement | null) {
+    const root = visualRoot();
+    if (root === null) return;
+    if (edgeFocused) {
+      showFlash("v selects from a row — j / k onto one");
+      return;
+    }
+    const row = conversationRows(root)[cursor] ?? null;
+    if (row === null) {
+      showFlash("nothing to select");
+      return;
+    }
+    const codeBlock = landedCodeBlock;
+    const container = codeBlock !== null && codeBlock.isConnected && row.contains(codeBlock) ? codeBlock : row;
+    const caret = container === row ? entrySelectableCaret(container, messageListEl()) : firstSelectableCaret(container);
+    if (caret === null) {
+      showFlash("nothing to select");
+      return;
+    }
+    const sel = window.getSelection();
+    if (sel === null) return;
+    // BROWSE's `v` (`line === false`) starts CARET; `V` (`line === true`)
+    // starts V-LINE directly.
+    const model: VisualModel = { anchor: caret, cursor: caret, kind: line ? "line" : "caret", goalX: null };
+    visualModelRef.current = model;
+    visualBuiltRef.current = rebuildSelection(sel as unknown as SelectionLike, model);
+    // Discard the BROWSE count when entering the region and start the region's count fresh.
+    countRef.current = null;
+    visualCountRef.current = null;
+    regionPendingGRef.current = null;
+    setFrozenSnapshot({ state, expanded, detailed, ruleOffers, answeredPermissions, sessionEnded });
+    modeRef.current = line ? "vline" : "caret";
+    setMode(modeRef.current);
+    root.focus({ preventScroll: true });
+  }
+
+  /** Clears region state without changing the mode, so the `[mode]` effect can also clean up
+   *  after another route has already left VISUAL/V-LINE and `exitRegion` would return early.
+   *  Remove only the selection built here, checked with `selectionMatchesBuild`, leaving a new
+   *  mouse selection alone. Clear `frozenSnapshot` too: otherwise `MessageList` keeps showing
+   *  stale cards while keyboard answers target the live conversation, possibly in another tab. */
+  function clearVisualLeftovers() {
+    const sel = window.getSelection();
+    const built = visualBuiltRef.current;
+    const root = visualRoot();
+    if (sel !== null && built !== null && root !== null && selectionMatchesBuild(sel as unknown as SelectionLike, built, root)) {
+      sel.removeAllRanges();
+    }
+    visualModelRef.current = null;
+    visualBuiltRef.current = null;
+    visualCountRef.current = null;
+    regionPendingGRef.current = null;
+    countRef.current = null;
+    setFrozenSnapshot(null);
+  }
+
+  /** Returns the band's label for a region mode: `CARET`, `V-LINE`, or `VISUAL`. */
+  function regionModeName(m: PanelMode): string {
+    return m === "caret" ? "CARET" : m === "vline" ? "V-LINE" : "VISUAL";
+  }
+
+  /** Checks whether `m` is CARET, VISUAL or V-LINE. Exit routes and the `[mode]`
+   *  backstop share this check so they all recognize the same region modes. */
+  function isRegionMode(m: PanelMode): m is "caret" | "visual" | "vline" {
+    return m === "caret" || m === "visual" || m === "vline";
+  }
+
+  /** Ends CARET, VISUAL or V-LINE and returns to BROWSE; does nothing outside those modes.
+   *  Updates `modeRef.current` synchronously as well as calling `setMode` so an immediate
+   *  `saveView` in the `tabs` handler cannot park a region mode that this panel cannot restore. */
+  function exitRegion() {
+    if (!isRegionMode(modeRef.current)) return;
+    clearVisualLeftovers();
+    modeRef.current = "browse";
+    setMode("browse");
+  }
+
+  /** Handles CARET/VISUAL/V-LINE keys in the root's `onKeyDownCapture`, before
+   *  `onKeyDown` and descendant handlers. Outside the region, returns without claiming keys
+   *  so normal handling can continue. */
+  function onVisualKeyDownCapture(event: KeyboardEvent<HTMLDivElement>) {
+    const currentMode = modeRef.current;
+    if (!isRegionMode(currentMode)) return;
+    const root = containerRef.current;
+    // Region keys must target the root. If focus escaped without an explicit exit,
+    // end the region and swallow this key so a descendant reason box or button cannot act on it.
+    if (root === null || event.target !== root) {
+      exitRegion();
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    // Feed every region key to the typing guard so it can cancel a card's deferred
+    // `a`/`d`/`D` answer even after the region has started.
+    const cancelled = typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt);
+    const model = visualModelRef.current;
+    if (model === null) {
+      exitRegion();
+      return;
+    }
+    // A bare modifier keydown preserves a region-local pending `g`, just as BROWSE's
+    // `pendingRef` does. Pressing Shift before `G`/`V`/`$` must not cancel a pending `gg`.
+    // Check before reading and clearing `count` and `regionPendingGRef` so both stay intact.
+    if (regionPendingGRef.current !== null && isModifierKey(event.key)) {
+      if (cancelled !== null) showFlash(cancelled);
+      return;
+    }
+    // Keep region motions, highlight checks and copying inside the message list. The conversation
+    // root also contains the activity line, composer and status band, which are outside the
+    // frozen region.
+    const listEl = messageListEl();
+    const count = visualCountRef.current;
+    visualCountRef.current = null;
+    const pendingG = regionPendingGRef.current;
+    regionPendingGRef.current = null;
+    const action = resolveKey(currentMode, event.nativeEvent as unknown as KeyLike, {
+      sessionEnded,
+      count,
+      pending: pendingG ?? undefined,
+      turnRunning: state.activeTurnId !== null,
+    });
+    if (action === null) {
+      // A null action leaves browser defaults and the current mode alone, including native Ctrl+c
+      // copying. Restore the count so a bare modifier before `$` or `V` does not lose it. A
+      // consumed pending `g`, such as in `gv`, stays cleared.
+      visualCountRef.current = count;
+      if (cancelled !== null) showFlash(cancelled);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const sel = window.getSelection();
+    // When a key ends the region, swallow its repeats until keyup through
+    // `promptSwallowKeyRef`. Otherwise a held `d` could deny a card, a held `y` could copy a row,
+    // or a held `>` could type into the composer after the mode changes.
+    // `answerConfirm` checks this ref before this handler on every key, so the repeat cannot
+    // reach the BROWSE or INPUT key table.
+    function endRegionFromKey() {
+      promptSwallowKeyRef.current = event.key;
+      exitRegion();
+    }
+    switch (action.kind) {
+      case "count":
+        visualCountRef.current = accumulateMotionCount(count, action.digit);
+        return;
+      case "pending":
+        // Arm the first `g` of `gg` or the reserved `gv` pair for the next key.
+        regionPendingGRef.current = action.prefix;
+        return;
+      case "vmove": {
+        // Motions accept held-key repeats. `gg`/`G` discard the count and take exactly
+        // one step: the panel has no buffer line number for a count such as `3G`.
+        if (sel === null || listEl === null) return;
+        const times = action.motion === "gg" || action.motion === "G" ? 1 : Math.max(1, count ?? 1);
+        const listTopBefore = listEl.scrollTop;
+        const next = repeatMotion(sel as unknown as SelectionLike, model, action.motion, times, listEl);
+        visualModelRef.current = next;
+        visualBuiltRef.current = rebuildSelection(sel as unknown as SelectionLike, next);
+        scrollCaretIntoView(next.cursor, listTopBefore);
+        return;
+      }
+      case "vswap": {
+        // A repeated `o` does nothing. CARET cannot reach this action because
+        // `resolveCaretKey` never returns it; keep the repeat guard for consistent handling.
+        if (event.repeat || sel === null) return;
+        const next = swapEnds(model);
+        visualModelRef.current = next;
+        visualBuiltRef.current = rebuildSelection(sel as unknown as SelectionLike, next);
+        scrollCaretIntoView(next.cursor, listEl?.scrollTop ?? null);
+        return;
+      }
+      case "vtoggle": {
+        // From CARET, `v`/`V` starts a selection. From VISUAL/V-LINE, the other key
+        // switches selection modes; the mode's own key reaches `vback` below.
+        // Ignore repeated `v`/`V` in either case.
+        if (event.repeat || sel === null) return;
+        const next: VisualModel = { ...model, kind: action.line ? "line" : "char" };
+        visualModelRef.current = next;
+        visualBuiltRef.current = rebuildSelection(sel as unknown as SelectionLike, next);
+        modeRef.current = action.line ? "vline" : "visual";
+        setMode(modeRef.current);
+        return;
+      }
+      case "vback": {
+        // VISUAL/V-LINE's own key or Esc returns to CARET at the moving end.
+        // Keep the region and frozen snapshot active. Ignore repeated `v`/`V`/Esc.
+        if (event.repeat || sel === null) return;
+        const caretModel: VisualModel = { anchor: model.cursor, cursor: model.cursor, kind: "caret", goalX: null };
+        visualModelRef.current = caretModel;
+        visualBuiltRef.current = rebuildSelection(sel as unknown as SelectionLike, caretModel);
+        modeRef.current = "caret";
+        setMode("caret");
+        // Swallow repeats of the key that leaves the mode until keyup. Otherwise a held `Esc` could
+        // return to CARET and immediately end the region, dropping the caret and freeze.
+        promptSwallowKeyRef.current = event.key;
+        return;
+      }
+      case "vyank": {
+        // Ignore repeated `y`. `endRegionFromKey` sets `promptSwallowKeyRef` so later
+        // repeats cannot fall through to BROWSE's copy action after the region ends.
+        if (event.repeat) return;
+        if (sel === null || root === null || listEl === null) {
+          endRegionFromKey();
+          return;
+        }
+        const built = visualBuiltRef.current;
+        // Copy only the selection still highlighted inside `.message-list`.
+        if (built === null || !selectionMatchesBuild(sel as unknown as SelectionLike, built, listEl)) {
+          showFlash("selection changed under it — nothing copied; v to start again");
+          endRegionFromKey();
+          return;
+        }
+        const text = copySelectionText(sel as unknown as SelectionLike, root, model);
+        // After a characterwise yank, place the row cursor on the row containing the first
+        // yanked character, the earlier selection end, regardless of where the moving end was left.
+        const earlier = compareCarets(model.anchor, model.cursor) <= 0 ? model.anchor : model.cursor;
+        const key = rowKeyOfCaret(earlier);
+        landCursorOnRowKey(key);
+        copied(text, key ?? undefined);
+        endRegionFromKey();
+        return;
+      }
+      case "vquote": {
+        // `>` quotes the highlighted text into the tab's draft and enters INPUT without
+        // sending anything. A held `>` quotes once; `promptSwallowKeyRef` swallows its repeats
+        // until keyup so they cannot type into the composer.
+        if (event.repeat) return;
+        if (sel === null || root === null || listEl === null) {
+          endRegionFromKey();
+          return;
+        }
+        const built = visualBuiltRef.current;
+        // Quote the same text `y` would copy, after checking the built selection.
+        // A failed check quotes nothing, shows the same message and ends the region as `vyank` does.
+        if (built === null || !selectionMatchesBuild(sel as unknown as SelectionLike, built, listEl)) {
+          showFlash("selection changed under it — nothing copied; v to start again");
+          endRegionFromKey();
+          return;
+        }
+        // Refuse quoting when the session has ended or the draft is open in nvim
+        // (`scratchEditing`). Keep VISUAL/V-LINE and its selection so the user can still
+        // back out with Esc or copy with `y`.
+        if (sessionEnded) {
+          showFlash("this session has ended — nothing to quote into");
+          return;
+        }
+        if (scratchEditing) {
+          showFlash("the draft is open in nvim — finish there first");
+          return;
+        }
+        const text = copySelectionText(sel as unknown as SelectionLike, root, model);
+        const quote = formatQuote(text);
+        if (quote === null) {
+          showFlash("nothing to quote");
+          return;
+        }
+        const earlier = compareCarets(model.anchor, model.cursor) <= 0 ? model.anchor : model.cursor;
+        const key = rowKeyOfCaret(earlier);
+        landCursorOnRowKey(key);
+        const nextDraft = appendQuote(draftRef.current, quote);
+        promptSwallowKeyRef.current = event.key;
+        exitRegion();
+        modeRef.current = "input";
+        setMode("input");
+        setComposerCaret("end");
+        setComposerFocusRequest((n) => n + 1);
+        restoreSeq.current += 1;
+        setRestoredDraft({ text: nextDraft, seq: restoreSeq.current });
+        mirrorDraft(nextDraft);
+        return;
+      }
+      case "vend": {
+        // Ignore repeated Esc in CARET. `promptSwallowKeyRef` swallows repeats of a key
+        // that ended a mode; this also covers repeats that reach CARET by another route.
+        if (event.repeat && action.key === "Escape") return;
+        landCursorOnRowKey(rowKeyOfCaret(model.cursor));
+        endRegionFromKey();
+        // `Esc` exits silently. Other unbound keys show the current mode's hint. Name Space explicitly
+        // so the message does not contain an unreadable blank key name.
+        if (action.key !== "Escape") {
+          const keyName = action.key === " " ? "Space" : action.key;
+          if (currentMode === "caret") {
+            showFlash(`CARET ended: ${keyName} is not a CARET key (v selects)`);
+          } else {
+            showFlash(`VISUAL ended: ${keyName} is not a VISUAL key (y copies)`);
+          }
+        }
+        return;
+      }
+      case "vswallow":
+        // This modified key was already prevented and stopped above, so leave state alone.
+        // An idle Ctrl+c in CARET also explains that nothing is selected instead of invoking
+        // native copy.
+        if (currentMode === "caret" && event.key === "c" && event.ctrlKey) {
+          showFlash("nothing selected — v, then y");
+        }
+        return;
+      case "keymap":
+        // `?` ends the region and opens the keymap for discovering available keys.
+        landCursorOnRowKey(rowKeyOfCaret(model.cursor));
+        endRegionFromKey();
+        setKeymapOpen(true);
+        return;
+      case "interrupt":
+        // Ctrl+c keeps its BROWSE interrupt action while leaving the region active.
+        interrupt();
+        return;
+      default:
+        return;
+    }
+  }
+
   /** The key table's home: mode + key + context in, an action out, applied here. Only claims what
    *  `resolveKey` claims -- an unrecognised key, or one INPUT leaves to the input method (a
    *  composing Escape), falls straight through with no `preventDefault`. That is what keeps
@@ -2846,9 +3549,10 @@ export default function App() {
       setHandoffOpen(false);
       return;
     }
-    // A bare modifier's own keydown (the Shift of `gT`) is not "the next key": it
-    // must not drop a pending `g`/`z`/`[`/`]`, a count or its which-key box, as vim waits through it.
-    if (pendingRef.current !== null && isModifierKey(event.key)) return;
+    // A bare modifier keydown must preserve a pending prefix, count and which-key box. `5 Ctrl+e`
+    // includes a Control keydown before `e`; clearing the count on Control would scroll once
+    // instead of five times.
+    if ((pendingRef.current !== null || countRef.current !== null) && isModifierKey(event.key)) return;
     const root = containerRef.current;
     const pending = pendingRef.current;
     pendingRef.current = null;
@@ -3140,6 +3844,16 @@ export default function App() {
         if (table !== null) table.scrollLeft += action.delta * TOOL_RESULT_SCROLL_STEP_PX;
         break;
       }
+      case "caret":
+        // `v` from BROWSE starts CARET. `enterRegion` checks for a row under the cursor and flashes if
+        // there is none. Pass the saved `landedCode`, also used by copy, because
+        // `copyCodeRef.current` has already been cleared.
+        enterRegion(false, landedCode);
+        break;
+      case "visual":
+        // `V` from BROWSE starts V-LINE directly.
+        enterRegion(action.line, landedCode);
+        break;
       case "copy": {
         // After HINT landed on a code block: that block's code, not the whole message. Only while it
         // is still in the DOM and still inside the row under the cursor -- anything else and the
@@ -3246,13 +3960,23 @@ export default function App() {
       case "scroll-line": {
         // Scroll `times` units, letting the cursor row's overflow box consume them first using
         // `TOOL_RESULT_SCROLL_STEP_PX`. Each remaining unit scrolls the conversation by one
-        // text line. Rehome the cursor with the same rule as `half-page`.
+        // text line. Rehome the cursor with the same rule as `half-page`. The box consumes
+        // units only while at least partly visible, through `scrollVisibleRowBox`, without
+        // bringing an offscreen row back.
         const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
         if (list === null || root === null) break;
         const row = cursorRow();
         let remaining = times;
-        while (remaining > 0 && scrollCursorRowBox(row, action.delta)) remaining--;
-        if (remaining > 0) list.scrollTop += action.delta * computedLineHeight(row ?? list) * remaining;
+        while (remaining > 0 && scrollVisibleRowBox(row, action.delta)) remaining--;
+        if (remaining > 0) {
+          list.scrollTop += action.delta * computedLineHeight(row !== null ? rowTextElement(row) : list) * remaining;
+        }
+        // `noteUserScroll` only arms the steering window; rearming following needs a scroll event on
+        // the list. Scrolling only a tool-result box produces none because scroll events do not
+        // bubble. Dispatch one for downward scrolling so following can resume at the bottom.
+        // `onScroll` reads the current position, so an additional real event is harmless.
+        // Upward scrolling must keep following off even if the list remains at the bottom.
+        if (action.delta > 0) list.dispatchEvent(new Event("scroll"));
         const next = clampCursorToView(list, conversationRows(list), cursor);
         if (next !== null) {
           landingRef.current = "keep";
@@ -3390,15 +4114,27 @@ export default function App() {
       // Real, focusable, so BROWSE's keydown handler has a DOM node to bubble from -- see the
       // effect above `onKeyDown` that keeps focus here whenever `mode` is "browse".
       tabIndex={0}
-      // A y/n prompt takes every key first, from wherever it was typed (the chooser and its inputs,
-      // the tab bar's rename, the `/` prompt, the composer): see `answerConfirm`'s own doc.
-      onKeyDownCapture={(event) => void answerConfirm(event)}
+      // A y/n prompt takes keys first in capture phase, wherever they were typed.
+      // The VISUAL key table runs next, before `onKeyDown` and descendant handlers.
+      // A card's reason box can deny from its own handler, so VISUAL must claim the key here
+      // before that handler sees it.
+      onKeyDownCapture={(event) => {
+        if (answerConfirm(event)) return;
+        onVisualKeyDownCapture(event);
+      }}
       onKeyDown={onKeyDown}
+      // A pointer press anywhere in the panel ends VISUAL before descendant handlers run. Approve
+      // still handles its click; a reason box enters BROWSE before a later Enter denies.
+      // Capture runs ahead of descendant `onClick` and `onMouseDown`.
+      onPointerDownCapture={() => exitRegion()}
       onFocus={(event) => {
         // The outermost stop (`stopOf`): a link inside a reply is in the reply's row, whatever the
         // reply's own HTML claims to be.
         const stop = containerRef.current === null ? null : stopOf(containerRef.current, event.target as HTMLElement);
         setEdgeFocused(stop !== null && stop.getAttribute("data-nav-stop") !== "row");
+        // End VISUAL before handling focus on any panel element other than its root,
+        // including a card's reason box, a button, the composer or the tab bar.
+        if (containerRef.current !== null && event.target !== containerRef.current) exitRegion();
       }}
     >
       {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
@@ -3421,17 +4157,23 @@ export default function App() {
           the footer are outside its box rather than lifted back above it (review; see
           `.agent-ui-scroller` in index.css). The tab bar goes above `errorBanner`. */}
       <div className="agent-ui-scroller">
+        {/* While VISUAL/V-LINE is active, `MessageList` uses props frozen at entry except
+            `cursor`, `focused` and `visual`, keeping its DOM stable under the selection.
+            `frozenTimeline` computes rows from those same props to translate frozen DOM rows
+            into live timeline keys. Express the live cursor by key in the frozen timeline's
+            indices. Use -1 when its row is absent there; falling back to the live index would
+            mark an unrelated frozen row as current. */}
         <MessageList
-          state={state}
-          sessionEnded={sessionEnded}
-          expanded={expanded}
-          cursor={cursor}
-          detailed={detailed}
+          state={frozenSnapshot?.state ?? state}
+          sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}
+          expanded={frozenSnapshot?.expanded ?? expanded}
+          cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
+          detailed={frozenSnapshot?.detailed ?? detailed}
           focused={paneFocused && !edgeFocused}
-          ruleOffers={ruleOffers}
+          ruleOffers={frozenSnapshot?.ruleOffers ?? ruleOffers}
           yankedKey={yanked?.key ?? null}
           onAnswerPermission={answerPermission}
-          answeredPermissions={answeredPermissions}
+          answeredPermissions={frozenSnapshot?.answeredPermissions ?? answeredPermissions}
           onPermissionReason={(permissionId, reason) => {
             if (reason === "") permissionReasons.current.delete(permissionId);
             else permissionReasons.current.set(permissionId, reason);
@@ -3442,6 +4184,7 @@ export default function App() {
             unseenAfterSeqRef.current = afterSeq;
           }}
           unseenSeed={unseenSeed}
+          visual={mode === "caret" ? "caret" : mode === "visual" ? "visual" : mode === "vline" ? "vline" : null}
         />
         {keymapOpen && (
           <KeymapOverlay

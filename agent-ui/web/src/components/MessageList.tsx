@@ -66,6 +66,10 @@ type Props = {
    *  back to the same `afterSeq` still re-fires the effect. `null` for a tab with no saved threshold
    *  (never parked, or restored at the bottom) -- nothing to seed. */
   unseenSeed?: { afterSeq: number; tick: number } | null;
+  /** Active selection mode: `"caret"`, `"visual"`, or `"vline"`; `null` or absent in BROWSE.
+   *  Drives `data-visual` for the list's selection and current-row styles. `App.tsx` builds the
+   *  selection directly on the DOM, so this prop only controls styling here. */
+  visual?: "caret" | "visual" | "vline" | null;
 };
 
 /** Whether a finished tool call succeeded, failed, is still running, or was abandoned -- the state a
@@ -181,6 +185,7 @@ export function MessageList({
   onOpenPath,
   onUnreadChange,
   unseenSeed,
+  visual = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   /** The one `ResizeObserver`, on the list and on every child of it (see "Correction (the GUI pass)"
@@ -546,6 +551,7 @@ export function MessageList({
       <div
         className="message-list"
         data-focused={String(focused)}
+        data-visual={visual ?? undefined}
         ref={listRef}
         onScroll={onScroll}
         // Open `.path-link` spans or inline code in replies when they parse as paths.
@@ -628,7 +634,7 @@ export function MessageList({
               return (
                 <Row key={item.key} kind="tool-run" sign="✓" current={current} className={yanked} navStop="row">
                   <div className="tool-card tool-card-run">
-                    {runSummary(item.calls)} <span aria-label="collapsed">▸</span>
+                    {runSummary(item.calls)} <span className="fold-marker" aria-label="collapsed">▸</span>
                   </div>
                 </Row>
               );

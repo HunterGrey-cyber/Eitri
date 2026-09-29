@@ -835,6 +835,76 @@ describe("slash command pickers", () => {
     expect(container.querySelector(".slash-picker")).toBeNull();
   });
 
+  /** A picker reply must not open over the chooser, `?`, or the `/` prompt.
+   *  Stacked overlays can send Enter to the underlying chooser after focus returns.
+   *  Closing the picker must return focus to the conversation rather than `<body>`. */
+  describe("the picker and the other overlays", () => {
+    const REPLY = (): AgentDomainEvent[] => [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    ];
+    const CHOOSER = {
+      kind: "chooser",
+      open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }],
+      records: [],
+    };
+    const root = (container: HTMLElement) => container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+
+    it("a reply that lands under the chooser opens no picker, and the chooser keeps the keys", () => {
+      const { container } = startedApp();
+      sendBareCommand(container, "/model");
+      dispatch(CHOOSER);
+      events(...REPLY());
+      expect(container.querySelector(".slash-picker")).toBeNull();
+      expect(container.querySelector(".chooser")).not.toBeNull();
+      dispatch({ kind: "pane_focus", focused: false });
+      dispatch({ kind: "pane_focus", focused: true });
+      expect(document.activeElement).toBe(container.querySelector(".chooser"));
+    });
+
+    it("opening the chooser drops the pending picker: its reply opens nothing after the chooser closes", () => {
+      const { container } = startedApp();
+      sendBareCommand(container, "/model");
+      dispatch(CHOOSER);
+      fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
+      events(...REPLY());
+      expect(container.querySelector(".slash-picker")).toBeNull();
+    });
+
+    for (const [overlay, key, selector] of [
+      ["?", "?", ".keymap-overlay"],
+      ["the / prompt", "/", ".search-bar"],
+    ] as const) {
+      it(`a reply that lands under ${overlay} opens no picker over it`, () => {
+        const { container } = startedApp();
+        sendBareCommand(container, "/model");
+        const textarea = container.querySelector("textarea");
+        if (textarea !== null) fireEvent.keyDown(textarea, { key: "Escape" });
+        fireEvent.keyDown(root(container), { key });
+        expect(container.querySelector(selector)).not.toBeNull();
+        events(...REPLY());
+        expect(container.querySelector(".slash-picker")).toBeNull();
+        expect(container.querySelector(selector)).not.toBeNull();
+      });
+    }
+
+    for (const [how, key] of [
+      ["Esc", "Escape"],
+      ["Enter", "Enter"],
+    ] as const) {
+      it(`closing the picker with ${how} hands the keys back to the conversation`, () => {
+        const { container } = startedApp();
+        sendBareCommand(container, "/model");
+        events(...REPLY());
+        const picker = container.querySelector<HTMLElement>(".slash-picker")!;
+        expect(document.activeElement).toBe(picker);
+        fireEvent.keyDown(picker, { key });
+        expect(container.querySelector(".slash-picker")).toBeNull();
+        expect(document.activeElement).toBe(root(container));
+      });
+    }
+  });
+
   /** `pendingSlashPickerRef` is shared across tabs, so a tab switch must clear it.
    *  The switch also closes `slashPicker` to prevent targeting the wrong tab. */
   describe("tab switch", () => {
@@ -1373,6 +1443,156 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
       expect(container.querySelector(".row-current")!.textContent).toContain("long");
       expect(box.scrollTop).toBeLessThan(100);
+    });
+
+    /* A tall command row can span both viewport edges while its `.tool-result-body` is off screen.
+       `scrollIntoView({block:"nearest"})` cannot move that row, so claiming the key would trap scrolling.
+       `Ctrl+e` must fall through to the conversation when the box cannot be reached this way. */
+    it("Ctrl+e falls through to the conversation when the row already spans the view and its box is still off screen", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      const row = container.querySelector(".row-current") as HTMLElement;
+      const list = box.closest(".message-list") as HTMLElement;
+      Object.defineProperty(box, "scrollHeight", { value: 500, configurable: true });
+      Object.defineProperty(box, "clientHeight", { value: 260, configurable: true });
+      Object.defineProperty(box, "scrollTop", { value: 0, configurable: true, writable: true });
+      // The row spans both edges of the 800px viewport; its result box sits further down, entirely
+      // below the bottom edge -- exactly the geometry the review's own repro describes.
+      row.getBoundingClientRect = () => ({ top: -50, bottom: 850 }) as DOMRect;
+      box.getBoundingClientRect = () => ({ top: 820, bottom: 1080 }) as DOMRect;
+      list.getBoundingClientRect = () => ({ top: 0, bottom: 800 }) as DOMRect;
+      Object.defineProperty(list, "scrollTop", { value: 0, configurable: true, writable: true });
+
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true });
+
+      expect(box.scrollTop).toBe(0); // the box never moved -- `scrollIntoView` could not reach it
+      expect(list.scrollTop).toBeGreaterThan(0); // the press fell through to the conversation instead
+    });
+
+    /* `Ctrl+y` then `Ctrl+e` can scroll only the nested result box while the list remains at its bottom.
+       Nested scroll events do not bubble, and `noteUserScroll("down")` only arms the steering window.
+       A scroll event on `.message-list` is still needed to let `MessageList` resume following. */
+    it("Ctrl+e dispatches a scroll event on the list even when the whole press stayed inside the box", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 500, clientHeight: 260 });
+      Object.defineProperty(box, "scrollTop", { value: 240, configurable: true, writable: true }); // already at its own end
+      const list = box.closest(".message-list") as HTMLElement;
+      const scrollEvents: Event[] = [];
+      list.addEventListener("scroll", (e) => scrollEvents.push(e));
+
+      fireEvent.keyDown(conversationRoot(container), { key: "y", ctrlKey: true }); // up: stops following outright
+      expect(box.scrollTop).toBe(200); // absorbed entirely by the box
+      expect(list.scrollTop).toBe(0);
+
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true }); // back down to its end
+
+      expect(box.scrollTop).toBe(240); // the box round-tripped back to where it started
+      expect(list.scrollTop).toBe(0); // the outer list was never touched
+      // Without the fix, no `scroll` event ever reaches the list here, so `MessageList` never learns
+      // it is still at the true bottom and following stays off for good.
+      expect(scrollEvents.length).toBeGreaterThan(0);
+    });
+
+    /* Line scrolling must not pull the view back toward an off-screen cursor row.
+       `Ctrl+e`/`Ctrl+y` scroll the result box only while it overlaps the viewport and can move that way.
+       Otherwise the list scrolls, avoiding jumps back to the same row on every held key.
+       Geometry here: list 0-800, row 760-1080, box 800-1060, list scrolled to 400. */
+    function placeBoxBelowTheView(container: HTMLElement) {
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      const row = container.querySelector(".row-current") as HTMLElement;
+      const list = box.closest(".message-list") as HTMLElement;
+      Object.defineProperty(box, "scrollHeight", { value: 500, configurable: true });
+      Object.defineProperty(box, "clientHeight", { value: 260, configurable: true });
+      Object.defineProperty(box, "scrollTop", { value: 100, configurable: true, writable: true });
+      row.getBoundingClientRect = () => ({ top: 760, bottom: 1080 }) as DOMRect;
+      box.getBoundingClientRect = () => ({ top: 800, bottom: 1060 }) as DOMRect;
+      list.getBoundingClientRect = () => ({ top: 0, bottom: 800 }) as DOMRect;
+      Object.defineProperty(list, "scrollTop", { value: 400, configurable: true, writable: true });
+      return { box, list };
+    }
+
+    it("held Ctrl+y scrolls the conversation up a line each time, never back down to a box below the view", () => {
+      const { container } = startedAppWithExpandedResult();
+      const { box, list } = placeBoxBelowTheView(container);
+      const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+      scrollIntoView.mockClear();
+
+      const seen: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        fireEvent.keyDown(conversationRoot(container), { key: "y", ctrlKey: true, repeat: i > 0 });
+        seen.push(list.scrollTop);
+      }
+
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(box.scrollTop).toBe(100); // the box is off screen: it takes nothing
+      expect(seen[0]).toBeLessThan(400);
+      expect(seen[1]).toBeLessThan(seen[0]);
+      expect(seen[2]).toBeLessThan(seen[1]);
+    });
+
+    it("Ctrl+e with the box below the view scrolls the conversation one line, not to the box", () => {
+      const { container } = startedAppWithExpandedResult();
+      const { box, list } = placeBoxBelowTheView(container);
+      const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+      scrollIntoView.mockClear();
+
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true });
+
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(box.scrollTop).toBe(100);
+      expect(list.scrollTop).toBeGreaterThan(400);
+      expect(list.scrollTop).toBeLessThan(400 + 40); // one line, not a box height
+    });
+
+    it("Ctrl+e scrolls a box that is partly on screen", () => {
+      const { container } = startedAppWithExpandedResult();
+      const { box, list } = placeBoxBelowTheView(container);
+      box.getBoundingClientRect = () => ({ top: 700, bottom: 960 }) as DOMRect;
+
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true });
+
+      expect(box.scrollTop).toBeGreaterThan(100);
+      expect(list.scrollTop).toBe(400);
+    });
+
+    /* Codex, the same finding: with the row's top exactly on the list's top (a tall row, scrolled to),
+       the "row spans the view" check was strict, missed the equality, and every unit of a counted
+       Ctrl+e went to a `scrollIntoView` that moved nothing. `j` had the same equality hole. */
+    function alignRowTopWithTheList(container: HTMLElement) {
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      const row = container.querySelector(".row-current") as HTMLElement;
+      const list = box.closest(".message-list") as HTMLElement;
+      Object.defineProperty(box, "scrollHeight", { value: 500, configurable: true });
+      Object.defineProperty(box, "clientHeight", { value: 260, configurable: true });
+      Object.defineProperty(box, "scrollTop", { value: 0, configurable: true, writable: true });
+      row.getBoundingClientRect = () => ({ top: 0, bottom: 1100 }) as DOMRect;
+      box.getBoundingClientRect = () => ({ top: 820, bottom: 1080 }) as DOMRect;
+      list.getBoundingClientRect = () => ({ top: 0, bottom: 800 }) as DOMRect;
+      Object.defineProperty(list, "scrollTop", { value: 0, configurable: true, writable: true });
+      return { box, list };
+    }
+
+    it("a counted Ctrl+e moves the conversation when the row's top sits exactly on the list's top", () => {
+      const { container } = startedAppWithExpandedResult();
+      const { box, list } = alignRowTopWithTheList(container);
+
+      fireEvent.keyDown(conversationRoot(container), { key: "3" });
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true });
+
+      expect(box.scrollTop).toBe(0);
+      expect(list.scrollTop).toBeGreaterThan(0);
+    });
+
+    it("j steps through the row when its top sits exactly on the list's top and its box is below the view", () => {
+      const { container } = startedAppWithExpandedResult();
+      const { box, list } = alignRowTopWithTheList(container);
+
+      fireEvent.keyDown(conversationRoot(container), { key: "j" });
+
+      expect(box.scrollTop).toBe(0);
+      expect(list.scrollTop).toBeGreaterThan(0);
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
     });
   });
 
@@ -2932,6 +3152,61 @@ describe("App global HINT: the panel's half", () => {
     expect(box2.selectionEnd).toBe(3);
   });
 
+  /** A HINT closes an open `/model` picker and clears a pending one, just as `prefix w` does.
+   *  A reply during HINT must not open `SlashPicker` under the labels or take focus from its landing. */
+  describe("and the /model picker", () => {
+    const MODEL_REPLY =
+      "Current model: `Haiku 4.5` (effort: high)\n" +
+      "Usage: /model <name>. Available: sonnet, opus, haiku, or a full model ID.";
+    function reply() {
+      events(
+        { type: "turn_started", turn_id: "t1" },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      );
+    }
+    /** `idle()`, then a bare `/model` sent from INPUT, left in BROWSE with the keys on the root. */
+    function sentBareModel() {
+      const rendered = idle();
+      fireEvent.keyDown(root(rendered.container), { key: "i" });
+      const textarea = rendered.container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: "/model" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(lastOfType("send_message")!.text).toBe("/model");
+      fireEvent.keyDown(rendered.container.querySelector("textarea")!, { key: "Escape" });
+      layOut(rendered.container);
+      box(rendered.container.querySelector(".composer")!, 900);
+      return rendered;
+    }
+
+    it("a reply that lands while the labels are up opens no picker, and landing on the composer types there", () => {
+      const { container } = sentBareModel();
+      expect(collect(1)).toBe(2);
+      show(1, 2);
+      reply();
+      expect(container.querySelector(".slash-picker")).toBeNull();
+      expect(labels(container)).toHaveLength(2);
+      dispatch({ kind: "hint_land", sessionId: 1, index: 1 });
+      expect(container.querySelector(".slash-picker")).toBeNull();
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+    });
+
+    it("a HINT drops the pending picker: the reply opens nothing after the HINT ends either", () => {
+      const { container } = sentBareModel();
+      collect(1);
+      dispatch({ kind: "hint_end", sessionId: 1 });
+      reply();
+      expect(container.querySelector(".slash-picker")).toBeNull();
+    });
+
+    it("a HINT closes an open picker, as it closes the chooser", () => {
+      const { container } = sentBareModel();
+      reply();
+      expect(container.querySelector(".slash-picker")).not.toBeNull();
+      collect(1);
+      expect(container.querySelector(".slash-picker")).toBeNull();
+    });
+  });
+
   it("offers no composer label only once the session has ended (C1: a running turn no longer disables it)", () => {
     // A running turn no longer disables the composer (C1: it queues a follow-up instead), so it is
     // a HINT target through the turn too -- one more than `AT`'s own count.
@@ -3234,7 +3509,12 @@ describe("App keyboard: scrolling through the conversation", () => {
       const top = y;
       y += heights[i];
       row.getBoundingClientRect = () => ({ top: top - scrollTop, bottom: top + heights[i] - scrollTop }) as DOMRect;
-      row.style.lineHeight = "20px";
+      // The `.row` wrapper sets neither `font-size` nor `line-height`; `.row-body` sets them.
+      // Deliberately different line heights make measuring the wrapper fail instead of matching the
+      // text cell by coincidence.
+      row.style.lineHeight = "999px";
+      const body = row.querySelector<HTMLElement>(".row-body")!;
+      body.style.lineHeight = "20px";
     });
     act(() => root(container).focus());
     return list;
@@ -3464,6 +3744,21 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(0);
   });
 
+  /* A one-line scroll measures `.row-body`'s computed line height, where the text is drawn.
+     `.row` has no font-size or line-height of its own in `index.css` and inherits ambient values.
+     `fakeLayout` deliberately uses 999px for the wrapper and 20px for the body to expose a wrong measurement. */
+  it("Ctrl+e steps by the row's TEXT line height, not the sign-column wrapper's own", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+
+    press("e", { ctrlKey: true });
+
+    expect(list.scrollTop).toBe(20); // `.row-body`'s 20px -- not the row wrapper's mismatched 999px
+  });
+
   it("a count repeats Ctrl+e/Ctrl+y, capped the same way every other count is (R4)", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -3481,6 +3776,28 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("0"); // "100"
     press("y", { ctrlKey: true });
     expect(list.scrollTop).toBe(0); // clamped at the top, exactly like an ordinary scrollTop write
+  });
+
+  /* A physical `Ctrl+e` produces a bare `Control` keydown before `e` with `ctrlKey: true`.
+     Sending only the combined `e` event cannot catch `countRef` being cleared by that first event.
+     Include both keydowns so the count must survive until `e` reads it. */
+  it("a bare Control keydown between the count and Ctrl+e does not clear the count", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+
+    press("5");
+    press("Control", { ctrlKey: true });
+    press("e", { ctrlKey: true });
+    expect(list.scrollTop).toBe(100); // still five 20px lines, exactly like the test above
+
+    press("2");
+    press("0");
+    press("Control", { ctrlKey: true });
+    press("y", { ctrlKey: true });
+    expect(list.scrollTop).toBe(0); // clamped at the top -- twenty 20px lines up from 100
   });
 
   it("Ctrl+e that carries the cursor's row off screen re-homes it to the nearest visible row", () => {
@@ -4182,10 +4499,11 @@ describe("App: the ? keymap overlay", () => {
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    // "Leader and tab keys" sits between BROWSE and "Typing"; "Slash
-    // commands" sits between "Typing" and "Anywhere".
+    // "Selecting" follows "This panel", then "Leader and tab keys" and "Typing".
+    // "Slash commands" sits between "Typing" and "Anywhere".
     expect(titles).toEqual([
       "This panel",
+      "Selecting (v)",
       "Leader and tab keys",
       "Typing",
       "Slash commands",
@@ -7095,5 +7413,1333 @@ describe("every panel y/n accepts Y too", () => {
     // Shift alone neither answered nor cancelled the prompt: the very next key still confirms it.
     fireEvent.keyDown(root, { key: "Y", shiftKey: true });
     expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
+  });
+});
+
+/* jsdom implements `Selection` but not `modify()`. This stub moves the live selection's focus
+   by characters or words over its text content, so tests can check that motions move the caret
+   and `y` copies the live DOM selection. Exact word and line movement is tested with the native
+   implementation in `shell/tests/panel_visual_mode.rs`. */
+function stubSelectionModify(): () => void {
+  const proto = Selection.prototype as unknown as { modify?: (alter: string, direction: string, granularity: string) => void };
+  const original = proto.modify;
+  proto.modify = function (this: Selection, alter: string, direction: string, granularity: string) {
+    const node = this.focusNode;
+    if (node === null) return;
+    const text = node.textContent ?? "";
+    let offset = this.focusOffset;
+    const startAnchorNode = this.anchorNode;
+    const startAnchorOffset = this.anchorOffset;
+    if (granularity === "character") {
+      offset = direction === "forward" ? Math.min(text.length, offset + 1) : Math.max(0, offset - 1);
+      // WebKit draws a block caret at the final text position, but jsdom has no layout to model it. When
+      // a collapsed selection at `text.length` cannot extend forward, pull its anchor back one
+      // character so the stub still yields a one-character selection.
+      if (
+        alter === "extend" &&
+        direction === "forward" &&
+        offset === this.focusOffset &&
+        startAnchorNode === node &&
+        startAnchorOffset === this.focusOffset &&
+        offset > 0
+      ) {
+        this.setBaseAndExtent(node, offset - 1, node, offset);
+        return;
+      }
+    } else if (granularity === "word") {
+      if (direction === "forward") {
+        let i = offset;
+        while (i < text.length && /\S/.test(text[i]!)) i++;
+        while (i < text.length && /\s/.test(text[i]!)) i++;
+        offset = i;
+      } else {
+        let i = offset;
+        while (i > 0 && /\s/.test(text[i - 1]!)) i--;
+        while (i > 0 && /\S/.test(text[i - 1]!)) i--;
+        offset = i;
+      }
+    } else {
+      // For "line" and "paragraphboundary", each stub row is one text node, so both move to
+      // that node's start or end. `0`/`$` and V-LINE use the same boundaries.
+      offset = direction === "forward" ? text.length : 0;
+    }
+    if (alter === "move") this.collapse(node, offset);
+    else this.setBaseAndExtent(this.anchorNode ?? node, this.anchorOffset, node, offset);
+  };
+  return () => {
+    if (original === undefined) delete proto.modify;
+    else proto.modify = original;
+  };
+}
+
+describe("BROWSE visual mode (spec 2026-09-28)", () => {
+  function visualFixture() {
+    return snapshotState({
+      userPrompts: [{ seq: 1, text: "hello world" }],
+      pendingPermissions: [{ seq: 2, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "rm build" } }],
+    });
+  }
+
+  /** Renders a live tab holding `visualFixture()`, lands the cursor on the prompt row (`gg`, the
+   *  first row by `seq`), and returns the conversation root. */
+  function startedOnPromptRow() {
+    // Must run before render (`stubBandWidth`'s own doc comment): the band's `.band-message` segment
+    // is dropped below `band.ts`'s pre-measurement floor (mode/pill only) until it is widened.
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(visualFixture(), 3);
+    // The band's mode block draws only while this pane holds the keys -- every
+    // test below reads it, so this pane needs focus, the same as a real launch's `pane_focus` gives
+    // the panel once it is clicked or `Ctrl+l`'d into.
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    gg(container);
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    expect(root.querySelector(".row-current")?.className).toContain("row-prompt");
+    return { container, root };
+  }
+
+  let restoreModify: () => void;
+  beforeEach(() => {
+    restoreModify = stubSelectionModify();
+  });
+  afterEach(() => {
+    restoreModify();
+    window.getSelection()?.removeAllRanges();
+    vi.unstubAllGlobals();
+  });
+
+  it("v enters CARET, a second v enters VISUAL, V enters V-LINE directly -- the band names which", () => {
+    const { container, root } = startedOnPromptRow();
+    const modeBlock = () => container.querySelector('[data-testid="mode-block"]');
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
+    expect(modeBlock()?.textContent).toBe("CARET"); // band.ts's own MODE_TEXT, human-readable
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeBlock()?.getAttribute("data-mode")).toBe("visual");
+    expect(modeBlock()?.textContent).toBe("VISUAL");
+    // Escape from VISUAL returns to CARET, keeping the region active.
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
+    // CARET's own Esc ends the whole region.
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeBlock()?.getAttribute("data-mode")).toBe("browse");
+    fireEvent.keyDown(root, { key: "V", shiftKey: true });
+    expect(modeBlock()?.getAttribute("data-mode")).toBe("vline");
+    expect(modeBlock()?.textContent).toBe("V-LINE");
+    // Escape from V-LINE also returns to CARET.
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
+  });
+
+  it("refuses to start with a flash when there is no row at all", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0); // no prompts, messages, tools or permissions: no rows
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(container.querySelector(".band-message")?.textContent).toBe("nothing to select");
+  });
+
+  it("v then a, d and Shift+D answer no card in CARET, and v v in VISUAL -- the region, not BROWSE, owns those keys", () => {
+    vi.useFakeTimers();
+    try {
+      const { root } = startedOnPromptRow();
+      // Move onto the permission row so this test checks the region's suppression of `a`/`d`/`D`. On the
+      // prompt row, `permissionTarget` finds no card and BROWSE already answers nothing, so the
+      // test could pass without suppression.
+      fireEvent.keyDown(root, { key: "j" });
+      expect(root.querySelector(".row-current")?.className).toContain("row-permission");
+      // Enter CARET with `v` before each answer key. The unbound `a`/`d`/`D` keys end the
+      // region, while `landCursorOnRowKey` keeps the row cursor on the card. A single `v`
+      // before the whole sequence would test later keys in BROWSE and could pass without
+      // testing their suppression in CARET.
+      for (const key of [{ key: "a" }, { key: "d" }, { key: "D", shiftKey: true }]) {
+        fireEvent.keyDown(root, { key: "v" });
+        expect(document.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+        fireEvent.keyDown(root, key);
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      }
+      // The same, from VISUAL (`v v`), added for 3a.
+      for (const key of [{ key: "a" }, { key: "d" }, { key: "D", shiftKey: true }]) {
+        fireEvent.keyDown(root, { key: "v" });
+        fireEvent.keyDown(root, { key: "v" });
+        expect(document.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+        fireEvent.keyDown(root, key);
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      }
+      expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("control for the test above: from the SAME permission row, in ordinary BROWSE (no VISUAL), a lone a DOES answer -- proving the row is a real card, not vacuous setup", () => {
+    vi.useFakeTimers();
+    try {
+      const { root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "j" });
+      expect(root.querySelector(".row-current")?.className).toContain("row-permission");
+      // `a` must stand alone: right after `j`, within the guard window, it is refused as
+      // typing. Wait so this control checks that the row answers a lone `a`.
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      fireEvent.keyDown(root, { key: "a" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "allow" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Shift+Tab does nothing in CARET or VISUAL and posts no cycle_mode", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    expect(container.querySelector(".band-message")?.textContent).toContain("Shift+Tab does not act in CARET");
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
+    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    expect(container.querySelector(".band-message")?.textContent).toContain("Shift+Tab does not act in VISUAL");
+  });
+
+  it("y copies exactly what is highlighted, flashes, and returns to BROWSE with the row cursor on it", () => {
+    const clipboard = stubClipboard();
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" }); // charwise inclusive: "he"
+    fireEvent.keyDown(root, { key: "y" });
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("he");
+    expect(container.querySelector(".band-message")?.textContent).toBe("copied 2 chars");
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(container.querySelector(".row-current")?.className).toContain("row-prompt");
+  });
+
+  it("a held y after it ends VISUAL does not fall through as BROWSE's own y", () => {
+    const clipboard = stubClipboard();
+    const { root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" });
+    fireEvent.keyDown(root, { key: "y" });
+    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("he");
+    // The SAME physical key, still down: a real auto-repeat keydown.
+    fireEvent.keyDown(root, { key: "y", repeat: true });
+    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
+    fireEvent.keyUp(root, { key: "y" });
+    // Released and pressed again: an ordinary BROWSE `y` now, copying the row.
+    fireEvent.keyDown(root, { key: "y" });
+    expect(clipboard.writeText).toHaveBeenCalledTimes(2);
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("hello world");
+  });
+
+  it("Esc from VISUAL goes back to CARET, nothing copied; Esc again from CARET clears the native selection into BROWSE", () => {
+    const clipboard = stubClipboard();
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET, entering on "hello world"'s first character, "h"
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" }); // extend to "he" (charwise inclusive)
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    // CARET selects one character at the moving end, which `l` advanced to "e". Check the text
+    // as well as the length: selecting the anchor "h" would also pass a length-only check.
+    expect(window.getSelection()?.toString()).toBe("e");
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(window.getSelection()?.toString()).toBe("");
+  });
+
+  it("any other unbound key ends CARET and says so, never its BROWSE meaning", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "v" });
+      fireEvent.keyDown(root, { key: "d" });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+      expect(container.querySelector(".band-message")?.textContent).toBe("CARET ended: d is not a CARET key (v selects)");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("any other unbound key ends VISUAL (the whole region) and says so, never its BROWSE meaning", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "v" });
+      fireEvent.keyDown(root, { key: "v" });
+      fireEvent.keyDown(root, { key: "d" });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+      expect(container.querySelector(".band-message")?.textContent).toBe("VISUAL ended: d is not a VISUAL key (y copies)");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("pane_focus false ends the region (CARET or VISUAL) and clears the selection", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(window.getSelection()?.toString()).toBe("");
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(window.getSelection()?.toString()).toBe("");
+  });
+
+  it("a tab switch ends the region (CARET or VISUAL)", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+  });
+
+  it("a click into the card's reason box ends the region, and its own Enter then denies", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "j" }); // onto the permission card row
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    fireEvent.pointerDown(reasonBox);
+    fireEvent.focus(reasonBox);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    fireEvent.keyDown(reasonBox, { key: "Enter" });
+    expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "deny" });
+  });
+
+  it("a bare Shift keydown then $ keeps CARET, then keeps VISUAL, then V converts it to V-LINE", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "Shift" });
+    fireEvent.keyDown(root, { key: "$", shiftKey: true });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "Shift" });
+    fireEvent.keyDown(root, { key: "$", shiftKey: true });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    fireEvent.keyDown(root, { key: "Shift" });
+    fireEvent.keyDown(root, { key: "V", shiftKey: true });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("vline");
+  });
+
+  it("a leader on v means v starts the leader, and V then v reaches VISUAL", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      // `binding` (testFixtures.ts): builds a `PanelTable` entry the `keymap` envelope carries.
+      dispatch({
+        kind: "keymap",
+        prefix: "Ctrl+b",
+        window: [],
+        prefixKeys: [],
+        newTabChord: "Ctrl+b c",
+        panel: { ...EMPTY_PANEL_TABLE, leader: "v", leaderLabel: "v", leaderSource: "mapleader", bindings: [binding(["<leader>", "d"], "tab.close")] },
+      });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      fireEvent.keyDown(root, { key: "v" });
+      // The leader claimed it: no VISUAL, no flash naming it as unbound.
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+      // Check that `v` starts the leader: its which-key box appears and `<leader>d` runs `tab.close`.
+      // Merely staying out of VISUAL would also pass if `v` were swallowed.
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      expect(container.querySelector(".which-key-box"), "v, the leader, draws the leader's which-key box").not.toBeNull();
+      posted.length = 0;
+      fireEvent.keyDown(root, { key: "d" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(posted.filter((m) => m.type === "tab_verb"), "<leader>d, begun by v, ran tab.close").toEqual([
+        expect.objectContaining({ type: "tab_verb", verb: "close" }),
+      ]);
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      fireEvent.keyDown(root, { key: "V", shiftKey: true });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("vline");
+      fireEvent.keyDown(root, { key: "v" });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a plain (non-leader) panel binding on V wins over VISUAL entry too -- the rule is not leader-only", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      dispatch({
+        kind: "keymap",
+        prefix: "Ctrl+b",
+        window: [],
+        prefixKeys: [],
+        newTabChord: "Ctrl+b c",
+        panel: { ...EMPTY_PANEL_TABLE, bindings: [binding(["V"], "tab.close")] },
+      });
+      // Wait past the typing guard's window after `startedOnPromptRow`'s `gg`. An immediate
+      // single-key table binding is refused as typing, so seeing "browse" alone would not prove
+      // the binding ran.
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      posted.length = 0;
+      fireEvent.keyDown(root, { key: "V", shiftKey: true });
+      // A lone single-key table binding runs after `TYPING_GUARD_MS`, like the default `L`
+      // binding. If `resolveKey`'s `V` entry ran instead of the table binding, the mode would
+      // be "vline" rather than "browse".
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+      // Check that `V` runs the binding. Staying in BROWSE alone would also pass if the key did nothing.
+      expect(posted.filter((m) => m.type === "tab_verb"), "the init.lua row on V ran: tab.close").toEqual([
+        expect.objectContaining({ type: "tab_verb", verb: "close" }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Each of these routes must call `exitVisual` and clear the region's selection. Test them
+  // separately so omitting any one call is caught.
+  it.each([
+    ["hint_collect", { kind: "hint_collect", sessionId: 1 }],
+    ["begin_rename", { kind: "begin_rename", tab: 1, current: null }],
+    ["chooser", { kind: "chooser", open: [], records: [] }],
+    ["confirm_close", { kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] }],
+    ["confirm_close_others", { kind: "confirm_close_others", tabs: [2], lines: ["close 1 other tab? (y/n)"] }],
+  ])("%s ends CARET and clears the selection it built", (_name, envelope) => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    expect(window.getSelection()?.toString()).not.toBe("");
+    dispatch(envelope);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(window.getSelection()?.toString()).toBe("");
+  });
+
+  it.each([
+    ["hint_collect", { kind: "hint_collect", sessionId: 1 }],
+    ["begin_rename", { kind: "begin_rename", tab: 1, current: null }],
+    ["chooser", { kind: "chooser", open: [], records: [] }],
+    ["confirm_close", { kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] }],
+    ["confirm_close_others", { kind: "confirm_close_others", tabs: [2], lines: ["close 1 other tab? (y/n)"] }],
+  ])("%s ends VISUAL and clears the selection it built (the exit runs from CARET above and VISUAL here)", (_name, envelope) => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "l" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    expect(window.getSelection()?.toString()).not.toBe("");
+    dispatch(envelope);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    expect(window.getSelection()?.toString()).toBe("");
+  });
+
+  it("confirm_bypass (Shift+Tab's own y/n prompt) ends the region too, from CARET and from VISUAL", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 7, lines: ["bypass? (y/n)"] });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    // Close the still-open y/n prompt itself before re-entering: any key but a counted `y` cancels
+    // it, and a `v` aimed at a live prompt must answer THAT, not start the region.
+    fireEvent.keyDown(root, { key: "Escape" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 8, lines: ["bypass? (y/n)"] });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+  });
+
+  it("a keydown dispatched directly on the reason box, or on Approve, never reaches CARET's own table -- the capture handler's foreign-target swallow", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "j" }); // onto the permission card row
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    // A click ends the region before keydown. Dispatch directly to the controls to check the
+    // separate keydown guard: a key targeted at anything other than the root itself ends the region and is swallowed
+    // before a descendant can handle it.
+    const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    const approve = container.querySelector<HTMLButtonElement>('button[data-nav-action="allow"]')!;
+    fireEvent.keyDown(reasonBox, { key: "a" });
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    // Back into CARET, then straight at the button.
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(approve, { key: "v" }); // CARET's own select key, targeted at the button instead of root
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+  });
+
+  it("a keydown dispatched directly on the reason box, or on Approve, never reaches VISUAL's own table", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "j" }); // onto the permission card row
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    const approve = container.querySelector<HTMLButtonElement>('button[data-nav-action="allow"]')!;
+    fireEvent.keyDown(reasonBox, { key: "a" });
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    // Back into VISUAL, then straight at the button.
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(approve, { key: "y" }); // VISUAL's own copy key, targeted at the button instead of root
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+  });
+
+  it("a delta arriving during VISUAL leaves the reply's DOM untouched until Esc -- the freeze itself, not just that it is documented", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 3,
+      throughRevision: 5,
+      events: [
+        { type: "turn_started", turn_id: "t1" },
+        { type: "content_delta", turn_id: "t1", kind: "text", text: "a new reply" },
+      ],
+    });
+    // The event reached the projection (the band/tray would count it) but the FROZEN list must not
+    // draw it -- removing the freeze (`state={state}` instead of `frozenSnapshot?.state ?? state`)
+    // still passes every other test in this describe, which is why this one exists.
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(1);
+    expect(container.querySelector(".row-assistant")!.textContent).toContain("a new reply");
+  });
+
+  it("blocking finding (both review programs): a session ending during VISUAL, then a tab switch to a DIFFERENT card, does not let a stale frozen card's key answer the new tab's card", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "j" }); // onto tab 1's own "rm build" card
+      fireEvent.keyDown(root, { key: "v" });
+      fireEvent.keyDown(root, { key: "v" });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+      // Tab 1's session ends while VISUAL is on -- the `sessionEnded` effect writes `mode` directly,
+      // never through `exitVisual`, so before the fix this left `frozenSnapshot` (and the DOM
+      // selection) exactly as they were.
+      dispatch({
+        kind: "events",
+        tab: 1,
+        fromRevision: 3,
+        throughRevision: 4,
+        events: [{ type: "session_closed", reason: "provider exited" }],
+      });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      // A second tab, with its own DIFFERENT, dangerous card.
+      dispatch({
+        kind: "tabs",
+        active: 2,
+        tabs: [
+          { id: 1, number: 1, label: "1", name: null, state: "closed", mode: "auto", marker: null, pending: 0, resumable: false, failure: null, title: null },
+          { ...LIVE_TAB, id: 2, number: 2, label: "2" },
+        ],
+      });
+      dispatch({
+        kind: "snapshot",
+        tab: 2,
+        throughRevision: 1,
+        state: snapshotState({ pendingPermissions: [{ seq: 1, permissionId: "pDANGEROUS", toolUseId: null, toolName: "Bash", input: { command: "rm -rf build" } }] }),
+      });
+      dispatch({ kind: "focus_permission", tab: 2 });
+      // The panel must be showing tab 2's own card now, never tab 1's stale "rm build" one. (Both
+      // cards say "Permission requested: Bash" -- the tool name, not the command -- so that heading
+      // alone cannot tell them apart; the command text is what must differ, and "rm build" is not a
+      // substring of "rm -rf build".)
+      expect(container.textContent).toContain("rm -rf build");
+      expect(container.textContent).not.toContain("rm build");
+      const liveRoot = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+      fireEvent.keyDown(liveRoot, { key: "a" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "pDANGEROUS", decision: "allow" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  const modeOf = (container: HTMLElement) => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
+
+  /* `handoff` and `error` reset to `initialState()`, whose status is `starting`.
+     That reset alone does not end VISUAL or release the frozen conversation; each route needs `exitVisual`.
+     Each case includes a control without `v` to check the setup. */
+  /** `between` runs after the `handoff` envelope and before the `tabs` one that follows it, so a
+   *  test can look at the arm's own effect before the `[sessionStarted]` backstop gets a turn. */
+  function handOffTab1(between: () => void = () => {}) {
+    dispatch({
+      kind: "handoff",
+      tab: 1,
+      command: "cd /home/user/project && claude --resume 1857dcd5-973b-46a2",
+      cwd: "/home/user/project",
+      providerSessionId: "1857dcd5-973b-46a2",
+    });
+    between();
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
+  }
+
+  it("control for the handoff case below: without VISUAL, Shift+Tab on the empty tab a handoff leaves posts cycle_mode", () => {
+    const { container } = startedOnPromptRow();
+    handOffTab1();
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "Tab", shiftKey: true });
+    expect(lastOfType("cycle_mode")).toBeDefined();
+  });
+
+  it("a handoff during CARET ends it -- the empty tab's Shift+Tab cycles the mode instead of saying Esc first", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    // The arm itself ends the region (the tab is still `live` here, so the `[sessionStarted]` backstop
+    // has not run yet): no frozen copy of the handed-over conversation is left on screen.
+    handOffTab1(() => {
+      expect(modeOf(container)).toBe("browse");
+      expect(container.textContent).not.toContain("hello world");
+    });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "Tab", shiftKey: true });
+    expect(lastOfType("cycle_mode")).toBeDefined();
+    expect(container.textContent).not.toContain("Esc first");
+  });
+
+  /** The tab fails while VISUAL is on, then Rust restarts it: `tabs` live again and the NEW
+   *  conversation's snapshot. (Rust's restart sends no `arrive`/`enter_input`, so nothing but this
+   *  panel's own reset can end VISUAL here.) */
+  function failAndRestartTab1(between: () => void = () => {}) {
+    dispatch({ kind: "error", tab: 1, message: "the session died" });
+    between();
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "failed", failure: "the session died" }] });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ userPrompts: [{ seq: 1, text: "a brand new conversation" }] }) });
+  }
+
+  it("control for the error case below: without VISUAL, a failed-then-restarted tab shows its new conversation", () => {
+    const { container } = startedOnPromptRow();
+    failAndRestartTab1();
+    expect(container.textContent).toContain("a brand new conversation");
+    expect(container.textContent).not.toContain("rm build");
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("an error during CARET ends it -- the restarted tab shows its own conversation, never the frozen one with the dead session's card", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    // The `error` arm itself ends the region, before the `tabs` envelope that would let the
+    // `[sessionStarted]` backstop do it.
+    failAndRestartTab1(() => expect(modeOf(container)).toBe("browse"));
+    expect(container.textContent).toContain("a brand new conversation");
+    expect(container.textContent).not.toContain("hello world");
+    expect(container.textContent).not.toContain("rm build");
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("a tab that leaves `live` by a bare `tabs` envelope (no error, no handoff) ends CARET too", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    // Nothing but `tabs` says the conversation is gone: only the `[sessionStarted]` effect sees it.
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 9, state: snapshotState({ userPrompts: [{ seq: 1, text: "a brand new conversation" }] }) });
+    expect(container.textContent).toContain("a brand new conversation");
+    expect(container.textContent).not.toContain("rm build");
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  /* App's `timeline` stays live while `MessageList` draws the frozen list, so join them by key.
+     A linked card can change live `[tool, reply]` to `[tool, card, reply]` while the frozen list
+     still has two rows. Live index 2 names no frozen row; the key identifies the reply in both. */
+  function linkedFixture() {
+    return snapshotState({
+      activeTurnId: "t1",
+      toolCalls: [{ seq: 1, toolUseId: "tu1", name: "Bash", input: { command: "ls" }, result: null, turnId: "t1" }],
+      transcript: [{ seq: 2, text: "the reply under the cursor" }],
+    });
+  }
+  function startedOnLinkedReply() {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(linkedFixture(), 3);
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    // A snapshot lands the cursor on the last row: the reply.
+    expect(root.querySelector(".row-current")?.textContent).toContain("the reply under the cursor");
+    return { container, root };
+  }
+  function linkedCardArrives() {
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 3,
+      throughRevision: 4,
+      events: [{ type: "permission_requested", permission_id: "p-linked", tool_use_id: "tu1", tool_name: "Bash", input: { command: "ls" } }],
+    });
+  }
+
+  it("a linked card arriving before the selected reply keeps MessageList's current row on the reply, and Esc lands the live cursor there", () => {
+    const { container, root } = startedOnLinkedReply();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    linkedCardArrives();
+    // Frozen: the card is not drawn yet, and the current row is still the reply, found by key.
+    expect(container.querySelector(".row-permission")).toBeNull();
+    expect(root.querySelector(".row-current")?.textContent).toContain("the reply under the cursor");
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeOf(container)).toBe("browse");
+    // Live again: the card is drawn between the tool and the reply, and the cursor is on the reply,
+    // not on whatever row now sits at the reply's old index (the card).
+    expect(container.querySelector(".row-permission")).not.toBeNull();
+    const rows = Array.from(root.querySelectorAll(".message-list [data-nav-stop='row']"));
+    expect(rows.map((r) => r.classList.contains("row-permission"))).toEqual([false, true, false]);
+    expect(root.querySelector(".row-current")?.textContent).toContain("the reply under the cursor");
+  });
+
+  it("a card arriving does not end CARET -- an exit nobody asked for would turn the next d or y into BROWSE's", () => {
+    const { container, root } = startedOnLinkedReply();
+    fireEvent.keyDown(root, { key: "v" });
+    linkedCardArrives();
+    expect(modeOf(container)).toBe("caret");
+    expect(window.getSelection()?.toString()).not.toBe("");
+  });
+
+  it("a selection changed under VISUAL (a mouse drag, say) copies nothing, says so, and ends VISUAL", () => {
+    const clipboard = stubClipboard();
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" });
+    // Replace the live selection without any DOM change (no observer fires) and without a pointer
+    // event (which would end VISUAL first): what a drag the page never saw leaves behind.
+    const promptText = Array.from(root.querySelectorAll(".row-prompt *"))
+      .flatMap((el) => Array.from(el.childNodes))
+      .find((n) => n.nodeType === Node.TEXT_NODE && (n.textContent ?? "").includes("hello world"))!;
+    window.getSelection()!.setBaseAndExtent(promptText, 0, promptText, 5);
+    expect(window.getSelection()!.toString()).toBe("hello");
+    fireEvent.keyDown(root, { key: "y" });
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    expect(container.querySelector(".band-message")?.textContent).toBe("selection changed under it — nothing copied; v to start again");
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  // A click into the reason box triggers both pointer press and focus. Test each event alone so
+  // neither can hide a missing region exit in the other handler.
+  it("a pointer press alone (on text that takes no focus) ends CARET", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    const text = root.querySelector(".row-prompt")!.lastElementChild!;
+    fireEvent.pointerDown(text);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("focus alone landing on a control (no pointer press) ends CARET", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "j" }); // onto the permission card row
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    act(() => reasonBox.focus());
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("a CARET motion key aimed at the reason box (not the root) ends CARET instead of moving the caret", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "j" }); // onto the permission card row
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    // `l` would move the caret and keep CARET active on the root. On a foreign target it must
+    // end the region and be swallowed.
+    const notPrevented = fireEvent.keyDown(reasonBox, { key: "l" });
+    expect(notPrevented).toBe(false);
+    expect(modeOf(container)).toBe("browse");
+    expect(window.getSelection()?.toString()).toBe("");
+  });
+
+  /* VISUAL keys must reach `typingGuard.onKey` in the capture handler.
+     Capture stops propagation, so `onKeyDown` cannot report those keys. Without this, a BROWSE `d`
+     typed just after leaving VISUAL can appear isolated and deny a card while the reader types prose.
+     Typing `ver` then `d` checks that the earlier keys still suppress the answer. */
+  it("the keys VISUAL takes count as typing -- a d right after the key that ended VISUAL answers no card", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "j" });
+      expect(root.querySelector(".row-current")?.className).toContain("row-permission");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      fireEvent.keyDown(root, { key: "v" });
+      act(() => vi.advanceTimersByTime(120));
+      fireEvent.keyDown(root, { key: "e" });
+      act(() => vi.advanceTimersByTime(120));
+      fireEvent.keyDown(root, { key: "r" }); // not a VISUAL key: ends VISUAL (vend)
+      expect(modeOf(container)).toBe("browse");
+      act(() => vi.advanceTimersByTime(120));
+      fireEvent.keyDown(root, { key: "d" }); // BROWSE's d, 120ms after r
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+      // Control: the same row, a d standing alone this time, does deny -- the card is real.
+      fireEvent.keyDown(root, { key: "d" });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
+      expect(lastOfType("permission_response")).toMatchObject({ permission_id: "p1", decision: "deny" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* Modified keys are swallowed: their default is prevented, VISUAL stays active,
+     and the selection does not move. Alt+j must not act as j. */
+  it("Ctrl+o and Alt+j in VISUAL are swallowed -- prevented, VISUAL stays, the selection unchanged", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" });
+    const before = window.getSelection()!.toString();
+    expect(before).toBe("he");
+    expect(fireEvent.keyDown(root, { key: "o", ctrlKey: true }), "Ctrl+o's default is prevented").toBe(false);
+    expect(modeOf(container)).toBe("visual");
+    expect(fireEvent.keyDown(root, { key: "j", altKey: true }), "Alt+j's default is prevented").toBe(false);
+    expect(modeOf(container)).toBe("visual");
+    expect(window.getSelection()!.toString()).toBe(before);
+  });
+
+  /* While VISUAL is active, live cursor indices must not address the frozen DOM.
+     A queued prompt can move the live cursor to index 3 while frozen row 3 is an unrelated tool row.
+     The cursor effect, current-row fallback and scroll clamp must not use that index to scroll,
+     highlight a frozen row or write a frozen index back into the live cursor. */
+  function queuedPromptFixture() {
+    const tool = (seq: number) => ({ seq, toolUseId: `tu${seq}`, name: "Read", input: { file_path: `/x/f${seq}.rs` }, result: { content: `file ${seq}`, isError: false }, turnId: "t1" });
+    return snapshotState({
+      activeTurnId: "t1",
+      userPrompts: [{ seq: 1, text: "first prompt" }],
+      transcript: [{ seq: 2, text: "the reply being read" }],
+      toolCalls: [tool(3), tool(4), tool(5)],
+    });
+  }
+  function queuedPromptSent() {
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 9,
+      throughRevision: 11,
+      events: [
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "", stop_reason: "end_turn", usage: null },
+        { type: "user_prompt_submitted", text: "a queued prompt" },
+      ],
+    });
+  }
+  function rect(top: number, bottom: number) {
+    return { top, bottom, left: 0, right: 100, width: 100, height: bottom - top, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+  }
+
+  it("a queued prompt sent at a turn's end during VISUAL reveals no frozen row, draws no stray current row, and the scroll clamp writes nothing back", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(queuedPromptFixture(), 9);
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    gg(container);
+    fireEvent.keyDown(root, { key: "j" });
+    expect(root.querySelector(".row-current")?.textContent).toContain("the reply being read");
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    const frozenRows = () => Array.from(root.querySelectorAll(".message-list [data-nav-stop='row']")).map((r) => r.textContent);
+    const before = frozenRows();
+    expect(before).toHaveLength(5); // prompt, reply, three Reads (a running turn folds no run)
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoView.mockClear();
+    queuedPromptSent();
+    expect(modeOf(container)).toBe("caret");
+    expect(frozenRows(), "the list on screen is still the frozen one").toEqual(before);
+    expect(scrollIntoView, "no frozen row is revealed for the live cursor").not.toHaveBeenCalled();
+    expect(root.querySelector(".row-current"), "the live cursor's row is not in the frozen list: no current row at all").toBeNull();
+
+    // The frozen row at the live cursor index (3) is off screen, while the first row is
+    // visible. Running the scroll clamp against these frozen rows would incorrectly write 0
+    // back to the live cursor.
+    const list = root.querySelector<HTMLElement>(".message-list")!;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+    list.getBoundingClientRect = () => rect(0, 100);
+    rows.forEach((row, i) => (row.getBoundingClientRect = () => (i === 0 ? rect(0, 50) : rect(-300, -200))));
+    fireEvent.scroll(list);
+    expect(root.querySelector(".row-current"), "the clamp wrote no frozen index back as the live cursor").toBeNull();
+
+    // Escape restores the live list, including the queued prompt, with the cursor on the row the region was on.
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeOf(container)).toBe("browse");
+    expect(root.textContent).toContain("a queued prompt");
+    expect(root.querySelector(".row-current")?.textContent).toContain("the reply being read");
+  });
+
+  /* Found while fixing the above: `focus_permission`'s own reveal read the DOM by a live index right
+     after `exitVisual` -- which has only ASKED for the thawed list, so the DOM there was still the
+     frozen one. A card that arrived during VISUAL is not in it: the row was never revealed. */
+  it("focus_permission right after VISUAL reveals the card in the live list, not a frozen row at its index", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(
+      snapshotState({
+        activeTurnId: "t1",
+        toolCalls: [{ seq: 1, toolUseId: "tu1", name: "Bash", input: { command: "ls" }, result: null, turnId: "t1" }],
+        transcript: [{ seq: 2, text: "the reply" }],
+        pendingPermissions: [{ seq: 3, permissionId: "p2", toolUseId: null, toolName: "Bash", input: { command: "rm build" } }],
+      }),
+      4, // the next event gets seq 4: p2 (seq 3) stays the oldest card
+    );
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    // A snapshot lands on the last row: the card.
+    expect(root.querySelector(".row-current")?.textContent).toContain("rm build");
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf(container)).toBe("caret");
+    // A card linked to the EARLIER tool call arrives: live [tool, card, reply, p2], frozen still
+    // [tool, reply, p2]. The live cursor follows p2 by key to index 3; the frozen list has no row 3.
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 4,
+      throughRevision: 5,
+      events: [{ type: "permission_requested", permission_id: "p-linked", tool_use_id: "tu1", tool_name: "Bash", input: { command: "ls" } }],
+    });
+    expect(root.querySelectorAll(".row-permission"), "frozen: the linked card is not drawn yet").toHaveLength(1);
+    const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoView.mockClear();
+    // The oldest waiting card is p2 (lowest seq), which the cursor is already on.
+    dispatch({ kind: "focus_permission", tab: 1 });
+    expect(modeOf(container)).toBe("browse");
+    const revealed = scrollIntoView.mock.instances.map((el: Element) => el.textContent ?? "");
+    expect(revealed.some((text) => text.includes("rm build")), `revealed: ${JSON.stringify(revealed)}`).toBe(true);
+    expect(root.querySelector(".row-current")?.textContent).toContain("rm build");
+  });
+
+  /* `exitVisual` requests a live render; it does not repaint synchronously.
+     `hint_collect` must wait for that render before reading `containerRef.current`, or controls
+     on newly arrived cards are absent from the collected targets. Nonzero layout stubs are needed
+     in jsdom so zero-sized targets do not hide the difference between frozen and live collections. */
+  it("hint_collect right after VISUAL counts the thawed list, not the frozen one it interrupts", () => {
+    const originalRect = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function () {
+      return { top: 0, bottom: 10, left: 0, right: 100, width: 100, height: 10, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+    };
+    try {
+      const widen = stubBandWidth();
+      const { container } = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchLiveTab(
+        snapshotState({
+          toolCalls: [{ seq: 1, toolUseId: "tu1", name: "Bash", input: { command: "ls" }, result: null, turnId: "t1" }],
+        }),
+        2,
+      );
+      dispatch({ kind: "pane_focus", focused: true });
+      act(() => widen(container));
+      const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+      // A snapshot lands on the last (and only) row: the live Bash tool call.
+      expect(root.querySelector(".row-current")?.className).toContain("row-tool");
+      fireEvent.keyDown(root, { key: "v" });
+      expect(modeOf(container)).toBe("caret");
+      // A card linked to the same call arrives during CARET. It is absent from the frozen list
+      // captured by `v`, as in the `focus_permission` test above.
+      dispatch({
+        kind: "events",
+        tab: 1,
+        fromRevision: 2,
+        throughRevision: 3,
+        events: [{ type: "permission_requested", permission_id: "p-linked", tool_use_id: "tu1", tool_name: "Bash", input: { command: "ls" } }],
+      });
+      dispatch({ kind: "hint_collect", sessionId: 1 });
+      const withVisual = lastOfType("hint_targets");
+      expect(withVisual).toMatchObject({ session_id: 1 });
+      // `hint_collect`'s own `exitVisual` has thawed the list by now (`mode` reads "browse"): a second
+      // HINT, right after, collects the identical live DOM with no VISUAL in the way at all -- the
+      // control this test is actually about.
+      expect(modeOf(container)).toBe("browse");
+      dispatch({ kind: "hint_collect", sessionId: 2 });
+      const withoutVisual = lastOfType("hint_targets");
+      expect(withoutVisual).toMatchObject({ session_id: 2 });
+      expect(
+        withVisual!.count,
+        `${withVisual!.count} targets collected with VISUAL still framing the collect, ${withoutVisual!.count} once thawed`,
+      ).toBe(withoutVisual!.count);
+    } finally {
+      Element.prototype.getBoundingClientRect = originalRect;
+    }
+  });
+
+  /* Finished results start folded, and `/` matches their text without unfolding them.
+     Press Enter before entering selection mode to make `.tool-result-body` available.
+     From the invocation line, 40 `j` presses reach "build line 040".
+     The `modify` stub moves by hard line, matching the fixture's one screen line per output line. */
+  function stubLineModify(): () => void {
+    const proto = Selection.prototype as unknown as { modify?: (alter: string, direction: string, granularity: string) => void };
+    const original = proto.modify;
+    const blockOf = (node: Node) => (node.parentElement?.closest("pre, p, li, td, th, div") ?? null) as Element | null;
+    const textNodes = () => {
+      const out: Text[] = [];
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n !== null; n = walker.nextNode()) if ((n.textContent ?? "").length > 0) out.push(n as Text);
+      return out;
+    };
+    proto.modify = function (this: Selection, alter: string, direction: string, granularity: string) {
+      const node = this.focusNode;
+      if (node === null) return;
+      const text = node.textContent ?? "";
+      let target: Node = node;
+      let offset = this.focusOffset;
+      if (granularity === "line" && direction === "forward") {
+        const nl = text.indexOf("\n", offset);
+        if (nl !== -1 && nl + 1 < text.length) offset = nl + 1;
+        else {
+          // The next line starts in the next text node that is in a different block.
+          const all = textNodes();
+          const block = blockOf(node);
+          const next = all.slice(all.indexOf(node as Text) + 1).find((n) => blockOf(n) !== block);
+          if (next === undefined) return;
+          target = next;
+          offset = 0;
+        }
+      } else if (granularity === "paragraphboundary") {
+        if (direction === "forward") {
+          const nl = text.indexOf("\n", offset);
+          offset = nl === -1 ? text.length : nl;
+        } else {
+          const nl = text.lastIndexOf("\n", Math.max(0, offset - 1));
+          offset = nl === -1 ? 0 : nl + 1;
+        }
+      } else if (granularity === "character") {
+        offset = direction === "forward" ? Math.min(text.length, offset + 1) : Math.max(0, offset - 1);
+      } else return;
+      if (alter === "move") this.collapse(target, offset);
+      else this.setBaseAndExtent(this.anchorNode ?? node, this.anchorOffset, target, offset);
+    };
+    return () => {
+      if (original === undefined) delete proto.modify;
+      else proto.modify = original;
+    };
+  }
+
+  it("W6's route, in jsdom: / finds the folded result, Enter unfolds it, V then 40 j stays in the box and ends on build line 040", () => {
+    restoreModify();
+    restoreModify = stubLineModify();
+    const clipboard = stubClipboard();
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    const out = Array.from({ length: 80 }, (_, i) => `build line ${String(i + 1).padStart(3, "0")}: ok`).join("\n");
+    // Place the waiting card before the tool call, matching `replay_main`, so a row follows the card
+    // and selection can cross its controls.
+    dispatchLiveTab(
+      snapshotState({
+        userPrompts: [{ seq: 1, text: "The quick brown fox jumps over the lazy dog" }],
+        transcript: [{ seq: 2, text: "a reply" }],
+        pendingPermissions: [{ seq: 3, permissionId: "perm_edit", toolUseId: "toolu_edit", toolName: "Edit", input: { file_path: "/x/lib.rs", old_string: "old text here", new_string: "new text here" } }],
+        toolCalls: [{ seq: 4, toolUseId: "toolu_bash", name: "Bash", input: { command: "cat build.log" }, result: { content: out, isError: false }, turnId: "t1" }],
+      }),
+      9,
+    );
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    fireEvent.keyDown(root, { key: "/" });
+    const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+    fireEvent.change(input, { target: { value: "build line 001" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(root.querySelector(".row-current")?.className).toContain("row-tool");
+    expect(container.querySelector(".tool-result-body"), "/ found the row, but its result is still folded").toBeNull();
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(container.querySelector(".tool-result-body"), "Enter draws the result").not.toBeNull();
+    fireEvent.keyDown(root, { key: "V", shiftKey: true });
+    expect(modeOf(container)).toBe("vline");
+    const sel = window.getSelection()!;
+    expect(sel.anchorNode?.parentElement?.closest(".tool-card-bash"), "V starts on the invocation line").not.toBeNull();
+    for (let step = 1; step <= 40; step++) {
+      fireEvent.keyDown(root, { key: "j" });
+      expect(sel.focusNode?.parentElement?.closest(".tool-result-body"), `j #${step} left the box`).not.toBeNull();
+    }
+    fireEvent.keyDown(root, { key: "y" });
+    const calls = clipboard.writeText.mock.calls;
+    const text = calls[calls.length - 1]?.[0] as string;
+    expect(text).toContain("$ cat build.log");
+    expect(text).toContain("build line 001");
+    expect(text).toContain("build line 040");
+    expect(text, "V-LINE ends at the cursor's own line").not.toContain("build line 041");
+  });
+
+  // `gg`/`G` place the caret, or extend the selection, at the list's first or last selectable
+  // character without calling `Selection.modify`. Check CARET's one-character selection at the
+  // fixture's endpoints; a call through the stub would appear in `sel.calls`.
+  it("gg/G place the caret at the conversation's first/last selectable character", () => {
+    const { container, root } = startedOnPromptRow();
+    expect(container.querySelector(".row-current")?.className).toContain("row-prompt");
+    fireEvent.keyDown(root, { key: "v" }); // CARET, starting on the prompt row
+    fireEvent.keyDown(root, { key: "G", shiftKey: true });
+    expect(window.getSelection()!.toString().length).toBe(1);
+    // The row cursor stays put until the region ends. Escape then lands it where the caret
+    // moved.
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(container.querySelector(".row-current")?.className).toContain("row-permission");
+    fireEvent.keyDown(root, { key: "v" }); // CARET again, now starting on the permission row
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(container.querySelector(".row-current")?.className).toContain("row-prompt");
+  });
+
+  it("> quotes the selection into the draft and enters INPUT with the caret at the end; a second quote appends below", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "v" }); // CARET
+      fireEvent.keyDown(root, { key: "v" }); // VISUAL
+      fireEvent.keyDown(root, { key: "w" }); // "hello w", including the character reached by `w`
+      posted.length = 0;
+      fireEvent.keyDown(root, { key: ">", shiftKey: true });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("input");
+      const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
+      expect(document.activeElement).toBe(textarea);
+      expect(textarea.value).toContain("> hello w\n\n");
+      expect(textarea.selectionStart).toBe(textarea.value.length);
+      // Exactly one draft posted, the full text, nothing sent and no turn started.
+      act(() => vi.advanceTimersByTime(300));
+      const draftPosts = posted.filter((m) => m.type === "draft");
+      expect(draftPosts).toHaveLength(1);
+      expect(draftPosts[0]).toMatchObject({ text: textarea.value });
+      expect(posted.some((m) => m.type === "send" || m.type === "send_now")).toBe(false);
+      // A second quote, from a fresh selection, appends below the first. Escape leaves INPUT from
+      // the textarea itself (`Composer`'s own handler, the same convention `typeAndLeaveCaretAt3`
+      // above uses) -- dispatching it on `root` instead does not reach the composer's box.
+      fireEvent.keyDown(textarea, { key: "Escape" }); // back to BROWSE
+      fireEvent.keyDown(root, { key: "v" });
+      fireEvent.keyDown(root, { key: "v" });
+      fireEvent.keyDown(root, { key: "l" });
+      fireEvent.keyDown(root, { key: ">", shiftKey: true });
+      // Composer only renders a `<textarea>` while `mode === "input"` (its own return JSX): leaving
+      // to BROWSE above unmounted the first one, and this `>` mounts a fresh one -- `textarea` is a
+      // stale, detached reference by now, so the second half re-queries rather than reusing it.
+      const secondTextarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
+      expect(secondTextarea.value).toBe(`> hello w\n\n> he\n\n`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // `>` must move the row cursor to the selection's start row, as `y` does. Start on the permission
+  // row and extend backward with `gg` to the prompt row. This works without `Selection.modify` or
+  // layout in jsdom. Nothing else moves the BROWSE cursor during the region, so leaving
+  // `landCursorOnRowKey` out of `vquote` would leave `.row-current` on the wrong row.
+  it("> moves the row cursor to the selection's start row, not wherever BROWSE was when the region started", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, root } = startedOnPromptRow();
+      fireEvent.keyDown(root, { key: "j" }); // BROWSE: down onto the permission row (the list's last)
+      expect(container.querySelector(".row-current")?.className).toContain("row-permission");
+      fireEvent.keyDown(root, { key: "v" }); // CARET, entering on the permission row
+      fireEvent.keyDown(root, { key: "v" }); // VISUAL
+      fireEvent.keyDown(root, { key: "g" }); // gg: extend the CURSOR (never the anchor) back to the
+      fireEvent.keyDown(root, { key: "g" }); //     list's first selectable character -- the prompt row
+      fireEvent.keyDown(root, { key: ">", shiftKey: true });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("input");
+      // The list (and its `.row-current`) is still on screen behind the composer.
+      expect(container.querySelector(".row-current")?.className).toContain("row-prompt");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("> is refused (VISUAL stays) on an ended session, and while the draft is open in nvim", () => {
+    const { container, root } = startedOnPromptRow();
+    const modeOf = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "l" });
+    dispatch({ kind: "scratch", tab: 1, editing: true });
+    posted.length = 0;
+    fireEvent.keyDown(root, { key: ">", shiftKey: true });
+    expect(container.querySelector(".band-message")?.textContent).toBe("the draft is open in nvim — finish there first");
+    expect(modeOf()).toBe("visual");
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(posted.filter((m) => m.type === "draft")).toHaveLength(0);
+    dispatch({ kind: "scratch", tab: 1, editing: false });
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 3,
+      throughRevision: 4,
+      events: [{ type: "session_closed", reason: "provider exited" }],
+    });
+    // The `[sessionEnded]` effect already ended the region. Re-enter on the ended session so
+    // the refusal below tests `>` with an active region.
+    expect(modeOf()).toBe("browse");
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "l" });
+    expect(modeOf()).toBe("visual");
+    posted.length = 0;
+    fireEvent.keyDown(root, { key: ">", shiftKey: true });
+    expect(container.querySelector(".band-message")?.textContent).toBe("this session has ended — nothing to quote into");
+    expect(modeOf()).toBe("visual");
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(posted.filter((m) => m.type === "draft")).toHaveLength(0);
+  });
+
+  it("a held > types nothing into the composer (its repeats are swallowed until keyup)", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "l" });
+    fireEvent.keyDown(root, { key: ">", shiftKey: true });
+    const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
+    expect(document.activeElement).toBe(textarea);
+    const afterFirstQuote = textarea.value;
+    // Send the repeat to the focused textarea, where a real repeat lands. jsdom does not type keydown
+    // events into textareas, so an unchanged value alone proves nothing. Preventing the keydown's
+    // default action is what stops `>` from being typed.
+    const typed = fireEvent.keyDown(textarea, { key: ">", shiftKey: true, repeat: true });
+    expect(typed).toBe(false);
+    expect(textarea.value).toBe(afterFirstQuote);
+    // Released and pressed again: an ordinary keystroke into the box, left to the engine.
+    fireEvent.keyUp(textarea, { key: ">", shiftKey: true });
+    expect(fireEvent.keyDown(textarea, { key: ">", shiftKey: true })).toBe(true);
+  });
+
+  // The snapshot must stay frozen from CARET through VISUAL and back to CARET. Deltas arriving at
+  // each stage must leave the reply DOM untouched until the region ends.
+  it("the freeze holds from CARET through VISUAL and back to CARET, a delta arriving at each stage", () => {
+    const { container, root } = startedOnPromptRow();
+    const modeOf = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
+    const delta = (from: number, events: unknown[]) =>
+      dispatch({ kind: "events", tab: 1, fromRevision: from, throughRevision: from + events.length, events });
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf()).toBe("caret");
+    delta(3, [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "one " },
+    ]);
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    fireEvent.keyDown(root, { key: "v" });
+    expect(modeOf()).toBe("visual");
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    delta(5, [{ type: "content_delta", turn_id: "t1", kind: "text", text: "two " }]);
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeOf()).toBe("caret");
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    delta(6, [{ type: "content_delta", turn_id: "t1", kind: "text", text: "three" }]);
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(0);
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeOf()).toBe("browse");
+    expect(container.querySelectorAll(".row-assistant")).toHaveLength(1);
+    expect(container.querySelector(".row-assistant")!.textContent).toContain("one two three");
+  });
+
+  // Idle `Ctrl+c` in CARET must prevent the default action and show why nothing was copied. Check the
+  // flash here as well as the key handling.
+  it("idle Ctrl+c in CARET is claimed and says why; in VISUAL it stays the engine's own copy", () => {
+    const clipboard = stubClipboard();
+    const { container, root } = startedOnPromptRow();
+    const modeOf = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
+    fireEvent.keyDown(root, { key: "v" });
+    expect(fireEvent.keyDown(root, { key: "c", ctrlKey: true })).toBe(false);
+    expect(container.querySelector(".band-message")?.textContent).toBe("nothing selected — v, then y");
+    expect(modeOf()).toBe("caret");
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    fireEvent.keyDown(root, { key: "v" });
+    // O6's default: VISUAL leaves idle Ctrl+c unclaimed, so the engine's native copy runs.
+    expect(fireEvent.keyDown(root, { key: "c", ctrlKey: true })).toBe(true);
+    expect(modeOf()).toBe("visual");
+  });
+
+  // A held Escape steps VISUAL back to CARET and swallows its repeats until keyup. Only a fresh press
+  // may end the region.
+  it("a held Esc in VISUAL stops at CARET; only a fresh Esc ends the region", () => {
+    const { container, root } = startedOnPromptRow();
+    const modeOf = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "l" });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeOf()).toBe("caret");
+    fireEvent.keyDown(root, { key: "Escape", repeat: true });
+    fireEvent.keyDown(root, { key: "Escape", repeat: true });
+    expect(modeOf()).toBe("caret");
+    expect(window.getSelection()?.toString()?.length).toBe(1);
+    fireEvent.keyUp(root, { key: "Escape" });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(modeOf()).toBe("browse");
+  });
+
+  // The observer's flash must name CARET when a change ends CARET.
+  it("D13's observer ends CARET on a change under the caret, and names CARET", async () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" });
+    const anchor = window.getSelection()!.anchorNode as Text;
+    expect(anchor.nodeType).toBe(Node.TEXT_NODE);
+    await act(async () => {
+      anchor.data = "rewritten under the caret";
+      await Promise.resolve();
+    });
+    expect(container.querySelector(".band-message")?.textContent).toBe("the conversation changed under it — CARET ended; v to start again");
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+  });
+
+  // A region key must announce all list scrolling it causes, including movement during a snap or
+  // probe before `scrollCaretIntoView`. Otherwise `follow.ts` can miss an upward scroll and snap
+  // the thawed list back to the bottom.
+  it("a motion that scrolled the list during the key announces it -- up when it went up", () => {
+    const { container, root } = startedOnPromptRow();
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    let top = 100;
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => {
+        top = v;
+      },
+    });
+    const seen: string[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => seen.push((event as CustomEvent).detail));
+    fireEvent.keyDown(root, { key: "v" });
+    // A motion with nothing scrolled says nothing.
+    fireEvent.keyDown(root, { key: "l" });
+    expect(seen).toEqual([]);
+    // The engine-side half of a step (a snap revealing the line it hit-tests) scrolls the list up.
+    const proto = Selection.prototype as unknown as { modify: (a: string, d: string, g: string) => void };
+    const stubbed = proto.modify;
+    proto.modify = function (this: Selection, a: string, d: string, g: string) {
+      top -= 20;
+      stubbed.call(this, a, d, g);
+    };
+    try {
+      fireEvent.keyDown(root, { key: "h" });
+    } finally {
+      proto.modify = stubbed;
+    }
+    expect(seen).toEqual(["up"]);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
   });
 });

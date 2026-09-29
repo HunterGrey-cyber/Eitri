@@ -55,8 +55,9 @@ export function textWidth(text: string): number {
  *  still degrade by priority. */
 
 const PAD = 2; // one character of padding each side (8px at --fs-sm)
-const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT" };
-const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H" };
+// CARET, VISUAL, and V-LINE shorten to C, V, and VL when the band is narrow.
+const MODE_TEXT: Record<PanelMode, string> = { input: "INPUT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
+const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H", caret: "C", visual: "V", vline: "VL" };
 
 /** The bottom band's degrade rule, a pure function of the facts and the measured
  *  width so it is testable without a browser. `widthPx <= 0` (before the first measurement)

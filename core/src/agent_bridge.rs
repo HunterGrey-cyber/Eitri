@@ -721,14 +721,16 @@ pub struct CallNotes {
     pub prompt_notes: BTreeMap<String, String>,
     /// Tool-use ids of `Write`/`Edit`/`NotebookEdit` calls allowed by the acceptEdits fast
     /// path without a card. The row displays "allowed by auto" through
-    /// `tab_set::note_auto_edit_answers`; no separate message is needed.
+    /// `tab_set::note_auto_edit_answers`; no separate message is needed. Captured by
+    /// `AgentBackend::answer_what_needs_no_human` when answering, rather than inferred from a
+    /// missing card.
     pub allowed_by_auto: BTreeSet<String>,
-    /// Tool-use ids of a `Write` the acceptEdits fast path answered with no card, over a path that
-    /// did not exist when the call started. `creates_file` above only ever
-    /// learns this from a `PermissionRequested` event, which a fast-path-allowed `Write` never
-    /// raises -- so without this, such a call kept `creates_file_call` false forever and its row
-    /// showed the overwrite warning ("Writes the whole file...") for a file that never existed,
-    /// exactly backwards. `tab_set::note_auto_creates_file` is the only writer.
+    /// Tool-use ids of `Write` calls allowed without a card over a path that did not exist just
+    /// before the answer, either through the acceptEdits fast path in `Auto` or through bypass.
+    /// `creates_file` only learns from delivered cards, so it cannot identify these new files.
+    /// This set keeps their rows from showing an overwrite warning for a file that did not exist.
+    /// Its source is `AgentBackend::answer_what_needs_no_human`'s `AnsweredForYou::creates_file`.
+    /// The wire key `autoCreatesFile` covers bypass answers too.
     pub auto_creates_file: BTreeSet<String>,
 }
 
@@ -749,9 +751,11 @@ impl CallNotes {
     }
 }
 
-/// [`serialize_events_for_js`], plus nonempty notes for this batch: `ruleNotes` pairs
-/// tool-use ids with saved rules, `createsFile` pairs permission ids with nullable tool-use
-/// ids, and `autoNotes` and `autoCreatesFile` contain tool-use ids. Empty fields are omitted.
+/// [`serialize_events_for_js`], with this batch's row notes:
+/// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]`,
+/// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]`,
+/// `"autoNotes":["toolu_..", ...]`, and `"autoCreatesFile":["toolu_..", ...]`.
+/// `autoCreatesFile` includes bypass `Write` calls too. Each field is omitted when empty.
 pub fn serialize_events_with_notes_for_js(
     tab: crate::tabs::TabId,
     from_revision: u64,
