@@ -904,6 +904,36 @@ mod tests {
         }
     }
 
+    /// The `prefix i` settings row (`SETTING_SOURCES_NOTE`) must match what every session loads.
+    /// Fresh, resumed and forked sessions all request `[PROJECT, LOCAL]`, never `USER`, excluding
+    /// `~/.claude` settings, hooks, plugins and `CLAUDE.md`. If the request changes, update the note
+    /// so the panel continues to describe the loaded settings accurately.
+    #[test]
+    fn every_request_loads_project_and_local_settings_only_and_the_note_says_so() {
+        for (shape, resume, fork) in [
+            ("fresh", None, false),
+            ("resume", Some("claude-id".to_string()), false),
+            ("fork", Some("claude-id".to_string()), true),
+        ] {
+            let policy = build_create_request("/p".into(), StreamingPreference::Partial, resume, fork, false)
+                .policy
+                .expect("a policy is always sent");
+            let sources = policy
+                .setting_sources
+                .expect("stated on every request, never left to the CLI's own default");
+            assert_eq!(
+                sources.sources,
+                vec![SettingSource::Project as i32, SettingSource::Local as i32],
+                "{shape}: project and local only, never user"
+            );
+        }
+        assert!(
+            crate::SETTING_SOURCES_NOTE.contains("~/.claude"),
+            "the note names what is not loaded: {}",
+            crate::SETTING_SOURCES_NOTE
+        );
+    }
+
     /// A manually maintained handshake fixture for testing capability and information mapping.
     /// It does not observe a running sidecar, so protocol or capability changes can leave it
     /// stale while unit tests still pass. Update it when the real handshake changes.

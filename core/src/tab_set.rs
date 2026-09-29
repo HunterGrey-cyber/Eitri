@@ -3192,7 +3192,7 @@ mod tests {
         set.select(first);
         let plan = plan(set.cycle_mode(first));
         assert_eq!(plan.approve, vec!["p1".to_string()]);
-        assert!(plan.lines[0].contains("1 张"), "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
 
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce),
@@ -3240,7 +3240,11 @@ mod tests {
         };
         assert_eq!(reprompted.approve, vec!["p1".to_string(), "p2".to_string()]);
         assert_ne!(reprompted.nonce, old_plan.nonce);
-        assert!(reprompted.lines[0].contains("2 张"), "{:?}", reprompted.lines);
+        assert!(
+            reprompted.lines[0].contains("2 waiting cards"),
+            "{:?}",
+            reprompted.lines
+        );
         assert_eq!(
             set.get(tab).unwrap().mode,
             SessionModeChoice::Auto,
@@ -3347,7 +3351,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab));
         assert_eq!(plan.scope, BypassScope::Tab(tab));
         assert!(
-            plan.lines[0].contains("本窗口之后的新会话也用 bypass"),
+            plan.lines[0].contains("New sessions in this window start in bypass too"),
             "{:?}",
             plan.lines
         );
@@ -3440,7 +3444,7 @@ mod tests {
             assert_eq!(plan.approve, Vec::<String>::new());
             assert_eq!(
                 plan.lines,
-                vec!["切到 bypass？(y/n)".to_string()],
+                vec!["Switch to bypass? (y/n)".to_string()],
                 "a starting tab asks like a live one"
             );
             assert_eq!(
@@ -3832,7 +3836,7 @@ mod tests {
 
         let plan = plan(set.cycle_mode(tab));
         assert_eq!(plan.approve, vec!["real-card".to_string()]);
-        assert!(plan.lines[0].contains("1 张"), "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce),
             Ok(ConfirmOutcome::Entered {
@@ -6420,9 +6424,9 @@ mod tests {
         assert_eq!(plan.approve, vec!["perm-write".to_string()]);
         // The prompt counts cards that stay waiting on a line after the approval count.
         assert_eq!(plan.lines.len(), 2, "{:?}", plan.lines);
-        assert!(plan.lines[0].contains("批准 1 张"), "{:?}", plan.lines);
+        assert!(plan.lines[0].contains("approve the 1 waiting card"), "{:?}", plan.lines);
         assert!(
-            plan.lines[1].contains("1 张") && plan.lines[1].contains("保留"),
+            plan.lines[1].contains("1 card") && plan.lines[1].contains("stays waiting"),
             "{:?}",
             plan.lines
         );

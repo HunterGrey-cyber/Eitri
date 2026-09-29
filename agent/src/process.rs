@@ -98,6 +98,15 @@ pub fn disallowed_tools() -> &'static [&'static str] {
     &[]
 }
 
+/// What every session loads, for `prefix i`: the sidecar asks for `[PROJECT, LOCAL]`
+/// (`build_create_request`) and legacy passes `--setting-sources project,local`. CLI 2.1.284 loads
+/// user memory (`~/.claude/CLAUDE.md`) only under `userSettings`, according to its code.
+///
+/// Compiled in every build because both backends and the panel read it. The request and argv tests
+/// check that the settings selection matches this note, so changes to either must update it.
+pub const SETTING_SOURCES_NOTE: &str =
+    "project + local only (.claude/ and CLAUDE.md here); ~/.claude's settings, hooks, plugins and CLAUDE.md are not loaded";
+
 /// Controls whether the application answers every permission request `allow`. This mode is
 /// never sent to the CLI. Both backends keep their permission gates: legacy uses
 /// `--permission-mode default` with the `PreToolUse` hook, and the sidecar uses `INTERACTIVE`.
@@ -2094,6 +2103,11 @@ exit 0"#,
         assert!(
             session_argv.contains("--permission-mode default"),
             "the CLI runs in `default`: {session_argv}"
+        );
+        assert!(
+            session_argv.contains("--setting-sources project,local"),
+            "legacy loads project and local settings only, which `SETTING_SOURCES_NOTE` tells the user \
+             on `prefix i` (R13): {session_argv}"
         );
         for ungated in [
             "bypassPermissions",

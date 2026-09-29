@@ -64,7 +64,10 @@ pub use permission_rules::{PrefixRule, PrefixRules};
 pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
 #[cfg(feature = "legacy-backend")]
 pub use process::AgentProcess;
-pub use process::{classify_cli_mode, disallowed_tools, CliModeReport, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS};
+pub use process::{
+    classify_cli_mode, disallowed_tools, CliModeReport, PermissionMode, CONSERVATIVE_DISALLOWED_TOOLS,
+    SETTING_SOURCES_NOTE,
+};
 #[cfg(feature = "legacy-backend")]
 pub use session::AgentSession;
 #[cfg(not(feature = "legacy-backend"))]

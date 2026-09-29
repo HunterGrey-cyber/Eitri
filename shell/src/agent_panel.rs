@@ -1856,7 +1856,7 @@ fn detail_rows(
         BackendKind::Sidecar => "yes",
         BackendKind::Legacy => "no (legacy backend)",
     };
-    let rows: [(&str, String); 18] = [
+    let rows: [(&str, String); 19] = [
         ("name", known(tab.name.clone())),
         ("title", known(tab.title.clone())),
         ("state", tab.wire_state().as_str().to_string()),
@@ -1872,6 +1872,8 @@ fn detail_rows(
         ("verdandi session", known(session_id)),
         ("claude session", known(provider_session_id)),
         ("CLI", known(cli)),
+        // The settings sources apply to every session on either backend, including an empty tab.
+        ("settings", agent::SETTING_SOURCES_NOTE.to_string()),
         ("Verdandi revision", known(revision)),
         ("resumable", resumable.to_string()),
         ("created", known(record.as_ref().map(|r| r.created_at.clone()))),
@@ -4721,6 +4723,7 @@ mod tests {
             "verdandi session",
             "claude session",
             "CLI",
+            "settings",
             "Verdandi revision",
             "resumable",
             "created",
@@ -4734,6 +4737,29 @@ mod tests {
         assert_eq!(resumable.value, "no (legacy backend)");
         let account = rows.iter().find(|r| r.label == "account").unwrap();
         assert_eq!(account.value, "work");
+
+        // Check the settings sources each session loads and excludes. Use the shared constant
+        // `build_create_request` and the legacy spawn use, rather than a copy, and place the row
+        // immediately after the CLI it describes.
+        let settings = rows.iter().find(|r| r.label == "settings").unwrap();
+        assert_eq!(settings.value, agent::SETTING_SOURCES_NOTE);
+        let position = |label: &str| labels.iter().position(|l| *l == label).unwrap();
+        assert_eq!(position("settings"), position("CLI") + 1, "{labels:?}");
+    }
+
+    /// The `settings` row is a fact about every session, so it does not depend on there being one:
+    /// an empty tab (no backend, no provider info) says it too, and on either backend.
+    #[test]
+    fn the_settings_row_is_the_same_on_an_empty_tab_and_on_either_backend() {
+        for kind in [BackendKind::Legacy, BackendKind::Sidecar] {
+            let set = TabSet::new(kind, neovibe_core::agent_bridge::SessionModeChoice::Auto);
+            let rows = detail_rows(set.active_tab(), kind, None, std::path::Path::new("/p"), None);
+            let settings = rows
+                .iter()
+                .find(|r| r.label == "settings")
+                .expect("the row is always drawn");
+            assert_eq!(settings.value, agent::SETTING_SOURCES_NOTE, "{}", kind.as_str());
+        }
     }
 
     /// Checks each close-watch tick's result and ordering without opening a window.

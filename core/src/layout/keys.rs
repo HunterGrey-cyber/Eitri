@@ -364,11 +364,12 @@ mod tests {
     #[test]
     fn a_stock_tmux_key_neovibe_does_not_bind_stays_reserved() {
         // `[` and `PPage` are bound to `copy-mode` and `copy-mode -u`, so Lua panels taking them fail
-        // `Bound`, not `StockTmux`.
+        // `Bound`, not `StockTmux`. `;` and `o` are bound to `last-pane` and `select-pane -t :.+` too.
+        // `q` (`display-panes`, replaced by HINT) remains an unbound stock key.
         // See `every_character_the_effective_table_binds_refuses_a_lua_panel`.
         for (key, command) in [
             ('s', "choose-tree"),
-            ('o', "select-pane"),
+            ('q', "display-panes"),
             (']', "paste-buffer"),
             ('C', "customize-mode"),
         ] {
