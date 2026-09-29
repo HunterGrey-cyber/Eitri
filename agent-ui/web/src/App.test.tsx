@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, jumpTarget, MAX_MOTION_COUNT, statusWarning } from "./App";
 import { applyEvent, initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
-import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo } from "./types";
+import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo, UsageInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
@@ -722,6 +722,106 @@ describe("App event folding", () => {
     expect(row.textContent).toContain("provider exited");
     expect(row.getAttribute("data-sign")).toBe("·");
     expect(container.querySelector(".row-error")).toBeNull();
+  });
+});
+
+/* the band shows the ACTIVE tab's last reported usage -- every token and the
+ *  cost, right of the model. Absent until a turn reports one and never `0 tok $0.00` for unknown; each
+ *  report replaces the figure whole; and it is per tab, carried by the snapshot on a switch. The
+ *  formatting itself is `band.test.ts`'s; this pins the wiring from events and snapshots to the band. */
+describe("the band's usage segment", () => {
+  const TWO = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+  const REPORT: UsageInfo = { total_cost_usd: 0.042, num_turns: null, tokens: { input: 1000, output: 3300, cache_creation: 0, cache_read: 0 }, model: null };
+  const turnDone = (usage: UsageInfo | null, turn = "t1"): AgentDomainEvent => ({
+    type: "turn_completed", turn_id: turn, outcome: "completed", result_text: "", stop_reason: null, usage,
+  });
+  const usageText = (container: HTMLElement) => container.querySelector(".band-usage")?.textContent ?? null;
+
+  /** A live tab 1 with the band measured wide enough to draw every segment. */
+  function started(state: AgentUiState = snapshotState()) {
+    const widen = stubBandWidth();
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(state, 1);
+    act(() => widen(rendered.container));
+    return { ...rendered, widen };
+  }
+  function events(tab: number, ...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", tab, fromRevision: 0, throughRevision: list.length, events: list });
+  }
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("draws nothing before a report -- on an empty tab and on a live one that has reported nothing", () => {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    act(() => widen(container));
+    expect(container.querySelector(".band-usage")).toBeNull();
+
+    dispatchLiveTab(snapshotState({ model: "claude-sonnet-5" }), 1);
+    act(() => widen(container));
+    // The band IS wide enough to draw the segment beside it: the model shows, the usage does not.
+    expect(container.querySelector(".band-model")?.textContent).toBe("sonnet-5");
+    expect(container.querySelector(".band-usage")).toBeNull();
+    // A turn that reports nothing (interrupted, synthesized) is not a zero either.
+    events(1, { type: "turn_started", turn_id: "t1" }, turnDone(null));
+    expect(container.querySelector(".band-usage")).toBeNull();
+  });
+
+  it("a turn_completed's report shows all its tokens and its cost, right of the model", () => {
+    const { container } = started(snapshotState({ model: "claude-sonnet-5" }));
+    events(1, { type: "turn_started", turn_id: "t1" }, turnDone(REPORT));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+    const right = Array.from(container.querySelectorAll(".band-right .band-seg")).map((el) => el.className.replace("band-seg ", ""));
+    expect(right.indexOf("band-usage")).toBe(right.indexOf("band-model") + 1);
+    expect(container.querySelector<HTMLElement>(".band-usage")!.title).toContain("since this tab started or resumed");
+    expect(container.querySelector<HTMLElement>(".band-usage")!.title).toContain("input 1,000 · output 3,300 · cache write 0 · cache read 0 · $0.0420");
+  });
+
+  it("a later turn that reports none keeps the figure, and a lower report replaces it (/clear)", () => {
+    const { container } = started();
+    events(1, turnDone(REPORT));
+    events(1, turnDone(null, "t2"));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+    events(1, turnDone({ ...REPORT, total_cost_usd: 0.0012, tokens: { input: 40, output: 60, cache_creation: 0, cache_read: 0 } }, "t3"));
+    expect(usageText(container)).toBe("100 tok <$0.01");
+  });
+
+  it("a legacy report -- a cost and a turn count, no tokens -- shows the cost alone", () => {
+    const { container } = started();
+    events(1, turnDone({ total_cost_usd: 1.5, num_turns: 4, tokens: null, model: null }));
+    expect(usageText(container)).toBe("$1.50");
+  });
+
+  it("is per tab: a switch shows the other tab's snapshot figure, and back again", () => {
+    const { container, widen } = started();
+    events(1, turnDone(REPORT));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+
+    // Tab 2 has reported nothing: no figure, and above all not tab 1's left over.
+    dispatch({ kind: "tabs", active: 2, tabs: TWO });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ usage: null }) });
+    act(() => widen(container));
+    expect(container.querySelector(".band-usage")).toBeNull();
+
+    // Back on tab 1, whose snapshot carries the figure the panel itself no longer holds.
+    dispatch({ kind: "tabs", active: 1, tabs: TWO });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ usage: REPORT }) });
+    act(() => widen(container));
+    expect(usageText(container)).toBe("4.3k tok $0.04");
+  });
+
+  it("a panel reload's first snapshot restores the figure at once", () => {
+    const { container } = started(snapshotState({ usage: { ...REPORT, total_cost_usd: 12.5 } }));
+    expect(usageText(container)).toBe("4.3k tok $12.50");
+  });
+
+  it("a report for a tab that is not on screen changes nothing here", () => {
+    const { container } = started();
+    dispatch({ kind: "tabs", active: 1, tabs: TWO });
+    events(2, turnDone(REPORT));
+    expect(container.querySelector(".band-usage")).toBeNull();
   });
 });
 

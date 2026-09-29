@@ -57,6 +57,7 @@
           "text": "<first><between>"
         }
       ],
+      "usage": null,
       "userPrompts": []
     },
     "text": "<between>",
@@ -111,6 +112,7 @@
           "text": "P1-unique-text"
         }
       ],
+      "usage": null,
       "userPrompts": []
     },
     "text": "P1-unique-text",

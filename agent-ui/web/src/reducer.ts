@@ -21,6 +21,7 @@ export function initialState(): AgentUiState {
     pendingPermissions: [],
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
+    usage: null,
     history: null,
     assistantMessageOpen: false,
     nextSeq: 0,
@@ -182,10 +183,12 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // resolves the request. Remove the card from this event so its lifetime follows Rust state.
       return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
     case "turn_completed":
-      // The one authoritative source for "no turn is in flight" -- replaces the deleted
-      // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
-      // NOT end the conversation, only session_closed/session_unavailable do.
-      return { ...state, activeTurnId: null, assistantMessageOpen: false };
+      // Clear the in-flight turn on `turn_completed`. Finishing a turn does not end the
+      // conversation; `session_closed` and `session_unavailable` do. Match
+      // `AgentSessionProjection::apply` when updating usage: replace the entire figure because the
+      // SDK reports a running total that `/clear` can reset. A lower report is valid. A turn with
+      // no usage report keeps the last figure; missing data must not erase it or become zero.
+      return { ...state, activeTurnId: null, assistantMessageOpen: false, usage: event.usage ?? state.usage };
     // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
     // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
     // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
@@ -334,8 +337,11 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   // reducer-internal fields. Supply them here. Preserve `assistantMessageOpen` from the snapshot:
   // Rust continues appending to an open reply, and resetting it would split that reply into two
   // rows with broken markdown. Reset `turnThinking` because earlier thinking does not imply current
-  // activity. Resync or reload may degrade `thinking` to `sent` but must not invent activity.
-  return { ...snapshot, nextSeq: throughRevision, turnThinking: false };
+  // activity. Resync or reload may degrade `thinking` to `sent` but must not invent activity. Take
+  // `usage` from this tab's snapshot so a tab with no report cannot retain the previous tab's
+  // figure. Default an absent key to `null`, which `usageSegment` treats as unknown; `undefined`
+  // would throw.
+  return { ...snapshot, usage: snapshot.usage ?? null, nextSeq: throughRevision, turnThinking: false };
 }
 
 /** Whether `resume_outcome` confirms the requested session. Share this predicate with

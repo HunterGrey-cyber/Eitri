@@ -152,6 +152,15 @@ export function StatusBand({ facts, paneFocused, onOpenDetail, onJump }: Props) 
               </span>
             );
           }
+          // The segment shows the short figure; its tooltip gives the token breakdown, exact cost,
+          // and what the figure means, just as `⚠`'s tooltip carries its warning.
+          if (seg.id === "usage") {
+            return (
+              <span key="usage" className="band-seg band-usage" title={facts.usage?.title}>
+                {seg.text}
+              </span>
+            );
+          }
           return (
             <span key={seg.id} className={`band-seg band-${seg.id}`} data-testid={seg.id === "showcmd" ? "showcmd" : undefined}>
               {seg.text}

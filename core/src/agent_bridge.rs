@@ -1081,6 +1081,13 @@ pub fn serialize_snapshot_with_notes_for_js(
         // disagreed about whether the last transcript entry was still open. Sending the real bit
         // is what lets `applySnapshot` take it from the wire instead of guessing "closed".
         "assistantMessageOpen": projection.assistant_message_open,
+        // the tab's last reported usage, so a tab switch or a panel reload
+        // shows the figure the band draws without waiting for the next turn to report one. An
+        // explicit `null` until a provider has reported something (never a zeroed object), then
+        // `agent::UsageInfo` as it derives: SNAKE_CASE inside, the same shape the `turn_completed`
+        // event carries -- the one place in `state` that is not camelCase, so the panel folds a
+        // live report and a snapshot's copy with one type (`types.ts`'s `UsageInfo`).
+        "usage": projection.usage,
         "capabilities": {
             "resume": capabilities.resume,
             "fork": capabilities.fork,
@@ -2002,6 +2009,100 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("untested"));
+    }
+
+    /// a tab's last usage figure rides its snapshot, so a tab switch or a
+    /// panel reload shows it at once instead of waiting for the next turn to report one. `null` --
+    /// present as a key, never a zeroed object -- until a provider has reported something, and
+    /// replaced whole by each later report. Inside, snake_case: the same shape the `turn_completed`
+    /// event carries (`agent::UsageInfo`'s own derive), where the rest of `state` is camelCase.
+    #[test]
+    fn a_snapshot_carries_the_last_reported_usage_and_null_before_any() {
+        let usage_in_snapshot = |projection: &AgentSessionProjection| -> Value {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities {
+                    resume: false,
+                    fork: false,
+                    interrupt: true,
+                    bypass_permission_mode: true,
+                    interactive_permission_mode: true,
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            assert!(
+                parsed["state"].as_object().unwrap().contains_key("usage"),
+                "the key is always sent: `null` says nothing was reported, an absent key says this build predates it"
+            );
+            parsed["state"]["usage"].clone()
+        };
+        let completed = |usage: Option<agent::UsageInfo>| AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage,
+        };
+
+        let mut projection = AgentSessionProjection::default();
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            Value::Null,
+            "a fresh session has reported nothing"
+        );
+
+        // A turn that reports nothing (interrupted, synthesized) is unknown, not a zero.
+        projection.apply(&completed(None));
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            Value::Null,
+            "silence is not a measurement"
+        );
+
+        // The sidecar's shape: tokens and a model, no turn count.
+        projection.apply(&completed(Some(agent::UsageInfo {
+            total_cost_usd: 0.42,
+            num_turns: None,
+            tokens: Some(agent::TokenUsage {
+                input: 1,
+                output: 2,
+                cache_creation: 3,
+                cache_read: 4,
+            }),
+            model: Some("claude-sonnet-5".into()),
+        })));
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            json!({
+                "total_cost_usd": 0.42,
+                "num_turns": null,
+                "tokens": {"input": 1, "output": 2, "cache_creation": 3, "cache_read": 4},
+                "model": "claude-sonnet-5",
+            })
+        );
+
+        // A later turn that reports nothing leaves the last figure standing...
+        projection.apply(&completed(None));
+        assert_eq!(usage_in_snapshot(&projection)["total_cost_usd"], 0.42);
+
+        // ...and one that does replaces it whole, a lower figure included (`/clear` resets the SDK's
+        // running total). Legacy's shape: a turn count, no tokens and no model.
+        projection.apply(&completed(Some(agent::UsageInfo {
+            total_cost_usd: 0.01,
+            num_turns: Some(3),
+            tokens: None,
+            model: None,
+        })));
+        assert_eq!(
+            usage_in_snapshot(&projection),
+            json!({"total_cost_usd": 0.01, "num_turns": 3, "tokens": null, "model": null})
+        );
     }
 
     /// sw-panel-render-2 (2026-09-27): a snapshot taken mid-reply used to say nothing at all about

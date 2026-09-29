@@ -1,11 +1,12 @@
 import type { PanelMode } from "./keymap";
+import type { UsageInfo } from "./types";
 
 /** A segment's identity, used for lookups.
  *  `bandLayout`'s construction order determines degrade order and render order. */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "queue" | "context" | "position" | "model";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "queue" | "context" | "position" | "model" | "usage";
 
 /** One band segment's text and side of the gap. The left holds mode, pill, `⚑N`, `⧗N`, and
- *  message; the right holds showcmd, `⚠`, context, model, position, and `↓N`.
+ *  message; the right holds showcmd, `⚠`, context, model, usage, position, and `↓N`.
  *  `StatusBand` groups by `side` when rendering; `bandLayout` reorders only by priority. */
 export type Seg = {
   id: SegId;
@@ -34,7 +35,14 @@ export type BandFacts = {
   context: { file: string; lines: [number, number] | null } | null;
   position: string | null;
   model: string | null;
+  /** The active tab's latest usage, formatted by `usageSegment`: `text` is the segment and `title`
+   *  its tooltip. Null until a turn reports usage, and always null on an empty tab. */
+  usage: UsageFact | null;
 };
+
+/** The band's usage segment as `usageSegment` words it: the text drawn, and the tooltip carrying
+ *  the breakdown the text has no room for. */
+export type UsageFact = { text: string; title: string };
 
 /** Count these East Asian wide and fullwidth ranges as two cells so file and model names
  *  do not overrun the band's monospace budget. This is a subset of Unicode's width table:
@@ -82,11 +90,15 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
     ...(ctxFull ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
     ...(f.model ? [{ id: "model", text: f.model, side: "right" } as Seg] : []),
+    ...(f.usage ? [{ id: "usage", text: f.usage.text, side: "right" } as Seg] : []),
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
     ...(f.unread ? [{ id: "unread", text: f.unread, side: "right" } as Seg] : []),
   ];
   const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD, 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
+    // Usage drops before even shortening the context, so a narrow panel keeps the displayed file
+    // name ahead of a token and cost figure.
+    (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
     (s) => s.filter((x) => x.id !== "model"),
     (s) => s.filter((x) => x.id !== "position"),
@@ -112,4 +124,44 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
 export function shortModel(model: string | null): string | null {
   if (model === null) return null;
   return model.startsWith("claude-") ? model.slice("claude-".length) : model;
+}
+
+/** `1234` -> `1.2k`, `1_200_000` -> `1.2M`: one decimal, and no trailing `.0`. A figure that would
+ *  round up to `1000k` reads `1M` instead (`999_950` is the first such). */
+function tokens(n: number): string {
+  const scaled = (value: number, unit: string) => `${value.toFixed(1).replace(/\.0$/, "")}${unit}`;
+  if (n < 1000) return `${n}`;
+  return n < 999_950 ? scaled(n / 1e3, "k") : scaled(n / 1e6, "M");
+}
+
+/** Cents, except that a real cost below half a cent reads `<$0.01` rather than `$0.00`: a session that
+ *  spent something never looks like one that spent nothing. */
+function dollars(c: number): string {
+  return c > 0 && c < 0.005 ? "<$0.01" : `$${c.toFixed(2)}`;
+}
+
+/** One formatter for the tooltip: `toLocaleString` builds a new `Intl.NumberFormat` on every call,
+ *  and this runs on every render of the panel while a reply streams. */
+const GROUPED = new Intl.NumberFormat("en-US");
+
+/** Format the latest reported token counts and cost, without accumulating reports. Return null for
+ *  unknown usage or a non-finite cost so rendering cannot throw. A legacy cost-only report shows
+ *  only its cost. */
+export function usageSegment(u: UsageInfo | null): UsageFact | null {
+  if (u === null || !Number.isFinite(u.total_cost_usd)) return null;
+  const t = u.tokens;
+  const total = t === null ? null : t.input + t.output + t.cache_creation + t.cache_read;
+  const text = total === null ? dollars(u.total_cost_usd) : `${tokens(total)} tok ${dollars(u.total_cost_usd)}`;
+  const parts =
+    t === null
+      ? []
+      : [
+          `input ${GROUPED.format(t.input)}`,
+          `output ${GROUPED.format(t.output)}`,
+          `cache write ${GROUPED.format(t.cache_creation)}`,
+          `cache read ${GROUPED.format(t.cache_read)}`,
+        ];
+  const what = "since this tab started or resumed; /clear starts it over; Claude Code's own estimate, not a bill";
+  const title = `${[...parts, `$${u.total_cost_usd.toFixed(4)}`].join(" · ")} — ${what}`;
+  return { text, title };
 }

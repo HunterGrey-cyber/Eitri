@@ -81,7 +81,7 @@ import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import { barePickerCommand } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
-import { shortModel } from "./band";
+import { shortModel, usageSegment } from "./band";
 import type { BandFacts } from "./band";
 import type { AgentUiState, HandoffCommand, Hello, DetailRow, TabId, TabsEnvelope, TurnClock, ChooserEnvelope, ContextSummary, QueueItem, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
@@ -3149,6 +3149,7 @@ export default function App() {
             context: contextFact(editorContext),
             position: null,
             model: null,
+            usage: null,
           }}
           paneFocused={paneFocused}
         />
@@ -4855,6 +4856,8 @@ export default function App() {
           context: sessionEnded ? null : contextFact(editorContext),
           position: timeline.length === 0 ? null : `${cursor + 1}/${timeline.length}`,
           model: shortModel(state.model),
+          // This tab's last reported usage, right of the model; nothing until one arrives.
+          usage: usageSegment(state.usage),
         }}
         paneFocused={paneFocused}
         onOpenDetail={() => post({ type: "open_detail" })}

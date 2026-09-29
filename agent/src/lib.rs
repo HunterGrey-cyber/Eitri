@@ -85,7 +85,8 @@ pub const LEGACY_NOT_IN_BUILD: &str =
 pub use projection::{
     describe_failed_resume, AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource,
     MatchedAskRule, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt, ResumeStatus,
-    ToolCallRecord, ToolCallResult, TranscriptMessage, TurnOutcome, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
+    TokenUsage, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnOutcome, UngatedCliModeRecord, UsageInfo,
+    UserPromptRecord,
 };
 pub use provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
