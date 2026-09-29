@@ -1408,8 +1408,9 @@ own_private_group() {
 	[ -n "$(find -H "$1" -maxdepth 0 -gid "$_opg_gid" -print 2>/dev/null)" ] || return 0
 	# An extended ACL can give a named user or group write access that the mode bits do not show (the
 	# group bits then report the ACL mask), so a directory with one never gets the allowance. GNU ls
-	# marks it with a '+' after the mode; getfacl, where it is installed, lists the entries themselves.
-	_opg_ls=$(ls -ld -- "$1" 2>/dev/null) || return 0
+	# marks it with a '+' after the mode (-L: of what a symlinked cache points at, as find -H checks
+# above); getfacl, where it is installed, lists the entries themselves.
+	_opg_ls=$(ls -ldL -- "$1" 2>/dev/null) || return 0
 	case $_opg_ls in ??????????+*) return 0 ;; esac
 	if command -v getfacl >/dev/null 2>&1; then
 		_opg_acl=$(getfacl -cp -- "$1" 2>/dev/null) || return 0

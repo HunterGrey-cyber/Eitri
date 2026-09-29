@@ -636,6 +636,37 @@ t_cache_parent_acl_named_writer_refused() {
 	expect_rc 0 "the same directory once its ACL is gone"
 }
 
+TESTS="$TESTS t_cache_symlinked_parent_acl_refused_without_getfacl"
+t_cache_symlinked_parent_acl_refused_without_getfacl() {
+	# Codex's rc.3 review: with ~/.cache a symlink to a directory carrying an ACL, `ls -ld` described
+	# the link, not the directory, so without getfacl the ACL went unseen. A getfacl stub that reports
+	# no ACL leaves ls as the only check here.
+	if ! own_private_group_here; then
+		printf 'note: the test user has no private group here; nothing to check\n'
+		return 0
+	fi
+	if ! command -v setfacl >/dev/null 2>&1; then
+		printf 'note: no setfacl here; nothing to check\n'
+		return 0
+	fi
+	serve 1.0.0
+	mkdir -p "$T/realcache"
+	chmod 0755 "$T/realcache"
+	if ! setfacl -m "u:$(id -un):rwx" -m m::rwx "$T/realcache" 2>/dev/null; then
+		printf 'note: this filesystem takes no ACLs; nothing to check\n'
+		return 0
+	fi
+	rm -rf "$TH/.cache"
+	ln -s "$T/realcache" "$TH/.cache"
+	mkdir -p "$T/stubs-getfacl"
+	printf '#!/bin/sh\nprintf "user::rwx\\ngroup::rwx\\nother::r-x\\n"\n' >"$T/stubs-getfacl/getfacl"
+	chmod +x "$T/stubs-getfacl/getfacl"
+	PRE_STUBS=$T/stubs-getfacl
+	inst_net
+	expect_fail "a symlinked cache whose target has an ACL, with getfacl reporting none"
+	expect_out "is writable by its group or by anyone, and not sticky"
+}
+
 TESTS="$TESTS t_cache_group_writable_duplicate_gid_refused"
 t_cache_group_writable_duplicate_gid_refused() {
 	# Codex's rc.2 review: a second group sharing the private group's GID gives its members the same
