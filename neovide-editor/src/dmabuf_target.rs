@@ -44,6 +44,16 @@
 //! cannot tell which importer will take a texture. `GDK_DEBUG=dmabuf` shows it;
 //! `NEOVIBE_EDITOR_DMABUF=0` is the escape hatch. Only Intel (i915, one GPU) has run this path.
 //!
+//! **The fallback itself can cost a download (2026-09-29).** On GTK 4.16+ with GSK's Vulkan
+//! renderer, a driver whose Vulkan cannot import `GtkGLArea`'s implicit-modifier export
+//! (`AB24:0xffffffffffffff`; Mesa RADV, seen in the 2026-09-28 arch-pc record) makes GSK download
+//! every frame through its GL renderer and upload it again: ~10 ms of main-thread CPU per frame at
+//! 2432x2482, i.e. about +10.75 ms typing at 165 Hz. The workaround is `GSK_RENDERER=gl` (`ngl`
+//! before GTK 4.18), which has GSK import the dmabuf through EGL; it is not yet measured on AMD.
+//! GTK below 4.16 is not affected (source read): `GtkGLArea` exports nothing there and GSK's
+//! default renderer is GL. [`fallback_hint`] prints one stderr line when the fallback is running
+//! under a Vulkan renderer; it changes no behaviour.
+//!
 //! **Lifetime and synchronization, the same contract as GTK's own buffers.** A buffer is drawn
 //! into only after GTK has released every texture over it. GSK holds a texture whose image a frame
 //! still uses (`gsk_gpu_image_toggle_ref_texture`, GTK 4.14.5 and 4.22.5 alike), so that release
@@ -150,6 +160,21 @@ pub(crate) fn setting(value: Option<&OsStr>) -> Setting {
     } else {
         Setting::Default
     }
+}
+
+/// The one-line hint for a pane that draws through `GtkGLArea`'s own texture: `Some` only on GTK
+/// 4.16+ (where the export exists) when the widget's native renderer is GSK's Vulkan renderer.
+/// Pure, so tested; the caller prints it once per pane.
+pub(crate) fn fallback_hint(gtk_minor: u32, fell_back: bool, renderer_type_name: &str) -> Option<String> {
+    if !fell_back || gtk_minor < MEASURED_FROM_GTK.1 || renderer_type_name != "GskVulkanRenderer" {
+        return None;
+    }
+    Some(
+        "GtkGLArea's texture may be exported as an implicit-modifier dmabuf, which GSK's Vulkan renderer may not \
+         import on some drivers (e.g. Mesa RADV; Intel was measured exporting linear, with no download): it then downloads every frame (~10 ms of CPU each at HiDPI). \
+         `GDK_DEBUG=dmabuf` shows \"for downloading\" lines if so; `GSK_RENDERER=gl` (`ngl` before GTK 4.18) should avoid it (untested)"
+            .to_string(),
+    )
 }
 
 /// Whether to try this path, from `NEOVIBE_EDITOR_DMABUF` and the **runtime** GTK version
@@ -910,6 +935,21 @@ fn import_write_fence(fds: &[OwnedFd], fence: &OwnedFd) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fallback_hint_needs_gtk_4_16_the_fallback_and_a_vulkan_renderer() {
+        let vk = "GskVulkanRenderer";
+        let hint = fallback_hint(16, true, vk).expect("hint");
+        assert!(
+            hint.contains("GDK_DEBUG=dmabuf") && hint.contains("for downloading") && hint.contains("GSK_RENDERER=gl")
+        );
+        assert!(fallback_hint(22, true, vk).is_some());
+        assert!(fallback_hint(14, true, vk).is_none(), "GTK 4.14 exports nothing");
+        assert!(fallback_hint(22, false, vk).is_none(), "own buffers in use");
+        assert!(fallback_hint(22, true, "GskGLRenderer").is_none());
+        assert!(fallback_hint(22, true, "GskNglRenderer").is_none());
+        assert!(fallback_hint(22, true, "").is_none());
+    }
 
     const MTL_RC_CCS_CC: u64 = 0x0100_0000_0000_000f;
     const TILE4: u64 = 0x0100_0000_0000_0009;
