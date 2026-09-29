@@ -20,7 +20,12 @@
 //!   window types, winit's `EventLoop`, ...: [`CODE_SIGNALS`]);
 //! - any path that starts with a display crate ([`DISPLAY_CRATES`]: `gtk4`, `gdk4`, `webkit6`, `winit`,
 //!   `xcb`, ...), and any `use` or `extern crate` of one however it is written -- renamed, globbed,
-//!   grouped ([`use_items`]) -- so `use gtk4 as g;` does not hide GTK from it (fix round 4);
+//!   grouped ([`use_items`]) -- so `use gtk4 as g;` does not hide GTK from it (fix round 4); and, since
+//!   the follow-up to round 4, every name such a `use` binds, through any chain of aliases and every
+//!   binding of a name bound twice ([`resolved`]), wherever it is used as a path, a call, a macro or an
+//!   attribute ([`used_positions`]), behind `self::`, `crate::`, `super::` or a module of the file's own
+//!   too: `g::init()` and `crate::g::init()` in `main` are GTK's init as `gtk4::init()` is, and a glob of a
+//!   display path (`use gtk4::*;`, `use g::*;`) binds the names the scan follows (`init`, `test_synced`);
 //! - a string literal that starts a display server or client, an input injector, a clipboard or screen
 //!   tool, or the product's own GUI binary ([`PROGRAMS`]), by the command it starts: its first word, or
 //!   that word's file name, so `"/usr/bin/xdotool key a"` counts as `"xdotool"` does; and, where the
@@ -33,31 +38,42 @@
 //! `#[path]`-included; `main` -- a `harness = false` test's -- calling `own_x_server::isolate` or
 //! `init_gtk` **before the first display signal in that `main`** (a call in a function nothing runs, or
 //! after the first connection, isolates nothing); no `gtk4::init` of its own; and none of gtk-rs's test
-//! macros (`#[gtk4::test]`, `#[gtk::test]`, `test_synced`, under any name), which are refused outright:
-//! they initialise GTK before the test body, so a call of the helper inside it comes too late.
+//! macros (`#[gtk4::test]`, `#[gtk::test]`, `test_synced`, under any name or chain of aliases, or used
+//! after a glob brought them in), which are refused outright: they initialise GTK before the test body, so a
+//! call of the helper inside it comes too late.
 //!
 //! **The allowlist is bound to the file's real `main`** (fix round 4): its calls, in order; GTK
-//! initialised exactly once, counted over the whole file in every spelling (an earlier `gtk4::init`
-//! would connect before the checks, and an ordered search finds the later one); and each judge of a
-//! display -- the socket, the compositor, its outputs -- the subject of a `match` (or `if let Err`)
-//! whose `Err` arm exits the process or returns from `main`.
+//! initialised exactly once, counted over the whole file in every spelling, an alias's included (an
+//! earlier `gtk4::init` would connect before the checks, and an ordered search finds the later one); and
+//! each judge of a display -- the socket, the compositor, its outputs -- the subject of a `match` (or
+//! `if let Err`) whose `Err` arm exits the process or returns from `main`.
 //!
 //! **What it does not check.** This is a tripwire for a test author who forgets the helper, or uses it
 //! wrongly by accident. It is not a defence against one who means to get round it: whatever can be
-//! done to text can be done here. Four such ways were found by the round-3 reviews and are left, on
-//! purpose, so nobody has to wonder (dated record, 2026-09-29, fix round 4):
+//! done to text can be done here. Six such ways were found by the round-3 and round-4 reviews and the
+//! review of the alias follow-up, and are left, on purpose, so nobody has to wonder (dated record,
+//! 2026-09-29, fix round 4, "merged, with three scanner limits parked" and "two of the three parked
+//! scanner limits closed"):
 //! - an inline `mod own_x_server { .. }` of the author's own, next to the real file included under
 //!   another name -- the `#[path]` attribute and the module declaration are checked apart;
 //! - the helper call under `#[cfg(any())]` or `if false { .. }`: text is read, not what runs;
 //! - `let _ = own_x_server::init_gtk(..)`: the server it returns is dropped, and stopped, at once, so
 //!   the test loses its display (GTK finds none and fails) rather than reaching another;
 //! - a second `fn main` in a nested module ahead of the real one: the first textual `fn main(` is taken
-//!   ([`main_range`]).
+//!   ([`main_range`]);
+//! - the helper called in a closure inside `main` that nothing calls
+//!   (`let setup = || own_x_server::isolate(..)`): its position in `main` is what is read;
+//! - GTK's init or a test macro, under a name a `use` or a glob gives it, taken as a value and called
+//!   under another (`use gtk4::init as start; let f = start; f()`): a bare name counts only where it is
+//!   used as a path, a call, a macro or an attribute, since a bare word is as often a local or a field.
 //!
 //! Also not covered, though nobody is being clever: the modules a test `#[path]`-includes from `src/`
 //! (their text is not read, so a display opened only there is not seen), a program started by a name
-//! held in a variable, a script written to a file and then run, and anything outside these two
-//! crates' `tests/` (no other crate's tests open a display today).
+//! held in a variable, a script written to a file and then run, a display opened in another function
+//! that `main` calls before the helper (only what is written in `main` is put in order; GTK is covered
+//! anyway, since a GTK init anywhere in the file is refused, but a winit `EventLoop::new` in a `fn setup()`
+//! called ahead of the helper is not), and anything outside these two crates' `tests/` (no other crate's
+//! tests open a display today).
 
 use std::path::{Path, PathBuf};
 
@@ -303,27 +319,42 @@ fn has_path(code: &str, path: &str) -> bool {
     !path_positions(code, path).is_empty()
 }
 
-/// Where `code` names `krate` as the first segment of a path (`krate::...`, or `::krate::...`), not as
-/// the tail of a longer one (`other::krate::...`) or a part of a longer name.
+/// Where `code` names `krate` as the first segment of a path (`krate::...`, `::krate::...`, or behind only
+/// `self::`, `crate::`, `super::` or a module of the file's own, [`starts_path`]), not as the tail of a longer
+/// one (`other::krate::...`) or a part of a longer name.
 fn root_positions(code: &str, krate: &str) -> Vec<usize> {
-    let bytes = code.as_bytes();
-    code.match_indices(krate)
-        .map(|(at, _)| at)
-        .filter(|&at| {
-            let before_ok = match at.checked_sub(1).map(|i| bytes[i]) {
-                None => true,
-                Some(b) if is_ident_byte(b) => false,
-                // A leading `::`, not the `::` of a longer path.
-                Some(b':') => {
-                    at >= 2
-                        && bytes[at - 2] == b':'
-                        && (at < 3 || !(is_ident_byte(bytes[at - 3]) || bytes[at - 3] == b':'))
-                }
-                Some(_) => true,
-            };
-            before_ok && code[at + krate.len()..].trim_start().starts_with("::")
-        })
+    let mods = local_modules(code);
+    path_positions(code, krate)
+        .into_iter()
+        .filter(|&at| starts_path(code, at, &mods) && code[at + krate.len()..].trim_start().starts_with("::"))
         .collect()
+}
+
+/// Whether a path at `at` in `code` starts there: not a method (`x.g`), and not the tail of a longer path
+/// (`y::g`) unless all that leads it is a leading `::`, `self::`, `crate::`, `super::` or a module the file
+/// declares (`mods`), which only say where in this file the name is bound (`crate::g::init()` is `g::init()`).
+fn starts_path(code: &str, at: usize, mods: &[String]) -> bool {
+    let mut before = code[..at].trim_end();
+    loop {
+        let Some(rest) = before.strip_suffix("::") else {
+            return !before.ends_with('.');
+        };
+        let rest = rest.trim_end();
+        let segment_len: usize = rest
+            .chars()
+            .rev()
+            .take_while(|&c| is_ident_char(c))
+            .map(char::len_utf8)
+            .sum();
+        let segment = &rest[rest.len() - segment_len..];
+        if segment.is_empty() {
+            return true; // a leading `::`
+        }
+        if !(["self", "crate", "super"].contains(&segment) || mods.iter().any(|m| m == segment)) {
+            return false;
+        }
+        before = rest[..rest.len() - segment_len].trim_end();
+    }
 }
 
 /// A literal with each backslash escape (`\n`, `\"`) read as a space, so a command line written into one
@@ -376,8 +407,10 @@ struct Signal {
     entry: bool,
 }
 
-/// Every place `code` (and its string `literals`, and the names its `uses` bring in) opens a display or
-/// calls the helper that isolates one, in the order they come.
+/// Every place `code` (and its string `literals`, and the names its `uses` bring in, [`resolved`]) opens a
+/// display or calls the helper that isolates one, in the order they come: a name a `use` binds to a display
+/// crate counts wherever it is used as a path, a call, a macro or an attribute ([`used_positions`]), as the
+/// crate's own name does where it starts a path.
 fn find_signals(code: &str, literals: &[Literal], uses: &[UseItem]) -> Vec<Signal> {
     let mut found = Vec::new();
     for name in CODE_SIGNALS {
@@ -417,6 +450,19 @@ fn find_signals(code: &str, literals: &[Literal], uses: &[UseItem]) -> Vec<Signa
             });
         }
     }
+    // A binding named like a code signal (`use webkit6::WebView;`) is found by that name already.
+    for (name, path) in display_bindings(uses)
+        .into_iter()
+        .filter(|(name, _)| !CODE_SIGNALS.contains(name))
+    {
+        for at in used_positions(code, name) {
+            found.push(Signal {
+                at,
+                what: format!("{name} (`{}`)", path.join("::")),
+                entry: false,
+            });
+        }
+    }
     let shell_runs = literals
         .iter()
         .any(|literal| command_of(&literal.text).is_some_and(|command| SHELLS.contains(&command.as_str())));
@@ -437,7 +483,7 @@ fn find_signals(code: &str, literals: &[Literal], uses: &[UseItem]) -> Vec<Signa
 fn display_signals(source: &str) -> Vec<String> {
     let (code, literals) = code_and_strings(source);
     let mut names: Vec<String> = Vec::new();
-    for signal in find_signals(&code, &literals, &use_items(&code)) {
+    for signal in find_signals(&code, &literals, &resolved(&code)) {
         if !names.contains(&signal.what) {
             names.push(signal.what);
         }
@@ -453,6 +499,9 @@ struct UseItem {
     alias: Option<String>,
     /// Where its declaration starts in the code.
     at: usize,
+    /// Brought in by a glob rather than named ([`resolved`]): a name the scan follows that a glob of a display
+    /// path would bring in, such as `init` from `use gtk4::*;`.
+    from_glob: bool,
 }
 
 /// A position in code for [`use_items`]'s small parser.
@@ -519,7 +568,12 @@ fn parse_use_tree(c: &mut Cursor, prefix: &[String], at: usize, out: &mut Vec<Us
         }
         if c.eat("*") {
             path.push("*".into());
-            out.push(UseItem { path, alias: None, at });
+            out.push(UseItem {
+                path,
+                alias: None,
+                at,
+                from_glob: false,
+            });
             return;
         }
         let Some(name) = c.ident() else { return };
@@ -538,7 +592,12 @@ fn parse_use_tree(c: &mut Cursor, prefix: &[String], at: usize, out: &mut Vec<Us
     if path.last().is_some_and(|last| last == "self") {
         path.pop();
     }
-    out.push(UseItem { path, alias, at });
+    out.push(UseItem {
+        path,
+        alias,
+        at,
+        from_glob: false,
+    });
 }
 
 /// Every name the `use` declarations and `extern crate` items in `code` bring in, groups and globs
@@ -576,6 +635,7 @@ fn use_items(code: &str) -> Vec<UseItem> {
                         path: vec![name.to_string()],
                         alias,
                         at: start,
+                        from_glob: false,
                     });
                     i = c.i;
                 }
@@ -586,9 +646,203 @@ fn use_items(code: &str) -> Vec<UseItem> {
     items
 }
 
+/// The name `item` binds: its alias, or the last segment of its path; none for a glob or `as _`.
+fn bound_name(item: &UseItem) -> Option<&str> {
+    let name = item.alias.as_deref().or(item.path.last().map(String::as_str))?;
+    (name != "*" && name != "_").then_some(name)
+}
+
+/// The paths a glob can bring in that the scan follows by name: GTK's init ([`INIT_FORMS`]) and gtk-rs's test
+/// macros.
+fn followed_paths() -> Vec<Vec<String>> {
+    let macros = GTK_ROOTS
+        .iter()
+        .flat_map(|root| TEST_MACROS.iter().map(move |name| format!("{root}::{name}")));
+    INIT_FORMS
+        .iter()
+        .map(|form| form.to_string())
+        .chain(macros)
+        .map(|path| path.split("::").map(str::to_string).collect())
+        .collect()
+}
+
+/// The modules `code` declares (`mod m;`, `mod m { .. }`), other than one named like a display crate: a path
+/// through one (`m::g`) is a path through this file, as `self::g` is.
+fn local_modules(code: &str) -> Vec<String> {
+    let mut mods = Vec::new();
+    for at in path_positions(code, "mod") {
+        let mut c = Cursor { code, i: at + 3 };
+        if let Some(name) = c.ident() {
+            if !DISPLAY_CRATES.contains(&name) && !mods.iter().any(|m| m == name) {
+                mods.push(name.to_string());
+            }
+        }
+    }
+    mods
+}
+
+/// `path` without the leading `self`, `crate`, `super` and module-of-this-file segments that only say where in
+/// the file its first real name is bound (`crate::g::init` is `g::init`), leaving at least one segment.
+fn local_tail(path: &[String], mods: &[String]) -> Vec<String> {
+    let mut path = path;
+    while path.len() > 1 && (["self", "crate", "super"].contains(&path[0].as_str()) || mods.contains(&path[0])) {
+        path = &path[1..];
+    }
+    path.to_vec()
+}
+
+/// Every name the `use` declarations and `extern crate` items in `code` bring in ([`use_items`]), with the root of
+/// each path followed through the names the others bind, so an alias of an alias is still the crate it came
+/// from: in `use gtk4 as g; use crate::g::{test_synced as run};` the second is `gtk4::test_synced` as `run`. A
+/// path through `self::`, `crate::`, `super::` or a module the file declares is the path after it
+/// ([`local_tail`]). Scope is not read, so it fails closed: a binding anywhere in the file counts everywhere,
+/// and a name bound more than once is followed through every binding, a chain that reaches a display crate
+/// winning. A glob of a display path (`use gtk4::*;`, `use g::*;`) binds each name in it the scan follows
+/// ([`followed_paths`]: `init`, `rt`, `test`, `test_synced`), marked as brought in by a glob.
+fn resolved(code: &str) -> Vec<UseItem> {
+    let mods = local_modules(code);
+    let resolve_all = |items: Vec<UseItem>| -> Vec<UseItem> {
+        let bound: Vec<(String, Vec<String>)> = items
+            .iter()
+            .filter_map(|item| Some((bound_name(item)?.to_string(), local_tail(&item.path, &mods))))
+            .collect();
+        items
+            .into_iter()
+            .map(|item| UseItem {
+                path: resolve(&local_tail(&item.path, &mods), &bound, &mods, bound.len().min(8) + 1),
+                ..item
+            })
+            .collect()
+    };
+    let mut items = resolve_all(use_items(code));
+    let mut from_globs: Vec<UseItem> = Vec::new();
+    for item in items
+        .iter()
+        .filter(|item| item.path.last().is_some_and(|last| last == "*"))
+    {
+        let prefix = &item.path[..item.path.len() - 1];
+        if !prefix
+            .first()
+            .is_some_and(|root| DISPLAY_CRATES.contains(&root.as_str()))
+        {
+            continue;
+        }
+        for followed in followed_paths() {
+            if followed.len() > prefix.len() && followed.starts_with(prefix) {
+                let path = followed[..=prefix.len()].to_vec();
+                if !from_globs.iter().any(|known| known.path == path) {
+                    from_globs.push(UseItem {
+                        path,
+                        alias: None,
+                        at: item.at,
+                        from_glob: true,
+                    });
+                }
+            }
+        }
+    }
+    if from_globs.is_empty() {
+        return items;
+    }
+    // Once more, so a name bound through one a glob brought in (`use gtk4::*; use self::rt as r;`) is followed.
+    items.extend(from_globs);
+    resolve_all(items)
+}
+
+/// `path` with its root replaced by what it is bound to in `bound`, repeatedly, at most `depth` times (a chain
+/// of more than eight aliases is not an accident, and the cap keeps a file of them from stalling the scan): through
+/// every binding of the root, the first chain that reaches a display crate, or else the first chain.
+fn resolve(path: &[String], bound: &[(String, Vec<String>)], mods: &[String], depth: usize) -> Vec<String> {
+    let Some(root) = path.first().filter(|_| depth > 0) else {
+        return path.to_vec();
+    };
+    let mut first = None;
+    for (_, target) in bound
+        .iter()
+        .filter(|(name, target)| name == root && target.first() != Some(name))
+    {
+        let spliced: Vec<String> = target.iter().chain(&path[1..]).cloned().collect();
+        let chain = resolve(&local_tail(&spliced, mods), bound, mods, depth - 1);
+        if chain
+            .first()
+            .is_some_and(|root| DISPLAY_CRATES.contains(&root.as_str()))
+        {
+            return chain;
+        }
+        first.get_or_insert(chain);
+    }
+    first.unwrap_or_else(|| path.to_vec())
+}
+
+/// Each name `uses` ([`resolved`]) binds to a display crate or a path in one, other than the crate's own
+/// name (which [`root_positions`] finds already), and the path it stands for.
+fn display_bindings(uses: &[UseItem]) -> Vec<(&str, &[String])> {
+    uses.iter()
+        .filter_map(|item| Some((bound_name(item)?, item.path.as_slice())))
+        .filter(|(name, path)| {
+            path.first().is_some_and(|root| DISPLAY_CRATES.contains(&root.as_str())) && *path != [name.to_string()]
+        })
+        .collect()
+}
+
+/// Where `code` holds `path` as the start of a path of its own ([`starts_path`]): not a method (`x.g`), not the
+/// tail of a longer path (`y::g`) other than one through this file (`self::g`, `m::g`), not inside a longer name.
+fn rooted_positions(code: &str, path: &str) -> Vec<usize> {
+    let mods = local_modules(code);
+    path_positions(code, path)
+        .into_iter()
+        .filter(|&at| starts_path(code, at, &mods))
+        .collect()
+}
+
+/// Where `code` uses the name `name` a `use` binds ([`rooted_positions`]) as something that can connect: the start
+/// of a longer path (`g::init`), a call (`run(..)`), a macro (`m!`) or an attribute (`#[test]`). Not a bare word,
+/// which in code is as often a local, a field or a pattern of the same name (`let g = 1;`, `Rgb { g: 0 }`).
+fn used_positions(code: &str, name: &str) -> Vec<usize> {
+    rooted_positions(code, name)
+        .into_iter()
+        .filter(|&at| {
+            let after = code[at + name.len()..].trim_start();
+            ["::", "(", "!"].iter().any(|next| after.starts_with(next))
+                || (code[..at].trim_end().ends_with("#[") && after.starts_with(['(', ']']))
+        })
+        .collect()
+}
+
+/// GTK's init under the names `uses` ([`resolved`]) give it, each with the spelling of [`INIT_FORMS`] it
+/// stands for: `g::init` for `use gtk4 as g;`, `start` for `use gtk4::init as start;`. A spelling that is
+/// itself one of [`INIT_FORMS`] (`gtk::init` for `use gtk4 as gtk;`) is left to that form's own count.
+fn aliased_inits(uses: &[UseItem]) -> Vec<(String, &'static str)> {
+    let mut spellings = Vec::new();
+    for (name, path) in display_bindings(uses) {
+        for form in INIT_FORMS {
+            let segments: Vec<&str> = form.split("::").collect();
+            if path.len() <= segments.len() && path.iter().zip(&segments).all(|(a, b)| a == b) {
+                let spelling = std::iter::once(name)
+                    .chain(segments[path.len()..].iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                if !INIT_FORMS.contains(&spelling.as_str()) {
+                    spellings.push((spelling, *form));
+                }
+            }
+        }
+    }
+    spellings
+}
+
+/// Where `code` calls `spelling` ([`rooted_positions`], then an opening parenthesis): a call, not the `use`
+/// that names it.
+fn calls(code: &str, spelling: &str) -> usize {
+    rooted_positions(code, spelling)
+        .into_iter()
+        .filter(|&at| code[at + spelling.len()..].trim_start().starts_with('('))
+        .count()
+}
+
 /// gtk-rs's test macros (`#[gtk4::test]`, `gtk4::test_synced`, ...), which initialise GTK before the test
 /// body runs: the first one `code` uses, as written, under any name the crate is imported by or brought
-/// in by name.
+/// in by name, through any chain of aliases (`uses` are [`resolved`]).
 fn gtk_test_macro(code: &str, uses: &[UseItem]) -> Option<String> {
     let gtk = |item: &UseItem| item.path.first().is_some_and(|root| GTK_ROOTS.contains(&root.as_str()));
     // `use gtk4 as gtk;` is the spelling gtk-rs documents `#[gtk::test]` under; `extern crate` renames too.
@@ -596,7 +850,7 @@ fn gtk_test_macro(code: &str, uses: &[UseItem]) -> Option<String> {
     roots.extend(
         uses.iter()
             .filter(|item| item.path.len() == 1 && gtk(item))
-            .filter_map(|item| item.alias.as_deref()),
+            .filter_map(bound_name),
     );
     for root in roots {
         for name in TEST_MACROS {
@@ -606,10 +860,14 @@ fn gtk_test_macro(code: &str, uses: &[UseItem]) -> Option<String> {
             }
         }
     }
+    let is_macro = |item: &&UseItem| {
+        gtk(item) && item.path.len() >= 2 && TEST_MACROS.contains(&item.path[item.path.len() - 1].as_str())
+    };
+    // Imported by name, refused on the import; brought in by a glob, where it is used (`use gtk4::*;` alone
+    // initialises nothing).
     uses.iter()
-        .find(|item| {
-            gtk(item) && item.path.len() >= 2 && TEST_MACROS.contains(&item.path[item.path.len() - 1].as_str())
-        })
+        .filter(is_macro)
+        .find(|item| !item.from_glob || bound_name(item).is_some_and(|name| !used_positions(code, name).is_empty()))
         .map(|item| item.path.join("::"))
 }
 
@@ -750,7 +1008,7 @@ fn refuses_by_exiting(body: &str, call: &str) -> Result<(), String> {
 /// or `None` if it keeps it. `helper` is the helper's canonical path.
 fn offence(rel: &str, source: &str, dir: &Path, helper: &Path) -> Option<String> {
     let (code, literals) = code_and_strings(source);
-    let uses = use_items(&code);
+    let uses = resolved(&code);
     // Outright, before anything is weighed: no call of the helper inside such a test can come first.
     if let Some(found) = gtk_test_macro(&code, &uses) {
         return Some(format!(
@@ -792,6 +1050,16 @@ fn offence(rel: &str, source: &str, dir: &Path, helper: &Path) -> Option<String>
                 ));
             }
         }
+        for (spelling, form) in aliased_inits(&uses) {
+            let count = calls(&code, &spelling);
+            if count != 0 {
+                return refused(format!(
+                    "`{spelling}` (`{form}` under a name a `use` gives it) is called {count} time(s) in the file \
+                     and may be called not at all -- GTK connects to a display where it is initialised, and only \
+                     the init the allowlist names, after the checks in its `main`, may"
+                ));
+            }
+        }
         for call in allowed.refusals {
             if let Err(problem) = refuses_by_exiting(body, call) {
                 return refused(problem);
@@ -803,7 +1071,10 @@ fn offence(rel: &str, source: &str, dir: &Path, helper: &Path) -> Option<String>
         && path_attributes(source)
             .iter()
             .any(|path| path.ends_with("own_x_server.rs") && dir.join(path).canonicalize().is_ok_and(|p| p == helper));
-    let inits_gtk_itself = INIT_FORMS.iter().any(|init| has_path(&code, init));
+    let inits_gtk_itself = INIT_FORMS.iter().any(|init| has_path(&code, init))
+        || aliased_inits(&uses)
+            .iter()
+            .any(|(spelling, _)| calls(&code, spelling) != 0);
     let mut names: Vec<&str> = Vec::new();
     for signal in &signals {
         if !names.contains(&signal.what.as_str()) {
@@ -1530,4 +1801,336 @@ fn the_helper_must_come_first_in_main() {
     ];
     let wrong = wrongly_refused(&fine);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// ---- the parked limits' follow-up (2026-09-29): aliases resolved outside the flattener -----------------------
+
+/// Limits (1) and (3) of the dated record's "merged, with three scanner limits parked": a name a `use` binds to
+/// a display crate, or to a path in one -- `g` in `use gtk4 as g;`, `start` in `use gtk4::init as start;`,
+/// through any chain of them -- is that crate wherever it is used: in `main`'s order, in the allowlisted file's
+/// count of GTK's init, and in the macro ban.
+#[test]
+fn aliases_count_in_main_and_in_the_macro_ban() {
+    let with = |body: &str| format!("{INCLUDE}{body}");
+    // (1) An alias used in `main` before the helper is a connection before it.
+    let before = vec![
+        (
+            "g::init() before init_gtk, `use gtk4 as g;` (Codex)",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ g::init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "an item renamed out of an alias, `use g::init as start;`",
+            with(&format!(
+                "use gtk4 as g;\nuse g::init as start;\nfn main() {{ start().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "an alias of an alias, `use gtk4 as g; use g::rt as r;`",
+            with(&format!(
+                "use gtk4 as g;\nuse g::rt as r;\nfn main() {{ r::init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "an extern crate rename, `extern crate winit as w;`",
+            with(&format!(
+                "extern crate winit as w;\nfn main() {{ let s = w::dpi::LogicalSize::new(1, 1); {HELPER_CALL} }}\n"
+            )),
+        ),
+    ];
+    // (3) A test macro brought in through an alias.
+    let macros = vec![
+        (
+            "test_synced grouped through an alias, `use g::{test_synced as run}` (Codex)",
+            with(&format!(
+                "use gtk4 as g;\nuse g::{{test_synced as run}};\nfn main() {{ {HELPER_CALL} run(|| {{}}); }}\n"
+            )),
+        ),
+        (
+            "the attribute imported through an alias, `use g::test;`",
+            with(&format!(
+                "use gtk4 as g;\nuse g::test;\n#[test]\nfn t() {{ {HELPER_CALL} }}\nfn main() {{}}\n"
+            )),
+        ),
+        (
+            "the attribute on an alias of an alias, `#[h::test]`",
+            with(&format!(
+                "use gtk4 as g;\nuse g as h;\n#[h::test]\nfn t() {{ {HELPER_CALL} }}\nfn main() {{}}\n"
+            )),
+        ),
+    ];
+    let itself = vec![(
+        "g::init() after init_gtk, `use gtk4 as g;`",
+        with(&format!(
+            "use gtk4 as g;\nfn main() {{ {HELPER_CALL} g::init().unwrap(); }}\n"
+        )),
+    )];
+    let mut missed = not_refused(&before, "before it calls the helper");
+    missed.extend(not_refused(&macros, "gtk-rs's test macro"));
+    missed.extend(not_refused(&itself, "calls `gtk4::init` itself"));
+
+    // (1) in the allowlisted file: an aliased init ahead of its guards is a second init.
+    let file = ALLOWED[0].file;
+    let real = std::fs::read_to_string(workspace().join(file)).unwrap();
+    let main_at = real
+        .rfind("fn main() {")
+        .expect("cursor_animation.rs has a `fn main() {`");
+    let open = main_at + "fn main() {".len();
+    let aliased = |import: &str, call: &str| {
+        format!(
+            "{}{import}\n{}\n    {call}{}",
+            &real[..main_at],
+            &real[main_at..open],
+            &real[open..]
+        )
+    };
+    for (name, source, needle) in [
+        (
+            "`use gtk4 as g;` and g::init() first in cursor_animation's main",
+            aliased("use gtk4 as g;", "g::init().unwrap();"),
+            "g::init",
+        ),
+        (
+            "`use g::rt::init as start;` and start() first in cursor_animation's main",
+            aliased("use gtk4 as g;\nuse g::rt::init as start;", "start().unwrap();"),
+            "start",
+        ),
+    ] {
+        let verdict = offence(file, &source, &workspace().join("neovide-editor/tests"), &helper());
+        if !verdict.as_deref().is_some_and(|o| o.contains(needle)) {
+            missed.push(format!(
+                "  {name}: wanted a refusal containing {needle:?}, got {verdict:?}"
+            ));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "{} case(s) not refused:\n{}",
+        missed.len(),
+        missed.join("\n")
+    );
+
+    // As before: a path written out is judged as it was, and an alias of anything else is nothing.
+    assert!(
+        judge(&with(&format!(
+            "fn main() {{ let w = gtk4::Window::new(); {HELPER_CALL} }}\n"
+        )))
+        .is_some_and(|o| o.contains("before it calls the helper")),
+        "a written-out path before the helper is still refused"
+    );
+    let fine = vec![
+        (
+            "a written-out path after the helper",
+            with(&format!("fn main() {{ {HELPER_CALL} let w = gtk4::Window::new(); }}\n")),
+        ),
+        (
+            "an alias used after the helper",
+            with(&format!("use gtk4 as g;\nfn main() {{ {HELPER_CALL} let w = g::Window::new(); }}\n")),
+        ),
+        (
+            "an unrelated alias before the helper",
+            with(&format!(
+                "use std::process as p;\nuse p::{{id as pid}};\nfn main() {{ p::id(); pid(); {HELPER_CALL} gtk4::Window::new(); }}\n"
+            )),
+        ),
+        (
+            "an alias's name as a method or a path's tail before the helper",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ x.g(); y::g::z(); {HELPER_CALL} g::Label::new(None); }}\n"
+            )),
+        ),
+        (
+            "a non-macro item grouped through an alias",
+            with(&format!("use gtk4 as g;\nuse g::{{Label as L}};\nfn main() {{ {HELPER_CALL} L::new(None); }}\n")),
+        ),
+    ];
+    let wrong = wrongly_refused(&fine);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let unrelated = "use std::io as sio;\nuse sio::{Write as W};\nfn main() { sio::stdout(); }\n";
+    assert_eq!(display_signals(unrelated), Vec::<String>::new());
+}
+
+/// The review of the alias change (2026-09-29): a glob of a display crate, direct or through an alias, binds GTK's
+/// init and test macros as a named import does; an alias reached through `self::`, `crate::`, `super::` or a
+/// module declared in the file is the alias; a name bound twice is followed through every binding, not the
+/// first; and a bare name bound to a crate is not a connection where it is only a local, a field or a pattern.
+#[test]
+fn globs_qualified_aliases_and_rebindings_count_too() {
+    let with = |body: &str| format!("{INCLUDE}{body}");
+    let before = vec![
+        (
+            "a glob of gtk4, then init() before the helper",
+            with(&format!("use gtk4::*;\nfn main() {{ init().unwrap(); {HELPER_CALL} }}\n")),
+        ),
+        (
+            "a glob through an alias, `use gtk4 as g; use g::*;`",
+            with(&format!(
+                "use gtk4 as g;\nuse g::*;\nfn main() {{ init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "a glob of gtk4::rt, then init()",
+            with(&format!("use gtk4::rt::*;\nfn main() {{ init().unwrap(); {HELPER_CALL} }}\n")),
+        ),
+        (
+            "self::g::init() before the helper",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ self::g::init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "crate::g::init() before the helper",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ crate::g::init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "m::g::init() through `mod m { pub use gtk4 as g; }`",
+            with(&format!(
+                "mod m {{ pub use gtk4 as g; }}\nfn main() {{ m::g::init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "an alias called as a struct field's value, `S { f: g::init() }`",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ let s = S {{ f: g::init() }}; {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "the alias bound again, to something else, before the gtk4 binding",
+            with(&format!(
+                "fn a() {{ use std::fmt as g; }}\nuse gtk4 as g;\nuse g::rt as r;\nfn main() {{ r::init().unwrap(); {HELPER_CALL} }}\n"
+            )),
+        ),
+    ];
+    let macros = vec![
+        (
+            "test_synced through a glob of gtk4, the helper inside it",
+            with(&format!("use gtk4::*;\nfn main() {{ test_synced(|| {{ {HELPER_CALL} }}); }}\n")),
+        ),
+        (
+            "test_synced through a glob of an alias, after the helper",
+            with(&format!(
+                "use gtk4 as g;\nuse g::*;\nfn main() {{ {HELPER_CALL} test_synced(|| {{}}); }}\n"
+            )),
+        ),
+        (
+            "test_synced grouped through `crate::g` (Codex)",
+            with(&format!(
+                "use gtk4 as g;\nuse crate::g::{{test_synced as run}};\nfn main() {{ run(|| {{}}); {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "test_synced through `self::g`",
+            with(&format!(
+                "use gtk4 as g;\nuse self::g::test_synced as run;\nfn main() {{ {HELPER_CALL} run(|| {{}}); }}\n"
+            )),
+        ),
+        (
+            "test_synced through `m::g`, `mod m { pub use gtk4 as g; }`",
+            with(&format!(
+                "mod m {{ pub use gtk4 as g; }}\nuse m::g::{{test_synced as run}};\nfn main() {{ {HELPER_CALL} run(|| {{}}); }}\n"
+            )),
+        ),
+        (
+            "the alias bound again, to something else, before the gtk4 binding",
+            with(&format!(
+                "mod a {{ use std::fmt as g; }}\nuse gtk4 as g;\nuse g::{{test_synced as run}};\nfn main() {{ {HELPER_CALL} run(|| {{}}); }}\n"
+            )),
+        ),
+    ];
+    let itself = vec![(
+        "init() through a glob, after the helper",
+        with(&format!(
+            "use gtk4::*;\nfn main() {{ {HELPER_CALL} init().unwrap(); }}\n"
+        )),
+    )];
+    let mut missed = not_refused(&before, "before it calls the helper");
+    missed.extend(not_refused(&macros, "gtk-rs's test macro"));
+    missed.extend(not_refused(&itself, "calls `gtk4::init` itself"));
+
+    // In the allowlisted file: an init a glob brought in, ahead of its guards, is a second init.
+    let file = ALLOWED[0].file;
+    let real = std::fs::read_to_string(workspace().join(file)).unwrap();
+    let main_at = real
+        .rfind("fn main() {")
+        .expect("cursor_animation.rs has a `fn main() {`");
+    let open = main_at + "fn main() {".len();
+    for (name, import, call, needle) in [
+        (
+            "a glob of gtk4 and init() first",
+            "use gtk4::*;",
+            "init().unwrap();",
+            "`init`",
+        ),
+        (
+            "crate::g::init() first",
+            "use gtk4 as g;",
+            "crate::g::init().unwrap();",
+            "g::init",
+        ),
+    ] {
+        let source = format!(
+            "{}{import}\n{}\n    {call}{}",
+            &real[..main_at],
+            &real[main_at..open],
+            &real[open..]
+        );
+        let verdict = offence(file, &source, &workspace().join("neovide-editor/tests"), &helper());
+        if !verdict.as_deref().is_some_and(|o| o.contains(needle)) {
+            missed.push(format!(
+                "  cursor_animation, {name}: wanted a refusal containing {needle:?}, got {verdict:?}"
+            ));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "{} case(s) not refused:\n{}",
+        missed.len(),
+        missed.join("\n")
+    );
+
+    // A bare name bound to a crate is a connection only where it is used as one: not as a local, a field, a
+    // pattern, or the tail of another path.
+    let fine = vec![
+        (
+            "a struct field named like the alias (Codex)",
+            with(&format!(
+                "use gtk4 as g;\nstruct Rgb {{ r: u8, g: u8, b: u8 }}\nfn main() {{ let bg = Rgb {{ r: 0, g: 0, b: 0 }}; {HELPER_CALL} let l = g::Label::new(None); }}\n"
+            )),
+        ),
+        (
+            "a local named like the alias",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ let g = 1; let y = g + 1; {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "a match binding named like the alias",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ let _ = match 1 {{ g => g }}; {HELPER_CALL} }}\n"
+            )),
+        ),
+        (
+            "a prelude glob, and a path written out after the helper",
+            with(&format!(
+                "use gtk4::prelude::*;\nfn main() {{ {HELPER_CALL} let w = gtk4::Window::new(); }}\n"
+            )),
+        ),
+        (
+            "a path through another crate's module named like a local one",
+            with(&format!(
+                "use gtk4 as g;\nfn main() {{ y::g::z(); {HELPER_CALL} }}\n"
+            )),
+        ),
+    ];
+    let wrong = wrongly_refused(&fine);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+    // A type found by its own name is named once.
+    assert_eq!(
+        display_signals("use webkit6::WebView;\nfn main() { let w = WebView::new(); }\n"),
+        vec!["webkit6", "WebView"]
+    );
 }
