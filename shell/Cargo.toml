@@ -120,3 +120,10 @@ harness = false
 [[test]]
 name = "panel_visual_mode"
 harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs an X
+# server of its own (see the file's header). Holds the 2026-09-29 IME fix: a web module's `WebView` at
+# (0,0) of its `WebHost`, so the position WebKitGTK adds to the input method's caret rectangle is zero.
+[[test]]
+name = "web_host_origin"
+harness = false

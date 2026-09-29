@@ -268,6 +268,11 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
     // nvim through the exact same `send_text_input` path plain keystrokes already use.
     let im_context = IMMulticontext::new();
     im_context.set_client_widget(Some(gl_area));
+    // The editor does not render the `preedit-changed` string. With GTK's default preedit setting,
+    // the input method leaves composition display to this client, making the text invisible.
+    // Disable preedit so the input method shows composition in its own candidate window next to
+    // the cursor rectangle published below.
+    im_context.set_use_preedit(false);
     {
         let live_state = live_state.clone();
         im_context.connect_commit(move |_ctx, text| {
@@ -332,6 +337,24 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
             focus_controller.connect_leave(move |_| ctx.focus_out());
         }
         gl_area.add_controller(focus_controller);
+    }
+
+    // --- IME candidate placement without preedit. With `set_use_preedit(false)` the `preedit-*`
+    // signals above may never fire, so the rectangle is also published on every key press, in the
+    // capture phase: that runs before the key controller below, whose attached input method may
+    // consume the key (the first letter of a composition) before its own ::key-pressed ever runs.
+    // The composition does not move nvim's cursor, so the rectangle published then stays right.
+    {
+        let live_state = live_state.clone();
+        let area = gl_area.clone();
+        let ctx = im_context.clone();
+        let placement = EventControllerKey::new();
+        placement.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        placement.connect_key_pressed(move |_controller, _key, _keycode, _state| {
+            publish_cursor_location(&ctx, &area, &live_state);
+            glib::Propagation::Proceed
+        });
+        gl_area.add_controller(placement);
     }
 
     // --- key input: GtkEventControllerKey attached directly to the GLArea (made focusable by the
