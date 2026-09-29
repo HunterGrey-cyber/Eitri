@@ -125,7 +125,7 @@ if [ "$IS_PRERELEASE" = 1 ] && [ "$ALLOW_PRERELEASE" != 1 ]; then
 	cat >&2 <<EOF
 bump-bin.sh: $VERSION is a prerelease (-rc.N). neovibe-bin is never published to the AUR for a
 prerelease version: its pkgver ('-' -> '_') sorts ABOVE the eventual final release under pacman's
-own vercmp (vercmp 1.0.0_rc.1-1 1.0.0-1 => 1), stranding every -rc.N installer above 1.0.0 with no
+own vercmp (vercmp 0.2.0_rc.1-1 0.2.0-1 => 1), stranding every -rc.N installer above 0.2.0 with no
 upgrade path (the private review notes #3).
 
 Pass --allow-prerelease only to build and test this version locally

@@ -43,9 +43,12 @@ default-members = [
 ]
 
 [workspace.package]
-# v1.0.0 as a SemVer major, one
-# `[workspace.package] version` inherited by every product crate. Release candidates are
-# `1.0.0-rc.N`; `release.sh` refuses when its argument and this disagree.
-version = "1.0.0-rc.3"
+# one `[workspace.package] version`
+# inherited by every product crate; `release.sh` refuses when its argument and this
+# disagree.
+# The first public release is 0.2.0. Release candidates are
+# `0.2.0-rc.N`. "v1" stays the internal milestone name; this field only ever carries the public
+# SemVer.
+version = "0.2.0-rc.1"
 edition = "2021"
 publish = false
