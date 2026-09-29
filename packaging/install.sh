@@ -1395,7 +1395,10 @@ pid_alive() {
 # it. Anything uncertain -- no getent, a failed lookup, a group named otherwise, another listed
 # member -- leaves OPG=0, and those checks refuse exactly as before. Called as a plain statement
 # (rule 2 above). A second account whose PRIMARY group is this one is not a member in getent's group
-# entry either, so the account list is searched for one too.
+# entry either, so the account list is searched for one too; a directory with an extended ACL, or a
+# GID two groups share, never qualifies. What this cannot see: accounts an NSS source does not
+# enumerate (a directory service with enumeration off) whose primary or supplementary group has
+# this GID -- a deliberate, unusual setup, stated in INSTALL.md.
 own_private_group() {
 	OPG=0
 	_opg_gid=$(id -g 2>/dev/null) || return 0
@@ -1403,6 +1406,15 @@ own_private_group() {
 	_opg_group=$(id -gn 2>/dev/null) || return 0
 	if [ -z "$_opg_user" ] || [ "$_opg_user" != "$_opg_group" ]; then return 0; fi
 	[ -n "$(find -H "$1" -maxdepth 0 -gid "$_opg_gid" -print 2>/dev/null)" ] || return 0
+	# An extended ACL can give a named user or group write access that the mode bits do not show (the
+	# group bits then report the ACL mask), so a directory with one never gets the allowance. GNU ls
+	# marks it with a '+' after the mode; getfacl, where it is installed, lists the entries themselves.
+	_opg_ls=$(ls -ld -- "$1" 2>/dev/null) || return 0
+	case $_opg_ls in ??????????+*) return 0 ;; esac
+	if command -v getfacl >/dev/null 2>&1; then
+		_opg_acl=$(getfacl -cp -- "$1" 2>/dev/null) || return 0
+		if printf '%s\n' "$_opg_acl" | grep -Eq '^(user|group):[^:]+:|^mask::'; then return 0; fi
+	fi
 	command -v getent >/dev/null 2>&1 || return 0
 	_opg_entry=$(getent group "$_opg_group" 2>/dev/null) || return 0
 	[ "$(printf '%s\n' "$_opg_entry" | cut -d: -f1)" = "$_opg_group" ] || return 0
@@ -1411,6 +1423,10 @@ own_private_group() {
 	'' | "$_opg_user") ;;
 	*) return 0 ;;
 	esac
+	# A second group with the same GID (groupadd --non-unique) gives its members the same access
+	# without being named here: the whole group list must hold exactly one group with this GID.
+	_opg_gcount=$(getent group 2>/dev/null | awk -F: -v g="$_opg_gid" '$3 == g { n++ } END { print n + 0 }') || return 0
+	[ "$_opg_gcount" = 1 ] || return 0
 	# A second account whose PRIMARY group is this one is never listed as a member, so look for one
 	# in the account list itself -- which must at least list this user, or it is not a list this
 	# check can rely on (enumeration off in some NSS setups), and the answer stays no.

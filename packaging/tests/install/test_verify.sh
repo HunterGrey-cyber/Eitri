@@ -471,6 +471,23 @@ STUB
 	printf '%s\n' "$T/stubs-getent-passwd"
 }
 
+# duplicate_gid_stubs: a PRE_STUBS directory whose getent lists a second group ("shared") with this
+# user's primary GID -- the groupadd --non-unique case a lookup by name never sees.
+duplicate_gid_stubs() {
+	mkdir -p "$T/stubs-getent-dupgid"
+	cat >"$T/stubs-getent-dupgid/getent" <<'STUB'
+#!/bin/sh
+if [ "$1" = group ] && [ $# -eq 1 ]; then
+	/usr/bin/getent group
+	printf 'shared:x:%s:bob\n' "$(id -g)"
+	exit 0
+fi
+exec /usr/bin/getent "$@"
+STUB
+	chmod +x "$T/stubs-getent-dupgid/getent"
+	printf '%s\n' "$T/stubs-getent-dupgid"
+}
+
 # own_private_group_here: 0 when the test user has a user-private group (the case own_private_group
 # accepts), so the tests that rely on it can say when they are not exercising it.
 own_private_group_here() {
@@ -587,6 +604,52 @@ t_cache_group_writable_shared_primary_gid_refused() {
 	PRE_STUBS=$(shared_primary_gid_stubs)
 	inst_net
 	expect_fail "a 0775 cache parent whose group is another account's primary group too"
+	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
+}
+
+TESTS="$TESTS t_cache_parent_acl_named_writer_refused"
+t_cache_parent_acl_named_writer_refused() {
+	# Codex's rc.2 review: an extended ACL entry for another user makes a directory writable to them
+	# while its mode reads 0775 (the group bits are the ACL mask), so the private-group allowance must
+	# never apply to a directory that has one.
+	if ! own_private_group_here; then
+		printf 'note: the test user has no private group here; nothing to check\n'
+		return 0
+	fi
+	if ! command -v setfacl >/dev/null 2>&1; then
+		printf 'note: no setfacl here; nothing to check\n'
+		return 0
+	fi
+	serve 1.0.0
+	mkdir -p "$TH/.cache"
+	chmod 0755 "$TH/.cache"
+	if ! setfacl -m "u:$(id -un):rwx" -m m::rwx "$TH/.cache" 2>/dev/null; then
+		printf 'note: this filesystem takes no ACLs; nothing to check\n'
+		return 0
+	fi
+	inst_net
+	expect_fail "a cache parent with an extended ACL, on the user's own private group"
+	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
+	setfacl -b "$TH/.cache"
+	chmod 0775 "$TH/.cache"
+	inst_net
+	expect_rc 0 "the same directory once its ACL is gone"
+}
+
+TESTS="$TESTS t_cache_group_writable_duplicate_gid_refused"
+t_cache_group_writable_duplicate_gid_refused() {
+	# Codex's rc.2 review: a second group sharing the private group's GID gives its members the same
+	# access without appearing under the private group's name.
+	if ! own_private_group_here; then
+		printf 'note: the test user has no private group here; nothing to check\n'
+		return 0
+	fi
+	serve 1.0.0
+	mkdir -p "$TH/.cache"
+	chmod 0775 "$TH/.cache"
+	PRE_STUBS=$(duplicate_gid_stubs)
+	inst_net
+	expect_fail "a 0775 cache parent whose GID another group shares"
 	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
 }
 
