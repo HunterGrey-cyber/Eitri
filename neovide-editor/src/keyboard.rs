@@ -313,8 +313,8 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
             let mut live = live_state.borrow_mut();
             if let LiveState::Ready(session) = &mut *live {
                 if !session.harness.has_neovim_exited() {
+                    // nvim's reply requests the frame (event-driven redraw).
                     session.harness.send_text_input(&text);
-                    session.wants_frame.set(true);
                 }
             }
         });
@@ -423,9 +423,7 @@ pub(crate) fn attach_keyboard_input(gl_area: &GLArea, live_state: &Rc<RefCell<Li
             if let LiveState::Ready(session) = &mut *live {
                 if !session.harness.has_neovim_exited() {
                     session.harness.send_text_input(&text);
-                    // A keypress deserves a same-tick-latency render rather than waiting on
-                    // nvim's async redraw round-trip to eventually move `last_seen_batches`.
-                    session.wants_frame.set(true);
+                    // nvim's reply requests the frame (event-driven redraw).
                 }
             }
             // Handled either way (even pre-Ready/post-exit) -- there is nothing else on this

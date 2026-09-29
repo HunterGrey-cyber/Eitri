@@ -319,7 +319,7 @@ mod tests {
         let settled = watched.settled(Duration::from_secs(2));
         assert!(settled.done && settled.returned, "{settled:?}");
 
-        let pending = WatchedCall::start("never", || std::future::pending::<bool>(), probe).unwrap();
+        let pending = WatchedCall::start("never", std::future::pending::<bool>, probe).unwrap();
         let started = Instant::now();
         let unsettled = pending.settled(Duration::from_millis(100));
         assert!(!unsettled.done);

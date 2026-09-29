@@ -18,6 +18,8 @@
 
 mod dmabuf_target;
 mod editor_area;
+#[doc(hidden)]
+pub mod fd_watch;
 mod frame_clock;
 mod gl_interop;
 mod keyboard;
@@ -25,6 +27,12 @@ mod mouse;
 mod nvim_child;
 mod nvim_rpc;
 mod stdin;
+mod tick_driver;
+
+/// Unit tests that acquire the default main context take this first: two at once would make the
+/// second `acquire` fail.
+#[cfg(test)]
+pub(crate) static DEFAULT_CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use editor_area::PresentationCounts;
 pub use nvim_rpc::{CallWatch, NvimMode};
@@ -53,11 +61,15 @@ use gl_interop::{
     same_grid_scale, GridLayout, SkiaState,
 };
 use mouse::DragState;
+use tick_driver::{
+    service_pending_after_render, tick_still_wanted, PendingInputs, Service, ServiceSource, TickDriver, TickInputs,
+    WantsFrame,
+};
 
 /// Log a frame-pacing line every N frames instead of spamming stdout every frame.
 const LOG_EVERY_N_FRAMES: u64 = 60;
 
-/// How many `add_tick_callback` invocations between `[tick]` summary log lines (see `TickStats`).
+/// How many service runs (tick callback or fd watch) between `[tick]` summary log lines (see `TickStats`).
 const TICK_LOG_EVERY_N_TICKS: u64 = 300;
 
 /// The clear colour painted across the whole framebuffer before each `LiveHarness::render_frame`
@@ -145,24 +157,23 @@ pub struct LiveSession {
     frame_count: u64,
     logged_ready: bool,
     /// `render_frame`'s own returned `animating` value, set after every render callback
-    /// invocation below. Starts `true` so the tick callback keeps rendering continuously through
+    /// invocation below. Starts `true` so the tick driver keeps running through
     /// the first few Ready-state frames, until a real `render_frame` call has actually reported a
     /// real value -- erring toward "render" rather than "skip" whenever this value hasn't been
     /// established yet.
     last_animating: Cell<bool>,
-    /// `harness.redraw_batches_seen()` as of the last time either the render callback or the tick
-    /// callback looked at it. The tick callback calls `LiveHarness::pump` every tick specifically
-    /// so a change here is visible at full display-refresh-rate latency even on ticks that don't
-    /// render -- this is the "did nvim actually send anything new" half of the fix, independent
-    /// of `last_animating`.
+    /// `harness.redraw_batches_seen()` as of the last time either the render callback or the
+    /// service run looked at it. The service (run by the tick while a frame is wanted, and by the
+    /// event-loop fd watch the moment a batch arrives) calls `LiveHarness::pump`, so a change here
+    /// is seen without waiting for a tick and even on runs that don't render -- this is the "did
+    /// nvim actually send anything new" half of the fix, independent of `last_animating`.
     last_seen_batches: Cell<u64>,
-    /// Set by the resize handler and the keyboard input handler: both are real external events
-    /// that deserve a guaranteed next frame regardless of what `last_animating`/
-    /// `last_seen_batches` currently say (a resize needs its own frame at the new size even if
-    /// nvim sent nothing new; a keypress deserves a same-tick-latency render rather than waiting
-    /// on nvim's async redraw round-trip to eventually move `last_seen_batches`). Read-and-cleared
-    /// by the tick callback every tick.
-    pub(crate) wants_frame: Cell<bool>,
+    /// Set by the resize handler and the other input handlers that decide a frame is owed (a
+    /// resize needs its own frame at the new size even if nvim sent nothing new). A plain key press
+    /// no longer sets it: the frame that shows a key's effect follows nvim's redraw, which the fd
+    /// watch sees. Setting it also makes sure the tick driver runs (`WantsFrame::set`).
+    /// Read-and-cleared by each service run.
+    pub(crate) wants_frame: WantsFrame,
     /// The grid (cols, rows) size nvim was last asked to resize to via
     /// `LiveHarness::resize_grid`. Set once at construction (to whatever the initial
     /// `content_region` computed to) and re-checked on every `connect_resize` callback so a real
@@ -227,13 +238,23 @@ pub struct LiveSession {
     unreachable_said: Cell<bool>,
 }
 
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        // Before the harness's fields drop: a watch on a closed (or reused) fd number is a bug.
+        self.wants_frame.release_watch();
+    }
+}
+
 impl LiveSession {
     fn new(
         harness: LiveHarness,
         grid_size: GridSize<u32>,
         fb_size: Rc<Cell<(i32, i32)>>,
         nvim_process: Arc<nvim_child::NvimProcess>,
+        driver: &Rc<TickDriver>,
     ) -> Self {
+        // A new harness: the driver's fd watch starts afresh on its fd.
+        driver.session_started();
         let now = Instant::now();
         Self {
             harness,
@@ -244,7 +265,7 @@ impl LiveSession {
             logged_ready: false,
             last_animating: Cell::new(true),
             last_seen_batches: Cell::new(0),
-            wants_frame: Cell::new(false),
+            wants_frame: WantsFrame::new(driver),
             last_grid_size: Cell::new(grid_size),
             close_requested: Cell::new(false),
             active_drag: Cell::new(None),
@@ -316,15 +337,23 @@ impl LiveSession {
     }
 }
 
-/// Counts, over rolling windows of `TICK_LOG_EVERY_N_TICKS` tick-callback invocations, how many
-/// ticks actually issued a `queue_render()` vs. how many skipped it because nothing needed another
-/// frame -- an idle pane should show `skipped` dominating, while a typing/scrolling/animating pane
-/// should show `issued` dominating. See `poc/p11_measurements/PHASE_REPORT.md` for the bug this
-/// directly addresses.
+/// Counts, over rolling windows of `TICK_LOG_EVERY_N_TICKS` service runs, how many issued a
+/// `queue_render()` vs. how many skipped it because nothing needed another frame. A service run
+/// comes from one of two drivers (`ServiceSource`): the tick callback (registered only while a
+/// frame is wanted) or the event-loop fd watch (one run per wake-up while idle, so it counts on
+/// its own and is never mixed into the tick's numbers). An idle pane shows `skipped` dominating; a
+/// typing/scrolling/animating pane shows `issued` dominating. See
+/// `poc/p11_measurements/PHASE_REPORT.md` for the bug this directly addresses.
 struct TickStats {
-    ticks: Cell<u64>,
+    /// Service runs in this window, from either driver; the window closes at
+    /// `TICK_LOG_EVERY_N_TICKS`.
+    runs: Cell<u64>,
+    tick_runs: Cell<u64>,
+    fd_runs: Cell<u64>,
     issued: Cell<u64>,
     skipped: Cell<u64>,
+    tick_runs_total: Cell<u64>,
+    fd_runs_total: Cell<u64>,
     issued_total: Cell<u64>,
     skipped_total: Cell<u64>,
 }
@@ -332,20 +361,30 @@ struct TickStats {
 impl TickStats {
     fn new() -> Self {
         Self {
-            ticks: Cell::new(0),
+            runs: Cell::new(0),
+            tick_runs: Cell::new(0),
+            fd_runs: Cell::new(0),
             issued: Cell::new(0),
             skipped: Cell::new(0),
+            tick_runs_total: Cell::new(0),
+            fd_runs_total: Cell::new(0),
             issued_total: Cell::new(0),
             skipped_total: Cell::new(0),
         }
     }
 
-    /// Record one tick's outcome; every `TICK_LOG_EVERY_N_TICKS` ticks, print a `[tick]` summary
-    /// of the just-finished window and reset the windowed counters (the `_total` counters keep
-    /// accumulating for the life of the process).
-    fn record(&self, issued_this_tick: bool) {
-        self.ticks.set(self.ticks.get() + 1);
-        if issued_this_tick {
+    /// Record one service run's outcome and which driver ran it; every `TICK_LOG_EVERY_N_TICKS`
+    /// runs, print a `[tick]` summary of the just-finished window and reset the windowed counters
+    /// (the `_total` counters keep accumulating for the life of the process).
+    fn record(&self, source: ServiceSource, issued_this_run: bool) {
+        self.runs.set(self.runs.get() + 1);
+        let (window, total) = match source {
+            ServiceSource::Tick => (&self.tick_runs, &self.tick_runs_total),
+            ServiceSource::FdWatch => (&self.fd_runs, &self.fd_runs_total),
+        };
+        window.set(window.get() + 1);
+        total.set(total.get() + 1);
+        if issued_this_run {
             self.issued.set(self.issued.get() + 1);
             self.issued_total.set(self.issued_total.get() + 1);
         } else {
@@ -353,18 +392,24 @@ impl TickStats {
             self.skipped_total.set(self.skipped_total.get() + 1);
         }
 
-        if self.ticks.get() >= TICK_LOG_EVERY_N_TICKS {
-            let ticks = self.ticks.get();
+        if self.runs.get() >= TICK_LOG_EVERY_N_TICKS {
+            let runs = self.runs.get();
             let issued = self.issued.get();
             let skipped = self.skipped.get();
             println!(
-                "[tick] last {ticks} ticks: issued={issued} skipped={skipped} \
-                 skip_ratio={:.1}% (cumulative issued={} skipped={})",
-                (skipped as f64 / ticks as f64) * 100.0,
+                "[tick] last {runs} service runs (tick={} fd_watch={}): issued={issued} skipped={skipped} \
+                 skip_ratio={:.1}% (cumulative tick={} fd_watch={} issued={} skipped={})",
+                self.tick_runs.get(),
+                self.fd_runs.get(),
+                (skipped as f64 / runs as f64) * 100.0,
+                self.tick_runs_total.get(),
+                self.fd_runs_total.get(),
                 self.issued_total.get(),
                 self.skipped_total.get(),
             );
-            self.ticks.set(0);
+            self.runs.set(0);
+            self.tick_runs.set(0);
+            self.fd_runs.set(0);
             self.issued.set(0);
             self.skipped.set(0);
         }
@@ -420,6 +465,8 @@ pub struct NeovideEditorPane {
     cell_size_callback: CellSizeCallbackSlot,
     /// See [`NeovideEditorPane::on_start_failed`].
     start_failed_callback: StartFailedCallbackSlot,
+    /// The tick callback's registration and the event-loop fd watch (`tick_driver`).
+    tick_driver: Rc<TickDriver>,
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
@@ -500,7 +547,7 @@ const REMAP_RENDER_DELAY: Duration = Duration::from_millis(50);
 /// Why a map needs a render at all: a host that hides this pane with `set_child_visible(false)`
 /// (the module grid) and shows it again over the same rectangle gives the `GLArea` no `resize`,
 /// so nothing sets `wants_frame`, and the single frame drawn on map is the only frame. If nvim
-/// redrew while the pane was hidden -- the tick callback keeps running and keeps draining nvim --
+/// redrew while the pane was hidden -- the fd watch keeps servicing (draining) nvim --
 /// that frame shows the cursor and nothing else, until nvim's next redraw (S3: 39 re-shows of 50,
 /// and 0 of 8 when only the cursor had moved). `GtkPaned` never showed it: its `set_visible(true)`
 /// forces a resize, and ~14 renders follow. Which half draws the window-less frame, Neovide's
@@ -852,6 +899,12 @@ impl ScaleWatch {
         }
     }
 
+    /// Whether [`observe`](Self::observe) would report `current` as a change, without recording it:
+    /// the render callback asks this after its own pump, to see a change only the tick reports.
+    pub(crate) fn would_change(&self, current: f32) -> bool {
+        self.last.get().to_bits() != current.to_bits()
+    }
+
     /// A host write made before nvim existed (buffered because there was no harness yet). Only the
     /// last one matters, mirroring `pending_fullscreen`.
     pub(crate) fn buffer_pending(&self, value: f32) {
@@ -927,6 +980,7 @@ impl NeovideEditorPane {
 
         let skia_state: Rc<RefCell<Option<SkiaState>>> = Rc::new(RefCell::new(None));
         let live_state: Rc<RefCell<LiveState>> = Rc::new(RefCell::new(LiveState::NotStarted));
+        let tick_driver: Rc<TickDriver> = Rc::new(TickDriver::default());
         let clear_color = Rc::new(Cell::new(OUTSIDE_COLOR));
         let focused: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
@@ -1155,6 +1209,8 @@ impl NeovideEditorPane {
             let focused = focused.clone();
             let pending_fullscreen = pending_fullscreen.clone();
             let scale_watch_for_ready = scale_watch.clone();
+            let scale_watch_for_render = scale_watch.clone();
+            let tick_driver_for_render = tick_driver.clone();
             let fb_size = fb_size.clone();
             let cell_size_callback_for_render = cell_size_callback.clone();
             let last_cell_size = last_cell_size.clone();
@@ -1228,6 +1284,9 @@ impl NeovideEditorPane {
                 // `live` is dropped -- same reentrancy rule. Unlike `cell_size_changed_to` this fires
                 // at most once per pane, since `Starting` -> `Failed` happens exactly once.
                 let mut start_failed_message: Option<String> = None;
+                // Set in the `Ready`, `Failed` and `Exited` arms, acted on after `live` is dropped:
+                // whether the tick callback is still wanted once this frame is committed (F2/F3).
+                let mut tick_wanted_after_render: Option<bool> = None;
 
                 let mut live = live_state.borrow_mut();
                 match &mut *live {
@@ -1360,6 +1419,7 @@ impl NeovideEditorPane {
                                     grid_size,
                                     fb_size.clone(),
                                     nvim_process,
+                                    &tick_driver_for_render,
                                 )));
                             }
                             Err(err) => {
@@ -1443,6 +1503,25 @@ impl NeovideEditorPane {
                         // callback.
                         session.last_animating.set(animating);
                         session.last_seen_batches.set(session.harness.redraw_batches_seen());
+                        // F2: `render_frame` pumped, and an exit, a fullscreen change or a scale
+                        // change it consumed is reported only by the tick's service. If this frame
+                        // is not animating nothing else would run that service. F3: with none of
+                        // those pending and nothing else wanted, the tick stops here, not one
+                        // empty cycle later.
+                        let exited = session.harness.has_neovim_exited();
+                        let service_pending = service_pending_after_render(PendingInputs {
+                            exited,
+                            close_requested: session.close_requested.get(),
+                            fullscreen_changed: session.harness.fullscreen_setting()
+                                != session.last_fullscreen_setting.get(),
+                            scale_changed: scale_watch_for_render.would_change(session.harness.scale_factor_setting()),
+                        });
+                        tick_wanted_after_render = Some(tick_still_wanted(TickInputs {
+                            animating,
+                            wants_frame: session.wants_frame.get(),
+                            exit_pending: exited && !session.close_requested.get(),
+                            service_pending,
+                        }));
 
                         if !session.logged_ready && session.harness.is_ready() {
                             session.logged_ready = true;
@@ -1485,11 +1564,21 @@ impl NeovideEditorPane {
                         // R1-4: this is the one paint `sessionless_tick_should_render` is waiting
                         // for -- once it is set, the tick callback stops asking for more frames.
                         failed_painted_for_render.set(true);
+                        // F3 for a failed pane: this paint is the last one it will ever want, so
+                        // the tick stops here rather than one empty cycle later.
+                        tick_wanted_after_render = Some(failed_tick_should_render(true));
                     }
-                    // Only the clear above: a host that released the pane does not show it.
-                    LiveState::Exited => {}
+                    // Only the clear above: a host that released the pane does not show it, and
+                    // nothing will ever change, so the tick stops here too.
+                    LiveState::Exited => tick_wanted_after_render = Some(false),
                 }
                 drop(live);
+
+                match tick_wanted_after_render {
+                    Some(true) => tick_driver_for_render.kick(),
+                    Some(false) => tick_driver_for_render.stop_after_render(),
+                    None => {}
+                }
 
                 if let Some(message) = start_failed_message {
                     if let Some(cb) = start_failed_callback_for_render.borrow().as_ref() {
@@ -1527,7 +1616,9 @@ impl NeovideEditorPane {
         // calls `queue_render()` when something genuinely needs another frame.
         {
             let live_state = live_state.clone();
-            let gl_area_for_tick = gl_area.clone();
+            // No strong `GLArea` here: the driver owns this service, and the area's own render
+            // handler owns the driver, so a strong capture would be a cycle through the driver.
+            // The area is always the `widget` argument (the tick's own, or the driver's weak ref).
             // Needed for the nvim-exited-on-its-own case just below: invoking the registered
             // `exited_callback` may, on the host side, lead straight back into `shutdown()` (e.g.
             // if the callback closes the host's own window, whose `connect_close_request` handler
@@ -1551,7 +1642,8 @@ impl NeovideEditorPane {
             // R1-4: read (never written) here -- the render callback's `Failed` arm is the only
             // writer. See `failed_tick_should_render`.
             let failed_painted_for_tick = failed_painted.clone();
-            gl_area.add_tick_callback(move |widget, _clock| {
+            let driver_for_service = Rc::downgrade(&tick_driver);
+            let service: Service = Rc::new(move |widget: &GLArea, source: ServiceSource| {
                 let mut live = live_state.borrow_mut();
                 // Set from inside the `Ready` arm below, then acted on only *after* `live` is
                 // dropped -- see the comment on `exited_callback_for_tick` above for why the
@@ -1682,7 +1774,7 @@ impl NeovideEditorPane {
                         // nothing previously reacted when nvim exits *on its own* (e.g. `:qa!`
                         // typed inside it). `pump()` just above is what actually observes a real
                         // `UserEvent::NeovimExited` arriving asynchronously, so checking right
-                        // here, every tick, catches it at the same latency the frame log already
+                        // here, on every service run (the tick, or the fd watch for a hidden or unrealized pane), catches it at the same latency the frame log already
                         // did. `close_requested.replace(true)` is the one-shot guard documented on
                         // `LiveSession::close_requested`; only the tick that flips it false->true
                         // actually fires the callback.
@@ -1753,12 +1845,35 @@ impl NeovideEditorPane {
                 }
 
                 if issued {
-                    gl_area_for_tick.queue_render();
+                    widget.queue_render();
                 }
-                tick_stats.record(issued);
+                tick_stats.record(source, issued);
 
-                glib::ControlFlow::Continue
+                // Whether another tick cycle is wanted, read after every callback above (one may
+                // have asked for a frame), and the fd watch once a harness exists. Pending service
+                // work is zero here: this run just consumed it.
+                let (need, fd) = match &*live_state.borrow() {
+                    LiveState::Ready(session) => (
+                        tick_still_wanted(TickInputs {
+                            animating: session.last_animating.get(),
+                            wants_frame: session.wants_frame.get(),
+                            exit_pending: session.harness.has_neovim_exited() && !session.close_requested.get(),
+                            service_pending: false,
+                        }),
+                        Some(session.harness.event_loop_fd()),
+                    ),
+                    other => (
+                        sessionless_tick_should_render(other, failed_painted_for_tick.get()),
+                        None,
+                    ),
+                };
+                if let (Some(fd), Some(driver)) = (fd, driver_for_service.upgrade()) {
+                    driver.watch_fd(fd);
+                }
+                need
             });
+            tick_driver.attach(&gl_area, service);
+            tick_driver.kick();
         }
 
         Self {
@@ -1775,6 +1890,7 @@ impl NeovideEditorPane {
             scale_watch,
             cell_size_callback,
             start_failed_callback,
+            tick_driver,
         }
     }
 
@@ -1835,7 +1951,7 @@ impl NeovideEditorPane {
     /// Registers `callback`, called with the new value each time `g:neovide_fullscreen` changes in
     /// nvim -- a `:let`, a mapping, or a value `init.lua` set (reported on the first tick after
     /// nvim is ready). This pane owns no window, so it acts on nothing itself: the host owns the
-    /// real window and follows the variable. Read from the tick callback. **Corrected 2026-09-23:**
+    /// real window and follows the variable. Read by the service run (the tick callback, or the fd watch). **Corrected 2026-09-23:**
     /// this used to claim that while this pane's widget is hidden (`set_visible(false)`, e.g. a
     /// pane zoom) a change waits until it is shown again. An adversarial recheck found that
     /// unverified and, per GTK 4.22.5's own source, most likely false: `gtkwidget.c` disconnects a
@@ -1879,10 +1995,11 @@ impl NeovideEditorPane {
     /// in nvim -- a `:let`, a mapping, or a value `init.lua` set (reported on the first tick after
     /// nvim is ready). This pane owns no window and applies the scale to its own renderer already
     /// (inside `LiveHarness::render_frame`); a host follows the callback to scale anything of its
-    /// own alongside the editor. Read from the tick callback -- see
+    /// own alongside the editor. Read by the service run (tick callback or fd watch) -- see
     /// [`on_fullscreen_setting`](Self::on_fullscreen_setting)'s own doc (corrected 2026-09-23) for
-    /// what is and is not known about whether hiding this pane's widget pauses that tick: most
-    /// likely it does not, per GTK's own source, but that has never been confirmed on a screen.
+    /// what is and is not known about whether hiding this pane's widget pauses the tick (since the
+    /// typing-latency fix the fd watch services a hidden or unrealized pane regardless, and the tick
+    /// exists only while a frame is wanted).
     /// `shell`'s zoom-together pending model (`shell/src/text_size.rs`) no longer has any
     /// time-based fallback for a paused tick to defeat -- a write it makes stays pending, however
     /// long nvim takes to answer, rather than assuming a fixed delay and going stale against it.
@@ -1911,12 +2028,11 @@ impl NeovideEditorPane {
     /// on -- `shell`'s `Ctrl+a Ctrl+a`. Dropped, with a log line, before nvim is ready.
     pub fn send_keys(&self, keys: &str) {
         if let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() {
+            // Forwarded to nvim only; its reply requests the frame.
             session.harness.send_text_input(keys);
-            session.wants_frame.set(true);
         } else {
             println!("[live] send_keys({keys:?}) before nvim is ready -- dropped");
         }
-        self.widget.queue_render();
     }
 
     /// Whether nvim is up, so a host can refuse a request `send_keys` would drop (phase 3: the
@@ -1925,7 +2041,7 @@ impl NeovideEditorPane {
         matches!(&*self.live_state.borrow(), LiveState::Ready(_))
     }
 
-    /// Whether nvim is up and has not exited, as of the last tick's pump. Unlike
+    /// Whether nvim is up and has not exited, as of the last service run's pump (tick or fd watch). Unlike
     /// [`is_ready`](Self::is_ready), which stays `true` from an unrequested exit until the host
     /// [`release_exited`](Self::release_exited) the pane: a host deciding whether nvim can still be
     /// asked something (a window close's `:confirm qall`) asks this.
@@ -2001,6 +2117,8 @@ impl NeovideEditorPane {
         match nvim_rpc::WatchedCall::start("exec_lua", call, probe) {
             Ok(watched) => {
                 session.watched = Some(watched);
+                // Buys one service run and one frame (the tick starts); nothing in `service` reads
+                // `session.watched`, so this is not what keeps the watch alive.
                 session.wants_frame.set(true);
                 true
             }
@@ -2158,6 +2276,8 @@ impl NeovideEditorPane {
             return false;
         }
         session.close_requested.set(true);
+        // The harness (and its event loop's fd) is dropped just below: no watch may outlive it.
+        self.tick_driver.unwatch_fd();
         session.harness.shutdown();
         *live = LiveState::Exited;
         println!("[live] nvim exited and the host released the pane; it stays empty");
@@ -2187,6 +2307,8 @@ impl NeovideEditorPane {
             session.ending.set(Some((at, schedule)));
             // On this thread, blocking: `end` closes stdin itself when the schedule says, since an
             // earlier `end_nvim`'s timer cannot run until this returns.
+            // No watch on the fd of a harness that is being torn down.
+            self.tick_driver.unwatch_fd();
             let harness = &mut session.harness;
             let ended = nvim_child::end(&session.nvim_process, at, schedule, &mut || harness.hang_up());
             println!("[live] shutdown(): nvim's stdin is closed ({ended:?}); tearing the harness down");
@@ -2222,10 +2344,13 @@ mod tests {
             Duration::from_millis(50),
             "S3's measured fix; another delay, or a frame-clock tick, needs the same 50-cycle check first"
         );
+        let _serial = crate::DEFAULT_CONTEXT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
-            .expect("no other test in this crate runs the default main context");
+            .expect("tests that run the default main context take DEFAULT_CONTEXT_TEST_LOCK first");
         // Longer than the product's 50ms on purpose: "nothing in the same turn" is checked by running
         // the loop once without blocking, and a test thread descheduled for longer than the delay
         // would see the render fire there and fail for a reason that is not the code's.

@@ -80,8 +80,12 @@ type Point = (f64, f64);
 #[derive(Clone, Copy, Debug)]
 struct Sample {
     at: Instant,
+    /// When GTK emitted `render` for this frame (the pump of nvim's batch happens inside it).
+    render_at: Instant,
     center: Option<Point>,
     pixels: usize,
+    /// Near-white pixels in the captured region; only counted while `Capture::count_white` is set.
+    white: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -101,6 +105,7 @@ struct Capture {
     error: RefCell<Option<String>>,
     keep_frame: Cell<bool>,
     frame: RefCell<Option<FramePixels>>,
+    count_white: Cell<bool>,
 }
 
 struct FramePixels {
@@ -118,6 +123,10 @@ impl FramePixels {
         &self.rgba[index..index + 4]
     }
 
+    fn white(&self) -> usize {
+        self.rgba.chunks_exact(4).filter(|rgba| is_white(rgba)).count()
+    }
+
     fn cursor(&self) -> (Option<Point>, usize) {
         let (mut count, mut sum_x, mut sum_y) = (0usize, 0.0, 0.0);
         for (index, rgba) in self.rgba.chunks_exact(4).enumerate() {
@@ -132,6 +141,10 @@ impl FramePixels {
     }
 }
 
+fn is_white(rgba: &[u8]) -> bool {
+    rgba[0] > 200 && rgba[1] > 200 && rgba[2] > 200
+}
+
 fn is_cursor(rgba: &[u8]) -> bool {
     rgba[0] > 160 && rgba[1] < 80 && rgba[2] < 80
 }
@@ -142,6 +155,7 @@ struct HookData {
     area: usize,
     count: Rc<Cell<u64>>,
     framebuffer: Rc<Cell<i32>>,
+    emitted_at: Rc<Cell<Instant>>,
 }
 
 struct RenderCounter {
@@ -149,6 +163,7 @@ struct RenderCounter {
     hook: libc::c_ulong,
     count: Rc<Cell<u64>>,
     framebuffer: Rc<Cell<i32>>,
+    emitted_at: Rc<Cell<Instant>>,
 }
 
 impl RenderCounter {
@@ -162,6 +177,7 @@ impl RenderCounter {
             // GTK emits this signal only on the main thread; HookData lives until removal.
             let data = unsafe { &*(data as *const HookData) };
             if len > 0 && unsafe { glib::gobject_ffi::g_value_get_object(values) } as usize == data.area {
+                data.emitted_at.set(Instant::now());
                 data.count.set(data.count.get() + 1);
                 let get = unsafe { gl_proc("glGetIntegerv") };
                 if !get.is_null() {
@@ -181,6 +197,7 @@ impl RenderCounter {
 
         let count = Rc::new(Cell::new(0));
         let framebuffer = Rc::new(Cell::new(0));
+        let emitted_at = Rc::new(Cell::new(Instant::now()));
         let signal =
             unsafe { glib::gobject_ffi::g_signal_lookup(c"render".as_ptr(), GLArea::static_type().into_glib()) };
         assert_ne!(signal, 0, "GtkGLArea has no render signal");
@@ -188,6 +205,7 @@ impl RenderCounter {
             area: area.as_ptr() as usize,
             count: count.clone(),
             framebuffer: framebuffer.clone(),
+            emitted_at: emitted_at.clone(),
         }));
         let hook = unsafe {
             glib::gobject_ffi::g_signal_add_emission_hook(signal, 0, Some(emitted), data.cast(), Some(destroy))
@@ -198,6 +216,7 @@ impl RenderCounter {
             hook,
             count,
             framebuffer,
+            emitted_at,
         }
     }
 }
@@ -337,6 +356,7 @@ impl PaintObserver {
         let area = area.clone();
         let count = counter.count.clone();
         let framebuffer = counter.framebuffer.clone();
+        let emitted_at = counter.emitted_at.clone();
         let handler = clock.connect_after_paint(move |_| {
             let renders = count.get();
             if !capture.enabled.get() || renders == capture.last_render.get() {
@@ -346,10 +366,13 @@ impl PaintObserver {
             match read_frame(&area, framebuffer.get(), capture.region.get()) {
                 Ok(frame) => {
                     let (center, pixels) = frame.cursor();
+                    let white = if capture.count_white.get() { frame.white() } else { 0 };
                     capture.samples.borrow_mut().push(Sample {
                         at: Instant::now(),
+                        render_at: emitted_at.get(),
                         center,
                         pixels,
+                        white,
                     });
                     if capture.keep_frame.get() {
                         *capture.frame.borrow_mut() = Some(frame);
@@ -874,6 +897,399 @@ fn presentation_lifetime(
     capture.enabled.set(false);
 }
 
+// ---- Typing-latency cases (2026-09-29, plan `2026-09-29-typing-latency-fix.md`, Task 4) --------------
+//
+// Redraws are event driven: nvim's batch wakes the pane through an fd watch, the tick runs only while a
+// frame is wanted, and a key press no longer forces a stale frame. Each case prints its numbers.
+
+/// Runs the default main context, blocking between events (no sleep granularity of its own, so a
+/// wake-up is measured at its own latency), until `done()` holds or `timeout` passes.
+fn run_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let context = glib::MainContext::default();
+    let expired = Rc::new(Cell::new(false));
+    let flag = expired.clone();
+    let source = glib::timeout_add_local_once(timeout, move || flag.set(true));
+    let met = loop {
+        if done() {
+            break true;
+        }
+        if expired.get() {
+            break false;
+        }
+        context.iteration(true);
+    };
+    if !expired.get() {
+        source.remove();
+    }
+    met
+}
+
+fn wait_for(duration: Duration) {
+    run_until(duration, || false);
+}
+
+/// Until the pane has drawn nothing for `quiet` (animation over, tick stopped).
+fn settle(counter: &RenderCounter, quiet: Duration) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut last, mut since) = (counter.count.get(), Instant::now());
+    while since.elapsed() < quiet {
+        assert!(Instant::now() < deadline, "editor did not settle");
+        wait_for(Duration::from_millis(10));
+        if counter.count.get() != last {
+            last = counter.count.get();
+            since = Instant::now();
+        }
+    }
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    sorted[(((sorted.len() - 1) as f64) * p).round() as usize]
+}
+
+fn summary(values: &[f64]) -> (f64, f64, f64, f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        percentile(&sorted, 0.5),
+        percentile(&sorted, 0.9),
+        percentile(&sorted, 0.99),
+        sorted.last().copied().unwrap_or(f64::NAN),
+    )
+}
+
+/// White typed text on black, in insert mode on `row`, so a typed key is visible as near-white pixels.
+fn typing_setup(socket: &Path, row: u32) {
+    lua(
+        socket,
+        &format!(
+            "vim.cmd('highlight Normal guifg=#ffffff guibg=#000000'); \
+             vim.api.nvim_win_set_cursor(0,{{{row},0}}); vim.cmd('startinsert'); return 'ok'"
+        ),
+    );
+    assert_eq!(rpc(socket, "mode()"), "i");
+}
+
+fn typing_teardown(socket: &Path, counter: &RenderCounter) {
+    lua(
+        socket,
+        "vim.cmd('stopinsert'); vim.cmd('highlight Normal guifg=#000000 guibg=#000000'); return 'ok'",
+    );
+    settle(counter, Duration::from_millis(200));
+}
+
+struct Typing {
+    /// Key press to the start of the render whose frame shows it, milliseconds.
+    render_ms: Vec<f64>,
+    /// Key press to the end of that frame's paint.
+    paint_ms: Vec<f64>,
+    /// Renders between a key and the one showing it that showed nothing new (settled runs only).
+    empty_renders: usize,
+    misses: usize,
+    /// When each press was sent.
+    pressed: Vec<Instant>,
+}
+
+/// `presses` alternating `x` and `<BS>` in insert mode, each changing the white pixels of a band across
+/// `row`; `interval(i)` is the time from press `i` to press `i + 1` (None: wait for the pane to settle).
+fn typing_probe(
+    pane: &NeovideEditorPane,
+    capture: &Capture,
+    counter: &RenderCounter,
+    socket: &Path,
+    row: u32,
+    presses: usize,
+    mut interval: impl FnMut(usize) -> Option<Duration>,
+) -> Typing {
+    settle(counter, Duration::from_millis(200));
+    capture.region.set(Some(cell_region(pane, socket, row, 1, 70)));
+    capture.count_white.set(true);
+    capture.enabled.set(true);
+    capture.samples.borrow_mut().clear();
+    pane.widget().queue_render();
+    assert!(
+        run_until(Duration::from_secs(2), || !capture.samples.borrow().is_empty()),
+        "no frame to take the typing baseline from"
+    );
+    settle(counter, Duration::from_millis(100));
+    let mut baseline = capture.samples.borrow().last().unwrap().white;
+    let mut out = Typing {
+        render_ms: Vec::new(),
+        paint_ms: Vec::new(),
+        empty_renders: 0,
+        misses: 0,
+        pressed: Vec::new(),
+    };
+    for i in 0..presses {
+        let key = if i % 2 == 0 { "x" } else { "<BS>" };
+        let first = capture.samples.borrow().len();
+        let pressed = Instant::now();
+        out.pressed.push(pressed);
+        pane.send_keys(key);
+        let found = |samples: &[Sample]| samples[first..].iter().position(|s| s.white.abs_diff(baseline) >= 5);
+        let hit = run_until(Duration::from_millis(500), || {
+            found(&capture.samples.borrow()).is_some()
+        });
+        if hit {
+            let samples = capture.samples.borrow();
+            let index = found(&samples).unwrap();
+            let sample = samples[first + index];
+            out.render_ms
+                .push(sample.render_at.saturating_duration_since(pressed).as_secs_f64() * 1000.0);
+            out.paint_ms
+                .push(sample.at.saturating_duration_since(pressed).as_secs_f64() * 1000.0);
+            out.empty_renders += index;
+            baseline = sample.white;
+        } else {
+            out.misses += 1;
+        }
+        match interval(i) {
+            // Press to press, not hit to press: the caller's cadence is measured from the key.
+            Some(period) => wait_for(period.saturating_sub(pressed.elapsed())),
+            None => settle(counter, Duration::from_millis(150)),
+        }
+    }
+    capture.enabled.set(false);
+    capture.count_white.set(false);
+    out
+}
+
+fn report(name: &str, run: &Typing) {
+    let (p50, p90, p99, max) = summary(&run.render_ms);
+    let (q50, _, q99, _) = summary(&run.paint_ms);
+    println!(
+        "{name}: presses={} misses={} key->render start ms p50={p50:.2} p90={p90:.2} p99={p99:.2} max={max:.2}; \
+         key->paint end ms p50={q50:.2} p99={q99:.2}; renders showing nothing new between key and batch: {}",
+        run.render_ms.len() + run.misses,
+        run.misses,
+        run.empty_renders
+    );
+}
+
+/// Case 2 and F3's empty tick cycle (case 6 after a re-realize, `label`): settled insert-mode typing.
+fn settled_typing_cases(
+    pane: &NeovideEditorPane,
+    capture: &Capture,
+    counter: &RenderCounter,
+    socket: &Path,
+    label: &str,
+    failures: &mut Vec<String>,
+) {
+    typing_setup(socket, 12);
+    let clock = pane.widget().frame_clock().expect("realized editor frame clock");
+    settle(counter, Duration::from_millis(300));
+    let (frames, renders) = (clock.frame_counter(), counter.count.get() as i64);
+    let run = typing_probe(pane, capture, counter, socket, 12, 100, |_| None);
+    settle(counter, Duration::from_millis(300));
+    let (frames, renders) = (clock.frame_counter() - frames, counter.count.get() as i64 - renders);
+    typing_teardown(socket, counter);
+    report(label, &run);
+    // F3: a frame clock frame that ran no render is an empty tick cycle. The last frame of each key's
+    // animation stops the tick itself, so there is none (the old code kept one armed after every key).
+    println!(
+        "{label}: over 100 keys the frame clock ran {frames} frames for {renders} renders \
+         ({} without a render)",
+        frames - renders
+    );
+    if frames - renders > 2 {
+        failures.push(format!(
+            "{label}: {} frame clock frame(s) ran no render over 100 keys (an empty tick cycle after \
+             the last animating frame; want <= 2)",
+            frames - renders
+        ));
+    }
+    let (p50, ..) = summary(&run.render_ms);
+    if run.misses > 0 || run.render_ms.len() < 100 {
+        failures.push(format!("{label}: {} of 100 presses never reached a frame", run.misses));
+    }
+    if p50.is_nan() || p50 > 3.0 {
+        failures.push(format!("{label}: key -> render p50 {p50:.2} ms exceeds 3 ms"));
+    }
+}
+
+fn typing_latency_cases(
+    pane: &NeovideEditorPane,
+    fixed: &gtk4::Fixed,
+    capture: &Capture,
+    counter: &RenderCounter,
+    socket: &Path,
+    failures: &mut Vec<String>,
+) {
+    capture.enabled.set(false);
+    settle(counter, Duration::from_millis(300));
+
+    // Case 1: a settled pane draws nothing. The frame clock's own counter is the pane's clock: with the
+    // tick registered only while a frame is wanted, an idle window has no frame to count (pristine ~120).
+    let clock = pane.widget().frame_clock().expect("realized editor frame clock");
+    let (frames, renders) = (clock.frame_counter(), counter.count.get());
+    wait_for(Duration::from_secs(2));
+    let advanced = clock.frame_counter() - frames;
+    println!(
+        "case 1 settled idle 2 s: frame clock advanced {advanced}, renders {}",
+        counter.count.get() - renders
+    );
+    if advanced > 2 {
+        failures.push(format!(
+            "case 1: settled idle advanced the frame clock {advanced} times (want <= 2)"
+        ));
+    }
+
+    // Case 2 (and the empty-tick-cycle half of F3, case 5).
+    settled_typing_cases(pane, capture, counter, socket, "case 2 settled typing", failures);
+
+    // Case 3: no render between a key and its batch. Insert-mode mappings hand `x` and `<BS>` to nvim after
+    // an 8 ms delay, so the batch reliably arrives well after the key. A pane that draws on the next tick
+    // after a key press (the old behaviour) draws a stale frame in that gap about half the time (8 of every
+    // 16.7 ms); an event-driven one draws nothing until the batch is there.
+    typing_setup(socket, 12);
+    lua(
+        socket,
+        "vim.keymap.set('i','x',function() vim.defer_fn(function() vim.api.nvim_feedkeys('x','nt',false) end,8) end); \
+         vim.keymap.set('i','<BS>',function() vim.defer_fn(function() \
+         vim.api.nvim_feedkeys(vim.keycode('<BS>'),'nt',false) end,8) end); return 'ok'",
+    );
+    let delayed = typing_probe(pane, capture, counter, socket, 12, 100, |_| None);
+    lua(
+        socket,
+        "vim.keymap.del('i','x'); vim.keymap.del('i','<BS>'); return 'ok'",
+    );
+    typing_teardown(socket, counter);
+    report("case 3 typing, nvim replies 8 ms after the key", &delayed);
+    if delayed.misses > 0 || delayed.empty_renders != 0 {
+        failures.push(format!(
+            "case 3: {} render(s) between a key and its batch showed nothing new (want 0 of 100), {} miss(es)",
+            delayed.empty_renders, delayed.misses
+        ));
+    }
+
+    // Case 5 (F3): keys 100-140 ms apart, spanning the end of each cursor animation, no settling in between.
+    // The empty-tick-cycle half of F3 is counted in the settled runs above and below (frame clock frames
+    // against renders). Here the timing half is reported: a key landing while an animation still runs waits
+    // for that animation's next frame by design (one refresh at most, so it is not judged); one landing after
+    // its last frame must not wait for a cycle the old code kept armed. Wayland paces frames by the compositor's
+    // frame callbacks, so a key within one refresh of the previous frame waits for the callback whatever the
+    // tick does, which is why no gate on a latency is put on keys this close together.
+    typing_setup(socket, 12);
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let burst = typing_probe(pane, capture, counter, socket, 12, 80, |_| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        Some(Duration::from_millis(100 + (seed >> 33) % 41))
+    });
+    typing_teardown(socket, counter);
+    report("case 5 keys 100-140 ms apart", &burst);
+    if burst.misses > 0 {
+        failures.push(format!("case 5: {} key(s) never reached a frame", burst.misses));
+    }
+
+    // Case 4 (F1): sustained nvim output must not starve paints.
+    let ticks = Rc::new(Cell::new(0u64));
+    let tick_id = {
+        let ticks = ticks.clone();
+        fixed.add_tick_callback(move |_, _| {
+            ticks.set(ticks.get() + 1);
+            glib::ControlFlow::Continue
+        })
+    };
+    settle(counter, Duration::from_millis(200));
+    let refresh_us = clock.refresh_info(clock.frame_time()).0.max(1);
+    let refresh_hz = 1_000_000.0 / refresh_us as f64;
+    lua(
+        socket,
+        "local n=0; vim.fn.timer_start(1, function() n=n+1; \
+         vim.api.nvim_buf_set_lines(0,0,1,false,{tostring(n)}) end, {['repeat']=-1}); return 'ok'",
+    );
+    wait_for(Duration::from_millis(300));
+    let (renders, widget_ticks, at) = (counter.count.get(), ticks.get(), Instant::now());
+    wait_for(Duration::from_secs(2));
+    let seconds = at.elapsed().as_secs_f64();
+    let (rendered, ticked) = (counter.count.get() - renders, ticks.get() - widget_ticks);
+    rpc(socket, "timer_stopall()");
+    tick_id.remove();
+    println!(
+        "case 4 flood, nvim timer every 1 ms for {seconds:.2} s: refresh {refresh_hz:.1} Hz, renders {rendered} \
+         ({:.1}/s, {:.0} % of refresh), second widget's ticks {ticked} ({:.1}/s)",
+        rendered as f64 / seconds,
+        100.0 * rendered as f64 / seconds / refresh_hz,
+        ticked as f64 / seconds
+    );
+    if (rendered as f64 / seconds) < 0.8 * refresh_hz {
+        failures.push(format!(
+            "case 4: {rendered} renders in {seconds:.2} s under a redraw flood, below 80 % of {refresh_hz:.1} Hz"
+        ));
+    }
+    if (ticked as f64 / seconds) < 0.8 * refresh_hz {
+        failures.push(format!(
+            "case 4: a second widget's tick ran {ticked} times in {seconds:.2} s under the flood (starved)"
+        ));
+    }
+    lua(
+        socket,
+        "vim.api.nvim_buf_set_lines(0,0,1,false,{string.rep(' ',80)}); return 'ok'",
+    );
+    settle(counter, Duration::from_millis(300));
+
+    // Case 7 (F2): a fullscreen change consumed by a paint that is not animating still reaches the host.
+    let fullscreen = Rc::new(Cell::new(None::<(Instant, bool)>));
+    {
+        let fullscreen = fullscreen.clone();
+        pane.on_fullscreen_setting(move |value| fullscreen.set(Some((Instant::now(), value))));
+    }
+    for target in [true, false] {
+        fullscreen.set(None);
+        settle(counter, Duration::from_millis(200));
+        rpc(
+            socket,
+            &format!(
+                "execute('let g:neovide_fullscreen={}')",
+                if target { "v:true" } else { "v:false" }
+            ),
+        );
+        // Nothing has iterated the main loop since: the notification is queued on the harness's
+        // channel, and the paint below reads it first (measured, not assumed: with the post-render
+        // service kick removed this case fails, so the idle-priority fd watch does not win the race).
+        std::thread::sleep(Duration::from_millis(30));
+        let asked = Instant::now();
+        pane.widget().queue_render();
+        let reached = run_until(Duration::from_millis(200), || fullscreen.get().is_some());
+        match fullscreen.get() {
+            Some((at, value)) if reached && value == target => println!(
+                "case 7 fullscreen={target}: reached the host {:.1} ms after the paint was asked for",
+                at.duration_since(asked).as_secs_f64() * 1000.0
+            ),
+            other => failures.push(format!(
+                "case 7: `let g:neovide_fullscreen={target}` did not reach the host within 200 ms ({other:?})"
+            )),
+        }
+    }
+}
+
+/// Case 8 (F2, last: it ends the session): `:qa!` consumed by a paint that is not animating still fires
+/// `on_exited_unrequested`.
+/// Measured: it stays green with only the F2 kick removed (`exit_pending` in `tick_still_wanted` also keeps the
+/// tick for an unhandled exit) and goes red with both removed, so it guards the pair, not F2's exit branch alone.
+fn exit_case(pane: &NeovideEditorPane, counter: &RenderCounter, socket: &Path, failures: &mut Vec<String>) {
+    let exited = Rc::new(Cell::new(None::<Instant>));
+    {
+        let exited = exited.clone();
+        pane.on_exited_unrequested(move || exited.set(Some(Instant::now())));
+    }
+    settle(counter, Duration::from_millis(300));
+    rpc(socket, "timer_start(0, {-> execute('qa!')})");
+    std::thread::sleep(Duration::from_millis(60));
+    let asked = Instant::now();
+    pane.widget().queue_render();
+    let reached = run_until(Duration::from_millis(200), || exited.get().is_some());
+    match exited.get() {
+        Some(at) if reached => println!(
+            "case 8 exit: on_exited fired {:.1} ms after the paint was asked for",
+            at.duration_since(asked).as_secs_f64() * 1000.0
+        ),
+        _ => failures.push("case 8: `:qa!` did not reach on_exited_unrequested within 200 ms".into()),
+    }
+}
+
 fn presentation(pane: &NeovideEditorPane) -> &'static str {
     if pane.draws_into_own_buffers() {
         "own dmabuf buffers"
@@ -882,6 +1298,7 @@ fn presentation(pane: &NeovideEditorPane) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the run threads the one fixture through every case
 fn run(
     pane: &NeovideEditorPane,
     fixed: &gtk4::Fixed,
@@ -953,8 +1370,18 @@ fn run(
         ));
     }
     println!("settled idle: renders={extra}");
+    typing_latency_cases(pane, fixed, capture, counter, socket, &mut failures);
     presentation_lifetime(pane, fixed, socket, capture, counter, observer);
     println!("presentation after re-realize: {}", presentation(pane));
+    // Case 6: the re-realized pane keeps its session and its fd watch (added once per harness); case 2/3 hold again.
+    settled_typing_cases(
+        pane,
+        capture,
+        counter,
+        socket,
+        "case 6 typing after re-realize",
+        &mut failures,
+    );
     let counts = pane.presentation_counts();
     println!(
         "presentation counts: own frames={} GtkGLArea frames={} own-buffer failures={}",
@@ -977,6 +1404,7 @@ fn run(
         }
         _ => {}
     }
+    exit_case(pane, counter, socket, &mut failures);
     failures
 }
 
