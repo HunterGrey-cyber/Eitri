@@ -27,8 +27,8 @@ import type { BuiltSelection, Caret, SelectionLike, VisualModel } from "./visual
 import { appendQuote, formatQuote } from "./quote";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
-import { buildTimeline, oldestPendingPermission, promptIndex } from "./timeline";
-import { buildDisplay, indexOfKey } from "./display";
+import { buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter } from "./timeline";
+import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { outputText, primaryText } from "./copyText";
 import { countCodePoints } from "./toolRegistry";
 import { findMatch } from "./search";
@@ -40,11 +40,13 @@ import {
   currentStop,
   hintTargets,
   isActivatableControl,
+  linkOpensAtOnce,
   nextControl,
   permissionTarget,
   rowIndexOf,
   rowOf,
   stopOf,
+  webLinks,
   HINT_ALPHABET,
 } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
@@ -52,7 +54,8 @@ import type { TimelineItem } from "./timeline";
 import { pathsIn, viewText } from "./paths";
 import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
-import { acceptsEnvelope, activeTabInfo, forgetClosed, saveView, takeView, withoutHandoff } from "./tabs";
+import { LinkPick } from "./components/LinkPick";
+import { acceptsEnvelope, activeTabInfo, countedTabTarget, forgetClosed, saveView, takeView, withoutHandoff } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
@@ -135,10 +138,32 @@ export function accumulateMotionCount(count: number | null, digit: number): numb
   return Math.min(MAX_MOTION_COUNT, (count ?? 0) * 10 + digit);
 }
 
+/** The row `gg`/`G` lands on: first or last without a count, otherwise row N starting at 1 and
+ *  clamped to the available rows. A shared pure function keeps the scroll announcement and jump
+ *  in agreement and makes the clamp testable without a DOM. */
+export function jumpTarget(to: "first" | "last", count: number | null, rows: number): number {
+  const last = Math.max(rows - 1, 0);
+  if (count === null) return to === "first" ? 0 : last;
+  return Math.max(0, Math.min(count, rows) - 1);
+}
+
 /** The band message when `a`/`d`/`D`, or Enter on a card button, is refused because another key
  *  came within `TYPING_GUARD_MS` (`./typingGuard`). It asks the user to pause because even
  *  `Esc` followed quickly by `a` is refused, without any prose being typed. */
 const TYPING_FLASH = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
+/** The band message when `a`/`d`/`D`, or Enter/Space on a card button, follows a count such as
+ *  `3a`. Card answers take no count, so the key answers nothing. */
+const COUNT_ANSWER_FLASH = "a / d / D take no count — press it on its own";
+/** The band message when Enter on a card button is refused because a modifier is held. This
+ *  includes Shift, which `isPlainAnswerKey` permits for `D`. */
+const MODIFIED_ENTER_FLASH = "Enter with a modifier answers no card";
+/** The band message when Enter on a card button is refused because focus did not just land
+ *  there through `l`/`h`, Tab, or a HINT. This prevents Enter after intervening text from
+ *  approving the card natively. */
+const ENTER_LANDING_FLASH = "Enter answers a card right after l, h or Tab onto its button";
+/** Message shown when Enter lands on a card other than the cursor's `permissionTarget`.
+ *  Tab can move between cards' buttons while the row cursor stays on the earlier card. */
+const ENTER_ELSEWHERE_FLASH = "Enter answers the card under the cursor — j / k onto it first";
 /** The band message when `a`/`d`/`D` have no card under the cursor or gating the tool call
  *  under it, and no card waits elsewhere. This gives feedback instead of silently doing
  *  nothing. */
@@ -146,6 +171,9 @@ const NO_CARD_FLASH = "no card here — i, o, A or Ctrl+j to type";
 /** The refusal message when a card is waiting elsewhere. It points back to the card, like the
  *  activity line's "j to it", rather than only suggesting typing. */
 const CARD_ELSEWHERE_FLASH = "a / d answer the card under the cursor — j / k onto it, then a / d";
+/** Message shown when `]p`/`[p` finds no card waiting for an answer in this tab.
+ *  Cards may be absent, already answered here, or inert because the session ended. */
+const NO_WAITING_CARD_FLASH = "no card waiting here";
 /** The v1-ui GUI pass (2026-09-27): what the band says when Enter or Space on the activity line's
  *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
  *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
@@ -452,10 +480,12 @@ export default function App() {
    *  can make the card answerable again, such as when an Always allow rule cannot be saved.
    *  Each `command_result` removes its entry.
    *  `"editor"` covers `edit_draft`, `open_path` and `view_in_editor`; refusals use a footer flash.
+   *  `"link"` tracks `gx`'s `open_url`. Rust refuses non-http(s) addresses with a footer flash,
+   *  rather than passing the refusal to the conversation error banner.
    *  `"picker-send"` calls `sendMessage` without clearing the composer, unlike an ordinary `"send"`.
    *  Its refusal only flashes; restoring its text into the composer would overwrite an unrelated draft. */
   const inFlight = useRef<
-    Map<string, { kind: "send" | "handoff" | "editor" | "permission" | "picker-send"; tab: TabId; text?: string; permissionId?: string }>
+    Map<string, { kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send"; tab: TabId; text?: string; permissionId?: string }>
   >(new Map());
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
@@ -534,6 +564,10 @@ export default function App() {
   /** The empty tab's landing mode on mount or switch: the latest `enter_input` requests INPUT;
    *  `arrive` or a tab switch requests BROWSE. Launch starts in INPUT. */
   const [emptyLanding, setEmptyLanding] = useState<PanelMode>("input");
+  /** Bumped by `dropPendingKeys()` so cancel routes also clear the empty tab's pending prefix
+   *  and leader sequence through `EmptyTab`'s `dropKeysRequest`. A counter lets repeated
+   *  requests act. */
+  const [emptyDropKeys, setEmptyDropKeys] = useState(0);
   /** The empty tab's own mode, reported by `EmptyTab`, for the band drawn under it. */
   const [emptyMode, setEmptyMode] = useState<PanelMode>("input");
   /** Bumped by each `focus_permission` envelope. A counter lets the handler stay installed once
@@ -713,24 +747,33 @@ export default function App() {
   /** The open `/` prompt and the cursor position when it opened; `lastSearchRef` holds what `n`/`N` repeat. */
   const [search, setSearch] = useState<{ query: string; origin: number } | null>(null);
   const lastSearchRef = useRef("");
+  /** The open `:` command line's text, or `null` while closed. It runs no command, so keys such as
+   *  `:ls` land in a text box instead of on a card. It closes wherever the `/` prompt closes,
+   *  including when an overlay returns focus to the root. Opening either line closes the other. */
+  const [exLine, setExLine] = useState<string | null>(null);
+  /** Bumped by every `/`, `:` and `panel.search` request and passed to `SearchBar` as `focusRequest`.
+   *  Repeating a line's key restores its focus after a click elsewhere, instead of just clearing it.
+   *  A newly opened line takes focus on mount. Only one line is open at a time, so both share this
+   *  counter. */
+  const [lineFocusRequest, setLineFocusRequest] = useState(0);
   function moveCursorTo(index: number) {
     const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
     noteUserScroll(list, index < cursor ? "up" : "down");
     setCursor(index);
   }
-  /** The first key of a two-key BROWSE sequence (`resolveKey`'s `{kind:"pending"}`), or `null`
-   *  between sequences. Cleared on EVERY key `onKeyDown` sees, so anything but the matching second
-   *  half cancels it, and on every `pane_focus` envelope, so a pane switch the WebView never saw as
-   *  a key cancels it too; handed to `resolveKey` in its context so the key table itself keeps no
-   *  memory. (Formerly `pendingGRef`, a plain boolean, before `[[`/`]]` gave BROWSE a second prefix.) */
+  /** The first key of a two-key BROWSE sequence (`g`, `z`, `[`, `]` or `Ctrl+w`), or `null`.
+   *  Cleared on every key `onKeyDown` sees, so only the matching second key completes it.
+   *  Also cleared on every `pane_focus` envelope to cancel across pane switches handled by GTK.
+   *  Passed to `resolveKey` in its context so the key table keeps no memory. */
   const pendingRef = useRef<PendingPrefix | null>(null);
-  /** The count accumulated from `1`-`9` followed by `0`-`9`, applied to the next
-   *  `j`/`k`/`[[`/`]]` and reset by it or any other action. `null` before any digit. Kept in a
-   *  ref because `onKeyDown` reads it without rendering it. */
+  /** The count starts with `1`-`9` and continues with `0`-`9`. It applies to the next
+   *  `j`/`k`/`[[`/`]]`/`G`/`gg`/`gt`/`gT`; a prefix passes it to its second key. Any completed
+   *  action resets it. `null` means no digits yet. A ref lets `onKeyDown` read it without
+   *  rendering it. */
   const countRef = useRef<number | null>(null);
   /** A leader/table sequence in progress (`./leader`'s `startSequence`/`advanceSequence`), or
    *  `null` between sequences -- the engine's OWN pending state, distinct from `pendingRef` above,
-   *  which is `resolveKey`'s four reserved two-key prefixes (`g`/`z`/`[`/`]`) and predates this
+   *  which is `resolveKey`'s five reserved two-key prefixes (`g`/`z`/`[`/`]`/`Ctrl+w`) and predates this
    *  plan. A ref for `onKeyDown` to read synchronously (the same reason `pendingRef` is one) mirrored
    *  into `seq` (state) so the box can render what it names. */
   const seqRef = useRef<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
@@ -787,6 +830,18 @@ export default function App() {
     cancelBoxTimer();
     cancelSeqTimeoutTimer();
     hideBox();
+  }
+  /** Cancels a pending prefix, count and leader sequence together on pane arrivals, overlays,
+   *  tab switches and Shift+Tab. Also clears the empty tab's local prefix and sequence.
+   *  Uses only refs and state setters, so listeners installed once can call it safely. */
+  function dropPendingKeys() {
+    pendingRef.current = null;
+    countRef.current = null;
+    clearSequence();
+    setEmptyDropKeys((n) => n + 1);
+    // A `gx` picker waiting for a letter is pending input too. Clear it on cancellation so the next
+    // typed letter cannot open a stale link.
+    setLinkPick(null);
   }
   useEffect(() => {
     cancelBoxTimer();
@@ -850,7 +905,10 @@ export default function App() {
         postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "info" });
         break;
       case "panel.search":
+        // The `/` prompt replaces an open `:` line so only one command line owns the keys.
+        setExLine(null);
         setSearch({ query: "", origin: cursor });
+        setLineFocusRequest((n) => n + 1);
         break;
       case "panel.keymap":
         setKeymapOpen(true);
@@ -911,12 +969,26 @@ export default function App() {
   /** The paths for a `gf` letter picker, or `null` when none is waiting. Set by `open-path` and
    *  cleared by the letter that selects a path or any other key. */
   const [pathPick, setPathPick] = useState<PathRef[] | null>(null);
+  /** `gx` with several links -- or a titled one, or one nobody can see -- waiting for
+   *  its letter: the full normalized addresses it lists, in order, or `null` between picks. Like `pathPick`
+   *  it owns every key while set (`onKeyDown`, ahead of the key table), but it is also dropped by every route
+   *  away (`dropPendingKeys`, the tab switch): a pick left up would open a link on a later letter, over a
+   *  conversation that no longer holds it. */
+  const [linkPick, setLinkPick] = useState<string[] | null>(null);
   /** `open_path` and `view_in_editor` share `edit_draft`'s `"editor"` request handling.
    *  They have no tab-scoped reply payload to restore; a refusal only needs a footer flash. */
   function openPath(ref: PathRef) {
     const requestId = nextRequestId();
     inFlight.current.set(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
     postToRust({ type: "open_path", request_id: requestId, path: ref.path, ...(ref.line === null ? {} : { line: ref.line }) });
+  }
+  /** `gx` passes the normalized `href` shown to the reader, taken from a `webLinks` `url`, to
+   *  Rust. Rust rechecks it with `web_url` and opens the system browser. Track it as `"link"` in
+   *  `inFlight` so a refusal flashes in the footer. */
+  function openUrl(url: string) {
+    const requestId = nextRequestId();
+    inFlight.current.set(requestId, { kind: "link", tab: activeTabRef.current ?? 0 });
+    postToRust({ type: "open_url", request_id: requestId, url });
   }
   /** The popover's own scrollable root -- unused today (it has nothing to scroll into view yet),
    *  kept for parity with `keymapOverlayRef` and because a forwarded ref is part of the component's
@@ -974,12 +1046,17 @@ export default function App() {
    *  unfixed, deliberately, rather than reaching for a heuristic that would trade a missed picker
    *  for a wrong one. */
   const pendingSlashPickerRef = useRef<SlashPickerKind | null>(null);
-  /** True while the chooser, slash picker, tab rename or live conversation's `/` prompt owns keys.
-   *  Gate the prompt on `sessionStarted`: stale search state under the empty layout must not
+  /** True while the chooser, slash picker, tab rename or live conversation's `/` or `:` line owns keys.
+   *  Gate the lines on `sessionStarted`: stale line state under the empty layout must not
    *  reserve keys for a `SearchBar` that never renders. `pane_focus` and `arrive` already close
    *  `?`, the detail popover and the handoff confirm. Focus effects use this flag to keep keys
    *  with the visible overlay. */
-  const overlayOpen = chooser !== null || slashPicker !== null || renaming !== null || (search !== null && sessionStarted);
+  const overlayOpen =
+    chooser !== null ||
+    slashPicker !== null ||
+    renaming !== null ||
+    (search !== null && sessionStarted) ||
+    (exLine !== null && sessionStarted);
   /** Counters `takeKeys` (below) bumps to ask a specific overlay/composer to re-focus itself,
    *  mirroring the existing `inputRequest`/`arriveRequest` convention: a plain number so a second
    *  request while the first is still pending is never silently coalesced away by React (an
@@ -1111,11 +1188,21 @@ export default function App() {
   /* An overlay drawn over the conversation takes the keys from the card a waiting answer was aimed
      at, whichever route opened it -- a key, an envelope, a click. */
   useEffect(() => {
-    if (keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null || overlayOpen) {
+    if (keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || confirm !== null || overlayOpen) {
       typingGuard.cancel();
     }
-  }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, confirm, overlayOpen]);
+  }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
+  /* A `gx` pick claims keys before the key table, so any other input or overlay taking focus
+     must end it. Otherwise the next letter would open a link instead of reaching that input.
+     Check the same overlays as the typing guard. `onKeyDown`'s `isEditableElement` check also
+     handles fields such as a card's reason box that take focus without changing our state. */
+  useEffect(() => {
+    if (linkPick === null) return;
+    if (mode !== "browse" || keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null || overlayOpen) {
+      setLinkPick(null);
+    }
+  }, [linkPick, mode, keymapOpen, detail, handoffOpen, pathPick, confirm, overlayOpen]);
   /* `slashReply` opens a picker only when no other overlay is open. Either way, consume it here.
      CARET/VISUAL/V-LINE also block the picker: focusing it would make the root's `onFocus` end
      the region via `exitRegion()`. Keep such replies as transcript text so an unrelated reply
@@ -1124,8 +1211,20 @@ export default function App() {
     if (slashReply === null) return;
     setSlashReply(null);
     const covered =
-      overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null || isRegionMode(modeRef.current);
-    if (!covered) setSlashPicker(slashReply);
+      overlayOpen ||
+      keymapOpen ||
+      detail !== null ||
+      handoffOpen ||
+      pathPick !== null ||
+      linkPick !== null ||
+      confirm !== null ||
+      isRegionMode(modeRef.current);
+    if (covered) return;
+    // Opening the picker cancels pending prefixes, counts and leader sequences. Its key handler returns
+    // before the usual pending-key reset, so stale input could otherwise consume the first key
+    // after the picker closes.
+    dropPendingKeys();
+    setSlashPicker(slashReply);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slashReply]);
   /** Kept focused so BROWSE's keydown handler actually receives keys: a keydown bubbles from
@@ -1144,7 +1243,7 @@ export default function App() {
   /** Routes keyboard arrivals through one focus handler so they cannot steal keys from an overlay.
    *  Handles `pane_focus`, `arrive`, `enter_input` and permission-card landings. Reads the current
    *  render's overlay and session state, so call it only from an effect after commit.
-   *  Focus order is the chooser, a tab rename, the `/` prompt, the live conversation,
+   *  Focus order is the chooser, slash picker, tab rename, `/` or `:` line, live conversation,
    *  then the empty tab's dashboard. */
   function takeKeys() {
     if (chooser !== null) {
@@ -1162,6 +1261,11 @@ export default function App() {
       return;
     }
     if (search !== null && sessionStarted) {
+      containerRef.current?.querySelector<HTMLInputElement>(".search-bar input")?.focus();
+      return;
+    }
+    // Focus the `:` command line like the search prompt; both use `SearchBar`.
+    if (exLine !== null && sessionStarted) {
       containerRef.current?.querySelector<HTMLInputElement>(".search-bar input")?.focus();
       return;
     }
@@ -1225,6 +1329,10 @@ export default function App() {
         tabMode: activeInfo?.mode ?? null,
       });
       if (route === "overlay") return;
+      // Shift+Tab follows any pending prefix, count or leader sequence, but `stopPropagation`
+      // prevents `onKeyDown` from clearing them. Clear them here for both routes. This uses only
+      // refs and state setters, so the listener installed once can call it.
+      dropPendingKeys();
       event.stopPropagation();
       // This capture-phase handler stops propagation, so Shift+Tab never reaches the bubble-phase typing
       // guard. Call `typingGuard.onKey` here to cancel deferred answers and count Shift+Tab when
@@ -1697,6 +1805,18 @@ export default function App() {
   useEffect(() => {
     landedControlRef.current = null;
   });
+  /** The control focused by an `h`/`l` move, plain Tab or HINT landing, with its
+   *  `typingGuard.keyCount()`. HINT labels do not reach this page, so use the count at landing.
+   *  Enter activates a card button only if this names that button at the preceding key count.
+   *  Write it where focus moves, not from key names. Later keys make it stale by count, so it
+   *  needs no clearing. Keep it in a ref for the dispatch installed once; `landedControlRef` is
+   *  cleared on every commit. */
+  const placedRef = useRef<{ el: HTMLElement; atKey: number } | null>(null);
+  /** The last plain Tab's `keyCount()` and native event until its focus move, or `null`.
+   *  The root's `onFocus` consumes this and records a landing only if the event's default was
+   *  not prevented. Check then, after all handlers have run, so a swallowed Tab cannot make an
+   *  unrelated later focus change count as a keyboard landing. */
+  const tabAtKeyRef = useRef<{ atKey: number; event: globalThis.KeyboardEvent } | null>(null);
 
   /** Set while a requested HINT is pending, until `endHint` or the timeout clears it.
    *  `shell` installs its key controller only after handling the script message. Until then, letters
@@ -1743,21 +1863,23 @@ export default function App() {
       if (payload.kind === "theme") {
         applyTheme(payload.vars);
       } else if (payload.kind === "pane_focus") {
-        // A pending prefix is for the very next key; a pane switch in between (GTK takes `Ctrl+h`/
-        // `Ctrl+k` before the WebView sees a keydown) must not leave it armed for a key pressed much
-        // later, when it would complete a chord nobody meant to start -- review.
-        pendingRef.current = null;
-        // Cancel the pending leader sequence and its box timer when focus changes. Switching away and back
-        // must not let an unrelated key complete an old sequence.
-        clearSequence();
+        // A prefix is for the next key. GTK captures pane-switch keys before the WebView sees them,
+        // so clear pending prefixes, counts, leader sequences and box timers here. Otherwise
+        // returning to the pane could complete a stale chord or apply an old count to a new `j`.
+        dropPendingKeys();
         // A keymap for THIS panel has no reason to stay drawn while another pane has the keys, and
         // leaving it up is how the review reproduced a dead keyboard: come back with `Ctrl+l`,
         // land in INPUT, and every keystroke is swallowed by the overlay's own branch (review).
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
-        // The `/` prompt belongs to this panel, so it closes here like the `?` overlay.
+        // The `/` prompt and `:` command line belong to this panel, so they close here like the `?`
+        // overlay.
         setSearch(null);
+        setExLine(null);
+        // A Tab that moved focus to another widget must not count a later focus return to this page
+        // as its landing.
+        tabAtKeyRef.current = null;
         setPaneFocused(payload.focused);
         // Losing focus cancels the bypass prompt. Regaining focus does not answer or cancel it; answers
         // come only from this pane's keydowns.
@@ -1787,15 +1909,13 @@ export default function App() {
         cancelBypassConfirm();
         // A reserved two-key prefix or a leader/table sequence armed from before this arrival means
         // nothing about it -- the same reason `pane_focus` cancels both.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         setEmptyLanding("browse");
         setArriveRequest((n) => n + 1);
       } else if (payload.kind === "focus_permission") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
         // that bubble from an overlay must not advance a stale sequence.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // The overlay would cover the card the cursor is about to land on.
         setKeymapOpen(false);
         setDetail(null);
@@ -1812,8 +1932,7 @@ export default function App() {
         // reason `pane_focus` and `arrive` cancel them, whether the effect below claims the chord or
         // answers it with `nav_fallthrough`. Left armed, `g`, Ctrl+j, Ctrl+k, `g` ran a stale `gg`
         //.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // V1 C1: the raw handler only records the request -- see `navKey`'s own doc
         // comment for why the decision has to live in an effect instead.
         navKeySeqRef.current += 1;
@@ -1874,11 +1993,11 @@ export default function App() {
         // GTK handles `prefix f` and its label keys before the WebView. Cancel the bypass prompt here so a
         // later copy key or composer keystroke cannot answer it. Rust cancels its prompt too.
         cancelBypassConfirm();
-        // Close the search prompt so HINT labels do not cover it or compete with `/` for keys.
+        // Close the `/` prompt and `:` line so HINT labels do not cover them or compete for keys.
         setSearch(null);
+        setExLine(null);
         // ...and the prefix the strip may still be waiting on, for the reason `pane_focus` does it.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // `exitRegion` above has only asked for the thawed list to render -- it does
         // not repaint synchronously, so the DOM here can still be the frozen VISUAL one. Collecting
         // targets from it misses any row that arrived during VISUAL (a linked permission card, a queued
@@ -1921,8 +2040,7 @@ export default function App() {
           typingGuard.cancel();
           // Cancel sequences from the old tab so a key in the new conversation cannot complete
           // them.
-          pendingRef.current = null;
-          clearSequence();
+          dropPendingKeys();
           // Flush the draft before the tab becomes inactive rather than waiting for the rest of its 300ms
           // debounce.
           flushDraft();
@@ -1976,9 +2094,13 @@ export default function App() {
           // Otherwise the next letter could open an old path: the `pathPick` key handler runs first
           // and does not check the active tab.
           setPathPick(null);
+          // Clear the `gx` pick too: it names links in the old tab's reply.
+          setLinkPick(null);
           cancelBypassConfirm(); // Cancel only when the active tab changes.
-          // The `/` prompt belongs to the old tab's conversation and must close on a tab switch.
+          // The `/` prompt and `:` command line belong to the old tab's conversation and must close
+          // on a tab switch.
           setSearch(null);
+          setExLine(null);
           setTurnClock(null);
           setHandoff(null);
           setFatalError(null);
@@ -2187,9 +2309,10 @@ export default function App() {
               // refusal is reported by name instead, with the full text so it is not lost.
               setCommandNotice(`A message to tab ${record.tab} was not sent (${payload.error}): ${record.text}`);
             }
-          } else if (record?.kind === "editor") {
-            // A scratch-editor round trip's own refusal is a footer nicety, not
-            // something that should fill the banner reserved for conversation-breaking errors.
+          } else if (record?.kind === "editor" || record?.kind === "link") {
+            // A scratch-editor round trip's own refusal, or `gx`'s address Rust would not
+            // open, is a footer nicety, not something that should fill the banner
+            // reserved for conversation-breaking errors.
             showFlash(payload.error);
           } else {
             if (record?.kind === "permission" && record.permissionId !== undefined && record.tab === activeTabRef.current) {
@@ -2277,8 +2400,7 @@ export default function App() {
       } else if (payload.kind === "begin_rename") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
         // that bubble from an overlay must not advance a stale sequence.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // A tab rename ends VISUAL explicitly because this branch does not otherwise set `mode`.
         exitRegion();
         // `prefix ,`: the tab bar stays on screen with an inline field open
@@ -2290,12 +2412,15 @@ export default function App() {
         // GTK claims `prefix ,`, so cancel the bypass prompt here before a name beginning with `y` can
         // answer it. Rust cancels its prompt too.
         cancelBypassConfirm();
+        // Close the `/` prompt and `:` line before renaming. Committing or cancelling the rename returns
+        // keys to the conversation root, which would leave either line drawn without focus.
+        setSearch(null);
+        setExLine(null);
         setRenaming({ tab: payload.tab, initial: payload.current ?? "" });
       } else if (payload.kind === "confirm_close") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
         // that bubble from an overlay must not advance a stale sequence.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // A close-tab confirmation ends VISUAL before taking the keys.
         exitRegion();
         // `prefix &`: drawn in the footer in place of the which-key strip,
@@ -2308,8 +2433,7 @@ export default function App() {
       } else if (payload.kind === "confirm_close_others") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
         // that bubble from an overlay must not advance a stale sequence.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // A close-others confirmation ends VISUAL before taking the keys.
         exitRegion();
         // `<leader>bo` opens a window-level confirmation. Close the conversation overlays so they cannot
@@ -2323,8 +2447,7 @@ export default function App() {
         // that bubble from an overlay must not advance a stale sequence. This bypass confirmation
         // stays above an open chooser: Shift+Tab there requests a mode cycle without leaving it, so
         // this confirmation must keep the chooser open.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // A bypass y/n prompt ends VISUAL so its next `y` answers the prompt
         // instead of copying the selection.
         exitRegion();
@@ -2338,8 +2461,7 @@ export default function App() {
       } else if (payload.kind === "chooser") {
         // An overlay or card landing cancels pending sequences, their boxes and reserved prefixes. Keys
         // that bubble from an overlay must not advance a stale sequence.
-        pendingRef.current = null;
-        clearSequence();
+        dropPendingKeys();
         // The chooser ends VISUAL before taking the keys.
         exitRegion();
         // `prefix w`: the other two overlays over the conversation area must not fight
@@ -2355,7 +2477,12 @@ export default function App() {
         setSlashReply(null);
         pendingSlashPickerRef.current = null;
         cancelBypassConfirm(); // Opening the chooser cancels the bypass prompt, not the
-        // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser.
+        // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser. Close
+        // the `/` prompt and `:` line too. Leaving the chooser returns keys to the conversation
+        // root through `onChooserLeave` and `returnKeysToRoot`. A line left drawn underneath would
+        // then show a command prompt while `l` and Enter could navigate to Approve and press it.
+        setSearch(null);
+        setExLine(null);
         setChooser({ open: payload.open, records: payload.records });
       } else if (payload.kind === "queue") {
         setQueue(payload.items);
@@ -2391,7 +2518,7 @@ export default function App() {
    *  Before the first `tabs` envelope, `activeTab` is `null` and `EmptyTab` is not mounted. Map that
    *  screen to `other` so Rust cannot claim `Ctrl+k` for a composer that does not exist. */
   const panelKeysMode: PanelKeysMode =
-    overlayOpen || keymapOpen || detail !== null || confirm !== null || pathPick !== null
+    overlayOpen || keymapOpen || detail !== null || confirm !== null || pathPick !== null || linkPick !== null
       ? "other"
       : sessionStarted
         ? sessionEnded
@@ -2413,7 +2540,7 @@ export default function App() {
    *  key. `keymapOpen`/`confirm` are checked here rather than left to `EmptyTab`:
    *  they are this component's own state, drawn over its layout, and `EmptyTab` has no prop carrying
    *  either -- forwarding `navKey` to it unfiltered would let it act on a request this effect has
-   *  already answered. `detail`/`pathPick` are live-tab-only by construction (neither ever renders
+   *  already answered. `detail`/`pathPick`/`linkPick` are live-tab-only by construction (none ever renders
    *  while `!sessionStarted`), so they are read only inside that branch below. */
   useEffect(() => {
     if (navKey === null) return;
@@ -2433,7 +2560,7 @@ export default function App() {
       setEmptyNavKey(navKey);
       return;
     }
-    if (detail !== null || pathPick !== null || sessionEnded) {
+    if (detail !== null || pathPick !== null || linkPick !== null || sessionEnded) {
       postToRust({ type: "nav_fallthrough", request_id: nextRequestId(), direction });
       return;
     }
@@ -2483,9 +2610,11 @@ export default function App() {
       setInputRequest((n) => n + 1);
       return;
     }
-    if (target.kind === "control") {
+    if (target.kind === "control" || target.kind === "link") {
       // An input (a permission card's reason box) takes the keys by being focused; a button is
-      // selected by being focused, drawn as the solid cursor block.
+      // selected by being focused, drawn as the solid cursor block. A web link is
+      // the same landing: focused, never clicked, its row current -- and Enter on it is then the browser's
+      // own activation (`LinkClicked`), not a key this panel claims.
       // A control inside a conversation row (a card's Approve) also brings the row cursor to that
       // row, the same place `l` would have reached it from: otherwise `h` from it would hand the
       // keys back to some other row, and `a`/`d` would answer a different card.
@@ -2495,6 +2624,10 @@ export default function App() {
       landedControlRef.current = target.el;
       setMode("browse");
       target.el.focus();
+      // Save a landing only if focus took; disabled controls cannot take focus.
+      // HINT labels do not reach this page, so the current key count identifies the landing
+      // for the next Enter, which may press this card button.
+      if (document.activeElement === target.el) placedRef.current = { el: target.el, atKey: typingGuard.keyCount() };
       return;
     }
     // A row or a code block: the row cursor goes there and the panel is back in BROWSE. The row's
@@ -2689,6 +2822,15 @@ export default function App() {
     // `enter_input` makes, which `EmptyTab`'s `Composer` answers by focusing its textarea.
     startScreenRef.current?.focus({ preventScroll: true });
     setInputRequest((n) => n + 1);
+  }
+
+  /** Feeds Enter and Esc from the `/` and `:` lines to the typing guard before their
+   *  callbacks run. `SearchBar` stops those keys, so `onKeyDown` never sees them; otherwise
+   *  an immediate `a` after closing a line could answer a card as though it stood alone.
+   *  Uses the same `event.timeStamp` clock as `onKeyDown`. */
+  function noteLineKey(event: KeyboardEvent<HTMLInputElement>) {
+    const cancelled = typingGuard.onKey(event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
+    if (cancelled !== null) showFlash(cancelled);
   }
 
   /** The `prefix w` chooser lists open tabs before saved sessions. Every callback closes the
@@ -2920,6 +3062,7 @@ export default function App() {
             // directly to it, including when a chooser covers an empty tab, because this layout has
             // no `App` conversation `containerRef`.
             keysRequest={emptyKeysRequest}
+            dropKeysRequest={emptyDropKeys}
             overlayOpen={overlayOpen}
             landing={emptyLanding}
             onModeChange={setEmptyMode}
@@ -3052,15 +3195,17 @@ export default function App() {
      input it cannot deliver. */
   const handingOff = tabs !== null && handoffRequests.has(tabs.active);
 
-  /** Defers `a`/`d`/`D` on a card. `stillThere` checks whether the target card can still
-   *  accept the answer, or is `null` when there is no card for the cursor. The answer runs
-   *  `TYPING_GUARD_MS` later, only if the key stood alone and nothing cancels the wait.
-   *  The card must still accept it and the panel must still be in BROWSE. */
+  /** Defers `a`/`d`/`D` on a card and Enter on its button. `stillThere` checks whether
+   *  the target can still accept the answer, or is `null` when no card is targeted.
+   *  Run `TYPING_GUARD_MS` later only if the key stood alone and nothing cancels the wait.
+   *  The card must still accept it and the panel must still be in BROWSE. Only Enter passes
+   *  `key` to `TypingGuard.defer` so a quick focus motion followed by Enter can answer. */
   function waitThenAnswer(
     event: KeyboardEvent<HTMLDivElement>,
     typedAt: number,
     stillThere: (() => boolean) | null,
     run: () => void,
+    key = "",
   ) {
     if (stillThere === null) {
       const waitingElsewhere = stateRef.current.pendingPermissions.some((p) => !answeredRef.current.has(p.permissionId));
@@ -3074,6 +3219,7 @@ export default function App() {
         if (stillThere() && modeRef.current === "browse") run();
       },
       TYPING_FLASH,
+      key,
     );
     if (!waiting) showFlash(TYPING_FLASH);
   }
@@ -3565,6 +3711,22 @@ export default function App() {
     // `f` or `L` says what did not happen, never the `a`/`d` text.
     const cancelled = typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typedAt);
     if (cancelled !== null) showFlash(cancelled);
+    // A plain Tab can create a focus landing at this key count only if its default remains allowed.
+    // Keep the native event so `onFocus` can check after all handlers run. A claimed Tab must
+    // not turn a later mouse focus into a keyboard landing.
+    tabAtKeyRef.current =
+      event.key === "Tab" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey
+        ? { atKey: typingGuard.keyCount(), event: event.nativeEvent }
+        : null;
+    // A card's own answer buttons (Approve, Deny, Always allow): see the Enter/Space rules below.
+    const onAnswerButton =
+      isActivatableControl(event.target) && (event.target as HTMLElement).closest("[data-nav-action]") !== null;
+    // The modal overlays below return before the card-button guards. Prevent Enter and Space here
+    // too, so a card button retaining focus under an overlay cannot activate through the
+    // browser default.
+    if ((chooser !== null || slashPicker !== null) && onAnswerButton && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+    }
     // The chooser is modal. Keys it does not handle can bubble here and would otherwise
     // reach `resolveKey`, where `a`/`d` could answer a card covered by the chooser. Return after
     // the typing guard sees the key so it still counts as typing after the chooser closes.
@@ -3582,6 +3744,19 @@ export default function App() {
       const index = HINT_ALPHABET.indexOf(event.key);
       if (index !== -1 && index < pathPick.length) openPath(pathPick[index]);
       setPathPick(null);
+      return;
+    }
+    // `gx` accepts only letters without Ctrl, Alt, Meta, Super or AltGr, excluding input-method
+    // composition, so Ctrl+a or Alt+s cannot open a link. Repeats and bare modifiers keep the
+    // pick waiting; other keys cancel it without acting. In a text field, cancel the pick and
+    // let the field receive the key.
+    if (linkPick !== null && isEditableElement(event.target)) setLinkPick(null);
+    else if (linkPick !== null) {
+      event.preventDefault();
+      if (event.repeat || isModifierKey(event.key)) return;
+      const index = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike) ? HINT_ALPHABET.indexOf(event.key) : -1;
+      if (index !== -1 && index < linkPick.length) openUrl(linkPick[index]);
+      setLinkPick(null);
       return;
     }
     // Esc closes `ContinueInTerminal`'s confirmation. Let other keys continue so Tab can reach its
@@ -3657,19 +3832,58 @@ export default function App() {
     // the only keyboard route to Approve. Other keys still reach the table, so `h`/`j`/`k`/`l` can
     // navigate from a focused button. On a card's answer buttons (Approve, Deny, Always allow) Space
     // is claimed and does nothing, since Claude Code's permission prompt confirms with Enter. Enter
-    // answers only through `mayAnswerNow`: no recent key, except an unbroken `h`/`l`/Tab walk onto
-    // the button that started with an isolated key. Other buttons keep native Enter and Space.
-    // Space during a pending leader sequence goes to that sequence, with its default prevented so
-    // it never activates the answer button.
-    const onAnswerButton =
-      isActivatableControl(event.target) && (event.target as HTMLElement).closest("[data-nav-action]") !== null;
+    // on those buttons is claimed too: this handler presses the button itself `TYPING_GUARD_MS`
+    // after a focus landing on it. `l`/`h`/Tab/HINT onto Approve followed by Enter still works, only
+    // deferred as `a`/`d` are. Other buttons keep native activation.
+    // A Space inside a pending leader sequence goes to the sequence engine, with its default
+    // already prevented so it cannot activate the focused button. `onAnswerButton` is computed
+    // before modal overlays return. A pending prefix owns Enter/Space on any focused control;
+    // a pending count blocks those keys only on a card's answer buttons.
+    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ") && (pending !== null || (count !== null && onAnswerButton))) {
+      event.preventDefault();
+      if (pending === null) showFlash(COUNT_ANSWER_FLASH);
+      return;
+    }
     if (onAnswerButton && event.key === " ") {
       event.preventDefault();
       if (seqRef.current === null) return;
     }
-    if (onAnswerButton && event.key === "Enter" && !typingGuard.mayAnswerNow("Enter", typedAt, event.repeat)) {
+    // Claim Enter before native button activation. Answer through `waitThenAnswer` after
+    // `TYPING_GUARD_MS` only if `mayAnswerNow` permits it, with no modifiers and focus placed
+    // on this button by the immediately preceding key. Any intervening key cancels the wait.
+    // The button must also belong to `permissionTarget`: Tab can move focus onto another card
+    // while the row cursor stays put.
+    if (onAnswerButton && event.key === "Enter") {
       event.preventDefault();
-      showFlash(TYPING_FLASH);
+      const button = event.target as HTMLButtonElement;
+      const placed = placedRef.current;
+      if (!typingGuard.mayAnswerNow("Enter", typedAt, event.repeat)) {
+        showFlash(TYPING_FLASH);
+        return;
+      }
+      if (event.shiftKey || !isPlainAnswerKey(event.nativeEvent as unknown as KeyLike)) {
+        showFlash(MODIFIED_ENTER_FLASH);
+        return;
+      }
+      if (placed === null || placed.el !== button || placed.atKey !== typingGuard.keyCount() - 1) {
+        showFlash(ENTER_LANDING_FLASH);
+        return;
+      }
+      const buttonRow = root === null ? null : rowOf(root, button);
+      const buttonRowIndex = root === null || buttonRow === null ? null : rowIndexOf(root, buttonRow);
+      if (buttonRowIndex === null || buttonRowIndex !== permissionTarget(answerableItems, cursor)) {
+        showFlash(ENTER_ELSEWHERE_FLASH);
+        return;
+      }
+      // The same card, in the same tab, still takes it at fire time -- as `answerCardByKey` checks.
+      const tab = activeTabRef.current;
+      waitThenAnswer(
+        event,
+        typedAt,
+        () => activeTabRef.current === tab && button.isConnected && !button.disabled && document.activeElement === button,
+        () => button.click(),
+        "Enter",
+      );
       return;
     }
     // The activity line's Stop accepts Enter and Space only on a key that stands alone
@@ -3710,7 +3924,9 @@ export default function App() {
         );
         return;
       }
-      if (!event.ctrlKey && !event.altKey) {
+      // A prefix's second key cannot start another sequence. `g` then Space cancels `g`
+      // through `resolveKey`; it cannot start the leader. `g` then `L` cannot switch tabs.
+      if (pending === null && !event.ctrlKey && !event.altKey) {
         const start = startSequence(panelTable, event.key, isActivatableControl(event.target));
         if (start.kind !== "none") {
           event.preventDefault();
@@ -3769,11 +3985,20 @@ export default function App() {
     // following immediately. `j`, `Ctrl+d` and `G` let the scroll decide, resuming at the bottom.
     // `h`/`l` can focus a control that scrolls itself into view in either direction.
     // `Ctrl+y` stops following; `Ctrl+e` resumes it only when the scroll reaches the bottom.
+    // Page motions (`Ctrl+f`/`PageDown`/`PageUp`) and arrow-key moves follow the same rule.
     const messageList = root?.querySelector<HTMLElement>(".message-list") ?? null;
-    if (action.kind === "move" || action.kind === "half-page" || action.kind === "scroll-line") {
+    if (
+      action.kind === "move" ||
+      action.kind === "half-page" ||
+      action.kind === "scroll-line" ||
+      action.kind === "page"
+    ) {
       noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
     } else if (action.kind === "jump") {
-      noteUserScroll(messageList, action.to === "first" ? "up" : "down");
+      // A counted jump goes to row N, so its direction depends on that row's position
+      // relative to the cursor. Bare `gg`/`G` uses its named end regardless of the cursor.
+      const up = count === null ? action.to === "first" : jumpTarget(action.to, count, timeline.length) < cursor;
+      noteUserScroll(messageList, up ? "up" : "down");
     } else if (action.kind === "control") {
       noteUserScroll(messageList, "unknown");
     }
@@ -3841,7 +4066,13 @@ export default function App() {
         const stop = currentStop(root, cursor);
         const target = stop === null ? null : nextControl(stop, action.delta);
         if (target === "stop") root.focus({ preventScroll: true });
-        else target?.focus();
+        else if (target !== null) {
+          // Save a landing only when this key actually moves focus onto the control.
+          // A clamped `l` on the last control moves nothing and records no landing.
+          const moved = document.activeElement !== target;
+          target.focus();
+          if (moved && document.activeElement === target) placedRef.current = { el: target, atKey: typingGuard.keyCount() };
+        }
       } else {
         // `a`/`d` answer by card id through `answerPermission`, sharing the buttons' guard against a
         // second answer. Only the cursor's card or the card gating its tool call is eligible
@@ -3873,6 +4104,20 @@ export default function App() {
         // un-collapses it right back into its calls (`display.ts`'s `buildDisplay`).
         const key = timeline[cursor]?.key;
         if (key !== undefined) setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
+        break;
+      }
+      case "fold": {
+        // `zo` opens this row's result or collapsed run. `zc` closes its open result, otherwise its
+        // containing run. Expanded calls use their own keys, so `runKeyOf` finds the run in the
+        // folded timeline; it returns null in detailed view or outside a run. Set `expanded`
+        // instead of toggling it so repeated opens or closes change nothing.
+        const key = timeline[cursor]?.key;
+        if (key === undefined) break;
+        const run =
+          action.open || expanded[key]
+            ? null
+            : runKeyOf(buildTimeline(state), { expanded, detailed, turnRunning: state.activeTurnId !== null }, key);
+        setExpanded((prev) => ({ ...prev, [run ?? key]: action.open }));
         break;
       }
       case "detailed":
@@ -3970,16 +4215,39 @@ export default function App() {
       case "pending":
         // Claimed (so the key does nothing else) and remembered for exactly one more key.
         pendingRef.current = action.prefix;
-        // The box shows continuations for `g`/`z`/`[`/`]` after `WHICH_KEY_DELAY_MS` without a completing
-        // key. `clearSequence` runs on each later key, including the second `g` of `gg`, to cancel
-        // the timer before it fires.
+        // Restore the count for a pending prefix (`3gg`, `2gt`) so its second key can read it.
+        // Like the prefix, the count was read and cleared at the top of this handler.
+        countRef.current = count;
+        // Show continuations for `g`/`z`/`[`/`]`/`Ctrl+w` after `WHICH_KEY_DELAY_MS` without a
+        // completing key. `clearSequence` on each later key, including the second `g` of `gg`,
+        // cancels the timer before it fires.
         scheduleBoxTimer();
         break;
-      case "panel":
-        // The second key of a reserved two-key prefix (`[b`) that also completes a panel-table
-        // sequence -- everything else a table
-        // sequence can run reaches here through the leader engine above instead.
+      case "panel": {
+        // Handles a reserved prefix's second key that also completes a panel-table sequence,
+        // such as `[b`, through `resolveKey`'s `ctx.pending` branch. Other table sequences reach
+        // the leader engine above. A count before `gt` selects tab N; before `gT` it moves N tabs
+        // backward. Other pairs ignore it. `select_tab` takes the tab id, which differs from its displayed number.
+        const tabAction = action.binding.keys[0] === "g" ? action.binding.action : null;
+        if (count !== null && (tabAction === "tab.next" || tabAction === "tab.prev")) {
+          const target = tabs === null ? null : countedTabTarget(tabs, tabAction, count);
+          if (target === null) showFlash(`no tab ${count}`);
+          else postToRust({ type: "select_tab", request_id: nextRequestId(), tab: target });
+          break;
+        }
         runPanelAction(action.binding);
+        break;
+      }
+      case "cancel":
+        // The key is already prevented and runs no action. Cancelling a prefix stays silent;
+        // a count before a card answer shows why the answer was refused.
+        if (action.why === "count-on-answer") showFlash(COUNT_ANSWER_FLASH);
+        break;
+      case "pane":
+        // `Ctrl+w h/j/k/l` asks the shell to move focus in that direction through `pane_nav`. A side
+        // with no module keeps focus here. The prefix is already consumed, and a preceding
+        // count does not affect the move.
+        postToRust({ type: "pane_nav", request_id: nextRequestId(), direction: action.direction });
         break;
       case "half-page": {
         // Scroll half the visible height, then use `clampCursorToView` to move an offscreen
@@ -4027,16 +4295,63 @@ export default function App() {
         }
         break;
       }
+      case "page": {
+        // Scroll `times` whole views, retaining two text lines of overlap. Measure those lines from the
+        // cursor row's text because the list has no explicit line height. Scroll only the list.
+        // If the cursor leaves view, move it to the nearest visible row, preserve the scroll
+        // position and restore root focus so an unseen control cannot answer Enter.
+        const list = messageList;
+        if (list === null || root === null) break;
+        const row = cursorRow();
+        const line = computedLineHeight(row !== null ? rowTextElement(row) : list);
+        list.scrollTop += action.delta * times * Math.max(1, list.clientHeight - 2 * line);
+        const next = clampCursorToView(list, conversationRows(list), cursor);
+        if (next !== null) {
+          landingRef.current = "keep";
+          setCursor(next);
+          root.focus({ preventScroll: true });
+        }
+        break;
+      }
       case "jump": {
-        // `G` goes to the very END of the list, not merely to the last row's top: on a long last
-        // reply, that is the line you want. `gg` goes to the very top.
-        const last = Math.max(timeline.length - 1, 0);
-        const target = action.to === "first" ? 0 : last;
-        if (target !== cursor) landingRef.current = "keep";
+        // Bare `G` scrolls to the list's end, including the bottom of a long last reply;
+        // bare `gg` scrolls to its top. With a count, both use `jumpTarget` to select row N,
+        // clamped to existing rows, and let the cursor effect reveal the row's near edge.
+        // Set the landing only if the cursor changes: an unchanged cursor runs no effect to
+        // consume it, so a leftover value would misplace a later unrelated move.
+        const target = jumpTarget(action.to, count, timeline.length);
+        if (target !== cursor) landingRef.current = count === null ? "keep" : target > cursor ? 1 : -1;
         setCursor(target);
         const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
-        if (list !== null) list.scrollTop = action.to === "first" ? 0 : list.scrollHeight;
+        if (list !== null && count === null) list.scrollTop = action.to === "first" ? 0 : list.scrollHeight;
         root?.focus({ preventScroll: true });
+        break;
+      }
+      case "scroll-row": {
+        // Align the whole row's top, middle or bottom with the view. A count selects the same clamped,
+        // one-based row as `{N}G` and moves the cursor there. Call `noteUserScroll` first so
+        // upward movement stops following. `"keep"` preserves the alignment, subject to the
+        // browser's scroll limits.
+        const list = messageList;
+        if (list === null || root === null) break;
+        const target = count === null ? cursor : jumpTarget("first", count, timeline.length);
+        const row = conversationRows(list)[target];
+        if (row === undefined) break;
+        const l = list.getBoundingClientRect();
+        const r = row.getBoundingClientRect();
+        const offset =
+          action.where === "top"
+            ? r.top - l.top
+            : action.where === "bottom"
+              ? r.bottom - l.bottom
+              : (r.top + r.bottom - l.top - l.bottom) / 2;
+        noteUserScroll(list, offset < 0 ? "up" : "down");
+        list.scrollTop += offset;
+        if (target !== cursor) {
+          landingRef.current = "keep";
+          setCursor(target);
+        }
+        root.focus({ preventScroll: true });
         break;
       }
       case "prompt-jump": {
@@ -4052,13 +4367,49 @@ export default function App() {
         root?.focus({ preventScroll: true });
         break;
       }
+      case "card-jump": {
+        // `]p`/`[p` move the cursor `times` waiting cards forward or backward, wrapping without
+        // answering. A later `a`/`d` uses the landed card and must pass the typing guard. Skip
+        // answered cards and ended sessions so the cursor cannot land on a card that can no
+        // longer be answered.
+        const target = sessionEnded ? null : waitingCardAfter(timeline, cursor, action.delta, times, answeredRef.current);
+        if (target === null) {
+          showFlash(NO_WAITING_CARD_FLASH);
+          break;
+        }
+        if (target !== cursor) {
+          // The way the cursor really travels, not the key's: a wrap from the last card to the first goes UP
+          // the list, and only a scroll up stops the list following. `landingRef` is the key's own -- which
+          // edge of a row taller than the view to show (`revealRow`), the top after `]p`, the bottom after `[p`.
+          noteUserScroll(messageList, target < cursor ? "up" : "down");
+          landingRef.current = action.delta;
+          setCursor(target);
+        }
+        // Even with the cursor staying (the one card waiting is the one it is on): the keys come back to the
+        // row from a focused control -- Approve after `l`, Stop -- as every other cursor move does, so the
+        // next `a` acts on the card the cursor shows and Enter cannot press a button it has left.
+        root?.focus({ preventScroll: true });
+        break;
+      }
       case "interrupt":
         // `Ctrl+c` interrupts a running turn from anywhere in BROWSE, using the same `interrupt()`
         // as the activity line's Stop button.
         interrupt();
         break;
       case "search":
+        // Opening `/` closes `:` because both use the command line. Leaving both open could let
+        // `takeKeys` focus the older search prompt.
+        setExLine(null);
         setSearch({ query: "", origin: cursor });
+        setLineFocusRequest((n) => n + 1);
+        break;
+      case "ex-line":
+        // The command box takes focus through `SearchBar` and runs nothing on opening.
+        // If it is already open with focus elsewhere, clear it and request focus again so `:`
+        // always presents a fresh command line.
+        setSearch(null);
+        setExLine("");
+        setLineFocusRequest((n) => n + 1);
         break;
       case "search-next": {
         const found = findMatch(timeline, lastSearchRef.current, cursor, action.delta, false);
@@ -4080,6 +4431,19 @@ export default function App() {
         if (paths.length === 0) showFlash("no path on this row");
         else if (paths.length === 1) openPath(paths[0]);
         else setPathPick(paths);
+        break;
+      }
+      case "open-link": {
+        // the web link(s) of the row under the cursor, read off the DOM as the
+        // reader sees them (`webLinks`: http(s) only, normalized, once per address). One whose visible text
+        // is its own address, on screen, opens at once; several, a titled one, or one nobody can see wait for
+        // a letter with each full address shown -- a link in a model's reply is never opened by a key alone
+        // without the reader having seen where it goes. A count is ignored, as `gf`'s is.
+        const row = cursorRow();
+        const links = row === null ? [] : webLinks(row).slice(0, HINT_ALPHABET.length);
+        if (links.length === 0) showFlash("no web link on this row");
+        else if (links.length === 1 && root !== null && linkOpensAtOnce(links[0], root)) openUrl(links[0].url);
+        else setLinkPick(links.map((link) => link.url));
         break;
       }
       case "view-in-editor": {
@@ -4143,7 +4507,8 @@ export default function App() {
       ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, modeFixed) }
       : pendingRef.current !== null
         ? {
-            title: pendingRef.current,
+            // `Ctrl+w`'s own spelling, not tmux's `"C-w"` (`PendingPrefix`'s): the other four are one character.
+            title: pendingRef.current === "C-w" ? "Ctrl+w" : pendingRef.current,
             entries: [...FIXED_PENDING_ENTRIES[pendingRef.current], ...boxEntries(panelTable, [pendingRef.current], modeFixed)],
           }
         : null;
@@ -4170,6 +4535,14 @@ export default function App() {
       // Capture runs ahead of descendant `onClick` and `onMouseDown`.
       onPointerDownCapture={() => exitRegion()}
       onFocus={(event) => {
+        // Record a plain Tab's landing only at that key count and only if its default survived every
+        // handler. Consume the first focus event so later effects or envelopes cannot create a
+        // keyboard landing.
+        const lastTab = tabAtKeyRef.current;
+        if (lastTab !== null && lastTab.atKey === typingGuard.keyCount() && !lastTab.event.defaultPrevented) {
+          placedRef.current = { el: event.target as HTMLElement, atKey: lastTab.atKey };
+        }
+        tabAtKeyRef.current = null;
         // The outermost stop (`stopOf`): a link inside a reply is in the reply's row, whatever the
         // reply's own HTML claims to be.
         const stop = containerRef.current === null ? null : stopOf(containerRef.current, event.target as HTMLElement);
@@ -4378,15 +4751,18 @@ export default function App() {
       {/* `gf` with several paths and the open `/` prompt each own every key through
           `onKeyDown` branches that run before `resolveKey`. Their placement here does not change that. */}
       {pathPick !== null && <PathPick paths={pathPick} />}
+      {linkPick !== null && <LinkPick urls={linkPick} />}
       {search !== null && (
         <SearchBar
           query={search.query}
+          focusRequest={lineFocusRequest}
           onChange={(query) => {
             setSearch({ query, origin: search.origin });
             const found = findMatch(timeline, query, search.origin, 1, true);
             setCursor(found ?? search.origin);
           }}
-          onAccept={() => {
+          onAccept={(event) => {
+            noteLineKey(event);
             lastSearchRef.current = search.query;
             if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
               showFlash(`pattern not found: ${search.query}`);
@@ -4395,10 +4771,34 @@ export default function App() {
             setSearch(null);
             containerRef.current?.focus({ preventScroll: true });
           }}
-          onCancel={() => {
+          onCancel={(event) => {
+            noteLineKey(event);
             setCursor(search.origin);
             setSearch(null);
             containerRef.current?.focus({ preventScroll: true });
+          }}
+        />
+      )}
+      {/* The `:` command line takes command text so `:ls`, `:l` or `:d` followed by Enter
+          cannot activate a card. It runs nothing; Enter explains that, while Esc and `Ctrl+[`
+          close it silently. */}
+      {exLine !== null && (
+        <SearchBar
+          lead=":"
+          label="Command line"
+          query={exLine}
+          focusRequest={lineFocusRequest}
+          onChange={setExLine}
+          onAccept={(event) => {
+            noteLineKey(event);
+            showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+            setExLine(null);
+            returnKeysToRoot();
+          }}
+          onCancel={(event) => {
+            noteLineKey(event);
+            setExLine(null);
+            returnKeysToRoot();
           }}
         />
       )}

@@ -278,6 +278,14 @@ body,
   font-family: var(--nv-font-mono);
   color: var(--nv-fg);
 }
+/* `gx` with several links: the same list as `.path-pick`, but every address is shown
+   in full -- a long one wraps rather than being cut, because the tail of a disguised link is the part a
+   reader needs to see. */
+.link-pick {
+  font-family: var(--nv-font-mono);
+  color: var(--nv-fg);
+  overflow-wrap: anywhere;
+}
 /* The queued lines: muted, one line each, directly above the composer in
    both layouts. V1's editor-context line used to sit here too (`.context-line`); the bottom band
    moved it into the band's own `.band-context` segment. */

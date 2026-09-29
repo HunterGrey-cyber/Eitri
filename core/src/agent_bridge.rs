@@ -87,6 +87,19 @@ pub enum NavKeyDirection {
     Up,
 }
 
+/// `Ctrl+w h/j/k/l`'s side: which way the keys leave the panel, by
+/// geometry -- `h` left, `j` down, `k` up, `l` right, vim's own letters. Not [`NavKeyDirection`], which
+/// is `Ctrl+j`/`Ctrl+k`'s two-valued mirror of BROWSE and INPUT and must stay two-valued. The wire
+/// words are the side's names, never the letters, so a direction is read the same by both halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneNavDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
@@ -289,6 +302,19 @@ pub enum InboundMessage {
         request_id: String,
         direction: NavKeyDirection,
     },
+    /// Ctrl+w h/j/k/l in BROWSE: move keyboard focus from the panel in that direction, by geometry.
+    PaneNav {
+        request_id: String,
+        direction: PaneNavDirection,
+    },
+    /// `gx` opens this web link in the system browser. The page sends a WHATWG-normalized
+    /// address from `agent-ui/web/src/nav.ts#webUrl`; `shell` rechecks it in
+    /// `agent_panel.rs#web_url` before `gtk4::UriLauncher`. No `serde(default)`: a missing
+    /// address is malformed.
+    OpenUrl {
+        request_id: String,
+        url: String,
+    },
     /// `y`/`Y` answers a `confirm_bypass` prompt under the panel's typed-input checks. Names
     /// the tab, or `null` for the window default, and the displayed nonce so stale prompts
     /// cannot answer newer ones. Routed at window level through `tab_ref` because
@@ -373,7 +399,9 @@ impl InboundMessage {
             // same reason `TabVerb` is window-level rather than routed by this generic mechanism.
             | InboundMessage::ConfirmBypass { .. }
             | InboundMessage::PanelKeys { .. }
-            | InboundMessage::NavFallthrough { .. } => return TabRef::WindowLevel,
+            | InboundMessage::NavFallthrough { .. }
+            | InboundMessage::PaneNav { .. }
+            | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
@@ -456,7 +484,9 @@ impl InboundMessage {
             | InboundMessage::CloseOthers { request_id }
             | InboundMessage::ConfirmBypass { request_id, .. }
             | InboundMessage::PanelKeys { request_id, .. }
-            | InboundMessage::NavFallthrough { request_id, .. } => request_id,
+            | InboundMessage::NavFallthrough { request_id, .. }
+            | InboundMessage::PaneNav { request_id, .. }
+            | InboundMessage::OpenUrl { request_id, .. } => request_id,
         }
     }
 }
@@ -1579,6 +1609,100 @@ mod tests {
         assert!(
             parse_inbound_message(r#"{"type":"nav_fallthrough","request_id":"req-10","direction":"left"}"#).is_none()
         );
+    }
+
+    /// `Ctrl+w h/j/k/l` in BROWSE sends window-level pane navigation with the request id.
+    /// All four directions are supported; the message names no session tab.
+    #[test]
+    fn parses_pane_nav_in_all_four_directions_as_a_window_level_message() {
+        let msg = parse_inbound_message(r#"{"type":"pane_nav","request_id":"r","direction":"left"}"#).unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "r");
+        assert!(matches!(
+            msg,
+            InboundMessage::PaneNav {
+                direction: PaneNavDirection::Left,
+                ..
+            }
+        ));
+        // The four strings `agent-ui/web/src/bridge.test.ts` pins `JSON.stringify` to, byte for byte.
+        for (json, id, want) in [
+            (
+                r#"{"type":"pane_nav","request_id":"req-1","direction":"left"}"#,
+                "req-1",
+                PaneNavDirection::Left,
+            ),
+            (
+                r#"{"type":"pane_nav","request_id":"req-2","direction":"down"}"#,
+                "req-2",
+                PaneNavDirection::Down,
+            ),
+            (
+                r#"{"type":"pane_nav","request_id":"req-3","direction":"up"}"#,
+                "req-3",
+                PaneNavDirection::Up,
+            ),
+            (
+                r#"{"type":"pane_nav","request_id":"req-4","direction":"right"}"#,
+                "req-4",
+                PaneNavDirection::Right,
+            ),
+        ] {
+            match parse_inbound_message(json) {
+                Some(InboundMessage::PaneNav { request_id, direction }) => {
+                    assert_eq!(direction, want, "{json}");
+                    assert_eq!(request_id, id, "{json}");
+                }
+                other => panic!("{json}: {other:?}"),
+            }
+        }
+    }
+
+    /// The same one-directional reasoning as `DecisionChoice`'s: a direction Rust does not know is a
+    /// parse failure, never a move some later `match` chose for it. `"sideways"` is the plan's own
+    /// example; `"Left"` and `"north"` are the near misses (case, and a compass instead of vim's keys),
+    /// and a message with no direction or no request id is malformed like any other.
+    #[test]
+    fn an_unknown_missing_or_misspelled_pane_nav_direction_fails_to_parse() {
+        for direction in ["sideways", "Left", "north", "", "h"] {
+            let json = format!(r#"{{"type":"pane_nav","request_id":"r","direction":"{direction}"}}"#);
+            assert!(parse_inbound_message(&json).is_none(), "{direction:?}");
+        }
+        assert!(parse_inbound_message(r#"{"type":"pane_nav","request_id":"r"}"#).is_none());
+        assert!(parse_inbound_message(r#"{"type":"pane_nav","direction":"left"}"#).is_none());
+        assert!(parse_inbound_message(r#"{"type":"pane_nav","request_id":"r","direction":null}"#).is_none());
+    }
+
+    /// `gx` sends a window-level `open_url` message with the request id and chosen address.
+    /// The link belongs to the current row, so no session tab is named. The JSON string matches
+    /// what `agent-ui/web/src/bridge.test.ts` serializes.
+    #[test]
+    fn parses_open_url_as_a_window_level_message() {
+        let json = r#"{"type":"open_url","request_id":"req-1","url":"https://example.com/a"}"#;
+        let msg = parse_inbound_message(json).unwrap();
+        assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+        assert_eq!(msg.request_id(), "req-1");
+        match msg {
+            InboundMessage::OpenUrl { request_id, url } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(url, "https://example.com/a");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A message with no address, a `null` one, a non-string one or no request id is malformed like any
+    /// other: never "open nothing", and never an address some later `match` invents for it.
+    #[test]
+    fn an_open_url_with_no_url_or_request_id_fails_to_parse() {
+        for bad in [
+            r#"{"type":"open_url","request_id":"r"}"#,
+            r#"{"type":"open_url","request_id":"r","url":null}"#,
+            r#"{"type":"open_url","request_id":"r","url":5}"#,
+            r#"{"type":"open_url","url":"https://example.com/"}"#,
+        ] {
+            assert!(parse_inbound_message(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

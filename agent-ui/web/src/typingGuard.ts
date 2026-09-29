@@ -13,6 +13,12 @@
  * makes that `l` followed by Enter eligible.
  * A held key's repeat (`event.repeat`) never answers.
  *
+ * Enter on a card button is also claimed and deferred, with the walk exception above.
+ * `App.tsx` activates it only if the immediately preceding key actually focused that button
+ * through `h`/`l` or Tab, or if HINT landed there with no key since. A key's name alone does
+ * not prove a landing. This guard counts keys (`keyCount`); `App.tsx` records focus changes
+ * and ties each landing to the key that made it.
+ *
  * `mayActAfterMotion` guards the leader and Enter/Space on Stop. A Space in prose can start
  * a leader sequence, and `j` from the last row can put the next Space on Stop. These keys act
  * only after a pause or an unbroken run of `j`/`k`/`h`/`l`/`g`/`G`/Tab that began with a key
@@ -121,6 +127,9 @@ export class TypingGuard {
   /** The waiting action's timer, boxed so a timer handle that happens to be falsy still counts, and
    *  what the band says should a key cancel it (`defer`'s `cancelledFlash`). */
   private pending: { handle: unknown; flash: string } | null = null;
+  /** The count of keys recorded by `onKey`, excluding bare modifiers but including cancelling modifiers.
+   *  `App.tsx` uses it to match a recorded focus landing to the key that made it. */
+  private recorded = 0;
 
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
 
@@ -131,6 +140,7 @@ export class TypingGuard {
    *  `a`/`d` -- or `null` when nothing was waiting. */
   onKey(key: string, t: number): string | null {
     if (isModifierKey(key) && !CANCELLING_MODIFIERS.has(key)) return null;
+    this.recorded += 1;
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
     this.previousRunIsWalk = this.latestRunIsWalk;
     this.latestRunIsWalk = WALK_KEYS.has(key) && (!continuesRun || this.previousRunIsWalk);
@@ -139,6 +149,13 @@ export class TypingGuard {
     this.previous = this.latest;
     this.latest = { key, t };
     return this.drop();
+  }
+
+  /** The number of keys recorded by `onKey`, including the key currently being handled.
+   *  A landing recorded with `keyCount()` belongs to the preceding key exactly when the next key
+   *  reads that landing's count as `keyCount() - 1`. */
+  keyCount(): number {
+    return this.recorded;
   }
 
   /** Whether the key `onKey` just recorded (at `t`) may answer now: with nothing within the window
@@ -164,13 +181,14 @@ export class TypingGuard {
     return this.previousRunIsMotion;
   }
 
-  /** `a`/`d`/`D`, `f`, a single-key table binding: when the key `onKey` just recorded stands alone
-   *  before, runs `run` after `TYPING_GUARD_MS` unless another key (`onKey`) or `cancel` comes
-   *  first, and returns true. Otherwise runs nothing and returns false -- the caller flashes.
-   *  `cancelledFlash` is what `onKey` hands back should a key cancel this wait. */
-  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string): boolean {
+  /** Defers `a`/`d`/`D`, `f`, single-key table bindings and Enter on a card button.
+   *  If `mayAnswerNow` allows the recorded key, schedules `run` after `TYPING_GUARD_MS` and returns true.
+   *  Another `onKey` or `cancel` cancels the wait. Otherwise schedules nothing and returns false for a flash.
+   *  `cancelledFlash` is returned by `onKey` on cancellation. Only `key: "Enter"` allows the walk exception;
+   *  other callers omit `key`. */
+  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string, key = ""): boolean {
     this.cancel();
-    if (!this.mayAnswerNow("", t, repeat)) return false;
+    if (!this.mayAnswerNow(key, t, repeat)) return false;
     const waiting: { handle: unknown; flash: string } = { handle: null, flash: cancelledFlash };
     waiting.handle = this.timers.setTimeout(() => {
       if (this.pending !== waiting) return;

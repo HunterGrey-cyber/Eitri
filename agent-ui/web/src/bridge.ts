@@ -1,5 +1,5 @@
 import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, HandoffCommand, Hello, QueueItem, TabId, TabsEnvelope } from "./types";
-import type { KeymapHelp } from "./keymap";
+import type { KeymapHelp, PaneDirection } from "./keymap";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -80,7 +80,20 @@ export type OutboundMessage =
   /** Return a `nav_key` this page could not apply because the mode mirror was stale, an overlay
    *  owns the keys, or the session ended. Rust then runs the chord's ordinary `move_focus` instead
    *  of dropping the key. */
-  | { type: "nav_fallthrough"; request_id: string; direction: NavKeyDirection };
+  | { type: "nav_fallthrough"; request_id: string; direction: NavKeyDirection }
+  /** `Ctrl+w h/j/k/l` in BROWSE: move the keys from
+   *  the panel to the module on that side, by geometry -- exactly what `Ctrl+h/j/k/l` do from it (shell
+   *  runs `move_focus(agent, direction)`, the same hook a `nav_fallthrough` uses). Window-level, like
+   *  `nav_fallthrough`; a side with no module leaves the keys where they are. Rust answers with a
+   *  `command_result`, an error only if no hook is installed. `InboundMessage::PaneNav`,
+   *  `core/src/agent_bridge.rs`. */
+  | { type: "pane_nav"; request_id: string; direction: PaneDirection }
+  /** `gx` on a web link: open this address in the system browser. `url` is
+   *  the WHATWG-normalized `href` (`nav.ts#webUrl`) -- what the pick showed -- never the spelling the reply
+   *  wrote. Window-level, like `open_path`; Rust re-checks it (`agent_panel.rs#web_url`, http(s) and a plain
+   *  host only) and answers with a `command_result`, an error when it is not a web link.
+   *  `InboundMessage::OpenUrl`, `core/src/agent_bridge.rs`. */
+  | { type: "open_url"; request_id: string; url: string };
 
 /** The composer mirror's three states. Distinct from `./keymap`'s `PanelMode`, which is
  *  this component's OWN mode ("hint" included, unreachable yet) -- this type is the wire value Rust

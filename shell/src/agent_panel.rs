@@ -20,7 +20,7 @@ use neovibe_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, B
 use neovibe_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_error_for_js, serialize_events_for_js,
     serialize_hello_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow, InboundMessage,
-    NavKeyDirection, PanelKeys, TabVerbWire,
+    NavKeyDirection, PaneNavDirection, PanelKeys, TabVerbWire,
 };
 use neovibe_core::keymap::TabAction;
 use neovibe_core::layout::Direction;
@@ -497,9 +497,9 @@ struct AgentPanelState {
     /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
     /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
     nav_mode: Cell<PanelKeys>,
-    /// Where a `nav_fallthrough` message's direction goes: `None` until `main.rs`'s
-    /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
-    /// can be refused.
+    /// Receives directions from `nav_fallthrough` and `pane_nav` messages.
+    /// `None` until `main.rs` installs a hook with `AgentPanelHandle::on_nav_fallthrough`.
+    /// Both message types can be refused while the hook is absent.
     nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
     /// Counts recent crashes of this WebView's process and tracks whether automatic recovery
     /// has given up. Manual recovery re-arms the guard; automatic recovery keeps the crash count
@@ -913,9 +913,9 @@ impl AgentPanelHandle {
         self.state.borrow_mut().tab_verb_hook = Some(Rc::new(hook));
     }
 
-    /// Where a `nav_fallthrough` message's direction goes: `main.rs` wires this to
-    /// `move_focus(&ModuleId::agent(), dir)`, i.e. exactly what the chord would have done had the
-    /// panel never intercepted it. `main.rs` installs this once.
+    /// Routes `nav_fallthrough` directions to `move_focus(&ModuleId::agent(), dir)` in `main.rs`,
+    /// the same move the intercepted chord would have made. `pane_nav` uses this hook too for
+    /// `Ctrl+w h/j/k/l`. `main.rs` installs the hook once.
     pub(crate) fn on_nav_fallthrough(&self, hook: impl Fn(Direction) + 'static) {
         self.state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(hook));
     }
@@ -3154,6 +3154,34 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, webvi
             Ok(()) => ok(webview),
             Err(why) => refuse(webview, why),
         },
+        // `Ctrl+w h/j/k/l` in BROWSE moves focus just as `Ctrl+h/j/k/l` does.
+        InboundMessage::PaneNav { direction, .. } => match run_pane_nav(state, direction) {
+            Ok(()) => ok(webview),
+            Err(why) => refuse(webview, why),
+        },
+        // `gx` opens a web link in the system browser. Rust checks the URL again with `web_url`
+        // before passing it to the launcher, even though `nav.ts#webUrl` checked it in the page.
+        // A refusal is logged because it indicates a page/Rust mismatch or an unexpected message.
+        // The address uses `{:?}` to escape characters a terminal could interpret.
+        InboundMessage::OpenUrl { url, .. } => match web_url(&url) {
+            Some(url) => {
+                let shown = url.to_string();
+                gtk4::UriLauncher::new(url).launch(
+                    None::<&gtk4::Window>,
+                    None::<&gtk4::gio::Cancellable>,
+                    move |result| {
+                        if let Err(error) = result {
+                            eprintln!("[agent_panel] open_url {shown}: {error}");
+                        }
+                    },
+                );
+                ok(webview);
+            }
+            None => {
+                eprintln!("[agent_panel] open_url refused: {url:?}");
+                refuse(webview, "not a web link");
+            }
+        },
         // Handles `y`/`Y` for the bypass prompt. The client enforces the 250 ms
         // `TYPING_GUARD_MS` delay and cancels on routes away. `apply_confirm_bypass` and
         // `TabSet::confirm_bypass` recheck the nonce, the active tab and whether exactly the
@@ -3266,6 +3294,48 @@ fn run_nav_fallthrough(state: &Rc<RefCell<AgentPanelState>>, direction: NavKeyDi
         }
         None => Err("nav fallthrough is not wired"),
     }
+}
+
+/// Routes `pane_nav` through the hook shared with `nav_fallthrough`.
+/// `main.rs` wires it to `move_focus(&ModuleId::agent(), direction)`, like `Ctrl+h/j/k/l`.
+fn run_pane_nav(state: &Rc<RefCell<AgentPanelState>>, direction: PaneNavDirection) -> Result<(), &'static str> {
+    let hook = state.borrow().nav_fallthrough_hook.clone();
+    let hook = hook.ok_or("pane nav is not wired")?;
+    hook(match direction {
+        PaneNavDirection::Left => Direction::Left,
+        PaneNavDirection::Down => Direction::Down,
+        PaneNavDirection::Up => Direction::Up,
+        PaneNavDirection::Right => Direction::Right,
+    });
+    Ok(())
+}
+
+/// Checks which `open_url` values may be passed to `UriLauncher`.
+/// The page supplies a WHATWG-normalized `URL.href`; Rust strictly re-checks it without
+/// browser-style parsing. Accepts only ASCII with no whitespace, controls or backslashes,
+/// an HTTP or HTTPS scheme, and a host containing only letters, digits, dots and hyphens.
+/// The host must have no trailing dot and must differ from `PANEL_BASE_URI`'s host.
+/// An optional port must contain only digits. Scheme and host comparisons ignore case.
+/// Returns the input unchanged if accepted. Rejects `%`, `@`, `[`, non-ASCII and userinfo
+/// rather than guessing how a browser would normalize them.
+fn web_url(url: &str) -> Option<&str> {
+    if url
+        .chars()
+        .any(|c| !c.is_ascii() || c.is_ascii_whitespace() || c.is_ascii_control() || c == '\\')
+    {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
+    let host_ok = !host.is_empty()
+        && !host.ends_with('.')
+        && host != "neovibe.invalid"
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    (host_ok && port.chars().all(|c| c.is_ascii_digit())).then_some(url)
 }
 
 /// `tab_verb`'s wire shape to the `TabAction` the prefix's own `Action::Tab` arm runs.
@@ -3998,6 +4068,131 @@ mod tests {
             assert_eq!(run_nav_fallthrough(&state, wire), Ok(()));
             assert_eq!(seen.borrow_mut().pop(), Some(direction), "{wire:?} -> {direction:?}");
         }
+    }
+
+    /// `pane_nav` uses the same hook as `nav_fallthrough`, calling `move_focus` from the agent module,
+    /// so `Ctrl+w h/j/k/l` moves focus like `Ctrl+h/j/k/l` from the panel. It refuses until the hook
+    /// is installed, then calls it once per message with the mapped `Direction` for each wire value.
+    /// The hook handles directions with no neighboring module.
+    #[test]
+    fn pane_nav_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        for wire in [
+            PaneNavDirection::Left,
+            PaneNavDirection::Down,
+            PaneNavDirection::Up,
+            PaneNavDirection::Right,
+        ] {
+            assert_eq!(run_pane_nav(&state, wire), Err("pane nav is not wired"), "{wire:?}");
+        }
+
+        let seen: Rc<RefCell<Vec<Direction>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |direction| seen.borrow_mut().push(direction)));
+        }
+        for (wire, direction) in [
+            (PaneNavDirection::Left, Direction::Left),
+            (PaneNavDirection::Down, Direction::Down),
+            (PaneNavDirection::Up, Direction::Up),
+            (PaneNavDirection::Right, Direction::Right),
+        ] {
+            assert_eq!(run_pane_nav(&state, wire), Ok(()));
+            assert_eq!(seen.borrow_mut().pop(), Some(direction), "{wire:?} -> {direction:?}");
+            assert!(
+                seen.borrow().is_empty(),
+                "{wire:?}: the hook is called once per message"
+            );
+        }
+    }
+
+    /// The hook `main.rs` installs goes back through the panel's state (`move_focus` reads and writes
+    /// it), so `run_pane_nav` must not hold a borrow of the state across the call -- the same reason
+    /// `run_tab_verb` clones its hook out first. A hook that borrows the state mutably panics here if
+    /// it does.
+    #[test]
+    fn pane_nav_does_not_hold_the_state_borrowed_while_the_hook_runs() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            neovibe_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        let reentrant = Rc::downgrade(&state);
+        state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |_| {
+            let state = reentrant.upgrade().expect("the state outlives the call");
+            state.borrow_mut().pane_focused = true;
+        }));
+        assert_eq!(run_pane_nav(&state, PaneNavDirection::Right), Ok(()));
+        assert!(state.borrow().pane_focused);
+    }
+
+    /// The URLs `gx` may pass to `UriLauncher` include queries, fragments, ports, numeric hosts,
+    /// punycode hosts, and `@` after the host's slash. The page normally sends normalized `URL.href`.
+    /// Uppercase input is checked case-insensitively and returned unchanged.
+    #[test]
+    fn web_url_accepts_plain_http_and_https_links() {
+        for url in [
+            "https://example.com/a?b#c",
+            "http://x.y:8080/p",
+            "https://xn--r8jz45g.jp/",
+            "https://example.com/@user",
+            "http://127.0.0.1:3000/",
+            "HTTPS://EXAMPLE.COM/A",
+        ] {
+            assert_eq!(web_url(url), Some(url), "{url}");
+        }
+    }
+
+    /// Every way a link can be something other than a web page a reader was shown: another scheme, a
+    /// relative link, the panel's own address (spelled any way a browser resolves it), a backslash or
+    /// userinfo that moves the real host, whitespace, a bracketed or non-ASCII host, and hosts a browser
+    /// would re-normalize. Backslash cases are raw strings so the backslash reaches the function.
+    #[test]
+    fn web_url_refuses_every_non_web_or_disguised_link() {
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "mailto:a@b",
+            "docs/a.md",
+            "https://neovibe.invalid/x",
+            "https://NEOVIBE.invalid/x",
+            "https://neovibe.invalid./x",
+            "https://%6eeovibe.invalid/x",
+            r"https:\\neovibe.invalid\x",
+            r"https://example.com\@evil/",
+            r"https://example.com/?a\b",
+            "https://a b",
+            "https://user@evil",
+            "https://user:pw@example.com/",
+            "https://例え.jp/",
+            "https://[::1]/",
+            "https://example.com./",
+            "https://a$b.com/",
+            "https://my_host.x/",
+            "https://",
+            "http://x.y:8080:9/p",
+            "https://example.com:80@example.net/",
+            "https://example.com/a\nb",
+            // The same rules past the host, where the host check cannot help: a space, a control character
+            // and a non-ASCII character in the path or query (a browser percent-encodes all three).
+            "https://example.com/a b",
+            "https://example.com/a\u{7f}b",
+            "https://example.com/?q=例え",
+            "",
+        ] {
+            assert_eq!(web_url(url), None, "{url:?}");
+        }
+    }
+
+    /// The panel document's own base (`PANEL_BASE_URI`) is where every relative link in a reply resolves;
+    /// opening it would launch a browser at an address that never resolves. Tied to the constant, so a
+    /// change of the base fails here until `web_url` follows it.
+    #[test]
+    fn web_url_refuses_the_panels_own_base() {
+        assert_eq!(web_url(PANEL_BASE_URI), None);
+        assert_eq!(web_url(&format!("{PANEL_BASE_URI}docs/a.md")), None);
     }
 
     /// Entering bypass from Auto always asks for confirmation and never persists bypass.

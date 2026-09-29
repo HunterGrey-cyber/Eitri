@@ -242,3 +242,28 @@ describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly (Int
     expect(JSON.stringify(message)).toBe(wire);
   });
 });
+
+/* Pins `pane_nav`'s exact wire strings for all four directions, including field order. The core
+   test `parses_pane_nav_in_all_four_directions_as_a_window_level_message` parses the same strings.
+   Directions use side names rather than the keys `h`/`j`/`k`/`l`. */
+describe("OutboundMessage: pane_nav serialises exactly", () => {
+  it.each<[OutboundMessage, string]>([
+    [{ type: "pane_nav", request_id: "req-1", direction: "left" }, '{"type":"pane_nav","request_id":"req-1","direction":"left"}'],
+    [{ type: "pane_nav", request_id: "req-2", direction: "down" }, '{"type":"pane_nav","request_id":"req-2","direction":"down"}'],
+    [{ type: "pane_nav", request_id: "req-3", direction: "up" }, '{"type":"pane_nav","request_id":"req-3","direction":"up"}'],
+    [{ type: "pane_nav", request_id: "req-4", direction: "right" }, '{"type":"pane_nav","request_id":"req-4","direction":"right"}'],
+  ])("%o -> %s", (message, wire) => {
+    expect(JSON.stringify(message)).toBe(wire);
+  });
+});
+
+/* Pins `open_url`'s exact wire string, including field order. The core test
+   `parses_open_url_as_a_window_level_message` parses the same string to keep spelling aligned.
+   The page sends the normalized `href` from `nav.ts#webUrl`; Rust validates it in
+   `agent_panel.rs#web_url` before it reaches `UriLauncher`. */
+describe("OutboundMessage: open_url serialises exactly", () => {
+  it("names the type, the request id and the url, in that order", () => {
+    const message: OutboundMessage = { type: "open_url", request_id: "req-1", url: "https://example.com/a" };
+    expect(JSON.stringify(message)).toBe('{"type":"open_url","request_id":"req-1","url":"https://example.com/a"}');
+  });
+});

@@ -3,8 +3,9 @@ import { isModifierKey, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 
 /* Each test drives the guard like `App.tsx`'s `onKeyDown`: every keydown goes through `onKey`
    first; `a`/`d`/`D` then ask `defer`, and Enter on a card button asks `mayAnswerNow`.
-   `answers` stores what would have been answered and when. The fake clock makes each
-   test gap the gap between keys. */
+   Enter also needs a deferred wait and a focus landing, which these cases do not model;
+   separate cases below and `App.test.tsx` cover those checks. `answers` stores what would
+   have been answered and when. The fake clock makes each test gap the gap between keys. */
 
 let guard: TypingGuard;
 let answers: Array<{ key: string; at: number }>;
@@ -343,5 +344,36 @@ describe("TypingGuard.mayActAfterMotion: the leader and Stop", () => {
     vi.advanceTimersByTime(80);
     guard.onKey("Enter", Date.now());
     expect(guard.mayAnswerNow("Enter", Date.now(), false)).toBe(false);
+  });
+});
+
+/* Enter on a card button is deferred like `a`/`d` and requires `App.tsx` to have seen the preceding
+   key focus that exact button. The guard counts keys so the caller can match a landing to its key;
+   it does not infer focus from key names. */
+describe("K02: keyCount", () => {
+  it("counts every recorded key, a cancelling Super included, and no bare Shift", () => {
+    const g = new TypingGuard();
+    g.onKey("l", 0);
+    g.onKey("Shift", 10);
+    expect(g.keyCount()).toBe(1);
+    g.onKey("Enter", 400);
+    g.onKey("Super", 500);
+    expect(g.keyCount()).toBe(3);
+  });
+
+  it("defer takes Enter's walk exception only when told the key", () => {
+    let ran = 0;
+    guard.onKey("l", 0);
+    guard.onKey("Enter", 100);
+    // `a`/`d`'s own call, with no key named: `l` 100 ms before is typing.
+    expect(guard.defer(100, false, () => ran++, "x")).toBe(false);
+    // Enter's: `l` is the walk onto the button, so it waits and then runs once.
+    expect(guard.defer(100, false, () => ran++, "x", "Enter")).toBe(true);
+    vi.advanceTimersByTime(TYPING_GUARD_MS - 1);
+    expect(ran).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(ran).toBe(1);
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(ran).toBe(1);
   });
 });

@@ -831,7 +831,8 @@ mod tests {
         assert!(err(&[del("zz")]).contains("nothing binds"));
         // `gt` is a default, so rebinding it is refused until it is deleted.
         assert!(err(&[set("gt", "tab.new")]).contains("tab.next (default)"));
-        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zb", "tab.new")], &[]).unwrap();
+        // `zq`, not `zb`: `zb` is reserved for BROWSE in panel.rs's TAKEN_PAIRS.
+        let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zq", "tab.new")], &[]).unwrap();
         assert_eq!(ok.panel_user().sets.len(), 2);
         assert_eq!(ok.panel_user().dels.len(), 1);
     }

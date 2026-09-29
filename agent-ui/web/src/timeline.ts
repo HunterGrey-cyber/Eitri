@@ -134,3 +134,49 @@ export function promptIndex(timeline: TimelineItem[], from: number, delta: 1 | -
   }
   return null;
 }
+
+/** Whether `item` is a card waiting for an answer from this panel: a permission item whose id is not in
+ *  `answered` -- the ids this tab has answered, by a card's button or by `a`/`d`, which stay drawn (inert)
+ *  until the provider resolves them. The one condition a timeline cannot know is whether the session still
+ *  lives (a dead session's cards are inert, `PermissionCard`): that is the caller's. */
+function isWaitingCard(item: TimelineItem, answered: ReadonlySet<string>): boolean {
+  return item.kind === "permission" && !answered.has(item.request.permissionId);
+}
+
+/** `]p` (+1) / `[p` (-1): the next waiting card after or before `from`, wrapping at either end.
+ *  Cards already answered by this panel are excluded. A lone waiting card returns its own index,
+ *  even when `from` is on it; no waiting cards returns `null`.
+ *  `from` may be outside the timeline, so a cursor past a shortened list still finds a row. */
+export function waitingCardIndex(
+  timeline: TimelineItem[],
+  from: number,
+  delta: 1 | -1,
+  answered: ReadonlySet<string>,
+): number | null {
+  const n = timeline.length;
+  for (let step = 1; step <= n; step++) {
+    const i = (((from + delta * step) % n) + n) % n;
+    if (isWaitingCard(timeline[i], answered)) return i;
+  }
+  return null;
+}
+
+/** `{N}]p` / `{N}[p`: repeats `waitingCardIndex` from each preceding landing.
+ *  After the first step, navigation cycles only through waiting cards. Reducing `times - 1` modulo
+ *  that count preserves the landing while limiting work to O(waiting x rows), rather than O(times x rows).
+ *  This avoids scanning a long conversation 9999 times for a single keydown. Returns `null` if no card waits. */
+export function waitingCardAfter(
+  timeline: TimelineItem[],
+  from: number,
+  delta: 1 | -1,
+  times: number,
+  answered: ReadonlySet<string>,
+): number | null {
+  let waiting = 0;
+  for (const item of timeline) if (isWaitingCard(item, answered)) waiting++;
+  if (waiting === 0) return null;
+  let target = from;
+  const steps = ((Math.max(1, times) - 1) % waiting) + 1;
+  for (let step = 0; step < steps; step++) target = waitingCardIndex(timeline, target, delta, answered) ?? target;
+  return target;
+}

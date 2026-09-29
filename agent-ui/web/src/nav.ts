@@ -19,9 +19,61 @@
 
 export const STOP_ATTR = "data-nav-stop";
 
-/** Label alphabet shared with the window-wide `f` HINT. It excludes `f` because that key starts
- *  HINT. The `gf` path picker reuses it for its letter-per-path footer list. */
+/** Label alphabet shared with the window-wide `f` HINT. It excludes `f`, which starts HINT.
+ *  The `gf` path picker and `gx` link picker reuse it for their letter labels. */
 export const HINT_ALPHABET = "asdjklghweruio";
+
+/** a web link as `web_url` (`shell/src/agent_panel.rs`) will re-check it -- `http(s)`
+ *  by the WHATWG parser with no base (the parser the browser opens it with, so `https://%6eeovibe.invalid/x`
+ *  and `https:\\neovibe.invalid\x` are what they really are), no userinfo, a plain `[a-z0-9.-]` host with
+ *  no trailing dot that is not the panel's own `neovibe.invalid` (where every relative link resolves), and
+ *  no backslash left anywhere in the address. Returns the normalized `href` -- what a pick shows and what
+ *  `open_url` sends, never the spelling the reply wrote -- or `null`. The host rules are Rust's, restated:
+ *  the parser alone keeps `neovibe.invalid.`, `a$b.com`, `my_host.x`, `[::1]` and a backslash in a query, and
+ *  Rust refuses all of them, so a letter offered for one could only fail. */
+export function webUrl(href: string | null): string | null {
+  let url: URL;
+  try {
+    url = new URL(href ?? "");
+  } catch {
+    return null;
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "") return null;
+  const host = url.hostname;
+  if (!/^[a-z0-9.-]+$/.test(host) || host.endsWith(".") || host === "neovibe.invalid" || url.href.includes("\\")) return null;
+  return url.href;
+}
+
+/** Links reachable by `gx` and HINT inside `row`, in document order, once per normalized
+ *  address. Keep the first anchor for each address and its `webUrl` result, which the picker
+ *  shows and `open_url` sends. */
+export function webLinks(row: HTMLElement): { el: HTMLAnchorElement; url: string }[] {
+  const seen = new Set<string>();
+  const out: { el: HTMLAnchorElement; url: string }[] = [];
+  for (const el of row.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+    const url = webUrl(el.getAttribute("href"));
+    if (url === null || seen.has(url)) continue;
+    seen.add(url);
+    out.push({ el, url });
+  }
+  return out;
+}
+
+/** `gx` opens without a picker only when a visible link's plain text matches its normalized URL.
+ *  Compare with the parsed address: Unicode host names may normalize to a different spelling,
+ *  which the picker must show before opening. Allow the trailing slash added to a bare host.
+ *  Hidden links, links in closed details and links outside the list's visible area require a pick.
+ *
+ *  Require `childElementCount === 0`: `textContent` includes text in hidden child elements, so
+ *  matching it alone could open an address whose full spelling was never visible. Reply classes
+ *  and styles are stripped, so plain text nodes cannot hide themselves inside a visible anchor.
+ *  Comment nodes render nothing and contribute nothing to `textContent`. Links wrapping elements
+ *  such as `b` or `code` require a pick. */
+export function linkOpensAtOnce(link: { el: HTMLAnchorElement; url: string }, root: HTMLElement): boolean {
+  if (link.el.childElementCount !== 0) return false;
+  const text = link.el.textContent?.trim() ?? "";
+  return (text === link.url || `${text}/` === link.url) && hintVisible(link.el, root);
+}
 
 /** Whether `el` is inside a control a key activates by default: a button, summary, link or
  *  element with `role="button"`.
@@ -259,15 +311,17 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
   return null;
 }
 
-/** A panel target of global `f` HINT: a conversation row, a code block inside a row, an enabled
- *  control from `controlsOf`, or a marked composer. Code targets remember their row so landing
- *  moves the row cursor. The list is frozen at `hint_collect`, and `shell` uses entry indices.
+/** A panel target of global `f` HINT: a conversation row, a code block or web link inside a row,
+ *  an enabled control from `controlsOf`, or a marked composer. Code and link targets remember
+ *  their row so landing moves the row cursor. Landing on a link focuses it without clicking it.
+ *  The list is frozen at `hint_collect`, and `shell` addresses entries by index afterward.
  *  `rowIndex` is only the index at collection time. Landing reads it from the element again
  *  because rows can be inserted above it while labels are displayed. */
 export type HintTarget =
   | { kind: "row"; el: HTMLElement; rowIndex: number }
   | { kind: "control"; el: HTMLElement }
   | { kind: "code"; el: HTMLElement; rowIndex: number }
+  | { kind: "link"; el: HTMLAnchorElement; rowIndex: number }
   | { kind: "composer"; el: HTMLElement };
 
 /** Marks the composer as a HINT target. The composer is in no
@@ -297,7 +351,11 @@ function intersects(a: DOMRect, b: DOMRect): boolean {
  *  that clips overflow. Checking every clipping ancestor prevents nested scrollers from exposing
  *  targets that an outer scroller hides. */
 export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
-  const box = el.getBoundingClientRect();
+  return boxShows(el.getBoundingClientRect(), el, root);
+}
+
+/** `hintVisible`'s test for one box of `el`'s: non-zero, and inside the root and every clipping ancestor. */
+function boxShows(box: DOMRect, el: HTMLElement, root: HTMLElement): boolean {
   if (box.width === 0 || box.height === 0) return false;
   for (let a = el.parentElement; a !== null && a !== root; a = a.parentElement) {
     if (clips(a) && !intersects(box, a.getBoundingClientRect())) return false;
@@ -305,10 +363,24 @@ export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
   return intersects(box, root.getBoundingClientRect());
 }
 
+/** Where a HINT label for a link that WRAPS belongs: the first of
+ *  its line boxes that is on screen -- `hintVisible`'s own test, line by line -- and not simply its first.
+ *  A link is a target while any part of it shows, and one whose first line has scrolled above the list
+ *  but whose last line has not would otherwise be labelled where nothing is drawn. With no line box on
+ *  screen, or none reported (jsdom lays nothing out), the bounding box, as before. A first line that only
+ *  PARTLY shows is still the first one on screen: its label may hang past the edge by its own height, as a
+ *  control at the edge of the list already does. */
+export function firstShownLine(el: HTMLElement, root: HTMLElement): DOMRect {
+  for (const line of Array.from(el.getClientRects())) {
+    if (boxShows(line, el, root)) return line;
+  }
+  return el.getBoundingClientRect();
+}
+
 /** Visible HINT targets under `root`, in document order: for each stop (row or other), the stop
- *  itself (if it's a row), then its code blocks, then its controls; for a non-row stop, its
- *  controls only. The composer, when marked (`HINT_COMPOSER_ATTR`), takes its place in document
- *  order among the stops. "Visible" is `hintVisible` above. */
+ *  itself (if it's a row), then its code blocks, then its web links (a row's only), then its controls;
+ *  for a non-row stop, its controls only. The composer, when marked (`HINT_COMPOSER_ATTR`), takes its
+ *  place in document order among the stops. "Visible" is `hintVisible` above. */
 export function hintTargets(root: HTMLElement): HintTarget[] {
   const targets: HintTarget[] = [];
   // The composer is in no stop; a marker inside one is a reply's own HTML, not the composer.
@@ -328,6 +400,11 @@ export function hintTargets(root: HTMLElement): HintTarget[] {
     if (rowIndex !== null) {
       for (const block of stop.querySelectorAll<HTMLElement>("pre.code-block")) {
         if (hintVisible(block, root)) targets.push({ kind: "code", el: block, rowIndex });
+      }
+      // Inspect each anchor directly. `webLinks` deduplicates addresses before checking visibility,
+      // so an off-screen first copy could leave a visible copy without a label.
+      for (const el of stop.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+        if (webUrl(el.getAttribute("href")) !== null && hintVisible(el, root)) targets.push({ kind: "link", el, rowIndex });
       }
     }
     for (const control of controlsOf(stop)) {

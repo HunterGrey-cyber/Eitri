@@ -8,14 +8,17 @@
  * result falls through to `resolveKey`, never the other way around), since the table's own
  * reserved-pair rule means the two can never both claim the same key.
  */
-import type { PanelBinding, PanelTable } from "./keymap";
+import type { PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
 /** which-key's default `delay` (which-key.nvim lua/which-key/config.lua:13-15). */
 export const WHICH_KEY_DELAY_MS = 200;
 
 /** The two-key prefixes `resolveKey` already reserves for its own fixed pairs (Global Constraint
  *  #4); a table sequence may still start with one of these keys (`[b`), but the bare key itself is
- *  never a sequence start on its own -- `resolveKey`'s `{kind:"pending"}` machinery owns it. */
+ *  never a sequence start on its own -- `resolveKey`'s `{kind:"pending"}` machinery owns it.
+ *  `Ctrl+w`, the fifth prefix, is deliberately not listed: it is a chord, so
+ *  `App.tsx` never asks `startSequence` about it (no sequence starts on a Ctrl key), and no table
+ *  binding can begin with it (`neovibe_core::keymap::panel::parse_seq` refuses `<C-w>`). */
 const PENDING_FIRST = new Set(["g", "z", "[", "]"]);
 
 /** The result of one key against the sequence engine, at a node identified by `typed` (the keys
@@ -124,19 +127,46 @@ export function sequenceTitle(table: PanelTable, typed: string[]): string {
   return typed.map((k) => humanKey(table, k)).join(" ");
 }
 
-/** `resolveKey`'s four reserved two-key prefixes have no `PanelBinding` of their own (they are
- *  fixed rows, not table entries), so a which-key box opened on one of them
- *  (`g`/`z`/`[`/`]`, held past `WHICH_KEY_DELAY_MS`) is filled in by hand rather than
- *  from `table.bindings`. */
-export const FIXED_PENDING_ENTRIES: Record<"g" | "z" | "[" | "]", BoxEntry[]> = {
+/** `resolveKey`'s reserved two-key prefixes have
+ *  no `PanelBinding` of their own (they are fixed rows, not table entries),
+ *  so a which-key box opened on one of them (`g`/`z`/`[`/`]`/`Ctrl+w`, held past
+ *  `WHICH_KEY_DELAY_MS`) is filled in by hand rather than from `table.bindings`. */
+export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
   g: [
     { key: "g", label: "first row", group: false, disabled: false },
     { key: "f", label: "open path", group: false, disabled: false },
+    // Label `FIXED_PAIRS.g.x`, which opens the row's web link.
+    // `leader.test.ts` checks that these entries and the fixed pairs list the same keys.
+    { key: "x", label: "open link", group: false, disabled: false },
   ],
   z: [
     { key: "h", label: "scroll table left", group: false, disabled: false },
     { key: "l", label: "scroll table right", group: false, disabled: false },
+    // Label the six row-scroll and fold pairs in `FIXED_PAIRS.z`.
+    // `leader.test.ts` checks that these entries and the fixed pairs list the same keys.
+    { key: "t", label: "row to top", group: false, disabled: false },
+    { key: "z", label: "row to middle", group: false, disabled: false },
+    { key: "b", label: "row to bottom", group: false, disabled: false },
+    { key: "a", label: "toggle fold", group: false, disabled: false },
+    { key: "o", label: "open fold", group: false, disabled: false },
+    { key: "c", label: "close fold", group: false, disabled: false },
   ],
-  "[": [{ key: "[", label: "previous prompt", group: false, disabled: false }],
-  "]": [{ key: "]", label: "next prompt", group: false, disabled: false }],
+  "[": [
+    { key: "[", label: "previous prompt", group: false, disabled: false },
+    // `FIXED_PAIRS["["].p` jumps to the waiting card before the cursor.
+    { key: "p", label: "previous waiting card", group: false, disabled: false },
+  ],
+  "]": [
+    { key: "]", label: "next prompt", group: false, disabled: false },
+    // `FIXED_PAIRS["]"].p` jumps to the waiting card after the cursor.
+    { key: "p", label: "next waiting card", group: false, disabled: false },
+  ],
+  // Label Ctrl+w's four module directions. `App.tsx` titles the box Ctrl+w;
+  // the internal prefix token uses the chord spelling "C-w".
+  "C-w": [
+    { key: "h", label: "module left", group: false, disabled: false },
+    { key: "j", label: "module below", group: false, disabled: false },
+    { key: "k", label: "module above", group: false, disabled: false },
+    { key: "l", label: "module right", group: false, disabled: false },
+  ],
 };
