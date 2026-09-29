@@ -36,7 +36,6 @@ function renderChooser(over: Record<string, unknown> = {}) {
     tabs: TABS,
     active: null,
     defaultMode: "auto" as const,
-    backend: "sidecar" as const,
     projectDir: "/home/user/src/neovibe",
     newTabChord: "Ctrl+b c",
     focusRequest: 0,
@@ -174,7 +173,8 @@ describe("Chooser", () => {
     expect(props.onNewSession).toHaveBeenCalled();
   });
 
-  it("a record row's line 2 names the sidecar and its short id, or is untitled with neither name nor title", () => {
+  /** A record row shows the short id without the backend name, so untitled sessions can be told apart. */
+  it("a record row's line 2 keeps only the short id, never the backend, and is untitled with neither name nor title", () => {
     const { container } = renderChooser({
       envelope: {
         open: [],
@@ -184,7 +184,7 @@ describe("Chooser", () => {
       },
     });
     const row = container.querySelectorAll(".chooser-row")[1]; // New session, then the record
-    expect(row.querySelector(".chooser-line2")!.textContent).toBe("sidecar · aaaa1111");
+    expect(row.querySelector(".chooser-line2")!.textContent).toBe("aaaa1111");
     expect(row.textContent).toContain("untitled");
   });
 
@@ -295,6 +295,52 @@ describe("Chooser", () => {
     expect(container.querySelector(".chooser-keys")!.textContent).toBe("enter resume · / filter · shift+tab mode · esc");
     fireEvent.keyDown(root, { key: "j" }); // tab 1
     expect(container.querySelector(".chooser-keys")!.textContent).toBe("enter switch · / filter · ctrl+r rename · x close tab · shift+tab mode · esc");
+  });
+
+  /** An open tab's second line omits the backend name, which adds no distinction in release builds,
+   *  and the default auto mode. It shows a title or bypass notice when present. */
+  describe("an open tab's line 2 (v1 trial item 1)", () => {
+    it("is absent in auto mode with no title -- no mode, no backend", () => {
+      const { container } = renderChooser(); // TAB1: auto, title null
+      const rows = container.querySelectorAll(".chooser-row");
+      expect(rows[1].querySelector(".chooser-line2")).toBeNull();
+      expect(rows[1].textContent).not.toContain("sidecar");
+    });
+    it("carries only the title in auto mode -- no mode, no backend", () => {
+      const withTitle = { ...TAB1, title: "write the docs" };
+      const { container } = renderChooser({ tabs: [withTitle, TAB2] });
+      const rows = container.querySelectorAll(".chooser-row");
+      const line2 = rows[1].querySelector(".chooser-line2")!;
+      expect(line2.textContent).toBe("write the docs");
+    });
+    it("shows only the bypass notice, drawn with the shared bypass mode-glyph token, when bypass and no title", () => {
+      const { container } = renderChooser(); // TAB2: bypass, title null
+      const rows = container.querySelectorAll(".chooser-row");
+      const line2 = rows[2].querySelector(".chooser-line2")!;
+      expect(line2.textContent).toBe("⏵⏵ bypass");
+      const glyph = line2.querySelector(".mode-glyph")!;
+      expect(glyph.getAttribute("data-mode-name")).toBe("bypass");
+      expect(rows[2].textContent).not.toContain("sidecar");
+    });
+    it("joins the bypass notice and the title with · when both are present", () => {
+      const withTitle = { ...TAB2, title: "write the docs" };
+      const { container } = renderChooser({ tabs: [TAB1, withTitle] });
+      const rows = container.querySelectorAll(".chooser-row");
+      const line2 = rows[2].querySelector(".chooser-line2")!;
+      expect(line2.textContent).toBe("⏵⏵ bypass · write the docs");
+    });
+  });
+
+  /** A not-started tab's label already says new, so its state word must not repeat it. */
+  it("a not-started tab has no state word on the right", () => {
+    const notStarted: TabInfo = { ...TAB1, state: "not_started" };
+    const { container } = renderChooser({
+      tabs: [notStarted, TAB2],
+      envelope: { ...ENVELOPE, open: [{ ...ENVELOPE.open[0], label: "1 new" }, ENVELOPE.open[1]] },
+    });
+    const rows = container.querySelectorAll(".chooser-row");
+    expect(rows[1].querySelector(".chooser-lead")!.textContent).toBe("1 new");
+    expect(rows[1].querySelector(".chooser-right")!.textContent).toBe("");
   });
 
   it("Space does nothing -- no preview, decision 6", () => {

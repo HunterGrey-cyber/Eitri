@@ -184,21 +184,23 @@ function oneLine(label: string): ToolRenderConfig {
   return { label, renderInvocation: (input) => <div className="tool-card">{label}: {summarizeInput(input)}</div> };
 }
 
-/** `Edit`/`Write`: a diff (`EditDiff`), folded to 6 lines except in the detailed view or an expanded row.
+/** `Edit`/`Write`/`NotebookEdit`: a diff (`EditDiff`), folded to a path and counts (`maxLines: 0`)
+ *  except in the detailed view or an expanded row. Each tool has its own row, so the default stays compact.
+ *  `toolName` is passed to `editPreview` separately from the display label.
  *  Falls back to a path line when `editPreview` returns `null`: no `old_string` or `new_string`,
- *  or a `Write` with neither `content` nor a path. */
-function editConfig(label: string): ToolRenderConfig {
+ *  a `Write` with neither `content` nor a path, or a `NotebookEdit` with neither `new_source` nor `notebook_path`. */
+function editConfig(label: string, toolName: string, pathField = "file_path"): ToolRenderConfig {
   return {
     label,
     renderInvocation: (input, { expanded, createsFile }) => {
-      const preview = editPreview(label === "Write file" ? "Write" : "Edit", input);
+      const preview = editPreview(toolName, input);
       if (preview === null)
         return (
           <div className="tool-card">
-            {label}: <PathLink path={pathOf(input, "file_path")} />
+            {label}: <PathLink path={pathOf(input, pathField)} />
           </div>
         );
-      return <EditDiff preview={preview} maxLines={expanded ? undefined : 6} createsFile={createsFile} />;
+      return <EditDiff preview={preview} maxLines={expanded ? undefined : 0} createsFile={createsFile} />;
     },
   };
 }
@@ -222,8 +224,8 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
       </div>
     ),
   },
-  Write: editConfig("Write file"),
-  Edit: editConfig("Edit file"),
+  Write: editConfig("Write file", "Write"),
+  Edit: editConfig("Edit file", "Edit"),
   Grep: {
     label: "Search",
     renderInvocation: (input) => <div className="tool-card">Grep: {pathOf(input, "pattern")}</div>,
@@ -247,7 +249,9 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     quiet: true,
     renderInvocation: (input) => <div className="tool-card tool-card-muted">ToolSearch {summarizeInput(input)}</div>,
   },
-  NotebookEdit: oneLine("NotebookEdit"),
+  // Show a diff of `new_source` against empty text because the tool schema has no "before" field,
+  // as handled by `editPreview`.
+  NotebookEdit: editConfig("NotebookEdit", "NotebookEdit", "notebook_path"),
   // Ordinary `tool_use` blocks named "Skill" -- no distinct wire event -- so this stays a
   // rendering-layer special case.
   Skill: {
@@ -355,10 +359,15 @@ export function renderToolCall(
   opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
+  // Pass `opts.detailed` through to `editConfig` so Ctrl+o widens Edit/Write/NotebookEdit diffs
+  // as well as `ToolResult`'s head/tail cut, even when the row is not expanded.
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : config ? (
-    config.renderInvocation(call.input, { expanded: opts.expanded ?? showResult, createsFile: call.createsFile })
+    config.renderInvocation(call.input, {
+      expanded: (opts.expanded ?? showResult) || opts.detailed === true,
+      createsFile: call.createsFile,
+    })
   ) : (
     // For tools without a special view, show the name and a one-line input summary.
     // Avoid "Unrecognized", which reads as a panel error.
@@ -396,11 +405,15 @@ export function renderToolCall(
   // of the same call. Rust supplies the text, shown muted beside the saved-rule note.
   const promptNote =
     call.promptNote === undefined ? null : <div className="tool-rule-note tool-prompt-note">{call.promptNote}</div>;
+  // A `Write`/`Edit`/`NotebookEdit` answered by the acceptEdits fast path shows a muted note.
+  // Saved rules never apply to these tools, so this note and `ruleNote` cannot both be present.
+  const autoNote = call.allowedByAuto === true ? <div className="tool-rule-note">allowed by auto</div> : null;
   const shown = call.result === null || showResult || opts.detailed === true;
   return (
     <div className="tool-call" data-tool-name={call.name} data-folded={shown ? undefined : "true"}>
       {invocation}
       {ruleNote}
+      {autoNote}
       {promptNote}
       {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
     </div>

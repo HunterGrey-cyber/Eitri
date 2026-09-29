@@ -58,6 +58,10 @@ import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { Chooser } from "./components/Chooser";
+import { SlashPicker } from "./components/SlashPicker";
+import type { SlashPickerKind } from "./components/SlashPicker";
+import { barePickerCommand } from "./slashCommands";
+import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
 import { shortModel } from "./band";
 import type { BandFacts } from "./band";
@@ -179,18 +183,23 @@ const ROW_SCROLL_LINES = 3;
  *  pixel off, and a row whose last line is 0.3px past the edge must not eat a keypress. */
 const EDGE_SLACK_PX = 1;
 
-/** One `j`/`k` step inside a tall row: `ROW_SCROLL_LINES` of the row's own computed line height.
- *  Derived, not a pixel constant, so it follows the theme's font size and the display's scale.
- *  `line-height: normal` (and jsdom, which computes nothing) has no pixel value, so it falls back to
- *  1.2 x the font size, the usual `normal`; with no font size either, to a 16px font. */
-function rowScrollStep(row: HTMLElement): number {
-  const style = getComputedStyle(row);
+/** The computed line height of `el` in pixels, shared by `rowScrollStep` and Ctrl+e/Ctrl+y's
+ *  one-line scroll. When `line-height` has no usable pixel value, use 1.2 times the font size,
+ *  defaulting to a 16px font if the font size is unavailable too. */
+function computedLineHeight(el: HTMLElement): number {
+  const style = getComputedStyle(el);
   let line = parseFloat(style.lineHeight);
   if (!Number.isFinite(line) || line <= 0) {
     const font = parseFloat(style.fontSize);
     line = (Number.isFinite(font) && font > 0 ? font : 16) * 1.2;
   }
-  return ROW_SCROLL_LINES * line;
+  return line;
+}
+
+/** One `j`/`k` step inside a tall row: `ROW_SCROLL_LINES` of the row's own computed line height.
+ *  Derived, not a pixel constant, so it follows the theme's font size and the display's scale. */
+function rowScrollStep(row: HTMLElement): number {
+  return ROW_SCROLL_LINES * computedLineHeight(row);
 }
 
 /** `j`/`k` while the `?` keymap overlay is open: scrolls the overlay itself, by the
@@ -835,17 +844,50 @@ export default function App() {
    *  closed. A `chooser` envelope sets it. It is window-wide rather than tab-scoped (`tabs.ts`
    *  omits it from `TAB_SCOPED`), and opens only on this key, not at launch. */
   const [chooser, setChooser] = useState<ChooserEnvelope | null>(null);
-  /** Whether the chooser, tab rename or live search overlay owns the keys.
-   *  Search counts only while `sessionStarted`: stale search state on an empty tab has no SearchBar
-   *  to receive keys and would otherwise block focus indefinitely.
-   *  `pane_focus`/`arrive` already close help, detail and handoff confirmation overlays.
-   *  Focus effects use this flag to avoid taking keys from an open overlay. */
-  const overlayOpen = chooser !== null || renaming !== null || (search !== null && sessionStarted);
+  /** The picker opened by a bare `/model` or `/effort` reply, or `null` when closed. The client
+   *  opens it without a Rust envelope when the events handler parses `turn_completed` after that
+   *  send. See `pendingSlashPickerRef` and `../slashPicker`. */
+  const [slashPicker, setSlashPicker] = useState<{ kind: SlashPickerKind; options: string[]; current: string | null } | null>(
+    null,
+  );
+  /** Set by `sendMessage` the moment it sends a BARE `/model`/`/effort` (`barePickerCommand`), read
+   *  and cleared by the very next `turn_completed` this tab sees, whether or not that reply parses
+   *  -- a ref, not state, because it is read and written from inside the `events` handler's own
+   *  closure (installed once, in the mount effect) rather than from render. Only the immediately
+   *  following turn is ever a candidate: a picker choice itself always carries an argument
+   *  (`onChoose` below), so it can never re-arm this, and a follow-up queued behind a running turn
+   *  is out of this feature's scope (an edge case `sendMessage`'s own "not running" path does not
+   *  reach) -- worst case there, no picker opens and the reply shows as ordinary text, never a
+   *  broken one.
+   *
+   *  Also a single flag rather than a per-tab one: the tab-switch
+   *  reset block below clears it the moment the active tab changes, so a switch away before the
+   *  reply lands drops the candidate instead of leaving it to be checked against whatever
+   *  `turn_completed` the NEW active tab sees next -- the same reasoning `queueMessage`/`send_now`
+   *  below never arming this at all is built on. Both `queueMessage` (queued behind a running turn)
+   *  and `send_now`'s own post (an immediate send that may itself queue if its interrupt is
+   *  refused) can leave more than one turn between the send and its own reply, so "the very next
+   *  `turn_completed`" would not reliably mean "this command's own reply" the way it does for
+   *  `sendMessage`'s own not-running path -- arming there risks a picker opening against an
+   *  unrelated turn's text, worse than today's safe fallback (plain text, no picker). Left
+   *  unfixed, deliberately, rather than reaching for a heuristic that would trade a missed picker
+   *  for a wrong one. */
+  const pendingSlashPickerRef = useRef<SlashPickerKind | null>(null);
+  /** True while the chooser, slash picker, tab rename or live conversation's `/` prompt owns keys.
+   *  Gate the prompt on `sessionStarted`: stale search state under the empty layout must not
+   *  reserve keys for a `SearchBar` that never renders. `pane_focus` and `arrive` already close
+   *  `?`, the detail popover and the handoff confirm. Focus effects use this flag to keep keys
+   *  with the visible overlay. */
+  const overlayOpen = chooser !== null || slashPicker !== null || renaming !== null || (search !== null && sessionStarted);
   /** Counters `takeKeys` (below) bumps to ask a specific overlay/composer to re-focus itself,
    *  mirroring the existing `inputRequest`/`arriveRequest` convention: a plain number so a second
    *  request while the first is still pending is never silently coalesced away by React (an
    *  unchanged boolean would be). */
   const [chooserFocusRequest, setChooserFocusRequest] = useState(0);
+  /** Requests focus for `SlashPicker`, like `chooserFocusRequest` does for the chooser.
+   *  Restoring focus to the picker when GTK returns focus keeps `j`/`k`/`Enter`/`Escape` working
+   *  there instead of sending them to the container root. */
+  const [slashPickerFocusRequest, setSlashPickerFocusRequest] = useState(0);
   const [tabBarFocusRequest, setTabBarFocusRequest] = useState(0);
   const [emptyKeysRequest, setEmptyKeysRequest] = useState(0);
   /** What `Composer` (the live conversation's) actually reads, instead of the raw `inputRequest`
@@ -980,6 +1022,12 @@ export default function App() {
   function takeKeys() {
     if (chooser !== null) {
       setChooserFocusRequest((n) => n + 1);
+      return;
+    }
+    // An open picker must keep the keys through a GTK focus change, `arrive`, or a HINT landing, just
+    // as the chooser does.
+    if (slashPicker !== null) {
+      setSlashPickerFocusRequest((n) => n + 1);
       return;
     }
     if (renaming !== null) {
@@ -1642,6 +1690,12 @@ export default function App() {
           setDetail(null);
           setHandoffOpen(false);
           setChooser(null);
+          // Close the `/model`/`/effort` picker on a tab switch: `chooseSlashOption` sends to the active tab,
+          // so an old picker would target the wrong session. Also clear `pendingSlashPickerRef`,
+          // which is not tab-scoped. The old tab's reply is filtered out by `acceptsEnvelope`, so
+          // leaving the flag armed could match the new tab's next `turn_completed`.
+          setSlashPicker(null);
+          pendingSlashPickerRef.current = null;
           // Close a `gf` picker on a tab switch because its paths belong to the old conversation.
           // Otherwise the next letter could open an old path: the `pathPick` key handler runs first
           // and does not check the active tab.
@@ -1779,6 +1833,21 @@ export default function App() {
           } else if (event.type === "resume_outcome" && !resumeAttached(event)) {
             setTurnClock(null);
           }
+          // Only the next `turn_completed` after a bare `/model` or `/effort` send is a picker candidate.
+          // Clear the pending flag whether parsing succeeds or fails so later turns cannot match
+          // it. Parse `result_text`, which both backends fill for local commands. On the sidecar
+          // backend, `content_delta` does not distinguish a local reply from assistant text.
+          if (event.type === "turn_completed") {
+            const pending = pendingSlashPickerRef.current;
+            pendingSlashPickerRef.current = null;
+            if (pending === "model") {
+              const parsed = parseModelReply(event.result_text);
+              if (parsed !== null) setSlashPicker({ kind: "model", options: parsed.options, current: parsed.current });
+            } else if (pending === "effort") {
+              const parsed = parseEffortReply(event.result_text);
+              if (parsed !== null) setSlashPicker({ kind: "effort", options: parsed.options, current: null });
+            }
+          }
         }
         // Stamped before the state update that will cause the render, so the span covers the work
         // being measured rather than starting after it.
@@ -1806,6 +1875,11 @@ export default function App() {
         if (!payload.ok) {
           console.warn("agent-ui: command failed", payload.requestId, payload.error);
           if (record?.kind === "send") {
+            // A refused send starts no turn, so clear `pendingSlashPickerRef` rather than matching
+            // it to an unrelated later reply. Clear it regardless of the refusal's tab: it is one
+            // shared flag, while `acceptsEnvelope` limits the events handler that reads it to
+            // active-tab events.
+            pendingSlashPickerRef.current = null;
             if (record.tab === activeTabRef.current) {
               // Restore the message the composer cleared optimistically when Rust refuses the send.
               // `draftRef.current` mirrors every keystroke, including that clear, so it holds the
@@ -1968,6 +2042,8 @@ export default function App() {
         setHandoffOpen(false);
         setKeymapOpen(false);
         setRenaming(null);
+        // Opening `prefix w` closes an existing picker so both overlays cannot compete for keys.
+        setSlashPicker(null);
         cancelBypassConfirm(); // Opening the chooser cancels the bypass prompt, not the
         // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser.
         setChooser({ open: payload.open, records: payload.records });
@@ -2184,9 +2260,29 @@ export default function App() {
     // The text is kept so a refusal can put it back. Dropped again as soon as the reply arrives.
     inFlight.current.set(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
+    // Arm `pendingSlashPickerRef` for the events handler before the send is acknowledged. Clear it
+    // on a refused `command_result`, since a send that never ran cannot start the turn this flag
+    // waits for.
+    pendingSlashPickerRef.current = barePickerCommand(text);
     postToRust({ type: "send_message", request_id: requestId, tab, text });
     // A send follows the reply, wherever the reader had scrolled (`./follow.ts`).
     resumeFollowing(containerRef.current?.querySelector(".message-list"));
+  }
+
+  /** The picker's own Enter (`./components/SlashPicker`): sends the choice as an ordinary turn
+   *  (never held back -- `barePickerCommand` only ever names a BARE command, and this always
+   *  carries an argument) and closes the picker immediately, the same way choosing a chooser row
+   *  closes the chooser. */
+  function chooseSlashOption(value: string) {
+    if (slashPicker === null) return;
+    const command = slashPicker.kind === "model" ? "/model" : "/effort";
+    setSlashPicker(null);
+    sendMessage(`${command} ${value}`);
+  }
+
+  /** The picker's own Escape/q: closes it, sends nothing. */
+  function cancelSlashPicker() {
+    setSlashPicker(null);
   }
 
   /** Queues what is typed behind the running turn. Recorded as a `"send"` for the same reason
@@ -2580,7 +2676,6 @@ export default function App() {
             tabs={tabs?.tabs ?? []}
             active={tabs?.active ?? null}
             defaultMode={tabs?.defaultMode ?? "auto"}
-            backend={hello?.backend ?? "legacy"}
             projectDir={hello?.projectDir ?? ""}
             newTabChord={keymapHelp.newTabChord}
             focusRequest={chooserFocusRequest}
@@ -2593,6 +2688,18 @@ export default function App() {
             onCycleTabMode={onChooserCycleTabMode}
             onLeave={onChooserLeave}
             answerConfirm={answerConfirm}
+          />
+        )}
+        {/* A bare /model or /effort reply opens this picker. Like the chooser above,
+            it is positioned in this layout without an `.agent-ui-scroller` to nest inside. */}
+        {slashPicker !== null && (
+          <SlashPicker
+            kind={slashPicker.kind}
+            options={slashPicker.options}
+            current={slashPicker.current}
+            focusRequest={slashPickerFocusRequest}
+            onChoose={chooseSlashOption}
+            onCancel={cancelSlashPicker}
           />
         )}
         {/* `? Keys`, `?` on an empty draft and `prefix ?` open this overlay here too.
@@ -2718,6 +2825,10 @@ export default function App() {
     // the typing guard sees the key so it still counts as typing after the chooser closes.
     // Do not prevent the default: filter and rename inputs still need to receive their text.
     if (chooser !== null) return;
+    // The picker is modal like the chooser. Its handler stops propagation for claimed
+    // keys, so this return handles only unclaimed keys and prevents them from reaching
+    // panel actions underneath the picker.
+    if (slashPicker !== null) return;
     // A `gf` picker with several paths takes the next key before other overlays. A valid letter
     // opens its path; Esc or any other key cancels without falling through, so the key cannot also
     // move the cursor.
@@ -2907,14 +3018,13 @@ export default function App() {
     // How many times THIS key repeats its move: the count just accumulated (cleared above, so this
     // is the last one) if any, else once, same as vim's own default count of 1.
     const times = Math.max(1, count ?? 1);
-    // Every key below that can move the conversation says so first, on the list itself, so
-    // `MessageList` knows the scroll that follows is the user's (`./follow.ts`, 2026-09-24): it no
-    // longer takes an unexplained drop in `scrollTop` for the reader leaving the bottom, because
-    // WebKitGTK once produced such drops by itself mid-reply. `k`, `Ctrl+u` and `gg` end following at
-    // once, as they always did; `j`, `Ctrl+d` and `G` let the scroll decide (reaching the bottom
-    // re-arms it); `h`/`l` can focus a control that scrolls itself into view, either way.
+    // Announce conversation movement on the list so `MessageList` can distinguish user
+    // scrolling from unexplained `scrollTop` drops during a reply. `k`, `Ctrl+u` and `gg` stop
+    // following immediately. `j`, `Ctrl+d` and `G` let the scroll decide, resuming at the bottom.
+    // `h`/`l` can focus a control that scrolls itself into view in either direction.
+    // `Ctrl+y` stops following; `Ctrl+e` resumes it only when the scroll reaches the bottom.
     const messageList = root?.querySelector<HTMLElement>(".message-list") ?? null;
-    if (action.kind === "move" || action.kind === "half-page") {
+    if (action.kind === "move" || action.kind === "half-page" || action.kind === "scroll-line") {
       noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
     } else if (action.kind === "jump") {
       noteUserScroll(messageList, action.to === "first" ? "up" : "down");
@@ -3116,33 +3226,39 @@ export default function App() {
         runPanelAction(action.binding);
         break;
       case "half-page": {
-        // Half the visible height, as in vim. Then, if the cursor's row is not on screen, the
-        // cursor comes to the visible row NEAREST to it: the first one on screen when the row lies
-        // above the view, the last one when it lies below. (It used to pick by the key's direction
-        // alone, so `Ctrl+d` with the cursor's row already off screen BELOW the view pulled the
-        // cursor UP by many rows -- found in review.) The view stays exactly where the scroll put it
-        // ("keep"): re-revealing that row with `nearest` would pull the view back by up to a row.
-        //
-        // A re-home also takes DOM focus back to the root, as `move` and `jump` do. Found in
-        // review: without it, a control that had the keys (Approve after `l`, a banner's Dismiss,
-        // Stop) KEPT them while the cursor was drawn on another row, so `Enter` activated an
-        // Approve scrolled out of sight and `j`/`k` steered from the old stop.
+        // Scroll half the visible height, then use `clampCursorToView` to move an offscreen
+        // cursor to its nearest visible row. Keep the view where the scroll put it; revealing
+        // that row again with `nearest` could pull the view back by up to a row.
+        // When rehoming the cursor, focus the root so an offscreen control cannot keep answering
+        // Enter or steering `j`/`k` from its old stop. Leave focus alone when the helper returns
+        // `null`, either because the cursor row is partly visible or no row is visible.
         const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
         if (list === null || root === null) break;
         list.scrollTop += action.delta * Math.max(1, Math.floor(list.clientHeight / 2));
-        const l = list.getBoundingClientRect();
-        if (l.bottom - l.top <= 0) break;
-        const rows = conversationRows(list);
-        const current = rows[cursor];
-        const onScreen = visibleRows(list);
-        if (current === undefined || onScreen.includes(current) || onScreen.length === 0) break;
-        const below = current.getBoundingClientRect().top >= l.bottom;
-        const next = rows.indexOf(below ? onScreen[onScreen.length - 1] : onScreen[0]);
-        if (next !== -1 && next !== cursor) {
+        const next = clampCursorToView(list, conversationRows(list), cursor);
+        if (next !== null) {
           landingRef.current = "keep";
           setCursor(next);
+          root.focus({ preventScroll: true });
         }
-        root.focus({ preventScroll: true });
+        break;
+      }
+      case "scroll-line": {
+        // Scroll `times` units, letting the cursor row's overflow box consume them first using
+        // `TOOL_RESULT_SCROLL_STEP_PX`. Each remaining unit scrolls the conversation by one
+        // text line. Rehome the cursor with the same rule as `half-page`.
+        const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
+        if (list === null || root === null) break;
+        const row = cursorRow();
+        let remaining = times;
+        while (remaining > 0 && scrollCursorRowBox(row, action.delta)) remaining--;
+        if (remaining > 0) list.scrollTop += action.delta * computedLineHeight(row ?? list) * remaining;
+        const next = clampCursorToView(list, conversationRows(list), cursor);
+        if (next !== null) {
+          landingRef.current = "keep";
+          setCursor(next);
+          root.focus({ preventScroll: true });
+        }
         break;
       }
       case "jump": {
@@ -3355,7 +3471,6 @@ export default function App() {
             tabs={tabs?.tabs ?? []}
             active={tabs?.active ?? null}
             defaultMode={tabs?.defaultMode ?? "auto"}
-            backend={hello?.backend ?? "legacy"}
             projectDir={hello?.projectDir ?? ""}
             newTabChord={keymapHelp.newTabChord}
             focusRequest={chooserFocusRequest}
@@ -3368,6 +3483,18 @@ export default function App() {
             onCycleTabMode={onChooserCycleTabMode}
             onLeave={onChooserLeave}
             answerConfirm={answerConfirm}
+          />
+        )}
+        {/* A bare /model or /effort reply opens this picker, positioned inside
+            `.agent-ui-scroller` like the chooser above. */}
+        {slashPicker !== null && (
+          <SlashPicker
+            kind={slashPicker.kind}
+            options={slashPicker.options}
+            current={slashPicker.current}
+            focusRequest={slashPickerFocusRequest}
+            onChoose={chooseSlashOption}
+            onCancel={cancelSlashPicker}
           />
         )}
         {/* The which-key box: `WHICH_KEY_DELAY_MS` after a leader/table

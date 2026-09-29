@@ -1976,7 +1976,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
             provider_prompt: None,
         });
 
@@ -2084,7 +2084,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
             provider_prompt: None,
         });
         let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
@@ -2335,7 +2335,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
             provider_prompt: None,
         });
 
@@ -2366,7 +2366,7 @@ mod tests {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
             provider_prompt: None,
         };
 
@@ -2464,7 +2464,7 @@ mod tests {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
             provider_prompt: None,
         };
 
@@ -2729,6 +2729,59 @@ mod tests {
                 backend.shutdown();
             }
         }
+    }
+
+    /// The acceptEdits fast path allows the gate for an in-project `Write`.
+    /// A later CLI prompt for that call remains a card in `Auto`, including one forced by
+    /// `permissions.ask` through `Edit(notes.txt)`. The fast-path allow is not a human approval,
+    /// so `HumanApprovals` stays empty even when no ask rule caused the prompt.
+    /// Prompts forced by `permissions.ask` remain cards in bypass too.
+    #[test]
+    fn a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = sidecar_backend(&dir);
+        let write = serde_json::json!({ "file_path": "notes.txt", "content": "fast path" });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-gate".into(),
+            tool_use_id: Some("tu-1".into()),
+            tool_name: "Write".into(),
+            input: write.clone(),
+            provider_prompt: None,
+        });
+        provider.queue(provider_prompt(
+            "perm-ruled",
+            Some("tu-1"),
+            "Write",
+            write.clone(),
+            Some("notes.txt"),
+        ));
+        provider.queue(provider_prompt("perm-cli", Some("tu-1"), "Write", write, None));
+        let mut host_answered = BTreeSet::new();
+        let mut approvals = HumanApprovals::default();
+        let (delivered, answered) = deliver(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut approvals,
+        );
+        assert!(
+            !carded(&delivered, "perm-gate"),
+            "the gate's request is the fast path's to answer: {delivered:?}"
+        );
+        assert!(
+            carded(&delivered, "perm-ruled"),
+            "the user's ask rule wins: {delivered:?}"
+        );
+        assert!(
+            carded(&delivered, "perm-cli"),
+            "the fast path is no human approval: {delivered:?}"
+        );
+        assert_eq!(provider.resolutions(), vec![("perm-gate".to_string(), true)]);
+        assert_eq!(host_answered, BTreeSet::from(["perm-gate".to_string()]));
+        assert!(approvals.is_empty() && answered.is_empty());
+        backend.shutdown();
     }
 
     /// In `Auto`, a human approval answers one CLI prompt for the exact call approved on the card:

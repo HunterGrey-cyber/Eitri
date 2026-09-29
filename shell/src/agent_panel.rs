@@ -3588,13 +3588,14 @@ mod tests {
         let (other_provider, backend) = live_backend(&dir);
         set.get_mut(other).unwrap().backend = TabBackend::Live(backend);
         assert_eq!(set.active(), other, "the user has switched away");
-        // `perm-1` must really be pending on the asking tab: a conversation refuses an answer to a
-        // permission it never asked for. A `Write` needs a human, so the pump leaves it a card.
+        // `perm-1` must be pending on the asking tab: a conversation refuses answers to permissions
+        // it never requested. Writing `.git/main.rs` needs confirmation and leaves a card for the test.
+        // An ordinary in-project `Write` would take the acceptEdits fast path without creating a card.
         asking_provider.queue(agent::AgentDomainEvent::PermissionRequested {
             permission_id: "perm-1".into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
             provider_prompt: None,
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

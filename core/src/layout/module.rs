@@ -110,13 +110,11 @@ pub enum Placement {
     /// The editor's own leaf: the module takes the editor's place and the editor is **hidden**,
     /// not gone. Lua `position = "main"`.
     InPlaceOfEditor,
-    /// A new column split below the smallest subtree that holds both the editor and the agent
-    /// (hidden or shown; the editor may be gone, then the agent's leaf alone), never below the
-    /// whole root -- `kill::reopen`'s answer for the terminal (task 6, 2026-09-26), so a terminal
-    /// killed next to a Lua `side` panel comes back under `[editor | agent]` as a first launch puts
-    /// it, not full width below the side panel too. Falls back to [`Placement::BelowRoot`] if
-    /// neither leaf is in the tree. Never a first-launch placement itself -- `place_new`'s own doc.
-    BelowEditorAndAgent,
+    /// A new column split below only the editor's leaf, pinned like [`Placement::BelowRoot`].
+    /// This is the terminal's default placement, keeping the agent and side panels at full height.
+    /// Falls back to [`Placement::BelowRoot`] if the editor is absent after
+    /// [`super::kill::Reopen::Never`]. Only the terminal uses this for first-launch placement.
+    BelowEditor,
 }
 
 /// A module beyond the editor and agent built into every window. Its key lives in

@@ -87,6 +87,11 @@ export interface EditPreview {
   replaceAll: boolean;
   /** True when the whole file is being written, so the card can say so rather than imply a patch. */
   wholeFile: boolean;
+  /** The note `EditDiff` shows under a `wholeFile` change instead of `Write`'s own wording ("Writes
+   *  the whole file..."), for a tool whose whole-content write is not a whole file -- `NotebookEdit`
+   *  writes one cell's `new_source`, and the tool's own schema carries no "before" to diff against.
+   *  `undefined` when `wholeFile` is `false`, or for `Write`, which keeps its pinned wording. */
+  wholeFileNote?: string;
 }
 
 /** A reviewable preview for the tools that change a file, or `null` for every other tool.
@@ -131,6 +136,41 @@ export function editPreview(toolName: string, input: unknown): EditPreview | nul
       removed: 0,
       replaceAll: false,
       wholeFile: true,
+    };
+  }
+
+  // `NotebookEdit` has no previous cell contents to diff against. Treat `new_source` as a whole-cell
+  // write, like `Write` for a whole file, using `notebook_path` rather than `file_path`.
+  // `edit_mode: "delete"` has no `new_source`, so give it deletion wording instead of an empty write diff.
+  // Name the cell with `cell_id` when supplied. An absent `edit_mode` defaults to "replace" in the tool schema.
+  if (toolName === "NotebookEdit") {
+    const notebookPath = str("notebook_path");
+    const cellId = str("cell_id");
+    if (fields["edit_mode"] === "delete") {
+      if (notebookPath === "") return null;
+      return {
+        filePath: notebookPath,
+        diff: [],
+        added: 0,
+        removed: 0,
+        replaceAll: false,
+        wholeFile: true,
+        wholeFileNote: cellId
+          ? `Deletes cell ${cellId}. The request carries no record of what it held.`
+          : "Deletes a cell. The request carries no record of what it held.",
+      };
+    }
+    const newSource = str("new_source");
+    if (newSource === "" && notebookPath === "") return null;
+    const diff = lineDiff("", newSource);
+    return {
+      filePath: notebookPath,
+      diff,
+      added: lines(newSource).length,
+      removed: 0,
+      replaceAll: false,
+      wholeFile: true,
+      wholeFileNote: "Writes the whole cell. The request does not say what is there now.",
     };
   }
 

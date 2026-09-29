@@ -87,6 +87,9 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   { label: "Escape, browse, idle", mode: "browse", event: key("Escape"), ctx: { sessionEnded: false, turnRunning: false } },
   { label: "Escape, browse, a turn is running", mode: "browse", event: key("Escape"), ctx: { sessionEnded: false, turnRunning: true } },
   { label: "Escape, input", mode: "input", event: key("Escape"), ctx: { sessionEnded: false } },
+  // Append new binding cases so regenerated fixture diffs show only additions.
+  { label: "Ctrl+e", mode: "browse", event: key("e", { ctrlKey: true }), ctx: { sessionEnded: false } },
+  { label: "Ctrl+y", mode: "browse", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
 ];
 
 function readJson<T>(text: string): T {

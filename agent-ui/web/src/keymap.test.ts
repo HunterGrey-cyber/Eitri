@@ -156,8 +156,9 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("y", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("r", { ctrlKey: true }), { sessionEnded: true })).toBeNull();
     expect(resolveKey("input", key("Escape", { shiftKey: true }), ctx)).toBeNull();
-    // The three chords it DOES name (below) are named exactly: every other modifier set on the
-    // same letters, and every other Ctrl/Shift letter a vim user might reach for, is still refused.
+    // The chords it DOES name (below, and Ctrl+e/Ctrl+y -- their own test just below this one) are
+    // named exactly: every other modifier set on the same letters, and every other Ctrl/Shift
+    // letter a vim user might reach for, is still refused.
     expect(resolveKey("browse", key("d", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     // Ctrl+a reaches the blanket modifier refusal before `isPlainAnswerKey` is consulted.
     // This checks Ctrl separately from the Alt, Meta and Super cases above.
@@ -166,8 +167,11 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("G", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("b", { ctrlKey: true }), ctx)).toBeNull();
-    expect(resolveKey("browse", key("e", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("p", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("J", { shiftKey: true }), ctx)).toBeNull();
+    // Ctrl+Shift+e/y are refused, like Ctrl+Shift+d above; only the unshifted Ctrl+e/y chords scroll.
+    expect(resolveKey("browse", key("e", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
+    expect(resolveKey("browse", key("y", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     // And the named ones belong to BROWSE only: in the composer they are the text box's own.
     expect(resolveKey("input", key("d", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("input", key("u", { ctrlKey: true }), ctx)).toBeNull();
@@ -183,6 +187,19 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
     // Scrolling a dead session's transcript is still reading it.
     expect(resolveKey("browse", key("d", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "half-page", delta: 1 });
+  });
+
+  /* Check Ctrl+e/Ctrl+y before the plain-key switch. A browser reports `key === "y"` for both
+     Ctrl+y and bare `y`, so letting Ctrl+y reach the switch would copy the current row. */
+  it("names Ctrl+e and Ctrl+y as one-line scrolls, and a Ctrl+y is never a copy", () => {
+    expect(resolveKey("browse", key("e", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: 1 });
+    expect(resolveKey("browse", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: -1 });
+    expect(resolveKey("browse", key("y"), ctx)).toEqual({ kind: "copy" });
+    // Scrolling a dead session's transcript is still reading it, the same as Ctrl+d/Ctrl+u.
+    expect(resolveKey("browse", key("e", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "scroll-line", delta: 1 });
+    // BROWSE only: INPUT's own Ctrl+e (end of line) and Ctrl+y are the composer's.
+    expect(resolveKey("input", key("e", { ctrlKey: true }), ctx)).toBeNull();
+    expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toBeNull();
   });
 
   it("names Shift+Y and Shift+D ahead of the modifier refusal", () => {
@@ -373,6 +390,8 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "A", ev: key("A", { shiftKey: true }) },
       { token: "Ctrl+d", ev: key("d", { ctrlKey: true }) },
       { token: "Ctrl+u", ev: key("u", { ctrlKey: true }) },
+      { token: "Ctrl+e", ev: key("e", { ctrlKey: true }) },
+      { token: "Ctrl+y", ev: key("y", { ctrlKey: true }) },
       { token: "gg", ev: key("g"), pending: "g" },
       { token: "1-9", ev: key("3") },
       { token: "[[", ev: key("["), pending: "[" },

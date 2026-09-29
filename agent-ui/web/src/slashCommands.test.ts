@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  barePickerCommand,
   heldBackSlashCommand,
   SLASH_COMMANDS,
   slashCommandFlashText,
@@ -69,10 +70,17 @@ describe("heldBackSlashCommand", () => {
     expect(heldBackSlashCommand("/resume")).toBe("resume");
   });
 
-  it("holds back /model without an argument, but not with one", () => {
-    expect(heldBackSlashCommand("/model")).toBe("model");
-    expect(heldBackSlashCommand("/model  ")).toBe("model");
+  /* Send a bare `/model`: its headless reply is parseable text that the panel turns into a
+   *  picker. */
+  it("no longer holds back a bare /model -- it sends, same as /model <name>", () => {
+    expect(heldBackSlashCommand("/model")).toBeNull();
+    expect(heldBackSlashCommand("/model  ")).toBeNull();
     expect(heldBackSlashCommand("/model sonnet")).toBeNull();
+  });
+
+  it("never held back /effort, bare or with an argument -- unknown to SLASH_COMMANDS either way", () => {
+    expect(heldBackSlashCommand("/effort")).toBeNull();
+    expect(heldBackSlashCommand("/effort low")).toBeNull();
   });
 
   it("sends a command classed works, e.g. /compact", () => {
@@ -125,14 +133,16 @@ describe("worksSlashCommands (the ? overlay's list)", () => {
 /* The v1-ui GUI pass (2026-09-27): `/config` typed and refused said "? lists the ones that do", and `?`
    listed `/config`. The overlay lists only what Enter sends. */
 describe("listedSlashCommands (the ? overlay's list, what Enter would send)", () => {
-  it("leaves out /config and lists /model in its sendable form", () => {
+  /* List `/model` as "model", like other sendable commands. It needs no "<name>" suffix because
+   *  the bare command also sends and opens a picker. */
+  it("leaves out /config and lists /model plainly", () => {
     expect(listedSlashCommands()).toEqual([
       "clear",
       "compact",
       "cost",
       "context",
       "usage",
-      "model <name>",
+      "model",
       "mcp",
       "agents",
       "doctor",
@@ -142,8 +152,27 @@ describe("listedSlashCommands (the ? overlay's list, what Enter would send)", ()
 
   it("names nothing Enter holds back", () => {
     for (const shown of listedSlashCommands()) {
-      const typed = `/${shown.replace(" <name>", " sonnet")}`;
-      expect(heldBackSlashCommand(typed), typed).toBeNull();
+      expect(heldBackSlashCommand(`/${shown}`), shown).toBeNull();
     }
+  });
+});
+
+describe("barePickerCommand", () => {
+  it("names a bare /model or /effort, trailing whitespace included", () => {
+    expect(barePickerCommand("/model")).toBe("model");
+    expect(barePickerCommand("/model  ")).toBe("model");
+    expect(barePickerCommand("  /effort")).toBe("effort");
+  });
+
+  it("is null the moment an argument is present", () => {
+    expect(barePickerCommand("/model sonnet")).toBeNull();
+    expect(barePickerCommand("/effort low")).toBeNull();
+  });
+
+  it("is null for any other command, known or not, and for plain text", () => {
+    expect(barePickerCommand("/compact")).toBeNull();
+    expect(barePickerCommand("/unknown-thing")).toBeNull();
+    expect(barePickerCommand("please add a test")).toBeNull();
+    expect(barePickerCommand("")).toBeNull();
   });
 });

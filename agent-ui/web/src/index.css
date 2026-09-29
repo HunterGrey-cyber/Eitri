@@ -1743,6 +1743,62 @@ body,
   background: color-mix(in srgb, var(--nv-hint-bg) 35%, transparent);
 }
 
+/* The /model /effort picker (`SlashPicker.tsx`). Positioned and
+   drawn the same way `.chooser` is -- a full overlay over the conversation, same font/colours --
+   since it is a smaller instance of the same idea (a `j`/`k`/Enter/Esc list over the conversation). */
+.slash-picker {
+  position: absolute;
+  inset: 0;
+  overflow-y: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 20px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+.slash-picker-header {
+  flex: 0 0 auto;
+  margin-bottom: 8px;
+}
+.slash-picker-title {
+  font-weight: bold;
+}
+.slash-picker-list {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.slash-picker-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px;
+}
+.slash-picker-row.current {
+  background: var(--nv-cursorline);
+}
+.slash-picker-sign {
+  flex: 0 0 auto;
+  width: 1.2em;
+  text-align: center;
+}
+.slash-picker-current-marker {
+  color: var(--nv-muted);
+}
+.slash-picker-hint {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  color: var(--nv-muted);
+}
+.slash-picker-scope {
+  color: var(--nv-muted);
+}
+
 /* Replaces window.alert: copyable, non-blocking, and able to show the sidecar's own multi-line
    startup diagnostics, which is usually where the real cause is. */
 .fatal-error {

@@ -46,10 +46,10 @@ export const SLASH_COMMANDS: readonly SlashCommandEntry[] = [
 const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map(SLASH_COMMANDS.map((entry) => [entry.name, entry]));
 
 /** Hold these commands back because their terminal pickers cannot be drawn in a headless turn.
- *  `/model` is held back only without an argument. `/model sonnet` is an ordinary sendable turn;
- *  a bare headless `/model` prints usage text instead of an interactive menu. */
+ *  `/model` and `/effort` are allowed: their headless replies contain parseable usage text, and
+ *  `parseModelReply` and `parseEffortReply` use it to build the panel's `SlashPicker`. Neither
+ *  command belongs in this set. */
 const INTERACTIVE_ONLY_UNCONDITIONAL: ReadonlySet<string> = new Set(["login", "config", "resume"]);
-const INTERACTIVE_ONLY_WITHOUT_ARGUMENT = "model";
 
 /** Classes that are always held back, regardless of name. No row
  *  in `SLASH_COMMANDS` carries one of these today -- kept as real classes rather than folded away so
@@ -57,8 +57,9 @@ const INTERACTIVE_ONLY_WITHOUT_ARGUMENT = "model";
 const HELD_BACK_CLASSES: ReadonlySet<SlashCommandClass> = new Set(["no-op", "error", "hangs"]);
 
 /** A draft's first word, if it is a slash command: `/name` alone, or `/name` followed by something
- *  else non-whitespace anywhere after it (an "argument", for `/model`'s own carve-out). Returns
- *  `null` for a draft that is not a slash command at all -- ordinary text, sent as always. */
+ *  else non-whitespace anywhere after it (an "argument" -- what tells `barePickerCommand` below a
+ *  bare `/model`/`/effort` apart from `/model sonnet`). Returns `null` for a draft that is not a
+ *  slash command at all -- ordinary text, sent as always. */
 function parseSlashCommand(text: string): { name: string; hasArgument: boolean } | null {
   const trimmed = text.trimStart();
   if (!trimmed.startsWith("/")) return null;
@@ -70,17 +71,26 @@ function parseSlashCommand(text: string): { name: string; hasArgument: boolean }
 }
 
 /** Returns the blocked command's name without the slash for the flash message, or `null` to send.
- *  Named interactive-only commands are always blocked; `/model` is blocked only when bare.
- *  Other commands pass unless their table class is held back. Unknown commands pass too. */
+ *  Named interactive-only commands and held-back classes are blocked. `/model`, `/effort` and
+ *  unknown commands pass, with or without arguments. */
 export function heldBackSlashCommand(text: string): string | null {
   const parsed = parseSlashCommand(text);
   if (parsed === null) return null;
-  const { name, hasArgument } = parsed;
+  const { name } = parsed;
   if (INTERACTIVE_ONLY_UNCONDITIONAL.has(name)) return name;
-  if (name === INTERACTIVE_ONLY_WITHOUT_ARGUMENT && !hasArgument) return name;
   const entry = BY_NAME.get(name);
   if (entry !== undefined && HELD_BACK_CLASSES.has(entry.class)) return name;
   return null;
+}
+
+/** Recognize a bare `/model` or `/effort` with no argument so the panel can parse its reply into
+ *  `SlashPicker` options. Return `null` for other commands, plain text or commands with
+ *  arguments. `App.tsx` watches the next `turn_completed` only for bare commands; the picker's
+ *  own choice always sends an argument and must not reopen a picker. */
+export function barePickerCommand(text: string): "model" | "effort" | null {
+  const parsed = parseSlashCommand(text);
+  if (parsed === null || parsed.hasArgument) return null;
+  return parsed.name === "model" || parsed.name === "effort" ? parsed.name : null;
 }
 
 /** Flash text for a blocked slash command, pointing to `?` for commands that work. */
@@ -95,14 +105,9 @@ export function worksSlashCommands(): string[] {
   return SLASH_COMMANDS.filter((entry) => entry.class === "works").map((entry) => entry.name);
 }
 
-/** What the `?` overlay lists (the v1-ui GUI pass, 2026-09-27): the **works** rows that Enter would
- *  actually send. The pass saw `/config` refused with "does not work in neovibe — ? lists the ones that
- *  do" while `?` listed `/config`, so the two contradicted each other on one screen. A command held
- *  back unconditionally (`/config`) is left out; `/model`, sendable only with an argument, is listed
- *  in that form. `worksSlashCommands` above stays the table's own class, unchanged. */
+/** Commands shown by the `?` overlay: rows classed **works** that Enter would actually send.
+ *  Exclude unconditionally held commands such as `/config` so the list agrees with sending
+ *  behavior. `worksSlashCommands` still returns the table's class without filtering holdbacks. */
 export function listedSlashCommands(): string[] {
-  return worksSlashCommands().flatMap((name) => {
-    if (heldBackSlashCommand(`/${name}`) === null) return [name];
-    return name === INTERACTIVE_ONLY_WITHOUT_ARGUMENT ? [`${name} <name>`] : [];
-  });
+  return worksSlashCommands().flatMap((name) => (heldBackSlashCommand(`/${name}`) === null ? [name] : []));
 }

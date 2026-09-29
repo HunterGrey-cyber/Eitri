@@ -101,12 +101,13 @@ describe("KeymapOverlay", () => {
       return Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Slash commands"))!;
     }
 
-    it("lists the works rows Enter would send, in the table's own order -- no /config, and /model <name>", () => {
+    // A bare /model is sent too, so list it without an argument placeholder.
+    it("lists the works rows Enter would send, in the table's own order -- no /config, and /model plain", () => {
       const section = slashSection(overlay().container);
       const items = Array.from(section.querySelectorAll("li")).map((li) => li.textContent);
       expect(items).toEqual(listedSlashCommands().map((name) => `/${name}`));
       expect(items).not.toContain("/config");
-      expect(items).toContain("/model <name>");
+      expect(items).toContain("/model");
     });
 
     it("adds no <tr> of its own -- it is a plain list, not a key table", () => {

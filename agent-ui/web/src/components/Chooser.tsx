@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import type { BackendKind, ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
+import type { ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
 import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
@@ -11,7 +11,6 @@ type Props = {
   tabs: TabInfo[];
   active: TabId | null;
   defaultMode: PermissionModeChoice;
-  backend: BackendKind;
   projectDir: string;
   newTabChord: string;
   /** Bumped by `App` on regained pane focus, `enter_input` and `arrive` to restore chooser focus.
@@ -158,7 +157,6 @@ export function Chooser({
   tabs,
   active,
   defaultMode,
-  backend,
   projectDir,
   newTabChord,
   focusRequest,
@@ -349,7 +347,6 @@ export function Chooser({
                   row={row}
                   current={index === cursor}
                   needle={needle}
-                  backend={backend}
                   newTabChord={newTabChord}
                   renaming={renaming}
                   renameRef={renameRef}
@@ -378,7 +375,6 @@ function ChooserRowItem({
   row,
   current,
   needle,
-  backend,
   newTabChord,
   renaming,
   renameRef,
@@ -390,7 +386,6 @@ function ChooserRowItem({
   row: ChooserRow;
   current: boolean;
   needle: string;
-  backend: BackendKind;
   newTabChord: string;
   renaming: { tab: TabId; value: string } | null;
   renameRef: RefObject<HTMLInputElement>;
@@ -419,6 +414,10 @@ function ChooserRowItem({
     const sign = word === "running" ? "running" : word === "done, unread" ? "unread" : null;
     const mode = row.info?.mode ?? "auto";
     const title = row.info?.title ?? null;
+    // Bypass is the one mode worth a glance here; auto is the default and carries nothing new. The
+    // backend name is not drawn here at all: it lives only in `prefix i` / `<leader>i`
+    // (`DetailPopover`).
+    const bypass = mode === "bypass";
     return (
       <div className={classes} onClick={onClick}>
         {current ? cursorSign : <span className={sign === null ? "chooser-sign" : `chooser-sign chooser-sign-${sign}`} />}
@@ -451,13 +450,23 @@ function ChooserRowItem({
           )}
           <span className="chooser-right">
             {row.tab.marker === "needs_input" && `⚑${row.tab.pending > 1 ? row.tab.pending : ""} `}
-            {word}
+            {/* A not-started tab's label already says new (`tabs::label`), so its state word would repeat it. */}
+            {word !== "new" && word}
           </span>
         </span>
-        <span className="chooser-line2 chooser-muted">
-          <ModeGlyph mode={mode} /> {mode} · {backend}
-          {title !== null && ` · ${title}`}
-        </span>
+        {(bypass || title !== null) && (
+          <span className="chooser-line2 chooser-muted">
+            {/* The same `.mode-glyph[data-mode-name="bypass"]` token the band and the mode line
+                above already colour bypass with (`--nv-error`) -- no new colour invented. */}
+            {bypass && (
+              <>
+                <ModeGlyph mode="bypass" /> bypass
+              </>
+            )}
+            {bypass && title !== null && " · "}
+            {title}
+          </span>
+        )}
       </div>
     );
   }
@@ -472,7 +481,9 @@ function ChooserRowItem({
         <span className="chooser-right">{relativeWhen(Date.now(), record.updatedAt)}</span>
       </span>
       <span className="chooser-line2 chooser-muted">
-        {record.heldElsewhere ? "open in another window, can't be resumed here" : `sidecar · ${shortId(record.providerSessionId)}`}
+        {/* The short id distinguishes untitled sessions. The backend name adds no distinction in
+            release builds. */}
+        {record.heldElsewhere ? "open in another window, can't be resumed here" : shortId(record.providerSessionId)}
       </span>
     </div>
   );

@@ -150,8 +150,8 @@ describe("Composer and slash commands (P10)", () => {
     );
   });
 
-  it("holds back every interactive-only command the same way: /config, /resume, and /model with no argument", () => {
-    for (const command of ["/config", "/resume", "/model"]) {
+  it("holds back the unconditional interactive-only commands: /config and /resume", () => {
+    for (const command of ["/config", "/resume"]) {
       const { textarea, onSend } = renderComposer();
       fireEvent.change(textarea, { target: { value: command } });
       fireEvent.keyDown(textarea, { key: "Enter" });
@@ -161,12 +161,17 @@ describe("Composer and slash commands (P10)", () => {
     }
   });
 
-  it("sends /model WITH an argument -- only the bare picker form is interactive-only", () => {
-    const { textarea, onSend } = renderComposer();
-    fireEvent.change(textarea, { target: { value: "/model sonnet" } });
-    fireEvent.keyDown(textarea, { key: "Enter" });
-    expect(onSend).toHaveBeenCalledWith("/model sonnet");
-    expect(textarea.value).toBe("");
+  /* Bare `/model` can be sent because `App.tsx` parses its reply into a picker. This component
+   *  only sends the command. */
+  it("sends /model bare or with an argument alike", () => {
+    for (const command of ["/model", "/model sonnet"]) {
+      const { textarea, onSend } = renderComposer();
+      fireEvent.change(textarea, { target: { value: command } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend, command).toHaveBeenCalledWith(command);
+      expect(textarea.value, command).toBe("");
+      cleanup();
+    }
   });
 
   it("sends a command classed works (/compact)", () => {

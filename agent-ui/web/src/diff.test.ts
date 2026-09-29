@@ -74,6 +74,50 @@ describe("editPreview", () => {
     expect(editPreview("mcp__x__y", { anything: 1 })).toBeNull();
   });
 
+  /** `NotebookEdit` supplies `notebook_path` and `new_source`, but no previous cell content.
+   *  Treat it as a whole-cell write, like `Write` for a whole file. The note must say "cell"
+   *  rather than "file" to describe the scope correctly. */
+  it("reads a NotebookEdit as a whole-cell write, filed under notebook_path", () => {
+    const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", cell_id: "c1", new_source: "one\ntwo\n" })!;
+    expect(preview.filePath).toBe("/p/a.ipynb");
+    expect(preview.wholeFile).toBe(true);
+    expect(preview.added).toBe(2);
+    expect(preview.removed).toBe(0);
+    expect(preview.wholeFileNote).toMatch(/cell/i);
+  });
+
+  it("survives a NotebookEdit with neither notebook_path nor new_source", () => {
+    expect(editPreview("NotebookEdit", {})).toBeNull();
+  });
+
+  /** `NotebookEdit` with `edit_mode: "delete"` has no `new_source` to diff.
+   *  Name the deletion instead of showing an empty diff and the misleading "Writes the whole cell" note. */
+  it("names a deleted cell instead of drawing an empty whole-cell write for it", () => {
+    const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", cell_id: "c1", edit_mode: "delete" })!;
+    expect(preview.filePath).toBe("/p/a.ipynb");
+    expect(preview.diff).toEqual([]);
+    expect(preview.added).toBe(0);
+    expect(preview.removed).toBe(0);
+    expect(preview.wholeFile).toBe(true);
+    expect(preview.wholeFileNote).toBe("Deletes cell c1. The request carries no record of what it held.");
+  });
+
+  it("still names a deletion with no cell_id, and never mentions writing", () => {
+    const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", edit_mode: "delete" })!;
+    expect(preview.wholeFileNote).toBe("Deletes a cell. The request carries no record of what it held.");
+    expect(preview.wholeFileNote).not.toMatch(/writes/i);
+  });
+
+  it("survives a delete with no notebook_path", () => {
+    expect(editPreview("NotebookEdit", { edit_mode: "delete" })).toBeNull();
+  });
+
+  it("still reads a plain replace as a whole-cell write, unaffected by the delete branch", () => {
+    const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", edit_mode: "replace", new_source: "x\n" })!;
+    expect(preview.wholeFileNote).toMatch(/writes the whole cell/i);
+    expect(preview.added).toBe(1);
+  });
+
   it("survives a malformed or absent input object", () => {
     expect(editPreview("Edit", null)).toBeNull();
     expect(editPreview("Edit", "not an object")).toBeNull();

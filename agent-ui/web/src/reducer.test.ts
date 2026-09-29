@@ -722,6 +722,21 @@ describe("applyCallNotes", () => {
     expect(applyCallNotes(state, { promptNotes: [] })).toBe(state);
   });
 
+  /** Apply acceptEdits fast-path notes to named calls only, like the rule notes above. Ignore
+   *  unknown call ids and preserve the state object when no notes arrive. */
+  it("marks the calls the acceptEdits fast path allowed, leaves the rest", () => {
+    let state = initialState();
+    for (const id of ["toolu_1", "toolu_2"]) {
+      state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: id, name: "Edit", input: {} });
+    }
+    const other = state.toolCalls[1];
+    const next = applyCallNotes(state, { autoNotes: ["toolu_1", "toolu_gone"] });
+    expect(next.toolCalls.map((c) => c.allowedByAuto)).toEqual([true, undefined]);
+    expect(next.toolCalls[1]).toBe(other);
+    expect(applyCallNotes(state, {})).toBe(state);
+    expect(applyCallNotes(state, { autoNotes: [] })).toBe(state);
+  });
+
   it("marks a Write card raised over no file, and its call", () => {
     let state = initialState();
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_w", name: "Write", input: { file_path: "/p/a" } });
@@ -731,6 +746,16 @@ describe("applyCallNotes", () => {
     const next = applyCallNotes(state, { createsFile: [{ permissionId: "perm-new", toolUseId: "toolu_w" }] });
     expect(next.pendingPermissions.map((p) => p.createsFile)).toEqual([true, undefined]);
     expect(next.toolCalls[0].createsFile).toBe(true);
+  });
+
+  /** A fast-path-allowed `Write` raises no `PermissionRequested`, so `createsFile` never learns
+   *  about it. `autoCreatesFile` carries the same new-file signal for a call answered without a card. */
+  it("marks a fast-path-allowed Write over no file as creating one, with no card ever raised", () => {
+    let state = initialState();
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_w", name: "Write", input: { file_path: "/p/new.rs" } });
+    const next = applyCallNotes(state, { autoCreatesFile: ["toolu_w"] });
+    expect(next.toolCalls[0].createsFile).toBe(true);
+    expect(applyCallNotes(state, { autoCreatesFile: [] })).toBe(state);
   });
 });
 

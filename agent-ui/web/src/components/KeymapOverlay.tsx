@@ -95,7 +95,7 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
 
 /** Slash commands use a plain list because they are commands rather than keybindings. This also
  *  keeps them out of key-table row counts. Names come from `../slashCommands` in table order.
- *  `listedSlashCommands` omits `/config` and displays `/model <name>`. */
+ *  `listedSlashCommands` omits `/config`. Bare `/model` can be sent and opens `../SlashPicker`. */
 function SlashCommands() {
   return (
     <section>

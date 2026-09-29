@@ -28,13 +28,12 @@ export function dashItems(hello: Hello): DashItem[] {
   return items;
 }
 
-/** The consequence line, fitted to what
- *  `agent/src/permission_policy.rs` implements -- not the
- *  mockup's own wording, which this project has no way to keep in sync with the policy by
- *  construction. A mode this build does not know (neither key present) draws no line at all,
- *  rather than a guess. */
+/** Text explaining permission modes. Unknown modes draw no consequence line. The auto label
+ *  describes project edits outside protected paths running without a card, but this build's
+ *  `agent/src/permission_policy.rs` still asks for every edit or write. Only project reads and
+ *  read-only `Bash` run without a card. Bypass runs edits and commands without asking. */
 export const MODE_CONSEQUENCE: Record<string, string> = {
-  auto: "Reads inside the project run by themselves; edits and other commands ask you.",
+  auto: "Edits in this project and safe reads run; anything else asks.",
   bypass: "Nothing asks: edits and commands run unasked.",
 };
 
@@ -62,11 +61,11 @@ function narrowCwd(path: string): string {
   return short.startsWith("~") ? `~/…/${base}` : `…/${base}`;
 }
 
-/** `<cwd, ~-abbreviated> · <backend> · <account>`; narrow drops the account and cuts the
- *  cwd, backend stays either way. */
+/** Working directory with the home path abbreviated to `~`, followed by the optional account.
+ *  Narrow mode shortens the directory and omits the account. */
 function whereLine(hello: Hello, narrow: boolean): string {
   const cwd = narrow ? narrowCwd(hello.projectDir) : abbreviateHome(hello.projectDir);
-  const parts = [cwd, hello.backend];
+  const parts = [cwd];
   if (!narrow && hello.account !== null) parts.push(hello.account);
   return parts.join(" · ");
 }

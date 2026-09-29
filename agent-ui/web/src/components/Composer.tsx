@@ -221,8 +221,9 @@ export function Composer({
     if (disabled || editingInNvim) return;
     const body = text;
     // Held-back slash commands are neither sent nor queued, including through send-now. This
-    // includes `/login`, `/config`, `/resume` and a bare `/model`. Keep the draft unchanged and
-    // show a flash naming the command.
+    // includes `/login`, `/config` and `/resume`. Keep the draft unchanged and show a flash
+    // naming the command. A bare `/model` or `/effort` is sent to open a picker parsed from the
+    // CLI reply.
     const held = heldBackSlashCommand(body);
     if (held !== null) {
       showSlashFlash(slashCommandFlashText(held));

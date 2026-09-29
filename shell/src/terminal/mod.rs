@@ -5,8 +5,8 @@
 //! `Ctrl+a t`, literal `Ctrl+a Ctrl+a`, app-reserved chords and terminal colours.
 //! These functions can be tested without a display.
 //!
-//! `ModuleId::terminal()` is placed below the editor and agent and stays hidden until
-//! the first `Ctrl+a t`. A Lua `bottom` panel goes under it without replacing it.
+//! `ModuleId::terminal()` is placed below the editor's own column and stays hidden until
+//! the first `Ctrl+a t`. A Lua `bottom` panel goes under everything without replacing it.
 //! The layout and `ModuleGrid` control placement, visibility, focus after hiding and
 //! `Ctrl+h/j/k/l` destinations. This module keeps the terminal-specific behavior.
 
@@ -28,29 +28,28 @@ use terminal_render::RgbColor;
 
 use crate::layout::Direction;
 
-/// The first-launch layout with the terminal in it: `Layout::initial` over the terminal first --
-/// below the editor and the agent, so a Lua `bottom` panel goes under it rather than replacing it as
-/// it did on `main` -- then `lua`, in the order they were registered. The terminal is hidden before
-/// anything is built from the layout, so its host is never on screen until `Ctrl+a t`, and the
-/// window looks exactly as it did without it (`BELOW_ROOT_SHARE`'s split collapses: `[editor | agent]`
-/// gets the whole height).
+/// Builds the first-launch layout with the terminal below the editor's own leaf, using
+/// `Placement::BelowEditor`, then adds Lua panels in registration order. The agent and Lua
+/// `side` panels keep the full window height. The terminal is hidden before the layout is
+/// built into widgets, so it appears only after `Ctrl+a t`. Its hidden split collapses to
+/// the editor's leaf and leaves the visible layout unchanged.
 ///
-/// **Full width only without a Lua `side` panel**. Placed after the
-/// terminal, a `side` panel wraps the whole root, `Row(Column(Row(editor | agent), terminal), side)`:
-/// the side panel runs the full height and the terminal is only as wide as `[editor | agent]`
-/// (857 of 1280px in the default window, where `main` spanned the full width under
-/// `[editor | side slot]`). A Lua `bottom` panel, likewise, puts the terminal's own split inside the
-/// upper two thirds, so its first show is 160px, not 240. Either panel can also be the module that
-/// takes the keys when the terminal hides, if it had them more recently than the editor or the agent.
+/// The terminal is always exactly the editor's width. In the default 1280px window, its
+/// first show is 760px wide and a third of the editor column's height. A Lua `side` panel
+/// reduces that width along with the editor's share. A Lua `bottom` panel uses
+/// `Placement::BelowRoot` and wraps the whole tree, including the editor's nested terminal
+/// and the agent. The two vertical splits compound, so the terminal's first show under a
+/// `bottom` panel is 160px high rather than 240px. A `Row` split does not change height.
+/// Either Lua panel can receive focus when the terminal hides if it held the keys more
+/// recently than the editor or agent.
 ///
-/// Hidden through `neovibe_core::layout::hide`, the only door (`Layout::hide_unfocused` is private
-/// to the layout so nothing hides the module with the keys without choosing where they go). At
-/// startup the keys are on the editor or a Lua `main` panel, never on the terminal, so `hide` reads
-/// no geometry and the frame it is given is only a formality.
+/// Hides the terminal through `layout::hide`, which chooses a focus destination before
+/// hiding a focused module. At startup the editor or a Lua `main` panel holds the keys,
+/// so hiding the terminal reads no geometry and the supplied frame is only a placeholder.
 pub(crate) fn initial_layout(lua: &[ModuleDecl]) -> Result<Layout, LayoutError> {
     let mut decls = vec![ModuleDecl {
         id: ModuleId::terminal(),
-        placement: Placement::BelowRoot,
+        placement: Placement::BelowEditor,
     }];
     decls.extend_from_slice(lua);
     let mut layout = Layout::initial(&decls)?;
@@ -231,9 +230,9 @@ mod tests {
         Frame::new(UNALLOCATED, 1)
     }
 
-    /// The module rectangles and the divider rectangles: what is on screen. (A divider's `path`
-    /// differs -- `[editor | agent]` is the first child of the terminal's hidden split now -- and a
-    /// path is not a pixel.)
+    /// Returns the module and divider rectangles that are on screen. The editor is the first
+    /// child of the terminal's hidden split, so divider paths can differ even when the visible
+    /// rectangles are identical.
     fn on_screen(layout: &Layout) -> (Vec<(ModuleId, Rect)>, Vec<Rect>) {
         let a = arrange(layout, &frame());
         (a.modules, a.dividers.iter().map(|d| d.rect).collect())
@@ -241,8 +240,10 @@ mod tests {
 
     /// The terminal stays hidden until the first `Ctrl+a t`. Until then, the window's module
     /// and divider rectangles match the `[editor | agent]` layout pixel for pixel.
+    /// While hidden below the editor, the terminal's pinned split collapses to the editor's
+    /// leaf alone.
     #[test]
-    fn the_terminal_starts_hidden_below_the_editor_and_the_agent() {
+    fn the_terminal_starts_hidden_below_the_editor() {
         let layout = initial_layout(&[]).unwrap();
         assert!(layout.contains(&term()));
         assert!(!layout.is_shown(&term()));
@@ -251,8 +252,8 @@ mod tests {
         assert_eq!(on_screen(&layout), on_screen(&Layout::initial(&[]).unwrap()));
     }
 
-    /// A Lua `bottom` panel no longer replaces the terminal (on `main` it did, and the terminal
-    /// then did not exist in that window): it goes under it, and the terminal is still hidden.
+    /// A Lua `bottom` panel goes under the whole layout, including the terminal's place below
+    /// the editor. It does not replace the terminal, which remains hidden until shown.
     #[test]
     fn a_lua_bottom_panel_goes_under_the_terminal() {
         let below = ModuleDecl {
@@ -260,7 +261,9 @@ mod tests {
             placement: Placement::BelowRoot,
         };
         let mut layout = initial_layout(&[below]).unwrap();
-        assert_eq!(layout.leaves(), [editor(), agent(), term(), ModuleId::lua("below")]);
+        // The terminal is now nested inside the editor's own leaf, so it comes right after it in
+        // tree order -- before the agent, not after.
+        assert_eq!(layout.leaves(), [editor(), term(), agent(), ModuleId::lua("below")]);
         assert_eq!(layout.visible_leaves(), [editor(), agent(), ModuleId::lua("below")]);
         layout.show(&term()).unwrap();
         assert_eq!(
@@ -271,17 +274,22 @@ mod tests {
             navigate(&layout, &ModuleId::lua("below"), Direction::Up, &frame()),
             Nav::Module(term())
         );
+        // The outer `bottom` panel's own two-thirds split and the terminal's own nested one compound
+        // (a `Row` split never touches height): 160px, not 240, and still only the editor's own
+        // width, 760 of 1280, not full width.
+        let rect = arrange(&layout, &frame()).rect_of(&term()).unwrap();
+        assert_eq!((rect.w, rect.h), (760, 160));
     }
 
-    /// `Ctrl+a t`'s show/focus/hide cycle and the keys around it, over the layout the grid
-    /// allocates -- the same calls `main.rs` makes through `ModuleGrid` (`show_module` is
-    /// `Layout::show`; `hide_module` is `neovibe_core::layout::hide`, then the focus it returns,
-    /// then the unmap). What `main`'s `PaneLayout` did for the terminal, each point checked here:
-    /// the first show a third of the height (`shown_position(None, h)`); `Ctrl+j` down to it from
-    /// the editor's bottom window (`'D'`) and from the panel; `Ctrl+k` back to whichever of the two
-    /// above last had the keys (`last_upper_pane`); `Ctrl+h/l/j` from it the edge; hiding it with the
-    /// keys handing them up first; a zoom never showing a hidden terminal (`bottom_visible`); and a
-    /// second show putting it back where it was left (`bottom_position`).
+    /// Checks `Ctrl+a t`'s show, focus and hide cycle using the layout allocated by the grid.
+    /// `ModuleGrid` shows through `Layout::show` and hides through `layout::hide`, applies the
+    /// returned focus destination, then unmaps the terminal.
+    /// The first show is a third of the editor column's height and exactly the editor's width.
+    /// `Ctrl+j` reaches it from the editor; the agent has no neighbour below. From the terminal,
+    /// `Ctrl+k` reaches the editor and `Ctrl+l` reaches the full-height agent column. Hiding a
+    /// focused terminal returns the keys to the more recently focused geometric neighbour,
+    /// using the `Up` and `Right` candidates. Zooming does not reveal a hidden terminal, and
+    /// showing it again restores its previous position.
     #[test]
     fn the_terminal_hides_and_shows_as_ctrl_a_t_did_on_main() {
         let mut layout = initial_layout(&[]).unwrap();
@@ -290,13 +298,14 @@ mod tests {
         assert_eq!(layout.show(&term()), Ok(true));
         let shown = arrange(&layout, &frame());
         // 721px of content, one 1px divider: 480 above it (the paned's 480px start, which
-        // `shown_position` made two thirds of the height on `main`), 240 for the terminal.
+        // `shown_position` made two thirds of the height on `main`), 240 for the terminal -- but
+        // only 760 of 1280px wide, the editor's own share, not the whole window.
         assert_eq!(
             shown.rect_of(&term()),
             Some(Rect {
                 x: 0,
                 y: 481,
-                w: 1280,
+                w: 760,
                 h: 240
             })
         );
@@ -307,25 +316,48 @@ mod tests {
         );
         assert_eq!(
             navigate(&layout, &agent(), Direction::Down, &frame()),
-            Nav::Module(term())
+            Nav::Nothing,
+            "the terminal sits beside the agent now, not under it"
         );
+        assert_eq!(
+            navigate(&layout, &term(), Direction::Up, &frame()),
+            Nav::Module(editor()),
+            "Ctrl+k always reaches the editor: the only module that shares the terminal's own edge above it"
+        );
+        assert_eq!(
+            navigate(&layout, &term(), Direction::Right, &frame()),
+            Nav::Module(agent()),
+            "Ctrl+l reaches the agent, which runs the whole column's height beside the editor and the terminal"
+        );
+        for edge in [Direction::Left, Direction::Down] {
+            assert_eq!(navigate(&layout, &term(), edge, &frame()), Nav::Nothing, "{edge:?}");
+        }
+
+        // `hide`'s own MRU tie-break still gives the keys to whichever of the editor or the agent
+        // was more recently focused, even though only one of them (the agent) reaches the terminal
+        // via a single `navigate` query -- `hide` merges every direction's neighbour, not just one.
         for (above, other) in [(agent(), editor()), (editor(), agent())] {
             layout.set_focus(&other).unwrap();
             layout.set_focus(&above).unwrap();
             layout.set_focus(&term()).unwrap();
             assert_eq!(
-                navigate(&layout, &term(), Direction::Up, &frame()),
-                Nav::Module(above.clone()),
-                "Ctrl+k goes back to the one above that last had the keys"
+                hide(&mut layout, &term(), &frame()),
+                Ok(Some(above.clone())),
+                "hide gives the keys to whichever of the two was focused last"
             );
-        }
-        for edge in [Direction::Left, Direction::Right, Direction::Down] {
-            assert_eq!(navigate(&layout, &term(), edge, &frame()), Nav::Nothing, "{edge:?}");
+            layout.show(&term()).unwrap();
         }
 
         // The user drags the divider; `Ctrl+a t` with the keys in the terminal hides it, and the
-        // keys go up first -- to the agent, which had them last above it.
-        let divider = shown.dividers.iter().find(|d| d.path.is_empty()).unwrap().clone();
+        // keys go up first -- to the agent, which had them last above it. The terminal's own pinned
+        // divider is no longer the root split (`path == []` is the editor/agent row now): it is the
+        // one Column-axis divider, nested one level in.
+        let divider = shown
+            .dividers
+            .iter()
+            .find(|d| d.axis == neovibe_core::layout::Axis::Column)
+            .unwrap()
+            .clone();
         layout.set_ratio(&divider.path, divider.ratio_for(400)).unwrap();
         let dragged = arrange(&layout, &frame()).rect_of(&term());
         assert_ne!(dragged, shown.rect_of(&term()), "the drag moved it");

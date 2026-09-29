@@ -54,27 +54,34 @@ describe("dashItems", () => {
 });
 
 describe("MODE_CONSEQUENCE", () => {
+  /** Auto's text describes the acceptEdits fast path even though this build still uses interactive
+   *  default behavior. `MODE_CONSEQUENCE` documents the temporary mismatch. The bypass text is
+   *  unchanged. */
   it("says what auto and bypass actually do", () => {
-    expect(MODE_CONSEQUENCE.auto).toBe("Reads inside the project run by themselves; edits and other commands ask you.");
+    expect(MODE_CONSEQUENCE.auto).toBe("Edits in this project and safe reads run; anything else asks.");
     expect(MODE_CONSEQUENCE.bypass).toBe("Nothing asks: edits and commands run unasked.");
   });
 });
 
 describe("Dashboard", () => {
-  it("draws the centred name and the where-line, account omitted when null", () => {
+  /** The where-line does not name the backend: the name is the same in every release build, so
+   *  it carries nothing. The backend stays reachable in `prefix i`. */
+  it("draws the centred name and the where-line with no backend, account omitted when null", () => {
     const { getByText, container } = renderDash();
     getByText("neovibe");
-    getByText("~/Documents/neovibe · sidecar · work");
+    getByText("~/Documents/neovibe · work");
     const noAccount = { ...HELLO, account: null };
     const { getByText: getByTextNoAccount } = renderDash({ hello: noAccount });
-    getByTextNoAccount("~/Documents/neovibe · sidecar");
+    getByTextNoAccount("~/Documents/neovibe");
     expect(container.textContent).toContain("neovibe");
+    expect(container.textContent).not.toContain("sidecar");
   });
 
-  it("cuts the cwd and drops the account when narrow", () => {
+  it("cuts the cwd and drops the account when narrow, still with no backend", () => {
     const { getByText, queryByText } = renderDash({ narrow: true });
-    getByText("~/…/neovibe · sidecar");
+    getByText("~/…/neovibe");
     expect(queryByText(/work/)).toBeNull();
+    expect(queryByText(/sidecar/)).toBeNull();
   });
 
   it("draws every item with its key letter; mode reads ⇧Tab, not a letter", () => {
@@ -108,7 +115,7 @@ describe("Dashboard", () => {
 
   it("draws the consequence line for auto and bypass, and none for an unknown mode", () => {
     const { getByText } = renderDash({ mode: "auto" });
-    getByText("Reads inside the project run by themselves; edits and other commands ask you.");
+    getByText("Edits in this project and safe reads run; anything else asks.");
     const bypass = renderDash({ mode: "bypass" });
     bypass.getByText("Nothing asks: edits and commands run unasked.");
     const unknown = renderDash({ mode: "future-mode" as PermissionModeChoice });

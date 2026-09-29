@@ -42,6 +42,16 @@ pub struct EditorContext {
 pub const CONTENT_LIMIT: usize = 2000;
 pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 
+/// Whether `user_text` is a bare `/model` or `/effort`, with only whitespace around it.
+/// Matches `agent-ui/web/src/slashCommands.ts`'s `barePickerCommand`, which controls picker replies.
+/// This copy only decides whether appending editor context is safe.
+///
+/// The CLI reads everything after the command name as an argument. Appending a file context
+/// block to a bare command makes it an invalid argument instead of a picker request.
+fn is_bare_slash_picker_command(user_text: &str) -> bool {
+    matches!(user_text.trim(), "/model" | "/effort")
+}
+
 /// Appends what the editor is showing to the user's own text.
 ///
 /// The two templates are the CLI's, verbatim. The trailing hedge sentence is **load-bearing**: with
@@ -50,12 +60,18 @@ pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 ///
 /// Returns the user's text unchanged when there is nothing worth saying -- no context at all, or a
 /// buffer with no file. A turn that carries a context block saying nothing is worse than one
-/// carrying none: it spends the model's attention and teaches the reader to ignore the block.
+/// carrying none: it spends the model's attention and teaches the reader to ignore the block. Also
+/// returns it unchanged for a bare `/model`/`/effort` (`is_bare_slash_picker_command`) -- appending
+/// anything there breaks the CLI's own local-command parsing, which is the one reply this panel
+/// depends on being able to parse back out.
 pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> String {
     let Some(context) = context else {
         return user_text.to_string();
     };
     if context.file.trim().is_empty() {
+        return user_text.to_string();
+    }
+    if is_bare_slash_picker_command(user_text) {
         return user_text.to_string();
     }
     let block = match &context.selection {
@@ -178,6 +194,38 @@ mod tests {
                 ))
             ),
             "q"
+        );
+    }
+
+    /// A bare `/model` or `/effort` gets no appended context, even with a file open.
+    /// The CLI would read that block as an argument and omit the reply the picker expects.
+    /// Selections and ordinary non-bare commands still compose context normally.
+    #[test]
+    fn a_bare_model_or_effort_command_gets_no_context_appended() {
+        assert_eq!(
+            compose_turn_text("/model", Some(&ctx("/p/src/main.rs", None))),
+            "/model"
+        );
+        assert_eq!(
+            compose_turn_text("/effort", Some(&ctx("/p/src/main.rs", None))),
+            "/effort"
+        );
+        // Whitespace-only padding is still bare -- matches `barePickerCommand`'s own `trim()` rule.
+        assert_eq!(
+            compose_turn_text("  /model  ", Some(&ctx("/p/src/main.rs", None))),
+            "  /model  "
+        );
+    }
+
+    /// The command must be EXACTLY bare: an argument (already a working send before this feature),
+    /// a different command, or ordinary text all still get the context block -- this check is
+    /// narrowly scoped to the one shape whose reply this panel depends on parsing back out.
+    #[test]
+    fn a_model_command_with_an_argument_still_gets_context_appended() {
+        let out = compose_turn_text("/model sonnet", Some(&ctx("/p/src/main.rs", None)));
+        assert_eq!(
+            out,
+            "/model sonnet\n\nThe user opened the file /p/src/main.rs in the IDE. This may or may not be related to the current task."
         );
     }
 

@@ -43,6 +43,19 @@ describe("renderToolCall", () => {
     expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
   });
 
+  /** A `Write`/`Edit`/`NotebookEdit` allowed by the acceptEdits fast path shows a muted note.
+   *  Calls without the note show no such text, including calls answered by a card or saved rule. */
+  it("names an edit the acceptEdits fast path allowed, and says nothing of the kind otherwise", () => {
+    const { container } = render(<>{renderToolCall(call({ name: "Edit", allowedByAuto: true }))}</>);
+    expect(container.querySelector(".tool-rule-note")?.textContent).toBe("allowed by auto");
+    cleanup();
+    const plain = render(<>{renderToolCall(call({ name: "Edit" }))}</>);
+    expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
+    cleanup();
+    const ruled = render(<>{renderToolCall(call({ allowedByRule: "Bash(echo *)" }))}</>);
+    expect(ruled.container.textContent).not.toContain("allowed by auto");
+  });
+
   /** A call whose CLI prompt was answered without a card shows a muted note, like a call answered
    *  by a saved rule. Calls without that note show no such text. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {
@@ -298,8 +311,9 @@ describe("a tool named after an Object.prototype member", () => {
 });
 
 /* Name every real tool, render ToolSearch as one muted line and collapse finished runs.
-   Fold edit diffs to six lines outside detailed or expanded rows. Gated rows show that they wait
-   without repeating the call. The detailed view uses wider result cuts. */
+   Fold edit diffs to a one-line path and counts summary outside detailed or expanded rows.
+   Write, Edit and NotebookEdit keep individual rows, so their default view must stay compact.
+   Gated rows show that they wait without repeating the call. The detailed view uses wider cuts. */
 describe("P2, P3, P4, R3 in the registry", () => {
   const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
 
@@ -326,16 +340,71 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect(out).not.toContain("Enter to expand");
   });
 
-  it("shows an edit's diff folded to 6 lines with its counts, in any mode (P3)", () => {
+  it("collapses an edit's diff to a one-line path+counts summary by default; Enter (opts.expanded) shows it whole (P3, v1 trial item 7)", () => {
     const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
     const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
     const input = { file_path: "/p/a.rs", old_string, new_string };
     const folded = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false }));
     expect(folded).toContain("/p/a.rs");
     expect(folded).toContain("+10 −10");
-    expect((folded.match(/class="diff-line/g) ?? []).length).toBe(6);
+    expect((folded.match(/class="diff-line/g) ?? []).length).toBe(0);
+    // `expanded` is the same per-row flag `Enter` (`toggle-expand`, MessageList.tsx) already
+    // toggles for every tool row -- no new key, just a lower default fold.
     const full = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, true, { expanded: true }));
     expect((full.match(/class="diff-line/g) ?? []).length).toBe(20);
+  });
+
+  /** `opts.detailed` (`Ctrl+o`) expands the edit diff as well as `ToolResult`'s head/tail cut.
+   *  A folded row must show the full diff in detailed view even without per-row expansion. */
+  it("Ctrl+o (opts.detailed) widens a folded edit's diff too, not only Enter", () => {
+    const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
+    const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
+    const input = { file_path: "/p/a.rs", old_string, new_string };
+    const detailedButUnexpanded = html(
+      renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false, detailed: true }),
+    );
+    expect((detailedButUnexpanded.match(/class="diff-line/g) ?? []).length).toBe(20);
+    // Neither flag: still folded.
+    const neither = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, false, { expanded: false, detailed: false }));
+    expect((neither.match(/class="diff-line/g) ?? []).length).toBe(0);
+  });
+
+  /** A `Write` that creates a file says so instead of warning about an unseen overwrite.
+   *  The note stays visible when collapsed because it sits outside the diff's line budget. */
+  it("says a Write creates a new file even collapsed, and NotebookEdit gets the same real diff view", () => {
+    const created = html(
+      renderToolCall({ seq: 1, toolUseId: "t", name: "Write", input: { file_path: "/p/new.rs", content: "fn new() {}" }, result: null, createsFile: true }, false, { expanded: false }),
+    );
+    expect(created).toContain("Creates a new file.");
+    expect((created.match(/class="diff-line/g) ?? []).length).toBe(0);
+
+    const notebook = html(
+      renderToolCall(
+        { seq: 1, toolUseId: "t", name: "NotebookEdit", input: { notebook_path: "/p/a.ipynb", new_source: "one\ntwo\n" }, result: null },
+        true,
+        { expanded: true },
+      ),
+    );
+    expect(notebook).toContain("a.ipynb");
+    expect(notebook).toContain("+2 −0");
+    expect(notebook.toLowerCase()).toContain("cell");
+    expect((notebook.match(/class="diff-line/g) ?? []).length).toBe(2);
+  });
+
+  /** A deleted notebook cell renders as a deletion. `PermissionCard` and completed rows share
+   *  `EditDiff`, so `editPreview` must supply the deletion description for both. */
+  it("names a deleted notebook cell instead of drawing an empty diff for it", () => {
+    const out = html(
+      renderToolCall(
+        { seq: 1, toolUseId: "t", name: "NotebookEdit", input: { notebook_path: "/p/a.ipynb", cell_id: "c1", edit_mode: "delete" }, result: null },
+        false,
+        { expanded: false },
+      ),
+    );
+    expect(out).toContain("a.ipynb");
+    expect(out).toContain("Deletes cell c1");
+    expect(out).not.toContain("Writes the whole cell");
+    expect((out.match(/class="diff-line/g) ?? []).length).toBe(0);
   });
 
   it("says a gated call waits for approval instead of repeating it (P4)", () => {

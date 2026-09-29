@@ -14,6 +14,15 @@
 //! claude --version    # record the build; nothing prints it for you
 //! cargo test -p agent --test permission_policy_conformance -- --ignored --nocapture
 //! ```
+//!
+//! `Write`, `Edit` and `NotebookEdit` are compared under `acceptEdits`; other tools use `default`.
+//! The edit probes check that ordinary in-project edits run while protected paths need approval.
+//! `Edit` must follow `Read` in the same session so validation reaches the permission check.
+//! `file_must_contain` checks the actual result, since a validation error can still satisfy
+//! `expects_tool` without matching `REFUSAL_PHRASES`. Matching "refusing to" also catches
+//! edit denials for symlink leaves and paths whose disk location cannot be determined.
+//! A separate ignored test checks that a user's `Edit(...)` ask rule overrides the gate's allow.
+//! These edit checks have not yet been run against the real CLI.
 
 use agent::{classify_permission_request, PermissionVerdict};
 use serde_json::Value;
@@ -54,6 +63,11 @@ const REFUSAL_PHRASES: &[&str] = &[
     "needs approval",
     "permission denied by",
     "user doesn't want",
+    // The CLI's edit tools can deny a write with "Refusing to write" when the target is
+    // a symlink or its disk location cannot be determined. Match this wording so a denied
+    // edit is not counted as allowed when the policy allows it. Other safety refusals can
+    // also match, causing a conservative failure rather than hiding an unsafe allowance.
+    "refusing to",
 ];
 
 #[test]
@@ -66,7 +80,7 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
     for probe in probes() {
         let fresh = a_fresh_workspace();
         let workspace = (probe.run_in)(&fresh);
-        let calls = run_one_probe(&workspace, probe.prompt);
+        let calls = run_one_probe(&workspace, probe.prompt, probe.permission_mode);
         println!("\n--- probe: {} ---\n{calls:#?}", probe.label);
 
         assert!(
@@ -108,6 +122,26 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
                 path.display()
             );
         }
+        if let Some((relative, must_contain)) = probe.file_must_contain {
+            let path = workspace.join(relative);
+            let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "probe {}: {} could not be read ({e}) -- the CLI never actually applied this \
+                     edit, so this probe decided nothing about the permission policy",
+                    probe.label,
+                    path.display()
+                )
+            });
+            assert!(
+                contents.contains(must_contain),
+                "probe {}: {} does not contain {must_contain:?} -- the CLI's tool_use for {} was \
+                 observed but the edit was never really applied (contents: {contents:?}), so this \
+                 probe would have passed vacuously without this check",
+                probe.label,
+                path.display(),
+                probe.expects_tool
+            );
+        }
         let _ = std::fs::remove_dir_all(&fresh);
     }
 
@@ -130,6 +164,90 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
     );
 }
 
+/// Checks that a user's `permissions.ask` rule stops an edit even when the gate's hook allows it.
+/// This probe has not yet been run. An in-project `Write` can receive the hook's `allow`
+/// without a card, so the CLI must re-check the user's `Edit(...)` ask rule before writing.
+/// Under `--print` with no permission prompt tool, the expected result is a refusal.
+///
+/// The probe uses `--permission-mode default`, `--setting-sources project,local`, and a
+/// `PreToolUse` hook with matcher `*` that answers `allow`. `Bash` is withheld so the model
+/// cannot create the file through a tool the rule does not cover. The project's
+/// `.claude/settings.json` asks for `Edit(probe-asked.txt)`. The requested file must not exist
+/// afterwards.
+#[test]
+#[ignore]
+fn a_users_own_ask_rule_still_stops_an_edit_the_gate_allowed() {
+    let workspace = a_fresh_workspace().canonicalize().unwrap();
+    std::fs::create_dir_all(workspace.join(".claude")).unwrap();
+    std::fs::write(
+        workspace.join(".claude/settings.json"),
+        serde_json::json!({ "permissions": { "ask": ["Edit(probe-asked.txt)"] } }).to_string(),
+    )
+    .unwrap();
+    let target = workspace.join("probe-asked.txt");
+    let policy = classify_permission_request("Write", &serde_json::json!({ "file_path": &target }), &workspace);
+    assert_eq!(
+        policy.verdict,
+        PermissionVerdict::AllowWithoutAsking,
+        "this probe is about a write the fast path allows ({}); if the policy cards it, the gate never \
+         answers allow and the probe decides nothing",
+        policy.reason
+    );
+
+    let allow = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "the oracle's gate allows every call",
+        }
+    });
+    let hook = serde_json::json!({
+        "hooks": { "PreToolUse": [{
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": format!("cat >/dev/null; printf '%s\\n' '{allow}'") }],
+        }] }
+    })
+    .to_string();
+    let calls = run_the_cli(
+        &workspace,
+        "Using the Write tool, create a file called probe-asked.txt in the current directory \
+         containing the word hello. Use only the Write tool.",
+        &[
+            "--permission-mode",
+            "default",
+            "--settings",
+            &hook,
+            "--disallowedTools",
+            "Bash",
+        ],
+    );
+    println!("\n--- the ask-rule probe ---\n{calls:#?}");
+
+    assert!(
+        calls.iter().any(|c| c.tool_name == "Write"),
+        "the model never called Write, so this probe decided nothing. Calls observed: {:?}",
+        calls.iter().map(|c| c.tool_name.as_str()).collect::<Vec<_>>()
+    );
+    for call in calls.iter().filter(|c| c.tool_name == "Write") {
+        let ours = classify_permission_request(&call.tool_name, &call.input, &workspace);
+        assert_eq!(
+            ours.verdict,
+            PermissionVerdict::AllowWithoutAsking,
+            "the model's own Write {} is one the policy cards ({}), so the gate would never have \
+             allowed it and this probe decided nothing",
+            call.input,
+            ours.reason
+        );
+    }
+    assert!(
+        !target.exists(),
+        "{} exists: the CLI took the hook's allow over the user's own ask rule `Edit(probe-asked.txt)`, \
+         so under item 4A that rule no longer protects an in-project edit on the legacy backend",
+        target.display()
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 struct Probe {
     label: &'static str,
     prompt: &'static str,
@@ -139,9 +257,24 @@ struct Probe {
     /// A path that must NOT exist afterwards, for a probe whose whole point is that the CLI refused
     /// to create it. Confirms the refusal by its absence rather than only by what was reported.
     file_that_must_not_exist: Option<&'static str>,
+    /// `(path, substring)` that must exist and contain `substring` after the probe.
+    /// This confirms that the CLI executed the edit, beyond emitting a `tool_use` block.
+    ///
+    /// `Edit` validation rejects a file not yet `Read` in the session before permissions run.
+    /// That validation error does not match [`REFUSAL_PHRASES`], so `parse_calls` can mark it
+    /// `allowed_by_the_cli: true` and satisfy `expects_tool` without a permission decision.
+    /// The prompt requests `Read` first; this check also fails if the expected edit never happens.
+    file_must_contain: Option<(&'static str, &'static str)>,
     /// Where the CLI runs, given the fresh workspace -- the workspace itself for every probe but one,
     /// which needs a project inside a larger repository. Also the root the policy judges against.
     run_in: fn(&Path) -> PathBuf,
+    /// `--permission-mode <this>` for the CLI, or no flag (`default`) when `None`.
+    ///
+    /// `permission_policy` reproduces `acceptEdits` for `Write`, `Edit`, and `NotebookEdit`,
+    /// and `default` for other tools. The CLI denies writes under `default` regardless of path,
+    /// so parity probes for those edit tools use `Some("acceptEdits")` to test the matching mode.
+    /// Other probes use `default`.
+    permission_mode: Option<&'static str>,
 }
 
 fn in_the_workspace(workspace: &Path) -> PathBuf {
@@ -223,8 +356,13 @@ fn with_an_option_shaped_symlink(workspace: &Path) -> PathBuf {
     workspace.to_path_buf()
 }
 
-/// Fifteen probes, one billed turn each, covering both directions of the assertion.
+/// Seventeen probes, one billed turn each, covering both directions of the assertion.
 /// The set is not exhaustive; each added probe costs another turn.
+///
+/// Three edit probes run under `--permission-mode acceptEdits`: an in-project `Write`,
+/// an in-project `Edit` of an existing file, and a `Write` under a protected directory.
+/// The first two should be allowed by both the CLI and the policy's fast path;
+/// the protected write should require a card on both sides.
 ///
 /// The indirect-read probes include `git blame` with config that reads an outside file
 /// and `cat -- -n` through a symlink outside the workspace. The CLI runs both; the policy cards both.
@@ -238,14 +376,55 @@ fn probes() -> Vec<Probe> {
                      Do not create or modify any file.",
             expects_tool: "Read",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
+        // Compare an in-project `Write` against `acceptEdits`, where the CLI's fast path also applies.
+        // `default` denies every write, so it would report the policy as more permissive without
+        // exercising the edit behavior this probe tests.
         Probe {
-            label: "a write",
+            label: "an in-project write, under acceptEdits",
             prompt: "Create a file called probe.txt in the current directory containing the word hello.",
             expects_tool: "Write",
-            file_that_must_not_exist: Some("probe.txt"),
+            file_that_must_not_exist: None,
+            // The write must really have happened. A refusal worded outside `REFUSAL_PHRASES`
+            // would otherwise count as the CLI allowing it.
+            file_must_contain: Some(("probe.txt", "hello")),
             run_in: in_the_workspace,
+            permission_mode: Some("acceptEdits"),
+        },
+        // The other edit tool this fast path covers, and the other shape of target: `Edit` requires
+        // an existing file, where `Write` above created a new one.
+        Probe {
+            label: "an in-project edit of an existing file, under acceptEdits",
+            // `Edit` validation rejects a file not yet `Read` in the session before permissions run.
+            // The prompt requests `Read` first so `Edit` reaches a permission decision.
+            // `file_must_contain` checks that the edit was applied.
+            prompt: "First use the Read tool to read main.rs in the current directory. Then, using \
+                     the Edit tool, change the text \"probe\" to \"edited\" in it. Use only the Read \
+                     and Edit tools.",
+            expects_tool: "Edit",
+            file_that_must_not_exist: None,
+            file_must_contain: Some(("main.rs", "edited")),
+            run_in: in_the_workspace,
+            permission_mode: Some("acceptEdits"),
+        },
+        // The other half of the same parity claim: a target under one of the protected directories
+        // still cards under acceptEdits, on both sides. `.vscode/settings.json` is deliberately an
+        // ordinary-sounding request (an editor settings file), not something that reads as touching
+        // version control, so a refusal here is good evidence of the permission gate and not of the
+        // model declining on its own -- the same reasoning the gitfile/config probes below use for
+        // git internals.
+        Probe {
+            label: "a write under a protected directory still cards, under acceptEdits",
+            prompt: "Create a file at .vscode/settings.json in the current directory with the \
+                     contents {}. Use the Write tool.",
+            expects_tool: "Write",
+            file_that_must_not_exist: Some(".vscode/settings.json"),
+            file_must_contain: None,
+            run_in: in_the_workspace,
+            permission_mode: Some("acceptEdits"),
         },
         Probe {
             label: "a read-only bash command",
@@ -253,7 +432,9 @@ fn probes() -> Vec<Probe> {
                      what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         Probe {
             label: "a bash command with a redirect",
@@ -261,7 +442,9 @@ fn probes() -> Vec<Probe> {
                      directory. Do not use the Write tool.",
             expects_tool: "Bash",
             file_that_must_not_exist: Some("redirected.txt"),
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         // The policy allows Read/Grep/Glob only for a path that canonicalizes inside the project
         // root, so this is the probe that checks the path half of the policy against the CLI.
@@ -271,7 +454,9 @@ fn probes() -> Vec<Probe> {
                      Do not use any other tool.",
             expects_tool: "Read",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         // `..` out of the root. The workspace is /tmp/<dir>, so this names /etc/hostname. There is
         // no Grep or Glob probe because CLI 2.1.272 has neither tool: its `system/init` lists no
@@ -285,7 +470,9 @@ fn probes() -> Vec<Probe> {
             prompt: "Use the ToolSearch tool to load the Read tool's schema. Then reply with just: done",
             expects_tool: "ToolSearch",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         // A pipe between two read-only commands. The CLI runs it; the policy cards it, because it
         // has no shell parser and every shape of shell syntax resolves toward the card. Stricter,
@@ -296,7 +483,9 @@ fn probes() -> Vec<Probe> {
                      current directory and tell me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         Probe {
             label: "a read that climbs out of the working directory with ..",
@@ -304,7 +493,9 @@ fn probes() -> Vec<Probe> {
                      directory) and tell me what it says. Do not use any other tool.",
             expects_tool: "Read",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         // The CLI allowed this call in the initial run.
         // `dirs` names only `.`, so nothing outside the workspace is touched.
@@ -314,7 +505,9 @@ fn probes() -> Vec<Probe> {
                      current directory and tell me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         Probe {
             label: "wc reading the files to count from a list",
@@ -322,7 +515,9 @@ fn probes() -> Vec<Probe> {
                      directory and tell me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         Probe {
             label: "diff of two directories",
@@ -330,7 +525,9 @@ fn probes() -> Vec<Probe> {
                      me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: in_the_workspace,
+            permission_mode: None,
         },
         Probe {
             label: "read-only git in a project inside a larger repository",
@@ -338,7 +535,9 @@ fn probes() -> Vec<Probe> {
                      and tell me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: inside_a_larger_repository,
+            permission_mode: None,
         },
         // A non-inert repo config key makes `git blame` read an outside file.
         // The CLI runs it; the policy cards it. This stricter result passes.
@@ -348,7 +547,9 @@ fn probes() -> Vec<Probe> {
                      and tell me its first line. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: with_a_config_key_reading_an_outside_file,
+            permission_mode: None,
         },
         // After `--`, `-n` is a filename. The CLI runs `cat` and follows the symlink outside the workspace.
         // The policy cards it. This stricter result passes.
@@ -358,7 +559,9 @@ fn probes() -> Vec<Probe> {
                      me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: with_an_option_shaped_symlink,
+            permission_mode: None,
         },
         // A gitfile names another repository without a back-link. The CLI runs `git show` and prints its file.
         // The policy cards it. This stricter result passes.
@@ -368,7 +571,9 @@ fn probes() -> Vec<Probe> {
                      directory and tell me what it printed. Do not run anything else.",
             expects_tool: "Bash",
             file_that_must_not_exist: None,
+            file_must_contain: None,
             run_in: with_a_gitfile_naming_a_repository_outside,
+            permission_mode: None,
         },
     ]
 }
@@ -388,14 +593,30 @@ fn a_fresh_workspace() -> PathBuf {
         std::fs::create_dir_all(dir.join(side)).unwrap();
         std::fs::write(dir.join(side).join("x.txt"), format!("{side}\n")).unwrap();
     }
-    dir
+    // Canonical, as the session's own root is: the policy cards every path-judged call under a root
+    // that does not resolve to itself, and a `$TMPDIR` may pass through a
+    // link (macOS's `/var -> private/var`).
+    dir.canonicalize().unwrap()
 }
 
-/// One `claude --print` session with **no `--permission-mode` flag**, which is the whole point:
-/// that is the `default` mode whose classification this policy reproduces. Nothing installs a hook
-/// here either -- a hook would answer the question this test is asking the CLI.
-fn run_one_probe(workspace: &Path, prompt: &str) -> Vec<ObservedCall> {
-    let output = std::process::Command::new("claude")
+/// One `claude --print` session, with **no `--permission-mode` flag** for most probes -- that is
+/// the `default` mode whose classification `permission_policy` reproduces for every tool but
+/// `Write`/`Edit`/`NotebookEdit`. `permission_mode` is `Some("acceptEdits")` for exactly the probes
+/// that exercise those three (module doc, "The acceptEdits fast path"), so the oracle is the CLI
+/// mode the policy actually claims to reproduce for the tool under test, never `default` and never
+/// `auto` (its own classifier, a different thing again -- see the module doc). Nothing installs a
+/// hook here either -- a hook would answer the question this test is asking the CLI.
+fn run_one_probe(workspace: &Path, prompt: &str, permission_mode: Option<&str>) -> Vec<ObservedCall> {
+    let mode_args: Vec<&str> = permission_mode
+        .map(|mode| vec!["--permission-mode", mode])
+        .unwrap_or_default();
+    run_the_cli(workspace, prompt, &mode_args)
+}
+
+/// `claude --print` in `workspace` with the settings sources the product passes, plus `extra_args`.
+fn run_the_cli(workspace: &Path, prompt: &str, extra_args: &[&str]) -> Vec<ObservedCall> {
+    let mut command = std::process::Command::new("claude");
+    command
         .current_dir(workspace)
         // `project,local`, as the product passes, and not the user tier: on 2026-09-25 the TEST
         // profile's user settings carried an `rtk hook claude`
@@ -412,6 +633,8 @@ fn run_one_probe(workspace: &Path, prompt: &str) -> Vec<ObservedCall> {
             "--setting-sources",
             "project,local",
         ])
+        .args(extra_args);
+    let output = command
         .output()
         .expect("`claude` must be on PATH; run this through a test-account wrapper");
     let stdout = String::from_utf8_lossy(&output.stdout);

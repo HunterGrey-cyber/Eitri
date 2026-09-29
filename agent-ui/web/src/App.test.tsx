@@ -725,6 +725,159 @@ describe("App event folding", () => {
   });
 });
 
+/* A bare /model or /effort sends as a turn, and the panel opens a picker from its reply.
+ *  `../slashPicker` tests cover parsing. These tests check which reply opens the picker
+ *  and what Enter/Esc do to a real send through `App`. */
+describe("slash command pickers", () => {
+  function startedApp() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    enterInputMode(rendered.container);
+    return rendered;
+  }
+
+  function events(...list: AgentDomainEvent[]) {
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+  }
+
+  // Verbatim probe reply, CLI 2.1.283 under a test-account wrapper.
+  const MODEL_REPLY =
+    "Current model: `Haiku 4.5` (effort: high)\n" +
+    "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], " +
+    "fable[1m], opusplan, default, or a full model ID.";
+  const EFFORT_REPLY = "Usage: /effort <low|medium|high|xhigh|max|auto>";
+
+  function sendBareCommand(container: HTMLElement, command: string) {
+    fireEvent.change(container.querySelector("textarea")!, { target: { value: command } });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+  }
+
+  it("sends a bare /model as an ordinary turn -- it is no longer held back", () => {
+    const { container } = startedApp();
+    sendBareCommand(container, "/model");
+    expect(lastOfType("send_message")!.text).toBe("/model");
+    expect(container.querySelector(".composer-slash-flash")).toBeNull();
+  });
+
+  it("opens a picker once the reply parses, current model marked, and Enter sends the cursor's choice", () => {
+    const { container } = startedApp();
+    sendBareCommand(container, "/model");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    );
+    const picker = container.querySelector(".slash-picker")!;
+    expect(picker).not.toBeNull();
+    const current = picker.querySelector(".slash-picker-row.current")!;
+    expect(current.textContent).toContain("haiku");
+    expect(current.textContent).toContain("(current)");
+    fireEvent.keyDown(picker, { key: "Enter" });
+    expect(lastOfType("send_message")!.text).toBe("/model haiku");
+    expect(container.querySelector(".slash-picker")).toBeNull();
+  });
+
+  it("Esc closes the picker and sends nothing", () => {
+    const { container } = startedApp();
+    sendBareCommand(container, "/model");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    );
+    const sentBefore = posted.filter((m) => m.type === "send_message").length;
+    fireEvent.keyDown(container.querySelector(".slash-picker")!, { key: "Escape" });
+    expect(container.querySelector(".slash-picker")).toBeNull();
+    expect(posted.filter((m) => m.type === "send_message")).toHaveLength(sentBefore);
+  });
+
+  it("opens a picker for a bare /effort too, with no current marked (the bare reply names none)", () => {
+    const { container } = startedApp();
+    sendBareCommand(container, "/effort");
+    expect(lastOfType("send_message")!.text).toBe("/effort");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: EFFORT_REPLY, stop_reason: null, usage: null },
+    );
+    const picker = container.querySelector(".slash-picker")!;
+    expect(picker).not.toBeNull();
+    expect(picker.querySelectorAll(".slash-picker-current-marker")).toHaveLength(0);
+    expect(picker.querySelector(".slash-picker-hint")!.textContent).toContain("applies to this session only");
+    fireEvent.keyDown(picker, { key: "Enter" });
+    expect(lastOfType("send_message")!.text).toBe("/effort low");
+  });
+
+  it("opens no picker when the reply does not parse -- shows as ordinary text instead", () => {
+    const { container } = startedApp();
+    sendBareCommand(container, "/model");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      {
+        type: "turn_completed",
+        turn_id: "t1",
+        outcome: "completed",
+        result_text: "I don't understand that command.",
+        stop_reason: null,
+        usage: null,
+      },
+    );
+    expect(container.querySelector(".slash-picker")).toBeNull();
+  });
+
+  it("/model <name>, typed directly, still works exactly as before -- no picker, no special-casing", () => {
+    const { container } = startedApp();
+    sendBareCommand(container, "/model sonnet");
+    expect(lastOfType("send_message")!.text).toBe("/model sonnet");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+    );
+    // The reply to `/model sonnet` never arms a picker: only a BARE send does.
+    expect(container.querySelector(".slash-picker")).toBeNull();
+  });
+
+  /** `pendingSlashPickerRef` is shared across tabs, so a tab switch must clear it.
+   *  The switch also closes `slashPicker` to prevent targeting the wrong tab. */
+  describe("tab switch", () => {
+    const TAB2 = { ...LIVE_TAB, id: 2, number: 2, label: "2 new" };
+
+    it("closes an open picker on a tab switch, rather than leaving it targeting the wrong tab", () => {
+      const { container } = startedApp();
+      dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB, TAB2] });
+      sendBareCommand(container, "/model");
+      events(
+        { type: "turn_started", turn_id: "t1" },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      );
+      expect(container.querySelector(".slash-picker")).not.toBeNull();
+      dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, TAB2] });
+      expect(container.querySelector(".slash-picker")).toBeNull();
+    });
+
+    it("does not spuriously open a picker for a DIFFERENT tab's own reply after a switch mid-flight", () => {
+      const { container } = startedApp();
+      dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB, TAB2] });
+      // Armed by the bare send, then switched away before tab 1's own `turn_completed` arrives --
+      // that envelope is tab-scoped and gets dropped entirely (`acceptsEnvelope`), so without the
+      // tab-switch reset the ref would sit armed for whatever `turn_completed` tab 2 sees next.
+      sendBareCommand(container, "/model");
+      dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, TAB2] });
+      dispatch({
+        kind: "events",
+        tab: 2,
+        fromRevision: 0,
+        throughRevision: 2,
+        events: [
+          { type: "turn_started", turn_id: "t2" },
+          // Shaped exactly like a `/model` reply, on purpose: the point of this test is that a
+          // stale ref would open a picker here even though tab 2 never sent a bare `/model` at all.
+          { type: "turn_completed", turn_id: "t2", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+        ],
+      });
+      expect(container.querySelector(".slash-picker")).toBeNull();
+    });
+  });
+});
+
 /* `App.tsx` sees the raw envelope and can tell whether `turnClock` came from a real
    `turn_started` event or a turn id first seen in a snapshot. Test the elapsed clock here,
    where that distinction is available. */
@@ -979,6 +1132,44 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(notes()).toEqual(["allowed by rule Bash(git log *)"]);
   });
 
+  /** An in-project edit allowed by the acceptEdits fast path gets its own row and diff,
+   *  rather than folding into a count-only run with nearby reads. Its "allowed by auto" note
+   *  comes from an events envelope's `autoNotes` or a snapshot's `allowedByAuto`.
+   *  `toolRegistry.test` covers a call without the note. */
+  it("shows an edit the fast path allowed as its own row, diffed, and named auto -- from events and from a snapshot", () => {
+    const { container } = startedApp();
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 0,
+      throughRevision: 5,
+      // Read, Edit, Read: keeping the edit out of count-only runs ensures its diff remains visible.
+      events: [
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_read1", name: "Read", input: { file_path: "a.rs" } },
+        { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_read1", content: "old", is_error: false },
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_edit", name: "Edit", input: { file_path: "a.rs", old_string: "old", new_string: "new" } },
+        { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_edit", content: "ok", is_error: false },
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_read2", name: "Read", input: { file_path: "b.rs" } },
+        { type: "tool_call_completed", turn_id: "t1", tool_use_id: "toolu_read2", content: "b", is_error: false },
+      ],
+      autoNotes: ["toolu_edit"],
+    });
+    expect(container.querySelectorAll(".tool-card-run")).toHaveLength(0);
+    const notes = () => [...container.querySelectorAll(".tool-rule-note")].map((n) => n.textContent);
+    expect(notes()).toEqual(["allowed by auto"]);
+    expect(container.querySelector('[data-tool-name="Edit"] .permission-card-edit-path')).not.toBeNull();
+    dispatchLiveTab(
+      {
+        ...snapshotState(),
+        toolCalls: [
+          { seq: 0, toolUseId: "toolu_1", name: "Edit", input: { file_path: "a.rs", old_string: "old", new_string: "new" }, result: null, allowedByAuto: true },
+        ],
+      },
+      1,
+    );
+    expect(notes()).toEqual(["allowed by auto"]);
+  });
+
   it("does nothing on r while the session is still running", () => {
     const { container } = startedApp();
     fireEvent.keyDown(conversationRoot(container), { key: "r" });
@@ -1137,6 +1328,48 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       Object.defineProperty(box, "scrollTop", { value: 100, configurable: true, writable: true });
 
       fireEvent.keyDown(conversationRoot(container), { key: "k" });
+
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
+      expect(box.scrollTop).toBeLessThan(100);
+    });
+
+    /* Ctrl+e uses `scrollCursorRowBox` to scroll a capped tool result first, just like j/k.
+       Unlike `j`, Ctrl+e does not advance to the next row when the box is exhausted.
+       The remaining count scrolls the conversation under the cursor. The cursor moves
+       only if its row leaves the view, which is checked elsewhere. */
+    it("Ctrl+e scrolls the box first, the same way j does", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 500, clientHeight: 260 });
+
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true });
+
+      // Still the tool row -- the cursor did not advance to "after".
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
+      expect(box.scrollTop).toBeGreaterThan(0);
+    });
+
+    it("Ctrl+e falls through to the conversation once the box has reached its end, without moving the cursor", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 260, clientHeight: 260 }); // nothing left to scroll
+      const list = box.closest(".message-list") as HTMLElement;
+
+      fireEvent.keyDown(conversationRoot(container), { key: "e", ctrlKey: true });
+
+      expect(box.scrollTop).toBe(0); // the box made no progress
+      expect(list.scrollTop).toBeGreaterThan(0); // the unit fell through to the conversation instead
+      // Unlike `j`, which would have moved on to "after" here (the test just above this one).
+      expect(container.querySelector(".row-current")!.textContent).toContain("long");
+    });
+
+    it("Ctrl+y scrolls the box upward first, the same way k does", () => {
+      const { container } = startedAppWithExpandedResult();
+      const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
+      makeScrollable(box, { scrollHeight: 500, clientHeight: 260 });
+      Object.defineProperty(box, "scrollTop", { value: 100, configurable: true, writable: true });
+
+      fireEvent.keyDown(conversationRoot(container), { key: "y", ctrlKey: true });
 
       expect(container.querySelector(".row-current")!.textContent).toContain("long");
       expect(box.scrollTop).toBeLessThan(100);
@@ -3209,6 +3442,68 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(lastOfType("permission_response")).toBeUndefined();
   });
 
+  /* In BROWSE, `Ctrl+e`/`Ctrl+y` scroll by one text line, not half a viewport.
+     `fakeLayout` uses 20px per line, the same unit used by `rowScrollStep`'s three-line tall-row step. */
+  it("Ctrl+e and Ctrl+y scroll by one text line, and the cursor stays while its row is on screen", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+
+    press("e", { ctrlKey: true });
+    expect(list.scrollTop).toBe(20);
+    expect(current(container)).toBe("r0"); // nowhere near leaving the view
+
+    press("e", { ctrlKey: true });
+    expect(list.scrollTop).toBe(40);
+
+    press("y", { ctrlKey: true });
+    expect(list.scrollTop).toBe(20);
+    press("y", { ctrlKey: true });
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it("a count repeats Ctrl+e/Ctrl+y, capped the same way every other count is (R4)", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+
+    press("5");
+    press("e", { ctrlKey: true });
+    expect(list.scrollTop).toBe(100); // five 20px lines in one press
+    expect(current(container)).toBe("r0"); // row 0 (0-300) still overlaps the 400px view
+
+    press("1");
+    press("0");
+    press("0"); // "100"
+    press("y", { ctrlKey: true });
+    expect(list.scrollTop).toBe(0); // clamped at the top, exactly like an ordinary scrollTop write
+  });
+
+  it("Ctrl+e that carries the cursor's row off screen re-homes it to the nearest visible row", () => {
+    const { container } = started();
+    prompts("r0", "r1", "r2", "r3", "r4");
+    const list = fakeLayout(container, [300, 300, 300, 300, 300]);
+    press("g");
+    press("g");
+
+    press("2");
+    press("0");
+    press("e", { ctrlKey: true }); // 20 lines * 20px = 400px: r0 (0-300) leaves the view entirely
+    expect(list.scrollTop).toBe(400);
+    expect(current(container)).toBe("r1"); // the first row still on screen -- the same rule Ctrl+d uses
+
+    press("G", { shiftKey: true }); // cursor to r4, the view at the very end
+    expect(current(container)).toBe("r4");
+    press("2");
+    press("0");
+    press("y", { ctrlKey: true }); // 400px back up: r4 (1200-1500) leaves the view entirely
+    expect(current(container)).toBe("r3"); // the LAST row still on screen
+  });
+
   it("G goes to the last row and the very end of the list; gg to the first row and the top", () => {
     const { container } = started();
     prompts("a", "b", "c");
@@ -4072,10 +4367,15 @@ describe("the panel's own scroll keys announce themselves to the message list", 
       { key: "G", shiftKey: true },
       { key: "g" }, // the first half of `gg` moves nothing, and says nothing
       { key: "g" },
+      // `Ctrl+e` follows the down rule of `j`/`Ctrl+d`/`G`: following re-arms only when
+      // the scroll reaches the bottom. `Ctrl+y` follows the up rule of `k`/`Ctrl+u`/`gg`:
+      // following stops before the scroll.
+      { key: "e", ctrlKey: true },
+      { key: "y", ctrlKey: true },
     ]) {
       fireEvent.keyDown(root, key);
     }
-    expect(seen).toEqual(["down", "up", "down", "up", "down", "up"]);
+    expect(seen).toEqual(["down", "up", "down", "up", "down", "up", "down", "up"]);
   });
 
   it("says nothing for a key that cannot move the conversation", () => {

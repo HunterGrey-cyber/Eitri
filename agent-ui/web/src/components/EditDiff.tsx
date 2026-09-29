@@ -38,11 +38,12 @@ export function EditDiff({ preview, maxLines, createsFile }: { preview: EditPrev
              overwritten -- a plain create is not a danger, and the warning below read as one. */
           <div className="permission-card-edit-note">Creates a new file.</div>
         ) : (
-          /* Said rather than implied. A Write request carries only what the file WILL contain, so a
-             patch-shaped rendering would suggest the rest of the file survives. It may not. Also
-             what is shown when nobody looked (a snapshot from before F22, a call no card gated). */
+          /* A Write request gives only the file's new content. A patch could falsely suggest
+             existing content survives, so state that the whole file is written. Use this wording
+             when file-existence information is absent too. `preview.wholeFileNote` overrides it for
+             content such as a NotebookEdit cell; undefined keeps the Write wording. */
           <div className="permission-card-edit-note">
-            Writes the whole file. The request does not say what is there now.
+            {preview.wholeFileNote ?? "Writes the whole file. The request does not say what is there now."}
           </div>
         ))}
       {preview.replaceAll && (

@@ -142,6 +142,13 @@ type InboundHandler = (
         createsFile?: { permissionId: string; toolUseId: string | null }[];
         /** Calls in this batch whose CLI prompt was answered without a card. */
         promptNotes?: { toolUseId: string; note: string }[];
+        /** Tool-use ids of `Write`, `Edit`, or `NotebookEdit` calls answered by the acceptEdits
+         *  fast path without a card. Absent when none were. */
+        autoNotes?: string[];
+        /** Tool-use ids of `Write` calls answered by the acceptEdits fast path without a card,
+         *  for paths that did not exist when the call started. Carries the `createsFile` signal
+         *  for calls that raised no card to carry it. */
+        autoCreatesFile?: string[];
       }
     /** `turnStartedAtMs`: when the running turn started, `Date.now()`'s clock, kept per tab by
      *  Rust (`tab_set`'s `turn_clock`) so a switch or a reload shows its real elapsed time; `null`

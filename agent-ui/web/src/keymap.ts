@@ -86,6 +86,10 @@ export type PanelAction =
   /** `Ctrl+d` (+1) / `Ctrl+u` (-1): scroll the conversation by half its visible height. `App.tsx`
    *  measures the list and re-homes the cursor if the scroll carried its row out of sight. */
   | { kind: "half-page"; delta: 1 | -1 }
+  /** Ctrl+e (+1) / Ctrl+y (-1) scroll by one prose line height and accept a count.
+   *  `App.tsx` first scrolls a long tool result's capped box, as j/k do, then uses
+   *  `clampCursorToView` to re-home the cursor if its row leaves the view. */
+  | { kind: "scroll-line"; delta: 1 | -1 }
   /** `gg` (first) / `G` (last): the cursor to that end row, the list scrolled to that very end. */
   | { kind: "jump"; to: "first" | "last" }
   /** The first key of a two-key sequence: nothing happens yet. `App.tsx` remembers which prefix
@@ -239,6 +243,12 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     if (event.ctrlKey && !event.shiftKey && (event.key === "d" || event.key === "u")) {
       return { kind: "half-page", delta: event.key === "d" ? 1 : -1 };
     }
+    // Handle `Ctrl+e`/`Ctrl+y` before the plain-key switch: Ctrl leaves `key` as "e"/"y",
+    // so an unchecked Ctrl+y could copy the current row instead of scrolling. This block excludes
+    // INPUT, where `Ctrl+e` belongs to the composer and moves to the line's end.
+    if (event.ctrlKey && !event.shiftKey && (event.key === "e" || event.key === "y")) {
+      return { kind: "scroll-line", delta: event.key === "e" ? 1 : -1 };
+    }
     // `Ctrl+c` interrupts a running turn without closing anything. While idle it is left to
     // the browser for native copy. INPUT's `Ctrl+c` belongs to the composer and is handled there.
     if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : null;
@@ -381,6 +391,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "1-9", what: "A count for j / k / [[ / ]] (3j moves three rows)" },
   { keys: "[[ / ]]", what: "Previous / next prompt of yours" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
+  { keys: "Ctrl+e / Ctrl+y", what: "One line down / up (a count repeats it, e.g. 5 Ctrl+e)" },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
   { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
   { keys: "Enter", what: "Show or hide a tool's result or a collapsed run" },

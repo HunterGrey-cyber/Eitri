@@ -146,9 +146,15 @@ pub struct Tab {
     /// rule that answered a call (`note_rule_answers`), and the `Write` cards whose
     /// file did not exist when they were raised (`note_new_files`).
     notes: CallNotes,
-    /// Tool-use id -> the rule that will answer it, for a call started but not yet finished. It
-    /// becomes a note only once the call completes with no card having been kept for it.
+    /// Tool-use id -> the rule for a started, unfinished call. Completion with no retained card
+    /// turns it into a note. Clear when `collect_starts` installs a fresh backend. On `Resync`,
+    /// drop entries still pending in the projection: queue overflow may have lost the
+    /// `PermissionRequested` that would remove them, as with `auto_edit_candidates`.
     rule_candidates: std::collections::BTreeMap<String, String>,
+    /// Tool-use ids of started, unfinished `Write`/`Edit`/`NotebookEdit` calls, tracked by
+    /// `note_auto_edit_answers`. A completion with no retained card is used to infer acceptEdits
+    /// fast-path approval and make a note. Uses the same lifecycle and clearing as `rule_candidates`.
+    auto_edit_candidates: BTreeSet<String>,
     /// The pending permission ids `rule_offers` was last computed for, sorted, so the classifier
     /// (which canonicalizes `Bash` arguments) runs once per change rather than every tick.
     rule_offers_seen: Vec<String>,
@@ -209,6 +215,7 @@ impl Tab {
             rule_offers_seen: Vec::new(),
             notes: CallNotes::default(),
             rule_candidates: std::collections::BTreeMap::new(),
+            auto_edit_candidates: BTreeSet::new(),
             turn_clock: None,
             host_answered: BTreeSet::new(),
             human_allowed: crate::agent_backend::HumanApprovals::default(),
@@ -1109,6 +1116,18 @@ impl TabSet {
                             &mut tab.notes.prompt_notes,
                             &events,
                         ),
+                        allowed_by_auto: note_auto_edit_answers(
+                            &mut tab.auto_edit_candidates,
+                            &mut tab.notes.allowed_by_auto,
+                            &events,
+                            bypass,
+                        ),
+                        auto_creates_file: note_auto_creates_file(
+                            &mut tab.notes.auto_creates_file,
+                            &events,
+                            project_root,
+                            bypass,
+                        ),
                     };
                     // Every card in the batch is counted, those the snapshot drew included: they are
                     // pending all the same, and this tab has not counted them yet.
@@ -1178,6 +1197,24 @@ impl TabSet {
                                 tab.notes.prompt_notes.insert(id, note);
                             }
                         }
+                    }
+                    // A dropped `PermissionRequested` can leave a candidate whose call has not finished, while
+                    // the projection still shows its permission awaiting a human. The completed-call sweep above
+                    // cannot remove it. `answer_what_needs_no_human` never runs on a dropped batch, so a real card
+                    // will be drawn from the snapshot. Remove its candidate instead of making a note, or a later
+                    // human approval would be mislabeled "allowed by auto".
+                    //
+                    // `rule_candidates` can lose the same removal event in `note_rule_answers`. Remove those by id
+                    // too, or a human approval could be mislabeled "allowed by rule".
+                    {
+                        let still_pending: BTreeSet<String> = backend
+                            .projection()
+                            .pending_permissions
+                            .values()
+                            .filter_map(|p| p.tool_use_id.clone())
+                            .collect();
+                        tab.auto_edit_candidates.retain(|id| !still_pending.contains(id));
+                        tab.rule_candidates.retain(|id, _| !still_pending.contains(id));
                     }
                     let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
                     // In bypass, resync sends pending requests lost to overflow through `approve_pending`,
@@ -1294,6 +1331,7 @@ impl TabSet {
                     tab.attention.restart();
                     tab.notes = CallNotes::default();
                     tab.rule_candidates.clear();
+                    tab.auto_edit_candidates.clear();
                     tab.prompt_note_candidates.clear();
                     tab.last_handoff = None;
                     tab.reported_start_failure = false;
@@ -1670,16 +1708,59 @@ fn note_rule_answers(
     fresh
 }
 
+/// Track `Write`/`Edit`/`NotebookEdit` calls inferred to have used the acceptEdits fast path.
+/// Return their tool-use ids and keep them in `notes.allowed_by_auto` for later snapshots.
+///
+/// Like `note_rule_answers`, start a candidate on `ToolCallStarted` and remove it if a
+/// `PermissionRequested` names its tool-use id. A card means the fast path did not answer,
+/// or the CLI asked again after the gate. A `ToolCallCompleted` with no retained card turns
+/// the candidate into a note. This implementation infers approval from that completion
+/// without reclassification. Skip bypass, where edits use the tab's unconditional allow.
+fn note_auto_edit_answers(
+    candidates: &mut BTreeSet<String>,
+    notes: &mut BTreeSet<String>,
+    events: &[AgentDomainEvent],
+    bypass: bool,
+) -> BTreeSet<String> {
+    const FAST_PATH_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
+    let mut fresh = BTreeSet::new();
+    for event in events {
+        match event {
+            AgentDomainEvent::ToolCallStarted { tool_use_id, name, .. }
+                if !bypass && FAST_PATH_TOOLS.contains(&name.as_str()) =>
+            {
+                candidates.insert(tool_use_id.clone());
+            }
+            AgentDomainEvent::PermissionRequested {
+                tool_use_id: Some(id), ..
+            } => {
+                candidates.remove(id);
+            }
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
+                if candidates.remove(tool_use_id) {
+                    notes.insert(tool_use_id.clone());
+                    fresh.insert(tool_use_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    fresh
+}
+
+/// Whether nothing exists at `path` at all -- a dangling symlink counts (a `Write` there, or a
+/// check of what it is about to replace, would follow it). Any lookup failure OTHER than "not
+/// found" (a parent directory this process may not search, a path through a regular file) says
+/// nothing about what is there, so it does NOT count as absent: an uncertain answer resolves toward
+/// the overwrite warning, as the permission policy's own uncertainties resolve toward a card.
+fn file_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The `Write` cards in this batch whose file does not exist now, when the card is
-/// raised -- recorded in `notes` for later snapshots and returned as this batch's own. Nothing at
-/// all at the path counts, a dangling symlink included, since the write would follow it; a relative
+/// raised -- recorded in `notes` for later snapshots and returned as this batch's own. A relative
 /// `file_path` (the tool asks for an absolute one) is read against the project root. Checked once,
 /// here: after an approval the file exists, and the card must go on meaning what it meant.
-///
-/// Only a lookup that says "not found" counts as no file. Any other failure (a parent directory
-/// this process may not search, a path through a regular file) says nothing about whether the
-/// write would replace something, so the card keeps its overwrite warning: an uncertain answer
-/// resolves toward the warning, as the permission policy's own uncertainties resolve toward a card.
 fn note_new_files(
     notes: &mut std::collections::BTreeMap<String, Option<String>>,
     events: &[AgentDomainEvent],
@@ -1707,13 +1788,56 @@ fn note_new_files(
         else {
             continue;
         };
-        let absent = matches!(
-            std::fs::symlink_metadata(project_root.join(file_path)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        );
-        if absent {
+        if file_absent(&project_root.join(file_path)) {
             notes.insert(permission_id.clone(), tool_use_id.clone());
             fresh.insert(permission_id.clone(), tool_use_id.clone());
+        }
+    }
+    fresh
+}
+
+/// Track `Write` calls whose targets were absent at `ToolCallStarted`, using `file_absent`.
+/// The acceptEdits fast path removes `PermissionRequested` before delivery, so `note_new_files`
+/// cannot mark those calls. Save their tool-use ids in `notes` for later snapshots and return
+/// this batch's new ids. `CallNotes::creates_file_call` combines these with `creates_file`
+/// so completed writes to absent targets say they create a file rather than overwrite one.
+///
+/// Skip bypass, whose permission requests reach `note_new_files` normally here. The eventual
+/// fast-path result is unknown at call start, so calls that later need a card are checked too.
+/// Their later `note_new_files` check gives the same answer.
+fn note_auto_creates_file(
+    notes: &mut BTreeSet<String>,
+    events: &[AgentDomainEvent],
+    project_root: &Path,
+    bypass: bool,
+) -> BTreeSet<String> {
+    let mut fresh = BTreeSet::new();
+    if bypass {
+        return fresh;
+    }
+    for event in events {
+        let AgentDomainEvent::ToolCallStarted {
+            tool_use_id,
+            name,
+            input,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if name != "Write" {
+            continue;
+        }
+        let Some(file_path) = input
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        if file_absent(&project_root.join(file_path)) {
+            notes.insert(tool_use_id.clone());
+            fresh.insert(tool_use_id.clone());
         }
     }
     fresh
@@ -1890,12 +2014,16 @@ mod tests {
         }
     }
 
+    /// Create a `Write` request that needs a human: `.git/main.rs` is protected, while an ordinary
+    /// in-project write can be allowed by the acceptEdits fast path without a card. The queueing,
+    /// attention and confirmation tests need a request that reliably produces a card.
+    /// The fast path has separate tests in `agent::permission_policy`.
     fn write(id: &str) -> AgentDomainEvent {
         AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": "main.rs", "content": "" }),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
             provider_prompt: None,
         }
     }
@@ -4356,6 +4484,350 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// An in-project `Write` answered without a card by the acceptEdits fast path is marked
+    /// "allowed by auto" in events and subsequent snapshots. A `Write` to a protected path such
+    /// as `.git/` keeps its pending card and has no such note.
+    #[test]
+    fn an_edit_the_fast_path_allowed_is_named_auto_in_events_and_snapshots() {
+        let dir = workspace("tabs-auto-notes");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let started_call = |id: &str, name: &str, input: serde_json::Value| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: name.into(),
+            input,
+        };
+        let gate = |perm: &str, id: &str, name: &str, input: serde_json::Value| AgentDomainEvent::PermissionRequested {
+            permission_id: perm.into(),
+            tool_use_id: Some(id.into()),
+            tool_name: name.into(),
+            input,
+            provider_prompt: None,
+        };
+        let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        };
+        provider.queue(started("t1"));
+        provider.queue(started_call(
+            "toolu_write",
+            "Write",
+            serde_json::json!({ "file_path": "new.rs", "content": "fn new() {}" }),
+        ));
+        provider.queue(gate(
+            "perm-write",
+            "toolu_write",
+            "Write",
+            serde_json::json!({ "file_path": "new.rs", "content": "fn new() {}" }),
+        ));
+        provider.queue(done("toolu_write"));
+        provider.queue(started_call(
+            "toolu_gitwrite",
+            "Write",
+            serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+        ));
+        provider.queue(gate(
+            "perm-gitwrite",
+            "toolu_gitwrite",
+            "Write",
+            serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+        ));
+        let mut payloads = Vec::new();
+        until(
+            "the fast path to answer the in-project write, and the protected one to card",
+            || {
+                payloads.extend(set.pump(&dir, true).active_payload);
+                payloads
+                    .iter()
+                    .any(|p| p.contains("toolu_write") && p.contains("tool_call_completed"))
+                    && payloads.iter().any(|p| p.contains("perm-gitwrite"))
+            },
+        );
+        let auto_notes: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("autoNotes").cloned())
+            .collect();
+        assert_eq!(auto_notes, vec![serde_json::json!(["toolu_write"])]);
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let calls = snapshot["state"]["toolCalls"].as_array().unwrap();
+        let auto_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c["toolUseId"] == id)
+                .unwrap()
+                .get("allowedByAuto")
+                .cloned()
+        };
+        assert_eq!(auto_of("toolu_write"), Some(serde_json::json!(true)));
+        assert_eq!(auto_of("toolu_gitwrite"), None, "a card was shown, not the fast path");
+        let pending = snapshot["state"]["pendingPermissions"].as_array().unwrap();
+        assert!(
+            pending.iter().any(|p| p["permissionId"] == "perm-gitwrite"),
+            "the protected write is still a card, not silently allowed"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// A rule can never fire for `Write`/`Edit`/`NotebookEdit` at all
+    /// (`agent::permission_policy`'s module doc), so a fast-path allow can never carry a rule note
+    /// too -- pinned directly rather than left to follow from the two features never overlapping in
+    /// practice.
+    #[test]
+    fn an_auto_allowed_edit_never_also_carries_a_rule_note() {
+        let dir = workspace("tabs-auto-notes-no-rule");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" }),
+        });
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-edit".into(),
+            tool_use_id: Some("toolu_edit".into()),
+            tool_name: "Edit".into(),
+            input: serde_json::json!({ "file_path": "main.rs", "old_string": "fn main() {}", "new_string": "fn main() { }" }),
+            provider_prompt: None,
+        });
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        until("the edit to finish", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_edit") && p.contains("tool_call_completed"))
+        });
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = &snapshot["state"]["toolCalls"][0];
+        assert_eq!(call["allowedByAuto"], serde_json::json!(true));
+        assert!(call.get("allowedByRule").is_none());
+        shut_down_all(&mut set);
+    }
+
+    /// A `Write` allowed by the acceptEdits fast path still marks its completed row as creating
+    /// a file when the target was absent. `note_new_files` cannot see this call because
+    /// `answer_what_needs_no_human` removes its `PermissionRequested` before delivery.
+    /// `note_auto_creates_file` supplies the mark so the row does not show an overwrite warning
+    /// for a new file.
+    #[test]
+    fn an_auto_allowed_write_over_no_file_is_marked_as_creating_one() {
+        let dir = workspace("tabs-auto-new-file");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_new".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": "brand_new.rs", "content": "fn x() {}" }),
+        });
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_new".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        let mut payloads = Vec::new();
+        until("the fast-path write to complete", || {
+            payloads.extend(set.pump(&dir, true).active_payload);
+            payloads
+                .iter()
+                .any(|p| p.contains("toolu_new") && p.contains("tool_call_completed"))
+        });
+        let auto_creates: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .filter_map(|p| p.get("autoCreatesFile").cloned())
+            .collect();
+        assert_eq!(auto_creates, vec![serde_json::json!(["toolu_new"])]);
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == "toolu_new")
+            .unwrap();
+        assert_eq!(call["createsFile"], serde_json::json!(true));
+        assert_eq!(call["allowedByAuto"], serde_json::json!(true));
+        shut_down_all(&mut set);
+    }
+
+    /// Codex's finding: a queue overflow can drop a candidate's own
+    /// `PermissionRequested` -- the event that would ordinarily remove it from
+    /// `auto_edit_candidates` -- while the projection (complete by construction) still shows the
+    /// permission pending, so the `Resync` snapshot draws a real card for it. Left alone, the
+    /// human's later approval on that card would complete the call through the ordinary path and
+    /// wrongly read "allowed by auto" for a call answered on screen. The `Resync` arm now sweeps
+    /// any candidate whose permission is still pending after the drop.
+    #[test]
+    fn a_resync_drops_a_candidate_whose_card_survived_the_overflow() {
+        let dir = workspace("tabs-resync-drops-candidate");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            name: "Edit".into(),
+            input: serde_json::json!({ "file_path": ".git/probe", "old_string": "a", "new_string": "b" }),
+        });
+        until("the edit call started as a candidate", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().auto_edit_candidates.contains("toolu_edit")
+        });
+
+        // Overflow the queue with this call's own `PermissionRequested` (which would ordinarily
+        // remove the candidate) plus filler, so the whole batch is dropped and this tick's drain is
+        // a `Resync` -- exactly the shape the finding needs.
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-edit".into(),
+            tool_use_id: Some("toolu_edit".into()),
+            tool_name: "Edit".into(),
+            input: serde_json::json!({ "file_path": ".git/probe", "old_string": "a", "new_string": "b" }),
+            provider_prompt: None,
+        });
+        for i in 0..(agent::UI_EVENT_QUEUE_CAPACITY + 20) {
+            provider.queue(text_delta("t1", &format!("chunk {i}")));
+        }
+        until("the projection to carry the pending card", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            backend.projection().pending_permissions.contains_key("perm-edit")
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert!(
+            !set.get(tab).unwrap().auto_edit_candidates.contains("toolu_edit"),
+            "the still-pending card must drop the candidate, not just the ordinary sweep"
+        );
+
+        set.answer_card(tab, "perm-edit", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-edit"));
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_edit".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        until("the edit to complete", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_edit") && p.contains("tool_call_completed"))
+        });
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == "toolu_edit")
+            .unwrap();
+        assert!(
+            call.get("allowedByAuto").is_none(),
+            "a human approved this on screen; it must never read allowed by auto"
+        );
+        shut_down_all(&mut set);
+    }
+
+    /// Queue overflow can drop a Bash call's `PermissionRequested` while the projection still
+    /// shows the permission pending and `Resync` displays its card. The pending sweep must remove
+    /// the call from `rule_candidates`, just as it does for `auto_edit_candidates`, so a later
+    /// human approval cannot leave an "allowed by rule" note.
+    #[test]
+    fn a_resync_drops_a_rule_candidate_whose_card_survived_the_overflow() {
+        let dir = workspace("tabs-resync-drops-rule-candidate");
+        let mut set = set();
+        set.set_rules(agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap()));
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+
+        provider.queue(started("t1"));
+        provider.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_npm".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+        });
+        until("the npm call started as a rule candidate", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().rule_candidates.contains_key("toolu_npm")
+        });
+
+        // Overflow the queue with this call's `PermissionRequested` and filler. The request
+        // would normally remove the candidate, but overflow drops the batch and makes this
+        // tick's drain a `Resync`.
+        provider.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-npm".into(),
+            tool_use_id: Some("toolu_npm".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "npm ci" }),
+            provider_prompt: None,
+        });
+        for i in 0..(agent::UI_EVENT_QUEUE_CAPACITY + 20) {
+            provider.queue(text_delta("t1", &format!("chunk {i}")));
+        }
+        until("the projection to carry the pending card", || {
+            let backend = set.get(tab).unwrap().live().unwrap();
+            backend.projection().pending_permissions.contains_key("perm-npm")
+        });
+        let out = set.pump(&dir, true);
+        let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
+        assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
+        assert!(
+            !set.get(tab).unwrap().rule_candidates.contains_key("toolu_npm"),
+            "the still-pending card must drop the candidate, not just the ordinary sweep"
+        );
+
+        set.answer_card(tab, "perm-npm", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        provider.queue(resolved("perm-npm"));
+        provider.queue(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "toolu_npm".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        until("the npm call to complete", || {
+            set.pump(&dir, true)
+                .active_payload
+                .is_some_and(|p| p.contains("toolu_npm") && p.contains("tool_call_completed"))
+        });
+        let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
+        let call = snapshot["state"]["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["toolUseId"] == "toolu_npm")
+            .unwrap();
+        assert!(
+            call.get("allowedByRule").is_none(),
+            "a human approved this on screen; it must never read allowed by rule"
+        );
+        shut_down_all(&mut set);
+    }
+
     /// When a snapshot covers every event in the next drain, the payload filters them all out.
     /// Notes produced when the tab processes those events still need delivery because the
     /// snapshot predates those notes. An empty `events` envelope carries them to
@@ -4440,8 +4912,12 @@ mod tests {
     /// existing file does not, nor does its file appearing later change what the card said.
     #[test]
     fn a_write_card_over_no_file_is_marked_as_creating_one() {
+        // Both targets are under `.git/` so their writes still produce cards. Ordinary top-level
+        // writes can be allowed by the acceptEdits fast path without a card, but this test needs
+        // cards to check their `createsFile` flags.
         let dir = workspace("tabs-new-file");
-        std::fs::write(dir.join("old.txt"), "there").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/old.txt"), "there").unwrap();
         let mut set = set();
         let tab = set.active();
         let (provider, backend) = live(&dir);
@@ -4457,10 +4933,10 @@ mod tests {
             turn_id: "t1".into(),
             tool_use_id: "toolu_new".into(),
             name: "Write".into(),
-            input: serde_json::json!({ "file_path": dir.join("new.txt"), "content": "x" }),
+            input: serde_json::json!({ "file_path": dir.join(".git/new.txt"), "content": "x" }),
         });
-        provider.queue(write("perm-new", "toolu_new", dir.join("new.txt")));
-        provider.queue(write("perm-old", "toolu_old", dir.join("old.txt")));
+        provider.queue(write("perm-new", "toolu_new", dir.join(".git/new.txt")));
+        provider.queue(write("perm-old", "toolu_old", dir.join(".git/old.txt")));
         let mut payloads = Vec::new();
         until("both cards", || {
             payloads.extend(set.pump(&dir, true).active_payload);
@@ -4475,7 +4951,7 @@ mod tests {
             marked,
             vec![serde_json::json!([{ "permissionId": "perm-new", "toolUseId": "toolu_new" }])]
         );
-        std::fs::write(dir.join("new.txt"), "now there").unwrap();
+        std::fs::write(dir.join(".git/new.txt"), "now there").unwrap();
         let snapshot: serde_json::Value = serde_json::from_str(&set.active_state_payloads()[0]).unwrap();
         let cards = snapshot["state"]["pendingPermissions"].as_array().unwrap();
         let creates = |id: &str| {

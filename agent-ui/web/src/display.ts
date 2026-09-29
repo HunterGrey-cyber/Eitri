@@ -10,6 +10,11 @@ export function runSummary(calls: ToolCallRecord[]): string {
   return Array.from(counts, ([name, n]) => `${name} ×${n}`).join(" · ");
 }
 
+/** `Write`, `Edit` and `NotebookEdit` can finish without a permission card under `acceptEdits`.
+ *  Keep each change in its own row so it cannot disappear into a tool-count summary. These tools
+ *  end a run on either side, just as failed or gated calls do; reads and searches still fold. */
+const NEVER_FOLDED_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+
 /** Fold consecutive finished, ungated tool calls into one `run` row when there are at least
  *  two and another item follows or the turn has ended. Expanded runs and the detailed view keep
  *  every call.
@@ -27,7 +32,14 @@ export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineI
     const start = i;
     while (i < timeline.length) {
       const item = timeline[i];
-      if (item.kind !== "tool" || item.call.result === null || item.call.result.isError || gated.has(item.call.toolUseId)) break;
+      if (
+        item.kind !== "tool" ||
+        item.call.result === null ||
+        item.call.result.isError ||
+        gated.has(item.call.toolUseId) ||
+        NEVER_FOLDED_TOOLS.has(item.call.name)
+      )
+        break;
       i++;
     }
     const length = i - start;

@@ -2,7 +2,7 @@
 //! what ran in it. The layout determines where it can reopen.
 //!
 //! `Reopen::At` returns the leaf to its first-launch place, hidden. The terminal goes
-//! below everything at a third of the height; a Lua panel uses its `position`.
+//! below the editor's column at a third of its height; a Lua panel uses its `position`.
 //! The old pinned split is removed; the new one settles its length on the next show.
 //!
 //! `Reopen::InPlace` leaves the leaf hidden where it was. The editor and agent use this:
@@ -140,24 +140,26 @@ mod tests {
         ModuleId::terminal()
     }
 
-    /// The first launch with the terminal in it, before anything is hidden.
+    /// The initial layout with the terminal below the editor's own leaf,
+    /// before anything is hidden.
     fn with_terminal() -> Layout {
         Layout::initial(&[ModuleDecl {
             id: term(),
-            placement: Placement::BelowRoot,
+            placement: Placement::BelowEditor,
         }])
         .unwrap()
     }
 
     /// A terminal moved right of the editor and killed there comes back where a first launch puts
-    /// it -- below everything, its pin fresh -- and the keys went to its neighbour first.
+    /// it -- below the editor's own leaf, its pin fresh, the agent untouched -- and the keys went to
+    /// its neighbour first.
     #[test]
-    fn a_killed_terminal_goes_back_below_everything_hidden_and_the_keys_move_first() {
+    fn a_killed_terminal_goes_back_below_the_editor_hidden_and_the_keys_move_first() {
         let mut layout = with_terminal();
         place(&mut layout, &term(), &editor(), Axis::Row).unwrap();
         assert_eq!(layout.focus(), &term());
         assert_eq!(
-            kill(&mut layout, &term(), Reopen::At(Placement::BelowRoot), &frame()),
+            kill(&mut layout, &term(), Reopen::At(Placement::BelowEditor), &frame()),
             Ok(Some(editor()))
         );
         assert_eq!(layout.focus(), &editor());
@@ -165,28 +167,24 @@ mod tests {
         assert!(!layout.is_gone(&term()));
         assert_eq!(
             layout.root(),
-            &Node::pinned(
-                Axis::Column,
-                BELOW_ROOT_SHARE,
-                Branch::Second,
-                Layout::initial(&[]).unwrap().root().clone(),
-                Node::Leaf(term())
-            )
+            with_terminal().root(),
+            "the same tree a first launch builds"
         );
         assert_eq!(layout.visible_leaves(), [editor(), agent()]);
-        // Shown again: a third of the height, as a first show is.
+        // Shown again: a third of the editor column's height, as a first show is -- and only the
+        // editor column's width, not the whole window's (760 of 1280, the agent's 519 untouched).
         layout.show(&term()).unwrap();
-        assert_eq!(arrange(&layout, &frame()).rect_of(&term()).unwrap().h, 240);
+        let rect = arrange(&layout, &frame()).rect_of(&term()).unwrap();
+        assert_eq!((rect.w, rect.h), (760, 240));
     }
 
-    /// The first launch with a Lua `side` panel too, terminal `BelowRoot` before it (task 6's own
-    /// equivalence check, brief step 1): `[editor | agent] | side`, terminal below `[editor | agent]`
-    /// only.
+    /// The initial layout with a Lua `side` panel: `[[editor / term] | agent] | side`.
+    /// The terminal goes below the editor's own leaf only.
     fn with_terminal_and_side() -> Layout {
         Layout::initial(&[
             ModuleDecl {
                 id: term(),
-                placement: Placement::BelowRoot,
+                placement: Placement::BelowEditor,
             },
             ModuleDecl {
                 id: ModuleId::lua("side"),
@@ -196,21 +194,17 @@ mod tests {
         .unwrap()
     }
 
-    /// A terminal moved next to the side panel and killed there with `Reopen::At(BelowEditorAndAgent)`
-    /// comes back under `[editor | agent]` only, producing exactly the tree a first launch with the
-    /// same terminal and side panel builds -- not full width below the side panel too, which
-    /// `Reopen::At(BelowRoot)` would give it.
+    /// A terminal moved next to the side panel and killed there with `Reopen::At(Placement::BelowEditor)`
+    /// comes back under the editor's own leaf only, producing exactly the tree a first launch with the
+    /// same terminal and side panel builds -- not below `[editor | agent]` together (what
+    /// `Placement::BelowEditorAndAgent`, task 6's now-superseded answer, gave it) and not below the
+    /// side panel either.
     #[test]
-    fn a_killed_terminal_reopens_below_editor_and_agent_not_below_the_side_panel() {
+    fn a_killed_terminal_reopens_below_the_editor_not_the_agent_or_the_side_panel() {
         let mut layout = with_terminal_and_side();
         place(&mut layout, &term(), &ModuleId::lua("side"), Axis::Row).unwrap();
         assert_eq!(
-            kill(
-                &mut layout,
-                &term(),
-                Reopen::At(Placement::BelowEditorAndAgent),
-                &frame()
-            ),
+            kill(&mut layout, &term(), Reopen::At(Placement::BelowEditor), &frame()),
             Ok(Some(ModuleId::lua("side")))
         );
         assert_eq!(layout.root(), with_terminal_and_side().root());
@@ -222,14 +216,17 @@ mod tests {
         let mut layout = with_terminal();
         assert!(super::super::geometry::settle_pins(&mut layout, &frame()));
         let settled = |layout: &Layout| match layout.root() {
-            Node::Split {
-                pin: Some(Pin { px, .. }),
-                ..
-            } => *px,
-            other => panic!("not the pinned split: {other:?}"),
+            Node::Split { first, .. } => match first.as_ref() {
+                Node::Split {
+                    pin: Some(Pin { px, .. }),
+                    ..
+                } => *px,
+                other => panic!("not the editor's pinned split: {other:?}"),
+            },
+            other => panic!("not a split: {other:?}"),
         };
         assert_eq!(settled(&layout), Some(240));
-        kill(&mut layout, &term(), Reopen::At(Placement::BelowRoot), &frame()).unwrap();
+        kill(&mut layout, &term(), Reopen::At(Placement::BelowEditor), &frame()).unwrap();
         assert_eq!(settled(&layout), None);
         assert!(!layout.is_shown(&term()));
     }

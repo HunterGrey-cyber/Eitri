@@ -268,5 +268,19 @@
       "kind": "mode",
       "to": "browse"
     }
+  },
+  {
+    "label": "Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
+    }
   }
 ]

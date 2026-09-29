@@ -1,28 +1,22 @@
-//! Rebuild a layout from the state file or `init.lua`'s default against this window's modules.
+//! Rebuilds a saved or `init.lua` default layout against the modules this window has.
 //!
-//! First, drop leaves for modules this window lacks and let their siblings take the space.
-//! If this leaves a hidden editor alone, show it again: its replacement Lua `main` panel
-//! (`Placement::InPlaceOfEditor`) is gone. An editor hidden by hand also reappears when
-//! its only neighbour was removed; the note reports this.
+//! 1. Removes unavailable leaves, such as unregistered Lua panels. Their siblings take the space.
+//!    If this leaves a hidden editor alone in its place, it is shown again so a removed Lua `main`
+//!    panel does not leave the window without an editor. An editor hidden by hand also returns if
+//!    its only neighbour was removed; a note explains the change.
+//! 2. Rejects a tree missing the editor or agent so the caller can fall back to the default.
+//! 3. For `init.lua` defaults only, [`reconcile_default`] pins a full-width bottom terminal or Lua
+//!    `bottom` panel to keep its height when the window grows. `init.lua` cannot express pins.
+//!    Saved layouts retain their own pins, including rows unpinned with `Ctrl+a _`.
+//! 4. Adds a missing terminal below the editor's leaf, hidden, and places missing registered Lua
+//!    panels by their `position`, as on first launch.
+//! 5. Keeps `hidden` entries only for leaves still in the tree. Restores focus if it is shown;
+//!    otherwise chooses the editor, then the first registered Lua panel placed in its place,
+//!    then the first shown module in tree order.
+//!    An `init.lua` default has no saved focus. Choosing its first leaf could give the agent the
+//!    keys instead of the editor in `{ 'row', {'agent', 0.4}, {'editor'} }`.
 //!
-//! Refuse trees missing the editor or agent, since every window has both. The caller
-//! falls back to the default layout.
-//!
-//! For `init.lua` defaults only ([`reconcile_default`]), pin full-width bottom rows that
-//! first-launch placement would pin, such as the terminal or a Lua `bottom` panel.
-//! `init.lua` cannot express pins, and pinning keeps these rows at a fixed height as the
-//! window grows. Saved layouts retain their own pins, including rows unpinned by `Ctrl+a _`.
-//!
-//! Add a missing terminal below everything, hidden, and place missing registered Lua
-//! panels by `position`, as on first launch.
-//!
-//! Keep `hidden` entries only for leaves still in the tree. Give focus to the saved
-//! module if shown, otherwise to the editor, then the first registered Lua panel placed
-//! in its stead, then the first shown module in tree order. An `init.lua` default has no
-//! focus; tree order alone could leave nvim without keys when the agent is first.
-//!
-//! Report every change as a separate note so the caller can explain why the layout
-//! could not reopen exactly as it was left.
+//! Each change produces a note so the caller can log why the window did not reopen as it was left.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -117,10 +111,10 @@ fn reconcile_with(
     }
     let terminal = ModuleId::terminal();
     if !root.leaves().contains(&terminal) {
-        root = place_new(root, &terminal, Placement::BelowRoot).0;
+        root = place_new(root, &terminal, Placement::BelowEditor).0;
         hidden.insert(terminal.clone());
         notes.push(format!(
-            "placed '{terminal}' below everything, hidden, as a first launch does"
+            "placed '{terminal}' below the editor, hidden, as a first launch does"
         ));
     }
     for decl in lua {
@@ -350,19 +344,22 @@ mod tests {
         );
     }
 
-    /// A file written before the terminal existed, or `init.lua`'s default tree without one: it goes
-    /// where a first launch puts it, hidden until `Ctrl+a t`.
+    /// A state file or Lua default tree without a terminal receives one below the editor's own
+    /// leaf, hidden until `Ctrl+a t`, leaving the agent untouched.
     #[test]
-    fn a_missing_terminal_is_placed_below_everything_and_hidden() {
+    fn a_missing_terminal_is_placed_below_the_editor_and_hidden() {
         let r = reconcile(row(leaf(editor()), leaf(agent())), &BTreeSet::new(), None, &[]).unwrap();
         assert_eq!(
             r.layout.root(),
-            &Node::pinned(
-                Axis::Column,
-                BELOW_ROOT_SHARE,
-                Branch::Second,
-                row(leaf(editor()), leaf(agent())),
-                leaf(term())
+            &row(
+                Node::pinned(
+                    Axis::Column,
+                    BELOW_ROOT_SHARE,
+                    Branch::Second,
+                    leaf(editor()),
+                    leaf(term())
+                ),
+                leaf(agent())
             )
         );
         assert_eq!(r.layout.hidden(), &set(&[term()]));
