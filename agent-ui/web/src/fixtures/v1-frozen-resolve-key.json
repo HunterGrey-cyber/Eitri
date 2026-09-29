@@ -422,6 +422,20 @@
     }
   },
   {
+    "label": "visual: Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "visual: Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
+    }
+  },
+  {
     "label": "visual: ?",
     "expected": {
       "kind": "keymap"
@@ -546,6 +560,20 @@
     "label": "vline: Esc",
     "expected": {
       "kind": "vback"
+    }
+  },
+  {
+    "label": "vline: Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "vline: Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
     }
   },
   {
@@ -677,6 +705,20 @@
     "expected": {
       "kind": "vtoggle",
       "line": true
+    }
+  },
+  {
+    "label": "caret: Ctrl+e",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": 1
+    }
+  },
+  {
+    "label": "caret: Ctrl+y",
+    "expected": {
+      "kind": "scroll-line",
+      "delta": -1
     }
   },
   {

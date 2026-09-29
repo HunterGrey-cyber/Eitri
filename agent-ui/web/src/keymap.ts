@@ -267,14 +267,27 @@ function resolveRegionPendingG(event: KeyLike, ctx: KeyContext): PanelAction | "
   return "fallthrough";
 }
 
-/** Modifier handling shared by CARET and VISUAL/V-LINE. `Ctrl+c` interrupts a running turn;
- *  other chords with Ctrl/Alt/Meta/Super/Hyper/AltGraph are swallowed. `idleCtrlC` supplies the caller's idle behavior:
- *  CARET swallows it, while VISUAL/V-LINE leaves it to native copy.
- *  Passing that action keeps the function independent of the current mode. */
+/** Modifier handling shared by CARET and VISUAL/V-LINE. `Ctrl+c` interrupts a running turn.
+ *  `idleCtrlC` supplies the caller's idle behavior: CARET swallows it, while VISUAL/V-LINE
+ *  leaves it to native copy. Other Ctrl/Alt/Meta/Super/Hyper/AltGraph chords are swallowed except `Ctrl+e`/`Ctrl+y`.
+ *  Those reuse BROWSE's `scroll-line` action because region modes return before BROWSE's
+ *  chord handling. `App.tsx` scrolls the frozen list one line without moving the caret
+ *  or selection or ending the region. */
 function resolveRegionModifierKey(event: KeyLike, ctx: KeyContext, idleCtrlC: PanelAction): PanelAction | "fallthrough" {
   if (isModifierKey(event.key)) return null;
   if (event.key === "c" && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && !hasSuperOrHyper(event) && !hasAltGraph(event)) {
     return ctx.turnRunning === true ? { kind: "interrupt" } : idleCtrlC;
+  }
+  if (
+    event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    !hasSuperOrHyper(event) &&
+    !hasAltGraph(event) &&
+    (event.key === "e" || event.key === "y")
+  ) {
+    return { kind: "scroll-line", delta: event.key === "e" ? 1 : -1 };
   }
   if (event.ctrlKey || event.altKey || event.metaKey || hasSuperOrHyper(event) || hasAltGraph(event)) {
     return { kind: "vswallow" };
@@ -622,8 +635,9 @@ export const CARET_KEYS: KeyHelp[] = [
   { keys: "gg / G", what: "First / last character of the conversation" },
   { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
   { keys: "v / V", what: "Select from here: VISUAL by character, V-LINE by line" },
+  { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the caret stays put" },
   { keys: "Esc", what: "Back to BROWSE, cursor on this row" },
-  { keys: "?", what: "This list (any other key ends the caret too)" },
+  { keys: "?", what: "This list (any other key ends the caret too, except Ctrl+e/Ctrl+y, which scroll instead)" },
 ];
 
 /** VISUAL/V-LINE, i.e. everything `resolveVisualKey` claims. Tied to
@@ -642,7 +656,8 @@ export const VISUAL_KEYS: KeyHelp[] = [
   { keys: "y", what: "Copy the highlighted text and return to BROWSE" },
   { keys: ">", what: "Quote into the message below, then type" },
   { keys: "Esc", what: "Back to the caret, at the moving end" },
-  { keys: "?", what: "This list (any other key ends the region too)" },
+  { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the selection stays put" },
+  { keys: "?", what: "This list (any other key ends the region too, except Ctrl+e/Ctrl+y, which scroll instead)" },
 ];
 
 export const INPUT_KEYS: KeyHelp[] = [

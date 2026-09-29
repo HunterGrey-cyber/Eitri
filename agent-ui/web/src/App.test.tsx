@@ -8742,4 +8742,186 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(seen).toEqual(["up"]);
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
   });
+
+
+  /** The `slashReply` effect treats CARET/VISUAL/V-LINE as covered through
+   *  `isRegionMode(modeRef.current)`. A bare `/model` or `/effort` reply stays plain transcript
+   *  text. Opening `SlashPicker` would focus it, trigger the root's `onFocus` exit, and discard
+   *  the region before the next key. */
+  it("finding 1: a bare /model's reply landing during VISUAL neither opens the picker nor ends the region", () => {
+    const MODEL_REPLY =
+      "Current model: `Haiku 4.5` (effort: high)\n" +
+      "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], " +
+      "fable[1m], opusplan, default, or a full model ID.";
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "i" });
+    const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
+    fireEvent.change(textarea, { target: { value: "/model" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(lastOfType("send_message")!.text).toBe("/model");
+    fireEvent.keyDown(textarea, { key: "Escape" }); // back to BROWSE, nothing left in the box
+    fireEvent.keyDown(root, { key: "g" }); // gg (already on the prompt row; the probe's own sequence)
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" }); // charwise inclusive: "he"
+    expect(window.getSelection()?.toString()).toBe("he");
+    // The reply to that bare /model, arriving while VISUAL holds the keys.
+    dispatch({
+      kind: "events",
+      tab: 1,
+      fromRevision: 3,
+      throughRevision: 5,
+      events: [
+        { type: "turn_started", turn_id: "t1" },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+      ],
+    });
+    expect(container.querySelector(".slash-picker"), "no picker opened over the region").toBeNull();
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+    expect(window.getSelection()?.toString(), "the selection the region built is still there").toBe("he");
+    // And the region still works normally afterwards: y still copies "he", not nothing.
+    const clipboard = stubClipboard();
+    fireEvent.keyDown(root, { key: "y" });
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("he");
+  });
+
+  /** `chooseSlashOption` sends directly through `sendMessage`; its text bypasses the
+   *  composer entirely. Ordinary send refusals restore sent text into the draft, so picker choices use a
+   *  separate "picker-send" in-flight kind. Refusing one must only flash in the footer and
+   *  preserve the draft. This test quotes "hello world" into an empty draft with `V >`, then
+   *  opens the picker from the earlier `/model` reply and refuses its choice. */
+  it("finding 2: a refused picker choice flashes and leaves an already-quoted draft untouched", () => {
+    vi.useFakeTimers();
+    try {
+      const MODEL_REPLY =
+        "Current model: `Haiku 4.5` (effort: high)\n" +
+        "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], " +
+        "fable[1m], opusplan, default, or a full model ID.";
+      const { container, root } = startedOnPromptRow();
+      // The bare /model, sent first from an empty box.
+      fireEvent.keyDown(root, { key: "i" });
+      const firstBox = container.querySelector<HTMLTextAreaElement>("textarea")!;
+      fireEvent.change(firstBox, { target: { value: "/model" } });
+      fireEvent.keyDown(firstBox, { key: "Enter" });
+      expect(lastOfType("send_message")!.text).toBe("/model");
+      fireEvent.keyDown(firstBox, { key: "Escape" }); // back to BROWSE, box now empty
+      // V > : quote "hello world" into the empty draft.
+      fireEvent.keyDown(root, { key: "V", shiftKey: true }); // V-LINE directly (O8)
+      fireEvent.keyDown(root, { key: ">", shiftKey: true });
+      expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("input");
+      expect(container.querySelector<HTMLTextAreaElement>("textarea")!.value).toBe("> hello world\n\n");
+      act(() => vi.advanceTimersByTime(300)); // flush the quote's own mirrorDraft debounce
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "> hello world\n\n" });
+      const draftPostsBefore = posted.filter((m) => m.type === "draft").length;
+      // Now the /model reply lands. Opening the picker steals focus from the composer's textarea
+      // (`SlashPicker`'s own mount effect), and the textarea's `onBlur` ("click away", unrelated
+      // and pre-existing -- `Composer.tsx:371-375`) reports BROWSE -- this test asserts nothing
+      // about `mode` either way; what matters is only what happens to the draft itself.
+      dispatch({
+        kind: "events",
+        tab: 1,
+        fromRevision: 3,
+        throughRevision: 5,
+        events: [
+          { type: "turn_started", turn_id: "t1" },
+          { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: MODEL_REPLY, stop_reason: null, usage: null },
+        ],
+      });
+      const picker = container.querySelector<HTMLElement>(".slash-picker")!;
+      expect(picker, "the reply parsed and opened a picker").not.toBeNull();
+      fireEvent.keyDown(picker, { key: "Enter" }); // chooses the marked-current option, "haiku"
+      const pickerRequest = lastOfType("send_message")!;
+      expect(pickerRequest.text).toBe("/model haiku");
+      dispatch({ kind: "command_result", requestId: pickerRequest.request_id, ok: false, error: "no active session" });
+      // Fixed: the picker's own refusal never mirrors anything back to Rust -- no new `draft` post
+      // at all, so the quoted text is left exactly as it was, never restored, still less
+      // concatenated with "/model haiku" ahead of it.
+      act(() => vi.advanceTimersByTime(300));
+      expect(posted.filter((m) => m.type === "draft")).toHaveLength(draftPostsBefore);
+      // A footer flash, not the banner "It is back in the box" message an ordinary composer send's
+      // refusal gets.
+      expect(container.querySelector(".band-message")?.textContent).toBe("no active session");
+      expect(container.querySelector(".command-notice")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** `resolveRegionModifierKey` handles Ctrl+e/Ctrl+y in CARET and VISUAL/V-LINE using BROWSE's
+   *  one-line `scroll-line` action. This checks that the region handler scrolls the list
+   *  without moving the caret or selection or changing the mode; `keymap.test.ts` checks the
+   *  low-level mapping. */
+  it("finding 3: Ctrl+e/Ctrl+y scroll the frozen list one line in CARET, without moving the caret or ending the region", () => {
+    const { container, root } = startedOnPromptRow();
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    list.scrollTop = 100;
+    fireEvent.keyDown(root, { key: "v" }); // CARET, on "hello world"'s first character
+    const before = window.getSelection()!.toString();
+    fireEvent.keyDown(root, { key: "e", ctrlKey: true });
+    expect(list.scrollTop, "Ctrl+e scrolled down").toBeGreaterThan(100);
+    expect(window.getSelection()!.toString(), "the caret did not move").toBe(before);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+    const afterCtrlE = list.scrollTop;
+    fireEvent.keyDown(root, { key: "y", ctrlKey: true });
+    expect(list.scrollTop, "Ctrl+y scrolled back up").toBeLessThan(afterCtrlE);
+    expect(window.getSelection()!.toString()).toBe(before);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+  });
+
+  it("finding 3: Ctrl+e/Ctrl+y scroll the frozen list in VISUAL too, without touching the highlighted selection", () => {
+    const { container, root } = startedOnPromptRow();
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    list.scrollTop = 100;
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" }); // "he"
+    expect(window.getSelection()?.toString()).toBe("he");
+    fireEvent.keyDown(root, { key: "e", ctrlKey: true });
+    expect(list.scrollTop).toBeGreaterThan(100);
+    expect(window.getSelection()?.toString(), "the highlighted selection did not change").toBe("he");
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
+  });
+
+  it("finding 3: a count repeats Ctrl+e/Ctrl+y in the region, the same as R4's other counted region motions", () => {
+    const { container, root } = startedOnPromptRow();
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    list.scrollTop = 1000;
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "e", ctrlKey: true }); // one line down, for a baseline step size
+    const oneLine = list.scrollTop - 1000;
+    expect(oneLine).toBeGreaterThan(0);
+    list.scrollTop = 1000;
+    fireEvent.keyDown(root, { key: "3" }); // count
+    fireEvent.keyDown(root, { key: "e", ctrlKey: true });
+    expect(list.scrollTop).toBeCloseTo(1000 + oneLine * 3, 1);
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+  });
+
+  /** Enter's `vend` flash in CARET and VISUAL/V-LINE points to the unfold route: press Enter in
+   *  BROWSE before `v` to expose folded text. Other unbound keys, including `d`, keep their
+   *  existing messages. */
+  it("finding 4: Enter's vend flash points at BROWSE's own unfold-then-v route, in CARET and in VISUAL", () => {
+    const { container, root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    const caretFlash = container.querySelector(".band-message")?.textContent ?? "";
+    expect(caretFlash).toContain("Enter");
+    expect(caretFlash, "names BROWSE's Enter-then-v route").toContain("BROWSE");
+    expect(caretFlash).toContain("v");
+
+    fireEvent.keyDown(root, { key: "v" }); // CARET again
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
+    const visualFlash = container.querySelector(".band-message")?.textContent ?? "";
+    expect(visualFlash).toContain("Enter");
+    expect(visualFlash, "names BROWSE's Enter-then-v route").toContain("BROWSE");
+    expect(visualFlash).toContain("v");
+    // An unbound `d` ends CARET and explains why.
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "d" });
+    expect(container.querySelector(".band-message")?.textContent).toBe("CARET ended: d is not a CARET key (v selects)");
+  });
 });

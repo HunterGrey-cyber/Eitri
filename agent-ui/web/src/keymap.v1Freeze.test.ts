@@ -32,14 +32,15 @@ const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> =
   ...over,
 });
 
-/** `CARET_KEYS`/`VISUAL_KEYS`' own token spelling -> a `KeyLike`, the same rule `keymap.test.ts`'s
- *  `parseVisualToken` uses: `"Esc"` is the display spelling of the real `key: "Escape"`, `"1-9"` a
- *  representative digit, `"gg"` (added for 3a) the FIRST of its two presses (a non-`pending` case
- *  below covers the second), and every bare uppercase letter or `?` carries Shift. */
+/** Convert `CARET_KEYS`/`VISUAL_KEYS` display tokens to `KeyLike`, matching `parseVisualToken`.
+ *  `Esc` maps to `Escape`, `1-9` to a representative digit, and `gg` to its first keypress;
+ *  a separate case covers the second. `Ctrl+x` holds Ctrl with `x`, and uppercase letters
+ *  and `?` carry Shift. */
 function visualToken(token: string): KeyLike {
   if (token === "Esc") return key("Escape");
   if (token === "1-9") return key("3");
   if (token === "gg") return key("g");
+  if (token.startsWith("Ctrl+")) return key(token.slice("Ctrl+".length), { ctrlKey: true });
   if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
   return key(token);
 }

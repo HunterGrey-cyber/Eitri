@@ -180,8 +180,10 @@ describe("KeymapOverlay", () => {
         expect(section.textContent).toContain(row.keys);
         expect(section.textContent).toContain(row.what);
       }
+      // Ctrl+e/Ctrl+y scroll the region without leaving it, so the note must name this exception
+      // to "any other key leaves".
       expect(section.textContent).toContain(
-        "Any other key leaves. The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.",
+        "Any other key leaves (Ctrl+e/Ctrl+y scroll instead). The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.",
       );
     });
 

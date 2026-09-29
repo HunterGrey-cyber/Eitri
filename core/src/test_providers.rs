@@ -28,6 +28,22 @@ impl RecordingProvider {
     pub fn queue(&self, event: AgentDomainEvent) {
         self.queued.lock().unwrap().push(event);
     }
+    /// Queues every event in `events`, in order, under ONE lock acquisition -- unlike calling
+    /// [`Self::queue`] once per event, which races the ingestion thread's own `pump` (also one lock
+    /// acquisition, taking whatever is queued at that instant). A test that pushes a "prefix" event
+    /// (one whose fold satisfies some condition the test polls for) followed by a long filler run
+    /// meant to overflow `UI_EVENT_QUEUE_CAPACITY` in the SAME batch cannot rely on `queue` for
+    /// that: the ingestion thread can drain and fold the prefix alone, the instant after it is
+    /// pushed and long before the filler loop finishes pushing the rest, so a test's `until` on the
+    /// prefix's own effect can succeed before the batch has actually overflowed. Measured 11/60
+    /// failures of `tab_set::tests::a_resync` at `--test-threads=8` under load with `queue`;
+    /// 0/100 with every such prefix+filler sequence switched to this instead, because `pump` (a
+    /// single `mem::take`) then either sees none of the batch or all of it, and `IngestState::fold`
+    /// runs the whole batch under one lock hold -- so nothing outside can observe the prefix's
+    /// effect until the overflow later in the same batch has already happened too.
+    pub fn queue_all(&self, events: Vec<AgentDomainEvent>) {
+        self.queued.lock().unwrap().extend(events);
+    }
     pub fn resolutions(&self) -> Vec<(String, bool)> {
         self.resolved.lock().unwrap().clone()
     }

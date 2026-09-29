@@ -109,7 +109,9 @@ function visualEntryNote(panel: PanelTable): string {
   const vClaim = visualKeyClaim(panel, "v");
   const capitalVClaim = visualKeyClaim(panel, "V");
   if (vClaim === null && capitalVClaim === null) {
-    return "Any other key leaves. The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.";
+    // Ctrl+e/Ctrl+y scroll the region without leaving it, so the note must name this exception
+    // to "any other key leaves".
+    return "Any other key leaves (Ctrl+e/Ctrl+y scroll instead). The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.";
   }
   if (vClaim !== null && capitalVClaim !== null) {
     return "v and V are both bound elsewhere in this panel, so nothing here reaches CARET or VISUAL.";

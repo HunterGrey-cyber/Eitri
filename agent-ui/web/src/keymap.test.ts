@@ -428,16 +428,16 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
   });
 });
 
-/** VISUAL/V-LINE's own token parser, mirroring `parseKeyToken` above but for the shape `VISUAL_KEYS`
- *  rows actually take: no two-key sequences, `"1-9"` a representative digit, `"Esc"` the display
- *  spelling of the real `key: "Escape"`, and every bare uppercase letter or `?` carrying Shift, the
- *  same reason `parseKeyToken` does. */
+/** Parses `VISUAL_KEYS` tokens into events for VISUAL/V-LINE tests. `1-9` uses a representative
+ *  digit, `Esc` becomes `Escape`, and `Ctrl+x` sets Ctrl with `x`. Uppercase letters and `?`
+ *  carry Shift, as in `parseKeyToken`. The `gg` branch supplies only its first key. */
 function parseVisualToken(token: string): KeyLike {
   if (token === "Esc") return key("Escape");
   if (token === "1-9") return key("3");
   // For `gg`, the table tests only need the first press, which arms a pending marker.
   // Separate tests check the complete sequence alongside `G`.
   if (token === "gg") return key("g");
+  if (token.startsWith("Ctrl+")) return key(token.slice("Ctrl+".length), { ctrlKey: true });
   if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
   return key(token);
 }
@@ -534,6 +534,43 @@ describe("CARET_KEYS <-> resolveKey", () => {
   it("o and y are VISUAL-only, not bound in CARET", () => {
     expect(resolveKey("caret", key("o"), ctx)).toEqual({ kind: "vend", key: "o" });
     expect(resolveKey("caret", key("y"), ctx)).toEqual({ kind: "vend", key: "y" });
+  });
+});
+
+/* Ctrl+e/Ctrl+y scroll one line in CARET, VISUAL and V-LINE, just as in BROWSE.
+   Handle them in the region resolvers before the generic modifier catch-all swallows them.
+   These modes return before reaching `resolveKey`'s non-INPUT scrolling branch. */
+describe("v1 trial seam review finding 3: Ctrl+e/Ctrl+y scroll the region instead of vswallow", () => {
+  it.each([
+    ["caret", "e", 1],
+    ["caret", "y", -1],
+    ["visual", "e", 1],
+    ["visual", "y", -1],
+    ["vline", "e", 1],
+    ["vline", "y", -1],
+  ] as const)("%s: Ctrl+%s resolves to scroll-line (delta=%d), not vswallow", (mode, letter, delta) => {
+    expect(resolveKey(mode, key(letter, { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta });
+  });
+
+  it("every other Ctrl/Alt/Meta/Super/Hyper/AltGraph chord in the region is still vswallow", () => {
+    expect(resolveKey("caret", key("o", { ctrlKey: true }), ctx)).toEqual({ kind: "vswallow" });
+    expect(resolveKey("visual", key("d", { ctrlKey: true }), ctx)).toEqual({ kind: "vswallow" });
+    expect(resolveKey("vline", key("e", { ctrlKey: true, shiftKey: true }), ctx)).toEqual({ kind: "vswallow" });
+  });
+
+  it("idle Ctrl+c in CARET is still claimed (vswallow), not mistaken for the new Ctrl+e/Ctrl+y rule", () => {
+    expect(resolveKey("caret", key("c", { ctrlKey: true }), ctx)).toEqual({ kind: "vswallow" });
+  });
+
+  it("CARET_KEYS and VISUAL_KEYS both list Ctrl+e / Ctrl+y now, and the ? row says they are exceptions", () => {
+    const caretRow = CARET_KEYS.find((row) => row.keys === "Ctrl+e / Ctrl+y");
+    const visualRow = VISUAL_KEYS.find((row) => row.keys === "Ctrl+e / Ctrl+y");
+    expect(caretRow, "CARET_KEYS should list Ctrl+e / Ctrl+y").toBeDefined();
+    expect(visualRow, "VISUAL_KEYS should list Ctrl+e / Ctrl+y").toBeDefined();
+    const caretHelp = CARET_KEYS.find((row) => row.keys === "?")!.what;
+    const visualHelp = VISUAL_KEYS.find((row) => row.keys === "?")!.what;
+    expect(caretHelp).toContain("Ctrl+e");
+    expect(visualHelp).toContain("Ctrl+e");
   });
 });
 

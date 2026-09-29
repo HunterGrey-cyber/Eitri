@@ -582,7 +582,7 @@ impl AgentBackend {
     /// In `Auto`, a CLI prompt matching an approval's non-empty tool-use id, tool and exact input
     /// is answered `allow` once and consumes that approval, which authorizes only that call.
     /// `answered_for_you` ([`AnsweredForYou`]) tracks answers made without a card for the call's row:
-    /// every CLI prompt, every gate answered by the acceptEdits fast path,
+    /// every CLI prompt, every gate answered by the acceptEdits fast path or a saved prefix rule,
     /// and every `Write` so answered whose target does not yet exist.
     pub fn take_ui_delivery_with_approvals(
         &mut self,
@@ -707,15 +707,25 @@ impl AgentBackend {
     ///
     /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by
     /// the acceptEdits fast path is added to `answered_for_you.by_the_fast_path` by tool-use id.
-    /// Saved prefix rules do not allow these tools. An absent card cannot prove fast-path
-    /// approval: `validateInput` may fail before any hook runs, a request may lack a tool-use
-    /// id, or a switch to bypass may answer it. Requests without a tool-use id are answered
-    /// but have no row to annotate.
+    /// Saved prefix rules do not allow these tools. The entry also carries `(tool_name, input)`
+    /// because a later card for the same call may have no tool-use id, preventing removal by
+    /// id alone. An absent card cannot prove fast-path approval: `validateInput` may fail
+    /// before any hook runs, a request may lack a tool-use id, or a switch to bypass may answer
+    /// it. Requests without a tool-use id are answered but have no row to annotate.
     ///
     /// For `Write`, existence at `file_path` is checked just before sending `allow`, before
     /// the CLI can write the file. A write to a missing file is added to
     /// `answered_for_you.creates_file` in both the fast path and bypass. `note_new_files`
     /// only sees delivered cards, so it cannot annotate these automatic answers.
+    ///
+    /// `classify_with_rules` checks `agent::rule_that_allows` first. A result with
+    /// `classification.reason == REASON_ALLOWED_BY_A_PROJECT_RULE` identifies a saved prefix
+    /// rule as the reason for allowing the call. After `respond_permission` succeeds,
+    /// `agent::rule_that_allows` is called again for the rule's display string, which goes into
+    /// `answered_for_you.by_rule` by tool-use id. The entry includes `(tool_name, input)` to
+    /// match later cards that lack a tool-use id. A rule matching `ToolCallStarted` and no card
+    /// arriving do not prove rule approval: `validateInput` may have failed before the gate,
+    /// or a switch to bypass may have answered the request.
     ///
     /// Each event keeps its fold revision from `take_revised_ui_delivery`. A kept event
     /// retains its revision; a dropped event is removed together with its revision.
@@ -854,14 +864,36 @@ impl AgentBackend {
             // The fast path is the only allow any of these three tools gets here (this function's
             // doc); its row note, and whether a `Write` creates its file -- read before the answer,
             // since once it is sent the CLI may already have written it.
-            let fast_path = named_call(tool_use_id).filter(|_| ACCEPT_EDITS_TOOLS.contains(&tool_name.as_str()));
-            let creates_file = fast_path
+            let call_id = named_call(tool_use_id);
+            let fast_path = call_id
+                .clone()
+                .filter(|_| ACCEPT_EDITS_TOOLS.contains(&tool_name.as_str()))
+                .map(|id| FastPathAnsweredForYou {
+                    tool_use_id: id,
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                });
+            let creates_file = call_id
                 .clone()
                 .filter(|_| write_over_no_file(&tool_name, input, project_root));
+            // `classify_with_rules` checks `agent::rule_that_allows` first, so this reason
+            // identifies an allowance by a saved rule. Look up its display string for the
+            // call's row note. Requests without a tool-use id are still answered but receive
+            // no row note, as on the fast path.
+            let rule = (classification.reason == agent::permission_policy::REASON_ALLOWED_BY_A_PROJECT_RULE)
+                .then(|| agent::rule_that_allows(&tool_name, input, project_root, rules))
+                .flatten();
+            let by_rule = call_id.zip(rule).map(|(id, rule)| RuleAnsweredForYou {
+                tool_use_id: id,
+                rule,
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+            });
             match self.respond_permission(&permission_id, PermissionDecision::Allow) {
                 Ok(_resolution) => {
                     answered_for_you.by_the_fast_path.extend(fast_path);
                     answered_for_you.creates_file.extend(creates_file);
+                    answered_for_you.by_rule.extend(by_rule);
                     // Said on stderr rather than silently: this is the only record anywhere of a
                     // tool call that ran without the user being asked. One short line, whose reason
                     // is a fixed label from the policy rather than anything the model wrote.
@@ -1051,16 +1083,44 @@ pub struct PromptAnsweredForYou {
     pub note: String,
 }
 
-/// Answers made without a card in one delivery, keyed by tool-use id.
-/// `answer_what_needs_no_human` captures them when answering so the tab set can attach row
-/// notes without inferring approval from a missing card.
+/// A `Write`/`Edit`/`NotebookEdit` call whose gate the acceptEdits fast path answered `allow`.
+/// Keeps the tool-use id and exact `(tool_name, input)` the answer saw for the row's auto note.
+/// A later CLI prompt for the same call can have an empty tool-use id, so
+/// `note_auto_edit_answers` also matches by content to remove the candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastPathAnsweredForYou {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
+/// A call allowed by a saved prefix rule, with the rule text displayed after completion and
+/// the exact `(tool_name, input)` that was approved. `note_rule_answers` matches it by
+/// content like [`FastPathAnsweredForYou`] when a later prompt has no tool-use id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAnsweredForYou {
+    pub tool_use_id: String,
+    pub rule: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
+/// Answers made without a card, keyed by tool-use id for the call's row notes.
+/// `answer_what_needs_no_human` records them when it answers. The tab set uses these entries
+/// rather than inferring an answer from the absence of a card.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnsweredForYou {
     /// The CLI's own prompts (O3), each with its note.
     pub prompts: Vec<PromptAnsweredForYou>,
-    /// `Write`/`Edit`/`NotebookEdit` calls whose gate the acceptEdits fast path answered `allow`
-    /// ("allowed by auto" on the row once the call completes).
-    pub by_the_fast_path: Vec<String>,
+    /// `Write`/`Edit`/`NotebookEdit` calls whose gate the acceptEdits fast path answered `allow`.
+    pub by_the_fast_path: Vec<FastPathAnsweredForYou>,
+    /// Calls whose gate a saved prefix rule answered `allow`. Every entry here came from
+    /// `classify_with_rules` actually answering THIS gate -- never from re-asking
+    /// `agent::rule_that_allows` on a `ToolCallStarted`'s own arguments, which is true of a call
+    /// whose gate never arrived at all (the CLI's `validateInput` failed first), of a gate a switch
+    /// to bypass answered instead of the rule, and of a card whose request named no tool-use id
+    /// (there is no row to name, so it is answered as ever and noted nowhere).
+    pub by_rule: Vec<RuleAnsweredForYou>,
     /// `Write` calls answered `allow` without a card -- by the fast path in `Auto`, or in bypass --
     /// whose `file_path` named nothing just before the answer was sent: the row says the call
     /// creates the file, never that it overwrites one it cannot see.

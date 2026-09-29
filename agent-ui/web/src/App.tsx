@@ -451,9 +451,11 @@ export default function App() {
    *  Untracked interrupts use the ordinary error path. Permission entries keep the card id so a refusal
    *  can make the card answerable again, such as when an Always allow rule cannot be saved.
    *  Each `command_result` removes its entry.
-   *  `"editor"` covers `edit_draft`, `open_path` and `view_in_editor`; refusals use a footer flash. */
+   *  `"editor"` covers `edit_draft`, `open_path` and `view_in_editor`; refusals use a footer flash.
+   *  `"picker-send"` calls `sendMessage` without clearing the composer, unlike an ordinary `"send"`.
+   *  Its refusal only flashes; restoring its text into the composer would overwrite an unrelated draft. */
   const inFlight = useRef<
-    Map<string, { kind: "send" | "handoff" | "editor" | "permission"; tab: TabId; text?: string; permissionId?: string }>
+    Map<string, { kind: "send" | "handoff" | "editor" | "permission" | "picker-send"; tab: TabId; text?: string; permissionId?: string }>
   >(new Map());
   /** Monotonic, so two refusals of the same text are two distinct restores. */
   const restoreSeq = useRef(0);
@@ -1114,11 +1116,15 @@ export default function App() {
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
-  /* `slashReply` opens a picker only when no other overlay is open. Either way, consume it here. */
+  /* `slashReply` opens a picker only when no other overlay is open. Either way, consume it here.
+     CARET/VISUAL/V-LINE also block the picker: focusing it would make the root's `onFocus` end
+     the region via `exitRegion()`. Keep such replies as transcript text so an unrelated reply
+     cannot interrupt the reader's selection. */
   useEffect(() => {
     if (slashReply === null) return;
     setSlashReply(null);
-    const covered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null;
+    const covered =
+      overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || confirm !== null || isRegionMode(modeRef.current);
     if (!covered) setSlashPicker(slashReply);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slashReply]);
@@ -2148,7 +2154,13 @@ export default function App() {
         }
         if (!payload.ok) {
           console.warn("agent-ui: command failed", payload.requestId, payload.error);
-          if (record?.kind === "send") {
+          if (record?.kind === "picker-send") {
+            // `chooseSlashOption` calls `sendMessage` directly without the composer's optimistic
+            // clear, so a refused picker choice has no draft to restore. Flash the error without
+            // changing any quoted or typed draft already in the box.
+            pendingSlashPickerRef.current = null;
+            showFlash(payload.error);
+          } else if (record?.kind === "send") {
             // A refused send starts no turn, so clear `pendingSlashPickerRef` rather than matching
             // it to an unrelated later reply. Clear it regardless of the refusal's tab: it is one
             // shared flag, while `acceptsEnvelope` limits the events handler that reads it to
@@ -2551,19 +2563,24 @@ export default function App() {
     postToRust({ type: "handoff_to_terminal", request_id: requestId, tab });
   }
 
-  /** Sends what is typed. On a `NotStarted` tab this is what starts the backend, lazily, with that
-   *  tab's remembered mode -- there is no separate `start_session` message any more. */
-  function sendMessage(text: string) {
+  /** Sends typed text. On a `NotStarted` tab, starts the backend lazily with the tab's
+   *  remembered mode, without a separate `start_session` message. `chooseSlashOption` passes
+   *  `fromPicker: true` so `inFlight` records a `"picker-send"`. Both paths post `send_message`,
+   *  but a refused picker send must not restore its command text into the composer. */
+  function sendMessage(text: string, options?: { fromPicker?: boolean }) {
     const tab = activeTabRef.current;
     if (tab === null) return;
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
-    // The text is kept so a refusal can put it back. Dropped again as soon as the reply arrives.
-    inFlight.current.set(requestId, { kind: "send", tab, text });
+    // The text is kept so a refusal can put it back (ordinary sends only -- `"picker-send"`'s own
+    // refusal never reads `record.text` back into the box). Dropped again as soon as the reply
+    // arrives.
+    inFlight.current.set(requestId, { kind: options?.fromPicker ? "picker-send" : "send", tab, text });
     setCommandNotice(null);
-    // Arm `pendingSlashPickerRef` for the events handler before the send is acknowledged. Clear it
-    // on a refused `command_result`, since a send that never ran cannot start the turn this flag
-    // waits for.
+    // Arms `pendingSlashPickerRef` for the `events` handler before the post is answered.
+    // The `command_result` handler clears it on refusal because a send that never ran cannot
+    // start the awaited turn. A picker choice carries an argument, so `barePickerCommand`
+    // returns `null` for it and both send paths can use this assignment.
     pendingSlashPickerRef.current = barePickerCommand(text);
     postToRust({ type: "send_message", request_id: requestId, tab, text });
     // A send follows the reply, wherever the reader had scrolled (`./follow.ts`).
@@ -2578,7 +2595,7 @@ export default function App() {
     if (slashPicker === null) return;
     const command = slashPicker.kind === "model" ? "/model" : "/effort";
     setSlashPicker(null);
-    sendMessage(`${command} ${value}`);
+    sendMessage(`${command} ${value}`, { fromPicker: true });
     // Restore focus after the picker unmounts so the keys do not stay on `<body>`. `takeKeys` runs
     // after the render that closed it.
     setKeysRequest((n) => n + 1);
@@ -3111,6 +3128,18 @@ export default function App() {
     return visualRoot()?.querySelector<HTMLElement>(".message-list") ?? null;
   }
 
+  /** Returns the frozen DOM row containing `caret`, or `null` outside a row.
+   *  Shared by `rowKeyOfCaret` and the `scroll-line` line-height calculation.
+   *  `rowTextElement` needs a row: reading `.message-list` directly gives a fraction
+   *  of the actual text line height. */
+  function rowElementOfCaret(caret: Caret): HTMLElement | null {
+    const root = visualRoot();
+    if (root === null) return null;
+    const el = caret.node instanceof Element ? caret.node : caret.node.parentElement;
+    if (el === null) return null;
+    return rowOf(root, el);
+  }
+
   /** Returns the caret row's key from `frozenTimeline`, or `null` outside a row.
    *  Match rows by key because linked cards arriving during VISUAL can give a row different
    *  positions in the frozen and live timelines. Each row in the frozen DOM belongs to
@@ -3118,9 +3147,7 @@ export default function App() {
   function rowKeyOfCaret(caret: Caret): string | null {
     const root = visualRoot();
     if (root === null || frozenTimeline === null) return null;
-    const el = caret.node instanceof Element ? caret.node : caret.node.parentElement;
-    if (el === null) return null;
-    const row = rowOf(root, el);
+    const row = rowElementOfCaret(caret);
     if (row === null) return null;
     const frozenIndex = rowIndexOf(root, row);
     if (frozenIndex === null) return null;
@@ -3459,10 +3486,14 @@ export default function App() {
         landCursorOnRowKey(rowKeyOfCaret(model.cursor));
         endRegionFromKey();
         // `Esc` exits silently. Other unbound keys show the current mode's hint. Name Space explicitly
-        // so the message does not contain an unreadable blank key name.
+        // so the message does not contain an unreadable blank key name. Enter explains how to
+        // unfold a row in BROWSE before selecting it, since folded text cannot be reached here.
         if (action.key !== "Escape") {
           const keyName = action.key === " " ? "Space" : action.key;
-          if (currentMode === "caret") {
+          if (action.key === "Enter") {
+            const modeName = regionModeName(currentMode);
+            showFlash(`${modeName} ended: Enter is not a ${modeName} key -- in BROWSE, Enter unfolds a row, then v selects it`);
+          } else if (currentMode === "caret") {
             showFlash(`CARET ended: ${keyName} is not a CARET key (v selects)`);
           } else {
             showFlash(`VISUAL ended: ${keyName} is not a VISUAL key (y copies)`);
@@ -3478,6 +3509,17 @@ export default function App() {
           showFlash("nothing selected — v, then y");
         }
         return;
+      case "scroll-line": {
+        // Ctrl+e/Ctrl+y scroll the frozen list by the count in text lines without moving
+        // the caret or selection or changing mode. Read `computedLineHeight` from the caret row's
+        // text through `rowTextElement`; `.message-list` sets neither font-size nor line-height,
+        // so reading it directly gives a fraction of the actual line height.
+        if (listEl === null) return;
+        const row = rowElementOfCaret(model.cursor);
+        const scrollTimes = Math.max(1, count ?? 1);
+        listEl.scrollTop += action.delta * computedLineHeight(row !== null ? rowTextElement(row) : listEl) * scrollTimes;
+        return;
+      }
       case "keymap":
         // `?` ends the region and opens the keymap for discovering available keys.
         landCursorOnRowKey(rowKeyOfCaret(model.cursor));
