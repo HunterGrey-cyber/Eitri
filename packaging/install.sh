@@ -1388,6 +1388,31 @@ pid_alive() {
 
 # acquire_lock: a mkdir lock in <cache>/neovibe/ (spec §6.5 step 1), so two runs never share
 # neovibe.new, the download directory or a sidecar build. A lock left by a dead pid is taken over.
+# own_private_group DIR: sets OPG=1 when DIR's group is this user's own user-private group -- the
+# user's primary group, named after the user, with no other members: the USERGROUPS_ENAB convention
+# of Debian, Ubuntu and Fedora, whose umask 002 routinely leaves a self-owned ~/.cache at 0775.
+# There, the group-write bit gives nobody else write access, so the group-write checks below accept
+# it. Anything uncertain -- no getent, a failed lookup, a group named otherwise, another listed
+# member -- leaves OPG=0, and those checks refuse exactly as before. Called as a plain statement
+# (rule 2 above). A second account whose PRIMARY group is this one would not be listed as a member;
+# that is not the convention, and is not checked.
+own_private_group() {
+	OPG=0
+	_opg_gid=$(id -g 2>/dev/null) || return 0
+	_opg_user=$(id -un 2>/dev/null) || return 0
+	_opg_group=$(id -gn 2>/dev/null) || return 0
+	if [ -z "$_opg_user" ] || [ "$_opg_user" != "$_opg_group" ]; then return 0; fi
+	[ -n "$(find -H "$1" -maxdepth 0 -gid "$_opg_gid" -print 2>/dev/null)" ] || return 0
+	command -v getent >/dev/null 2>&1 || return 0
+	_opg_entry=$(getent group "$_opg_group" 2>/dev/null) || return 0
+	[ "$(printf '%s\n' "$_opg_entry" | cut -d: -f1)" = "$_opg_group" ] || return 0
+	[ "$(printf '%s\n' "$_opg_entry" | cut -d: -f3)" = "$_opg_gid" ] || return 0
+	case $(printf '%s\n' "$_opg_entry" | cut -d: -f4) in
+	'' | "$_opg_user") OPG=1 ;;
+	*) ;;
+	esac
+}
+
 acquire_lock() {
 	NV_LOCK=$NV_CACHE_NV/lock
 	if [ "$OPT_DRY_RUN" = 1 ]; then
@@ -1428,6 +1453,13 @@ acquire_lock() {
 	# checked now (installer-claude-8: `-perm -0002` alone missed a group-writable 0770 directory).
 	_al_priv=$(find -H "$NV_CACHE_NV" -prune ! -perm -0002 ! -perm -0020 -print 2>/dev/null) || _al_priv=
 	if [ -z "$_al_priv" ]; then
+		# Group-write alone, on this user's own private group (own_private_group), lets no one else in.
+		_al_upg=$(find -H "$NV_CACHE_NV" -prune ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_upg=
+		OPG=0
+		if [ -n "$_al_upg" ]; then own_private_group "$NV_CACHE_NV"; fi
+		if [ "$OPG" = 1 ]; then _al_priv=$_al_upg; fi
+	fi
+	if [ -z "$_al_priv" ]; then
 		die "other users can write to $NV_CACHE_NV, so a download checked there could be replaced before it is used: run chmod go-w '$NV_CACHE_NV' (or set XDG_CACHE_HOME to a directory of your own) and re-run"
 	fi
 	# A parent (<cache> itself) that anyone can write to, without the sticky bit, lets another user
@@ -1450,6 +1482,15 @@ acquire_lock() {
 			fi
 		fi
 		_al_parent_bad=$(find -H "$NV_CACHE" -maxdepth 0 \( -perm -0002 -o -perm -0020 \) ! -perm -1000 -print 2>/dev/null) || _al_parent_bad=
+		if [ -n "$_al_parent_bad" ]; then
+			# rc.2's e2e (2026-09-28): refusing every group-writable <cache> refused a default Ubuntu
+			# user's own 0775 ~/.cache, so `neovibe setup` failed after a plain .deb install. Group-write
+			# alone, on this user's own private group, lets no one else in (own_private_group).
+			_al_parent_upg=$(find -H "$NV_CACHE" -maxdepth 0 ! -perm -0002 -perm -0020 -print 2>/dev/null) || _al_parent_upg=
+			OPG=0
+			if [ -n "$_al_parent_upg" ]; then own_private_group "$NV_CACHE"; fi
+			if [ "$OPG" = 1 ]; then _al_parent_bad=; fi
+		fi
 		if [ -n "$_al_parent_bad" ]; then
 			# M2 follow-up (v1-dist whole-branch review, fix round 2, 2026-09-28): this check applies
 			# regardless of who owns $NV_CACHE (the ownership check above already requires it be us

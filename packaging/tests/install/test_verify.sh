@@ -440,6 +440,27 @@ t_cache_writable_by_others_refused() {
 	expect_eq "$(installed_version)" 1.0.0 "the version once the cache is private"
 }
 
+# shared_group_stubs: a PRE_STUBS directory whose getent reports this user's primary group with a
+# second member -- a group really shared with someone else, whatever this machine's own layout is
+# (the host and the dash image both give the test user a private group of its own).
+shared_group_stubs() {
+	mkdir -p "$T/stubs-getent"
+	cat >"$T/stubs-getent/getent" <<'STUB'
+#!/bin/sh
+if [ "$1" = group ]; then printf '%s:x:%s:%s,someone-else\n' "$2" "$(id -g)" "$(id -un)"; exit 0; fi
+exec /usr/bin/getent "$@"
+STUB
+	chmod +x "$T/stubs-getent/getent"
+	printf '%s\n' "$T/stubs-getent"
+}
+
+# own_private_group_here: 0 when the test user has a user-private group (the case own_private_group
+# accepts), so the tests that rely on it can say when they are not exercising it.
+own_private_group_here() {
+	[ "$(id -un)" = "$(id -gn)" ] || return 1
+	case $(getent group "$(id -gn)" | cut -d: -f4) in '' | "$(id -un)") return 0 ;; *) return 1 ;; esac
+}
+
 TESTS="$TESTS t_cache_group_writable_refused"
 t_cache_group_writable_refused() {
 	# installer-claude-8: the original check tested only the other-write bit (`-perm -0002`), so a
@@ -448,6 +469,7 @@ t_cache_group_writable_refused() {
 	serve 1.0.0
 	mkdir -p "$TH/.cache/neovibe"
 	chmod 0770 "$TH/.cache/neovibe"
+	PRE_STUBS=$(shared_group_stubs)
 	inst_net
 	expect_fail "a group-writable cache directory"
 	expect_out "other users can write to $TH/.cache/neovibe"
@@ -505,6 +527,7 @@ t_cache_parent_group_writable_without_sticky_refused() {
 	serve 1.0.0
 	mkdir -p "$TH/.cache"
 	chmod 0770 "$TH/.cache"
+	PRE_STUBS=$(shared_group_stubs)
 	inst_net
 	expect_fail "a group-writable, non-sticky cache parent"
 	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
@@ -513,6 +536,35 @@ t_cache_parent_group_writable_without_sticky_refused() {
 	inst_net
 	expect_rc 0
 	expect_eq "$(installed_version)" 1.0.0 "the version once the parent is private"
+}
+
+TESTS="$TESTS t_cache_group_writable_own_private_group_allowed"
+t_cache_group_writable_own_private_group_allowed() {
+	# rc.2's e2e (2026-09-28): a default Ubuntu user has a group of their own and umask 002, so tools
+	# leave ~/.cache (and anything under it) at 0775. Refusing that refused `neovibe setup` right
+	# after a plain .deb install. Group-write on the user's own private group lets no one else in.
+	if ! own_private_group_here; then
+		printf 'note: the test user has no private group here; nothing to check\n'
+		return 0
+	fi
+	serve 1.0.0
+	mkdir -p "$TH/.cache/neovibe"
+	chmod 0775 "$TH/.cache" "$TH/.cache/neovibe"
+	inst_net
+	expect_rc 0 "a 0775 ~/.cache and ~/.cache/neovibe on the user's own private group"
+	expect_eq "$(installed_version)" 1.0.0 "the version with a 0775 cache on a private group"
+}
+
+TESTS="$TESTS t_cache_other_writable_own_private_group_still_refused"
+t_cache_other_writable_own_private_group_still_refused() {
+	# The private-group allowance covers the group bit only: other-write without the sticky bit is
+	# refused whoever the group is.
+	serve 1.0.0
+	mkdir -p "$TH/.cache"
+	chmod 0777 "$TH/.cache"
+	inst_net
+	expect_fail "a world-writable, non-sticky cache parent even on a private group"
+	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
 }
 
 TESTS="$TESTS t_cache_owned_by_another_user_refused"
