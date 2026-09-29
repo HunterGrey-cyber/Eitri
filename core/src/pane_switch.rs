@@ -957,8 +957,11 @@ mod tests {
         let (mut reader, empty) = poll_within(reader, Duration::from_secs(2), None);
         assert!(empty.is_empty(), "nothing written yet");
         let elapsed = before.elapsed();
+        // A blocking accepted stream would hold this poll until poll_within's 2 s cap, so the bound only has to
+        // tell "returned at once" from "blocked". 20 ms was tripped by scheduler delay alone on a loaded host
+        // (28.75 ms at a load average of ~20 on 18 cores, 2026-09-29); 500 ms keeps the whole margin to 2 s.
         assert!(
-            elapsed < Duration::from_millis(20),
+            elapsed < Duration::from_millis(500),
             "poll blocked for {elapsed:?} on an accepted, silent connection"
         );
 
