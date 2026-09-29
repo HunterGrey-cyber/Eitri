@@ -271,6 +271,16 @@ A few common install-time refusals, in the installer's own words (abridged):
   printed at the end of a successful install; add `~/.local/bin` to your shell's `PATH`, or put it
   before whatever else answers to `neovibe` today (often `/usr/bin/neovibe` from an earlier `.deb`).
 
+- **`… is writable by its group or by anyone, and not sticky`** — the installer keeps its downloads
+  under `$XDG_CACHE_HOME/neovibe` (by default `~/.cache/neovibe`) and refuses a cache directory other
+  users could write to, since they could swap a checked download before it is used. A `0775`
+  `~/.cache` is accepted when its group is your own private group (the usual setup on Ubuntu, Debian
+  and Fedora), unless an ACL or a second group with the same GID gives someone else write access. The
+  installer can only see the accounts your system lists: on a machine joined to a directory service
+  that does not enumerate its users, it cannot rule out a directory account sharing that group, so
+  there `chmod g-w ~/.cache`, or pointing `XDG_CACHE_HOME` at a directory of your own, is the safe
+  choice.
+
 ### Ubuntu 23.10 and later
 
 Ubuntu's `apparmor` package sets `kernel.apparmor_restrict_unprivileged_userns=1` (24.04 included),

@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=289d40fbe574421902d9ebd0c8f1aa324b053fd445a9c18727a8b94c639be900 -->
+<!-- translated-from: INSTALL.md sha256=f942f29d799b4da1a7ee1015d58ab5b57c3892e49c7b83acdfc1436e45e9cde7 -->
 
 # 安装 neovibe
 
@@ -153,6 +153,14 @@ $XDG_STATE_HOME/neovibe/                       各项目的布局、提示词历
 - **`the signature on SHA256SUMS does not verify`**——直接拒绝；在一个正式发行版本上遇到这个，不要继续往下走。见[运行前先验证](#verify-before-running)。
 - **在 `PATH` 上找不到 `claude` CLI，或者版本不受支持**——这只是警告，不会拒绝安装：neovibe 照样会装上，但 agent 面板需要一个能用、已登录的 Claude Code 才能运行对话轮次。警告信息里会给出 Anthropic 自己的安装方式。
 - **`~/.local/bin` is not on your `PATH`**，或者 **`\`neovibe\` on this PATH runs <something else>`**——安装成功之后会打印出来；把 `~/.local/bin` 加到你 shell 的 `PATH` 里，或者把它排到当前其他响应 `neovibe` 这个名字的东西前面（往往是早先某次 `.deb` 安装留下的 `/usr/bin/neovibe`）。
+
+- **`… is writable by its group or by anyone, and not sticky`** — 安装器把下载的文件放在
+  `$XDG_CACHE_HOME/neovibe`（默认是 `~/.cache/neovibe`）。如果其他用户能写这个缓存目录，他们就可能在
+  校验之后、使用之前替换下载的文件，所以安装器会拒绝。权限为 `0775` 的 `~/.cache`，只要它的组是你自己
+  的私有组（Ubuntu、Debian 和 Fedora 的常见设置），就会被接受；但如果某条 ACL 或另一个 GID 相同的组让
+  别人也能写，仍会拒绝。安装器只能看到系统列得出来的账号：机器加入了不列举用户的目录服务时，它无法排除
+  有目录账号共用这个组，这时最稳妥的做法是 `chmod g-w ~/.cache`，或把 `XDG_CACHE_HOME` 指向一个只属于
+  你的目录。
 
 <a id="ubuntu-2310-and-later"></a>
 ### Ubuntu 23.10 及以后版本
