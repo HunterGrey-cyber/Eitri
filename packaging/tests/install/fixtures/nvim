@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test double for nvim on PATH, so the report does not depend on the host's nvim.
+printf '%s\n' 'NVIM v0.11.4' 'Build type: Release'

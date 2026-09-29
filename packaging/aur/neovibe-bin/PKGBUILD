@@ -1,0 +1,111 @@
+# Packages the release tarball's four binaries and builds the agent sidecar locally
+# on the user's machine during installation.
+#
+# pkgver and sha256sums are placeholders until packaging/aur/bump-bin.sh fills them from
+# a release's RELEASE and SHA256SUMS. This checked-in copy will not build as-is.
+#
+# The binary package is never published to the AUR for a `-rc.N` prerelease. Replacing '-'
+# with '_' makes its pkgver sort above the final release under pacman, preventing normal
+# upgrades to that release. bump-bin.sh refuses to print a publishable commit for prereleases.
+# Prerelease builds are only for packaging/aur/test-in-container.sh, using a local source=
+# override that is never pushed.
+
+pkgname=neovibe-bin
+pkgver=1.0.0
+pkgrel=1
+# _realver preserves the release's hyphenated version for tags, download URLs and asset names.
+# pkgver replaces '-' with '_' because makepkg forbids hyphens, so it differs for prereleases.
+# Use _realver for download URLs and asset filenames. bump-bin.sh sets both values from the
+# same RELEASE key.
+_realver=1.0.0
+pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (prebuilt binaries; builds its own sidecar on install)"
+arch=('x86_64')
+url="https://github.com/HunterGrey-cyber/neovibe"
+# Include the package's MIT, Apache-2.0, LGPL-3.0-only and MPL-2.0 notices, plus the
+# Claude Agent SDK licence after build() builds the sidecar. The SDK is not open source;
+# it is built locally by the user rather than redistributed with the release.
+license=('MIT' 'Apache-2.0' 'LGPL-3.0-only' 'MPL-2.0' 'LicenseRef-Anthropic-Claude-Agent-SDK')
+depends=('gtk4' 'webkitgtk-6.0' 'glibc' 'gcc-libs')
+# !strip: measured, not assumed -- makepkg's default post-package `strip`/`objcopy`/`gdb-add-index`
+# pass corrupts the sidecar (a Node SEA executable, whose fuse/injection mechanism does not
+# survive its ELF sections being restructured: "Loadable section \"\" outside of ELF segments",
+# "Can't find string offset for section name '.note.100'" from binutils, then the packaged binary
+# fails with "Exec format error"). Every other binary here is prebuilt and already stripped by
+# release.sh, so disabling makepkg's own pass costs nothing on them either.
+options=('!strip')
+optdepends=(
+	'neovim: the editor (any nvim >= 0.10 on PATH)'
+	'claude-code: the Claude Code CLI the panel drives'
+	'noto-fonts: the ⏵⏵ mode glyph'
+)
+makedepends=('curl' 'tar')
+provides=('neovibe')
+conflicts=('neovibe')
+
+# _verdandi_source: the exact release asset name (varies with the pinned Verdandi revision --
+# RELEASE's own VERDANDI_SOURCE key); bump-bin.sh rewrites only this line, so build()/package()
+# below never need to know it.
+_verdandi_source=verdandi-0000000-source.tar.gz
+# _nodever: the Node the sidecar is built with -- RELEASE's own NODE_VERSION (packaging/pins.env's,
+# copied into RELEASE at build time). bump-bin.sh rewrites this line and the third sha256sums entry
+# together, from the same RELEASE, so the URL and its checksum never name two different Nodes.
+_nodever=v22.23.2
+
+source=(
+	"neovibe-${_realver}-x86_64-linux.tar.gz::https://github.com/HunterGrey-cyber/neovibe/releases/download/v${_realver}/neovibe-${_realver}-x86_64-linux.tar.gz"
+	"${_verdandi_source}::https://github.com/HunterGrey-cyber/neovibe/releases/download/v${_realver}/${_verdandi_source}"
+	"node-${_nodever}-linux-x64.tar.xz::https://nodejs.org/dist/${_nodever}/node-${_nodever}-linux-x64.tar.xz"
+)
+# The first two are filled by bump-bin.sh from a real release's SHA256SUMS; the third is RELEASE's
+# NODE_SHA256_linux_x64, which bump-bin.sh writes along with _nodever above, so a Node bump in
+# packaging/pins.env reaches this PKGBUILD through the next release's RELEASE rather than through a
+# second, hand-edited copy of the pin.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000'
+            '0000000000000000000000000000000000000000000000000000000000000000'
+            'd60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307')
+
+# build() downloads and links the Claude Agent SDK into the installed sidecar.
+# A local makepkg run builds it for the user. Publishing the resulting .pkg.tar.zst would
+# redistribute the SDK, whose licence does not permit that. Direct users to the AUR entry
+# instead of mirroring a built binary.
+
+build() {
+	cd "$srcdir"
+	sh "neovibe-${_realver}-x86_64-linux/lib/neovibe/neovibe-setup" \
+		--build-sidecar-into "$srcdir/sidecar" \
+		--node "$srcdir/node-${_nodever}-linux-x64.tar.xz" \
+		--verdandi-source "$srcdir/${_verdandi_source}"
+}
+
+package() {
+	cd "$srcdir"
+	local top="neovibe-${_realver}-x86_64-linux"
+
+	# Keep the tarball's library layout, including RELEASE, and install the sidecar produced
+	# by build() alongside it.
+	install -d "$pkgdir/usr/lib/neovibe"
+	install -m0644 "$top/lib/neovibe/RELEASE" "$pkgdir/usr/lib/neovibe/RELEASE"
+	install -m0755 "$top/lib/neovibe/shell" "$pkgdir/usr/lib/neovibe/shell"
+	install -m0755 "$top/lib/neovibe/neovibe-supervisor" "$pkgdir/usr/lib/neovibe/neovibe-supervisor"
+	install -m0755 "$top/lib/neovibe/neovibe-tmux-shim" "$pkgdir/usr/lib/neovibe/neovibe-tmux-shim"
+	install -m0755 "$top/lib/neovibe/neovibe-claude-handoff" "$pkgdir/usr/lib/neovibe/neovibe-claude-handoff"
+	install -m0755 "$top/lib/neovibe/neovibe-setup" "$pkgdir/usr/lib/neovibe/neovibe-setup"
+	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/neovibe/verdandi-claude-sidecar"
+	install -m0644 "$srcdir/sidecar/verdandi-claude-sidecar.rev" "$pkgdir/usr/lib/neovibe/verdandi-claude-sidecar.rev"
+
+	install -Dm0755 "$top/bin/neovibe" "$pkgdir/usr/bin/neovibe"
+	install -Dm0644 "$top/share/applications/neovibe.desktop" "$pkgdir/usr/share/applications/neovibe.desktop"
+
+	# Install the tarball's licences and SOURCE, plus the SDK's LICENSE.md and Node's licence.
+	# The setup script saves the latter two beside the sidecar when present.
+	install -d "$pkgdir/usr/share/licenses/$pkgname"
+	install -m0644 "$top/share/licenses/neovibe/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -m0644 "$top/share/licenses/neovibe/THIRD-PARTY-LICENSES" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES"
+	install -m0644 "$top/share/licenses/neovibe/SOURCE" "$pkgdir/usr/share/licenses/$pkgname/SOURCE"
+	if [ -f "$srcdir/sidecar/LICENSE.md" ]; then
+		install -m0644 "$srcdir/sidecar/LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+	fi
+	if [ -f "$srcdir/sidecar/NODE-LICENSE" ]; then
+		install -m0644 "$srcdir/sidecar/NODE-LICENSE" "$pkgdir/usr/share/licenses/$pkgname/NODE-LICENSE"
+	fi
+}

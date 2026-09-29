@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # neovibe
 
 **Your whole Neovim, unmodified, with a real rich agent panel beside it. Both halves are real, and
@@ -107,12 +109,63 @@ per-window Unix socket. `agent` depends on Verdandi's `claude-runtime-protocol` 
 revision in `agent/Cargo.toml` and fetched from GitHub by Cargo; nothing else of Verdandi is needed
 to *build* neovibe.
 
-To *run* the sidecar backend, neovibe needs the sidecar itself, found in this order:
-`NEOVIBE_SIDECAR_BINARY` (a built executable), a `verdandi-claude-sidecar` beside the `shell`
-binary, or a Verdandi checkout at `NEOVIBE_VERDANDI_CHECKOUT` (default `~/src/verdandi`). Without
-any of them neovibe uses its **legacy** backend, which spawns the `claude` on your `PATH` directly.
-`NEOVIBE_AGENT_BACKEND=legacy|sidecar` forces one; the choice is printed on stderr at startup.
-Either way you need Claude Code installed and logged in; neovibe spends whatever account it runs.
+To *run* the sidecar backend, neovibe needs the sidecar itself, found in this order: first
+`NEOVIBE_SIDECAR_BINARY` (a built executable), then — if that is unset — `NEOVIBE_VERDANDI_CHECKOUT`
+(a development override pointing at a Verdandi checkout); then a `verdandi-claude-sidecar` beside
+the `shell` binary (what the packages and the AUR builds produce); then the artifact `neovibe setup`
+builds for your user, under `$XDG_DATA_HOME/neovibe/sidecar/<pinned revision>/` (or
+`~/.local/share/…` if unset), keyed to the exact revision this build pins so an old release's build
+is never picked up by a newer one; and last, a Verdandi checkout at the default
+`~/src/verdandi`, but only if one is already sitting there with something built.
+Nothing here ever builds anything on its own — see [Install](#install) for why that build has to
+happen on your machine, and run through `neovibe setup`.
+
+**No release contains the legacy backend** that used to spawn the `claude` on your `PATH` directly.
+It stays in the tree as a development-only build option (`cargo build --features
+shell/legacy-backend`) for local testing and the project's own sandbox GUI passes; a release build
+cannot select it (`neovibe --legacy` on a release exits 1, naming why). Either way — sidecar or the
+legacy dev build — you need Claude Code installed and logged in; neovibe spends whatever account it
+runs under.
+
+## Install
+
+The quick way — downloads and runs the installer over HTTPS, installing to `~/.local` with no `sudo`:
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/neovibe/releases/latest/download/install.sh | sh
+```
+
+Read the script before piping it to a shell, or check it against its signed checksums first — see
+[`INSTALL.md`](INSTALL.md) for the full "verify before running" recipe, what verification does and
+does not protect, and every other route in detail:
+
+- **`.deb`/`.rpm`** from the [releases page](https://github.com/HunterGrey-cyber/neovibe/releases),
+  then run `neovibe setup` once — it builds the sidecar for this machine and offers to fetch a
+  private `nvim` if yours is too old.
+- **AUR**: `yay -S neovibe-bin` (prebuilt binaries, sidecar built at install time) or
+  `yay -S neovibe-git` (everything, including neovibe itself, built from source).
+- **`--from-source`**: `sh install.sh --from-source` builds neovibe on your own machine — see
+  [Building](#building) for the toolchain it needs. **v1.0.0 is x86_64 only**; `--from-source`
+  refuses on any other `uname -m` too, so it is not an ARM route.
+
+**Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux — every route, prebuilt or
+from source. **nvim ≥ 0.10** — your own, on
+`PATH`, or let the installer fetch a private copy for neovibe alone
+(`$XDG_DATA_HOME/neovibe/nvim/<version>/`, never placed on `PATH` and never touching, replacing or
+removing anything named `nvim`/`vim`/`vi` anywhere else on your system). Claude Code, installed and
+logged in.
+
+- Ubuntu 23.10 and later (24.04 included): a stock desktop's AppArmor policy blocks WebKitGTK's
+  sandbox by default, so the agent panel's place shows a one-time fix instead of the panel until you
+  apply it. See [INSTALL.md's "Ubuntu 23.10 and later" section](INSTALL.md#ubuntu-2310-and-later).
+<!-- /ubuntu-userns -->
+
+**Why the sidecar is built on your machine, not shipped.** It bundles Anthropic's
+`@anthropic-ai/claude-agent-sdk` ("© Anthropic PBC. All rights reserved"), which we do not
+redistribute. `neovibe setup` (and the installer's other routes, and an AUR package's own `build()`)
+fetches it from the npm registry to your machine, under Anthropic's own terms, and builds the
+sidecar from the pinned Verdandi revision. The sidecar itself is not in any neovibe release
+artifact.
 
 ## Building
 
@@ -120,21 +173,27 @@ Either way you need Claude Code installed and logged in; neovibe spends whatever
 git clone --recurse-submodules https://github.com/HunterGrey-cyber/neovibe.git
 cd neovibe
 # cloned without --recurse-submodules?  git submodule update --init
-cargo build --workspace --locked
+cargo build --locked
 ```
+
+`cargo build --locked` — **not** `--workspace` — is the product: the workspace's `default-members`
+(`shell`, `neovide-editor`, `agent`, `core`, `supervisor` and the terminal crates) at the GTK 4.14
+floor. `--workspace` also builds the frozen `poc/` crates, which are pinned to a newer GTK
+(4.18) and are not part of what ships.
 
 Prerequisites, all of them hard — a missing one fails the build, often inside a third-party build
 script with an error that never names this project:
 
-- **Rust** recent enough for the fork's 2024 edition (developed on 1.96).
-- **GTK 4.18+ and WebKitGTK 6.0 development packages**, and `pkg-config`
+- **Rust 1.96 or newer** for the fork's 2024 edition (the installer refuses anything older).
+- **GTK 4.14+ and WebKitGTK 6.0 development packages**, and `pkg-config`
   (Arch: `gtk4 webkitgtk-6.0`; Debian/Ubuntu: `libgtk-4-dev libwebkitgtk-6.0-dev`).
 - **Node.js and npm**: `shell/build.rs` runs `npm ci` and `npm run build` in `agent-ui/web/`.
 - **`protoc`** (`protobuf`/`protobuf-compiler`): Verdandi's protocol crate generates its types with it.
 - **A C toolchain**: Lua 5.4 is built from source and statically linked.
 - **Network access on the first build**: `skia-safe` downloads a prebuilt Skia, and Cargo fetches
   the Verdandi protocol crate from GitHub.
-- At run time: **`nvim`** on `PATH`, a working OpenGL driver, a Wayland session, and Claude Code.
+- At run time: **`nvim`** on `PATH` (or neovibe's own private copy, see [Install](#install)), a
+  working OpenGL driver, a Wayland session, and Claude Code.
 
 ## Running
 
@@ -147,29 +206,51 @@ The project directory is resolved once and shared by the editor, the agent and t
 path that is not a directory, or an unknown option, is a startup error rather than silently ignored
 (`--` ends option parsing). Each launch is its own process with its own `nvim`.
 
-A few keys to start with (prefix is `Ctrl-b` unless you change it): `Ctrl-h`/`Ctrl-l` switch
-panes; `prefix ?` shows every key; `prefix t` opens the terminal; `prefix c` opens a session tab;
-`prefix z` zooms the pane with the keys; `F11` toggles fullscreen.
-
-`./install.sh` installs a release build for your own user (`~/.local`) with a desktop entry, and
-`./try-neovibe.sh` launches with the backend and account stated up front. Configuration lives in
-`~/.config/neovibe/init.lua` (`NEOVIBE_CONFIG_DIR` overrides it); per-project state (layout,
-history, saved permission rules) under `$XDG_STATE_HOME/neovibe/`.
+If you installed neovibe (see [Install](#install)), run it as `neovibe [project directory]`.
+`./try-neovibe.sh` in this repository launches a source build with the backend and account stated up
+front. Configuration lives in `~/.config/neovibe/init.lua` (`NEOVIBE_CONFIG_DIR` overrides it);
+per-project state (layout, history, saved permission rules) under `$XDG_STATE_HOME/neovibe/`.
 
 The editor component alone, without the shell: `cargo run -p neovide-editor --example standalone`.
+
+## Keys
+
+Everything defaults to stock tmux: prefix `Ctrl-b`, then a normal tmux/vim-shaped key (`c` a new
+session tab, `t` the bottom terminal, `z` zoom the pane with the keys, `x` close it, the arrow keys
+move between panes with the prefix). Pane navigation itself needs no prefix — `Ctrl-h`/`j`/`k`/`l`,
+vim-tmux-navigator style, as above. Rebind any of it in `~/.config/neovibe/init.lua`
+(`neovibe.keymap`); a binding that collides with another is a startup error naming both.
+
+**`prefix ?` shows every key bound today, in your build, with your own rebindings already applied.**
+That overlay, not this README, is the source of truth for a keymap that is still actively growing.
 
 ## Tests
 
 ```sh
-cargo test --workspace                      # non-ignored tests; set XDG_STATE_HOME to a scratch dir
+cargo test                                  # non-ignored tests; set XDG_STATE_HOME to a scratch dir
 cd agent-ui/web && npm ci && npx vitest run
 ```
 
-Tests marked `#[ignore]` need a display, a real `nvim`, or a real Claude account (and bill it);
-each says in its own doc comment what it needs.
+`cargo test` runs the product at its GTK 4.14 floor, same as the build above; `cargo test
+--workspace` additionally builds and tests the frozen `poc/` crates and needs GTK 4.18+ for them.
+Tests marked `#[ignore]` need a display, a real `nvim`, or a real Claude account (and bill it); each
+says in its own doc comment what it needs.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE), except `terminal-input/`, which is Apache-2.0. Built on a fork of
+MIT — see [`LICENSE`](LICENSE), except `terminal-input/`, which is Apache-2.0 (derived from
+Alacritty; see its own `NOTICE`). Built on a fork of
 [Neovide](https://github.com/neovide/neovide) (MIT), whose architecture and code directly shaped the
-editor component. `packaging/collect-licenses.py` generates the third-party notices a package ships.
+editor component.
+
+`shell` statically links [`nvim-rs`](https://crates.io/crates/nvim-rs) 0.9.2, which is
+**LGPL-3.0**. Every release carries the Corresponding Source as a separate asset on the same release
+page, `neovibe-<version>-source.tar.gz` (the exact public tree that was built, the `neovide` fork,
+`cargo vendor` output and the pinned Skia archive), and a `SOURCE` file
+(`/usr/share/licenses/neovibe/SOURCE` in the installed packages) naming that asset and giving the
+exact recipe to modify `nvim-rs` and relink it into the shipped binary.
+
+`packaging/collect-licenses.py` generates the full third-party notices, `THIRD-PARTY-LICENSES`, that
+every package ships. **The sidecar — the only piece of this that touches Anthropic's Claude Agent
+SDK — is not in any neovibe release artifact**; see [Install](#install) for why and where it is
+built instead.

@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# Tests for packaging/neovibe.launcher.sh. Standalone: `bash packaging/test_launcher.sh`.
+# Builds a fake install tree under ~/.cache/nv-v1dist-t8/launcher-test-<pid>/ (never /tmp), with a
+# `bin/neovibe` symlink to the REAL launcher script and a stub `lib/neovibe/shell` that records its
+# own argv and the environment this suite cares about, then runs the real launcher against it.
+#
+# Never touches the real $HOME: every invocation below runs with HOME pointed at a scratch
+# directory this script creates, so the launcher's own `$HOME`-relative defaults (the XDG_DATA_HOME
+# fallback) resolve inside the scratch tree rather than the real user's.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER="$HERE/neovibe.launcher.sh"
+
+SCRATCH_ROOT="$HOME/.cache/nv-v1dist-t8/launcher-test-$$"
+rm -rf "$SCRATCH_ROOT"
+mkdir -p "$SCRATCH_ROOT"
+trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+
+ROOT="$SCRATCH_ROOT/install"
+FAKE_HOME="$SCRATCH_ROOT/home"
+PROJECT_DIR="$SCRATCH_ROOT/project"
+mkdir -p "$ROOT/bin" "$ROOT/lib/neovibe" "$FAKE_HOME" "$PROJECT_DIR"
+# `$ROOT/bin/neovibe` is a real COPY of the launcher, the way a `.deb`/tarball install actually
+# lays it out (nfpm's `contents` entry copies the tracked file; it never symlinks it) -- so LIBDIR
+# for every ordinary test below is simply `$ROOT/bin/neovibe`'s own sibling `../lib/neovibe`.
+cp "$LAUNCHER" "$ROOT/bin/neovibe"
+chmod +x "$ROOT/bin/neovibe"
+
+cat >"$ROOT/lib/neovibe/shell" <<'STUB'
+#!/usr/bin/env bash
+# Test double for the real `shell` binary: records what it was invoked with rather than opening a
+# window, so packaging/test_launcher.sh can assert on the launcher's own decisions.
+echo "STUB_SELF:$0"
+if [[ "${1:-}" == --version ]]; then
+	echo "STUB_VERSION:neovibe-stub 0.0.0-test"
+	exit 0
+fi
+for a in "$@"; do
+	echo "STUB_ARG:$a"
+done
+STUB
+chmod +x "$ROOT/lib/neovibe/shell"
+
+cat >"$ROOT/lib/neovibe/neovibe-setup" <<'STUB'
+#!/bin/sh
+# Test double for packaging/install.sh acting as neovibe-setup: records each invocation on its own
+# (a plain `neovibe setup` runs it up to twice -- --sidecar-only, then --nvim-offer), so
+# packaging/test_launcher.sh can assert on how many times the launcher ran it and with what argv.
+echo "STUB_SETUP_CALL"
+for a in "$@"; do
+	echo "STUB_SETUP_ARG:$a"
+done
+STUB
+chmod +x "$ROOT/lib/neovibe/neovibe-setup"
+
+FAILURES=0
+CHECKS=0
+
+# assert_contains OUTPUT NEEDLE DESCRIPTION
+assert_contains() {
+	CHECKS=$((CHECKS + 1))
+	if [[ "$1" == *"$2"* ]]; then
+		echo "ok - $3"
+	else
+		echo "FAIL - $3"
+		echo "  expected to find: $2"
+		echo "  in: $1"
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+# assert_not_contains OUTPUT NEEDLE DESCRIPTION
+assert_not_contains() {
+	CHECKS=$((CHECKS + 1))
+	if [[ "$1" != *"$2"* ]]; then
+		echo "ok - $3"
+	else
+		echo "FAIL - $3"
+		echo "  expected NOT to find: $2"
+		echo "  in: $1"
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+assert_eq() {
+	CHECKS=$((CHECKS + 1))
+	if [[ "$1" == "$2" ]]; then
+		echo "ok - $3"
+	else
+		echo "FAIL - $3 (got $1, want $2)"
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+# assert_count OUTPUT NEEDLE COUNT DESCRIPTION
+assert_count() {
+	CHECKS=$((CHECKS + 1))
+	local have
+	have="$(grep -Fc -- "$2" <<<"$1")"
+	if [[ "$have" == "$3" ]]; then
+		echo "ok - $4"
+	else
+		echo "FAIL - $4 (found $2 $have time(s), want $3)"
+		echo "  in: $1"
+		FAILURES=$((FAILURES + 1))
+	fi
+}
+
+# Reset the sidecar-discoverable state the hint checks: no RELEASE, no packaged sibling, no
+# per-user rev-keyed sidecar, and a fresh (empty) fake $HOME so no earlier case's files leak into
+# the next one.
+reset_state() {
+	rm -f "$ROOT/lib/neovibe/RELEASE" "$ROOT/lib/neovibe/verdandi-claude-sidecar"
+	rm -rf "$FAKE_HOME"
+	mkdir -p "$FAKE_HOME"
+}
+
+run_launcher() {
+	# A clean environment for every run: only what the launcher and its stub need, so a variable
+	# left exported by the harness (or by a previous case) never leaks in.
+	env -i HOME="$FAKE_HOME" PATH="$PATH" "${EXTRA_ENV[@]}" "$ROOT/bin/neovibe" "$@" 2>&1
+}
+
+echo "== LIBDIR resolves through a symlinked bin/neovibe =="
+# A real install's own bin/neovibe is a plain copy (as built above), never a symlink -- but a user
+# or a distro's alternatives system may point a SEPARATE entry point at it (e.g.
+# `~/.local/bin/neovibe -> /usr/bin/neovibe`, or `~/bin/neovibe -> ~/.local/bin/neovibe`, F5's own
+# second case). The launcher follows that FILE's own symlink chain, so LIBDIR must come out as the
+# copy's OWN sibling `lib/neovibe` -- the target's, not some unrelated directory next to wherever
+# the symlink itself happens to sit.
+reset_state
+SYMLINK_ENTRY_DIR="$SCRATCH_ROOT/other-bin"
+mkdir -p "$SYMLINK_ENTRY_DIR"
+ln -s "$ROOT/bin/neovibe" "$SYMLINK_ENTRY_DIR/neovibe"
+EXTRA_ENV=()
+out="$(env -i HOME="$FAKE_HOME" PATH="$PATH" "$SYMLINK_ENTRY_DIR/neovibe" --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$ROOT/lib/neovibe/shell" "invoked through a symlink, LIBDIR still resolves to the real script's own lib/neovibe"
+assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the symlink"
+
+echo "== LIBDIR resolves through a RELATIVE symlink target (GNU stow's own shape) =="
+# The preceding test uses an absolute symlink target. This one uses a relative target
+# to exercise resolve_launcher_path's relative branch, which must resolve the target
+# relative to the symlink's directory.
+reset_state
+RELSYM_ENTRY_DIR="$SCRATCH_ROOT/relsym-bin"
+mkdir -p "$RELSYM_ENTRY_DIR"
+(cd "$RELSYM_ENTRY_DIR" && ln -s ../install/bin/neovibe neovibe)
+EXTRA_ENV=()
+out="$(env -i HOME="$FAKE_HOME" PATH="$PATH" "$RELSYM_ENTRY_DIR/neovibe" --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$ROOT/lib/neovibe/shell" "a relative symlink target still resolves LIBDIR to the real script's own lib/neovibe"
+assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the relative symlink"
+
+echo "== LIBDIR resolves when the launcher's own bindir is itself a symlinked directory =="
+# F5's other case: ~/.local/bin (or here, bin/) is a SYMLINKED DIRECTORY -- e.g. GNU stow folding
+# it into a dotfiles repo -- while the launcher FILE inside it is a plain copy, not a symlink, and
+# lib/neovibe is a real sibling of the unresolved (logical) bindir. The old `readlink -f "$0"`
+# canonicalized straight through a symlinked directory component too, landing LIBDIR next to the
+# symlink's TARGET instead of this install's own lib/neovibe, so `cd` died "No such file or
+# directory" on every launch. Only the FILE's own symlink chain may be followed; a directory
+# symlink earlier in the path must be left alone, and `cd`'s logical resolution of the appended
+# `../lib/neovibe` then removes the bindir as named, landing on its own sibling.
+reset_state
+SYMDIR_REALBIN="$SCRATCH_ROOT/symdir-realbin"
+SYMDIR_ROOT="$SCRATCH_ROOT/symdir-root"
+rm -rf "$SYMDIR_REALBIN" "$SYMDIR_ROOT"
+mkdir -p "$SYMDIR_REALBIN" "$SYMDIR_ROOT/lib/neovibe"
+cp "$LAUNCHER" "$SYMDIR_REALBIN/neovibe"
+chmod +x "$SYMDIR_REALBIN/neovibe"
+ln -s "$SYMDIR_REALBIN" "$SYMDIR_ROOT/bin"
+cp "$ROOT/lib/neovibe/shell" "$SYMDIR_ROOT/lib/neovibe/shell"
+chmod +x "$SYMDIR_ROOT/lib/neovibe/shell"
+EXTRA_ENV=()
+out="$(env -i HOME="$FAKE_HOME" PATH="$PATH" "$SYMDIR_ROOT/bin/neovibe" --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$SYMDIR_ROOT/lib/neovibe/shell" "a symlinked bindir still resolves LIBDIR to this install's own sibling lib/neovibe"
+assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the symlinked bindir"
+assert_not_contains "$out" "No such file or directory" "no broken cd through the symlinked bindir"
+
+echo "== ... and still resolves under POSIXLY_CORRECT=1 =="
+# A guard, not a reproduction: this case has always passed. POSIX-mode `cd` resolves the `..` in
+# `bin/../lib/neovibe` logically (it removes `bin` as named, symlinked or not), exactly as bash
+# does by default. What POSIX mode turns off is bash's extra physical retry when that logical path
+# does not exist. Only the unsupported inverse shape (lib/neovibe next to the symlink's target, none
+# next to the bindir as named) would need that retry. This check pins that F5's own case never
+# comes to depend on it.
+out="$(env -i HOME="$FAKE_HOME" POSIXLY_CORRECT=1 PATH="$PATH" "$SYMDIR_ROOT/bin/neovibe" --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$SYMDIR_ROOT/lib/neovibe/shell" "a symlinked bindir resolves LIBDIR under POSIXLY_CORRECT=1 too"
+assert_not_contains "$out" "No such file or directory" "no broken cd through the symlinked bindir under POSIXLY_CORRECT=1"
+
+echo "== an exported CDPATH does not corrupt LIBDIR through a RELATIVE invocation =="
+# With a relative launcher path, the cd used to resolve LIBDIR receives a relative
+# directory. An exported CDPATH with a matching entry can make cd print its destination,
+# adding a line before pwd's output and producing an invalid LIBDIR.
+# Set CDPATH='' for that cd so exec receives a single directory path.
+reset_state
+CDPATH_ENTRY_DIR="$SCRATCH_ROOT/cdpath-relative"
+rm -rf "$CDPATH_ENTRY_DIR"
+mkdir -p "$CDPATH_ENTRY_DIR/inst/bin" "$CDPATH_ENTRY_DIR/inst/lib/neovibe"
+cp "$LAUNCHER" "$CDPATH_ENTRY_DIR/inst/bin/neovibe"
+chmod +x "$CDPATH_ENTRY_DIR/inst/bin/neovibe"
+cp "$ROOT/lib/neovibe/shell" "$CDPATH_ENTRY_DIR/inst/lib/neovibe/shell"
+chmod +x "$CDPATH_ENTRY_DIR/inst/lib/neovibe/shell"
+out="$(cd "$CDPATH_ENTRY_DIR" && env -i HOME="$FAKE_HOME" CDPATH=.: PATH=/usr/bin:/bin bash inst/bin/neovibe --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$CDPATH_ENTRY_DIR/inst/lib/neovibe/shell" "a relative launch under an exported CDPATH still resolves LIBDIR to one clean line"
+assert_contains "$out" "STUB_VERSION:" "--version reached the stub despite the exported CDPATH"
+assert_not_contains "$out" "No such file or directory" "no broken cd from a CDPATH-doubled LIBDIR"
+out="$(cd "$CDPATH_ENTRY_DIR" && env -i HOME="$FAKE_HOME" CDPATH=.: PATH="inst/bin:/usr/bin:/bin" bash -c 'neovibe --version' 2>&1)"
+assert_contains "$out" "STUB_SELF:$CDPATH_ENTRY_DIR/inst/lib/neovibe/shell" "a relative PATH entry under an exported CDPATH also resolves cleanly"
+
+echo "== LIBDIR resolves when the launcher's own directory is spelled '.' or ends in '/.' =="
+# Reproduced against the next version, which computed the parent of the bindir with a second `dirname`
+# instead of appending `..`: `dirname .` is `.`, not `..`, so running an unpacked release's
+# bin/neovibe in place from inside bin/ (`./neovibe`, $0's directory `.`) looked for `./lib/neovibe`
+# inside bin/, and `bin/./neovibe` run from the release root looked for `bin/lib/neovibe`. Both died
+# "cd: ...: No such file or directory". Appending `..` to the directory as spelled is right for any
+# spelling of it.
+reset_state
+out="$(cd "$ROOT/bin" && env -i HOME="$FAKE_HOME" PATH=/usr/bin:/bin ./neovibe --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$ROOT/lib/neovibe/shell" "./neovibe run from inside bin/ resolves LIBDIR to the sibling lib/neovibe"
+assert_not_contains "$out" "No such file or directory" "no broken cd for ./neovibe run from inside bin/"
+out="$(cd "$ROOT" && env -i HOME="$FAKE_HOME" PATH=/usr/bin:/bin bin/./neovibe --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$ROOT/lib/neovibe/shell" "bin/./neovibe run from the release root resolves LIBDIR to lib/neovibe"
+out="$(cd "$ROOT" && env -i HOME="$FAKE_HOME" POSIXLY_CORRECT=1 CDPATH=.: PATH=/usr/bin:/bin bin/./neovibe --version 2>&1)"
+assert_contains "$out" "STUB_SELF:$ROOT/lib/neovibe/shell" "bin/./neovibe resolves LIBDIR under POSIXLY_CORRECT=1 with an exported CDPATH too"
+
+echo "== --version works and skips project/hint output =="
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher --version)"
+assert_not_contains "$out" "neovibe  project" "--version never resolves or prints a project"
+assert_not_contains "$out" "no sidecar built yet" "--version never prints the sidecar hint"
+
+echo "== --legacy passes through to shell's argv, no env export =="
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher --legacy "$PROJECT_DIR")"
+assert_contains "$out" "STUB_ARG:--legacy" "the stub received --legacy on argv"
+assert_not_contains "$out" "NEOVIBE_AGENT_BACKEND" "no NEOVIBE_AGENT_BACKEND is exported for --legacy"
+
+echo "== no sidecar anywhere -> the hint is printed =="
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher "$PROJECT_DIR")"
+assert_contains "$out" 'no sidecar built yet -- run "neovibe setup"' "the hint fires with nothing installed"
+
+echo "== NEOVIBE_SIDECAR_BINARY set and executable -> no hint =="
+reset_state
+sidecar_bin="$SCRATCH_ROOT/explicit-sidecar"
+printf '#!/bin/sh\n' >"$sidecar_bin"
+chmod +x "$sidecar_bin"
+EXTRA_ENV=("NEOVIBE_SIDECAR_BINARY=$sidecar_bin")
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "an explicit NEOVIBE_SIDECAR_BINARY suppresses the hint"
+
+echo "== a packaged sibling at \$LIBDIR/verdandi-claude-sidecar -> no hint =="
+reset_state
+EXTRA_ENV=()
+printf '#!/bin/sh\n' >"$ROOT/lib/neovibe/verdandi-claude-sidecar"
+chmod +x "$ROOT/lib/neovibe/verdandi-claude-sidecar"
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "a packaged sibling suppresses the hint"
+
+echo "== a RELEASE with no matching sidecar anywhere -> the hint still fires =="
+reset_state
+EXTRA_ENV=()
+printf 'VERDANDI_REV=abcdef0123456789abcdef0123456789abcdef01\n' >"$ROOT/lib/neovibe/RELEASE"
+out="$(run_launcher "$PROJECT_DIR")"
+assert_contains "$out" "no sidecar built yet" "RELEASE alone (no built sidecar) still hints"
+
+echo "== relative XDG_DATA_HOME: the rev-keyed sidecar under \$HOME/.local/share suppresses the hint =="
+reset_state
+printf 'VERDANDI_REV=abcdef0123456789abcdef0123456789abcdef01\n' >"$ROOT/lib/neovibe/RELEASE"
+sidecar_dir="$FAKE_HOME/.local/share/neovibe/sidecar/abcdef0"
+mkdir -p "$sidecar_dir"
+printf '#!/bin/sh\n' >"$sidecar_dir/verdandi-claude-sidecar"
+chmod +x "$sidecar_dir/verdandi-claude-sidecar"
+# Treat a relative XDG_DATA_HOME as unset and find the sidecar under $HOME/.local/share.
+# Using `${XDG_DATA_HOME:-default}` would instead search relative to the launcher's current
+# directory and wrongly print the missing-sidecar hint.
+EXTRA_ENV=("XDG_DATA_HOME=relative/xdg")
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "a relative XDG_DATA_HOME falls back to \$HOME/.local/share, where the sidecar sits"
+
+echo "== an EMPTY XDG_DATA_HOME also falls back to \$HOME/.local/share =="
+EXTRA_ENV=("XDG_DATA_HOME=")
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "an empty XDG_DATA_HOME falls back the same way"
+
+echo "== an absolute XDG_DATA_HOME elsewhere is honoured, and finds nothing there -> the hint fires =="
+elsewhere="$SCRATCH_ROOT/elsewhere-xdg"
+mkdir -p "$elsewhere"
+EXTRA_ENV=("XDG_DATA_HOME=$elsewhere")
+out="$(run_launcher "$PROJECT_DIR")"
+assert_contains "$out" "no sidecar built yet" "an absolute XDG_DATA_HOME is honoured, and the sidecar built under the old one is not found there"
+
+# Explicit setup modes must pass through without a prepended --sidecar-only, which
+# would conflict with --nvim-only or --uninstall and break recovery commands.
+# These tests check launcher dispatch through a stub that only reports its arguments.
+# Plain setup runs --sidecar-only followed by --nvim-offer, the normal conditional offer.
+# Using --nvim-only would force a download even with an adequate nvim on PATH and make
+# a download failure fatal. The stub cannot check this installer behavior;
+# packaging/tests/install/test_nvim.sh checks do_nvim_offer itself.
+echo "== plain 'neovibe setup' builds the sidecar and then runs the nvim offer =="
+EXTRA_ENV=()
+out="$(run_launcher setup)"
+assert_count "$out" "STUB_SETUP_CALL" 2 "neovibe-setup ran twice"
+assert_contains "$out" $'STUB_SETUP_ARG:--sidecar-only\nSTUB_SETUP_CALL\nSTUB_SETUP_ARG:--nvim-offer' \
+	"the sidecar-only call precedes the nvim-offer call, each carrying only its own mode flag"
+
+echo "== 'neovibe setup --no-nvim' builds the sidecar only: --no-nvim is honoured =="
+out="$(run_launcher setup --no-nvim)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once"
+assert_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "the one call is --sidecar-only"
+assert_contains "$out" "STUB_SETUP_ARG:--no-nvim" "--no-nvim reached it"
+assert_not_contains "$out" "STUB_SETUP_ARG:--nvim-offer" "the nvim step never ran"
+
+echo "== 'neovibe setup --with-nvim' is no longer ignored: the nvim-offer step now runs too =="
+out="$(run_launcher setup --with-nvim)"
+assert_count "$out" "STUB_SETUP_CALL" 2 "neovibe-setup ran twice"
+assert_contains "$out" $'STUB_SETUP_ARG:--sidecar-only\nSTUB_SETUP_ARG:--with-nvim\nSTUB_SETUP_CALL\nSTUB_SETUP_ARG:--nvim-offer\nSTUB_SETUP_ARG:--with-nvim' \
+	"both calls happen, and --with-nvim reaches both"
+
+echo "== 'neovibe setup --nvim-only' passes straight through as its own mode, never combined =="
+out="$(run_launcher setup --nvim-only)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once"
+assert_contains "$out" "STUB_SETUP_ARG:--nvim-only" "the one call is --nvim-only"
+assert_not_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "--sidecar-only was never prepended (this used to die \"--sidecar-only and --nvim-only cannot be combined\")"
+assert_not_contains "$out" "STUB_SETUP_ARG:--nvim-offer" "the explicit --nvim-only is never rewritten into --nvim-offer"
+
+echo "== 'neovibe setup --help' prints the installer's usage exactly once, never twice =="
+out="$(run_launcher setup --help)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once, not once per mode"
+assert_contains "$out" "STUB_SETUP_ARG:--help" "--help reached it"
+assert_not_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "--sidecar-only was never prepended for --help"
+
+echo "== 'neovibe setup -h' prints the installer's usage exactly once too =="
+out="$(run_launcher setup -h)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once, not once per mode"
+assert_contains "$out" "STUB_SETUP_ARG:-h" "-h reached it"
+assert_not_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "--sidecar-only was never prepended for -h"
+
+echo "== 'neovibe setup --uninstall --purge' passes straight through as its own mode =="
+out="$(run_launcher setup --uninstall --purge)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once"
+assert_contains "$out" "STUB_SETUP_ARG:--uninstall" "--uninstall reached it"
+assert_contains "$out" "STUB_SETUP_ARG:--purge" "--purge reached it"
+assert_not_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "--sidecar-only was never prepended"
+
+echo "== 'neovibe setup --sidecar-only' passes straight through, never doubled =="
+out="$(run_launcher setup --sidecar-only)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once"
+assert_count "$out" "STUB_SETUP_ARG:--sidecar-only" 1 "--sidecar-only appears exactly once"
+
+# --nvim-offer is an explicit installer mode and must pass through unchanged.
+# Prepending --sidecar-only would create conflicting modes, even with --dry-run.
+# Keep dispatch consistent with the modes exposed by the installer's help text.
+echo "== 'neovibe setup --nvim-offer' passes straight through as its own mode =="
+out="$(run_launcher setup --nvim-offer --dry-run)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "neovibe-setup ran once"
+assert_count "$out" "STUB_SETUP_ARG:--nvim-offer" 1 "--nvim-offer appears exactly once"
+assert_contains "$out" "STUB_SETUP_ARG:--dry-run" "--dry-run reached it"
+assert_not_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "--sidecar-only was never prepended (this used to die \"--sidecar-only and --nvim-offer cannot be combined\")"
+
+# The guard that keeps the list from drifting again: every mode packaging/install.sh's own parse_args
+# hands to set_mode (whose refusal of a second mode is what a prepended --sidecar-only runs into) must
+# reach neovibe-setup alone, exactly once, with nothing prepended. The mode names are read out of
+# the real installer, so a mode added there without being added to the launcher fails here.
+echo "== every installer mode passes straight through 'neovibe setup', read from install.sh itself =="
+INSTALLER_MODES="$(grep -o 'set_mode [a-z][a-z-]*' "$HERE/install.sh" | sed 's/^set_mode /--/' | LC_ALL=C sort -u)"
+mode_count="$(printf '%s\n' "$INSTALLER_MODES" | grep -c '^--')"
+CHECKS=$((CHECKS + 1))
+if [[ "$mode_count" -ge 6 && "$INSTALLER_MODES" == *--nvim-offer* && "$INSTALLER_MODES" == *--uninstall* ]]; then
+	echo "ok - read $mode_count modes out of packaging/install.sh"
+else
+	echo "FAIL - could not read packaging/install.sh's modes (got: $INSTALLER_MODES): the guard below would be vacuous"
+	FAILURES=$((FAILURES + 1))
+fi
+for mode in $INSTALLER_MODES; do
+	out="$(run_launcher setup "$mode")"
+	assert_count "$out" "STUB_SETUP_CALL" 1 "'neovibe setup $mode' ran neovibe-setup once"
+	assert_count "$out" "STUB_SETUP_ARG:$mode" 1 "'neovibe setup $mode' passed $mode exactly once"
+	if [[ "$mode" != --sidecar-only ]]; then
+		assert_not_contains "$out" "STUB_SETUP_ARG:--sidecar-only" "'neovibe setup $mode' prepended no --sidecar-only"
+	fi
+done
+
+echo "== the launcher's --help mentions no internal design references =="
+EXTRA_ENV=()
+out="$(run_launcher --help)"
+assert_not_contains "$out" "D16" "no ruling id in the help text"
+assert_not_contains "$out" "LEGACY_NOT_IN_BUILD" "no Rust constant name in the help text"
+assert_not_contains "$out" "spec " "no \"spec sec/\$N\" reference in the help text"
+
+echo "== -h prints plain-word help, no internal ruling id =="
+# -h/--help prints the launcher's header comment. Keep its explanation of release behavior
+# in plain language so users can understand it without implementation details.
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher -h)"
+assert_not_contains "$out" "D16" "the help text names no internal ruling id"
+assert_not_contains "$out" "LEGACY_NOT_IN_BUILD" "the help text names no internal constant"
+assert_contains "$out" "a release build refuses it" "the help text still says what a release build does, in plain words"
+
+echo
+echo "$CHECKS checks, $FAILURES failed"
+[[ "$FAILURES" -eq 0 ]]

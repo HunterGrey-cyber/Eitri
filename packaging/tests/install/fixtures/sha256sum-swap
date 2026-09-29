@@ -1,0 +1,20 @@
+#!/bin/sh
+# Test double for sha256sum: runs the real one, and the first time it is called while
+# <scratch>/logs/swap exists, renames the file that names over the one on its second line
+# afterwards -- a tarball replaced the moment the installer has hashed it.
+S=$(cd "$(dirname "$0")/.." && pwd)
+real=
+for m in /usr/bin/sha256sum /bin/sha256sum; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+if [ -f "$S/logs/swap" ]; then
+	{ read -r src; read -r dst; } <"$S/logs/swap"
+	"$real" "$@"
+	rc=$?
+	rm -f "$S/logs/swap"
+	mv -f -- "$src" "$dst"
+	echo "swapped $dst" >>"$S/logs/swap.log"
+	exit "$rc"
+fi
+exec "$real" "$@"

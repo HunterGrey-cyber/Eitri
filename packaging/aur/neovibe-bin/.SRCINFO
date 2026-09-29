@@ -1,0 +1,31 @@
+pkgbase = neovibe-bin
+	pkgdesc = Neovim, embedded as a real component, with a Claude agent panel beside it (prebuilt binaries; builds its own sidecar on install)
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/HunterGrey-cyber/neovibe
+	arch = x86_64
+	license = MIT
+	license = Apache-2.0
+	license = LGPL-3.0-only
+	license = MPL-2.0
+	license = LicenseRef-Anthropic-Claude-Agent-SDK
+	makedepends = curl
+	makedepends = tar
+	depends = gtk4
+	depends = webkitgtk-6.0
+	depends = glibc
+	depends = gcc-libs
+	optdepends = neovim: the editor (any nvim >= 0.10 on PATH)
+	optdepends = claude-code: the Claude Code CLI the panel drives
+	optdepends = noto-fonts: the ⏵⏵ mode glyph
+	provides = neovibe
+	conflicts = neovibe
+	options = !strip
+	source = neovibe-1.0.0-x86_64-linux.tar.gz::https://github.com/HunterGrey-cyber/neovibe/releases/download/v1.0.0/neovibe-1.0.0-x86_64-linux.tar.gz
+	source = verdandi-0000000-source.tar.gz::https://github.com/HunterGrey-cyber/neovibe/releases/download/v1.0.0/verdandi-0000000-source.tar.gz
+	source = node-v22.23.2-linux-x64.tar.xz::https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
+
+pkgname = neovibe-bin

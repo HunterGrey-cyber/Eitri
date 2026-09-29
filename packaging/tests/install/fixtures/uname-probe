@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test double for uname: a `main` that runs with none of its arguments (a truncated `curl | sh`) is
+# caught at the platform check, before it could change or download anything (SH-1).
+echo PROBE-UNAME

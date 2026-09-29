@@ -1,44 +1,56 @@
-//! Spawns and manages one long-lived, full-duplex `claude` CLI child process for an entire
-//! conversation.
-//! Unlike v1 (one process per turn, prompt as a CLI arg, no piped stdin, session continuity via
-//! `--resume`), this spawns exactly once per conversation with piped stdin/stdout/stderr, writes
-//! NDJSON turns/control-requests to stdin as the conversation progresses, and relies on a
-//! per-conversation Unix-socket listener thread to receive real `PreToolUse` permission requests
-//! relayed by the `agent-hook` companion binary and write decisions back. Session
-//! continuity is now just "the process is still alive" -- there is no session-id/`--resume`
-//! concept left in this module at all.
+//! Spawns one long-lived, full-duplex `claude` CLI child per conversation with piped stdin,
+//! stdout and stderr. Sends NDJSON turns and control requests to stdin. A per-conversation
+//! Unix-socket listener receives `PreToolUse` permission requests from `agent-hook` and writes
+//! decisions back. The running child maintains continuity without a session ID or `--resume`.
 //!
-//! Shutdown discipline mirrors this project's already-proven `nvim --embed` lifecycle (graceful
-//! attempt, escalate to SIGTERM, escalate to SIGKILL, block until confirmed gone, idempotent,
-//! `Drop` fallback) -- see `neovide-editor`'s `NeovideEditorPane::shutdown`/`LiveHarness::shutdown`
-//! in the sibling `neovide` checkout for the pattern this follows. New here vs v1: `shutdown()`'s
-//! first action is to genuinely close stdin (drop the write end, sending real EOF to the child) --
-//! both official Claude Code SDKs converge on this exact ordering as the real, intended way to ask
-//! a long-lived `claude --print --input-format stream-json` process to wrap up.
+//! Shutdown closes stdin to send EOF, waits for natural exit, then escalates to SIGTERM and
+//! SIGKILL if needed and waits until the child is gone. It is idempotent and has a `Drop`
+//! fallback.
+//!
+//! Most items require the `legacy-backend` feature. Shared items compile in every build, with
+//! each legacy item's `cfg` placed on that item. Shared items include
+//! `CONSERVATIVE_DISALLOWED_TOOLS`, `disallowed_tools`, `PermissionMode`, `CliModeReport` and
+//! `classify_cli_mode`.
 
+#[cfg(feature = "legacy-backend")]
 use crate::event::{AgentEvent, PermissionSource};
+#[cfg(feature = "legacy-backend")]
 use crate::hook_protocol::parse_pretooluse_input;
+#[cfg(feature = "legacy-backend")]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(feature = "legacy-backend")]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(feature = "legacy-backend")]
 use std::path::Path;
+#[cfg(feature = "legacy-backend")]
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(feature = "legacy-backend")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "legacy-backend")]
 use std::sync::mpsc::{Receiver, TryRecvError};
+#[cfg(feature = "legacy-backend")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "legacy-backend")]
 use std::thread::JoinHandle;
+#[cfg(feature = "legacy-backend")]
 use std::time::{Duration, Instant};
+#[cfg(feature = "legacy-backend")]
 use uuid::Uuid;
 
 /// How long `shutdown()` waits after sending SIGTERM before escalating to SIGKILL.
+#[cfg(feature = "legacy-backend")]
 const GRACE_PERIOD: Duration = Duration::from_millis(300);
 /// How long `shutdown()` waits for the child to exit naturally after stdin is closed (real EOF)
 /// before escalating to a signal at all.
+#[cfg(feature = "legacy-backend")]
 const NATURAL_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
+#[cfg(feature = "legacy-backend")]
 const NATURAL_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How often the hook-listener thread's non-blocking `accept()` poll loop checks both for an
 /// incoming connection and for `hook_listener_stop` -- bounds how long `shutdown()` can be kept
 /// waiting on that thread when nothing is connecting to the hook socket (the common case for any
 /// turn that never triggers a real tool call).
+#[cfg(feature = "legacy-backend")]
 const HOOK_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long the hook listener waits for an accepted connection to finish its line. Linux
 /// accepted sockets do not inherit the listener's `O_NONBLOCK`, while macOS sockets do. Set
@@ -47,12 +59,14 @@ const HOOK_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Without a timeout, a client killed mid-write could leave `read_line` blocked forever and
 /// prevent shutdown. Normally `agent-hook` reads its input before connecting and writes the
 /// complete line immediately.
+#[cfg(feature = "legacy-backend")]
 const HOOK_CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How many of the child's most recent stderr lines are retained (newest evicting oldest) so a
 /// later `ProcessExited { success: false, .. }` can carry the real reason instead of a generic
 /// one. A handful is enough for a startup refusal (typically one line) without this becoming an
 /// unbounded log of a long conversation's entire stderr.
+#[cfg(feature = "legacy-backend")]
 const STDERR_TAIL_CAPACITY: usize = 20;
 
 /// A conservative, documented starting point for `disallowed_tools` -- see this plan's Global
@@ -134,6 +148,7 @@ pub fn classify_cli_mode(reported: &str) -> CliModeReport {
 
 /// The one `[permission]` line a stricter or unreported hook-call mode earns per conversation, or
 /// `None` once `noted` says it was already printed.
+#[cfg(feature = "legacy-backend")]
 fn note_hook_cli_mode(noted: &AtomicBool, reported: &str) -> Option<String> {
     if noted.swap(true, Ordering::Relaxed) {
         return None;
@@ -145,6 +160,7 @@ fn note_hook_cli_mode(noted: &AtomicBool, reported: &str) -> Option<String> {
 
 /// Tracks one pending `HookRelay` permission request so `respond_permission` knows which live
 /// `agent-hook` socket connection to write the decision back to. Removed once answered.
+#[cfg(feature = "legacy-backend")]
 struct PendingHookConnection {
     stream: UnixStream,
 }
@@ -152,6 +168,7 @@ struct PendingHookConnection {
 /// A live (or just-exited) `claude` CLI child process for one whole conversation, with its stdout
 /// being translated into `AgentEvent`s on a background thread and buffered for non-blocking
 /// pickup via [`poll_events`](Self::poll_events).
+#[cfg(feature = "legacy-backend")]
 pub struct AgentProcess {
     child: Child,
     /// `None` after `shutdown()` has taken it (closing the write end, sending EOF to the child)
@@ -226,6 +243,7 @@ pub struct AgentProcess {
 /// restrictive than `default` is denied and emits `AgentEvent::UngatedCliMode` to close the session
 /// instead of showing a card. Stricter or unreported modes are noted once per conversation through
 /// `cli_mode_noted`, then filed normally.
+#[cfg(feature = "legacy-backend")]
 fn spawn_hook_listener(
     listener: UnixListener,
     tx: std::sync::mpsc::Sender<AgentEvent>,
@@ -353,6 +371,7 @@ fn spawn_hook_listener(
 /// the underlying `io::Error` unchanged -- `spawn_with_binary`'s real `cmd.spawn()` a few lines
 /// down would fail on it identically, so this just surfaces the same failure slightly earlier and
 /// before anything else (a socket, a listener thread) has been created.
+#[cfg(feature = "legacy-backend")]
 fn preflight_gate_flag_is_accepted(binary: &str, settings_json: &str, project_dir: &Path) -> std::io::Result<()> {
     let output = Command::new(binary)
         // The same working directory the real spawn sets, and this is load-bearing rather than
@@ -402,6 +421,7 @@ fn preflight_gate_flag_is_accepted(binary: &str, settings_json: &str, project_di
 /// Best-effort and never fatal: `None` (rendered as a placeholder by the caller) means only that
 /// this diagnostic could not resolve a path, never that the real spawn is expected to fail --
 /// `cmd.spawn()` does its own, authoritative resolution independently of this.
+#[cfg(feature = "legacy-backend")]
 fn resolve_binary_absolute_path(binary: &str) -> Option<std::path::PathBuf> {
     if binary.contains('/') {
         return Path::new(binary).canonicalize().ok();
@@ -431,6 +451,7 @@ fn resolve_binary_absolute_path(binary: &str) -> Option<std::path::PathBuf> {
 /// never be mistaken for an approval -- see `spawn_hook_listener`'s fail-closed doc. Deliberately
 /// best-effort and infallible from the caller's point of view: if the peer has already gone away
 /// there is no one left to tell, and the connection is being dropped either way.
+#[cfg(feature = "legacy-backend")]
 fn write_fail_closed_deny(stream: &UnixStream, reason: &str) {
     let decision = crate::hook_protocol::format_decision(false, Some(&format!("agent-hook relay failed: {reason}")));
     let mut sink = stream;
@@ -453,6 +474,7 @@ fn write_fail_closed_deny(stream: &UnixStream, reason: &str) {
 /// hazard `spawn_hook_listener`'s doc describes. Split out as a free function taking `pending`
 /// directly so this behavior can be tested against a real, genuinely-blocked peer without a live
 /// `AgentProcess`.
+#[cfg(feature = "legacy-backend")]
 fn release_pending_hook_connections(pending: &Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>) {
     let mut pending = pending.lock().unwrap();
     for (_request_id, conn) in pending.drain() {
@@ -468,6 +490,7 @@ fn release_pending_hook_connections(pending: &Arc<Mutex<std::collections::HashMa
 /// process. A request id with no matching pending connection (already answered, or never a real
 /// `HookRelay` request) is a harmless no-op, not an error -- mirrors the same reasoning as
 /// `AgentSessionProjection::apply`'s `ToolResult`-for-unknown-id case elsewhere in this crate.
+#[cfg(feature = "legacy-backend")]
 fn write_hook_decision(
     pending: &Arc<Mutex<std::collections::HashMap<String, PendingHookConnection>>>,
     request_id: &str,
@@ -494,6 +517,7 @@ fn write_hook_decision(
 /// I/O) so its exact shape can be unit-tested directly, independent of `respond_permission`'s
 /// stdin-writing side (which needs a live `ChildStdin` and is otherwise already covered by
 /// `send_turn`/`interrupt`'s identical write-then-flush pattern).
+#[cfg(feature = "legacy-backend")]
 fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Option<&str>) -> serde_json::Value {
     let behavior = if allow { "allow" } else { "deny" };
     let mut response = serde_json::json!({ "behavior": behavior });
@@ -508,6 +532,7 @@ fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Op
     })
 }
 
+#[cfg(feature = "legacy-backend")]
 impl AgentProcess {
     /// Spawns one long-lived process for the whole conversation. `project_dir` is the CLI's cwd,
     /// where `--setting-sources project,local` finds project settings, and the root the conversation
@@ -935,13 +960,16 @@ impl AgentProcess {
     }
 }
 
+#[cfg(feature = "legacy-backend")]
 const SIGTERM: i32 = 15;
 
+#[cfg(feature = "legacy-backend")]
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+#[cfg(feature = "legacy-backend")]
 impl Drop for AgentProcess {
     /// Defense in depth: if a caller drops an `AgentProcess` without calling `shutdown()`
     /// explicitly, this must not leak an orphaned `claude` subprocess -- same non-negotiable this
@@ -954,8 +982,11 @@ impl Drop for AgentProcess {
     }
 }
 
+/// The deny lists' and the CLI-mode classification's tests: what the sidecar shares, so they run in
+/// every build. The legacy spawn's own tests are `mod tests` below, which keeps the names the records
+/// cite (`process::tests::...`).
 #[cfg(test)]
-mod tests {
+mod deny_list_tests {
 
     /// Checks that the shared deny list is empty so every session offers every tool.
     /// Both modes run the CLI in `default` under the `PreToolUse` gate. `Auto` routes calls
@@ -994,19 +1025,6 @@ mod tests {
         }
     }
 
-    /// Once per conversation: the flag is what `AgentProcess` shares with its listener.
-    #[test]
-    fn a_stricter_hook_mode_is_noted_once() {
-        let noted = AtomicBool::new(false);
-        let line = note_hook_cli_mode(&noted, "plan").expect("the first report is noted");
-        assert_eq!(
-            line,
-            "[permission] the CLI reports permission mode 'plan' in a hook call, not 'default'"
-        );
-        assert_eq!(note_hook_cli_mode(&noted, "plan"), None);
-        assert_eq!(note_hook_cli_mode(&noted, ""), None);
-    }
-
     /// Pins the exact contents of `CONSERVATIVE_DISALLOWED_TOOLS`, because a typo in it is silent
     /// on BOTH sides of a repository boundary.
     ///
@@ -1041,6 +1059,31 @@ mod tests {
         }
     }
     use super::*;
+}
+
+/// The legacy spawn tests need `AgentProcess` and the hook relay, which are available only
+/// with the `legacy-backend` feature.
+///
+/// Use separate attributes because `wire_guard` recognizes test code by a literal `#[cfg(test)]`
+/// with further attributes allowed. A combined condition would cause it to scan these tests'
+/// `"bypassPermissions"` fixtures as production source.
+#[cfg(test)]
+#[cfg(feature = "legacy-backend")]
+mod tests {
+    use super::*;
+
+    /// Once per conversation: the flag is what `AgentProcess` shares with its listener.
+    #[test]
+    fn a_stricter_hook_mode_is_noted_once() {
+        let noted = AtomicBool::new(false);
+        let line = note_hook_cli_mode(&noted, "plan").expect("the first report is noted");
+        assert_eq!(
+            line,
+            "[permission] the CLI reports permission mode 'plan' in a hook call, not 'default'"
+        );
+        assert_eq!(note_hook_cli_mode(&noted, "plan"), None);
+        assert_eq!(note_hook_cli_mode(&noted, ""), None);
+    }
 
     /// Real end-to-end: spawns one long-lived process, sends two separate turns over the same
     /// process (no `--resume`, no respawn), and confirms the second turn's answer genuinely

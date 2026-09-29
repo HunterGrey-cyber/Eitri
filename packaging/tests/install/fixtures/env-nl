@@ -1,0 +1,10 @@
+#!/bin/sh
+# env-nl VAR FIRST SECOND COMMAND [ARG]...: runs COMMAND with VAR set to FIRST, a newline, then
+# SECOND. run-in-env.sh refuses a newline in --set, so a value like that is set here, inside the
+# wrapped command.
+var=$1
+value="$2
+$3"
+shift 3
+export "$var=$value"
+exec "$@"

@@ -253,7 +253,9 @@ fn auto_offers_bash_runs_a_read_only_command_and_cards_a_write() {
     auto_offers_bash_on(BackendKind::Sidecar, "auto-bash");
 }
 
-/// The same on the legacy backend, whose `claude` gets no `--disallowedTools` in Auto now.
+/// Checks the same behavior on the legacy backend, which passes no `--disallowedTools` in Auto.
+/// Requires a build with `--features legacy-backend`.
+#[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn auto_offers_bash_on_the_legacy_backend_too() {

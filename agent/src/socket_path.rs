@@ -37,13 +37,16 @@ pub fn in_dir(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// The legacy backend's per-conversation `PreToolUse` relay socket: `neovibe-hook-<32 hex>.sock`,
-/// 50 bytes of file name (99 under macOS's 49-byte `temp_dir()`).
+/// Builds the legacy backend's per-conversation `PreToolUse` relay socket path.
+/// The filename uses `HOOK_SOCKET_PREFIX` and a UUID in 32-hex form to keep the path short.
+/// Only the `legacy-backend` feature compiles this function.
+#[cfg(feature = "legacy-backend")]
 pub(crate) fn hook_socket(dir: &Path, conversation_id: uuid::Uuid) -> io::Result<PathBuf> {
     in_dir(dir, &format!("{HOOK_SOCKET_PREFIX}{}.sock", conversation_id.simple()))
 }
 
 /// The file-name prefix [`hook_socket`] uses, for code that lists leftover sockets.
+#[cfg(feature = "legacy-backend")]
 pub(crate) const HOOK_SOCKET_PREFIX: &str = "neovibe-hook-";
 
 /// One sidecar instance's gRPC socket: `neovibe-sc-<id>.sock`. A hyphenated UUID -- which is what
@@ -114,12 +117,16 @@ mod tests {
     }
 
     /// Both production socket paths fit under the macOS temp dir, and under this machine's own.
+    /// The hook socket only where it is built: a build with the legacy backend.
     #[test]
     fn every_production_socket_path_fits_under_the_macos_temp_dir() {
         for dir in [Path::new(MACOS_TEMP_DIR).to_path_buf(), std::env::temp_dir()] {
-            let hook = hook_socket(&dir, uuid::Uuid::new_v4()).unwrap();
             let sidecar = sidecar_socket(&dir, &uuid::Uuid::new_v4().to_string()).unwrap();
-            for path in [hook, sidecar] {
+            #[cfg(feature = "legacy-backend")]
+            let paths = [hook_socket(&dir, uuid::Uuid::new_v4()).unwrap(), sidecar];
+            #[cfg(not(feature = "legacy-backend"))]
+            let paths = [sidecar];
+            for path in paths {
                 assert!(path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES, "{path:?}");
             }
         }

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test double for sudo and the package managers (apt, apt-get, dnf, pacman, zypper): the installer
+# must never run any of them. Each call is appended to <scratch>/logs/forbidden.log, which the
+# harness requires to be empty after every test, and fails.
+S=$(cd "$(dirname "$0")/.." && pwd)
+{
+	printf '%s' "$(basename "$0")"
+	printf ' %s' "$@"
+	printf '\n'
+} >>"$S/logs/forbidden.log"
+exit 1

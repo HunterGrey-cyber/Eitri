@@ -1,0 +1,26 @@
+#!/bin/sh
+# Test double for mv: fail the second rename of the install swap, after the old
+# installation has moved aside. All other calls use real mv. When installed as
+# <scratch>/stubs-mvterm/mv, send SIGTERM to the installer before failing.
+# Both failure and interruption must restore the working old installation.
+src=
+for a do
+	case $a in
+	--) ;;
+	*)
+		src=$a
+		break
+		;;
+	esac
+done
+case $src in
+*/.local/lib/neovibe.new)
+	case $0 in */stubs-mvterm/*) kill -TERM "$PPID" ;; esac
+	echo "mv: simulated failure of the swap" >&2
+	exit 1
+	;;
+esac
+for m in /usr/bin/mv /bin/mv; do
+	if [ -x "$m" ]; then exec "$m" "$@"; fi
+done
+exit 127

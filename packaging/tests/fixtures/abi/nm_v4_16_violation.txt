@@ -1,0 +1,6 @@
+                 U abort@GLIBC_2.2.5
+                 U gtk_fake_baseline_fn
+                 U gtk_fake_v4_14_fn
+                 U gtk_fake_v4_16_fn
+                 U glib_get_prgname
+                 U memcpy@GLIBC_2.14

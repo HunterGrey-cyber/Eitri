@@ -9,6 +9,9 @@
 //!     cargo test -p neovibe-core --test v1_mode_real_cli -- --ignored --nocapture --test-threads=1
 //! ```
 //!
+//! The four legacy tests (2, 3 on legacy, 5 on legacy twice) exist only in a build with the legacy
+//! backend: add `--features legacy-backend` to run them.
+//!
 //! The sidecar runs the CLI named by `VERDANDI_CLAUDE_CLI_PATH`; `PATH` alone does not select it.
 //!
 //! **What these prove, and what they only record.** Bypass is neovibe's own `allow` under a CLI
@@ -571,7 +574,8 @@ fn host_answer_latency_in_bypass() {
 /// Exercises the same three calls on `BackendKind::Legacy` with `--permission-mode default` and
 /// the hook returning `allow`. Checks that no card appears, tools finish without error, and
 /// disk effects land. Legacy drops the synchronous resolution with the request, so this does
-/// not expect a `PermissionResolved`.
+/// not expect a `PermissionResolved`. Requires a build with `--features legacy-backend`.
+#[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn legacy_default_mode_with_the_hook_allowing_runs_the_same_calls() {
@@ -973,6 +977,8 @@ fn a_subagent_tool_call_reaches_the_host_on_sidecar() {
     a_subagent_tool_call_reaches_the_host_on(BackendKind::Sidecar, "subagent-sidecar");
 }
 
+/// Requires a build with `--features legacy-backend`.
+#[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn a_subagent_tool_call_reaches_the_host_on_legacy() {
@@ -1309,6 +1315,8 @@ fn default_mode_bypass_permissions_gates_the_sidecar() {
     run_default_mode_probe(BackendKind::Sidecar, "bypassPermissions", "default-mode-bypass-sidecar");
 }
 
+/// Requires a build with `--features legacy-backend`.
+#[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn default_mode_bypass_permissions_gates_legacy() {
@@ -1321,6 +1329,8 @@ fn default_mode_accept_edits_gates_the_sidecar() {
     run_default_mode_probe(BackendKind::Sidecar, "acceptEdits", "default-mode-accept-edits-sidecar");
 }
 
+/// Requires a build with `--features legacy-backend`.
+#[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn default_mode_accept_edits_gates_legacy() {

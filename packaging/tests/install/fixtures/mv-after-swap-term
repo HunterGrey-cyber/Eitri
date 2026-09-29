@@ -1,0 +1,22 @@
+#!/bin/sh
+# Test double for mv: runs the real mv, and right after the swap's second rename
+# (.local/lib/neovibe.new -> .local/lib/neovibe) has succeeded, sends SIGTERM to the installer --
+# an interrupt in the moment after the new install is in place and before it is finished.
+real=
+for m in /usr/bin/mv /bin/mv; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+"$real" "$@" || exit
+src=
+for a do
+	case $a in
+	--) ;;
+	*)
+		src=$a
+		break
+		;;
+	esac
+done
+case $src in */.local/lib/neovibe.new) kill -TERM "$PPID" ;; esac
+exit 0

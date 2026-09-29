@@ -1,0 +1,187 @@
+# Maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
+#
+# neovibe-git -- built from source: the public neovibe repo, its neovide fork submodule and the
+# public Verdandi repo (for the sidecar's source), plus Node for the Node SEA build. See
+# packaging/aur/neovibe-bin/PKGBUILD's own header for the licence note this package repeats below
+#.
+
+pkgname=neovibe-git
+pkgver=1.0.0.r0.g0000000
+pkgrel=1
+pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (built from source)"
+arch=('x86_64')
+url="https://github.com/HunterGrey-cyber/neovibe"
+license=('MIT' 'Apache-2.0' 'LGPL-3.0-only' 'MPL-2.0' 'LicenseRef-Anthropic-Claude-Agent-SDK')
+depends=('gtk4' 'webkitgtk-6.0' 'glibc' 'gcc-libs')
+# !strip: see packaging/aur/neovibe-bin/PKGBUILD's own comment -- the same sidecar build (a Node
+# SEA executable, from the same packaging/install.sh --build-sidecar-into recipe) is produced here
+# too, and makepkg's default strip pass corrupts it. Measured on neovibe-bin's build in
+# packaging/aur/test-in-container.sh, where the stripped sidecar failed with "Exec format error";
+# this package inherits the option rather than having been measured without it.
+# !lto: makepkg's default lto option adds -flto=auto to CFLAGS, so the cc crate compiles the
+# vendored Lua (mlua's `vendored` feature, lua-src) into GCC LTO bytecode objects -- and rustc links
+# x86_64-unknown-linux-gnu through lld, which cannot read GCC's LTO sections. Measured in
+# packaging/aur/test-in-container.sh: with lto on, liblua5.4.a's objects carry only .gnu.lto_*
+# sections and linking `shell` fails with "ld.lld: error: undefined symbol: lua_gettop" (and every
+# other lua_* the mlua crate calls). Rust's own code is unaffected; this only turns off makepkg's
+# C-side LTO flags.
+options=('!strip' '!lto')
+optdepends=(
+	'neovim: the editor (any nvim >= 0.10 on PATH)'
+	'claude-code: the Claude Code CLI the panel drives'
+	'noto-fonts: the ⏵⏵ mode glyph'
+)
+# prepare() fetches the crate registry; build() uses --frozen for Rust dependencies.
+# clang and pkgconf support the graphics build scripts. protobuf supplies the system protoc
+# required by the agent's protocol build script. nodejs and npm build agent-ui/web through
+# shell/build.rs and the sidecar in apps/claude-sidecar, so build() still uses the npm registry.
+# curl fetches the pinned graphics archive in prepare(). It is listed explicitly because
+# prepare() calls it directly, even though pacman already depends on it.
+makedepends=('git' 'cargo' 'clang' 'pkgconf' 'protobuf' 'nodejs' 'npm' 'curl')
+provides=('neovibe')
+conflicts=('neovibe')
+source=(
+	"${pkgname}::git+https://github.com/HunterGrey-cyber/neovibe.git"
+	"neovide::git+https://github.com/HunterGrey-cyber/neovide.git#branch=neovibe-integration"
+	"verdandi::git+https://github.com/HunterGrey-cyber/verdandi.git"
+	"node-v22.23.2-linux-x64.tar.xz::https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz"
+)
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP'
+            'd60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307')
+
+# pkgver(): remove the leading v and replace every hyphen from git describe with a dot.
+# Prerelease tags contain an extra hyphen, so replacing only the first one leaves a hyphen
+# that makepkg rejects. A global substitution handles both prerelease and final tags.
+pkgver() {
+	cd "$srcdir/$pkgname"
+	git describe --long --tags | sed 's/^v//; s/-/./g'
+}
+
+prepare() {
+	cd "$srcdir/$pkgname"
+
+	# Use the submodule clone already fetched by makepkg as a source= entry.
+	# This avoids fetching the same repository again over the network.
+	git submodule init
+	git config submodule.neovide.url "$srcdir/neovide"
+	git -c protocol.file.allow=always submodule update
+
+	# Read the sidecar's required revision from agent/Cargo.toml and require 40 hex digits.
+	# The dependency pin must be a full commit id before checking out the matching source.
+	_at_line=$(grep -E '^claude-runtime-protocol[[:space:]]*=' agent/Cargo.toml | head -n1)
+	if [ -z "$_at_line" ]; then
+		printf '==> ERROR: %s\n' "agent/Cargo.toml has no claude-runtime-protocol dependency: not the neovibe tree this PKGBUILD expects" >&2
+		return 1
+	fi
+	_verdandi_rev=$(printf '%s\n' "$_at_line" | sed -n 's/.*rev[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
+	if ! printf '%s' "$_verdandi_rev" | grep -Eqx '[0-9a-f]{40}'; then
+		printf '==> ERROR: %s\n' "agent/Cargo.toml pins Verdandi at \"$_verdandi_rev\", which is not 40 hex: the public repo is expected to carry the full commit" >&2
+		return 1
+	fi
+
+	cd "$srcdir/verdandi"
+	git checkout --quiet "$_verdandi_rev"
+
+	# Require buildBinary.mjs to pin the Node version listed in source=.
+	# A mismatch means this PKGBUILD needs a Node version update.
+	_node_pin=$(sed -n "s/^const NODE_VERSION = '\\(v[0-9.]*\\)';.*/\\1/p" apps/claude-sidecar/scripts/buildBinary.mjs)
+	if [ -z "$_node_pin" ]; then
+		printf '==> ERROR: %s\n' "could not read NODE_VERSION out of Verdandi $_verdandi_rev's apps/claude-sidecar/scripts/buildBinary.mjs: the sidecar build recipe may have moved" >&2
+		return 1
+	fi
+	if [ "$_node_pin" != "v22.23.2" ]; then
+		printf '==> ERROR: %s\n' "this PKGBUILD needs a Node bump: Verdandi $_verdandi_rev's buildBinary.mjs pins $_node_pin, not the v22.23.2 in this PKGBUILD's source=" >&2
+		return 1
+	fi
+
+	# Archive the checked-out sidecar source and write a matching RELEASE for
+	# --build-sidecar-into to validate its inputs. Use the fields produced by
+	# synthesize_release_from_checkout, computing them here because build() invokes cargo
+	# directly rather than using the --from-source install flow.
+	git archive --format=tar.gz -o "$srcdir/verdandi-source.tar.gz" HEAD
+	_verdandi_sha=$(sha256sum "$srcdir/verdandi-source.tar.gz" | cut -d' ' -f1)
+	_verdandi_rev7=${_verdandi_rev:0:7}
+
+	cd "$srcdir/$pkgname"
+	_neovibe_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+	_neovibe_commit=$(git rev-parse HEAD)
+	_fork_commit=$(git -C neovide rev-parse HEAD)
+	_pins=packaging/pins.env
+	_node_version=$(sed -n 's/^NODE_VERSION=//p' "$_pins")
+	_node_x64=$(sed -n 's/^NODE_SHA256_linux_x64=//p' "$_pins")
+	_node_arm64=$(sed -n 's/^NODE_SHA256_linux_arm64=//p' "$_pins")
+	_nvim_version=$(sed -n 's/^NVIM_VERSION=//p' "$_pins")
+	_nvim_sha=$(sed -n 's/^NVIM_SHA256_linux_x86_64=//p' "$_pins")
+	{
+		printf 'NEOVIBE_VERSION=%s\n' "$_neovibe_version"
+		printf 'NEOVIBE_COMMIT=%s\n' "$_neovibe_commit"
+		printf 'NEOVIDE_FORK_COMMIT=%s\n' "$_fork_commit"
+		printf 'VERDANDI_REV=%s\n' "$_verdandi_rev"
+		printf 'VERDANDI_SOURCE=verdandi-%s-source.tar.gz\n' "$_verdandi_rev7"
+		printf 'VERDANDI_SOURCE_SHA256=%s\n' "$_verdandi_sha"
+		printf 'NODE_VERSION=%s\n' "$_node_version"
+		printf 'NODE_SHA256_linux_x64=%s\n' "$_node_x64"
+		printf 'NODE_SHA256_linux_arm64=%s\n' "$_node_arm64"
+		printf 'NVIM_VERSION=%s\n' "$_nvim_version"
+		printf 'NVIM_SHA256_linux_x86_64=%s\n' "$_nvim_sha"
+	} >"$srcdir/release-for-sidecar.env"
+
+	export CARGO_HOME="$srcdir/cargo"
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+
+	# Fetch the Skia archive used by skia-bindings.
+	# packaging/pins.env supplies its URL and checksum.
+	_skia_url=$(sed -n 's/^SKIA_BINARIES_URL_UPSTREAM=//p' "$_pins")
+	_skia_sha=$(sed -n 's/^SKIA_BINARIES_SHA256=//p' "$_pins")
+	_skia_name=${_skia_url##*/}
+	curl -fsSL -o "$srcdir/$_skia_name" "$_skia_url"
+	printf '%s  %s\n' "$_skia_sha" "$srcdir/$_skia_name" | sha256sum -c -
+}
+
+build() {
+	cd "$srcdir/$pkgname"
+	export CARGO_HOME="$srcdir/cargo"
+	_skia_url=$(sed -n 's/^SKIA_BINARIES_URL_UPSTREAM=//p' packaging/pins.env)
+	_skia_name=${_skia_url##*/}
+	SKIA_BINARIES_URL="file://$srcdir/$_skia_name" \
+		cargo build --frozen --release -p shell -p agent -p supervisor --bins
+
+	# Build the sidecar from the clone prepared and archived by prepare(), using the same
+	# --build-sidecar-into entry point as the binary package.
+	sh packaging/install.sh \
+		--build-sidecar-into "$srcdir/sidecar" \
+		--node "$srcdir/node-v22.23.2-linux-x64.tar.xz" \
+		--verdandi-source "$srcdir/verdandi-source.tar.gz" \
+		--release-file "$srcdir/release-for-sidecar.env"
+}
+
+package() {
+	cd "$srcdir/$pkgname"
+
+	install -d "$pkgdir/usr/lib/neovibe"
+	install -m0755 "target/release/shell" "$pkgdir/usr/lib/neovibe/shell"
+	install -m0755 "target/release/neovibe-supervisor" "$pkgdir/usr/lib/neovibe/neovibe-supervisor"
+	install -m0755 "target/release/neovibe-tmux-shim" "$pkgdir/usr/lib/neovibe/neovibe-tmux-shim"
+	install -m0755 "target/release/neovibe-claude-handoff" "$pkgdir/usr/lib/neovibe/neovibe-claude-handoff"
+	install -m0755 "packaging/install.sh" "$pkgdir/usr/lib/neovibe/neovibe-setup"
+	install -m0644 "$srcdir/release-for-sidecar.env" "$pkgdir/usr/lib/neovibe/RELEASE"
+	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/neovibe/verdandi-claude-sidecar"
+	install -m0644 "$srcdir/sidecar/verdandi-claude-sidecar.rev" "$pkgdir/usr/lib/neovibe/verdandi-claude-sidecar.rev"
+
+	install -Dm0755 "packaging/neovibe.launcher.sh" "$pkgdir/usr/bin/neovibe"
+	install -Dm0644 "packaging/neovibe.desktop" "$pkgdir/usr/share/applications/neovibe.desktop"
+
+	# Install this tree's LICENSE plus the SDK and Node licences. This locally built AUR
+	# package omits generated THIRD-PARTY-LICENSES and SOURCE. Unlike from_source_stage,
+	# it does not install explanatory placeholder files for those notices.
+	install -d "$pkgdir/usr/share/licenses/$pkgname"
+	install -m0644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	if [ -f "$srcdir/sidecar/LICENSE.md" ]; then
+		install -m0644 "$srcdir/sidecar/LICENSE.md" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+	fi
+	if [ -f "$srcdir/sidecar/NODE-LICENSE" ]; then
+		install -m0644 "$srcdir/sidecar/NODE-LICENSE" "$pkgdir/usr/share/licenses/$pkgname/NODE-LICENSE"
+	fi
+}

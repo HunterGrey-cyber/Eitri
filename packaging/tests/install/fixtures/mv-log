@@ -1,0 +1,18 @@
+#!/bin/sh
+# Wraps the real mv: records each call in <scratch>/logs/mv.log -- with INTO-EXISTING-DIR when the
+# last argument already is a directory, i.e. when mv would move the source inside it -- then runs
+# the real one.
+S=$(cd "$(dirname "$0")/.." && pwd)
+last=
+for a do last=$a; done
+flag=
+if [ -d "$last" ] && [ ! -L "$last" ]; then flag=' INTO-EXISTING-DIR'; fi
+{
+	printf 'mv'
+	printf ' %s' "$@"
+	printf '%s\n' "$flag"
+} >>"$S/logs/mv.log"
+for m in /usr/bin/mv /bin/mv; do
+	if [ -x "$m" ]; then exec "$m" "$@"; fi
+done
+exit 127

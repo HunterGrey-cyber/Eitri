@@ -1,0 +1,22 @@
+#!/bin/sh
+# Test double for find that simulates a target directory with a different uid.
+# This exercises ownership checks without needing root to change directory ownership.
+# For find -H PATH with a -uid predicate, report the path named by the test marker
+# as a hit, as ! -uid OUR_ID would for another user's directory.
+# All other calls use real find, including permission and symlink checks on that path.
+S=$(cd "$(dirname "$0")/.." && pwd)
+real=
+for m in /usr/bin/find /bin/find; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+_marker=$S/logs/fake-owner-path
+if [ -f "$_marker" ] && [ "$1" = -H ] && [ "$2" = "$(cat "$_marker")" ]; then
+	case " $* " in
+	*' -uid '*)
+		printf '%s\n' "$2"
+		exit 0
+		;;
+	esac
+fi
+exec "$real" "$@"

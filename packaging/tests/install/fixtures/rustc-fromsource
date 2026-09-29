@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test double for rustc used by check_build_tools to check the minimum version.
+# Only a plausible rustc --version line at or above NV_MIN_RUSTC is needed;
+# these tests do not require a real compiler.
+case $1 in
+--version) printf 'rustc 1.96.0 (fromsource-stub 2026-09-27)\n' ;;
+*)
+	echo "rustc-fromsource-stub: unexpected argv: $*" >&2
+	exit 1
+	;;
+esac
