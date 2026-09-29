@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test double for tar that fails during unpack, to prove the failure stops the installer even
+# though it happens inside a function (SH-2).
+echo "tar: simulated failure" >&2
+exit 1

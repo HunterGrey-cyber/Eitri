@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test double for `protoc`: check_build_tools only ever checks that it is present (`command -v`),
+# never invokes it. Exists so no test here needs protobuf-compiler installed.
+echo "protoc-fromsource-stub: never actually invoked by check_build_tools" >&2
+exit 1

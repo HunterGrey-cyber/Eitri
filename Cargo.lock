@@ -35,7 +35,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "claude-runtime-protocol",
  "hyper-util",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "neovibe-core"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "agent",
  "libc",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "neovibe-terminal"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "neovide-editor"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "gtk4",
  "libc",
@@ -4008,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "agent",
  "alacritty_terminal",
@@ -4018,8 +4018,10 @@ dependencies = [
  "mlua",
  "neovibe-core",
  "neovibe-terminal",
+ "neovide",
  "neovide-editor",
  "serde_json",
+ "sha2",
  "skia-safe",
  "supervisor",
  "terminal-input",
@@ -4314,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "supervisor"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "gtk4",
  "serde",
@@ -4418,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-frame"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
@@ -4427,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-input"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
@@ -4436,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-render"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "alacritty_terminal",
  "terminal-frame",
@@ -4444,7 +4446,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-sync"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "alacritty_terminal",
  "libc",

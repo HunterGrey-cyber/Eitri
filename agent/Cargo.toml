@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -17,3 +17,49 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 sha2 = "0.10"
 libc = "0.2"
+
+# The legacy backend (`AgentSession`: this crate spawning `claude` itself, parsing its stream-json
+# wire, relaying its `PreToolUse` hook through `agent-hook`) is development-only and is in no release
+# (spec 2026-09-27-v1-dist-design.md §10, D16; the owner: "legacy后端是不是可以不用发布了"). Off by
+# default, so any `cargo build` -- `release.sh`, the AUR `-git` PKGBUILD, `install.sh --from-source`,
+# a README reader -- leaves it out without having to remember a flag. Without it, `AgentSession` is
+# the uninhabited stub in `src/session_stub.rs`, so `neovibe-core` and `shell` compile unchanged.
+# Development asks for it with `--features shell/legacy-backend` (forwarded by both).
+[features]
+legacy-backend = []
+
+# The legacy gate's relay, located only by `settings::locate_agent_hook_binary` on the legacy spawn
+# path: without the feature there is nothing for it to relay to, so it is not built. A release then
+# has four binaries: shell, neovibe-supervisor, neovibe-tmux-shim, neovibe-claude-handoff.
+[[bin]]
+name = "agent-hook"
+path = "src/bin/agent-hook.rs"
+required-features = ["legacy-backend"]
+
+# A live demo of the legacy `AgentSession`; without the feature it would compile against the stub and
+# fail at `start`, so it asks for the feature instead.
+[[example]]
+name = "demo"
+required-features = ["legacy-backend"]
+
+# Tests of the legacy backend alone: skipped without the feature, run by
+# `cargo test -p agent --features legacy-backend`. No test is deleted.
+[[test]]
+name = "agent_hook_binary"
+required-features = ["legacy-backend"]
+
+[[test]]
+name = "backend_conformance"
+required-features = ["legacy-backend"]
+
+[[test]]
+name = "environment_conformance"
+required-features = ["legacy-backend"]
+
+[[test]]
+name = "hook_protocol"
+required-features = ["legacy-backend"]
+
+[[test]]
+name = "wire_translation"
+required-features = ["legacy-backend"]

@@ -22,6 +22,7 @@ pub mod keymap;
 pub mod layout;
 pub mod line_feed;
 pub mod lua;
+pub mod nvim_bin;
 pub mod nvim_keys;
 pub mod pane_switch;
 pub mod permission_store;

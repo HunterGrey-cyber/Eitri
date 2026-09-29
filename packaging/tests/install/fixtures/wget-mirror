@@ -1,0 +1,26 @@
+#!/bin/sh
+# Test double for wget: records its argv in <scratch>/logs/wget.log, then serves the URL's path from
+# <scratch>/srv like curl-mirror. The installer must never run wget (install.sh's require_curl says
+# why), so any line in that log fails the test; serving anyway means a regression that did use wget
+# would install and be caught by the log, not by an unrelated download error.
+S=$(cd "$(dirname "$0")/.." && pwd)
+{
+	printf 'wget'
+	printf ' %s' "$@"
+	printf '\n'
+} >>"$S/logs/wget.log"
+out=-
+url=
+while [ $# -gt 0 ]; do
+	case $1 in
+	-O) out=$2; shift ;;
+	--) url=$2; shift ;;
+	-*) ;;
+	*) url=$1 ;;
+	esac
+	shift
+done
+p=${url#*://}
+p=/${p#*/}
+[ -f "$S/srv$p" ] || exit 8
+if [ "$out" = - ]; then cat "$S/srv$p"; else cat "$S/srv$p" >"$out"; fi

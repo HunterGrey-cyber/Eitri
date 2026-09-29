@@ -1,0 +1,26 @@
+#!/bin/sh
+# Test double for `mkdir`: passes every call through to the real utility, and when it creates a
+# directory whose basename is exactly "lock" (acquire_lock's own NV_LOCK, $NV_CACHE_NV/lock), also
+# plants a read-only, empty "pid" file inside it -- so install.sh's own
+# `printf '%s\n' "$$" >"$NV_LOCK/pid"` fails to even open it for writing (EACCES) while leaving a
+# regular, empty file behind at that path, exactly the shape a real write that fails mid-flight
+# (installer-codex-7: e.g. ENOSPC right after the file was created) would leave. Reproduces the bug
+# without needing real disk exhaustion.
+last=
+for a do
+	case $a in
+	-*) continue ;;
+	esac
+	last=$a
+done
+for m in /usr/bin/mkdir /bin/mkdir; do
+	if [ -x "$m" ]; then
+		"$m" "$@" || exit $?
+		if [ -n "$last" ] && [ "${last##*/}" = lock ]; then
+			: >"$last/pid" 2>/dev/null || :
+			chmod 0444 "$last/pid" 2>/dev/null || :
+		fi
+		exit 0
+	fi
+done
+exit 127

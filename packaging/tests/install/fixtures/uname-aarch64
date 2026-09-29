@@ -1,0 +1,13 @@
+#!/bin/sh
+# Test double for `uname`: reports aarch64 for `-m` (installer-codex-4/5's own fixture -- neither
+# check_platform, which refuses a prebuilt install off x86_64 before either finding is reachable,
+# nor check_glibc calls uname at all), and passes every other invocation through to the real one.
+case "$*" in
+-m) printf 'aarch64\n' ;;
+*)
+	for u in /usr/bin/uname /bin/uname; do
+		if [ -x "$u" ]; then exec "$u" "$@"; fi
+	done
+	exit 127
+	;;
+esac

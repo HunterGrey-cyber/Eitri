@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test double for the claude CLI: the host's real claude must never run from an installer test
+# (plan Global Constraints). Records its argv in <scratch>/logs/claude.log and prints a
+# spec-shaped version.
+S=$(cd "$(dirname "$0")/.." && pwd)
+{
+	printf 'claude-stub'
+	printf ' %s' "$@"
+	printf '\n'
+} >>"$S/logs/claude.log"
+printf '%s\n' '2.1.283 (Claude Code)'

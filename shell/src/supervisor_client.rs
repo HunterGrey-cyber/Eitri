@@ -115,9 +115,10 @@ fn retry_schedule() -> Vec<u64> {
 /// every other test in the binary shares.
 ///
 /// Anything unrecognised is `false`. This is the safe direction and the opposite of the one
-/// `BackendKind::from_env` picks for its own typos, deliberately: a typo there silently selects a
-/// *backend*, so it warns; a typo here silently declines to open a window, which the user can see
-/// and correct by looking at the screen.
+/// `BackendKind::from_env` picks for its own typos, deliberately: a typo there still selects a
+/// *backend* (the sidecar, with a warning -- **correction, 2026-09-27, v1-dist Task 5: it used to
+/// fall to legacy instead, before legacy became the gated backend, D10**), so it warns; a typo here
+/// silently declines to open a window, which the user can see and correct by looking at the screen.
 fn spawn_requested(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1" | "true" | "yes"))
 }

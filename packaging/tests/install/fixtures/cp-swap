@@ -1,0 +1,25 @@
+#!/bin/sh
+# Test double for cp: runs the real one first, then -- only for a call shaped `cp -- SRC DST`
+# (every cp call packaging/install.sh's own source makes) whose SRC matches the path named on
+# <scratch>/logs/swap-verdandi's first line -- overwrites that SAME SRC path in place with the
+# file named on its second line, once. Simulates another user (or process) replacing a file the
+# instant after this installer's single read of it; the read that matters already happened in the
+# real cp just above, which wrote the genuine bytes to DST before this stub ever inspects SRC.
+S=$(cd "$(dirname "$0")/.." && pwd)
+real=
+for m in /usr/bin/cp /bin/cp; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+"$real" "$@"
+rc=$?
+if [ "$rc" = 0 ] && [ -f "$S/logs/swap-verdandi" ] && [ "$1" = -- ] && [ $# -eq 3 ]; then
+	watch_src=$(sed -n 1p "$S/logs/swap-verdandi")
+	evil_src=$(sed -n 2p "$S/logs/swap-verdandi")
+	if [ "$2" = "$watch_src" ]; then
+		rm -f "$S/logs/swap-verdandi"
+		cat -- "$evil_src" >"$watch_src" || :
+		echo "swapped $watch_src" >>"$S/logs/swap-verdandi.log"
+	fi
+fi
+exit "$rc"

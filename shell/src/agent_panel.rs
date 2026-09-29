@@ -533,7 +533,15 @@ pub(crate) struct AgentPanelHandle {
     state: Rc<RefCell<AgentPanelState>>,
     /// Held so the panel's document can be re-injected without going back through the widget tree.
     /// Cheap: a `WebView` is a GObject and cloning it is a refcount bump on the same object.
-    webview: WebView,
+    ///
+    /// `None` when WebKit's sandbox cannot start in this process (`webkit_sandbox::Decision::
+    /// Unavailable`, v1-dist sub-plan 2026-09-28-v1-dist-ubuntu-userns): no `WebView` is built, the
+    /// panel's place is a GTK notice, and nothing ever starts a session -- sessions start from the
+    /// page's own messages, and there is no page. Every method below still runs against the inert
+    /// state `main.rs`'s focus, HINT, prefix and tab-verb paths call into; what would reach a page
+    /// does nothing, and the tab verbs refuse (`closing`), so `main.rs` flashes rather than opening
+    /// tabs nobody can see.
+    webview: Option<WebView>,
 }
 
 impl AgentPanelHandle {
@@ -651,13 +659,17 @@ impl AgentPanelHandle {
     /// ever stopped being the sole consumer, or a snapshot that stopped being complete, would turn
     /// this into a quiet data-loss path with no test failing.
     pub(crate) fn reload_document(&self) {
+        let Some(webview) = &self.webview else {
+            eprintln!("[agent_panel] no panel document to reload: WebKit's sandbox cannot start here");
+            return;
+        };
         eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
         // The page that said `ready` is going; the tick holds its envelopes until the new one does.
         self.state.borrow_mut().document_ready = false;
         // And so is the mode it reported: until the new page's `ready`, nothing is BROWSE or INPUT.
         forget_the_pages_nav_mode(&self.state.borrow());
         let vars = self.state.borrow().theme.css_vars();
-        self.webview.load_html(&themed_document(&vars), Some(PANEL_BASE_URI));
+        webview.load_html(&themed_document(&vars), Some(PANEL_BASE_URI));
     }
 
     /// The user's OWN recovery action for a wedged or crashed panel -- `prefix r`
@@ -709,7 +721,9 @@ impl AgentPanelHandle {
                 let html = crate::webview_crash_guard::crash_message_html(
                     "Reload it by hand with \u{21bb} in the top bar, or prefix r.",
                 );
-                self.webview.load_html(&html, Some(PANEL_BASE_URI));
+                if let Some(webview) = &self.webview {
+                    webview.load_html(&html, Some(PANEL_BASE_URI));
+                }
             }
             crate::webview_crash_guard::CrashResponse::AlreadyGivenUp => {}
         }
@@ -740,17 +754,17 @@ impl AgentPanelHandle {
     pub(crate) fn set_theme(&self, tokens: &neovibe_core::theme::ThemeTokens) {
         let payload = neovibe_core::agent_bridge::serialize_theme_for_js(tokens);
         self.state.borrow_mut().theme = tokens.clone();
-        paint_webview_background(&self.webview, tokens);
+        let Some(webview) = &self.webview else { return };
+        paint_webview_background(webview, tokens);
         let script = format!(
             "window.__neovibeDispatch && window.__neovibeDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
         );
-        self.webview
-            .evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
-                if let Err(e) = result {
-                    eprintln!("[agent_panel] theme dispatch failed: {e}");
-                }
-            });
+        webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
+            if let Err(e) = result {
+                eprintln!("[agent_panel] theme dispatch failed: {e}");
+            }
+        });
     }
 
     /// Updates only the recorded theme's `font_size_px` and re-sends it -- the zoom-together
@@ -790,16 +804,17 @@ impl AgentPanelHandle {
     /// call before the page has loaded (in which case `ready`'s own batch re-sends whatever state
     /// mattered, and this call is simply a no-op). `what` is a short label for the error log only.
     fn dispatch(&self, payload: String, what: &'static str) {
+        // No page at all (`webview`'s own doc): nothing is listening, as before a page loads.
+        let Some(webview) = &self.webview else { return };
         let script = format!(
             "window.__neovibeDispatch && window.__neovibeDispatch({});",
             serde_json::to_string(&payload).unwrap_or_default()
         );
-        self.webview
-            .evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, move |result| {
-                if let Err(e) = result {
-                    eprintln!("[agent_panel] {what} dispatch failed: {e}");
-                }
-            });
+        webview.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, move |result| {
+            if let Err(e) = result {
+                eprintln!("[agent_panel] {what} dispatch failed: {e}");
+            }
+        });
     }
 
     /// Records whether this panel's pane has keyboard focus and tells the live document, which
@@ -978,18 +993,29 @@ impl AgentPanelHandle {
 // Tasks 7 and 8 wire these to the keymap and the window close; until then some have no caller.
 #[allow(dead_code)]
 impl AgentPanelHandle {
+    /// The window is closing (`AgentPanelState::shutting_down`), or there is no page at all
+    /// (`webview`'s own doc): every verb below then does nothing, and says so to its caller the way
+    /// it does for a closing window.
     fn closing(&self) -> bool {
-        self.state.borrow().shutting_down
+        self.live_page().is_none()
+    }
+
+    /// The page, while there is one and the window is not closing.
+    fn live_page(&self) -> Option<&WebView> {
+        if self.state.borrow().shutting_down {
+            return None;
+        }
+        self.webview.as_ref()
     }
 
     /// `prefix c`: opens a tab, selects it, and sends `tabs` -- nothing else: an empty tab has no
     /// state yet.
     pub(crate) fn new_tab(&self) {
-        if self.closing() {
+        let Some(webview) = self.live_page() else {
             return;
-        }
+        };
         self.state.borrow_mut().tabs.open();
-        send_tabs(&self.state, &self.webview);
+        send_tabs(&self.state, webview);
     }
 
     /// `prefix <digit>`. `false` when no tab has that number (the caller flashes, ruling 10).
@@ -1008,14 +1034,14 @@ impl AgentPanelHandle {
     }
 
     fn switch_with(&self, select: impl FnOnce(&mut neovibe_core::tab_set::TabSet) -> Option<TabId>) -> bool {
-        if self.closing() {
+        let Some(webview) = self.live_page() else {
             return false;
-        }
+        };
         let selected = select(&mut self.state.borrow_mut().tabs);
         if selected.is_none() {
             return false;
         }
-        send_switch(&self.state, &self.webview);
+        send_switch(&self.state, webview);
         true
     }
 
@@ -1097,9 +1123,9 @@ impl AgentPanelHandle {
     /// The tray chip, `prefix a`: switches to the tab holding the oldest pending card and puts the
     /// panel's cursor on it. `false` when no tab holds a card.
     pub(crate) fn focus_oldest_card(&self) -> bool {
-        if self.closing() {
+        let Some(webview) = self.live_page() else {
             return false;
-        }
+        };
         let target = {
             let mut state = self.state.borrow_mut();
             let Some(target) = state.tabs.oldest_card_tab() else {
@@ -1111,7 +1137,7 @@ impl AgentPanelHandle {
             state.tabs.drop_bypass_prompt();
             target
         };
-        send_switch(&self.state, &self.webview);
+        send_switch(&self.state, webview);
         self.dispatch(
             neovibe_core::agent_bridge::serialize_focus_permission_for_js(target),
             "focus-permission",
@@ -1148,9 +1174,9 @@ impl AgentPanelHandle {
     /// Refused, closing nothing, while a tab is being handed off to a terminal: `close_tab` refuses
     /// that tab, and a kill that closed the others and left it would not be a kill.
     pub(crate) fn close_every_tab(&self) -> Result<usize, &'static str> {
-        if self.closing() {
+        let Some(webview) = self.live_page() else {
             return Ok(0);
-        }
+        };
         let ids: Vec<TabId> = {
             let state = self.state.borrow();
             if state.tabs.tabs().iter().any(|t| t.pending_handoff.is_some()) {
@@ -1159,7 +1185,7 @@ impl AgentPanelHandle {
             state.tabs.tabs().iter().map(|t| t.id).collect()
         };
         for id in &ids {
-            close_tab(&self.state, &self.webview, *id)?;
+            close_tab(&self.state, webview, *id)?;
         }
         eprintln!(
             "[agent_panel] killed: {} session tab(s) closed, records kept",
@@ -1204,11 +1230,38 @@ fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: neovibe_core::
     }
 }
 
+/// `backend_kind` is `main()`'s own choice (v1-dist plan Task 5, spec §10): `BackendKind::from_env`
+/// is called there, before any window exists, so `--legacy`/`NEOVIBE_AGENT_BACKEND=legacy` on a
+/// release build can exit 1 naming the reason before touching GTK at all. This function no longer
+/// makes that choice itself -- it only prints it.
+///
+/// `unavailable`: `Some(notice)` when WebKit's sandbox cannot start in this process
+/// (`webkit_sandbox::Decision::Unavailable`). Then no `WebView` -- nor anything else of WebKit's --
+/// is built: the panel's place is `webkit_sandbox::notice_widget(notice)`, and the handle carries the
+/// same state with no page (`AgentPanelHandle::webview`'s own doc), no pump, no supervisor client.
 pub(crate) fn build_agent_panel(
     project_dir: PathBuf,
     editor_context: neovibe_core::editor_context::ContextSource,
     scratch: Option<neovibe_core::scratch::ScratchDir>,
+    backend_kind: BackendKind,
+    unavailable: Option<&str>,
 ) -> (gtk4::Widget, AgentPanelHandle) {
+    if let Some(notice) = unavailable {
+        println!(
+            "[agent_panel] backend: {} (no panel: WebKit's sandbox cannot start here)",
+            backend_kind.as_str()
+        );
+        let state = Rc::new(RefCell::new(panel_state(
+            project_dir,
+            editor_context,
+            scratch,
+            backend_kind,
+            None,
+            None,
+        )));
+        let handle = AgentPanelHandle { state, webview: None };
+        return (crate::webkit_sandbox::notice_widget(notice), handle);
+    }
     let content_manager = UserContentManager::new();
     // Finding 3 (panel-content review): a CSP floor the page cannot loosen, plus a network backstop
     // behind it -- see `PANEL_CONTENT_SECURITY_POLICY` and `PANEL_NETWORK_PROXY_URI`'s doc comments.
@@ -1281,66 +1334,15 @@ pub(crate) fn build_agent_panel(
             crate::supervisor_client::PendingSupervisor::Ready(client) => (client, None),
             crate::supervisor_client::PendingSupervisor::Connecting(rx) => (None, Some(rx)),
         };
-    let backend_kind = BackendKind::from_env();
     println!("[agent_panel] backend: {}", backend_kind.as_str());
-    let state_home = std::env::var_os("XDG_STATE_HOME");
-    let home = std::env::var_os("HOME");
-    let prefs_dir = neovibe_core::agent_prefs::state_dir(state_home.as_deref(), home.as_deref());
-    let (mode, notes) = neovibe_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
-    for note in notes {
-        eprintln!("{note}");
-    }
-    let history_dir = neovibe_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
-    let rules_dir = neovibe_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
-    let (history, notes) = neovibe_core::prompt_history::startup(history_dir.as_deref(), &project_dir);
-    for note in notes {
-        eprintln!("{note}");
-    }
-    let (rules, notes) = neovibe_core::permission_store::startup(rules_dir.as_deref(), &project_dir);
-    for note in notes {
-        eprintln!("{note}");
-    }
-    let mut tabs = neovibe_core::tab_set::TabSet::new(backend_kind, mode);
-    tabs.set_rules(rules);
-    // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
-    // way). `main.rs` already canonicalized the root; this only makes the string explicit.
-    let canonical_project_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.clone())
-        .to_string_lossy()
-        .into_owned();
-    let state = Rc::new(RefCell::new(AgentPanelState {
-        tabs,
-        editor_context,
-        backend_kind,
+    let state = Rc::new(RefCell::new(panel_state(
         project_dir,
-        canonical_project_dir,
-        prefs_dir,
+        editor_context,
+        scratch,
+        backend_kind,
         supervisor,
         supervisor_pending,
-        shutting_down: false,
-        theme: neovibe_core::theme::ThemeTokens::fallback(),
-        keymap_help: None,
-        pane_focused: false,
-        hint_hook: None,
-        attention_hook: None,
-        last_tabs_payload: None,
-        last_open_ids: Vec::new(),
-        scratch,
-        pending_edits: Vec::new(),
-        editor_request_hook: None,
-        editor_done_hook: None,
-        retiring: Retiring::default(),
-        history_dir,
-        rules_dir,
-        history,
-        document_ready: false,
-        last_context_payload: None,
-        tab_verb_hook: None,
-        nav_mode: Cell::new(PanelKeys::Other),
-        nav_fallthrough_hook: None,
-        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
-    }));
+    )));
 
     content_manager.register_script_message_handler("neovibeAgent", None);
     {
@@ -1380,7 +1382,7 @@ pub(crate) fn build_agent_panel(
 
     let handle = AgentPanelHandle {
         state: state.clone(),
-        webview: webview.clone(),
+        webview: Some(webview.clone()),
     };
 
     // R1-6: recover this WebView's own crash automatically (guarded) instead of leaving the chat
@@ -1394,6 +1396,76 @@ pub(crate) fn build_agent_panel(
     }
 
     (webview.upcast(), handle)
+}
+
+/// The panel's state, the same with a page or without one (`build_agent_panel`'s `unavailable`):
+/// the tab set in the project's remembered mode, its prompt history and saved permission rules.
+fn panel_state(
+    project_dir: PathBuf,
+    editor_context: neovibe_core::editor_context::ContextSource,
+    scratch: Option<neovibe_core::scratch::ScratchDir>,
+    backend_kind: BackendKind,
+    supervisor: Option<crate::supervisor_client::SupervisorClient>,
+    supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
+) -> AgentPanelState {
+    let state_home = std::env::var_os("XDG_STATE_HOME");
+    let home = std::env::var_os("HOME");
+    let prefs_dir = neovibe_core::agent_prefs::state_dir(state_home.as_deref(), home.as_deref());
+    let (mode, notes) = neovibe_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
+    let history_dir = neovibe_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
+    let rules_dir = neovibe_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
+    let (history, notes) = neovibe_core::prompt_history::startup(history_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
+    let (rules, notes) = neovibe_core::permission_store::startup(rules_dir.as_deref(), &project_dir);
+    for note in notes {
+        eprintln!("{note}");
+    }
+    let mut tabs = neovibe_core::tab_set::TabSet::new(backend_kind, mode);
+    tabs.set_rules(rules);
+    // The key a session lease is taken under (`AgentConversation` canonicalizes its cwd the same
+    // way). `main.rs` already canonicalized the root; this only makes the string explicit.
+    let canonical_project_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.clone())
+        .to_string_lossy()
+        .into_owned();
+    AgentPanelState {
+        tabs,
+        editor_context,
+        backend_kind,
+        project_dir,
+        canonical_project_dir,
+        prefs_dir,
+        supervisor,
+        supervisor_pending,
+        shutting_down: false,
+        theme: neovibe_core::theme::ThemeTokens::fallback(),
+        keymap_help: None,
+        pane_focused: false,
+        hint_hook: None,
+        attention_hook: None,
+        last_tabs_payload: None,
+        last_open_ids: Vec::new(),
+        scratch,
+        pending_edits: Vec::new(),
+        editor_request_hook: None,
+        editor_done_hook: None,
+        retiring: Retiring::default(),
+        history_dir,
+        rules_dir,
+        history,
+        document_ready: false,
+        last_context_payload: None,
+        tab_verb_hook: None,
+        nav_mode: Cell::new(PanelKeys::Other),
+        nav_fallthrough_hook: None,
+        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+    }
 }
 
 /// The panel's single main-loop tick, over EVERY tab (spec §3.1). Three jobs, in order:
@@ -3857,6 +3929,75 @@ mod tests {
             nav_fallthrough_hook: None,
             crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
         }))
+    }
+
+    /// v1-dist sub-plan 2026-09-28-v1-dist-ubuntu-userns: with no page (WebKit's sandbox cannot
+    /// start, so no `WebView` exists), every call `main.rs`'s focus, HINT, prefix, tab-verb, theme,
+    /// zoom and close paths make still runs -- none panics, none needs a display -- and nothing that
+    /// only a page could act on happens: no tab is opened or switched to (the verbs refuse, so the
+    /// prefix flashes), `panel_keys` never leaves `Other` (so `Ctrl+j`/`Ctrl+k` are never claimed for
+    /// a composer that does not exist and always move focus), and the chat owes no attention.
+    #[test]
+    fn a_panel_with_no_page_answers_every_window_call_and_does_nothing_a_page_would() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let handle = AgentPanelHandle {
+            state: state.clone(),
+            webview: None,
+        };
+        let tabs_before: Vec<TabId> = state.borrow().tabs.tabs().iter().map(|t| t.id).collect();
+
+        // Focus and arrival (`pane_focus`, `move_focus`, `arrive`), the prefix's panel keys.
+        handle.set_pane_focused(true);
+        handle.arrive();
+        handle.enter_input();
+        handle.nav_key(NavKeyDirection::Down);
+        handle.literal_key(&neovibe_core::keymap::KeySpec::parse("C-b").unwrap());
+        handle.open_keymap();
+        handle.set_keymap_help("{}".to_string());
+        assert!(state.borrow().pane_focused);
+        assert_eq!(handle.panel_keys(), PanelKeys::Other);
+        handle.set_pane_focused(false);
+
+        // HINT (`hint::HintCoordinator`): every envelope is a no-op.
+        handle.hint_collect(1);
+        handle.hint_show(1, &["a".to_string()]);
+        handle.hint_prefix(1, "a");
+        handle.hint_land(1, 0);
+        handle.hint_end(1);
+
+        // Theme, zoom, reload and a crash report: recorded where there is state, nothing else.
+        let mut tokens = neovibe_core::theme::ThemeTokens::fallback();
+        tokens.font_size_px = 17.0;
+        handle.set_theme(&tokens);
+        assert_eq!(state.borrow().theme.font_size_px, 17.0);
+        handle.set_panel_font_size_px(19.0);
+        handle.set_editor_row_px(21.0);
+        assert_eq!(state.borrow().theme.font_size_px, 19.0);
+        handle.reload_document();
+        handle.reload_document_by_hand();
+        handle.on_web_process_terminated(webkit6::WebProcessTerminationReason::Crashed);
+
+        // The tab verbs refuse: nothing a user could not see is opened, closed or switched to.
+        handle.new_tab();
+        assert!(!handle.step(1));
+        assert!(!handle.select_last());
+        assert!(!handle.select_number(1));
+        handle.begin_rename();
+        handle.confirm_close();
+        handle.confirm_close_others();
+        handle.open_chooser();
+        handle.open_detail();
+        assert!(!handle.focus_oldest_card());
+        assert_eq!(handle.close_every_tab(), Ok(0));
+        let tabs_after: Vec<TabId> = state.borrow().tabs.tabs().iter().map(|t| t.id).collect();
+        assert_eq!(tabs_after, tabs_before);
+
+        // What the tray, the toast and the window-close prompt ask.
+        assert_eq!(handle.attention(), Default::default());
+        assert_eq!(handle.newest_card_label(), None);
+        assert_eq!(handle.running_count(), 0);
+        assert_eq!(handle.queued_count(), 0);
+        assert!(!handle.poll_activate());
     }
 
     /// Panel round 2 plan Task 6: `tab_verb` refuses naming why until `main.rs` installs a hook

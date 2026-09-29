@@ -1,6 +1,6 @@
 [package]
 name = "neovide-editor"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -8,7 +8,7 @@ publish.workspace = true
 name = "neovide_editor"
 
 [dependencies]
-gtk4 = { version = "0.11.4", features = ["v4_18"] }
+gtk4 = { version = "0.11.4", features = ["v4_14"] }
 # `fstat` and `dup2` for `stdin::detach_stdin_from_nvim`, which std does not expose. Already in the
 # shipped binary through `agent`, so this adds no crate to what `shell` links.
 libc = "0.2"

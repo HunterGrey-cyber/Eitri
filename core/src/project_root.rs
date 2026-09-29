@@ -40,11 +40,48 @@ const PROJECT_DIR_ENV: &str = "NEOVIBE_PROJECT_DIR";
 /// startup failure** -- loudly, at the first launch, rather than by silently opening the wrong
 /// directory, which is the trade this module exists to make. It takes no value; one that did
 /// would need more than a membership test here (see [`select_root_source`]'s doc).
-const KNOWN_FLAGS: [&str; 1] = ["--clean"];
+///
+/// `--version` (v1-dist plan Task 1, spec §3) joined this list rather than being handled some
+/// other way, for exactly the reason above: `main()` intercepts it and exits before `resolve()`
+/// is ever called, but a flag `main()` matches and this module does not know about is still the
+/// silent-wrong-project failure this module exists to rule out -- this list is the one place that
+/// distinction is made, whether or not the caller happens to reach it on a given run.
+///
+/// `--legacy` (v1-dist plan Task 5, spec §10, D16) joined it for the identical reason: `main()`
+/// also intercepts it and exits before `resolve()` is reached, on any build that did not compile
+/// the legacy backend in (every release). Listed in **every** build regardless -- this module has
+/// no notion of the `legacy-backend` cargo feature, and the point is the same either way: a release
+/// user who types `shell --legacy` gets `LEGACY_NOT_IN_BUILD`'s real reason, never "unrecognized
+/// option --legacy" from this module, nor a silently opened cwd.
+const KNOWN_FLAGS: [&str; 3] = ["--clean", "--version", "--legacy"];
 
 /// The conventional end-of-flags separator. The first token after it is the project directory
 /// verbatim, so a directory whose name really does begin with `-` is reachable.
 const END_OF_FLAGS: &str = "--";
+
+/// Whether `flag` appears in `args` *before* the first `--` -- the same end-of-flags rule
+/// [`select_root_source`] itself applies.
+///
+/// `shell/src/main.rs` used to run its own early `--version`/`--legacy`/`--clean` scans as three
+/// separate `args_os().any(|a| a == "...")` loops, none of which knew about `--` at all. So
+/// `shell -- --version` printed the version line instead of opening a directory literally named
+/// `--version`, and (on a build that did not compile the legacy backend in -- every release)
+/// `shell -- --legacy` was refused before ever reaching the directory step instead of opening a
+/// directory literally named `--legacy` (v1-dist verdict #5). Routing all three scans through this
+/// one function -- rather than three ad-hoc loops that could each get `--` handling right or wrong
+/// independently -- is what keeps `main()` and [`select_root_source`] from being able to disagree
+/// about where flag parsing ends.
+pub fn flag_given<'a>(args: impl IntoIterator<Item = &'a OsStr>, flag: &str) -> bool {
+    for arg in args {
+        if arg == OsStr::new(END_OF_FLAGS) {
+            return false;
+        }
+        if arg == OsStr::new(flag) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Which of the three candidates won, decided before any filesystem call happens. Separating the
 /// choice from the `canonicalize` is what keeps the precedence rule unit-testable without a real
@@ -222,6 +259,28 @@ mod tests {
     }
 
     #[test]
+    fn version_is_a_known_flag_and_never_a_project_directory() {
+        // `main()` intercepts `--version` and exits before `resolve()` is ever called (v1-dist
+        // plan Task 1), but this module must still classify it the same way `--clean` is
+        // classified: as a known flag, never as a project directory named "--version".
+        assert_eq!(select(["--version"], None), Ok(RootSource::Cwd));
+        // `shell --version /x` is not an error for the resolver -- the flag is skipped and the
+        // real positional argument after it is still found, the same shape as `--clean` above.
+        assert_eq!(select(["--version", "/x"], None), Ok(argument("/x")));
+    }
+
+    #[test]
+    fn legacy_is_a_known_flag_in_every_build_and_never_a_project_directory() {
+        // `main()` intercepts `--legacy` too (v1-dist plan Task 5, spec §10) -- on a build that
+        // did not compile the legacy backend in, it exits before `resolve()` is ever called, the
+        // same shape `--version` uses. This module lists it regardless of that cargo feature, so a
+        // release still reports `LEGACY_NOT_IN_BUILD`'s real reason rather than this module's own
+        // "unrecognized option --legacy".
+        assert_eq!(select(["--legacy"], None), Ok(RootSource::Cwd));
+        assert_eq!(select(["--legacy", "/x"], None), Ok(argument("/x")));
+    }
+
+    #[test]
     fn an_unrecognized_option_is_an_error_rather_than_a_silent_fallback_to_the_cwd() {
         // The failure this replaces: `shell -myproj` (or a mistyped `--clen`) used to be dropped
         // on the floor and the cwd opened instead, with nothing printed anywhere.
@@ -298,6 +357,28 @@ mod tests {
     #[test]
     fn nothing_at_all_falls_back_to_the_cwd() {
         assert_eq!(select([], None), Ok(RootSource::Cwd));
+    }
+
+    #[test]
+    fn flag_given_finds_a_flag_before_the_double_dash() {
+        let args: Vec<OsString> = ["--legacy", "--", "/proj"].iter().map(OsString::from).collect();
+        assert!(flag_given(args.iter().map(OsString::as_os_str), "--legacy"));
+    }
+
+    #[test]
+    fn flag_given_does_not_find_a_flag_after_the_double_dash() {
+        // The exact defect this function replaces: `shell -- --version` must open a directory
+        // literally named `--version`, not have `main()`'s own early scan still detect the flag
+        // past the `--` (v1-dist verdict #5).
+        let args: Vec<OsString> = ["--", "--version"].iter().map(OsString::from).collect();
+        assert!(!flag_given(args.iter().map(OsString::as_os_str), "--version"));
+    }
+
+    #[test]
+    fn flag_given_works_with_no_double_dash_present() {
+        let args: Vec<OsString> = ["--clean"].iter().map(OsString::from).collect();
+        assert!(flag_given(args.iter().map(OsString::as_os_str), "--clean"));
+        assert!(!flag_given(args.iter().map(OsString::as_os_str), "--version"));
     }
 
     #[test]

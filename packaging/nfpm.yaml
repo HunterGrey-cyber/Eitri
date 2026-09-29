@@ -6,13 +6,26 @@ maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 description: |
   Neovim, embedded as a real component, with a Claude agent panel beside it.
   Pre-MVP: the agent can read, search and talk, but cannot yet edit your files.
+  Source, including this package's own build recipe: ${NEOVIBE_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
-license: MIT
+# SPDX. The public expression (packaging/nfpm-public.yaml) plus
+# LicenseRef-Anthropic-Claude-Agent-SDK: unlike the public profile, this one ships the sidecar
+# (decision B, 2026-09-19), so its notice must name the SDK's own licence too (spec sec 8, sec 11).
+license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0 AND LicenseRef-Anthropic-Claude-Agent-SDK
 
 # Direct links only -- gtk4 and webkitgtk pull in the other ~100 transitively, and listing those
 # would pin versions this package has no opinion about. `neovim` and `claude` are runtime lookups on
 # PATH rather than link-time: nvim is a real package, `claude` is not in any distro and is named in
 # the description instead of pretended to be resolvable.
+#
+# `neovim` itself is a top-level (Arch/pacman-default) `depends`, not a `recommends`: nfpm's
+# archlinux packager writes `depend` lines only -- no `optdepend` -- so there is no soft-dependency
+# spelling to move it to there (the KNOWN LIMIT note below this file already established that for
+# the font). The `.deb` moves it to `recommends` instead (D8, spec sec 8): the private mirror's own audience
+# is this owner's machines, where a distro `neovim` package satisfying `Depends:` and then being
+# too old to run (Ubuntu 24.04 ships 0.9.5, spec sec 2.4) is the failure D8 exists to avoid on
+# Debian/Ubuntu hosts specifically; pacman has no such floor problem recorded, so its hard
+# `depends` is left as is.
 depends:
   - gtk4
   - webkitgtk-6.0
@@ -40,18 +53,21 @@ overrides:
     depends:
       - libgtk-4-1
       - libwebkitgtk-6.0-4
-      - neovim
+    # neovim moved here from `depends` (spec sec 8, D8): Ubuntu 24.04's own neovim is 0.9.5, below
+    # the fork's floor of 0.10, so a hard `Depends:` would resolve, install, and then fail at first
+    # launch with no useful error (the same reasoning as the public `.deb`, packaging/nfpm-public.yaml).
     recommends:
       - fonts-noto-core
+      - neovim
 
 contents:
-  # All five must land in ONE directory: each companion is located as a sibling of the running
+  # All four must land in ONE directory: each companion is located as a sibling of the running
   # executable (`current_exe()`'s parent). Splitting them produces a build that starts and then
-  # silently has no pane switching, no supervisor, and no permission gate on the legacy backend.
+  # silently has no pane switching or supervisor. There were five here and `agent-hook` (legacy's
+  # PreToolUse relay); it is gone (D16, spec sec 10) -- no release contains the legacy backend, the
+  # private one included, so there is no gate left for it to relay for.
   - src: ./target/release/shell
     dst: /usr/lib/neovibe/shell
-  - src: ./target/release/agent-hook
-    dst: /usr/lib/neovibe/agent-hook
   - src: ./target/release/neovibe-supervisor
     dst: /usr/lib/neovibe/neovibe-supervisor
   - src: ./target/release/neovibe-tmux-shim
@@ -60,7 +76,7 @@ contents:
     dst: /usr/lib/neovibe/neovibe-claude-handoff
 
   # The Verdandi sidecar, as a self-contained executable with no Node runtime dependency (its own
-  # build bundles one). Installed as a SIXTH sibling, under a versionless name: the artifact's own
+  # build bundles one). Installed as a FIFTH sibling, under a versionless name: the artifact's own
   # file name carries its version and architecture, which is right for a download and wrong for an
   # installed path -- encoding it here would make every sidecar upgrade a change to this file. The
   # compatibility statement lives in the handshake (protocol major plus sidecar_version).
@@ -73,10 +89,34 @@ contents:
   - src: ./dist/verdandi-claude-sidecar
     dst: /usr/lib/neovibe/verdandi-claude-sidecar
 
+  # Which Verdandi revision that sidecar was built from, spelled as the PUBLIC twin rev (the one
+  # `EXPECTED_VERDANDI_REVISION` in the extracted `shell` names), not the private rev it was
+  # actually built from -- publish.sh asserts the private pin's public export equals this rev before
+  # writing the file, so a private-rev mismatch never reaches a package (spec sec 8 step 5). A
+  # missing or mismatched `.rev` beside the sidecar sibling is what makes `spawn.rs`'s skew warning
+  # fire (spec sec 5.2).
+  - src: ./dist/verdandi-claude-sidecar.rev
+    dst: /usr/lib/neovibe/verdandi-claude-sidecar.rev
+    file_info:
+      mode: 0644
+
   - src: ./packaging/neovibe.launcher.sh
     dst: /usr/bin/neovibe
   - src: ./packaging/neovibe.desktop
     dst: /usr/share/applications/neovibe.desktop
+
+  # The AppArmor profile Ubuntu 23.10+'s user-namespace restriction needs before WebKit's sandbox
+  # can start (packaging/apparmor/neovibe; docs/superpowers/plans/2026-09-28-v1-dist-ubuntu-userns.md).
+  # The .deb only: no rpm-based distribution restricts user namespaces this way. A conffile
+  # (config|noreplace), so a site's edit survives an upgrade, and nothing loads it -- this package has
+  # no maintainer scripts: the next restart does, or `sudo apparmor_parser -r /etc/apparmor.d/neovibe`,
+  # which neovibe itself prints in the agent panel's place until it is loaded.
+  - src: ./packaging/apparmor/neovibe
+    dst: /etc/apparmor.d/neovibe
+    type: config|noreplace
+    packager: deb
+    file_info:
+      mode: 0644
 
   # neovibe's own licence, and the notices for everything else in this package. The second file is
   # generated by packaging/collect-licenses.py (publish.sh runs it before packaging and aborts if it
@@ -87,3 +127,16 @@ contents:
     dst: /usr/share/licenses/neovibe/LICENSE
   - src: ./dist/THIRD-PARTY-LICENSES
     dst: /usr/share/licenses/neovibe/THIRD-PARTY-LICENSES
+  # The LGPL-3.0 sec 4(d)(0) / GPL-3.0 sec 6(d) Corresponding Source notice: these packages ship the
+  # public release's own binaries, extracted rather than rebuilt (D2, spec sec 8 step 3), so this is
+  # the same `SOURCE` file the public tarball carries, taken from it unmodified (spec sec 8's "extra
+  # files" row).
+  - src: ./dist/SOURCE
+    dst: /usr/share/licenses/neovibe/SOURCE
+
+  # What `neovibe setup` reads on a private install too (spec sec 6.2, sec 8's "extra files" row):
+  # the public release's own manifest, taken from its tarball unmodified. 0644: read, never executed.
+  - src: ./dist/RELEASE
+    dst: /usr/lib/neovibe/RELEASE
+    file_info:
+      mode: 0644

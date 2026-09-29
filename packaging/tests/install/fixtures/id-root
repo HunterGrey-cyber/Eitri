@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test double for id: this process is root (ROOT-1).
+case ${1-} in
+-u) echo 0 ;;
+*) echo 'uid=0(root) gid=0(root) groups=0(root)' ;;
+esac

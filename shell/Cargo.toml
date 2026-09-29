@@ -1,15 +1,21 @@
 [package]
 name = "shell"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[build-dependencies]
+# build_web.rs's fingerprint over agent-ui/web's build inputs (v1-dist plan Task 6, P4-A1). Already
+# resolved in Cargo.lock as an ordinary dependency of `agent` (sha2 0.10.9), so this adds no new
+# crate to fetch -- only a new edge from `shell`'s own build script to a version cargo already has.
+sha2 = "0.10"
 
 [dependencies]
 neovide-editor = { path = "../neovide-editor" }
 agent = { path = "../agent" }
 neovibe-core = { path = "../core" }
 supervisor = { path = "../supervisor" }
-gtk4 = { version = "0.11.4", features = ["v4_18"] }
+gtk4 = { version = "0.11.4", features = ["v4_14"] }
 webkit6 = "0.6"
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
 serde_json = "1"
@@ -30,7 +36,19 @@ libloading = "0.9.0"
 # cache). The lockfile happened to pin 0.3.34, which is why this only mattered on paper before now.
 futures-channel = "0.3.32"
 
+[features]
+# The development-only legacy backend (`NEOVIBE_AGENT_BACKEND=legacy`, the sandbox GUI passes' stand-in
+# that spends nothing), off by default so that no plain `cargo build` -- a release's, the AUR's, a
+# README reader's -- contains it (spec 2026-09-27-v1-dist-design.md §10, D16). Ask for it with
+# `cargo run -p shell --features shell/legacy-backend`; `agent` holds every `cfg`.
+legacy-backend = ["neovibe-core/legacy-backend"]
+
 [dev-dependencies]
+# `tests/web_bundle_freshness.rs` `include!`s `build_web.rs` (the way `build_info_lockfile_parsing.rs`
+# already includes `build_info_lockfile.rs`), which needs sha2 in its own compilation graph too --
+# `[build-dependencies]` above covers only the actual build script, not a `tests/` target. Same crate,
+# same already-resolved version; this adds no new dependency edge cargo has to fetch.
+sha2 = "0.10"
 # Only to name a `TermMode` in a test: `terminal/keys.rs` checks a bare modifier's kitty code through
 # the real `terminal_input::encode`, which takes one (GUI pass 2026-09-23, defect 2). The version the
 # terminal crates already resolve, so it adds no crate to the graph and ships in no binary.
@@ -38,6 +56,23 @@ alacritty_terminal = "0.26.0"
 # `neovibe_core::test_providers::RecordingProvider`, for the agent panel's per-tab routing tests
 # (session tabs plan, Task 6). Tests only: the normal dependency above stays feature-free.
 neovibe-core = { path = "../core", features = ["test-support"] }
+# Only for `tests/nvim_bin_override.rs` (v1-dist plan Task 6, spec §7): that test drives a real,
+# headless `LiveHarness` directly, which needs the fork crate itself, not just `neovide-editor`'s
+# wrapper around it. Same rev as `neovide-editor/Cargo.toml`'s own (non-dev) dependency -- Cargo
+# already resolved this exact commit for that crate, so this adds no second build, only visibility
+# from this crate's own test code.
+neovide = { path = "../neovide" }
+
+# Guards the GTK 4.14 / WebKit 2.40 toolkit floor (spec 2026-09-27-v1-dist-design.md §2.2, plan
+# Task 2): a plain #[test] harness (unlike the three below), added explicitly so its presence in
+# `cargo test`'s default run is visible in this file rather than only in tests/'s directory listing.
+[[test]]
+name = "toolkit_floor"
+
+# Guards the web bundle's rebuild-when-any-input-changed rule (v1-dist plan Task 6, P4-A1): a plain
+# #[test] harness, added explicitly for the same reason `toolkit_floor` is above.
+[[test]]
+name = "web_bundle_freshness"
 
 # The panel keeps a streaming reply where the reader put it, in the real WebKitGTK (2026-09-24).
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored` and needs a display
@@ -67,4 +102,12 @@ harness = false
 # band one editor row high in GTK logical px while WebKitGTK zooms the page for `gtk-xft-dpi`.
 [[test]]
 name = "band_xft_zoom"
+harness = false
+
+# A plain `main`, because winit allows one `EventLoop` per process, on the main thread only (the
+# same reason `neovide-editor`'s own ignored `LiveHarness` tests are `harness = false`). Needs `nvim`
+# (>= 0.10) on `PATH` and the session's display (no window is ever shown). Proves the pinned fork
+# honours `NEOVIM_BIN` (v1-dist plan Task 6, spec §7): see the file's own header.
+[[test]]
+name = "nvim_bin_override"
 harness = false

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Test double for mv: the swap's second rename (.local/lib/neovibe.new -> .local/lib/neovibe) fails,
+# after the first has already moved the old install to neovibe.old; every other call runs the real
+# mv. Installed as <scratch>/stubs-mvterm/mv it first sends SIGTERM to the installer, as an interrupt
+# at that moment would. Either way the old install must come back (Review Focus 3: "a failed or
+# interrupted upgrade leaves the old install working").
+src=
+for a do
+	case $a in
+	--) ;;
+	*)
+		src=$a
+		break
+		;;
+	esac
+done
+case $src in
+*/.local/lib/neovibe.new)
+	case $0 in */stubs-mvterm/*) kill -TERM "$PPID" ;; esac
+	echo "mv: simulated failure of the swap" >&2
+	exit 1
+	;;
+esac
+for m in /usr/bin/mv /bin/mv; do
+	if [ -x "$m" ]; then exec "$m" "$@"; fi
+done
+exit 127

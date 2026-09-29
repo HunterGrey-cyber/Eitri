@@ -48,7 +48,10 @@ use crate::metrics::TerminalMetrics;
 /// Removed from the child's environment. A neovibe started from inside tmux would otherwise make
 /// every program in its terminal believe it is inside THAT tmux: nested-session refusals,
 /// vim-tmux-navigator driving the wrong server, `claude-wrapper` checking the wrong socket.
-pub const REMOVED_ENV: [&str; 2] = ["TMUX", "TMUX_PANE"];
+/// `NEOVIM_BIN` joins the other two (v1-dist plan Task 6, spec §7): `shell`'s own choice of which
+/// `nvim` the *editor* pane's Neovide runtime spawns must never reach a `neovide`/script started
+/// inside this terminal -- that terminal is a separate program the user is running, not the fork.
+pub const REMOVED_ENV: [&str; 3] = ["TMUX", "TMUX_PANE", "NEOVIM_BIN"];
 
 /// Set on the child, replacing whatever the host had. `TERM` is what the owner's own `foot.ini`
 /// sets; `TERM_PROGRAM=neovibe` is what his `.zshrc` keys neovibe-only remaps on.
@@ -407,13 +410,16 @@ mod tests {
     }
 
     #[test]
-    fn the_child_environment_is_the_hosts_minus_tmux_plus_three() {
+    fn the_child_environment_is_the_hosts_minus_tmux_and_neovim_bin_plus_three() {
         let host = os(&[
             ("PATH", "/usr/bin"),
             ("TMUX", "/tmp/tmux-1000/default,1,0"),
             ("TMUX_PANE", "%3"),
             ("TERM", "tmux-256color"),
             ("WAYLAND_DISPLAY", "wayland-0"),
+            // v1-dist plan Task 6, spec §7: `shell`'s own choice of `nvim` for the *editor* pane
+            // must never reach a `neovide`/script run inside this terminal.
+            ("NEOVIM_BIN", "/home/x/.local/share/neovibe/nvim/0.11.4/bin/nvim"),
         ]);
         let mut env = child_environment(host);
         env.sort();

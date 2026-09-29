@@ -1,0 +1,26 @@
+# The dash half of packaging/install.sh's harness (plan 2026-09-27-v1-dist, Task 9): Ubuntu 24.04,
+# whose /bin/sh is dash, with only what the installer and the harness need. apt-get runs here, in the
+# image build -- the container's package manager, never the host's.
+#
+# Built and run by packaging/test_install.py (spec §2.4's container hygiene):
+#   docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" -t neovibe-install-dash \
+#       -f packaging/tests/install/Dockerfile.dash packaging/tests/install
+#   docker run --rm --user "$(id -u):$(id -g)" --network none --mount type=bind,... neovibe-install-dash \
+#       /bin/sh <worktree>/packaging/tests/install/harness.sh --sh /bin/sh --scratch ...
+FROM ubuntu:24.04
+ARG UID=1000
+ARG GID=1000
+# python3 is only for the harness's fixture server (`python3 -m http.server` on the container's own
+# 127.0.0.1): with the server inside, the container runs with --network none and reaches nothing of
+# the host's. git is real (plan Task 11's --from-source/--verdandi-checkout tests clone, archive,
+# commit and read real repositories -- unlike the C/Rust/pkg-config toolchain check_build_tools also
+# checks, which the harness stubs entirely, so no rustc/cc/pkg-config/protobuf-compiler is needed
+# here).
+RUN apt-get update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+		curl openssh-client xz-utils ca-certificates python3 git \
+	&& rm -rf /var/lib/apt/lists/*
+# ssh-keygen refuses to run for a uid with no passwd entry ("No user exists for uid"), and the run
+# uses the host's uid. ubuntu:24.04 already has uid 1000 (`ubuntu`); any other uid gets a user.
+RUN getent group "$GID" >/dev/null || groupadd -g "$GID" tester; \
+	getent passwd "$UID" >/dev/null || useradd -u "$UID" -g "$GID" -M -d /nonexistent tester

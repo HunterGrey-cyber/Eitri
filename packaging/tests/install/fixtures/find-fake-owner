@@ -1,0 +1,25 @@
+#!/bin/sh
+# Test double for `find`: simulates a target directory being owned by a DIFFERENT user than the
+# installer's own uid, for M2's own regression tests (v1-dist whole-branch review, 2026-09-28) --
+# this sandbox has no way to chown a real directory to another uid without root, which this task's
+# own Global Constraints forbid using here. When invoked as `find -H PATH ...-uid...` against the
+# path a test named in <scratch>/logs/fake-owner-path, it reports that path as a hit, exactly as
+# the real find would for `! -uid OUR_ID` against a directory owned by someone else. Every other
+# invocation -- including every OTHER predicate this same installer run checks against that same
+# path (permissions, symlink-ness) -- runs the real find, untouched.
+S=$(cd "$(dirname "$0")/.." && pwd)
+real=
+for m in /usr/bin/find /bin/find; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+_marker=$S/logs/fake-owner-path
+if [ -f "$_marker" ] && [ "$1" = -H ] && [ "$2" = "$(cat "$_marker")" ]; then
+	case " $* " in
+	*' -uid '*)
+		printf '%s\n' "$2"
+		exit 0
+		;;
+	esac
+fi
+exec "$real" "$@"

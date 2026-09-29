@@ -1,0 +1,63 @@
+#!/bin/sh
+# Test double for `cargo`, standing in for the whole `cargo build --release --locked -p shell -p
+# agent -p supervisor --bins` recipe --from-source runs (plan 2026-09-27-v1-dist, Task 11, spec
+# §6.2): no test here ever runs a real multi-crate release compile. Records its argv (one line per
+# call) to <scratch>/logs/cargo.log and, on a `build` call, writes the four binaries install.sh's own
+# NV_BINARIES names into <target-dir>/release/. NEOVIBE_INSTALL_TEST_CARGO_MODE selects the
+# behaviour (default "ok"): "fail" makes the build call exit 1, so nothing after it in
+# do_from_source ever runs. "skip" (M4 minor follow-up / F3 fix-round-1 coverage gap, v1-dist
+# whole-branch review, fix round 2, 2026-09-28) exits 0 without writing anything at all into
+# <target-dir> -- standing in for a build genuinely redirected elsewhere (build.target,
+# CARGO_BUILD_TARGET) or one cargo decided needed no work, so a test can prove do_from_source's own
+# pre-build rm loop (which deletes each shipped binary from <src>/target/release before this stub
+# ever runs) is what makes staging fail honestly afterwards, rather than silently shipping whatever
+# was already on disk from an earlier run.
+#
+# F3 (v1-dist whole-branch review, 2026-09-28): real cargo honours --target-dir first, then
+# CARGO_TARGET_DIR, then falls back to target/ under the workspace root (run_in's cwd, the
+# cloned/checked-out source tree) -- this stub follows the same first two, so a test can prove
+# do_from_source's own --target-dir flag really does win over a caller's CARGO_TARGET_DIR rather
+# than just recording it and writing to cwd regardless.
+S=$(cd "$(dirname "$0")/.." && pwd)
+{
+	printf 'cargo'
+	printf ' %s' "$@"
+	printf '\n'
+	# installer-claude-4: also recorded, so a test can assert the pinned, checksummed Skia archive
+	# (never skia-bindings' own unauthenticated download) is what the build actually saw.
+	printf 'SKIA_BINARIES_URL=%s\n' "${SKIA_BINARIES_URL:-<unset>}"
+} >>"$S/logs/cargo.log"
+case $1 in
+build)
+	case ${NEOVIBE_INSTALL_TEST_CARGO_MODE:-ok} in
+	fail)
+		echo "cargo-fromsource-stub: simulated build failure" >&2
+		exit 1
+		;;
+	skip)
+		exit 0
+		;;
+	esac
+	_cfs_target_dir=
+	_cfs_prev=
+	for _cfs_a in "$@"; do
+		if [ "$_cfs_prev" = --target-dir ]; then _cfs_target_dir=$_cfs_a; fi
+		_cfs_prev=$_cfs_a
+	done
+	if [ -z "$_cfs_target_dir" ]; then _cfs_target_dir=${CARGO_TARGET_DIR:-target}; fi
+	mkdir -p "$_cfs_target_dir/release" || exit 1
+	for b in shell neovibe-supervisor neovibe-tmux-shim neovibe-claude-handoff agent-hook; do
+		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
+		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
+	done
+	exit 0
+	;;
+--version)
+	printf 'cargo 1.96.0-fromsource-stub\n'
+	exit 0
+	;;
+*)
+	echo "cargo-fromsource-stub: unexpected argv: $*" >&2
+	exit 1
+	;;
+esac

@@ -90,18 +90,37 @@ pub(crate) fn install(
     let register_fn = lua.create_function(move |_, spec: Table| {
         let parsed = parse_panel_spec(&spec)?;
         let resolved_url = resolve_panel_url(&config_dir, &parsed.url);
-        let webview = webkit6::WebView::new();
-        webview.load_uri(&resolved_url);
-        webview.set_hexpand(true);
-        webview.set_vexpand(true);
-        let crash_guard = install_crash_recovery(&webview, parsed.id.clone(), resolved_url.clone());
+        // WebKit's sandbox cannot start in this process (`crate::webkit_sandbox`, decided once in
+        // `main()`): no `WebView` is built -- WebKit would abort the whole process on it -- and the
+        // panel is registered as usual with a notice in its place, so its key, position and title
+        // still hold and `init.lua` needs no change. `main.rs`'s kill and revive paths downcast the
+        // widget to a `WebView` and skip anything else.
+        let (widget, crash_guard) = if crate::webkit_sandbox::decision().allows_webviews() {
+            let webview = webkit6::WebView::new();
+            webview.load_uri(&resolved_url);
+            webview.set_hexpand(true);
+            webview.set_vexpand(true);
+            let crash_guard = install_crash_recovery(&webview, parsed.id.clone(), resolved_url.clone());
+            (webview.upcast(), crash_guard)
+        } else {
+            eprintln!(
+                "[lua] panel '{}': not loading {resolved_url}: WebKit's sandbox cannot start here",
+                parsed.id
+            );
+            (
+                crate::webkit_sandbox::lua_panel_placeholder(&parsed.title),
+                Rc::new(RefCell::new(
+                    crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+                )),
+            )
+        };
         registry.borrow_mut().register(PanelEntry {
             id: parsed.id,
             title: parsed.title,
             slot: parsed.slot,
             key: parsed.key,
             url: resolved_url,
-            widget: webview.upcast(),
+            widget,
             crash_guard,
         });
         Ok(())

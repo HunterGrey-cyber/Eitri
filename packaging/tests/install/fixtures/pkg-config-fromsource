@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test double for `pkg-config`, standing in for check_build_tools' own `--exists gtk4` /
+# `--exists webkitgtk-6.0` checks (plan 2026-09-27-v1-dist, Task 11): no test here needs the real
+# GTK4/WebKitGTK development files installed. Reports both as present and nothing else.
+case $* in
+*--exists*gtk4* | *--exists*webkitgtk-6.0*) exit 0 ;;
+*)
+	echo "pkg-config-fromsource-stub: unexpected argv: $*" >&2
+	exit 1
+	;;
+esac

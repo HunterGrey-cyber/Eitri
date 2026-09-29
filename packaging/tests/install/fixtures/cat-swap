@@ -1,0 +1,24 @@
+#!/bin/sh
+# Test double for cat: runs the real cat, and when <scratch>/logs/swap names the file just read (its
+# second line), renames the file its first line names over it afterwards -- another process that
+# can rename files in a directory the user named, acting the moment the installer has read one.
+S=$(cd "$(dirname "$0")/.." && pwd)
+real=
+for m in /usr/bin/cat /bin/cat; do
+	if [ -x "$m" ]; then real=$m; break; fi
+done
+[ -n "$real" ] || exit 127
+last=
+for a do last=$a; done
+if [ -f "$S/logs/swap" ]; then
+	{ read -r src; read -r dst; } <"$S/logs/swap"
+	if [ "$last" = "$dst" ]; then
+		"$real" "$@"
+		rc=$?
+		rm -f "$S/logs/swap"
+		mv -f -- "$src" "$dst"
+		echo "swapped $dst" >>"$S/logs/swap.log"
+		exit "$rc"
+	fi
+fi
+exec "$real" "$@"

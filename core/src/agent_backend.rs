@@ -103,13 +103,26 @@ impl BackendKind {
         }
     }
 
-    /// Reads `NEOVIBE_AGENT_BACKEND`. Anything unrecognized falls back to `legacy` with a warning
-    /// rather than failing to start: a typo must not cost the user their editor, and silently
-    /// picking the NEW backend on a typo would be the dangerous direction.
-    pub fn from_env() -> Self {
+    /// Reads `NEOVIBE_AGENT_BACKEND` and `agent::LEGACY_BACKEND_COMPILED`.
+    ///
+    /// `legacy_flag` is `main()`'s own `--legacy`, read the same way it reads `--clean` -- passed
+    /// in rather than read here for the same testability reason `explicit` is (see [`choose`]).
+    ///
+    /// **Correction (2026-09-27, v1-dist plan Task 5, spec §10, D10, D16):** this used to fall back
+    /// to `legacy` on an unrecognized value or on "unset, no sidecar artifact" -- described just
+    /// below until this correction. Legacy is now the gated backend (`agent::LEGACY_BACKEND_COMPILED`,
+    /// off in every release), so a typo or a missing artifact can no longer land there: both now
+    /// select the sidecar, with a warning for the typo (D10). Only an explicit `--legacy` or
+    /// `NEOVIBE_AGENT_BACKEND=legacy` can still select legacy, and only in a build that compiled it
+    /// in -- otherwise `Err` names why. See [`choose`]'s own doc for the resulting matrix.
+    ///
+    /// [`choose`]: Self::choose
+    pub fn from_env(legacy_flag: bool) -> Result<Self, BackendChoiceError> {
         Self::choose(
             std::env::var("NEOVIBE_AGENT_BACKEND").ok().as_deref().map(str::trim),
-            agent::packaged_sidecar_available(),
+            legacy_flag,
+            agent::sidecar_availability(),
+            agent::LEGACY_BACKEND_COMPILED,
         )
     }
 
@@ -119,63 +132,93 @@ impl BackendKind {
     /// other test in this binary shares. That is not hygiene for its own sake: the same shape --
     /// a function taking an override as a signal while reading its value from the environment
     /// itself -- was a real bug in `locate_verdandi_checkout` earlier the same day, and a test is
-    /// what found it.
-    pub fn choose(explicit: Option<&str>, packaged_sidecar_available: bool) -> Self {
-        match explicit {
-            Some("sidecar") => BackendKind::Sidecar,
-            Some("legacy") => BackendKind::Legacy,
-            // Unset is the interesting case, and it is no longer a constant.
-            //
-            // **The sidecar is the intended backend** -- it has partial streaming, resume, bounded
-            // ingestion and typed permission outcomes, and it is immune to the class of failure
-            // that broke legacy's only permission gate on this host (a wrapper owning `--settings`;
-            // the sidecar delivers its hook as an in-process SDK callback). What kept legacy the
-            // default was never a preference: the sidecar needed a source checkout and Node, which
-            // an installed copy does not have.
-            //
-            // So the default follows what this installation can actually run, and the question is
-            // NARROW: is a sidecar artifact here that can be run **without building anything**?
-            // `agent::packaged_sidecar_available` answers it from three places -- a named binary,
-            // one beside this binary, or one already built in a Verdandi checkout -- and a checkout
-            // with nothing built still answers no, because a build is what must never happen behind
-            // a backend nobody chose. (That predicate said "a checkout never counts" until
-            // 2026-09-18; its own doc records why the object was wrong.)
-            //
-            // This says WHICH backend and WHY, in one word. It does not say which binary, because
-            // it cannot: a `bool` carries no path. `agent`'s own `agent: ...` line at session start
-            // names the exact program, which is the more precise answer to the same question.
-            // An empty value is "not set", the way a wrapper script's `VAR=` means it.
-            None | Some("") => {
-                if packaged_sidecar_available {
-                    eprintln!(
-                        "[agent_backend] using the sidecar backend: a sidecar artifact is available \
-                         with nothing to build (the `agent:` line below names which one)"
-                    );
-                    BackendKind::Sidecar
-                } else {
-                    // Said every time, not once: this is the line that explains why streaming and
-                    // resume are missing, and a reader who does not see it will look for the reason
-                    // in the code. It names the way out, because on a development machine there is
-                    // one and it is a single command.
-                    eprintln!(
-                        "[agent_backend] using the legacy backend: no sidecar artifact can be run \
-                         without building one -- NEOVIBE_SIDECAR_BINARY is unset, none sits beside \
-                         this binary, and no Verdandi checkout has one built. Build it once with \
-                         `npm run build:binary -w @verdandi/claude-sidecar` in the checkout, or set \
-                         NEOVIBE_AGENT_BACKEND=sidecar to build from source on first start"
-                    );
-                    BackendKind::Legacy
-                }
+    /// what found it. `legacy_compiled` is an input for the identical reason: it lets one test
+    /// binary exercise both the release matrix (`legacy_compiled = false`) and the development one
+    /// (`legacy_compiled = true`) without a `cfg`-gated test module.
+    ///
+    /// **The matrix (spec §10):**
+    /// - `--legacy` (`legacy_flag`) or `NEOVIBE_AGENT_BACKEND=legacy` (`explicit`) asks for legacy.
+    ///   When `legacy_compiled`, that ask is granted. When it is not (every release build), it is
+    ///   `Err` naming [`agent::LEGACY_NOT_IN_BUILD`] and which of the two asked -- the flag wins the
+    ///   naming when both are given, because it is a decision made on *this* invocation's command
+    ///   line, where the env var could be an inherited leftover nobody meant to set today.
+    /// - Everything else selects the sidecar, in both builds alike: an explicit `"sidecar"`, unset,
+    ///   empty (a wrapper script's `VAR=`, treated as unset), and -- since this correction -- an
+    ///   unrecognized value too (D10: it used to fall back to legacy, which is exactly the direction
+    ///   a typo must not go now that legacy is the gated backend) and unset with no artifact
+    ///   installed (it used to fall back to legacy for want of one; now it says
+    ///   [`agent::NO_SIDECAR_HINT`] and starts the sidecar path anyway, which fails with that same
+    ///   hint when it actually tries to spawn one). `sidecar` ([`agent::SidecarAvailability`]) only
+    ///   shapes which sentence this prints -- it is not part of the choice between backends. It was
+    ///   a `bool` (`packaged_sidecar_available`) until lane A's whole-branch review, which made the
+    ///   "not installed" sentence appear above a named `NEOVIBE_VERDANDI_CHECKOUT` the spawn was
+    ///   about to build; the third value names that case.
+    pub fn choose(
+        explicit: Option<&str>,
+        legacy_flag: bool,
+        sidecar: agent::SidecarAvailability,
+        legacy_compiled: bool,
+    ) -> Result<Self, BackendChoiceError> {
+        if legacy_flag || explicit == Some("legacy") {
+            if legacy_compiled {
+                return Ok(BackendKind::Legacy);
             }
-            Some(other) => {
+            // The flag is the more explicit act -- a decision made on this command line -- so it
+            // wins the naming when both are somehow given at once (e.g. a launcher's leftover
+            // `NEOVIBE_AGENT_BACKEND=legacy` plus a freshly typed `--legacy`).
+            let asked_via = if legacy_flag {
+                "--legacy"
+            } else {
+                "NEOVIBE_AGENT_BACKEND=legacy"
+            };
+            return Err(BackendChoiceError {
+                message: format!("{asked_via}: {}", agent::LEGACY_NOT_IN_BUILD),
+            });
+        }
+
+        // Every remaining case selects the sidecar (D10, D16) -- there is no fallback to legacy left
+        // in this function at all, in either build. An unrecognized value still gets its own
+        // warning, because a typo silently landing on ANY backend without a word about it is worse
+        // than the sidecar it now lands on.
+        if let Some(other) = explicit {
+            if other != "sidecar" && !other.is_empty() {
                 eprintln!(
                     "[agent_backend] NEOVIBE_AGENT_BACKEND={other:?} is not recognized \
-                     (expected \"legacy\" or \"sidecar\"); using legacy"
+                     (expected \"legacy\" or \"sidecar\"); using sidecar"
                 );
-                BackendKind::Legacy
             }
         }
+        match sidecar {
+            agent::SidecarAvailability::Runnable => eprintln!(
+                "[agent_backend] using the sidecar backend: a sidecar artifact is available \
+                 with nothing to build (the `agent:` line below names which one)"
+            ),
+            // Development only: naming a checkout is what authorizes the build (spawn step 2).
+            agent::SidecarAvailability::BuildsNamedCheckout => eprintln!(
+                "[agent_backend] using the sidecar backend: NEOVIBE_VERDANDI_CHECKOUT names a \
+                 checkout with no sidecar built for this machine, so the first session start \
+                 builds it there (npm)"
+            ),
+            // Said every time, not once: this is the line that explains why the panel's greeting
+            // names no session, and a reader who does not see it will look for the reason in the
+            // code. `NO_SIDECAR_HINT` names the way out (`neovibe setup`) because starting the
+            // sidecar path anyway is about to fail with that identical sentence.
+            agent::SidecarAvailability::Missing => {
+                eprintln!("[agent_backend] using the sidecar backend: {}", agent::NO_SIDECAR_HINT)
+            }
+        }
+        Ok(BackendKind::Sidecar)
     }
+}
+
+/// What [`BackendKind::choose`] returns when `--legacy`/`NEOVIBE_AGENT_BACKEND=legacy` asked for a
+/// backend this build did not compile in. `message` is a finished, human-readable sentence for
+/// `main()` to print before exiting -- the same contract `neovibe_core::project_root::resolve`'s
+/// `Result<_, String>` keeps, as a dedicated type here only so the error case cannot be confused
+/// with a real `BackendKind` at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendChoiceError {
+    pub message: String,
 }
 
 /// One command's failure, classified by whether the conversation survives it.
@@ -1214,41 +1257,111 @@ impl BackendGreeting {
 
 #[cfg(test)]
 mod tests {
+    use agent::SidecarAvailability::{self, BuildsNamedCheckout, Missing, Runnable};
 
-    /// The explicit variable wins in both directions, whatever is installed. Someone who names a
-    /// backend is testing that backend, and an installation that happens to carry an artifact must
-    /// not quietly overrule them.
+    /// Every answer `agent::sidecar_availability` can give. None of them may change which backend is
+    /// chosen: since v1-dist Task 5 it only picks the startup line.
+    const ALL_AVAILABILITIES: [SidecarAvailability; 3] = [Runnable, BuildsNamedCheckout, Missing];
+
+    /// The explicit variable wins over what is installed, whatever is installed -- and now that
+    /// legacy is the gated backend (v1-dist plan Task 5, spec §10, D16), it wins only where this
+    /// build compiled legacy in at all. Someone who names a backend is testing that backend, and
+    /// an installation that happens to carry a sidecar artifact must not quietly overrule them.
     #[test]
     fn an_explicit_choice_beats_what_is_installed() {
-        for available in [true, false] {
-            assert_eq!(BackendKind::choose(Some("sidecar"), available), BackendKind::Sidecar);
-            assert_eq!(BackendKind::choose(Some("legacy"), available), BackendKind::Legacy);
+        for available in ALL_AVAILABILITIES {
+            for legacy_compiled in [true, false] {
+                assert_eq!(
+                    BackendKind::choose(Some("sidecar"), false, available, legacy_compiled),
+                    Ok(BackendKind::Sidecar)
+                );
+            }
+            assert_eq!(
+                BackendKind::choose(Some("legacy"), false, available, true),
+                Ok(BackendKind::Legacy)
+            );
         }
     }
 
-    /// The default follows what this installation can actually run. This is the change that makes
-    /// the sidecar the real default the moment the artifact ships -- with no further edit here,
-    /// which is the point: a constant would have to be flipped by hand in a release nobody
-    /// remembers to do it in.
+    /// The default follows what this installation can actually run -- in every build alike, since
+    /// this correction: legacy is never the fallback for "unset, no sidecar artifact" any more,
+    /// whether or not this build could have compiled legacy in. This is the change that makes the
+    /// sidecar the real default the moment the artifact ships, with no further edit here.
     #[test]
-    fn with_nothing_set_the_default_is_whichever_backend_this_installation_can_run() {
-        assert_eq!(BackendKind::choose(None, true), BackendKind::Sidecar);
-        assert_eq!(BackendKind::choose(None, false), BackendKind::Legacy);
+    fn with_nothing_set_the_default_is_the_sidecar_in_every_build() {
+        for legacy_compiled in [true, false] {
+            for available in ALL_AVAILABILITIES {
+                assert_eq!(
+                    BackendKind::choose(None, false, available, legacy_compiled),
+                    Ok(BackendKind::Sidecar)
+                );
+            }
+        }
     }
 
-    /// `VAR=` in a wrapper script means "not set", and honouring it literally would take the
-    /// unrecognised branch and pin every such launch to legacy however the machine is equipped.
+    /// `VAR=` in a wrapper script means "not set", and selects the sidecar exactly like `None`
+    /// does, in every build.
     #[test]
     fn an_empty_variable_is_not_a_choice() {
-        assert_eq!(BackendKind::choose(Some(""), true), BackendKind::Sidecar);
-        assert_eq!(BackendKind::choose(Some(""), false), BackendKind::Legacy);
+        for legacy_compiled in [true, false] {
+            assert_eq!(
+                BackendKind::choose(Some(""), false, Runnable, legacy_compiled),
+                Ok(BackendKind::Sidecar)
+            );
+            assert_eq!(
+                BackendKind::choose(Some(""), false, Missing, legacy_compiled),
+                Ok(BackendKind::Sidecar)
+            );
+        }
     }
 
-    /// A typo must not silently select the newer backend -- that is the dangerous direction, and it
-    /// stays legacy even where the sidecar is available.
+    /// A typo selects the sidecar with a warning (D10) -- it used to fall back to legacy, which is
+    /// exactly the dangerous direction now that legacy is the gated backend. True in every build:
+    /// there is no "well this one compiled legacy in, so fall back there" exception left.
     #[test]
-    fn an_unrecognized_value_falls_back_to_legacy_even_where_the_sidecar_is_available() {
-        assert_eq!(BackendKind::choose(Some("sidcar"), true), BackendKind::Legacy);
+    fn an_unrecognized_value_selects_the_sidecar_in_every_build() {
+        for legacy_compiled in [true, false] {
+            for available in ALL_AVAILABILITIES {
+                assert_eq!(
+                    BackendKind::choose(Some("sidcar"), false, available, legacy_compiled),
+                    Ok(BackendKind::Sidecar)
+                );
+            }
+        }
+    }
+
+    /// A release build (legacy not compiled in) refuses `--legacy` and `NEOVIBE_AGENT_BACKEND=legacy`
+    /// alike, `Err` naming `LEGACY_NOT_IN_BUILD` and which of the two asked -- and the refusal does
+    /// not depend on whether a sidecar artifact happens to be installed.
+    #[test]
+    fn a_release_build_refuses_legacy_by_flag_or_by_variable() {
+        let by_flag = BackendKind::choose(None, true, Runnable, false).unwrap_err();
+        assert!(by_flag.message.contains(agent::LEGACY_NOT_IN_BUILD), "{by_flag:?}");
+        assert!(by_flag.message.contains("--legacy"), "{by_flag:?}");
+
+        let by_var = BackendKind::choose(Some("legacy"), false, Runnable, false).unwrap_err();
+        assert!(by_var.message.contains(agent::LEGACY_NOT_IN_BUILD), "{by_var:?}");
+        assert!(by_var.message.contains("NEOVIBE_AGENT_BACKEND=legacy"), "{by_var:?}");
+
+        // Not "an artifact happens to be missing" -- it refuses with one available too, above.
+        assert!(BackendKind::choose(None, true, Missing, false).is_err());
+    }
+
+    /// A development build (legacy compiled in) grants `--legacy` regardless of the environment,
+    /// and the flag beats a conflicting `NEOVIBE_AGENT_BACKEND=sidecar` -- it is the more explicit
+    /// act, made on this invocation's own command line, where the env var could be an inherited
+    /// leftover nobody meant to set today.
+    #[test]
+    fn a_development_build_grants_legacy_by_flag_over_a_conflicting_variable() {
+        assert_eq!(
+            BackendKind::choose(Some("sidecar"), true, Runnable, true),
+            Ok(BackendKind::Legacy)
+        );
+        assert_eq!(BackendKind::choose(None, true, Runnable, true), Ok(BackendKind::Legacy));
+        assert_eq!(
+            BackendKind::choose(Some("legacy"), false, Runnable, true),
+            Ok(BackendKind::Legacy)
+        );
     }
     use super::*;
     use crate::editor_context::{EditorContext, Selection};

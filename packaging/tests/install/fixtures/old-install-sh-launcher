@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# neovibe, installed by install.sh. Everything it decides is printed before the window opens.
+set -euo pipefail
+# Test fixture: the opening lines of the launcher the pre-v1 root install.sh wrote. The installer
+# recognises that launcher by its second line alone (spec 2026-09-27-v1-dist-design.md §6.5).
+exec "$HOME/.local/lib/neovibe/shell" "$@"

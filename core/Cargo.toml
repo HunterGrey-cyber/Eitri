@@ -1,12 +1,16 @@
 [package]
 name = "neovibe-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [features]
 # Lets `shell`'s tests use `test_providers`' doubles.
 test-support = []
+# The development-only legacy backend, off by default and in no release (spec
+# 2026-09-27-v1-dist-design.md §10, D16): forwarded to `agent`, which holds every `cfg`. Without it,
+# `AgentBackend::Legacy` still compiles but can never be constructed.
+legacy-backend = ["agent/legacy-backend"]
 
 [dependencies]
 agent = { path = "../agent" }

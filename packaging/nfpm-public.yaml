@@ -1,0 +1,110 @@
+name: neovibe
+arch: amd64
+version: ${VERSION}
+release: 1
+version_schema: semver
+maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
+description: |
+  Neovim, embedded as a real component, with a Claude agent panel beside it.
+  Uses your own Claude Code plan; run `neovibe setup` after installing to build the agent
+  backend (it downloads and builds Anthropic's Agent SDK on your own machine -- the SDK is not
+  ours to redistribute, so this package never contains it).
+  Source, including this package's own build recipe: ${NEOVIBE_SOURCE_URL}
+homepage: https://github.com/HunterGrey-cyber/neovibe
+# SPDX, spec sec 8/sec 11: this package (the tarball's four binaries, statically linking nvim-rs
+# LGPL-3.0-only) plus the collector's own MIT/Apache-2.0/MPL-2.0 findings. No
+# LicenseRef-Anthropic-Claude-Agent-SDK here -- this profile never carries the sidecar (D14, I7).
+license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
+
+# This is the PUBLIC profile: what `release.sh` packages from the public commit built in the
+# Ubuntu 24.04 container (spec sec 4, D2). No sidecar, no `agent-hook` (D16, spec sec 10 -- no
+# release ships the legacy backend), no maintainer scripts (a postinst would build the sidecar as
+# root, spec sec 8's "The public packages have no maintainer scripts"). The private mirror's
+# profile is packaging/nfpm.yaml; packaging/test_nfpm_profiles.py holds the two to differing only
+# in the fields spec sec 8's table lists.
+#
+# neovim is deliberately NOT a dependency of either the deb or the rpm (D8): Ubuntu 24.04 ships
+# neovim 0.9.5 (spec sec 2.4, `apt-cache policy` measured in the release container's base image --
+# the Neovide fork's own NEOVIM_REQUIRED_VERSION is (0, 10, 0)), so a `depends`/`Requires` on the
+# distro package would resolve, install, and then fail at first launch with no useful error.
+# Fedora's neovim tracks current upstream, so the rpm gets a soft `recommends`; on Arch many users
+# run bob or a self-built nvim, so the AUR packages (packaging/aur/) use `optdepends` instead of
+# either (spec sec 9).
+#
+# No top-level `depends:`/`recommends:` here, unlike the private profile: this profile only ever
+# produces `deb` and `rpm` (D7 -- no apk/archlinux target through nfpm; Arch ships through the AUR
+# PKGBUILDs instead), and both are fully covered by `overrides` below. Verified against this host's
+# nfpm, 2026-09-27: a profile with no top-level `depends:`/`recommends:` at all, only
+# `overrides.<packager>`, produces exactly that packager's list for both `deb` and `rpm` -- so
+# nothing here depends on whether `overrides` replaces or extends a top-level default.
+overrides:
+  deb:
+    depends:
+      - libgtk-4-1 (>= 4.14)
+      - libwebkitgtk-6.0-4
+  rpm:
+    depends:
+      - gtk4 >= 4.14
+      - webkitgtk6.0
+    recommends:
+      - neovim
+
+contents:
+  # The four binaries every release ships. No agent-hook (legacy's PreToolUse relay, D16): the
+  # legacy backend is never compiled into a release build in the first place, so there is nothing
+  # for that binary to relay for.
+  - src: ./target/release/shell
+    dst: /usr/lib/neovibe/shell
+  - src: ./target/release/neovibe-supervisor
+    dst: /usr/lib/neovibe/neovibe-supervisor
+  - src: ./target/release/neovibe-tmux-shim
+    dst: /usr/lib/neovibe/neovibe-tmux-shim
+  - src: ./target/release/neovibe-claude-handoff
+    dst: /usr/lib/neovibe/neovibe-claude-handoff
+
+  # The installer itself, staged under the install directory as `neovibe setup` (spec sec 6.2,
+  # sec 8): `packaging/install.sh` and this copy must be byte-identical (release.sh's content
+  # check, spec sec 4.2 step 9), which is why this entry names the tracked file directly rather
+  # than a build output.
+  - src: ./packaging/install.sh
+    dst: /usr/lib/neovibe/neovibe-setup
+    file_info:
+      mode: 0755
+
+  # What `neovibe setup` (and the launcher's pre-flight hint) reads to know which sidecar
+  # revision, Node pin and nvim pin this install expects (spec sec 4.3, sec 6.2). 0644: it is
+  # read, never executed.
+  - src: ./dist/RELEASE
+    dst: /usr/lib/neovibe/RELEASE
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/neovibe.launcher.sh
+    dst: /usr/bin/neovibe
+  - src: ./packaging/neovibe.desktop
+    dst: /usr/share/applications/neovibe.desktop
+
+  # The AppArmor profile Ubuntu 23.10+'s user-namespace restriction needs before WebKit's sandbox
+  # can start (packaging/apparmor/neovibe; docs/superpowers/plans/2026-09-28-v1-dist-ubuntu-userns.md).
+  # The .deb only: no rpm-based distribution restricts user namespaces this way. A conffile
+  # (config|noreplace), so a site's edit survives an upgrade, and nothing loads it -- this package has
+  # no maintainer scripts: the next restart does, or `sudo apparmor_parser -r /etc/apparmor.d/neovibe`,
+  # which neovibe itself prints in the agent panel's place until it is loaded.
+  - src: ./packaging/apparmor/neovibe
+    dst: /etc/apparmor.d/neovibe
+    type: config|noreplace
+    packager: deb
+    file_info:
+      mode: 0644
+
+  # neovibe's own licence, the notices for everything else this package links or bundles
+  # (packaging/collect-licenses.py --no-sidecar, spec sec 11), and the LGPL-3.0 sec 4(d)(0) /
+  # GPL-3.0 sec 6(d) Corresponding Source notice naming the source asset and the exact relink
+  # recipe. All three are the public release's own files (release.sh writes them before staging
+  # this package, spec sec 4.2 steps 6-7), so this profile never regenerates them itself.
+  - src: ./LICENSE
+    dst: /usr/share/licenses/neovibe/LICENSE
+  - src: ./dist/THIRD-PARTY-LICENSES
+    dst: /usr/share/licenses/neovibe/THIRD-PARTY-LICENSES
+  - src: ./dist/SOURCE
+    dst: /usr/share/licenses/neovibe/SOURCE

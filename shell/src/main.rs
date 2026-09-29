@@ -30,6 +30,8 @@ mod text_size;
 mod theme;
 mod toast;
 mod tray;
+mod version;
+mod webkit_sandbox;
 mod webkit_zoom;
 mod webview_crash_guard;
 mod wheel_zoom;
@@ -37,6 +39,7 @@ mod window_mode;
 mod xft_dpi;
 
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -70,6 +73,45 @@ fn config_dir() -> PathBuf {
 }
 
 fn main() -> glib::ExitCode {
+    // Collected once, before anything else, and consulted through `flag_given` -- never a raw
+    // `args_os().any(|a| a == "...")` -- by every early flag scan below (`--version`, `--legacy`,
+    // `--clean`). `flag_given` stops at the first `--`, the same end-of-flags rule
+    // `neovibe_core::project_root::select_root_source` applies to the project-directory argument
+    // itself; before this, each scan ran its own ad-hoc `.any()` with no notion of `--` at all, so
+    // `shell -- --version` printed the version line instead of opening a directory literally named
+    // `--version`, and `shell -- --legacy` was refused on a release build instead of reaching the
+    // directory step (v1-dist verdict #5). `args_os`, not `args`, and skipping argv[0] (never a
+    // flag), for the same non-UTF-8-safety reason `project_root` gives for its own `args_os` use.
+    let early_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let has_flag =
+        |flag: &str| neovibe_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
+
+    // `--version` (v1-dist plan Task 1, spec §3), before anything else -- including the stdin
+    // detach right below, which is otherwise the very first thing this binary does: printing a
+    // version line must never touch GTK, a display, or nvim's stdin.
+    // `neovibe_core::project_root::KNOWN_FLAGS` also lists `--version`, so `shell --version
+    // /some/project` is never a startup failure even though `main()` never reaches `resolve()` on
+    // this path -- see that module's own tests.
+    if has_flag("--version") {
+        println!("{}", version::version_line());
+        return glib::ExitCode::SUCCESS;
+    }
+
+    // The backend this launch uses (v1-dist plan Task 5, spec §10, D10, D16), decided here -- before
+    // any window exists, and before the stdin detach right below -- so `--legacy` (or
+    // `NEOVIBE_AGENT_BACKEND=legacy`) on a build that did not compile the legacy backend in (every
+    // release) exits with its reason and touches nothing else: no GTK, no display, no nvim stdin.
+    // `--legacy` joins `--clean` in `neovibe_core::project_root::KNOWN_FLAGS` for the same reason
+    // `--clean` is there -- so a release still names the real reason rather than "unknown option".
+    let legacy_flag = has_flag("--legacy");
+    let backend_kind = match neovibe_core::agent_backend::BackendKind::from_env(legacy_flag) {
+        Ok(kind) => kind,
+        Err(err) => {
+            eprintln!("neovibe: {}", err.message);
+            return glib::ExitCode::FAILURE;
+        }
+    };
+
     // First, before any thread or fd exists: a pipe, socket or file on stdin would be handed to the
     // embedded nvim by the Neovide fork, which reads it as a buffer and, for a pipe or socket whose
     // writer stays open, blocks until EOF with the editor blank (`neovide_editor::stdin`; the GUI
@@ -82,7 +124,8 @@ fn main() -> glib::ExitCode {
 
     // Same `--clean` passthrough convenience as `neovide_embed_live`/`shell_composed`: pass
     // `--clean` on this binary's own command line to launch nvim with `--clean` instead of a
-    // real embedding host's actual config.
+    // real embedding host's actual config. Through `has_flag`, like `--version`/`--legacy` above,
+    // for the same `--` reason.
     //
     // `args_os`, not `args`, throughout this function: `std::env::args()` panics on an argument
     // that is not valid UTF-8, and `shell <dir>` makes a path a supported argument -- see
@@ -93,7 +136,7 @@ fn main() -> glib::ExitCode {
     // `KNOWN_FLAGS` list, which is the only place that can tell a flag from a project directory;
     // one missing from that list makes passing it a hard startup failure rather than a silently
     // wrong project root.
-    let want_clean = std::env::args_os().any(|arg| arg == "--clean");
+    let want_clean = has_flag("--clean");
 
     // Resolved once, here, and then carried as a value into every pane that needs it -- see
     // `neovibe_core::project_root`'s own module doc for why three separate `current_dir()` reads
@@ -107,8 +150,52 @@ fn main() -> glib::ExitCode {
     };
     println!("neovibe: project root {}", project_root.display());
 
+    // Which nvim the forked Neovide runtime spawns (v1-dist plan Task 6, spec §7). Resolved and
+    // acted on here -- before `build_application`/`app.run_with_args` bring up GTK's own threads,
+    // before `build_ui` starts anything else, and while this is still the only thread in the
+    // process -- because a non-`Path`/`Inherited` choice can only reach the fork by being set on
+    // *this* process's own environment: the pinned fork's `CmdLineSettings` reads `NEOVIM_BIN`
+    // through clap's `env = "NEOVIM_BIN"` (`cmd_line.rs:229`) while `LiveHarness::with_options`
+    // builds its settings, before any `child_env` map ever reaches a `Command` -- see
+    // `neovibe_core::nvim_bin`'s own module doc for the full reasoning, including why this is a
+    // deliberate, narrow exception to `pane_switch`'s "never mutate this process's environment"
+    // rule (unlike `TMUX`/`TMUX_PANE`, leaking `NEOVIM_BIN` to every other child is harmless: only
+    // Neovide reads it, and the bottom terminal's shell removes it itself).
+    match neovibe_core::nvim_bin::resolve() {
+        Ok(choice) => {
+            println!("{}", choice.describe());
+            if let Some(path) = choice.neovim_bin_to_set() {
+                // SAFETY: nothing else in this process has spawned a thread that touches the
+                // environment. `resolve()`'s own version probe (if it ran one) never calls
+                // `.env`/`.env_clear` on the `Command` it spawns, so it never calls `getenv` and
+                // cannot race this `setenv` even if, past its own 2s deadline, it is still running
+                // in the background (see `neovibe_core::nvim_bin::version_of_binary`'s own doc).
+                unsafe { std::env::set_var(neovibe_core::nvim_bin::NEOVIM_BIN_ENV, path) };
+            }
+        }
+        Err(message) => {
+            eprintln!("neovibe: {message}");
+            return glib::ExitCode::FAILURE;
+        }
+    }
+
+    // WebKit's sandbox (v1-dist sub-plan docs/superpowers/plans/2026-09-28-v1-dist-ubuntu-userns.md):
+    // decided here, once, while this is still the only thread -- `webkit_sandbox`'s module doc says
+    // why that matters for the pending option (B) -- and before any `WebView` exists. Where it cannot
+    // start (a stock Ubuntu 24.04 desktop with no AppArmor profile for this binary), no `WebView` is
+    // built anywhere, and the agent panel's place shows the same text printed here, instead of WebKit
+    // aborting the whole process on its first `WebView`.
+    let panel_notice: Option<String> = match webkit_sandbox::decision() {
+        webkit_sandbox::Decision::Unavailable { reason } => {
+            let notice = webkit_sandbox::unavailable_notice(reason);
+            eprint!("{notice}");
+            Some(notice)
+        }
+        webkit_sandbox::Decision::Available | webkit_sandbox::Decision::DisabledByUser => None,
+    };
+
     let app = build_application();
-    app.connect_activate(move |app| build_ui(app, want_clean, &project_root));
+    app.connect_activate(move |app| build_ui(app, want_clean, &project_root, backend_kind, panel_notice.as_deref()));
     app.run_with_args::<&str>(&[])
 }
 
@@ -136,7 +223,13 @@ fn build_application() -> Application {
         .build()
 }
 
-fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
+fn build_ui(
+    app: &Application,
+    want_clean: bool,
+    project_root: &Path,
+    backend_kind: neovibe_core::agent_backend::BackendKind,
+    panel_notice: Option<&str>,
+) {
     // Ruling S3 (D4, `docs/superpowers/plans/2026-09-27-v1-scale.md`): before anything else, so
     // `gtk-xft-dpi` is never unset by the time the agent panel's (or a Lua panel's) `WebView` reads
     // it. See `xft_dpi`'s module doc.
@@ -206,8 +299,13 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         Some(feed) => editor_context::listen(feed, scratch_path.clone()),
         None => std::rc::Rc::new(|| None),
     };
-    let (agent_widget, agent_panel_handle) =
-        agent_panel::build_agent_panel(project_root.to_path_buf(), editor_context_source, scratch_dir);
+    let (agent_widget, agent_panel_handle) = agent_panel::build_agent_panel(
+        project_root.to_path_buf(),
+        editor_context_source,
+        scratch_dir,
+        backend_kind,
+        panel_notice,
+    );
 
     lua_engine.load_init_file(&config_dir.join("init.lua"));
 
@@ -497,7 +595,15 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
     // before it is ever handed to the grid.
     let (editor_host, editor_start_failure_label) = editor_start_failure::install(pane.widget());
     grid.add(ModuleId::editor(), &editor_host, HostKind::Direct);
-    grid.add(ModuleId::agent(), &agent_widget, HostKind::Web);
+    // With no `WebView` in this process (`webkit_sandbox`), the chat's and each Lua panel's place is
+    // a plain GTK notice: allocated directly, as the editor is, rather than held at a settled size
+    // like a `WebView` being resized.
+    let web_host = if webkit_sandbox::decision().allows_webviews() {
+        HostKind::Web
+    } else {
+        HostKind::Direct
+    };
+    grid.add(ModuleId::agent(), &agent_widget, web_host);
     // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to zero
     // reports a 1-row grid to its shell.
     terminal.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
@@ -506,7 +612,7 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         if *slot == PanelSlot::Bottom {
             widget.set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
         }
-        grid.add(id.clone(), widget, HostKind::Web);
+        grid.add(id.clone(), widget, web_host);
     }
     // The terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
     // `Ctrl+a \ t`, its tray chip, `neovibe.layout.show`, a saved layout -- rather than only on the
@@ -768,7 +874,16 @@ fn build_ui(app: &Application, want_clean: bool, project_root: &Path) {
         agent_widget: agent_widget.clone(),
         modules: {
             let grid = grid.clone();
-            Rc::new(move || grid.hosts_in_tree_order())
+            // A chat with no page (`webkit_sandbox`) has no labels of its own to answer
+            // `hint_collect` with: left in, every HINT would wait out the panel's 300 ms timeout
+            // and still label nothing there. Left out, the rest of the window is labelled at once.
+            let chat_has_page = panel_notice.is_none();
+            Rc::new(move || {
+                grid.hosts_in_tree_order()
+                    .into_iter()
+                    .filter(|(id, _)| chat_has_page || id.kind() != ModuleKind::Agent)
+                    .collect()
+            })
         },
         focus_module: focus_module.clone(),
         agent: agent_panel_handle.clone(),

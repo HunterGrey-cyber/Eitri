@@ -1,0 +1,76 @@
+#!/bin/sh
+# Test double for the Node tarball's own bin/npm (plan 2026-09-27-v1-dist, Task 10, spec §5.3):
+# stands in for the whole "npm ci --no-audit --no-fund" / "npm run build:binary -w
+# @verdandi/claude-sidecar" recipe, so no test ever runs a real npm or reaches the real npm
+# registry, registry.npmjs.org or grpc-tools' prebuilt host. install.sh's sidecar_build_core always
+# invokes this by the absolute path inside the (real or fake) extracted Node tarball, never a bare
+# `npm` resolved off PATH -- this fixture never needs to shadow a real npm.
+#
+# NEOVIBE_INSTALL_TEST_NPM_MODE selects the behaviour (default "ok"):
+#   ok            both steps succeed, producing a spec-shaped artifact
+#   fail-ci       `npm ci` exits 1
+#   fail-build    `npm run build:binary` exits 1
+#   bad-protocol  the built artifact reports the wrong protocol number
+#   bad-node      the built artifact reports the wrong node version
+#   sdk-bundled   the built artifact serves "host_cli, sdk_bundled" (never host_cli alone)
+mode=${NEOVIBE_INSTALL_TEST_NPM_MODE:-ok}
+sidecar_version=${NEOVIBE_INSTALL_TEST_SIDECAR_VERSION:-0.1.0}
+build_stamp=${NEOVIBE_INSTALL_TEST_BUILD_STAMP:-0123456789abcdef}
+
+case $1 in
+ci)
+	case $mode in
+	fail-ci)
+		echo "npm-sidecar-stub: simulated npm ci failure" >&2
+		exit 1
+		;;
+	esac
+	mkdir -p node_modules/@anthropic-ai/claude-agent-sdk || exit 1
+	printf '{\n  "version": "0.3.252"\n}\n' >node_modules/@anthropic-ai/claude-agent-sdk/package.json
+	printf '%s\n' '© Anthropic PBC. All rights reserved.' \
+		'See https://www.anthropic.com/legal/consumer-terms for the full terms.' \
+		>node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md
+	exit 0
+	;;
+run)
+	if [ "$2" != build:binary ]; then
+		echo "npm-sidecar-stub: unexpected npm run target: $2" >&2
+		exit 1
+	fi
+	case $mode in
+	fail-build)
+		echo "npm-sidecar-stub: simulated build failure" >&2
+		exit 1
+		;;
+	esac
+	protocol=3
+	node_version=${NEOVIBE_INSTALL_TEST_NODE_VERSION:-v22.23.2}
+	served=host_cli
+	case $mode in
+	bad-protocol) protocol=99 ;;
+	bad-node) node_version=v0.0.0 ;;
+	sdk-bundled) served='host_cli, sdk_bundled' ;;
+	esac
+	mkdir -p apps/claude-sidecar/dist-bin || exit 1
+	artifact=apps/claude-sidecar/dist-bin/verdandi-claude-sidecar-$sidecar_version-linux-x64
+	cat >"$artifact" <<ARTIFACT_EOF
+#!/bin/sh
+if [ "\$1" = "--version" ]; then
+	printf '%s\n' \\
+		"verdandi-claude-sidecar $sidecar_version (protocol $protocol, node $node_version, build $build_stamp)" \\
+		"claude-agent-sdk 0.3.252 (bundled claude code 2.1.252)" \\
+		"supported claude code CLI: >=2.1.252 <3.0.0" \\
+		"executable sources served: $served"
+	exit 0
+fi
+echo "npm-sidecar-stub artifact: unexpected argv: \$*" >&2
+exit 1
+ARTIFACT_EOF
+	chmod 0755 "$artifact" || exit 1
+	exit 0
+	;;
+*)
+	echo "npm-sidecar-stub: unexpected npm subcommand: $1" >&2
+	exit 1
+	;;
+esac
