@@ -1394,8 +1394,8 @@ pid_alive() {
 # There, the group-write bit gives nobody else write access, so the group-write checks below accept
 # it. Anything uncertain -- no getent, a failed lookup, a group named otherwise, another listed
 # member -- leaves OPG=0, and those checks refuse exactly as before. Called as a plain statement
-# (rule 2 above). A second account whose PRIMARY group is this one would not be listed as a member;
-# that is not the convention, and is not checked.
+# (rule 2 above). A second account whose PRIMARY group is this one is not a member in getent's group
+# entry either, so the account list is searched for one too.
 own_private_group() {
 	OPG=0
 	_opg_gid=$(id -g 2>/dev/null) || return 0
@@ -1408,9 +1408,18 @@ own_private_group() {
 	[ "$(printf '%s\n' "$_opg_entry" | cut -d: -f1)" = "$_opg_group" ] || return 0
 	[ "$(printf '%s\n' "$_opg_entry" | cut -d: -f3)" = "$_opg_gid" ] || return 0
 	case $(printf '%s\n' "$_opg_entry" | cut -d: -f4) in
-	'' | "$_opg_user") OPG=1 ;;
-	*) ;;
+	'' | "$_opg_user") ;;
+	*) return 0 ;;
 	esac
+	# A second account whose PRIMARY group is this one is never listed as a member, so look for one
+	# in the account list itself -- which must at least list this user, or it is not a list this
+	# check can rely on (enumeration off in some NSS setups), and the answer stays no.
+	_opg_passwd=$(getent passwd 2>/dev/null) || return 0
+	_opg_verdict=$(printf '%s\n' "$_opg_passwd" | awk -F: -v g="$_opg_gid" -v u="$_opg_user" '
+		$1 == u { self = 1 }
+		$4 == g && $1 != u { other = 1 }
+		END { print (self && !other) ? "ok" : "no" }') || return 0
+	if [ "$_opg_verdict" = ok ]; then OPG=1; fi
 }
 
 acquire_lock() {
