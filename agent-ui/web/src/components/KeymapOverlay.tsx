@@ -19,8 +19,12 @@ type Props = {
 };
 
 /** One of the four groups, rendered from the same tables `keymap.test.ts` binds to
- *  `resolveKey` both ways -- this component adds no keys of its own, only a title and a layout. */
-function Section({ title, rows }: { title: string; rows: KeyHelp[] }) {
+ *  `resolveKey` both ways -- this component adds no keys of its own, only a title and a layout.
+ *  `note` is a sentence under the table, for what is true of the whole group and is not one key's row
+ *  (a `<p>`, like the leader and "Selecting" sections' own): a rule `resolveKey` never sees -- `Ctrl+[`
+ *  is Esc is one listener on the document (`../ctrlBracket`) -- cannot be a row of a table
+ *  `keymap.test.ts` ties to `resolveKey` both ways. A section with no note draws no `<p>`. */
+function Section({ title, rows, note }: { title: string; rows: KeyHelp[]; note?: string }) {
   return (
     <section>
       <h2>{title}</h2>
@@ -36,6 +40,7 @@ function Section({ title, rows }: { title: string; rows: KeyHelp[] }) {
           ))}
         </tbody>
       </table>
+      {note !== undefined && <p>{note}</p>}
     </section>
   );
 }
@@ -205,16 +210,27 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      {/* V1 C1: `Ctrl+j` here is Rust's mirror (`install_module_nav`) claiming the chord
-          ahead of `resolveKey`, never `resolveKey` itself -- so it is spliced in here rather than
-          added to `BROWSE_KEYS`, which `keymap.test.ts` ties to `resolveKey` both ways and would fail
-          on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
-          "Typing" section below already does the same for its own two GTK-decided rows. */}
-      <Section title="This panel" rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]} />
+      {/* Rust's `install_module_nav` claims `Ctrl+j` before `resolveKey`, so add it here rather
+          than to `BROWSE_KEYS`, which tests tie to `resolveKey` in both directions. The Typing
+          section likewise adds GTK-handled keys separately. `Ctrl+[` is handled by the
+          `../ctrlBracket` document listener, so describe it in the note rather than as a
+          `BROWSE_KEYS` row. */}
+      <Section
+        title="This panel"
+        rows={[...BROWSE_KEYS, { keys: "Ctrl+j", what: "Type (the box below)" }]}
+        note="Ctrl+[ is Esc everywhere in this panel."
+      />
       <Selecting panel={panel} />
       <LeaderAndTabKeys panel={panel} />
+      {/* Describe the context Enter sends in this group's note. `Composer` sends it; it is not
+          an `INPUT_KEYS` binding handled by `resolveKey`. `compose_turn_text` adds the editor's
+          file name or its live Visual selection. `feed.rs` omits the cursor line. Selection
+          limits are `MAX_SELECTION_LINES = 400` and `CONTENT_LIMIT = 2000`.
+          `CLI_LOCAL_COMMANDS`, including bare `/model` and `/effort`, omit the context block.
+          `Dashboard.tsx` gives the shorter form in `.dash-context`. */}
       <Section
         title="Typing"
+        note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."
         rows={[
           ...INPUT_KEYS,
           // The pane-motion row lists only Ctrl+h/l. Ctrl+j/k have their own meanings in the rows

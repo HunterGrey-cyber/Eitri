@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
 import type { ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
-import { choosable, chooserRows, relativeWhen, resumeMode, tabStateWord } from "../chooser";
+import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
 import { isShiftTab, modeFixedMessage, modeKeyRoute } from "../modeKey";
+import { isModifierKey } from "../typingGuard";
 
 type Props = {
   envelope: ChooserEnvelope;
@@ -95,7 +96,10 @@ function tabNumber(tab: { tab: TabId; label: string }, info: TabInfo | null): nu
  *  For open tabs, `tabModeRoute` determines what `Shift+Tab` can do from here.
  *  The mode key toggles auto and bypass, so the hint says "toggle".
  *  Uses "auto mode" in the full sentence rather than the shorter wording from `modePill`. */
-function modeLine(row: ChooserRow, active: TabInfo | null, defaultMode: PermissionModeChoice): ReactNode {
+function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMode: PermissionModeChoice): ReactNode {
+  // A filter with no matches leaves `row` undefined. Return no mode line instead of reading
+  // `row.kind` and unmounting the panel. `keysLine` handles the same missing row.
+  if (row === undefined) return null;
   if (row.kind === "tab") {
     const mode = row.info?.mode ?? "auto";
     const route = tabModeRoute(row, active);
@@ -225,6 +229,12 @@ export function Chooser({
     rootRef.current?.querySelector(".chooser-row.current")?.scrollIntoView({ block: "nearest" });
   }, [cursor, filter]);
 
+  /** One step of the list cursor, clamped to the rows: an empty list clamps to 0 (a `-1` left no row
+   *  under the cursor once the filter was cleared again). */
+  function moveCursor(step: 1 | -1) {
+    setCursor((c) => Math.max(0, Math.min(c + step, rows.length - 1)));
+  }
+
   function choose(row: ChooserRow | undefined) {
     if (row === undefined || !choosable(row)) return;
     if (row.kind === "new") onNewSession();
@@ -244,8 +254,9 @@ export function Chooser({
     else showFlash(`switch to tab ${tabNumber(row.tab, row.info)} to change its mode`);
   }
 
-  // A lone `g` waits for the second `g`. Any other key clears the wait and then performs its
-  // normal action.
+  // A lone `g` waits without a timeout. The next key completes `gg` or is swallowed to cancel the
+  // wait, so `gx` cannot close a tab and `gEnter` cannot choose a row. Bare modifiers keep
+  // waiting.
   const pendingG = useRef(false);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (composing(event)) return;
@@ -263,16 +274,25 @@ export function Chooser({
       return;
     }
     if (filtering || renaming !== null) return;
-    const key = event.key;
+    // Map Down and Ctrl+n to `j`, and Up and Ctrl+p to `k`, through the full handling below,
+    // including a pending `g` and the allow-list.
+    const step = pickerStep(event);
+    const key = step === null ? event.key : step > 0 ? "j" : "k";
+    if (pendingG.current) {
+      if (isModifierKey(event.key)) return;
+      pendingG.current = false;
+      event.preventDefault();
+      event.stopPropagation();
+      if (key === "g") setCursor(0);
+      return;
+    }
     if (key === "g" || key === "G") {
       event.preventDefault();
       event.stopPropagation();
       if (key === "G") setCursor(Math.max(rows.length - 1, 0));
-      else if (pendingG.current) setCursor(0);
-      pendingG.current = key === "g" && !pendingG.current;
+      else pendingG.current = true;
       return;
     }
-    pendingG.current = false;
     if (event.ctrlKey && key === "r") {
       event.preventDefault();
       event.stopPropagation();
@@ -282,8 +302,8 @@ export function Chooser({
     if (!["j", "k", "Enter", "x", "/", "Escape", "q"].includes(key)) return;
     event.preventDefault();
     event.stopPropagation();
-    if (key === "j") setCursor((c) => Math.min(c + 1, rows.length - 1));
-    else if (key === "k") setCursor((c) => Math.max(c - 1, 0));
+    if (key === "j") moveCursor(1);
+    else if (key === "k") moveCursor(-1);
     else if (key === "Enter") choose(current);
     else if (key === "x") {
       if (current?.kind === "tab") onCloseTab(current.tab.tab);
@@ -318,6 +338,15 @@ export function Chooser({
           }}
           onKeyDown={(event) => {
             if (composing(event)) return;
+            // The four list-motion keys keep focus in the filter box while moving the list. `j`/`k`
+            // remain typed text here, so they cannot navigate while filtering.
+            const step = pickerStep(event);
+            if (step !== null) {
+              event.preventDefault();
+              event.stopPropagation();
+              moveCursor(step);
+              return;
+            }
             if (event.key === "Enter" || event.key === "Escape") {
               event.preventDefault();
               event.stopPropagation();

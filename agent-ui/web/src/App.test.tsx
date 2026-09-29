@@ -6861,6 +6861,134 @@ describe("App: the ? keymap overlay", () => {
   });
 });
 
+/* `Ctrl+[` acts as Escape throughout the panel. The browser delivers it as key "[", code
+   BracketLeft, with ctrlKey set. The document-capture listener in `./ctrlBracket`, installed by
+   `App`'s first effect, re-dispatches a plain Escape keydown on the same target. These tests
+   exercise the existing Escape routes through the real `App`; CARET/VISUAL routes are tested
+   under "BROWSE visual mode" below. */
+describe("Ctrl+[ is Esc everywhere in the panel (R9, kbux P15)", () => {
+  const CTRL_BRACKET = { key: "[", code: "BracketLeft", ctrlKey: true };
+  const CHOOSER = {
+    kind: "chooser",
+    open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }],
+    records: [],
+  };
+  const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const modeOf = (c: HTMLElement) => c.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+
+  function started() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState(), 0);
+    // The band names the mode only while this pane holds the keys.
+    dispatch({ kind: "pane_focus", focused: true });
+    return rendered;
+  }
+
+  it("INPUT, then Ctrl+[, lands in BROWSE, as Esc does", () => {
+    const { container } = started();
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    expect(textarea).not.toBeNull();
+    expect(modeOf(container)).toBe("input");
+    expect(fireEvent.keyDown(textarea, CTRL_BRACKET), "the Ctrl+[ itself is claimed").toBe(false);
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(container.querySelector(".composer-browse-hint")).not.toBeNull();
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("closes the chooser", () => {
+    const { container } = started();
+    dispatch(CHOOSER);
+    expect(container.querySelector(".chooser")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".chooser")!, CTRL_BRACKET);
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+
+  it("closes the chooser's filter box, then the chooser, one Esc each", () => {
+    const { container } = started();
+    dispatch(CHOOSER);
+    fireEvent.keyDown(container.querySelector(".chooser")!, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
+    expect(filter).not.toBeNull();
+    fireEvent.keyDown(filter, CTRL_BRACKET);
+    expect(container.querySelector(".chooser-filter"), "the first leaves the filter").toBeNull();
+    expect(container.querySelector(".chooser"), "and only the filter").not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".chooser")!, CTRL_BRACKET);
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+
+  it("closes the ? overlay", () => {
+    const { container } = started();
+    act(() => root(container).focus());
+    fireEvent.keyDown(root(container), { key: "?", shiftKey: true });
+    const overlay = container.querySelector<HTMLElement>(".keymap-overlay");
+    expect(overlay).not.toBeNull();
+    fireEvent.keyDown(overlay!, CTRL_BRACKET);
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+  });
+
+  it("closes the ? overlay on the empty tab's start screen too", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchEmptyTab();
+    act(() => dispatch({ kind: "open_keymap" }));
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".empty-tab")!, CTRL_BRACKET);
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+  });
+
+  it("closes the / prompt", () => {
+    const { container } = started();
+    fireEvent.keyDown(root(container), { key: "/" });
+    const input = container.querySelector<HTMLInputElement>(".search-bar input");
+    expect(input).not.toBeNull();
+    fireEvent.keyDown(input!, CTRL_BRACKET);
+    expect(container.querySelector(".search-bar")).toBeNull();
+  });
+
+  it("a composing Ctrl+[ does nothing: an input method's own key, as Esc is", () => {
+    const { container } = started();
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    for (const composing of [{ isComposing: true }, { keyCode: 229 }]) {
+      expect(fireEvent.keyDown(textarea, { ...CTRL_BRACKET, ...composing }), "left to the input method").toBe(true);
+      expect(container.querySelector("textarea"), JSON.stringify(composing)).not.toBeNull();
+      expect(modeOf(container)).toBe("input");
+    }
+    // The same over an overlay: the ? overlay closes on a real Ctrl+[, not on a composing one.
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    fireEvent.keyDown(root(container), { key: "?", shiftKey: true });
+    const overlay = container.querySelector<HTMLElement>(".keymap-overlay")!;
+    fireEvent.keyDown(overlay, { ...CTRL_BRACKET, isComposing: true });
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    fireEvent.keyDown(overlay, CTRL_BRACKET);
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+  });
+
+  it("only a plain Ctrl+[ leaves INPUT: with Shift, Alt or Meta held, or with no Ctrl, it does not", () => {
+    const { container } = started();
+    enterInputMode(container);
+    const textarea = container.querySelector("textarea")!;
+    for (const init of [
+      { key: "{", ctrlKey: true, shiftKey: true },
+      { ...CTRL_BRACKET, altKey: true },
+      { ...CTRL_BRACKET, metaKey: true },
+      { key: "[" },
+    ]) {
+      fireEvent.keyDown(textarea, init);
+      expect(container.querySelector("textarea"), JSON.stringify(init)).not.toBeNull();
+    }
+  });
+
+  it("stops claiming Ctrl+[ once the panel unmounts", () => {
+    const { unmount } = started();
+    expect(fireEvent.keyDown(document.body, CTRL_BRACKET), "claimed while mounted").toBe(false);
+    unmount();
+    expect(fireEvent.keyDown(document.body, CTRL_BRACKET), "not claimed once gone").toBe(true);
+  });
+});
+
 describe("the activity line, the bottom band, and the detail popover", () => {
   it("puts the activity line above the composer, then the band -- and none of the components it replaced", () => {
     const { container } = render(<App />);
@@ -10484,6 +10612,37 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     // Escape from V-LINE also returns to CARET.
     fireEvent.keyDown(root, { key: "Escape" });
     expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
+  });
+
+  /** `Ctrl+[` is Esc in the region too. Until then the region
+   *  read it as a modified key its table does not claim (`vswallow`: swallowed, nothing else), so a
+   *  vim user reaching for it saw CARET/VISUAL stay on -- the one region change of that plan. It
+   *  reaches `resolveKey` as the plain Escape `./ctrlBracket` turns it into, `repeat` and all. */
+  it("R9: Ctrl+[ is Esc in the region -- VISUAL and V-LINE back to CARET, CARET to BROWSE, and a held one steps back once", () => {
+    const { container, root } = startedOnPromptRow();
+    const modeBlock = () => container.querySelector('[data-testid="mode-block"]');
+    const mode = () => modeBlock()?.getAttribute("data-mode");
+    const ctrlBracket = { key: "[", code: "BracketLeft", ctrlKey: true };
+
+    fireEvent.keyDown(root, { key: "v" });
+    fireEvent.keyDown(root, { key: "v" });
+    expect(mode()).toBe("visual");
+    expect(fireEvent.keyDown(root, ctrlBracket), "claimed, not left to the browser").toBe(false);
+    expect(mode()).toBe("caret");
+    // The key that steps back swallows its own repeats. The translated Escape preserves
+    // `repeat`, so holding Ctrl+[ does not also end the region.
+    fireEvent.keyDown(root, { ...ctrlBracket, repeat: true });
+    expect(mode()).toBe("caret");
+    // A fresh press is a new key and ends it, as a fresh Esc does.
+    fireEvent.keyDown(root, ctrlBracket);
+    expect(mode()).toBe("browse");
+
+    fireEvent.keyDown(root, { key: "V", shiftKey: true });
+    expect(mode()).toBe("vline");
+    fireEvent.keyDown(root, ctrlBracket);
+    expect(mode()).toBe("caret");
+    fireEvent.keyDown(root, ctrlBracket);
+    expect(mode()).toBe("browse");
   });
 
   it("refuses to start with a flash when there is no row at all", () => {

@@ -25,6 +25,7 @@ import {
 } from "./visual";
 import type { BuiltSelection, Caret, SelectionLike, VisualModel } from "./visual";
 import { appendQuote, formatQuote } from "./quote";
+import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter } from "./timeline";
@@ -76,6 +77,7 @@ import { KeymapOverlay } from "./components/KeymapOverlay";
 import { Chooser } from "./components/Chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
+import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import { barePickerCommand } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, showTabBar } from "./tabs";
@@ -672,10 +674,18 @@ export default function App() {
     flashSeq.current += 1;
     setFlash({ text, seq: flashSeq.current });
   }
-  // Whether Super is held, from its own keydown/keyup: WebKitGTK reports it on no other key's event,
-  // and `isPlainAnswerKey` reads this for `a`/`d`/`D` and the bypass `y` (heldSuper.ts). The first
-  // effect in this component, so its window-capture listener runs before HINT's, which stops keys.
-  useEffect(() => installHeldSuperTracking(document, window), []);
+  // Track Super from its own keydown/keyup because WebKitGTK omits it from other keys' events.
+  // `isPlainAnswerKey` uses it for `a`/`d`/`D` and bypass `y`. This first effect installs window
+  // capture before HINT can stop keys. It also maps `Ctrl+[` to Escape in document capture, ahead
+  // of `onModeKey` and the other handlers. HINT's window capture still runs first while pending.
+  useEffect(() => {
+    const removeHeldSuper = installHeldSuperTracking(document, window);
+    const removeCtrlBracket = installCtrlBracketAsEscape(document);
+    return () => {
+      removeHeldSuper();
+      removeCtrlBracket();
+    };
+  }, []);
   // A newer flash replaces an older one (`showFlash` above); this only ever clears the flash that
   // is STILL the current one when its own two seconds are up, so an older flash's timer firing late
   // cannot erase a newer flash that has since taken its place.
@@ -2741,6 +2751,14 @@ export default function App() {
     setKeysRequest((n) => n + 1);
   }
 
+  /** Closes an overlay whose render throws through its own leave path and names it in
+   *  the band. The leave path also returns the keys where needed. Each overlay's
+   *  `PanelErrorBoundary` calls this through `onError`, keeping the rest of the panel mounted. */
+  function overlayFailed(what: string, close: () => void) {
+    close();
+    showFlash(`the ${what} failed and closed`);
+  }
+
   /** Queues what is typed behind the running turn. Recorded as a `"send"` for the same reason
    *  `sendMessage` is: the composer cleared the box on Enter, and a refusal here (the session ended,
    *  or a handoff is pending, while this side still showed a turn running) means nothing was queued
@@ -3137,48 +3155,54 @@ export default function App() {
         {/* `prefix w`'s chooser can open over an empty tab 1 too -- `.agent-ui-root` is this layout's
             own positioned ancestor (it has no `.agent-ui-scroller` to nest inside). */}
         {chooser !== null && (
-          <Chooser
-            envelope={chooser}
-            tabs={tabs?.tabs ?? []}
-            active={tabs?.active ?? null}
-            defaultMode={tabs?.defaultMode ?? "auto"}
-            projectDir={hello?.projectDir ?? ""}
-            newTabChord={keymapHelp.newTabChord}
-            focusRequest={chooserFocusRequest}
-            onSwitch={onChooserSwitch}
-            onResume={onChooserResume}
-            onNewSession={onChooserNewSession}
-            onCloseTab={onChooserCloseTab}
-            onRenameTab={onChooserRenameTab}
-            onCycleMode={onChooserCycleMode}
-            onCycleTabMode={onChooserCycleTabMode}
-            onLeave={onChooserLeave}
-            answerConfirm={answerConfirm}
-          />
+          <PanelErrorBoundary name="chooser" onError={() => overlayFailed("chooser", onChooserLeave)}>
+            <Chooser
+              envelope={chooser}
+              tabs={tabs?.tabs ?? []}
+              active={tabs?.active ?? null}
+              defaultMode={tabs?.defaultMode ?? "auto"}
+              projectDir={hello?.projectDir ?? ""}
+              newTabChord={keymapHelp.newTabChord}
+              focusRequest={chooserFocusRequest}
+              onSwitch={onChooserSwitch}
+              onResume={onChooserResume}
+              onNewSession={onChooserNewSession}
+              onCloseTab={onChooserCloseTab}
+              onRenameTab={onChooserRenameTab}
+              onCycleMode={onChooserCycleMode}
+              onCycleTabMode={onChooserCycleTabMode}
+              onLeave={onChooserLeave}
+              answerConfirm={answerConfirm}
+            />
+          </PanelErrorBoundary>
         )}
         {/* A bare /model or /effort reply opens this picker. Like the chooser above,
             it is positioned in this layout without an `.agent-ui-scroller` to nest inside. */}
         {slashPicker !== null && (
-          <SlashPicker
-            kind={slashPicker.kind}
-            options={slashPicker.options}
-            current={slashPicker.current}
-            focusRequest={slashPickerFocusRequest}
-            onChoose={chooseSlashOption}
-            onCancel={cancelSlashPicker}
-          />
+          <PanelErrorBoundary name="picker" onError={() => overlayFailed("picker", cancelSlashPicker)}>
+            <SlashPicker
+              kind={slashPicker.kind}
+              options={slashPicker.options}
+              current={slashPicker.current}
+              focusRequest={slashPickerFocusRequest}
+              onChoose={chooseSlashOption}
+              onCancel={cancelSlashPicker}
+            />
+          </PanelErrorBoundary>
         )}
         {/* `? Keys`, `?` on an empty draft and `prefix ?` open this overlay here too.
             `.agent-ui-root` is this layout's positioned ancestor, as for the chooser. */}
         {keymapOpen && (
-          <KeymapOverlay
-            ref={keymapOverlayRef}
-            onClose={() => setKeymapOpen(false)}
-            windowKeys={keymapHelp.window}
-            prefixKeys={keymapHelp.prefixKeys}
-            prefixLabel={keymapHelp.prefix}
-            panel={panelTable}
-          />
+          <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
+            <KeymapOverlay
+              ref={keymapOverlayRef}
+              onClose={() => setKeymapOpen(false)}
+              windowKeys={keymapHelp.window}
+              prefixKeys={keymapHelp.prefixKeys}
+              prefixLabel={keymapHelp.prefix}
+              panel={panelTable}
+            />
+          </PanelErrorBoundary>
         )}
         <HintLayer root={startScreenRef.current} hints={hints} typed={hintTyped} />
       </div>
@@ -4602,58 +4626,66 @@ export default function App() {
           visual={mode === "caret" ? "caret" : mode === "visual" ? "visual" : mode === "vline" ? "vline" : null}
         />
         {keymapOpen && (
-          <KeymapOverlay
-            ref={keymapOverlayRef}
-            onClose={() => setKeymapOpen(false)}
-            windowKeys={keymapHelp.window}
-            prefixKeys={keymapHelp.prefixKeys}
-            prefixLabel={keymapHelp.prefix}
-            panel={panelTable}
-          />
+          <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
+            <KeymapOverlay
+              ref={keymapOverlayRef}
+              onClose={() => setKeymapOpen(false)}
+              windowKeys={keymapHelp.window}
+              prefixKeys={keymapHelp.prefixKeys}
+              prefixLabel={keymapHelp.prefix}
+              panel={panelTable}
+            />
+          </PanelErrorBoundary>
         )}
         {detail !== null && (
-          <DetailPopover
-            ref={detailRef}
-            rows={detail}
-            current={detailCursor}
-            onClose={() => setDetail(null)}
-            onHandoff={() => {
-              setDetail(null);
-              setHandoffOpen(true);
-            }}
-          />
+          <PanelErrorBoundary name="session details" onError={() => overlayFailed("session details", () => setDetail(null))}>
+            <DetailPopover
+              ref={detailRef}
+              rows={detail}
+              current={detailCursor}
+              onClose={() => setDetail(null)}
+              onHandoff={() => {
+                setDetail(null);
+                setHandoffOpen(true);
+              }}
+            />
+          </PanelErrorBoundary>
         )}
         {chooser !== null && (
-          <Chooser
-            envelope={chooser}
-            tabs={tabs?.tabs ?? []}
-            active={tabs?.active ?? null}
-            defaultMode={tabs?.defaultMode ?? "auto"}
-            projectDir={hello?.projectDir ?? ""}
-            newTabChord={keymapHelp.newTabChord}
-            focusRequest={chooserFocusRequest}
-            onSwitch={onChooserSwitch}
-            onResume={onChooserResume}
-            onNewSession={onChooserNewSession}
-            onCloseTab={onChooserCloseTab}
-            onRenameTab={onChooserRenameTab}
-            onCycleMode={onChooserCycleMode}
-            onCycleTabMode={onChooserCycleTabMode}
-            onLeave={onChooserLeave}
-            answerConfirm={answerConfirm}
-          />
+          <PanelErrorBoundary name="chooser" onError={() => overlayFailed("chooser", onChooserLeave)}>
+            <Chooser
+              envelope={chooser}
+              tabs={tabs?.tabs ?? []}
+              active={tabs?.active ?? null}
+              defaultMode={tabs?.defaultMode ?? "auto"}
+              projectDir={hello?.projectDir ?? ""}
+              newTabChord={keymapHelp.newTabChord}
+              focusRequest={chooserFocusRequest}
+              onSwitch={onChooserSwitch}
+              onResume={onChooserResume}
+              onNewSession={onChooserNewSession}
+              onCloseTab={onChooserCloseTab}
+              onRenameTab={onChooserRenameTab}
+              onCycleMode={onChooserCycleMode}
+              onCycleTabMode={onChooserCycleTabMode}
+              onLeave={onChooserLeave}
+              answerConfirm={answerConfirm}
+            />
+          </PanelErrorBoundary>
         )}
         {/* A bare /model or /effort reply opens this picker, positioned inside
             `.agent-ui-scroller` like the chooser above. */}
         {slashPicker !== null && (
-          <SlashPicker
-            kind={slashPicker.kind}
-            options={slashPicker.options}
-            current={slashPicker.current}
-            focusRequest={slashPickerFocusRequest}
-            onChoose={chooseSlashOption}
-            onCancel={cancelSlashPicker}
-          />
+          <PanelErrorBoundary name="picker" onError={() => overlayFailed("picker", cancelSlashPicker)}>
+            <SlashPicker
+              kind={slashPicker.kind}
+              options={slashPicker.options}
+              current={slashPicker.current}
+              focusRequest={slashPickerFocusRequest}
+              onChoose={chooseSlashOption}
+              onCancel={cancelSlashPicker}
+            />
+          </PanelErrorBoundary>
         )}
         {/* The which-key box: `WHICH_KEY_DELAY_MS` after a leader/table
             sequence, or one of `resolveKey`'s own reserved `g`/`z`/`[`/`]` prefixes, is still

@@ -111,7 +111,8 @@ type Props = {
 };
 
 /** The empty tab's dashboard: a centred `neovibe`, the
- *  where-line, one row per `dashItems(hello)`, and the selected mode's consequence line.
+ *  where-line, one row per `dashItems(hello)`, the selected mode's consequence line, what every
+ *  message also carries from the editor, and the first-run hint.
  *
  * Items carry `data-nav-stop="dash"` for the same CSS/grid symmetry the rest of the panel's rows
  * have, but they are deliberately NOT `nav.ts` stops (`controlsOf`'s selector has no `[role=
@@ -155,6 +156,14 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, prefix }: Props
         ))}
       </div>
       {consequence !== undefined && <div className="dash-consequence">{consequence}</div>}
+      {/* Explain editor context where a session starts. `compose_turn_text` appends the file name
+          or live Visual selection to panel turns; it sends neither the cursor position nor the
+          whole file's text. Show the hint at every width and in every mode. CLI-local commands such
+          as `/model` and `/effort` omit this context, as the `?` overlay's Typing note explains.
+          Use the same tokens as `.dash-consequence`. */}
+      <div className="dash-context">
+        Each message also sends the editor's file name, or the lines you selected there in Visual mode.
+      </div>
       {/* Show the key hint on every empty tab. It occupies otherwise empty space and needs no
           persistent first-run state. */}
       <div className="dash-hint">

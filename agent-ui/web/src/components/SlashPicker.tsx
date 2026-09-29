@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
+import { pickerStep } from "../chooser";
 
 export type SlashPickerKind = "model" | "effort";
 
@@ -23,8 +24,8 @@ type Props = {
 };
 
 /** Picker opened by a bare `/model` or `/effort` reply, parsed by `../slashPicker` in `App.tsx`.
- *  Uses the chooser's keys: `j`/`k` move, `Enter` chooses, and `Escape`/`q` cancel without sending.
- *  Clicking a row chooses it directly, as in `Chooser`. */
+ *  Uses the chooser's keys: `j`/`k`, `↓`/`↑` and `Ctrl+n`/`Ctrl+p` move, `Enter` chooses,
+ *  and `Escape`/`q` cancel without sending. Clicking a row chooses it directly, as in `Chooser`. */
 export function SlashPicker({ kind, options, current, focusRequest, onChoose, onCancel }: Props) {
   const startIndex = current === null ? -1 : options.indexOf(current);
   const [cursor, setCursor] = useState(startIndex === -1 ? 0 : startIndex);
@@ -41,7 +42,9 @@ export function SlashPicker({ kind, options, current, focusRequest, onChoose, on
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
-    const key = event.key;
+    // `pickerStep` maps `↓` and `Ctrl+n` to `j`, and `↑` and `Ctrl+p` to `k`, before the allow-list.
+    const step = pickerStep(event);
+    const key = step === null ? event.key : step > 0 ? "j" : "k";
     if (!["j", "k", "Enter", "Escape", "q"].includes(key)) return;
     event.preventDefault();
     event.stopPropagation();

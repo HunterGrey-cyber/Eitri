@@ -36,6 +36,15 @@ export function choosable(row: ChooserRow): boolean {
   return row.kind !== "record" || !row.record.heldElsewhere;
 }
 
+/** Move a picker's list from the list or its filter box: Down and Ctrl+n step down; Up and Ctrl+p
+ *  step up. Shared by the chooser and the `/model` and `/effort` pickers. Return null for other
+ *  keys so callers retain their own handling of `j`/`k` and Ctrl+j/Ctrl+k. */
+export function pickerStep(event: { key: string; ctrlKey: boolean }): 1 | -1 | null {
+  if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) return 1;
+  if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) return -1;
+  return null;
+}
+
 /** Lists `New session`, then open tabs, then records open in no tab, preserving Rust's order.
  *  Joins each open row to `TabInfo` by id for its number, name, title, mode and state.
  *  Drops `New session` while filtering so `j`/`k` do not visit an unmatched row. */
