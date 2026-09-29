@@ -145,7 +145,7 @@ does not protect, and every other route in detail:
 - **AUR**: `yay -S neovibe-bin` (prebuilt binaries, sidecar built at install time) or
   `yay -S neovibe-git` (everything, including neovibe itself, built from source).
 - **`--from-source`**: `sh install.sh --from-source` builds neovibe on your own machine — see
-  [Building](#building) for the toolchain it needs. **v1.0.0 is x86_64 only**; `--from-source`
+  [Building](#building) for the toolchain it needs. **0.2.0 is x86_64 only**; `--from-source`
   refuses on any other `uname -m` too, so it is not an ARM route.
 
 **Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux — every route, prebuilt or

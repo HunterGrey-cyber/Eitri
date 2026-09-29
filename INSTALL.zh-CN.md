@@ -1,11 +1,11 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=f942f29d799b4da1a7ee1015d58ab5b57c3892e49c7b83acdfc1436e45e9cde7 -->
+<!-- translated-from: INSTALL.md sha256=575d56a098bab59fc556d71e1acc5b39ebae275ed2eb29e39f50ee7d8dc53ac5 -->
 
 # 安装 neovibe
 
 不管走哪条路径，结果都一样：一份按用户安装在 `~/.local` 下的安装（或者从 `.deb`/`.rpm` 装出的系统级安装），以及一个 `neovibe` 启动器。`install.sh` 会在安装过程中顺带为你的机器构建 agent sidecar——除了 `.deb`/`.rpm` 这条路径：它不运行 maintainer script，需要你之后自己显式运行一次 `neovibe setup`（见下文）。`neovibe` 启动器本身从来不会构建 sidecar：在 sidecar 还没构建出来之前运行它，它照样会打开窗口，只是没有 agent 后端，并打印一行提示，让你运行 `neovibe setup`。见下面的[为什么 sidecar 要在你自己的机器上构建](#why-the-sidecar-is-built-on-your-machine)。完整的选项列表见 `sh install.sh --help` 和 `neovibe setup --help`；读完这一篇之后，权威来源就是那些输出，而不是这份文档。
 
-**环境要求**：GTK ≥ 4.14、WebKitGTK 6.0、glibc ≥ 2.39、x86_64 Linux。**v1.0.0 只支持 x86_64**——从源码构建（见下文）也需要同样的架构，在其他任何架构上都会拒绝运行，所以目前还没有 ARM 路径。**nvim ≥ 0.10**——可以是你自己 `PATH` 上的那份，也可以让安装脚本为 neovibe 单独获取一份私有副本（见下文）。还需要安装并登录 Claude Code（缺失时只是警告，不会拒绝安装——只是在你补上之前，neovibe 没法运行对话轮次）。
+**环境要求**：GTK ≥ 4.14、WebKitGTK 6.0、glibc ≥ 2.39、x86_64 Linux。**0.2.0 只支持 x86_64**——从源码构建（见下文）也需要同样的架构，在其他任何架构上都会拒绝运行，所以目前还没有 ARM 路径。**nvim ≥ 0.10**——可以是你自己 `PATH` 上的那份，也可以让安装脚本为 neovibe 单独获取一份私有副本（见下文）。还需要安装并登录 Claude Code（缺失时只是警告，不会拒绝安装——只是在你补上之前，neovibe 没法运行对话轮次）。
 
 ## 快速安装
 
@@ -17,7 +17,7 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 
 `--proto '=https' --proto-redir '=https'` 会拒绝纯 HTTP 的重定向，`-L` 则会跟随 GitHub 自己的 `releases/latest/download/…` → `releases/download/v<X>/…` 重定向——没有 `-L` 的话，单纯的 `curl -sSf` 会从重定向响应里拿到一个空响应体，什么都不会传给 `sh`，结果是什么都没装上，也什么都没提示（`curl -f` 只会在 4xx/5xx 状态码上出错，从不会因为 302 出错）。这几个正是 `install.sh` 自己的 `fetch()` 函数在每一次非本地环回（也就是真实）下载时使用的旗标（`packaging/install.sh` 的 `fetch()` 函数）。
 
-在 `--` 之后传选项：`curl … install.sh | sh -s -- --version 1.0.0 --yes`。
+在 `--` 之后传选项：`curl … install.sh | sh -s -- --version 0.2.0 --yes`。
 
 **如果你想在运行之前先读一遍**，可以先把它下载下来，而不是直接接进管道：
 
@@ -97,7 +97,7 @@ yay -S neovibe-git    # 包括 neovibe 本身在内的一切都从源码构建
 sh install.sh --from-source
 ```
 
-**v1.0.0 只支持 x86_64**：在除 x86_64 之外的任何 `uname -m` 上都会立即拒绝——目前锁定的唯一 Skia 预构建包是 x86_64 版本，还没有为 ARM 锁定对应的包。
+**0.2.0 只支持 x86_64**：在除 x86_64 之外的任何 `uname -m` 上都会立即拒绝——目前锁定的唯一 Skia 预构建包是 x86_64 版本，还没有为 ARM 锁定对应的包。
 
 在发行版本自己的 tag 上克隆公开仓库，如果它的 `HEAD` 和这个发行版本记录的 commit 对不上就拒绝继续，然后完全按照预构建路径的方式构建并安装。需要完整的工具链：**Rust 1.96 或更新版本**（2024 edition；安装脚本会拒绝更旧的 `rustc`）、**GTK 4.14+ 和 WebKitGTK 6.0 的开发包**外加 `pkg-config`、**Node.js 和 npm**、**`protoc`**、一套 **C 工具链**，以及第一次构建时需要的**联网**。`--checkout DIR` 会直接构建一份本地工作树，而不是重新克隆（这是作者自己的开发方式）——完整的前置条件列表和各发行版对应的包名，见 README 里的[构建](README.zh-CN.md#building)一节；`--verdandi-checkout` 和其他 `--from-source` 子选项见 `sh install.sh --help`。
 

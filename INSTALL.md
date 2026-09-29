@@ -11,7 +11,7 @@ before one exists, it still opens with no agent backend and a one-line hint to r
 option lists are `sh install.sh --help` and `neovibe setup --help`; that output, not this file, is the
 source of truth once you've read this once.
 
-**Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux. **v1.0.0 is x86_64 only** —
+**Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux. **0.2.0 is x86_64 only** —
 building from source (below) needs the same architecture and refuses on anything else, so there is
 no ARM route yet. **nvim ≥ 0.10** — your own, on `PATH`, or let the installer fetch a
 private copy for neovibe alone (below). Claude Code, installed and logged in (a warning, not a
@@ -32,7 +32,7 @@ nothing is said either way (`curl -f` only trips on a 4xx/5xx status, never a 30
 `install.sh`'s own `fetch()` flags for every non-loopback download (`packaging/install.sh`'s `fetch()`
 function).
 
-Pass options after `--`: `curl … install.sh | sh -s -- --version 1.0.0 --yes`.
+Pass options after `--`: `curl … install.sh | sh -s -- --version 0.2.0 --yes`.
 
 **If you'd rather read it before running it**, download it first instead of piping it:
 
@@ -160,7 +160,7 @@ users run a self-built or `bob`-managed nvim, so this never fights that.
 sh install.sh --from-source
 ```
 
-**x86_64 only in v1** — this refuses immediately on any other `uname -m`: the only pinned Skia
+**x86_64 only in this release** — this refuses immediately on any other `uname -m`: the only pinned Skia
 archive is x86_64, and no ARM archive is pinned yet.
 
 Clones the public repository at the release's own tag, refuses unless its `HEAD` matches that

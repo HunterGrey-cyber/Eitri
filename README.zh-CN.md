@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=8fd8b35ddfd9d4629571fd9485af5d08b96155d14132416e990d93390445509d -->
+<!-- translated-from: README.md sha256=ab3588b2349a9ee376eb3ed4adc0a3afe832d8d01b476f96863d2bba242638cb -->
 
 # neovibe
 
@@ -84,7 +84,7 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/
 
 - **`.deb`/`.rpm`**：从[发布页面](https://github.com/HunterGrey-cyber/neovibe/releases)下载，然后运行一次 `neovibe setup`——它会为这台机器构建 sidecar，如果你的 `nvim` 太旧，还会主动提出为你获取一份私有的 `nvim`。
 - **AUR**：`yay -S neovibe-bin`（预构建二进制，sidecar 在安装时构建）或 `yay -S neovibe-git`（包括 neovibe 本身在内的一切都从源码构建）。
-- **`--from-source`**：`sh install.sh --from-source` 会在你自己的机器上构建 neovibe——需要的工具链见[构建](#building)。**v1.0.0 只支持 x86_64**；`--from-source` 在其他任何 `uname -m` 上也会拒绝运行，所以它并不是一条 ARM 路径。
+- **`--from-source`**：`sh install.sh --from-source` 会在你自己的机器上构建 neovibe——需要的工具链见[构建](#building)。**0.2.0 只支持 x86_64**；`--from-source` 在其他任何 `uname -m` 上也会拒绝运行，所以它并不是一条 ARM 路径。
 
 **环境要求**：GTK ≥ 4.14、WebKitGTK 6.0、glibc ≥ 2.39、x86_64 Linux——不管是预构建二进制还是从源码构建，都是这个要求。**nvim ≥ 0.10**——可以是你自己 `PATH` 上的那份，也可以让安装脚本为 neovibe 单独获取一份私有副本（`$XDG_DATA_HOME/neovibe/nvim/<version>/`，永远不会放上 `PATH`，也永远不会触碰、替换或删除系统里其他任何叫 `nvim`/`vim`/`vi` 的东西）。还需要安装并登录 Claude Code。
 

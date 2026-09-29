@@ -2,6 +2,10 @@ neovibe @VERSION@ -- Neovim, embedded as a real component, with a Claude agent p
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
+**0.2.0 is the first public release**, after an earlier non-public pre-release 0.1.0. If you have an
+installed test build numbered `1.0.0-rc.N`, it sorts above this release, so the installer refuses to
+downgrade over it -- uninstall it first (`sh install.sh --uninstall`, or remove the package).
+
 ## Install
 
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/neovibe/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
@@ -44,6 +48,8 @@ notice.
 ## 简体中文
 
 neovibe @VERSION@ -- 将 Neovim 作为真正的组件嵌入，旁边配有 Claude 代理面板。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
+
+**0.2.0 是首个公开发行版**，此前有一个未公开的预发布版本 0.1.0。如果你安装过编号为 `1.0.0-rc.N` 的测试构建，它在版本排序上高于本次发布，安装程序会拒绝降级——请先卸载它（`sh install.sh --uninstall`，或者移除对应的软件包）。
 
 ### 安装
 
