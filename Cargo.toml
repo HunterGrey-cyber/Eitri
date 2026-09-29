@@ -46,6 +46,6 @@ default-members = [
 # v1.0.0 as a SemVer major, one
 # `[workspace.package] version` inherited by every product crate. Release candidates are
 # `1.0.0-rc.N`; `release.sh` refuses when its argument and this disagree.
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 edition = "2021"
 publish = false
