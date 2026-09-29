@@ -2,10 +2,11 @@
 //! appendix, verdict SUPPORTED in `the private review notes`):
 //! `agent/Cargo.toml`'s `claude-runtime-protocol` `rev` and `agent::EXPECTED_VERDANDI_REVISION` must
 //! name the same commit. The manifest has held both a full 40-character revision and a short one
-//! (the P5 audit's verdicts), so the comparison is by prefix in either direction, never equality --
-//! `cargo`'s own `git` dependency resolution accepts either shape, and this crate's own runtime
-//! checkout-drift warning (`providers::claude_sidecar::spawn::describe_checkout`) makes the same
-//! `starts_with` choice for the same reason.
+//! (`the private review notes`), so the comparison is by prefix
+//! in either direction, never equality -- `cargo`'s own `git` dependency resolution accepts either
+//! shape, and this crate's own runtime checkout-drift warning
+//! (`providers::claude_sidecar::spawn::describe_checkout`) makes the same `starts_with` choice for the
+//! same reason.
 //!
 //! This test is static and offline: it reads `Cargo.toml` as text and compares it against the
 //! compiled-in constant, with no checkout and no network. It is not a replacement for

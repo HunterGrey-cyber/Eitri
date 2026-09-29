@@ -801,8 +801,8 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
 
 
 # ---------------------------------------------------------------------------------------------
-# The prebuilt Skia archive's own contents (verdict #7 of the
-# v1-dist code review): the public source asset redistributes the WHOLE archive (spec D9), not just
+# The prebuilt Skia archive's own contents (verdict #7,
+# the private review notes #7): the public source asset redistributes the WHOLE archive (spec D9), not just
 # whatever a shipped binary ends up linking after --gc-sections discards the rest. That is a
 # different question from native_components() above, which only ever sees what `shell` itself
 # actually links -- measured (2026-09-27) at 0 for every one of expat/libjpeg-turbo/Wuffs/HarfBuzz/

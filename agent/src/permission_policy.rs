@@ -5273,8 +5273,8 @@ mod tests {
     // ---- the P1 audit of 2026-09-28: reads the path checks never saw -----------------------------
     //
     // Each of these was allowed without a card at 8b13773, and each was reproduced by running the
-    // real command in a scratch fixture before being fixed (the private review notes;
-    // the dated record, 2026-09-28).
+    // real command in a scratch fixture before being fixed
+    // (the private review notes; the dated record, 2026-09-28).
 
     /// A list file inside the project names what the command then reads, so the path checks, which
     /// look only at argv, never see the path. `wc`/`du --files0-from` print an outside file's size,

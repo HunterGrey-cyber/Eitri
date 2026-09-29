@@ -879,7 +879,8 @@ class ScanViewOnDiskTests(unittest.TestCase):
         scan = os.path.join(os.path.dirname(_PACKAGING), "publish", "scan.sh")
         if not os.path.isfile(scan):
             self.skipTest("publish/scan.sh is not in this checkout")
-        _plant(src, {"agent-ui/web/dist/index.html": b"<script>/* /home/" + b"some" + b"one/x */</script>\n"})
+        ident = _private_identifiers(scan)[0]
+        _plant(src, {"agent-ui/web/dist/index.html": f"<script>/* {ident}/x */</script>\n".encode()})
         leak = os.path.join(dest_parent, "leak")
         rc.make_scan_view(src, leak)
         proc = subprocess.run(["bash", scan, leak], capture_output=True, text=True)
@@ -904,7 +905,8 @@ class ScanViewOnDiskTests(unittest.TestCase):
         # The fork's retina image names (name@2x.png) are not addresses: the clean view passes.
         proc = subprocess.run(["bash", scan, dest], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        for planted, hit in ((b"// /home/" + b"some" + b"one/x\n", "[home-path]"),
+        ident = _private_identifiers(scan)[0]
+        for planted, hit in ((f"// {ident}/x\n".encode(), ident),
                              (b"// someone@" + b"mail.co.uk\n", "[email] someone@mail.co.uk")):
             with self.subTest(hit=hit):
                 _plant(src, {"neovide/src/lib.rs": planted})
@@ -919,8 +921,9 @@ class ScanViewOnDiskTests(unittest.TestCase):
 class ThirdPartyLicensesScanAllowTests(unittest.TestCase):
     """publish/scan-allow.txt's THIRD-PARTY-LICENSES entry removes third-party addresses before the
     other rules run; an address carrying one of scan.sh's own private identifiers must still hit
-    (Task 4 review). The identifiers, and every address, are spelled in pieces so this file itself
-    stays clean under the same scan for the export."""
+    (Task 4 review). The identifiers come from scan-allow.txt itself (_private_identifiers), never
+    from this file, which ships: every one is checked, and nothing private is spelled here, whole or
+    in pieces. The third-party addresses are invented, and pieced so the email rule passes this file."""
 
     def scan(self, text):
         scan = os.path.join(os.path.dirname(_PACKAGING), "publish", "scan.sh")
@@ -936,12 +939,28 @@ class ThirdPartyLicensesScanAllowTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_an_address_carrying_a_private_identifier_still_hits(self):
-        for address in ("me@" + "private" + ".example", "some" + "one@" + "mail.example",
-                        "x.some" + "one@" + "mail.example", "someone@" + "other" + ".example"):
+        scan = os.path.join(os.path.dirname(_PACKAGING), "publish", "scan.sh")
+        if not os.path.isfile(scan):
+            self.skipTest("publish/scan.sh is not in this checkout")
+        addresses = [shape.format(ident) for ident in _private_identifiers(scan)
+                     for shape in ("someone@{}.example", "{}@mail.example", "x.{}@mail.example")]
+        for address in addresses:
             with self.subTest(address=address):
                 proc = self.scan(f"Author: <{address}>, <jane@example.org>\n")
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn(f"[email] {address}", proc.stdout)
+
+
+def _private_identifiers(scan):
+    """The private identifiers publish/scan-allow.txt's THIRD-PARTY-LICENSES entry never lets pass
+    (its `(?i:...)` lookahead), plain words only: the tests below plant them, read at run time from
+    beside scan.sh, so this shipped file never carries one."""
+    with open(os.path.join(os.path.dirname(scan), "scan-allow.txt"), encoding="utf-8") as f:
+        line = next(l for l in f if l.startswith("*THIRD-PARTY-LICENSES\t"))
+    group = re.search(r"\(\?i:([^)]*)\)", line).group(1)
+    idents = [w for w in group.split("|") if re.fullmatch(r"[a-z0-9-]+", w)]
+    assert idents, line
+    return idents
 
 
 def _plant(root, files):

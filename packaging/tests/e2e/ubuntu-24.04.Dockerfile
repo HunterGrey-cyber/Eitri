@@ -1,8 +1,8 @@
 # plan 2026-09-27-v1-dist, Task 15 (spec sec 6, 5.3, 7, 15): a minimal Ubuntu 24.04 image carrying
 # only what a real end user's machine has -- the runtime libraries install.sh's own hint table
 # names for this distro, plus openssh-client so the real `ssh-keygen -Y verify` path actually runs
-# instead of silently degrading (codex verdict #5 of the
-# v1-dist plan review): ubuntu:24.04 carries no openssh-client by default, and install.sh's own D13
+# instead of silently degrading (codex verdict #5,
+# the private review notes #5: ubuntu:24.04 carries no openssh-client by default, and install.sh's own D13
 # degrade-on-missing-ssh-keygen path would otherwise accept a tampered SHA256SUMS.sig here with no
 # test noticing). No nvim by default -- ARG WITH_DISTRO_NVIM=1 adds Ubuntu's own neovim (0.9.5,
 # below the fork's 0.10 floor: spec sec 2.4's own `apt-cache policy` measurement), for the one

@@ -303,20 +303,20 @@ class NpmPackages(unittest.TestCase):
 class NoScratchDiskPathShipsInPinsEnv(unittest.TestCase):
     """leaks-claude-4 (+leaks-codex-3), packaging half: the owner's own scratch-disk mount point is
     not something a public reader needs -- packaging/pins.env's own comment used to name it
-    literally. Deliberately not self-checking THIS file's own source: a test asserting a string's
-    absence has to spell that string out to compare against, which would recreate the very leak
-    it exists to catch. publish/tests/ scans the real shipped source (including this file) for the
-    same marker without that paradox; see publish/scan.sh's private-path rule."""
+    literally. The private paths are publish/scan.sh's to know, not this file's: a test that spelled
+    one out (even in pieces) would ship it. So pins.env goes through the leak scan itself, every rule
+    included, wherever publish/ exists; publish/tests/test_scratch_disk_leak.sh checks the scan's
+    private-path rule against the marker directly."""
 
-    # Built from parts so this file's own source never contains the forbidden substring
-    # contiguously (the paradox the class docstring names).
-    _SCRATCH_DISK_MARKER = "/" + "srv" + "/" + "scratch"
-
-    def test_pins_env_names_no_scratch_disk_path(self):
-        path = os.path.join(cl.REPO, "packaging", "pins.env")
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        self.assertNotIn(self._SCRATCH_DISK_MARKER, text, path)
+    def test_pins_env_passes_the_leak_scan(self):
+        scan = os.path.join(cl.REPO, "publish", "scan.sh")
+        if not os.path.isfile(scan):
+            self.skipTest("publish/scan.sh is not in this checkout")
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        shutil.copy(os.path.join(cl.REPO, "packaging", "pins.env"), os.path.join(root, "pins.env"))
+        proc = subprocess.run(["bash", scan, root], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 # The pinned public source-asset archive (Task 3's pin, verdict #7's own subject): tag 0.153.3,
@@ -480,7 +480,7 @@ class SkiaArchiveComponents(unittest.TestCase):
         self.assertEqual(found, {"expat": ["libskia.a(libexpat.xmlparse.o)"]})
 
     def test_real_pinned_archive_matches_verdict_7s_evidence_table(self):
-        """the private review notes #7's own table, against the real,
+        """The v1-dist code review's verdict #7 evidence table, against the real,
         pinned (sha256-checked) archive this release links -- skipped where that build cache is
         absent, the same shape as test_real_shell_binary_carries_nvim_rs... above. Every count
         matches exactly once skia_archive_symbol_counts() counts only "T" (global function) symbols,

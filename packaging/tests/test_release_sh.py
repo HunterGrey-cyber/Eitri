@@ -602,9 +602,10 @@ class PublicCommitsRule(ReleaseShTestCase):
     read from it (git ls-remote; here the fixture's bare repo, through NEOVIBE_PUBLIC_REPO_URL), never
     from the clone's own refs/remotes/origin/*, and HEAD is scanned even when the public repo has it."""
 
-    # Built at run time, so this public file carries no private path itself (publish/rewrites.sed would
-    # rewrite it and publish/scan.sh would flag it).
-    PRIVATE_PATH = "/srv" + "/scratch/neovibe-release/v1.0.0-rc.1"
+    # Something publish/scan.sh refuses in a commit message: an invented address (its email rule), in two
+    # pieces so this file passes that rule itself. Never a real private value, whole or pieced -- scan.sh
+    # joins pieced literals and runs its private rules on them.
+    LEAK = "someone@" + "mail.co.uk"
     SOMEONE = ("Someone Else", "someone@example.com")
 
     def commit_as(self, message, author=None, committer=None):
@@ -632,16 +633,16 @@ class PublicCommitsRule(ReleaseShTestCase):
         self.assertRefused(self.run_release("--unsigned"), "not the public identity")
 
     def test_a_private_path_in_the_release_commits_message_is_refused(self):
-        self.commit_as(f"Release candidate 1.0.0-rc.1, built in {self.PRIVATE_PATH}")
+        self.commit_as(f"Release candidate 1.0.0-rc.1, built in {self.LEAK}")
         self.assertRefused(self.run_release("--unsigned"), "does not pass publish/scan.sh")
 
     def test_a_private_path_in_an_earlier_commit_the_push_publishes_is_refused(self):
-        self.commit_as(f"Tidy up {self.PRIVATE_PATH}")
+        self.commit_as(f"Tidy up {self.LEAK}")
         self.commit_as("Release candidate 1.0.0-rc.1")
         self.assertRefused(self.run_release("--unsigned"), "does not pass publish/scan.sh")
 
     def test_a_commit_the_public_repo_already_has_is_not_this_pushs_to_scan(self):
-        self.commit_as(f"An old commit naming {self.PRIVATE_PATH}")
+        self.commit_as(f"An old commit naming {self.LEAK}")
         self.publish()
         self.commit_as("Release candidate 1.0.0-rc.1")
         proc = self.run_release("--unsigned")
@@ -655,20 +656,20 @@ class PublicCommitsRule(ReleaseShTestCase):
     def test_the_clones_own_origin_refs_do_not_say_what_is_public(self):
         # A clone of a local clone (the plan's own rc.1 recipe): its origin/main is the release commit
         # itself, while the public repo has none of these commits. The old range was empty.
-        self.commit_as(f"Tidy up {self.PRIVATE_PATH}")
+        self.commit_as(f"Tidy up {self.LEAK}")
         self.commit_as("Release candidate 1.0.0-rc.1")
         self.env.git(self.clone, "update-ref", "refs/remotes/origin/main", "HEAD")
         self.assertRefused(self.run_release("--unsigned"), "does not pass publish/scan.sh")
 
     def test_the_release_commit_is_scanned_even_when_the_public_repo_has_it(self):
-        self.commit_as(f"Release candidate 1.0.0-rc.1, built in {self.PRIVATE_PATH}")
+        self.commit_as(f"Release candidate 1.0.0-rc.1, built in {self.LEAK}")
         self.publish()
         self.assertRefused(self.run_release("--unsigned"), "does not pass publish/scan.sh")
 
     def test_main_ahead_of_a_detached_head_is_scanned(self):
         # `git push origin main`, typed by habit instead of the printed HEAD:main, publishes main.
         self.commit_as("Release candidate 1.0.0-rc.1")
-        self.commit_as(f"Follow-up in {self.PRIVATE_PATH}")
+        self.commit_as(f"Follow-up in {self.LEAK}")
         self.env.git(self.clone, "checkout", "-q", "--detach", "HEAD~1")
         self.assertRefused(self.run_release("--unsigned"), "does not pass publish/scan.sh")
 
@@ -695,7 +696,7 @@ class PublicCommitsRule(ReleaseShTestCase):
     # a push sends, so a commit "fixed" with `git replace --edit` was scanned as its stand-in and pushed
     # as the original.
     def test_a_replacement_hiding_a_leaky_commit_is_refused(self):
-        self.commit_as(f"Tidy up {self.PRIVATE_PATH}")
+        self.commit_as(f"Tidy up {self.LEAK}")
         self.stand_in("HEAD", "Tidy up")
         self.commit_as("Release candidate 1.0.0-rc.1")
         self.assertRefused(self.run_release("--unsigned"), "replacement refs")
@@ -704,7 +705,7 @@ class PublicCommitsRule(ReleaseShTestCase):
         # GIT_REPLACE_REF_BASE moves where git looks for replacements, so no refs/replace/ ref exists:
         # the reads themselves must ignore replacements.
         self.env.vars["GIT_REPLACE_REF_BASE"] = "refs/elsewhere/"
-        self.commit_as(f"Tidy up {self.PRIVATE_PATH}")
+        self.commit_as(f"Tidy up {self.LEAK}")
         self.stand_in("HEAD", "Tidy up", ref_base="refs/elsewhere/")
         self.commit_as("Release candidate 1.0.0-rc.1")
         self.assertRefused(self.run_release("--unsigned"), "does not pass publish/scan.sh")
