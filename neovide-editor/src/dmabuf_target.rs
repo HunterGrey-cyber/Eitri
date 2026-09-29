@@ -1,44 +1,52 @@
-//! Presentation dmabufs allocated with a tiled layout, rendered by Skia through GL,
-//! and handed to GTK as `GdkDmabufTexture`s.
+//! Tiled dmabuf presentation buffers, rendered by Skia through GL and handed to GTK as
+//! `GdkDmabufTexture`s.
 //!
-//! `GtkGLArea` on GTK 4.16+ exports its colour texture as a dmabuf every frame. Mesa's
-//! iris driver reallocates textures as shareable for export. Without the kernel tiling
-//! uAPI, including on Intel Gfx12.5+, a shareable texture with no modifier is linear.
-//! At 2432x2482 pixels, copying from Skia's tiled intermediate into that linear buffer
-//! measured about 3.4 ms of GPU time, compared with 0.9 ms for Skia's drawing. Drawing
-//! directly into the linear buffer measured about 5 ms. Allocating an external buffer
-//! with an explicit tiled modifier avoids export reallocation and lets Skia draw
-//! directly into it. Compression is used where available.
+//! `GtkGLArea` exports its colour texture as a dmabuf on every frame starting with GTK 4.16.
+//! Mesa's iris driver reallocates a texture as shareable for export. Without the kernel's tiling
+//! uAPI, including on Intel Gfx12.5+, a shareable texture with no modifier is allocated linear.
+//! At 2432x2482 pixels, copying the Skia intermediate into that buffer took about 3.4 ms of GPU
+//! time per frame, compared with about 0.9 ms for Skia drawing into its tiled target. Drawing
+//! directly into the linear buffer took about 5 ms. Allocating an external buffer with an explicit
+//! tiled modifier, compressed where available, avoids reallocation and lets Skia draw without
+//! the intermediate copy.
 //!
-//! Buffers use the same pixel size, origin, and flip as `GtkGLArea`: widget size times
-//! GTK's integer scale factor. Missing EGL, GBM, or a mutually supported renderable
-//! modifier causes one stderr message and fallback for the rest of the GL context.
-//! Failures during a frame are also reported, with retries on later size changes,
-//! limited to a few per context. `NEOVIBE_EDITOR_DMABUF=0` forces fallback when rendering
-//! is wrong without a detectable error.
+//! Buffers use the same pixel size, origin and flip as `GtkGLArea`: widget size times GTK's
+//! integer scale factor. Missing EGL, GBM or a mutually supported modifier produces one stderr
+//! message and selects `GtkGLArea`'s buffer for the rest of the GL context. Allocation, import,
+//! framebuffer or texture failures during a frame are also reported. Retrying happens at the
+//! next size change, with a bounded number of attempts per GL context in `editor_area`.
+//! `NEOVIBE_EDITOR_DMABUF=0` forces the fallback, for a driver on which this path draws wrongly
+//! without failing, and for the regression test that forces it.
 //!
-//! Enabled by default only on GTK 4.16+ ([`decide`]). GTK 4.14 passes GSK a `GdkGLTexture`
-//! with a `GLsync` without exporting a dmabuf. On that version this path trades an
-//! intermediate copy for a new EGL import each frame, whose cost has not been measured.
-//! `NEOVIBE_EDITOR_DMABUF=1` forces this path for measurement there.
+//! Enabled by default only on GTK 4.16 and later. GTK 4.14 passes GSK a `GdkGLTexture` with a
+//! `GLsync` and exports no dmabuf. There, avoiding the intermediate copy would add a per-frame EGL
+//! import of a new `GdkDmabufTexture`, whose cost has not been measured.
+//! `NEOVIBE_EDITOR_DMABUF=1` forces this path there, for measuring it.
 //!
-//! `gdk_display_get_dmabuf_formats` lists formats accepted by any of GDK's importers.
-//! It does not guarantee the active GSK renderer can import a modifier directly. A
-//! hybrid GPU setup, incompatible Vulkan compression support, or `GSK_RENDERER=cairo`
-//! can cause a GPU-to-CPU-to-GPU transfer each frame. The public API cannot identify
-//! the chosen importer. `GDK_DEBUG=dmabuf` exposes it; `NEOVIBE_EDITOR_DMABUF=0`
-//! forces fallback. This path has only been exercised on Intel i915 with one GPU.
+//! `gdk_display_get_dmabuf_formats` combines formats accepted by GDK's Vulkan, EGL and mmap
+//! importers. A listed modifier need not be directly importable by the active GSK renderer.
+//! Different GPUs, unsupported compressed modifiers or `GSK_RENDERER=cairo` can cause a silent
+//! GPU-to-CPU-to-GPU transfer each frame. The public API cannot identify the importer used for a
+//! texture. `GDK_DEBUG=dmabuf` shows it; `NEOVIBE_EDITOR_DMABUF=0` is the escape hatch.
+//! Only Intel (i915, one GPU) has run this path.
 //!
-//! Draw into a buffer only after GTK releases every texture over it. GSK keeps textures
-//! while their images are in use, so release follows completion of GPU reads. Textures
-//! keep the dmabuf fds open across resize and unrealize. Implicit fences make writes
-//! visible before GTK samples them; GSK's Vulkan renderer imports the fence as a semaphore.
-//! This path also imports a native fence sync file after GL rendering as a dmabuf write
-//! using `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`. Without `EGL_ANDROID_native_fence_sync` or on
-//! kernels before 6.0, it reports that once and relies on implicit fencing.
+//! The fallback can also require a download on GTK 4.16+ with GSK's Vulkan renderer. If Vulkan
+//! cannot import `GtkGLArea`'s implicit-modifier export (`AB24:0xffffffffffffff`), GSK downloads
+//! through GL and uploads again. With Mesa RADV at 2432x2482 this took about 10 ms of main-thread
+//! CPU per frame. `GSK_RENDERER=gl` (`ngl` before GTK 4.18) uses EGL import instead; its cost on
+//! AMD has not been measured. GTK below 4.16 exports nothing here and defaults to GL.
+//! [`fallback_hint`] prints one stderr message for a fallback under Vulkan without changing it.
 //!
-//! Uses `GdkDmabufTextureBuilder` and `gdk_display_get_dmabuf_formats`, both available
-//! since GTK 4.14. Loads `libgbm.so.1` at runtime instead of linking it.
+//! A buffer is reused only after GTK releases every texture over it. GSK retains textures until
+//! the GPU finishes reading them, and the textures keep the dmabuf fds open across resize or
+//! unrealize. Before GTK samples a frame, it must see the GL writes. This path imports an explicit
+//! native fence sync file into the dmabuf as a write with `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`.
+//! Without `EGL_ANDROID_native_fence_sync` or on a kernel before 6.0, it reports this once and
+//! relies on the driver's implicit fence, as `GtkGLArea` does. GSK's Vulkan renderer converts the
+//! implicit fence to a semaphore with `gdk_dmabuf_export_sync_file`.
+//!
+//! `GdkDmabufTextureBuilder` and `gdk_display_get_dmabuf_formats` require GTK 4.14.
+//! GBM is opened at runtime from `libgbm.so.1`, never linked.
 
 use std::ffi::{c_char, c_int, c_void, CStr, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -129,6 +137,21 @@ pub(crate) fn setting(value: Option<&OsStr>) -> Setting {
     } else {
         Setting::Default
     }
+}
+
+/// The one-line hint for a pane that draws through `GtkGLArea`'s own texture: `Some` only on GTK
+/// 4.16+ (where the export exists) when the widget's native renderer is GSK's Vulkan renderer.
+/// Pure, so tested; the caller prints it once per pane.
+pub(crate) fn fallback_hint(gtk_minor: u32, fell_back: bool, renderer_type_name: &str) -> Option<String> {
+    if !fell_back || gtk_minor < MEASURED_FROM_GTK.1 || renderer_type_name != "GskVulkanRenderer" {
+        return None;
+    }
+    Some(
+        "GtkGLArea's texture may be exported as an implicit-modifier dmabuf, which GSK's Vulkan renderer may not \
+         import on some drivers (e.g. Mesa RADV; Intel was measured exporting linear, with no download): it then downloads every frame (~10 ms of CPU each at HiDPI). \
+         `GDK_DEBUG=dmabuf` shows \"for downloading\" lines if so; `GSK_RENDERER=gl` (`ngl` before GTK 4.18) should avoid it (untested)"
+            .to_string(),
+    )
 }
 
 /// Whether to try this path, from `NEOVIBE_EDITOR_DMABUF` and the **runtime** GTK version
@@ -889,6 +912,21 @@ fn import_write_fence(fds: &[OwnedFd], fence: &OwnedFd) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fallback_hint_needs_gtk_4_16_the_fallback_and_a_vulkan_renderer() {
+        let vk = "GskVulkanRenderer";
+        let hint = fallback_hint(16, true, vk).expect("hint");
+        assert!(
+            hint.contains("GDK_DEBUG=dmabuf") && hint.contains("for downloading") && hint.contains("GSK_RENDERER=gl")
+        );
+        assert!(fallback_hint(22, true, vk).is_some());
+        assert!(fallback_hint(14, true, vk).is_none(), "GTK 4.14 exports nothing");
+        assert!(fallback_hint(22, false, vk).is_none(), "own buffers in use");
+        assert!(fallback_hint(22, true, "GskGLRenderer").is_none());
+        assert!(fallback_hint(22, true, "GskNglRenderer").is_none());
+        assert!(fallback_hint(22, true, "").is_none());
+    }
 
     const MTL_RC_CCS_CC: u64 = 0x0100_0000_0000_000f;
     const TILE4: u64 = 0x0100_0000_0000_0009;

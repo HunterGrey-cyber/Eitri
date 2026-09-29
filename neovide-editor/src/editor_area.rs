@@ -150,6 +150,8 @@ mod imp {
         pub(super) lifecycle: Cell<Lifecycle>,
         pub(super) last_resize: Cell<(i32, i32)>,
         pub(super) drawing_into_own_buffer: Cell<bool>,
+        /// The fallback hint (`dmabuf_target::fallback_hint`) is printed at most once per pane.
+        pub(super) fallback_hint_done: Cell<bool>,
         /// Never reset: it spans every realize.
         pub(super) counts: Cell<PresentationCounts>,
     }
@@ -173,6 +175,7 @@ mod imp {
             // whatever size `GtkGLArea` last reported.
             self.last_resize.set((0, 0));
             self.count(|c| c.fallback_frames += 1);
+            self.note_fallback();
             self.parent_snapshot(snapshot);
         }
 
@@ -210,6 +213,26 @@ mod imp {
             let r = f(&mut lifecycle);
             self.lifecycle.set(lifecycle);
             r
+        }
+
+        /// Once per pane: name the likely per-frame download when the fallback runs under GSK's
+        /// Vulkan renderer on GTK 4.16+. Diagnostic only.
+        fn note_fallback(&self) {
+            use gtk4::prelude::NativeExt;
+            if self.fallback_hint_done.get() {
+                return;
+            }
+            let Some(native) = self.obj().native() else {
+                return;
+            };
+            let Some(renderer) = native.renderer() else {
+                return;
+            };
+            self.fallback_hint_done.set(true);
+            let name = glib::prelude::ObjectExt::type_(&renderer).name();
+            if let Some(hint) = dmabuf_target::fallback_hint(gtk4::minor_version(), true, name) {
+                eprintln!("[editor] {hint}");
+            }
         }
 
         /// `true` when this frame was handled (drawn, or -- like `GtkGLArea` -- nothing to draw);
