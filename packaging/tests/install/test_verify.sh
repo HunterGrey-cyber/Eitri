@@ -684,6 +684,33 @@ t_cache_group_writable_duplicate_gid_refused() {
 	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
 }
 
+TESTS="$TESTS t_cache_group_list_cut_short_refused"
+t_cache_group_list_cut_short_refused() {
+	# Codex's rc.3 review: a group list that stops early (getent exiting non-zero after printing the
+	# user's own group) must not count as "exactly one group with this GID".
+	if ! own_private_group_here; then
+		printf 'note: the test user has no private group here; nothing to check\n'
+		return 0
+	fi
+	serve 1.0.0
+	mkdir -p "$TH/.cache"
+	chmod 0775 "$TH/.cache"
+	mkdir -p "$T/stubs-getent-short"
+	cat >"$T/stubs-getent-short/getent" <<'STUB'
+#!/bin/sh
+if [ "$1" = group ] && [ $# -eq 1 ]; then
+	/usr/bin/getent group "$(id -gn)"
+	exit 1
+fi
+exec /usr/bin/getent "$@"
+STUB
+	chmod +x "$T/stubs-getent-short/getent"
+	PRE_STUBS=$T/stubs-getent-short
+	inst_net
+	expect_fail "a 0775 cache parent when the group list is cut short"
+	expect_out "$TH/.cache is writable by its group or by anyone, and not sticky"
+}
+
 TESTS="$TESTS t_cache_other_writable_own_private_group_still_refused"
 t_cache_other_writable_own_private_group_still_refused() {
 	# The private-group allowance covers the group bit only: other-write without the sticky bit is

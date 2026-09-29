@@ -1426,7 +1426,9 @@ own_private_group() {
 	esac
 	# A second group with the same GID (groupadd --non-unique) gives its members the same access
 	# without being named here: the whole group list must hold exactly one group with this GID.
-	_opg_gcount=$(getent group 2>/dev/null | awk -F: -v g="$_opg_gid" '$3 == g { n++ } END { print n + 0 }') || return 0
+	# Captured first: in a pipeline getent's own failure (a list cut short) would be lost.
+	_opg_groups=$(getent group 2>/dev/null) || return 0
+	_opg_gcount=$(printf '%s\n' "$_opg_groups" | awk -F: -v g="$_opg_gid" '$3 == g { n++ } END { print n + 0 }') || return 0
 	[ "$_opg_gcount" = 1 ] || return 0
 	# A second account whose PRIMARY group is this one is never listed as a member, so look for one
 	# in the account list itself -- which must at least list this user, or it is not a list this
