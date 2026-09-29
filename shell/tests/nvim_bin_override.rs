@@ -10,8 +10,8 @@
 //!
 //! With `harness = false`, `main` handles `--ignored` itself. The test needs `nvim` >= 0.10
 //! on `PATH` and a display connection for winit's clipboard, even though it opens no window.
-//! Start a separate display and point the test at it before running this command, so the
-//! test does not connect to the desktop session.
+//! `support/own_x_server.rs` starts a separate `Xvfb` and points the test at it before winit
+//! connects, dropping inherited `WAYLAND_DISPLAY` and `DISPLAY` values. Run it with:
 //!
 //!     cargo test -p shell --test nvim_bin_override -- --ignored
 //!
@@ -25,6 +25,10 @@ use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
 use neovide::units::{GridSize, PixelRect};
 use skia_safe::surfaces;
 
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
+
 fn main() {
     // Mirrors `#[ignore]` under a plain `main`: `cargo test --workspace` needs no nvim and writes
     // nothing to disk.
@@ -33,6 +37,15 @@ fn main() {
         println!("nvim_bin_override: ignored (spawns a real nvim, needs a display); run with `-- --ignored`");
         return;
     }
+    // As `shell`'s own `main` and `cursor_animation` do: a pipe or socket on
+    // stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer and
+    // blocks it at startup (`neovide_editor::stdin`), which failed this test as "nvim never became ready".
+    if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+        println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
+    }
+    // Before winit or the clipboard connects to anything: its own Xvfb, the only display left to find.
+    // Declared first, so a failed assertion below drops (and stops) it last, after the harness.
+    let _server = own_x_server::isolate("nvim_bin_override", "640x480x24");
 
     // `$TMPDIR` (`/tmp` when unset), like every other test in this workspace that needs a throwaway
     // directory -- this project's own dev-scratch convention (`~/.cache/nv-v1dist-*`) is for a human

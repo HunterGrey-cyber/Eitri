@@ -7,24 +7,26 @@
 //!
 //! 1. `set_os_scale_factor(2.0)` returns `true`, `os_scale_factor()` reads back `2.0`, and
 //!    cell width is about twice its scale-1 baseline after one frame.
-//! 2. In the same transition, the ink height of row 0's 'MMM' grows by about the same ratio.
+//! 5. In check 1's transition, the ink height of row 0's 'MMM' grows by about the same ratio.
 //!    No `resize_grid` call is made: the integer grid stays fixed while cell size changes.
 //!    This detects a missing redraw when `LiveHarness::render_frame` combines
 //!    `os_scale_redraw_pending` with `scale_factor_changed`. Using only
 //!    `apply_scale_factor_setting()` leaves the glyph image unchanged at a ratio near 1.0;
 //!    including the pending redraw produces a ratio near 2.0.
-//! 3. Repeating `set_os_scale_factor(2.0)` returns `false`. Cell width and
+//! 2. Repeating `set_os_scale_factor(2.0)` returns `false`. Cell width and
 //!    `os_scale_factor_resyncs()` remain unchanged across 30 idle frames.
-//! 4. At display scale 2.0, `:let g:neovide_scale_factor = 1.5` gives about 3x the baseline
+//! 3. At display scale 2.0, `:let g:neovide_scale_factor = 1.5` gives about 3x the baseline
 //!    cell width; setting zoom back to 1.0 returns to about 2x. `sync_scale_factor` multiplies
 //!    the two scales and leaves the host's `os_scale_factor` unchanged.
-//! 5. `set_os_scale_factor(0.0)`, `(-1.0)` and `(f64::NAN)` return `false` without changing
+//! 4. `set_os_scale_factor(0.0)`, `(-1.0)` and `(f64::NAN)` return `false` without changing
 //!    the stored display scale or cell width.
 //! 6. `set_os_scale_factor(1.0)` returns `true` and restores the original cell width.
 //!
-//! Ignored unless requested: it spawns `nvim` (>= 0.10 on `PATH`) and connects to the
-//! session's display for the clipboard without creating a window. A plain `main`
-//! (`harness = false`) keeps the single winit `EventLoop` on the main thread. Run with:
+//! Ignored unless requested: it spawns `nvim` (>= 0.10 on `PATH`) and starts its own `Xvfb`
+//! for the clipboard without creating a window. `shell/tests/support/own_x_server.rs`
+//! starts the display before winit connects and removes inherited `WAYLAND_DISPLAY` and
+//! `DISPLAY`. A plain `main` (`harness = false`) keeps the single winit `EventLoop`
+//! on the main thread. Run without a display wrapper:
 //!
 //!     cargo test -p neovide-editor --test os_scale_factor -- --ignored
 use std::time::{Duration, Instant};
@@ -34,6 +36,11 @@ use neovide::{
     units::{GridSize, PixelRect},
 };
 use skia_safe::{surfaces, Color, Surface};
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29). The one helper
+// every display-connecting test in the workspace shares, so it lives with `shell`'s.
+#[path = "../../shell/tests/support/own_x_server.rs"]
+mod own_x_server;
 
 struct Frames {
     surface: Surface,
@@ -123,6 +130,15 @@ fn main() {
         println!("os_scale_factor: ignored (spawns a real nvim); run with `-- --ignored`");
         return;
     }
+    // As `shell`'s own `main` and `cursor_animation` do: a pipe or socket on
+    // stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer and
+    // blocks it at startup (`neovide_editor::stdin`), which failed this test as "nvim never became ready".
+    if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+        println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
+    }
+    // Before winit or the clipboard connects to anything: its own Xvfb, the only display left to find.
+    // Declared first, so a failed assertion below drops (and stops) it last, after the harness.
+    let _server = own_x_server::isolate("os_scale_factor", "640x480x24");
 
     let mut harness = LiveHarness::with_options(LiveHarnessOptions {
         os_scale_factor: 1.0,

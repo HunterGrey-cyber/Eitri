@@ -16,13 +16,14 @@
 //! control. With the workaround it must take the new colour. The test also checks that
 //! the visible sibling changed colour and that the sampled widget was mapped.
 //!
-//! Run under its own X server with GTK explicitly using X11:
+//! The test starts its own Xvfb with a 1024x768 screen through `support/own_x_server.rs`.
+//! It drops inherited `WAYLAND_DISPLAY` and `DISPLAY` values before GTK initialises.
 //!
-//!     xvfb-run -a -s "-nolisten tcp -screen 0 1024x768x24" env GDK_BACKEND=x11 \
-//!         cargo test -p shell --test hidden_widget_restyle -- --ignored
+//!     cargo test -p shell --test hidden_widget_restyle -- --ignored
 //!
 //! Uses a plain `main` (`harness = false`) because GTK must own the main thread.
-//! Refuses to start unless `GDK_BACKEND=x11`. Takes about 8s.
+//! Checking only `GDK_BACKEND=x11` would also accept a desktop's XWayland display.
+//! Takes about 8s.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -30,6 +31,10 @@ use std::time::{Duration, Instant};
 use gtk4::prelude::*;
 use neovibe_core::attention::Attention;
 use neovibe_core::layout::{Axis, Layout, ModuleId, Node};
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 #[allow(dead_code)]
 #[path = "../src/theme/restyle.rs"]
@@ -214,20 +219,8 @@ fn main() {
         println!("hidden_widget_restyle: ignored (drives real GTK on a display); run with `-- --ignored`");
         return;
     }
-    if std::env::var("GDK_BACKEND").as_deref() != Ok("x11") {
-        eprintln!(
-            "hidden_widget_restyle: refusing to open windows without GDK_BACKEND=x11 -- run it under its own X server:"
-        );
-        eprintln!(
-            "    xvfb-run -a -s \"-nolisten tcp -screen 0 1024x768x24\" env GDK_BACKEND=x11 \
-             cargo test -p shell --test hidden_widget_restyle -- --ignored"
-        );
-        std::process::exit(1);
-    }
-    if let Err(e) = gtk4::init() {
-        eprintln!("hidden_widget_restyle: GTK could not initialise ({e}); it needs an X server of its own");
-        std::process::exit(1);
-    }
+    // Its own Xvfb, GTK initialised on it and checked to be on it -- never an inherited display.
+    let server = own_x_server::init_gtk("hidden_widget_restyle", "1024x768x24");
 
     type Scenario = fn(bool) -> Result<Read, String>;
     let scenarios: [(&str, Scenario); 2] = [("tray", tray_chip), ("child-visible", child_visible)];
@@ -263,7 +256,7 @@ fn main() {
     }
     if !failed.is_empty() {
         eprintln!("hidden_widget_restyle: {} failed: {}", failed.len(), failed.join("; "));
-        std::process::exit(1);
+        server.exit(1);
     }
     println!("hidden_widget_restyle: 4 passed");
 }

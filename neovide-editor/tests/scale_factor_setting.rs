@@ -21,8 +21,9 @@
 //!    The check measures the first contiguous run of non-background pixels in the text row
 //!    to verify that `prepare_lines(scale_factor_changed)` updates the rendered pixels.
 //!
-//! Ignored unless requested. Requires `nvim` >= 0.10 on `PATH` and uses the session's
-//! display for the clipboard without opening a window.
+//! Ignored unless requested. Requires `nvim` >= 0.10 on `PATH` and starts its own `Xvfb`
+//! for the clipboard without opening a window. `shell/tests/support/own_x_server.rs` starts
+//! the display before winit connects and removes inherited `WAYLAND_DISPLAY` and `DISPLAY`.
 //! Uses a plain `main` (`harness = false`) because winit builds its event loop on the main
 //! thread. Run with:
 //!
@@ -34,6 +35,11 @@ use neovide::{
     units::{GridSize, PixelRect},
 };
 use skia_safe::{surfaces, Color, Surface};
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29). The one helper
+// every display-connecting test in the workspace shares, so it lives with `shell`'s.
+#[path = "../../shell/tests/support/own_x_server.rs"]
+mod own_x_server;
 
 struct Frames {
     surface: Surface,
@@ -131,6 +137,15 @@ fn main() {
         println!("scale_factor_setting: ignored (spawns a real nvim); run with `-- --ignored`");
         return;
     }
+    // As `shell`'s own `main` and `cursor_animation` do: a pipe or socket on
+    // stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer and
+    // blocks it at startup (`neovide_editor::stdin`), which failed this test as "nvim never became ready".
+    if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
+        println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
+    }
+    // Before winit or the clipboard connects to anything: its own Xvfb, the only display left to find.
+    // Declared first, so a failed assertion below drops (and stops) it last, after the harness.
+    let _server = own_x_server::isolate("scale_factor_setting", "640x480x24");
 
     let mut harness = LiveHarness::with_options(LiveHarnessOptions {
         os_scale_factor: 1.0,

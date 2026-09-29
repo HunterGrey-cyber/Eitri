@@ -13,14 +13,14 @@
 //! does so at 144 dpi, then live at 146 dpi (which WebKit ignores: within 2% of the zoom it applied),
 //! 96 and 120 dpi, the way a desktop's text-scaling change arrives.
 //!
-//! Needs a display, and never the real desktop: run it under its own X server, with GTK told to use
-//! it rather than a Wayland session the shell may have exported (and `GDK_SCALE=2` for scale 2) --
+//! Needs a display, and never the real desktop: **it starts its own** (2026-09-29,
+//! `support/own_x_server.rs`) -- an `Xvfb` with a 1024x900 screen, pointed to before GTK
+//! initialises, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped (and `GDK_SCALE=2` for scale 2) --
 //!
-//!     xvfb-run -a -s "-nolisten tcp -screen 0 1024x900x24" env GDK_BACKEND=x11 \
-//!         cargo test -p shell --test band_xft_zoom -- --ignored
+//!     cargo test -p shell --test band_xft_zoom -- --ignored
 //!
-//! A plain `main` (`harness = false`), because GTK must own the main thread; it refuses to start
-//! unless `GDK_BACKEND=x11`. A few seconds.
+//! A plain `main` (`harness = false`), because GTK must own the main thread. It used to refuse only a
+//! missing `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on a desktop session satisfies. A few seconds.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,6 +31,10 @@ use neovibe_core::theme::ThemeTokens;
 use serde_json::Value;
 use webkit6::prelude::*;
 use webkit6::WebView;
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 // `unused_imports`: the module's own `#[cfg(test)] mod tests` comes along, its `#[test]`s dropped for
 // want of a harness, and its `use super::*` with them.
@@ -215,23 +219,13 @@ fn main() {
         println!("band_xft_zoom: ignored (drives real WebKitGTK on a display); run with `-- --ignored`");
         return;
     }
-    if std::env::var("GDK_BACKEND").as_deref() != Ok("x11") {
-        eprintln!("band_xft_zoom: refusing to open windows without GDK_BACKEND=x11 -- run it under its own X server:");
-        eprintln!(
-            "    xvfb-run -a -s \"-nolisten tcp -screen 0 1024x900x24\" env GDK_BACKEND=x11 \
-             cargo test -p shell --test band_xft_zoom -- --ignored"
-        );
-        std::process::exit(1);
-    }
-    if let Err(e) = gtk4::init() {
-        eprintln!("band_xft_zoom: GTK could not initialise ({e}); it needs an X server of its own");
-        std::process::exit(1);
-    }
+    // Its own Xvfb, GTK initialised on it and checked to be on it -- never an inherited display.
+    let server = own_x_server::init_gtk("band_xft_zoom", "1024x900x24");
     match run() {
         Ok(()) => println!("band_xft_zoom: ok (the band is one {ROW}px editor row at 144, 146, 96 and 120 dpi)"),
         Err(e) => {
             eprintln!("band_xft_zoom: FAILED: {e}");
-            std::process::exit(1);
+            server.exit(1);
         }
     }
 }

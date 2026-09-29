@@ -12,23 +12,21 @@
 //! This checks GTK allocation and focus forwarding. It does not check the rectangle delivered
 //! to an input method or capture-phase key delivery from a WebView.
 //!
-//! Run with an isolated /tmp and runtime directory under an X server with no filesystem socket.
-//! Unset inherited displays and XAUTHORITY, and explicitly select the X11 backend. Build first, then:
+//! The harness starts its own 1600x900 Xvfb through support/own_x_server.rs before GTK initialises.
+//! It ignores inherited displays and disconnects from the session bus. No xvfb-run is needed.
+//! Run with:
 //!
-//!     bwrap --dev-bind / / --tmpfs /tmp --tmpfs /run/user/$(id -u) --unsetenv WAYLAND_DISPLAY \
-//!         --unsetenv DISPLAY --unsetenv XAUTHORITY --setenv TMPDIR /tmp -- sh -c '
-//!       Xvfb :573 -nolisten tcp -nolisten unix -screen 0 1600x900x24 & x=$!; sleep 1
-//!       DISPLAY=:573 GDK_BACKEND=x11 cargo test -p shell --test web_host_origin -- --ignored; r=$?
-//!       kill $x; exit $r'
+//!     cargo test -p shell --test web_host_origin -- --ignored
 //!
-//! xvfb-run chooses a display by lock file and can unlink a desktop socket that has no lock file.
-//! The isolated /tmp separates socket paths, and -nolisten unix leaves only the abstract socket.
-//! The wrapper shares the network namespace so the test can reach that socket.
-//! A plain main with `harness = false` keeps GTK on the main thread and requires GDK_BACKEND=x11.
+//! A plain main with `harness = false` keeps GTK on the main thread.
 
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
+
+// The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 // `dead_code`: the product calls more of the module than this test does.
 #[allow(dead_code)]
@@ -164,30 +162,19 @@ fn main() {
         println!("web_host_origin: ignored (drives real GTK on a display); run with `-- --ignored`");
         return;
     }
-    if std::env::var("GDK_BACKEND").as_deref() != Ok("x11") {
-        eprintln!(
-            "web_host_origin: refusing to open windows without GDK_BACKEND=x11 -- run it under its own X server:"
-        );
-        eprintln!(
-            "    xvfb-run -a -s \"-nolisten tcp -screen 0 1600x900x24\" env GDK_BACKEND=x11 \
-             cargo test -p shell --test web_host_origin -- --ignored"
-        );
-        std::process::exit(1);
-    }
-    if let Err(e) = gtk4::init() {
-        eprintln!("web_host_origin: GTK could not initialise ({e}); it needs an X server of its own");
-        std::process::exit(1);
-    }
+    // Its own Xvfb, GTK initialised on it and checked to be on it -- never an inherited display.
+    let server = own_x_server::init_gtk("web_host_origin", "1600x900x24");
     match run() {
         Ok(report) => {
             for line in report {
                 println!("web_host_origin: {line}");
             }
             println!("web_host_origin: ok");
+            server.exit(0);
         }
         Err(e) => {
             eprintln!("web_host_origin: FAILED: {e}");
-            std::process::exit(1);
+            server.exit(1);
         }
     }
 }
