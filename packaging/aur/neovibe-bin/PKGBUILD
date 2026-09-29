@@ -11,26 +11,26 @@
 # neovibe-bin is deliberately never published to the AUR for a `-rc.N` prerelease version
 # (the private review notes #3, plan
 # docs/superpowers/plans/2026-09-27-v1-dist.md Task 14): mapping `-` -> `_` the way spec sec 3
-# says (`1.0.0-rc.1` -> `1.0.0_rc.1`) sorts ABOVE the eventual final release under pacman's own
+# says (`0.2.0-rc.1` -> `0.2.0_rc.1`) sorts ABOVE the eventual final release under pacman's own
 # version comparison --
 #
-#   $ vercmp 1.0.0_rc.1-1 1.0.0-1
+#   $ vercmp 0.2.0_rc.1-1 0.2.0-1
 #   1
 #
-# -- which would strand every `-rc.N` installer above the real `1.0.0` release with no upgrade
+# -- which would strand every `-rc.N` installer above the real `0.2.0` release with no upgrade
 # path (pacman/AUR helpers only ever offer to upgrade to a *higher* version). bump-bin.sh refuses
 # to print an AUR-ready commit for a prerelease version; a prerelease build of this PKGBUILD exists
 # only for packaging/aur/test-in-container.sh (a local, test-only source= override, never pushed).
 
 pkgname=neovibe-bin
-pkgver=1.0.0
+pkgver=0.2.0
 pkgrel=1
-# _realver: the release's own NEOVIBE_VERSION, hyphenated (e.g. "1.0.0-rc.1"), as GitHub's release
+# _realver: the release's own NEOVIBE_VERSION, hyphenated (e.g. "0.2.0-rc.1"), as GitHub's release
 # tag and every asset filename actually spell it. pkgver above is that same string with '-' -> '_'
 # (spec docs/superpowers/specs/2026-09-27-v1-dist-design.md sec 3 -- makepkg's pkgver may not
 # contain a hyphen at all), so the two diverge for any prerelease and only _realver is right to use
 # in a download URL or an asset's on-disk name. bump-bin.sh sets both from the same RELEASE key.
-_realver=1.0.0
+_realver=0.2.0
 pkgdesc="Neovim, embedded as a real component, with a Claude agent panel beside it (prebuilt binaries; builds its own sidecar on install)"
 arch=('x86_64')
 url="https://github.com/HunterGrey-cyber/neovibe"

@@ -4,7 +4,7 @@
 # or a package manager: when something is missing it prints the command and stops.
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL https://github.com/HunterGrey-cyber/neovibe/releases/latest/download/install.sh | sh
-#   curl --proto '=https' --tlsv1.2 -fsSL .../install.sh | sh -s -- --version 1.0.0 --yes
+#   curl --proto '=https' --tlsv1.2 -fsSL .../install.sh | sh -s -- --version 0.2.0 --yes
 #   neovibe setup        (this same file, installed as lib/neovibe/neovibe-setup)
 #
 # `sh install.sh --help` lists the options.
@@ -137,7 +137,7 @@ neovibe installer -- installs neovibe for the user running it, into ~/.local.
 usage: sh install.sh [options]
 
   (no option)                  install or upgrade to the latest release
-  --version X                  a specific release, e.g. 1.0.0 (also the only way to install an
+  --version X                  a specific release, e.g. 0.2.0 (also the only way to install an
                                older version than the one installed)
   --yes, --no-nvim, --with-nvim
                                non-interactive answers to the prompt offering to install a private
@@ -241,7 +241,7 @@ parse_args() {
 		die "--purge only goes with --uninstall"
 	fi
 	if [ -n "$OPT_VERSION" ] && ! printf '%s\n' "$OPT_VERSION" | grep -Eqx "$NV_VERSION_ERE"; then
-		die "--version $OPT_VERSION: expected a release version such as 1.0.0 or 1.0.0-rc.1"
+		die "--version $OPT_VERSION: expected a release version such as 0.2.0 or 0.2.0-rc.1"
 	fi
 	if [ -n "$OPT_TARBALL$OPT_SUMS$OPT_SIG" ]; then
 		if [ -z "$OPT_TARBALL" ] || [ -z "$OPT_SUMS" ]; then

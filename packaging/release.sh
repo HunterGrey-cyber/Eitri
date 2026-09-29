@@ -707,14 +707,14 @@ This release candidate carries no release key. `install.sh` built from this tree
 SHA256SUMS only, which detects a damaged download, not who made the release; `SHA256SUMS.sig`,
 when it exists, is signed with a throwaway key that is published nowhere and is not a trust
 anchor, so there is no manual verification command against this build that would mean anything.
-The first v1.0.0 final release will embed the owner's dedicated release key, and every installer
+The first v0.2.0 final release will embed the owner's dedicated release key, and every installer
 built after that verifies `SHA256SUMS.sig` automatically.
 NV_VERIFY
 )"
 		verify_section_zh="$(cat <<'NV_VERIFY_ZH'
     sha256sum -c --ignore-missing SHA256SUMS
 
-这个候选版本没有发布密钥。基于这份源码构建出的 `install.sh` 只检查 SHA256SUMS，这能发现下载损坏，但无法证明发布者身份；`SHA256SUMS.sig`（如果存在）是用一次性密钥签名的，该密钥未在任何地方公开，也不是信任锚点，因此没有任何针对本构建的手动验证命令是有意义的。第一个 v1.0.0 正式版会内置所有者专用的发布密钥，此后构建出的每个安装脚本都会自动验证 `SHA256SUMS.sig`。
+这个候选版本没有发布密钥。基于这份源码构建出的 `install.sh` 只检查 SHA256SUMS，这能发现下载损坏，但无法证明发布者身份；`SHA256SUMS.sig`（如果存在）是用一次性密钥签名的，该密钥未在任何地方公开，也不是信任锚点，因此没有任何针对本构建的手动验证命令是有意义的。第一个 v0.2.0 正式版会内置所有者专用的发布密钥，此后构建出的每个安装脚本都会自动验证 `SHA256SUMS.sig`。
 NV_VERIFY_ZH
 )"
 	fi

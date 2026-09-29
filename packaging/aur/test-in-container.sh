@@ -28,7 +28,7 @@
 #       --verdandi-mirror DIR [--tag TAG] [--work DIR] [--only bin|git] [--jobs N]
 #
 # --release-dir is the only thing that needs to change to re-run this against a later (real,
-# signed) release: `--release-dir ~/.cache/neovibe-release/v1.0.0/` (release.sh's default --out)
+# signed) release: `--release-dir ~/.cache/neovibe-release/v0.2.0/` (release.sh's default --out)
 # once it exists, keeping --neovibe-checkout/--neovide-mirror/--verdandi-mirror pointed at whatever
 # public clone/mirrors correspond to that release (a fresh public export for a real cut, or the
 # same ones here if the commits have not moved).
@@ -227,7 +227,7 @@ test_git() {
 	NEOVIDE_MIRROR="$(realpath -- "$NEOVIDE_MIRROR")"
 	VERDANDI_MIRROR="$(realpath -- "$VERDANDI_MIRROR")"
 
-	# A throwaway tagged clone: the public repo carries no v1.0.0-rc.1 tag yet (the rc window this
+	# A throwaway tagged clone: the public repo carries no v0.2.0-rc.1 tag yet (the rc window this
 	# is testing IS the scenario finding #2 asks to be exercised specifically), so pkgver()'s
 	# `git describe --long --tags` needs one to describe from. Never touches --neovibe-checkout
 	# itself. A checkout that already carries $TAG (tagged once the release is cut) keeps it, but

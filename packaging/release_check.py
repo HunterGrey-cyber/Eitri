@@ -9,8 +9,8 @@ no network -- the pattern packaging/collect-licenses.py and packaging/test_colle
 
 Usage (release.sh calls these; Task 4 fixed the set):
     python3 release_check.py validate-release-file RELEASE [--rehearsal]
-    python3 release_check.py asset-names 1.0.0-rc.1 a2f194a
-    python3 release_check.py gh-release-command 1.0.0-rc.1 --repo OWNER/NAME --title T --notes-file F asset1 ...
+    python3 release_check.py asset-names 0.2.0-rc.1 a2f194a
+    python3 release_check.py gh-release-command 0.2.0-rc.1 --repo OWNER/NAME --title T --notes-file F asset1 ...
     python3 release_check.py check-legacy-symbols NM_C_OUTPUT_FILE
     python3 release_check.py tree-equal EXTRACTED_DIR REPO_DIR REV [--allow ADDITION ...]
     python3 release_check.py build-executables BUILD_JSON
