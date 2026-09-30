@@ -2150,7 +2150,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
-        cancelBypassConfirm();
+        endKeyPrompts();
         arrivalParkRef.current = null; // #22: this lands INPUT, never on a parked row
         setEmptyLanding("input");
         setInputRequest((n) => n + 1);
@@ -2160,7 +2160,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
-        cancelBypassConfirm();
+        endKeyPrompts();
         // A reserved two-key prefix or a leader/table sequence armed from before this arrival means
         // nothing about it -- the same reason `pane_focus` cancels both.
         dropPendingKeys();
@@ -2175,13 +2175,13 @@ export default function App() {
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
-        cancelBypassConfirm();
+        endKeyPrompts();
         arrivalParkRef.current = null; // #22: a card landing wins over a parked row
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "nav_key") {
         // GTK claimed this key before the WebView could pass it to `answerConfirm`. Cancel the
         // bypass prompt here because only a guarded `y`/`Y` may confirm it.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees a keydown, so this is a key pressed
         // after any pending `g`/`z`/`[`/`]` prefix or leader sequence -- cancelled here for the same
         // reason `pane_focus` and `arrive` cancel them, whether the effect below claims the chord or
@@ -2215,7 +2215,7 @@ export default function App() {
         // Check those types rather than `isEditableElement` because this needs text selection.
         // Cancel the bypass prompt here because GTK claimed the key before `answerConfirm` could
         // see it.
-        cancelBypassConfirm();
+        endKeyPrompts();
         if (payload.key !== "C-a") return;
         const el = document.activeElement;
         if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
@@ -2225,7 +2225,7 @@ export default function App() {
         // The start screen displays the keymap overlay through `? Keys`, so this request opens it there
         // too. GTK claims `prefix ?` before `answerConfirm` sees it, so opening the overlay must
         // also cancel the bypass prompt.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // `?` exits VISUAL through `onVisualKeyDownCapture`. GTK captures `prefix ?`, so that route
         // reaches this panel as an envelope and must exit VISUAL here.
         exitRegion();
@@ -2243,7 +2243,10 @@ export default function App() {
         // A route away from a bypass prompt, from VISUAL, and from every overlay over the conversation,
         // as `hint_collect` and `tab_detail` are: GTK's chord reaches no key handler here. The `/` prompt
         // and this line are one command line, so opening one closes the other.
-        cancelBypassConfirm();
+        // End every pending y/n prompt and any `gf` picker, not only a bypass prompt: see `endKeyPrompts`.
+        // A key typed into this line is the line's; the prompt it covers is over, as it is for BROWSE's own `:`
+        // (whose key ends it).
+        endKeyPrompts();
         exitRegion();
         setKeymapOpen(false);
         setDetail(null);
@@ -2273,7 +2276,7 @@ export default function App() {
         pendingSlashPickerRef.current = null;
         // GTK handles `prefix f` and its label keys before the WebView. Cancel the bypass prompt here so a
         // later copy key or composer keystroke cannot answer it. Rust cancels its prompt too.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // Close the `/` prompt and `:` line so HINT labels do not cover them or compete for keys.
         setSearch(null);
         setExLine(null);
@@ -2416,7 +2419,7 @@ export default function App() {
         // `open_keymap` does -- the two overlays are mutually exclusive over the conversation area.
         // A route away from a bypass prompt: the popover's own `y` copies a row,
         // and its handoff row is reached by clicks that never pass through `answerConfirm`.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // Opening the detail popover ends VISUAL.
         exitRegion();
         setDetail(payload.rows);
@@ -2685,7 +2688,7 @@ export default function App() {
         setKeymapOpen(false);
         // GTK claims `prefix ,`, so cancel the bypass prompt here before a name beginning with `y` can
         // answer it. Rust cancels its prompt too.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // Close the `/` prompt and `:` line before renaming. Committing or cancelling the rename returns
         // keys to the conversation root, which would leave either line drawn without focus.
         setSearch(null);
@@ -2750,7 +2753,7 @@ export default function App() {
         setSlashPicker(null);
         setSlashReply(null);
         pendingSlashPickerRef.current = null;
-        cancelBypassConfirm(); // Opening the chooser cancels the bypass prompt, not the
+        endKeyPrompts(); // Opening the chooser cancels the bypass prompt, not the
         // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser. Close
         // the `/` prompt and `:` line too. Leaving the chooser returns keys to the conversation
         // root through `onChooserLeave` and `returnKeysToRoot`. A line left drawn underneath would
@@ -3191,13 +3194,29 @@ export default function App() {
     postToRust({ type: "cycle_mode", request_id: nextRequestId(), tab });
   }
 
-  /** Cancels a bypass prompt on focus loss, a tab switch, `arrive`, `focus_permission` or `enter_input`.
-   *  Also called for GTK-handled routes before the WebView sees a key: `hint_collect`,
-   *  `begin_rename`, `tab_detail`, `open_keymap`, `nav_key`, `literal_key`, and terminal handoff.
-   *  Rust drops its prompt on the same routes, so a stray `y` is refused by the nonce.
-   *  Leaves `close` and `close_others` confirmations to their own overlay handling. */
+  /** Cancels a bypass prompt when the pane loses focus, the active tab changes, or keys move
+   *  to the terminal. Rust also drops its prompt, so the nonce rejects a late `y`.
+   *  Leaves close confirmations alone. Routes to another control inside the panel call
+   *  `endKeyPrompts` instead, so text entered there cannot answer an earlier close prompt. */
   function cancelBypassConfirm() {
     setConfirm((c) => (c?.kind === "bypass" ? null : c));
+  }
+
+  /** What a route that hands the keys to something else ends -- every
+   *  pending y/n prompt (`close`, `close_others` and `bypass`, which `cancelBypassConfirm` leaves two of) and a
+   *  `gf` letter picker. Both answer the next key they are given, ahead of whatever that key was meant for:
+   *  `answerConfirm` runs in the root's capture phase and claims every key while any `confirm` is set, and the
+   *  picker's branch of `onKeyDown` runs ahead of the rest of it. So a `y` typed into a rename field, the chooser,
+   *  the composer or a card's reason box, which the route has just put the keys in, closed a tab; a letter opened a
+   *  file. Called by every such route (`open_command_line`, `begin_rename`, `chooser`, `tab_detail`, `open_keymap`,
+   *  `hint_collect`, `enter_input`, `arrive`, `focus_permission`, and the two keys GTK claims, `nav_key` and
+   *  `literal_key` -- for which "any key but y cancels" is the prompt's own rule). NOT by `pane_focus` or a switch to
+   *  another tab, which take the keys nowhere: a close prompt names its tab by id and stays drawn in the band, so
+   *  the `y` that answers it is still a `y` to it (those two keep `cancelBypassConfirm`). Only state setters, so a
+   *  listener installed once, with the first render's closure, may call it. */
+  function endKeyPrompts() {
+    setConfirm(null);
+    setPathPick(null);
   }
 
   /** Handles confirmation keys before other controls in both the conversation and empty layouts.

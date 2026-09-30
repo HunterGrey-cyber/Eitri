@@ -6,6 +6,10 @@
  *  A user wheel scroll cancels HINT through the window scroll controller.
  *  Rows with no usable sign cell, including a clipped sliver, get a small label at their visible
  *  top-left instead of one covering the row. These labels are measured and kept clear of later labels.
+ *  Placement must settle because the effect runs again after `setPlacements`. `labelHeight` uses
+ *  whole pixels, `SLIVER_SLACK_PX` avoids treating nearly full-height cells as slivers, and
+ *  `samePlacements` ignores sub-pixel differences. `MAX_SELF_PASSES` bounds layout changes to
+ *  avoid reaching React's update-depth limit and replacing the panel with its crash fallback.
  *  The `hint-bg`/`hint-fg` colour pair is checked for contrast in Rust (`tokens.rs`). */
 import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
@@ -26,31 +30,74 @@ export const LABEL_PX = 16;
 
 /** The height a label would have at its own font size, read off the style `index.css` gives every
  *  `.hint-label` (`line-height: 1`, so one line is the font size, plus the vertical padding), for a label
- *  whose box was set to a sign cell's and so says nothing about its natural size. `0` where the browser
- *  reports nothing to read (jsdom loads no stylesheet). */
+ *  whose box was set to a sign cell's and so says nothing about its natural size. jsdom loads no stylesheet and
+ *  reports its own defaults (a 16px font, no padding: 16), which is why the tests stub it for a label. */
 function naturalHeight(label: HTMLElement): number {
   const style = getComputedStyle(label);
   const height = parseFloat(style.fontSize) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
   return Number.isFinite(height) ? height : 0;
 }
 
+/** One label's height as a whole-pixel box height, however the label was placed. An unsized
+ *  label is its own box (`offsetHeight`, which rounds); one sized to a sign cell has that cell's box, so its
+ *  height is what its style says -- ROUNDED the same way. This used to be the style unrounded (31.14px at
+ *  `agent.font_size` 32) against the box's 31 for the same label, so a sign cell showing 31.05px was a sliver
+ *  by one measure and not by the other, and the two placements alternated on every commit. */
+function labelHeight(label: HTMLElement): number {
+  return label.style.width === "" ? label.offsetHeight : Math.round(naturalHeight(label));
+}
+
 /** The largest label in `layer`, or `LABEL_PX` for a dimension not yet measured. The placement
  *  effect runs after every commit, using the fallback first and measured sizes next. A
- *  sign-cell-sized row label contributes only its styled `naturalHeight`, since its box belongs
- *  to the cell. Fallback row labels have their own boxes and contribute both dimensions, so
- *  larger fonts cannot overflow a clamp based on 16px. */
+ *  sign-cell-sized label contributes only `labelHeight`, since its width belongs to the cell.
+ *  Fallback row labels have their own boxes and contribute both dimensions, so larger fonts
+ *  cannot overflow a clamp based on 16px. */
 function labelSize(layer: HTMLElement | null): { width: number; height: number } {
   let width = 0;
   let height = 0;
   for (const label of layer?.querySelectorAll<HTMLElement>(".hint-label") ?? []) {
-    if (label.style.width === "") {
-      width = Math.max(width, label.offsetWidth);
-      height = Math.max(height, label.offsetHeight);
-    } else {
-      height = Math.max(height, naturalHeight(label));
-    }
+    if (label.style.width === "") width = Math.max(width, label.offsetWidth);
+    height = Math.max(height, labelHeight(label));
   }
   return { width: width > 0 ? width : LABEL_PX, height: height > 0 ? height : LABEL_PX };
+}
+
+/** A sign cell is a sliver -- too short to carry a label squashed into it -- only when it is clearly shorter
+ *  than a label, not when the two merely disagree by the sub-pixel a rounded and a fractional measure of the
+ *  same thing can. */
+const SLIVER_SLACK_PX = 1;
+
+/** Two placements closer than this are the same one: a fractional rect differs by float noise between
+ *  commits, and re-placing for it would only start another commit. Half a CSS pixel is under a device pixel
+ *  at any scale this panel is drawn at 1x and above, and a label never drifts further than that from its
+ *  target, since the comparison is always against what is drawn. */
+const SAME_PLACEMENT_PX = 0.5;
+
+/** The most commits in a row that this layer's own `setPlacements` may cause before it keeps what is drawn.
+ *  A legitimate placement settles in two or three (the first uses the fallback size, the next the measured
+ *  one, and a fallback label's own width can move a neighbour); a layout that still changes after that is
+ *  one the labels themselves keep changing, and looping on it ends in React's "Maximum update depth
+ *  exceeded" and the panel's crash fallback. */
+const MAX_SELF_PASSES = 4;
+
+function near(a: number | undefined, b: number | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return Math.abs(a - b) < SAME_PLACEMENT_PX;
+}
+
+function samePlacement(a: Placement | undefined, b: Placement | undefined): boolean {
+  if (a === undefined || b === undefined || a === null || b === null) return a === b;
+  return (
+    (a.shift === true) === (b.shift === true) &&
+    near(a.top, b.top) &&
+    near(a.left, b.left) &&
+    near(a.width, b.width) &&
+    near(a.height, b.height)
+  );
+}
+
+function samePlacements(a: Placement[], b: Placement[]): boolean {
+  return a.length === b.length && a.every((p, i) => samePlacement(p, b[i]));
 }
 
 type Rect = { top: number; left: number; right: number; bottom: number };
@@ -77,7 +124,10 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
       const cell = sign === null ? null : visibleBox(sign, root);
       // A clipped sign cell shorter than a label would squash the label into a sliver. Use the
       // fallback below instead.
-      const sliver = cell !== null && cell.height < label.height && cell.height < (sign?.getBoundingClientRect().height ?? 0);
+      const sliver =
+        cell !== null &&
+        cell.height + SLIVER_SLACK_PX < label.height &&
+        cell.height < (sign?.getBoundingClientRect().height ?? 0);
       if (cell !== null && !sliver) {
         return { top: clampTop(cell.top), left: cell.left - origin.left, width: cell.width, height: cell.height };
       }
@@ -115,11 +165,20 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
 export function HintLayer({ root, hints, typed }: { root: HTMLElement | null; hints: ShownHint[]; typed: string }) {
   const [placements, setPlacements] = useState<Placement[]>([]);
   const layerRef = useRef<HTMLDivElement>(null);
-  // No dependency list on purpose: see the doc above. The equality check is what stops this effect
-  // from re-rendering itself forever.
+  // Whether the commit this effect is about to run for was caused by its own `setPlacements` below, and how many
+  // in a row were (`MAX_SELF_PASSES`).
+  const ownUpdate = useRef(false);
+  const selfPasses = useRef(0);
+  // No dependency list on purpose: see the doc above. The equality check is what stops this effect from
+  // re-rendering itself forever, and `MAX_SELF_PASSES` is what stops it if a measure it reads ever changes
+  // with the very placement it just drew.
   useLayoutEffect(() => {
+    selfPasses.current = ownUpdate.current ? selfPasses.current + 1 : 0;
+    ownUpdate.current = false;
     const next = root === null ? [] : place(root, hints, labelSize(layerRef.current));
-    if (JSON.stringify(next) !== JSON.stringify(placements)) setPlacements(next);
+    if (samePlacements(next, placements) || selfPasses.current >= MAX_SELF_PASSES) return;
+    ownUpdate.current = true;
+    setPlacements(next);
   });
   if (root === null || hints.length === 0) return null;
   return (
