@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=99baa619a83285cc28f82e847024ce3f4831eb4528440c2f12480308adc3d782 -->
+<!-- translated-from: INSTALL.md sha256=a88db133a54d4ded5fdfbf239880b5b7bc447119ad58c4a7ca2375e558b55978 -->
 
 # 安装 Eitri
 
@@ -99,7 +99,7 @@ sh install.sh --from-source
 
 **0.2.0 只支持 x86_64**：在除 x86_64 之外的任何 `uname -m` 上都会立即拒绝——目前锁定的唯一 Skia 预构建包是 x86_64 版本，还没有为 ARM 锁定对应的包。
 
-在发行版本自己的 tag 上克隆公开仓库，如果它的 `HEAD` 和这个发行版本记录的 commit 对不上就拒绝继续，然后完全按照预构建路径的方式构建并安装。需要完整的工具链：**Rust 1.96 或更新版本**（2024 edition；安装脚本会拒绝更旧的 `rustc`）、**GTK 4.14+ 和 WebKitGTK 6.0 的开发包**外加 `pkg-config`、**Node.js 和 npm**、**`protoc`**、一套 **C 工具链**，以及第一次构建时需要的**联网**。`--checkout DIR` 会直接构建一份本地工作树，而不是重新克隆（这是作者自己的开发方式）——完整的前置条件列表和各发行版对应的包名，见 README 里的[构建](README.zh-CN.md#building)一节；`--verdandi-checkout` 和其他 `--from-source` 子选项见 `sh install.sh --help`。
+在发行版本自己的 tag 上克隆公开仓库，如果它的 `HEAD` 和这个发行版本记录的 commit 对不上就拒绝继续，然后完全按照预构建路径的方式构建并安装。需要完整的工具链：**Rust 1.96 或更新版本**（2024 edition；安装脚本会拒绝更旧的 `rustc`）、**GTK 4.14+ 和 WebKitGTK 6.0 的开发包**外加 `pkg-config`、**Node.js 和 npm**、**`protoc`**、一套 **C 工具链**，以及第一次构建时需要的**联网**。`--checkout DIR` 会直接构建一份本地工作树，而不是重新克隆（这是作者自己的开发方式）——完整的前置条件列表和各发行版对应的包名，见 CONTRIBUTING.md 里的[前置条件](CONTRIBUTING.md#prerequisites)一节（仅有英文版）；`--verdandi-checkout` 和其他 `--from-source` 子选项见 `sh install.sh --help`。
 
 <a id="why-the-sidecar-is-built-on-your-machine"></a>
 ## 为什么 sidecar 要在你自己的机器上构建

@@ -1,8 +1,47 @@
 # Contributing to Eitri
 
 Bug reports, small fixes and larger changes are all welcome. This file gets you from a clean clone
-to a green test suite; [README.md](README.md) is the map of what the project actually is and how
-it's laid out.
+to a green test suite, and says how the project is laid out; [README.md](README.md) says what it is
+and [INSTALL.md](INSTALL.md) how to install it.
+
+## The one rule
+
+**Component-ize Neovide, don't virtualize it.** No terminal-emulator relay, no WebView relay, no
+framebuffer compositing, and no second text model synchronised against Neovim's buffer. Neovide was
+forked and minimally restructured into an embeddable surface; the fork's changes stay in surface,
+geometry, input-adapter and renderer-viewport code so it keeps merging with upstream.
+
+```
+GTK4 shell (gtk4-rs)
+├── chrome          top bar, tray, dividers — GTK's own appearance suppressed
+├── editor pane     GtkGLArea → Skia → Neovide renderer → real `nvim --embed`
+├── agent panel     WebKitGTK → React/TypeScript — markdown, tool calls, diffs, permission cards
+└── terminal        an in-process PTY → terminal state → Skia (a shell, not a relay for the editor)
+```
+
+- **GTK** provides windowing, layout, focus, IME and the WebKitGTK container. It is not the visual
+  style: the chrome is drawn by Eitri and follows your Neovim colorscheme.
+- **Neovim** keeps owning buffers, motions, LSP, completion, Treesitter and rendering. The shell
+  never reimplements any of it.
+- **Agent state lives in the Rust host, not the WebView.** The panel is a pure view over a
+  projection held in Rust, so reloading or crashing the WebView loses nothing.
+
+## The workspace
+
+One Cargo workspace at the repository root.
+
+| crate | what it is |
+|---|---|
+| `shell/` | **the application binary.** Window, chrome, focus, the module grid, the Lua kernel, theme following |
+| `neovide-editor/` | library: `NeovideEditorPane`, the forked Neovide renderer, input and runtime on a `GtkGLArea` |
+| `agent/` | library: Claude session backends (no GTK). Also builds `agent-hook` and `eitri-claude-handoff` |
+| `core/` | library, package **`eitri-core`**: the GTK-free half of the shell — backend selection, the Lua kernel, theme tokens, the per-window sockets, layout, keymap, session tabs |
+| `agent-ui/web/` | the panel's React/TypeScript frontend. Not a crate: `shell/build.rs` builds it with npm and embeds the single-file result |
+| `supervisor/` | `eitri-supervisor`, a read-only cross-window agent-status dashboard |
+| `terminal/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
+| `terminal-render/`, `terminal-frame/`, `terminal-sync/`, `terminal-input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
+| `neovide/` | submodule: the Neovide fork ([HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide), branch `neovibe-integration`) |
+| `poc/` | frozen proof-of-concept crates from the feasibility stage. Not the product; they deliberately keep bugs fixed only in the product crates |
 
 ## Prerequisites
 
@@ -68,8 +107,19 @@ Eitri's agent talks to Claude Code through a sidecar, a Node service from the si
 [Verdandi](https://github.com/HunterGrey-cyber/verdandi). `agent` depends on Verdandi's
 `claude-runtime-protocol` crate, pinned by revision in `agent/Cargo.toml` and fetched from GitHub by
 Cargo — *building* Eitri never needs a Verdandi checkout. *Running* the sidecar backend is a
-separate question with its own search order (a built binary, a Verdandi checkout, or `eitri
-setup`'s own build) — see [README.md's Verdandi section](README.md#the-verdandi-dependency).
+separate question with its own search order:
+
+To *run* the sidecar backend, Eitri needs the sidecar itself, found in this order: first
+`EITRI_SIDECAR_BINARY` (a built executable), then — if that is unset — `EITRI_VERDANDI_CHECKOUT`
+(a development override pointing at a Verdandi checkout); then a `verdandi-claude-sidecar` beside
+the `shell` binary (what the packages and the AUR builds produce); then the artifact `eitri setup`
+builds for your user, under `$XDG_DATA_HOME/eitri/sidecar/<pinned revision>/` (or
+`~/.local/share/…` if unset), keyed to the exact revision this build pins so an old release's build
+is never picked up by a newer one; and last, a Verdandi checkout at the default
+`~/src/verdandi`, but only if one is already sitting there with something built.
+Nothing here ever builds anything on its own — see INSTALL.md's
+[Why the sidecar is built on your machine](INSTALL.md#why-the-sidecar-is-built-on-your-machine) for why
+that build has to happen on your machine, and run through `eitri setup`.
 
 If you need to change the protocol crate itself, don't re-pin the revision for a work-in-progress
 change: point Cargo at your own Verdandi checkout instead, in a `.cargo/config.toml` you keep out of
@@ -82,6 +132,24 @@ claude-runtime-protocol = { path = "/path/to/your/verdandi/checkout/crates/claud
 
 Land the protocol change on the Verdandi side first, then open the Eitri side of it pointing at a
 real, pinned revision.
+
+## Running a source build
+
+```sh
+cargo run -p shell -- /path/to/project     # or: EITRI_PROJECT_DIR=..., or the current directory
+cargo run -p shell -- --clean /path        # start the embedded nvim with --clean
+```
+
+The project directory is resolved once and shared by the editor, the agent and the terminal. A
+path that is not a directory, or an unknown option, is a startup error rather than silently ignored
+(`--` ends option parsing). Each launch is its own process with its own `nvim`.
+
+If you installed Eitri (see [INSTALL.md](INSTALL.md)), run it as `eitri [project directory]`.
+`./try-eitri.sh` in this repository launches a source build with the backend and account stated up
+front. Configuration lives in `~/.config/eitri/init.lua` (`EITRI_CONFIG_DIR` overrides it);
+per-project state (layout, history, saved permission rules) under `$XDG_STATE_HOME/eitri/`.
+
+The editor component alone, without the shell: `cargo run -p neovide-editor --example standalone`.
 
 ## The `poc/` crates
 

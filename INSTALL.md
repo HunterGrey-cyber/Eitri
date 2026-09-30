@@ -168,8 +168,8 @@ release's recorded commit, then builds and installs exactly like the prebuilt ro
 toolchain: **Rust 1.96 or newer** (edition 2024; the installer refuses an older `rustc`), **GTK
 4.14+ and WebKitGTK 6.0 development packages** plus `pkg-config`, **Node.js and npm**, **`protoc`**,
 a **C toolchain**, and **network access** on the first build. `--checkout DIR` builds a local
-working tree instead of cloning — see [Building](README.md#building) in
-the README for the full prerequisite list and package names per distro, and `sh install.sh --help`
+working tree instead of cloning — see [Prerequisites](CONTRIBUTING.md#prerequisites) in
+CONTRIBUTING.md for the full prerequisite list and package names per distro, and `sh install.sh --help`
 for `--verdandi-checkout` and the other `--from-source` sub-options.
 
 ## Why the sidecar is built on your machine

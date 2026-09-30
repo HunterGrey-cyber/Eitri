@@ -2,255 +2,172 @@ English | [简体中文](README.zh-CN.md)
 
 # Eitri
 
-**Your whole Neovim, unmodified, with a real rich agent panel beside it. Both halves are real, and
-the shell owns neither one's internals.**
+**Your Neovim, with Claude Code beside it.**
 
-There are two ordinary ways to put an AI agent next to code, and each charges you for the other
-half. Run the agent in a terminal and your editor is untouched, but everything it says arrives as
-text in a PTY — markdown that isn't rendered, diffs you read as plus and minus lines. Use one of the
-AI-editor forks and the panel is genuinely good, but the built-in "Vim mode" is an emulation of
-whichever parts someone had time to reimplement.
+A Claude Code you'd actually want to read: rendered markdown and diffs, permission cards — without
+reaching for the mouse. Eitri is a Linux desktop window (MIT) around your own Neovim configuration and
+the `claude` you have installed. You keep control of the code: each change is a diff you read, and in
+auto mode anything beyond an in-project edit or a safe read waits for your answer.
 
-Eitri refuses the trade. The editor pane is Neovide's own pipeline — keyboard and mouse → Neovim →
-Neovide's renderer → Skia → GPU — driving a real `nvim --embed` that loads your actual
-configuration, with your plugins, your LSP, your Treesitter and your keymaps. The agent panel is a
-React app in WebKitGTK, because that is still the sane way to render markdown, diffs and tool
-output. Neither half is a reimplementation of the other.
+<!-- MEDIA: hero.png -- the whole window. Left: the editor on LazyVim, a file open, a Visual selection.
+Right: the panel mid-conversation: a markdown reply with a highlighted code block, a folded tool-call
+row, and a waiting card with a line diff (auto runs in-project edits unasked, so stage the card with an
+edit outside the project or on a protected path such as `.git/`). Terminal hidden. 2560x1600 at scale
+2, shown at width 900; the caption names the desktop, session type and distribution. -->
 
-![A pending permission card beside real Neovim](demo/permission-card.png)
-
-## The one rule
-
-**Component-ize Neovide, don't virtualize it.** No terminal-emulator relay, no WebView relay, no
-framebuffer compositing, and no second text model synchronised against Neovim's buffer. Neovide was
-forked and minimally restructured into an embeddable surface; the fork's changes stay in surface,
-geometry, input-adapter and renderer-viewport code so it keeps merging with upstream.
-
-```
-GTK4 shell (gtk4-rs)
-├── chrome          top bar, tray, dividers — GTK's own appearance suppressed
-├── editor pane     GtkGLArea → Skia → Neovide renderer → real `nvim --embed`
-├── agent panel     WebKitGTK → React/TypeScript — markdown, tool calls, diffs, permission cards
-└── terminal        an in-process PTY → terminal state → Skia (a shell, not a relay for the editor)
-```
-
-- **GTK** provides windowing, layout, focus, IME and the WebKitGTK container. It is not the visual
-  style: the chrome is drawn by Eitri and follows your Neovim colorscheme.
-- **Neovim** keeps owning buffers, motions, LSP, completion, Treesitter and rendering. The shell
-  never reimplements any of it.
-- **Agent state lives in the Rust host, not the WebView.** The panel is a pure view over a
-  projection held in Rust, so reloading or crashing the WebView loses nothing.
-
-## What it does
-
-- **Editor and agent know about each other.** Your current file, cursor and visual selection go
-  into the turn as context; an edit the agent proposes is shown on its permission card as a line
-  diff; a buffer the agent wrote reloads in the editor.
-- **Permissions that ask only when a human is needed.** In Auto mode the panel answers what Claude
-  Code's own interactive default would allow without asking — reads inside the project, a shell
-  command that only reads — and shows a card for everything else. Every uncertainty resolves toward
-  the card: there is no shell parser, so a redirect, a pipe or a substitution asks; an unknown tool
-  asks; a path that resolves outside the project asks, `..` and symlinks included.
-- **Keyboard first.** `Ctrl-h`/`Ctrl-l` move between panes without breaking your splits (the embedded
-  Neovim believes it is inside tmux, so `vim-tmux-navigator` decides the boundary). The panel is a
-  document with a `BROWSE` mode: `j`/`k`, `h`/`l`, `a`/`d` to approve or deny, `G`/`gg`, and your
-  Neovim `mapleader` with a which-key box. `f` puts jump labels on every target in the window.
-- **Session tabs.** One conversation per tab, all running at once, driven by tmux's window keys.
-- **The layout is data.** Editor, panel and terminal are modules in a tree: hide, kill, split, swap
-  and zoom with tmux's keys; a project reopens the way you left it.
-- **A bottom terminal.** Its own PTY painted with Skia, with IME input, bracketed paste and OSC 52
-  copy, scrollback (`Shift-PageUp`/`PageDown`, the wheel), mouse selection with middle-click paste,
-  and mouse reporting to programs that ask for it (`nvim`, `htop`, `less`).
-- **It inherits, it does not impose.** One `:colorscheme` in Neovim and the chrome, editor and panel
-  all follow. Window keys default to stock tmux (prefix `Ctrl-b`) and are rebound in
-  `~/.config/eitri/init.lua`, a real Lua kernel (`eitri.keymap`, `eitri.command`,
-  `eitri.panel`, `eitri.config`). A binding that collides with another is a startup error
-  naming both. An example `Ctrl-a` setup is in [`docs/keymap/`](docs/keymap/).
-
-![Eitri follows your colorscheme](demo/colorscheme.gif)
-
-## Status — read this before trying it
-
-- **Linux on Wayland is the primary and only verified platform.** Developed on GNOME and a headless
-  sway; X11 has not been tried. A macOS port of the GTK-free crates is in progress; the application
-  itself does not run there.
-- **Much of it has been verified only in an isolated GUI sandbox**, with synthetic input on a
-  headless compositor. Everything listed above exists and has tests; much less of it has been
-  checked on real hardware under a real hand. Expect rough edges.
-- The feasibility questions (Neovide's renderer outside its own window, a browser engine beside it
-  without taxing the editor, IME, fractional scaling, fork mergeability) were each tested against a
-  Go/No-Go criterion written beforehand and came back Go, several with written conditions. The two
-  design documents that preceded the work are in [`docs/`](docs/), Chinese originals under
-  [`docs/zh/`](docs/zh/).
-- The agent side speaks to Claude Code only. It is not a multi-provider client.
-
-## The workspace
-
-One Cargo workspace at the repository root.
-
-| crate | what it is |
-|---|---|
-| `shell/` | **the application binary.** Window, chrome, focus, the module grid, the Lua kernel, theme following |
-| `neovide-editor/` | library: `NeovideEditorPane`, the forked Neovide renderer, input and runtime on a `GtkGLArea` |
-| `agent/` | library: Claude session backends (no GTK). Also builds `agent-hook` and `eitri-claude-handoff` |
-| `core/` | library, package **`eitri-core`**: the GTK-free half of the shell — backend selection, the Lua kernel, theme tokens, the per-window sockets, layout, keymap, session tabs |
-| `agent-ui/web/` | the panel's React/TypeScript frontend. Not a crate: `shell/build.rs` builds it with npm and embeds the single-file result |
-| `supervisor/` | `eitri-supervisor`, a read-only cross-window agent-status dashboard |
-| `terminal/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
-| `terminal-render/`, `terminal-frame/`, `terminal-sync/`, `terminal-input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
-| `neovide/` | submodule: the Neovide fork ([HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide), branch `neovibe-integration`) |
-| `poc/` | frozen proof-of-concept crates from the feasibility stage. Not the product; they deliberately keep bugs fixed only in the product crates |
-
-### The Verdandi dependency
-
-The agent talks to Claude Code through a **sidecar**, a Node service from the sibling project
-[Verdandi](https://github.com/HunterGrey-cyber/verdandi) (`apps/claude-sidecar`), over gRPC on a
-per-window Unix socket. `agent` depends on Verdandi's `claude-runtime-protocol` crate, pinned by
-revision in `agent/Cargo.toml` and fetched from GitHub by Cargo; nothing else of Verdandi is needed
-to *build* Eitri.
-
-To *run* the sidecar backend, Eitri needs the sidecar itself, found in this order: first
-`EITRI_SIDECAR_BINARY` (a built executable), then — if that is unset — `EITRI_VERDANDI_CHECKOUT`
-(a development override pointing at a Verdandi checkout); then a `verdandi-claude-sidecar` beside
-the `shell` binary (what the packages and the AUR builds produce); then the artifact `eitri setup`
-builds for your user, under `$XDG_DATA_HOME/eitri/sidecar/<pinned revision>/` (or
-`~/.local/share/…` if unset), keyed to the exact revision this build pins so an old release's build
-is never picked up by a newer one; and last, a Verdandi checkout at the default
-`~/src/verdandi`, but only if one is already sitting there with something built.
-Nothing here ever builds anything on its own — see [Install](#install) for why that build has to
-happen on your machine, and run through `eitri setup`.
-
-**No release contains the legacy backend** that used to spawn the `claude` on your `PATH` directly.
-It stays in the tree as a development-only build option (`cargo build --features
-shell/legacy-backend`) for local testing and the project's own sandbox GUI passes; a release build
-cannot select it (`eitri --legacy` on a release exits 1, naming why). Either way — sidecar or the
-legacy dev build — you need Claude Code installed and logged in; Eitri spends whatever account it
-runs under.
-
-## Install
-
-The quick way — downloads and runs the installer over HTTPS, installing to `~/.local` with no `sudo`:
+- **Your own Neovim.** A real `nvim --embed` with your `init.lua`, plugins, LSP and keymaps, drawn by a
+  fork of Neovide's GPU renderer; Eitri keeps only a few keys for itself.
+- **Every change in front of you.** Each edit the agent makes is its own diff row in the panel, and the
+  file reloads in your Neovim. Cards are answered with a key: `a` allows, `d` denies.
+- **Replies you can read.** Markdown, code highlighted in your colorscheme's syntax colours, and tool
+  calls with foldable results. The current file's name and any Visual selection go with each prompt.
+- **Keyboard first.** vim keys in the panel, tmux keys for the window (prefix `Ctrl+b`), and
+  `Ctrl+h/j/k/l` across panes.
+- **One window per project**: several agent sessions in tabs, a bottom terminal, and a layout that
+  is kept per project.
 
 ```sh
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
+eitri ~/path/to/project
 ```
 
-Read the script before piping it to a shell, or check it against its signed checksums first — see
-[`INSTALL.md`](INSTALL.md) for the full "verify before running" recipe, what verification does and
-does not protect, and every other route in detail:
+Linux x86_64 only; read [Status and limits](#status-and-limits) first. A release candidate installs
+with the command in its own notes on the [releases page](https://github.com/HunterGrey-cyber/eitri/releases).
+The installer downloads the release from GitHub, checks its checksums, installs under `~/.local`
+without `sudo` and builds the agent sidecar on your machine; `.deb`, `.rpm`, from-source and
+verifying a final release are in [INSTALL.md](INSTALL.md).
 
-- **`.deb`/`.rpm`** from the [releases page](https://github.com/HunterGrey-cyber/eitri/releases),
-  then run `eitri setup` once — it builds the sidecar for this machine and offers to fetch a
-  private `nvim` if yours is too old.
-- **AUR**: `yay -S eitri-bin` (prebuilt binaries, sidecar built at install time) or
-  `yay -S eitri-git` (everything, including Eitri itself, built from source).
-- **`--from-source`**: `sh install.sh --from-source` builds Eitri on your own machine — see
-  [Building](#building) for the toolchain it needs. **0.2.0 is x86_64 only**; `--from-source`
-  refuses on any other `uname -m` too, so it is not an ARM route.
+## What it does
 
-**Requirements**: GTK ≥ 4.14, WebKitGTK 6.0, glibc ≥ 2.39, x86_64 Linux — every route, prebuilt or
-from source. **nvim ≥ 0.10** — your own, on
-`PATH`, or let the installer fetch a private copy for Eitri alone
-(`$XDG_DATA_HOME/eitri/nvim/<version>/`, never placed on `PATH` and never touching, replacing or
-removing anything named `nvim`/`vim`/`vi` anywhere else on your system). Claude Code, installed and
-logged in.
+- **The editor.** Neovide's renderer on a `GtkGLArea`, driving an `nvim` started in the project
+  directory. Kept for Eitri: `Ctrl+h/j/k/l`, `Ctrl+=`/`Ctrl+-`/`Ctrl+0` (text size) and `F11`.
+- **The agent.** Claude Code, through the Claude Agent SDK, in a separate sidecar process. Replies
+  stream in as they are written. The conversation is held in the Rust host, not the web view, so it
+  survives a reload or a crash of the panel (a draft typed in the last 300 ms may not).
+- **Approvals.** Every tool call passes a gate. In **auto** mode Eitri allows, without asking, edits
+  inside the project and reads it can confirm stay inside it; nearly everything else is a card (no shell parser, so a
+  pipe, a redirect or a `cd` asks), and a card can offer to always allow that kind of call here. In
+  **bypass** mode nothing asks; entering it asks first.
+- **Sessions.** One conversation per tab, all running at once. A remembered session can be resumed
+  from the chooser, and `<leader>t` closes a conversation here and shows the `claude --resume`
+  command that continues it in your terminal.
+- **The window.** Editor, panel and terminal are modules you show, hide, split, swap and zoom with
+  tmux's keys. The bottom terminal is its own PTY running your shell, with bracketed paste, OSC 52
+  copy and a copy mode. One `:colorscheme` in Neovim recolours the chrome and the panel. Keys and
+  options live in `~/.config/eitri/init.lua`; a colliding binding is a startup error naming both.
 
-- Ubuntu 23.10 and later (24.04 included): a stock desktop's AppArmor policy blocks WebKitGTK's
-  sandbox by default, so the agent panel's place shows a one-time fix instead of the panel until you
-  apply it. See [INSTALL.md's "Ubuntu 23.10 and later" section](INSTALL.md#ubuntu-2310-and-later).
-<!-- /ubuntu-userns -->
-
-**Why the sidecar is built on your machine, not shipped.** It bundles Anthropic's
-`@anthropic-ai/claude-agent-sdk` ("© Anthropic PBC. All rights reserved"), which we do not
-redistribute. `eitri setup` (and the installer's other routes, and an AUR package's own `build()`)
-fetches it from the npm registry to your machine, under Anthropic's own terms, and builds the
-sidecar from the pinned Verdandi revision. The sidecar itself is not in any Eitri release
-artifact.
-
-## Building
-
-```sh
-git clone --recurse-submodules https://github.com/HunterGrey-cyber/eitri.git
-cd eitri
-# cloned without --recurse-submodules?  git submodule update --init
-cargo build --locked
-```
-
-`cargo build --locked` — **not** `--workspace` — is the product: the workspace's `default-members`
-(`shell`, `neovide-editor`, `agent`, `core`, `supervisor` and the terminal crates) at the GTK 4.14
-floor. `--workspace` also builds the frozen `poc/` crates, which are pinned to a newer GTK
-(4.18) and are not part of what ships.
-
-Prerequisites, all of them hard — a missing one fails the build, often inside a third-party build
-script with an error that never names this project:
-
-- **Rust 1.96 or newer** for the fork's 2024 edition (the installer refuses anything older).
-- **GTK 4.14+ and WebKitGTK 6.0 development packages**, and `pkg-config`
-  (Arch: `gtk4 webkitgtk-6.0`; Debian/Ubuntu: `libgtk-4-dev libwebkitgtk-6.0-dev`).
-- **Node.js and npm**: `shell/build.rs` runs `npm ci` and `npm run build` in `agent-ui/web/`.
-- **`protoc`** (`protobuf`/`protobuf-compiler`): Verdandi's protocol crate generates its types with it.
-- **A C toolchain**: Lua 5.4 is built from source and statically linked.
-- **Network access on the first build**: `skia-safe` downloads a prebuilt Skia, and Cargo fetches
-  the Verdandi protocol crate from GitHub.
-- At run time: **`nvim`** on `PATH` (or Eitri's own private copy, see [Install](#install)), a
-  working OpenGL driver, a Wayland session, and Claude Code.
-
-## Running
-
-```sh
-cargo run -p shell -- /path/to/project     # or: EITRI_PROJECT_DIR=..., or the current directory
-cargo run -p shell -- --clean /path        # start the embedded nvim with --clean
-```
-
-The project directory is resolved once and shared by the editor, the agent and the terminal. A
-path that is not a directory, or an unknown option, is a startup error rather than silently ignored
-(`--` ends option parsing). Each launch is its own process with its own `nvim`.
-
-If you installed Eitri (see [Install](#install)), run it as `eitri [project directory]`.
-`./try-eitri.sh` in this repository launches a source build with the backend and account stated up
-front. Configuration lives in `~/.config/eitri/init.lua` (`EITRI_CONFIG_DIR` overrides it);
-per-project state (layout, history, saved permission rules) under `$XDG_STATE_HOME/eitri/`.
-
-The editor component alone, without the shell: `cargo run -p neovide-editor --example standalone`.
+<!-- MEDIA: colorscheme.webm (or .gif if the host renders no video) -- the same window as hero.png,
+switching `:colorscheme` three times (a light theme, a dark theme, back); the chrome, the panel and
+its code block follow each switch. 1280x800, 6 seconds or less, under 3 MB. -->
 
 ## Keys
 
-Everything defaults to stock tmux: prefix `Ctrl-b`, then a normal tmux/vim-shaped key (`c` a new
-session tab, `t` the bottom terminal, `z` zoom the pane with the keys, `x` close it, the arrow keys
-move between panes with the prefix). Pane navigation itself needs no prefix — `Ctrl-h`/`j`/`k`/`l`,
-vim-tmux-navigator style, as above. Rebind any of it in `~/.config/eitri/init.lua`
-(`eitri.keymap`); a binding that collides with another is a startup error naming both.
+Window keys follow stock tmux and panel keys follow vim. **`prefix ?` lists every key bound in your
+build, with your own rebindings applied; it, not this table, is the reference.**
 
-**`prefix ?` shows every key bound today, in your build, with your own rebindings already applied.**
-That overlay, not this README, is the source of truth for a keymap that is still actively growing.
+| Where | Keys |
+|---|---|
+| After the prefix (`Ctrl+b`) | `c` new agent tab, `n`/`p` next/previous tab, `w` choose a tab or session, `a`/`e`/`t` show and focus the agent, editor or terminal (hide it if it already has the keys), `z` zoom, `x` close the module after y/n, `f` jump labels, `?` all keys |
+| Agent panel, browsing | `j`/`k` rows, `gg`/`G`, `/` search, `a`/`d` allow/deny the card under the cursor, `D` deny with a reason, `y` copy, `i` or `Ctrl+j` start typing |
+| Agent panel, typing | `Enter` send, `Ctrl+y` approve the oldest waiting card, `Ctrl+g` edit the prompt in `nvim`, `Shift+Tab` auto ⇄ bypass, `Esc` or `Ctrl+k` back to browsing |
 
-## Tests
+`Ctrl+h/j/k/l` move between panes: in Neovim's Normal and Visual mode after its own splits
+(vim-tmux-navigator decides the edge if you use it), and always from the terminal, whose shell never
+sees them (`prefix Ctrl+l` sends the literal). The panel's leader is your Neovim `mapleader`.
+[`docs/keymap/tmux-ctrl-a.lua`](docs/keymap/tmux-ctrl-a.lua) ports one full tmux configuration.
 
-```sh
-cargo test                                  # non-ignored tests; set XDG_STATE_HOME to a scratch dir
-cd agent-ui/web && npm ci && npx vitest run
-```
+<!-- MEDIA: hint.png -- after `prefix f`: jump labels over the editor, the panel and the tray.
+1600x1000 at scale 2, shown at width 800. -->
 
-`cargo test` runs the product at its GTK 4.14 floor, same as the build above; `cargo test
---workspace` additionally builds and tests the frozen `poc/` crates and needs GTK 4.18+ for them.
-Tests marked `#[ignore]` need a display, a real `nvim`, or a real Claude account (and bill it); each
-says in its own doc comment what it needs.
+## How it compares
+
+Other ways to run a coding agent next to Neovim, as each project describes itself (read 2026-09-30):
+
+| | Editor | Agent | Where you read the agent's work |
+|---|---|---|---|
+| Eitri | Neovim (`nvim --embed`, your config) | Claude Code | A rendered panel beside the editor |
+| [avante.nvim](https://github.com/avante-corp/avante.nvim) | Neovim (plugin) | Many LLM providers; ACP agents, Claude Code among them | A sidebar chat in Neovim windows |
+| [codecompanion.nvim](https://github.com/olimorris/codecompanion.nvim) | Neovim (plugin) | LLM adapters; ACP agents, Claude Code among them | A chat buffer; larger proposed edits in a floating diff |
+| [claude-code.nvim](https://github.com/greggh/claude-code.nvim) | Neovim (plugin) | Claude Code | Claude Code's terminal UI in a Neovim window |
+| [claudecode.nvim](https://github.com/coder/claudecode.nvim) | Neovim (plugin, Claude Code's IDE protocol) | Claude Code | Claude Code in a terminal split; proposed edits in a Neovim diff view |
+| [CopilotChat.nvim](https://github.com/CopilotC-Nvim/CopilotChat.nvim) | Neovim (plugin) | Models through GitHub Copilot, plus custom providers | A chat window in Neovim |
+| [Claude Code CLI](https://code.claude.com/docs/en/overview), in a tmux pane | Neovim in another pane | Claude Code | The CLI's own terminal UI |
+| [Zed](https://zed.dev/docs/ai/overview) | Zed, with its Vim emulation layer | Zed's agent; ACP agents, Claude among them | Zed's agent panel, with per-hunk review |
+| [Cursor](https://cursor.com/docs) | Cursor, based on VS Code | Cursor's agent, over models from several vendors | A side pane and an agents window |
+
+## Why not a plugin
+
+If you want to stay in the terminal, use one of the plugins above. They keep your terminal, your tmux
+session and `ssh`; Eitri gives all three up. And if Neovide on its own was not a reason to leave the
+terminal, Eitri's editor half is not one either: the editor is the same Neovim, drawn the same way.
+
+The reason is the other half: reading what the agent did before you accept it. In a terminal or a
+Neovim buffer, a reply is drawn into a grid of cells in one font. Eitri lays it out in a web view
+(prose, tables, code blocks, diffs) and keeps everything around it Vim-shaped: the panel has modes,
+counts, `gg`/`G`, search and your leader key; approving is `a` on a card; the window is driven by
+tmux's keys. Zed and Cursor also render the agent's work, but around their own editor.
+
+What it costs: a GUI window (Linux, x86_64, tested on Wayland; no remote editing), Claude Code as the
+only agent, and more memory and GPU time than native Neovide, since the panel is a web view. Measured
+in headless sway (Intel Core Ultra 5 125H, Mesa 26.2.2, GTK 4.22.5, WebKitGTK 2.52.6, 3072x1920 at
+165 Hz, scale 1.5), both apps on `nvim --clean` with fresh profiles, native Neovide built from the same
+fork, the panel on its empty tab with no agent running; not yet measured on GTK 4.14 or Ubuntu 24.04:
+
+- **Memory.** 272 MiB (PSS, whole process tree) against 67-70 MiB; WebKit's two processes were about
+  137 MiB of it. Each agent tab adds a sidecar (about 80 MiB RSS) and its own `claude` (265-290 MiB
+  RSS), about 350 MiB per tab.
+- **GPU** 3.2 ms per changed frame against about 1 ms; **startup** 672 ms to an editable buffer
+  against 499 ms.
+
+## Status and limits
+
+Eitri 0.2.0 is in release candidates. Bugs, probably; the `init.lua` API and the default keys may
+still change in 0.x.
+
+<!-- TODO: after the rc.2 hardware test: the machines, GPUs, desktops and distributions it has been
+used on, and what was exercised only in the project's headless GUI sandbox. -->
+
+- **Platform.** Tested on Wayland (GNOME and sway); X11 is not refused but untested. No macOS or
+  Windows build.
+- **Ubuntu 23.10 and later.** The stock AppArmor policy blocks WebKitGTK's sandbox; the panel shows a
+  one-time fix in its place instead ([INSTALL.md](INSTALL.md#ubuntu-2310-and-later)).
+- **Input methods and scaling.** fcitx5 composition in all three panes, and a live change of output
+  scale, have been tested in a headless sandbox only. A composition started right after a zoom or a
+  resize can place its candidate window from a stale cursor position.
+- **Typing latency** (key event to composited frame in a headless compositor, not input-to-photon;
+  165 Hz; median added over native Neovide): +0.34 ms on AMD, +0.71-0.78 ms on Intel; +10.75 ms on AMD
+  with `EITRI_EDITOR_DMABUF=0`. GTK older than 4.16 draws the editor another way, not yet measured.
+- **Typing while a reply streams.** While you type in the editor, the panel's stream is throttled to
+  5 updates/s (`agent.typing_cadence_hz`). Even so, 6-9 % of key presses took about two refreshes
+  instead of one, measured on Intel with a stand-in stream; a real reply has not been measured.
+
+## Requirements
+
+- Linux on x86_64, glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK ≥ 2.40 (the `webkitgtk-6.0` API): Ubuntu 24.04,
+  Debian 13, Fedora 40+, RHEL 10 and Arch meet these. A Wayland session and a working OpenGL driver.
+- Neovim ≥ 0.10 on `PATH`, or a private copy the installer fetches for Eitri alone (never on `PATH`).
+- Claude Code ≥ 2.1.252 and < 3.0, installed. Eitri does not bundle Claude Code; it runs yours.
+- For the agent sidecar, built on your machine at install time: network access (the installer fetches
+  the Verdandi source and its own pinned Node.js; no system Node or npm is used) and about 600 MiB free.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE), except `terminal-input/`, which is Apache-2.0 (derived from
-Alacritty; see its own `NOTICE`). Built on a fork of
-[Neovide](https://github.com/neovide/neovide) (MIT), whose architecture and code directly shaped the
-editor component.
+MIT ([LICENSE](LICENSE)), except `terminal-input/`, which is Apache-2.0 (derived from Alacritty; see
+its `NOTICE`). The editor pane is built on a fork of [Neovide](https://github.com/neovide/neovide) (MIT).
 
-`shell` statically links [`nvim-rs`](https://crates.io/crates/nvim-rs) 0.9.2, which is
-**LGPL-3.0**. Every release carries the Corresponding Source as a separate asset on the same release
-page, `eitri-<version>-source.tar.gz` (the exact public tree that was built, the `neovide` fork,
-`cargo vendor` output and the pinned Skia archive), and a `SOURCE` file
-(`/usr/share/licenses/eitri/SOURCE` in the installed packages) naming that asset and giving the
-exact recipe to modify `nvim-rs` and relink it into the shipped binary.
+`shell` statically links [nvim-rs](https://crates.io/crates/nvim-rs) 0.9.2, which is **LGPL-3.0**:
+each release page carries the Corresponding Source (`eitri-<version>-source.tar.gz`), and the
+installed `SOURCE` file gives the recipe for relinking against a modified nvim-rs.
+`THIRD-PARTY-LICENSES` carries every other notice.
 
-`packaging/collect-licenses.py` generates the full third-party notices, `THIRD-PARTY-LICENSES`, that
-every package ships. **The sidecar — the only piece of this that touches Anthropic's Claude Agent
-SDK — is not in any Eitri release artifact**; see [Install](#install) for why and where it is
-built instead.
+The agent sidecar bundles Anthropic's Claude Agent SDK, which is not open source. No Eitri release
+contains it: `eitri setup` downloads it from npm and builds the sidecar on your machine, under
+Anthropic's own terms.
+
+## Links
+
+- [Releases](https://github.com/HunterGrey-cyber/eitri/releases), [issues](https://github.com/HunterGrey-cyber/eitri/issues)
+- [INSTALL.md](INSTALL.md): every install route, verifying a download, updating, uninstalling
+- [CONTRIBUTING.md](CONTRIBUTING.md): building from source and running the tests
+- [HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide): the Neovide fork (`neovibe-integration`)
+- [HunterGrey-cyber/verdandi](https://github.com/HunterGrey-cyber/verdandi): the agent sidecar
