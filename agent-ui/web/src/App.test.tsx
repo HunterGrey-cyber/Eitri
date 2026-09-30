@@ -5749,6 +5749,76 @@ describe("App global HINT: the panel's half", () => {
       const linkLabel = labels(container).find((l) => l.classList.contains("hint-link"))!;
       expect(linkLabel.style.left).toBe("26px");
     });
+    /* rc.4 review (Codex, IMPORTANT): two measurement sources for one height. A label sized to a sign cell was
+       measured by its STYLE (`naturalHeight`, fractional: 31.14px at `agent.font_size` 32), a fallback label by
+       its `offsetHeight` (rounded: 31). A sign cell showing 31.046875px is a sliver against 31.14 (fallback
+       label) but not against 31 (cell-sized label again), and with no other label to hold the maximum up the
+       two alternated on every commit until React gave up ("Maximum update depth exceeded") and the panel's
+       crash fallback replaced it. jsdom reports no style, so `getComputedStyle` is stubbed for a `.hint-label`
+       the way WebKit reports it at that font size. */
+    describe("K07-11: a label's height has one source, so its placement settles", () => {
+      const NATURAL = { fontSize: "25.142857px", paddingTop: "3px", paddingBottom: "3px" }; // 31.142857
+      function stubLabelStyle(natural: Record<string, string> = NATURAL) {
+        const real = window.getComputedStyle.bind(window);
+        const spy = vi.spyOn(window, "getComputedStyle").mockImplementation((el: Element, pseudo?: string | null) =>
+          el instanceof HTMLElement && el.classList.contains("hint-label")
+            ? (natural as unknown as CSSStyleDeclaration)
+            : real(el, pseudo),
+        );
+        return () => spy.mock.calls.filter(([el]) => el instanceof HTMLElement && el.classList.contains("hint-label")).length;
+      }
+      /** One row only, so the one label's measure is the whole maximum -- its sign cell's bottom 31.046875px
+       *  shows, the rest of the (tall) cell is above the list. */
+      function oneTallRow(visible: number) {
+        const rendered = started();
+        events({ type: "user_prompt_submitted", text: "a long tool row" });
+        layOut(rendered.container);
+        act(() => root(rendered.container).focus());
+        const row = rendered.container.querySelector<HTMLElement>('[data-nav-stop="row"]')!;
+        box(row, visible - 2000, 2000);
+        box(row.querySelector(".row-sign")!, visible - 2000, 2000);
+        return rendered;
+      }
+
+      it("a sign cell 31.046875px tall against a 31.14px label does not loop until React's depth limit", () => {
+        measuredLabels(31, 31);
+        const labelStyleReads = stubLabelStyle();
+        const { container } = oneTallRow(31.046875);
+        expect(collect(1)).toBe(1);
+        expect(() => show(1, 1)).not.toThrow();
+        expect(container.querySelector(".panel-error, [role=alert]")).toBeNull();
+        expect(labels(container)).toHaveLength(1);
+        // It settles on its own measure -- one pass places, one re-measures the drawn label and finds nothing to
+        // change -- not by the layer's safety bound (`MAX_SELF_PASSES`) cutting an alternation off. And what is
+        // drawn is the sign-cell label, sized to the cell, as it was on the first pass.
+        expect(labelStyleReads()).toBeLessThanOrEqual(2);
+        expect(labels(container)[0].style.width).toBe("100px");
+      });
+
+      it("a layout the labels keep changing still stops: the layer keeps what is drawn and the panel survives", () => {
+        // Not the 31-vs-31.14 case above but a measure that genuinely disagrees with itself by more than any
+        // slack (a 40px label by style, a 31px one by box): a sign cell 35px tall is then a sliver for the first
+        // and not the second, forever. Nothing may throw; the bound is `MAX_SELF_PASSES`, not React's limit.
+        measuredLabels(31, 31);
+        stubLabelStyle({ fontSize: "34px", paddingTop: "3px", paddingBottom: "3px" });
+        const { container } = oneTallRow(35);
+        expect(collect(1)).toBe(1);
+        expect(() => show(1, 1)).not.toThrow();
+        expect(labels(container)).toHaveLength(1);
+      });
+
+      it("the decision does not depend on which kind of label was measured: same cell, same placement, either way", () => {
+        measuredLabels(31, 31);
+        stubLabelStyle();
+        const { container } = oneTallRow(31.046875);
+        show(1, collect(1));
+        const first = labels(container)[0].getAttribute("style");
+        // A later commit of the App (a streamed delta, the typed prefix) re-measures; nothing has moved.
+        dispatch({ kind: "hint_prefix", sessionId: 1, typed: "" });
+        expect(labels(container)[0].getAttribute("style")).toBe(first);
+      });
+    });
+
     it("K07-9: a link partly scrolled out gets its label inside the list", () => {
       const { container } = labelled(
         (c) => box(c.querySelector('.row-assistant a[href^="https:"]')!, -5, 20),
@@ -13981,5 +14051,175 @@ describe("#28: prefix : opens the panel's command line", () => {
     expect(line(container)).toBeNull();
     expect(band(container)).toBe("no command line on this screen — ? lists this panel's keys");
     expect(sent()).toEqual([]);
+  });
+
+  /** rc.4 review (Codex, IMPORTANT): `prefix :` is GTK's chord, so no key of it reaches `answerConfirm`, and
+   *  `cancelBypassConfirm` deliberately leaves a `close`/`close_others` confirm alone. The prompt therefore
+   *  survived the line opening, and `answerConfirm` -- which runs in the root's CAPTURE phase and claims every
+   *  key while a confirm is set -- took the `y` typed into the line as "yes, close", posting `close_tab`/
+   *  `close_others` instead of entering text. Opening the line ends every y/n prompt, as any takeover does. */
+  it.each([
+    ["a tab close", { kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] }, "close_tab"],
+    ["close-others", { kind: "confirm_close_others", tabs: [2, 3], lines: ["close 2 other tabs? 1 running (y/n)"] }, "close_others"],
+    ["a move into bypass", { kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass? (y/n)"] }, "confirm_bypass"],
+  ] as const)("%s waiting for y/n is ended by opening it: a y typed into the line is text, posts nothing", (_name, envelope, posts) => {
+    const { container } = startedWithRows();
+    dispatch(envelope as unknown as Parameters<typeof dispatch>[0]);
+    expect(container.querySelector(".band-prompt")).not.toBeNull();
+    dispatch({ kind: "open_command_line" });
+    const input = line(container)!;
+    expect(document.activeElement).toBe(input);
+    // Each key must reach the input untouched (not claimed by the prompt) and end up as its text.
+    for (const ch of "yes") {
+      const free = fireEvent.keyDown(input, { key: ch });
+      expect(free, `${ch} must not be claimed by a prompt`).toBe(true);
+      fireEvent.change(line(container)!, { target: { value: line(container)!.value + ch } });
+    }
+    expect(line(container)!.value).toBe("yes");
+    expect(lastOfType(posts)).toBeUndefined();
+    // The prompt is really gone, not merely unanswered: it is off the band, and Esc closing the line then a
+    // `y` on the conversation is BROWSE's own `y`, not an answer.
+    expect(container.querySelector(".band-prompt"), "the prompt is gone from the band").toBeNull();
+    fireEvent.keyDown(line(container)!, { key: "Escape" });
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "y" });
+    expect(lastOfType(posts)).toBeUndefined();
+  });
+
+  /** rc.4 review (Codex, minor): `gf` with two paths leaves its letter picker up, and `dropPendingKeys` (which
+   *  clears `gx`'s link pick) never touched `pathPick`. With the picker still set the line opened under it, and
+   *  a typed `a` -- `pathPick`'s branch of `onKeyDown` runs ahead of everything -- was taken as the choice and
+   *  sent `open_path` for the first file. Opening the line ends the pick. */
+  it("a gf letter picker is ended by opening it: a typed letter is text, and opens no file", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "compare a.rs and b.rs" }] }), 2);
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(container));
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    dispatch({ kind: "open_command_line" });
+    const input = line(container)!;
+    expect(fireEvent.keyDown(input, { key: "a" }), "a must not be claimed as the pick's letter").toBe(true);
+    fireEvent.change(input, { target: { value: "a" } });
+    expect(line(container)!.value).toBe("a");
+    expect(posted.filter((m) => m.type === "open_path")).toEqual([]);
+    expect(container.querySelector(".path-pick")).toBeNull();
+  });
+});
+
+/* rc.4 review, follow-up (the coordinator's ask after finding 1): `open_command_line` was not the only route that hands
+   the keys to something else. `cancelBypassConfirm` -- what every other such route called -- leaves a `close` /
+   `close_others` prompt alone, and a `gf` letter picker was ended only by the tab switch, so a `y` typed into what the
+   route opened (a rename field, the chooser's filter, the composer, a card's reason box) answered "close this tab?",
+   and a letter opened a file. Each route below is pinned to end both: every pending y/n prompt and the picker. */
+describe("rc.4 review: a route that hands the keys elsewhere ends every pending y/n prompt and a gf picker", () => {
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  function started() {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "compare a.rs and b.rs" }] }), 2);
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    return rendered;
+  }
+  const conversationRoot = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  const CHOOSER = { kind: "chooser", open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }], records: [] };
+  // Every route that puts the keys somewhere inside the panel, as Rust (or the panel itself) starts it.
+  const ROUTES: Array<[string, () => void]> = [
+    ["hint_collect", () => dispatch({ kind: "hint_collect", sessionId: 1 })],
+    ["tab_detail", () => dispatch({ kind: "tab_detail", tab: 1, rows: [] })],
+    ["open_keymap", () => dispatch({ kind: "open_keymap" })],
+    ["begin_rename", () => dispatch({ kind: "begin_rename", tab: 1, current: null })],
+    ["chooser", () => dispatch(CHOOSER as unknown as Parameters<typeof dispatch>[0])],
+    ["enter_input", () => dispatch({ kind: "enter_input" })],
+    ["arrive", () => dispatch({ kind: "arrive" })],
+    ["focus_permission", () => dispatch({ kind: "focus_permission", tab: 1 })],
+    ["nav_key", () => dispatch({ kind: "nav_key", direction: "down" })],
+    ["literal_key", () => dispatch({ kind: "literal_key", key: "C-b" })],
+  ];
+  const CONFIRMS = [
+    ["a tab close", { kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] }, "close_tab"],
+    ["close-others", { kind: "confirm_close_others", tabs: [2, 3], lines: ["close 2 other tabs? (y/n)"] }, "close_others"],
+  ] as const;
+
+  describe.each(CONFIRMS)("%s waiting for y/n", (_what, envelope, posts) => {
+    it.each(ROUTES)("is ended by %s: the prompt leaves the band and a y answers nothing", (_route, open) => {
+      stubClipboard();
+      const { container } = started();
+      dispatch(envelope as unknown as Parameters<typeof dispatch>[0]);
+      expect(container.querySelector(".band-prompt")).not.toBeNull();
+      open();
+      expect(container.querySelector(".band-prompt"), "the prompt is gone from the band").toBeNull();
+      fireEvent.keyDown(conversationRoot(container), { key: "y" });
+      expect(lastOfType(posts)).toBeUndefined();
+    });
+  });
+
+  it("begin_rename: a name that starts with y is text in the rename field, and closes nothing", () => {
+    const { container } = started();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    dispatch({ kind: "begin_rename", tab: 1, current: null });
+    const field = container.querySelector<HTMLInputElement>(".tab-rename")!;
+    expect(field).not.toBeNull();
+    for (const ch of "yes") {
+      expect(fireEvent.keyDown(field, { key: ch }), `${ch} must reach the field`).toBe(true);
+      fireEvent.change(field, { target: { value: field.value + ch } });
+    }
+    expect(field.value).toBe("yes");
+    expect(lastOfType("close_tab")).toBeUndefined();
+  });
+
+  it("the chooser: a y typed into its filter is text, and closes nothing", () => {
+    const { container } = started();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    dispatch(CHOOSER as unknown as Parameters<typeof dispatch>[0]);
+    const panel = container.querySelector(".chooser")!;
+    expect(panel).not.toBeNull();
+    fireEvent.keyDown(panel, { key: "/" });
+    const filter = container.querySelector<HTMLInputElement>(".chooser input")!;
+    expect(filter).not.toBeNull();
+    expect(fireEvent.keyDown(filter, { key: "y" }), "y must reach the filter").toBe(true);
+    expect(lastOfType("close_tab")).toBeUndefined();
+  });
+
+  /* The two routes that stay bypass-only (`endKeyPrompts`' doc): they take the keys nowhere inside the panel, and a
+     close prompt names its tab by id and stays drawn in the band. */
+  it("a close prompt survives the pane losing the keys, and a switch to another tab: it is still drawn and answers y", () => {
+    const { container } = started();
+    dispatch({ kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] });
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(container.querySelector(".band-prompt")).not.toBeNull();
+    const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
+    dispatch({ kind: "tabs", active: 2, tabs: two });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState({ transcript: [{ seq: 1, text: "second" }] }) });
+    expect(container.querySelector(".band-prompt")).not.toBeNull();
+    fireEvent.keyDown(conversationRoot(container), { key: "y" });
+    expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
+  });
+
+  it.each(ROUTES)("%s ends a gf letter picker: its letter opens no file, the picker is gone", (_route, open) => {
+    const { container } = started();
+    const root = conversationRoot(container);
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    open();
+    expect(container.querySelector(".path-pick"), "the picker is gone").toBeNull();
+    fireEvent.keyDown(conversationRoot(container), { key: "a" });
+    expect(posted.filter((m) => m.type === "open_path")).toEqual([]);
   });
 });

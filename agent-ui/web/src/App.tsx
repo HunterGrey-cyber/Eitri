@@ -2456,7 +2456,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
-        cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list
+        endKeyPrompts(); // v1, D11/spec §3.4's cancel list
         arrivalParkRef.current = null; // #22: this lands INPUT, never on a parked row
         setEmptyLanding("input");
         setInputRequest((n) => n + 1);
@@ -2467,7 +2467,7 @@ export default function App() {
         setKeymapOpen(false);
         setDetail(null);
         setHandoffOpen(false);
-        cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list
+        endKeyPrompts(); // v1, D11/spec §3.4's cancel list
         // A reserved two-key prefix or a leader/table sequence armed from before this arrival means
         // nothing about it -- the same reason `pane_focus` cancels both (spec §2.4, Review Focus 1).
         dropPendingKeys();
@@ -2483,13 +2483,13 @@ export default function App() {
         setDetail(null);
         setHandoffOpen(false);
         setChooser(null);
-        cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list
+        endKeyPrompts(); // v1, D11/spec §3.4's cancel list
         arrivalParkRef.current = null; // #22: a card landing wins over a parked row
         setPermissionRequest((n) => n + 1);
       } else if (payload.kind === "nav_key") {
         // A key, claimed by GTK before the WebView saw it, so it never reached `answerConfirm`: D1's
         // "any key but a counted y cancels" has to be applied here instead (v1-mode fix round 1).
-        cancelBypassConfirm();
+        endKeyPrompts();
         // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees a keydown, so this is a key pressed
         // after any pending `g`/`z`/`[`/`]` prefix or leader sequence -- cancelled here for the same
         // reason `pane_focus` and `arrive` cancel them, whether the effect below claims the chord or
@@ -2525,7 +2525,7 @@ export default function App() {
         // Deliberately NOT `isEditableElement`: this needs "has a text selection", which is exactly
         // these two types.
         // Like `nav_key` above: a key GTK claimed, so D1's cancel is applied here (v1-mode fix round 1).
-        cancelBypassConfirm();
+        endKeyPrompts();
         if (payload.key !== "C-a") return;
         const el = document.activeElement;
         if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
@@ -2538,7 +2538,7 @@ export default function App() {
         // it is opened, and closed, where it is seen.
         // `prefix ?` is a route away from a bypass prompt (spec §3.4, v1-mode fix round 1): GTK takes
         // the chord, so no key of it reaches `answerConfirm`.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // Visual-mode spec D12/D10: `?` is one of VISUAL's own routes away too (its OWN `?` key
         // reaches this through `onVisualKeyDownCapture`, not here -- but `prefix ?` is GTK's, and
         // reaches this panel only as this envelope).
@@ -2558,7 +2558,10 @@ export default function App() {
         // A route away from a bypass prompt, from VISUAL, and from every overlay over the conversation,
         // as `hint_collect` and `tab_detail` are: GTK's chord reaches no key handler here. The `/` prompt
         // and this line are one command line, so opening one closes the other.
-        cancelBypassConfirm();
+        // rc.4 review (Codex): EVERY pending y/n and a `gf` picker, not only a bypass prompt: see `endKeyPrompts`.
+        // A key typed into this line is the line's; the prompt it covers is over, as it is for BROWSE's own `:`
+        // (whose key ends it).
+        endKeyPrompts();
         exitRegion();
         setKeymapOpen(false);
         setDetail(null);
@@ -2594,7 +2597,7 @@ export default function App() {
         // a keydown here, so the next ordinary key after a landing -- the `y` that copies the code
         // block HINT just landed on, the first letter typed into the composer -- answered a bypass
         // prompt left open under it. HINT is a route away (spec §3.4); Rust drops its own prompt too.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // R4: the labels would sit over the search prompt, and HINT and `/` never contend for keys
         // (nor HINT and K02's `:` line).
         setSearch(null);
@@ -2749,7 +2752,7 @@ export default function App() {
         // `open_keymap` does -- the two overlays are mutually exclusive over the conversation area.
         // A route away from a bypass prompt (v1-mode fix round 1): the popover's own `y` copies a row,
         // and its handoff row is reached by clicks that never pass through `answerConfirm`.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // Visual-mode spec D12: the detail popover is one of the overlays that ends VISUAL.
         exitRegion();
         setDetail(payload.rows);
@@ -3060,7 +3063,7 @@ export default function App() {
         setKeymapOpen(false);
         // The whole-branch review (blocking): `prefix ,` is GTK's, so a name starting with `y` typed
         // into the field answered a bypass prompt left open (spec §3.4). Rust drops its own too.
-        cancelBypassConfirm();
+        endKeyPrompts();
         // K02 fix round 1: the `/` prompt and the `:` line too, for the chooser's reason (its own
         // arm): committing or cancelling the rename hands the keys to the conversation root.
         setSearch(null);
@@ -3131,7 +3134,7 @@ export default function App() {
         setSlashPicker(null);
         setSlashReply(null);
         pendingSlashPickerRef.current = null;
-        cancelBypassConfirm(); // v1, D11/spec §3.4's cancel list -- opening the chooser, not the
+        endKeyPrompts(); // v1, D11/spec §3.4's cancel list -- opening the chooser, not the
         // reverse: `confirm_bypass`'s own branch deliberately does NOT close an already-open chooser.
         // K02 fix round 1 (Codex, blocking): the `/` prompt and the `:` line close too. Every way out
         // of the chooser hands the keys to the conversation root (`onChooserLeave`,
@@ -3612,10 +3615,29 @@ export default function App() {
    *  WebView sees a key (`hint_collect`, `begin_rename`, `tab_detail`, `open_keymap`, `nav_key`,
    *  `literal_key`) and from a terminal handoff. Rust drops its own outstanding prompt on the same
    *  routes, so a `y` that slipped through is refused by the nonce. Leaves a `close`/`close_others`
-   *  confirm alone -- those already have their own overlay-ranking rules and are not this rule's
-   *  concern. */
+   *  confirm alone. **Since the rc.4 review only three callers are left** -- losing the pane's focus, a switch to
+   *  another active tab and the terminal handoff, routes that take the keys nowhere inside the panel: every route
+   *  that hands the keys to something else calls `endKeyPrompts` (below) instead, which ends all three kinds of
+   *  prompt, because a `y` typed into what such a route opens answered a close prompt too. */
   function cancelBypassConfirm() {
     setConfirm((c) => (c?.kind === "bypass" ? null : c));
+  }
+
+  /** rc.4 review (Codex, then the coordinator): what a route that hands the keys to something else ends -- every
+   *  pending y/n prompt (`close`, `close_others` and `bypass`, which `cancelBypassConfirm` leaves two of) and a
+   *  `gf` letter picker. Both answer the next key they are given, ahead of whatever that key was meant for:
+   *  `answerConfirm` runs in the root's capture phase and claims every key while any `confirm` is set, and the
+   *  picker's branch of `onKeyDown` runs ahead of the rest of it. So a `y` typed into a rename field, the chooser,
+   *  the composer or a card's reason box, which the route has just put the keys in, closed a tab; a letter opened a
+   *  file. Called by every such route (`open_command_line`, `begin_rename`, `chooser`, `tab_detail`, `open_keymap`,
+   *  `hint_collect`, `enter_input`, `arrive`, `focus_permission`, and the two keys GTK claims, `nav_key` and
+   *  `literal_key` -- for which "any key but y cancels" is the prompt's own rule). NOT by `pane_focus` or a switch to
+   *  another tab, which take the keys nowhere: a close prompt names its tab by id and stays drawn in the band, so
+   *  the `y` that answers it is still a `y` to it (those two keep `cancelBypassConfirm`). Only state setters, so a
+   *  listener installed once, with the first render's closure, may call it. */
+  function endKeyPrompts() {
+    setConfirm(null);
+    setPathPick(null);
   }
 
   /** The window-close prompt (ruling 7) owns every key ahead of everything else, in BOTH layouts:
